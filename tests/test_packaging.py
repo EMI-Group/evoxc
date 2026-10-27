@@ -343,6 +343,26 @@ def _build_distribution(dist: str, src: Path, out_dir: Path) -> tuple[Path | Non
     return artifacts[0], ""
 
 
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory) -> Path:
+    """ONE real `evoxc` wheel build, shared by every wheel leg below."""
+    src = _copy_checkout(tmp_path_factory.mktemp("wheel") / "src")
+    wheel, reason = _build_distribution("wheel", src, tmp_path_factory.mktemp("wheel-out"))
+    if wheel is None:
+        pytest.skip(reason)
+    return wheel
+
+
+@pytest.fixture(scope="module")
+def built_sdist(tmp_path_factory) -> Path:
+    """ONE real `evoxc` sdist build, shared by every sdist leg below."""
+    src = _copy_checkout(tmp_path_factory.mktemp("sdist") / "src")
+    sdist, reason = _build_distribution("sdist", src, tmp_path_factory.mktemp("sdist-out"))
+    if sdist is None:
+        pytest.skip(reason)
+    return sdist
+
+
 def _hf_entries(entries: Iterable[str]) -> list[str]:
     """Paths whose first component is `evoxc_hf` (a file OR a bare directory)."""
     return [e for e in entries if e == HF_TOP_LEVEL or e.startswith(HF_TOP_LEVEL + "/")]
@@ -375,14 +395,9 @@ def _assert_distribution_ships_no_evoxc_hf(entries: Sequence[str], kind: str) ->
     assert not hf_entries, f"{kind} ships evoxc_hf source entries: {hf_entries[:5]}\n{_STALE_HINT}"
 
 
-def test_wheel_contains_no_evoxc_hf(tmp_path):
+def test_wheel_contains_no_evoxc_hf(built_wheel):
     """A real `evoxc` wheel must contain no `evoxc_hf` module (skips without tooling)."""
-    src = _copy_checkout(tmp_path / "src")
-    wheel, reason = _build_distribution("wheel", src, tmp_path / "wheel")
-    if wheel is None:
-        pytest.skip(reason)
-
-    with zipfile.ZipFile(wheel) as archive:
+    with zipfile.ZipFile(built_wheel) as archive:
         names = archive.namelist()
         record_name = next((n for n in names if n.endswith(".dist-info/RECORD")), None)
         assert record_name is not None, "wheel has no RECORD"
@@ -395,7 +410,7 @@ def test_wheel_contains_no_evoxc_hf(tmp_path):
     assert not hf_entries, f"wheel ships evoxc_hf files: {hf_entries[:5]}\n{_STALE_HINT}"
 
 
-def test_sdist_contains_no_evoxc_hf(tmp_path):
+def test_sdist_contains_no_evoxc_hf(built_sdist):
     """A real `evoxc` sdist must contain no `evoxc_hf` source (skips without tooling).
 
     The sdist is the distribution that ships `pyproject.toml` + the sources, so
@@ -403,12 +418,88 @@ def test_sdist_contains_no_evoxc_hf(tmp_path):
     isolated temp COPY of the checkout with `*.egg-info`, `build/` and `dist/`
     removed, so nothing from the working tree can leak in.
     """
-    src = _copy_checkout(tmp_path / "src")
-    archive, reason = _build_distribution("sdist", src, tmp_path / "sdist")
-    if archive is None:
-        pytest.skip(reason)
+    _assert_distribution_ships_no_evoxc_hf(_relative_entries(built_sdist), "sdist")
 
-    _assert_distribution_ships_no_evoxc_hf(_relative_entries(archive), "sdist")
+
+# --------------------------------------------------------------------------
+# 5. the distribution/brand name is pinned: `evoxc` (EvoX Compiler), never `etl`
+# --------------------------------------------------------------------------
+
+
+def _metadata_headers(text: str) -> dict[str, str]:
+    """The RFC822 header block of a `METADATA` file (the body is the README)."""
+    headers: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            break
+        key, sep, value = line.partition(":")
+        if sep:
+            headers.setdefault(key.strip().lower(), value.strip())
+    return headers
+
+
+def test_wheel_is_named_evoxc(built_wheel):
+    """The wheel is the `evoxc` distribution presenting itself as `EvoX Compiler`."""
+    assert built_wheel.name.startswith("evoxc-"), (
+        f"built wheel is {built_wheel.name!r}, not `evoxc-<version>-...whl`"
+    )
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = archive.namelist()
+        dist_infos = sorted({n.split("/", 1)[0] for n in names if ".dist-info/" in n})
+        assert len(dist_infos) == 1, f"wheel must carry exactly one .dist-info: {dist_infos}"
+        assert dist_infos[0].startswith("evoxc-"), dist_infos
+        metadata = _metadata_headers(archive.read(f"{dist_infos[0]}/METADATA").decode())
+
+    assert metadata.get("name") == "evoxc", (
+        f"wheel METADATA says Name: {metadata.get('name')!r}, not 'evoxc' — "
+        "the rename to `evoxc` (EvoX Compiler) must not regress"
+    )
+    summary = metadata.get("summary", "")
+    assert summary.startswith("EvoX Compiler"), (
+        f"wheel METADATA says Summary: {summary!r}; it must start with 'EvoX Compiler'"
+    )
+
+
+def test_wheel_contains_no_etl_package(built_wheel):
+    """No wheel entry may sit under a top-level `etl` package (the pre-rename name)."""
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = archive.namelist()
+        top_level_name = next((n for n in names if n.endswith("top_level.txt")), None)
+        top_level = None if top_level_name is None else archive.read(top_level_name).decode()
+
+    etl_entries = [n for n in names if n.split("/")[0].rstrip("/") == "etl"]
+    assert not etl_entries, (
+        f"wheel ships a top-level `etl` package ({etl_entries[:5]}): the project is `evoxc` "
+        "(EvoX Compiler) — a stale `etl/` source dir or `etl.egg-info/` was picked up by the build"
+    )
+    if top_level is not None:
+        declared = [line.strip() for line in top_level.splitlines() if line.strip()]
+        assert declared == ["evoxc"], (
+            f"wheel top_level.txt declares {declared!r}, not ['evoxc'] — an `etl` package "
+            "was reintroduced into the distribution"
+        )
+
+
+def test_sdist_is_named_evoxc(built_sdist):
+    """The sdist has ONE `evoxc-<version>` root shipping `evoxc` + `tests`."""
+    assert built_sdist.name.startswith("evoxc-"), (
+        f"built sdist is {built_sdist.name!r}, not `evoxc-<version>.tar.gz`"
+    )
+    with tarfile.open(built_sdist) as tar:
+        roots = sorted({n.split("/", 1)[0].rstrip("/") for n in tar.getnames()})
+    assert len(roots) == 1, f"sdist must have a single top-level root, got {roots}"
+    assert roots[0].startswith("evoxc-"), (
+        f"sdist root is {roots[0]!r}, not 'evoxc-<version>' — the rename must not regress"
+    )
+
+    top = {entry.split("/", 1)[0] for entry in _relative_entries(built_sdist)}
+    assert {"evoxc", "tests"} <= top, f"sdist ships {sorted(top)} (expected evoxc + tests)"
+    stale = sorted(top & {"etl", HF_TOP_LEVEL})
+    assert not stale, (
+        f"sdist ships top-level {stale}: the project is `evoxc` (EvoX Compiler) and `evoxc_hf` "
+        "lives only in the checkout — rebuild from a clean tree"
+    )
+
 
 # The exact stale artifact that can poison an sdist: a leftover `SOURCES.txt`
 # from an earlier build listing `evoxc_hf/` modules. One entry points at a file
