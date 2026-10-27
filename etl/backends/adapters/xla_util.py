@@ -981,6 +981,7 @@ class _LoadedExecutable(_Handle):
         buffers: list["_Buffer"],
         execute_device: int | None = None,
         output_meta: Any = None,
+        events: list | None = None,
     ) -> list["_Buffer"]:
         """Execute; return output buffers.
 
@@ -1000,10 +1001,27 @@ class _LoadedExecutable(_Handle):
         one-time run-time check) verifies them against the real plugin
         metadata. ``None`` (the default) keeps the lazy per-buffer queries
         of the CPU/host-staging path.
+
+        ``events`` is the optional DEVICE-COMPLETE-EVENT sink: passing a
+        list requests ONE per-device ``PJRT_Event*`` completion handle from
+        the plugin (``PJRT_LoadedExecutable_Execute_Args.device_complete_events``;
+        ``num_devices`` is always 1 in this driver) and, ON SUCCESS, appends
+        its RAW handle value to that list — an ``int``, or ``None``/``0``
+        when the plugin returned no event (appended as-is so the caller can
+        detect a plugin that violated the contract). The CALLER OWNS the
+        handle: it must await it (``PjrtPlugin.await_event``) and destroy it
+        (``PjrtPlugin.destroy_event``); this method never waits for the
+        device, never destroys a handle it handed out, and never appends
+        anything on FAILURE — a stray non-NULL handle the plugin may have
+        written is destroyed best-effort there (inside its own
+        ``try``/``except`` so a cleanup failure can never mask the original
+        execute error) and the slot is cleared. ``None`` (the default)
+        leaves ``device_complete_events`` NULL: the byte-identical,
+        zero-plugin-cost enqueue behavior of every earlier version.
         """
         num_args = len(buffers)
         scaffolding = self._execute_scaffolding(num_args)
-        device_ptrs, out_ptrs, args, num_outputs = scaffolding
+        device_ptrs, out_ptrs, args, num_outputs, event_slots = scaffolding
         metas = output_meta
         if metas is not None:
             # Validate the contract BEFORE invoking: a mismatched
@@ -1020,10 +1038,45 @@ class _LoadedExecutable(_Handle):
         for i, buffer in enumerate(buffers):
             device_ptrs[i] = buffer.ptr
         args.execute_device = execute_device
-        self.plugin._check(
-            self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
-            "PJRT_LoadedExecutable_Execute",
-        )
+        # The args struct is SCAFFOLDED (reused across calls), so the event
+        # field is (re)assigned on EVERY call — it must never be left over
+        # from a previous one (`events=None` keeps it NULL: no plugin cost).
+        if events is not None:
+            event_slots[0] = None  # zero the slot the plugin writes through
+            args.device_complete_events = ctypes.cast(
+                event_slots, ctypes.POINTER(ctypes.c_void_p)
+            )
+            try:
+                self.plugin._check(
+                    self.plugin.api.PJRT_LoadedExecutable_Execute(
+                        ctypes.byref(args)
+                    ),
+                    "PJRT_LoadedExecutable_Execute",
+                )
+            except BaseException:
+                # FAILURE: the caller gets nothing. Destroy a stray non-NULL
+                # handle the plugin may have written BEST-EFFORT — the
+                # cleanup is guarded so it can never mask the execute error.
+                stray = event_slots[0]
+                if stray:
+                    try:
+                        self.plugin.destroy_event(stray)
+                    except BaseException:
+                        pass
+                event_slots[0] = None
+                args.device_complete_events = None
+                raise
+            # Hand the raw value over AS-IS (None/0 = the plugin returned no
+            # event), then clear the slot: the handle now belongs to the
+            # caller, never to this scaffolding.
+            events.append(event_slots[0])
+            event_slots[0] = None
+        else:
+            args.device_complete_events = None
+            self.plugin._check(
+                self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
+                "PJRT_LoadedExecutable_Execute",
+            )
         plugin = self.plugin
         outputs: list[_Buffer] = [None] * num_outputs
         if metas is None:
@@ -1049,6 +1102,15 @@ class _LoadedExecutable(_Handle):
         across threads. The output count is part of the key so a reused
         pointer address (an executable closed and a new one allocated at the
         same address) can never be served stale, under-sized arrays.
+
+        The result is the 5-tuple ``(device_ptrs, out_ptrs, args,
+        num_outputs, event_slots)``: ``event_slots`` is the ONE-element
+        ``c_void_p`` array the plugin writes its single per-device
+        ``PJRT_Event*`` completion handle through (``num_devices`` is always
+        1 here) when ``execute(..., events=[...])`` asks for one. It lives in
+        the cached scaffolding because it IS the pointer stored in
+        ``args.device_complete_events`` — it must stay alive as long as the
+        struct can be reused.
         """
         num_outputs = self.num_outputs()
         key = (self.ptr, num_args, num_outputs)
@@ -1067,6 +1129,8 @@ class _LoadedExecutable(_Handle):
         output_lists = (ctypes.c_void_p * 1)(
             ctypes.cast(out_ptrs, ctypes.c_void_p)
         )
+        # ONE per-device completion-event slot (num_devices is always 1).
+        event_slots = (ctypes.c_void_p * 1)()
         options = pjrt.PJRT_ExecuteOptions(
             struct_size=pjrt.sizeof(pjrt.PJRT_ExecuteOptions)
         )
@@ -1085,7 +1149,7 @@ class _LoadedExecutable(_Handle):
             device_complete_events=None,
             execute_device=None,
         )
-        scaffolding = (device_ptrs, out_ptrs, args, num_outputs)
+        scaffolding = (device_ptrs, out_ptrs, args, num_outputs, event_slots)
         if len(cache) >= _EXECUTE_SCAFFOLDING_MAX:
             # Bounded: a meta-level loop that builds many executables must
             # not grow per-thread state without limit. Clearing is safe —
