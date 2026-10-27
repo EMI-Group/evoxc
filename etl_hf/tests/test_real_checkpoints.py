@@ -1015,10 +1015,11 @@ _GOLDEN_DIR = Path(__file__).resolve().parents[2] / "bench_logs" / "hf_goldens"
 #: 161 works / 162 crashes — see ``./etl_hf/CONTEXT.md``).
 IREE_CONSUMED_INPUT_CLIFF = 161
 
-#: The packed 124M ``gpt2`` plan: 3 concatenated weight inputs (``packed.0``
-#: ``(125009, 768)``, ``packed.1`` ``(121344,)``, ``packed.2`` ``(9216, 3072)``)
-#: plus the ``input_ids`` leaf = **4** declared inputs, versus 197 unpacked.
-PACKED_GPT2_INPUTS = 3
+#: The packed 124M ``gpt2`` plan: 4 concatenated weight inputs (``packed.0``
+#: ``(125009, 768)``, ``packed.1`` ``(121344,)``, ``packed.2`` ``(9216, 3072)``,
+#: ``packed.3`` — the pre-transposed tied head — ``(768, 50257)``) plus the
+#: ``input_ids`` leaf = **5** declared inputs, versus 197 unpacked.
+PACKED_GPT2_INPUTS = 4
 PACKED_GPT2_DECLARED = PACKED_GPT2_INPUTS + 1
 
 #: fp32 parity budget of a compiled graph against the numpy interpreter, relative
@@ -1041,7 +1042,7 @@ _PACKED_MIN_MEMORY = 3 * 1024**3
 #: timing threshold would turn a busy host into a red test, and none of these is
 #: a correctness property.  (``first_call``/``warm`` are best-of-12 medians; the
 #: numpy interpreter stays far ahead on CPU, so packing's payoff here is
-#: *runnability*, not speed — 197 → 4 inputs, at numpy-equivalent latency and
+#: *runnability*, not speed — 197 → 5 inputs, at numpy-equivalent latency and
 #: with the same fp32 numbers.)
 MEASURED: dict[str, object] = {
     "canonical_keys": 196,
@@ -1099,19 +1100,20 @@ def _golden_logits(slug: str) -> tuple[np.ndarray, np.ndarray]:
 @_BIG
 @requires_iree
 def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
-    """124M ``gpt2`` packed → **4** inputs instead of 197, runs 12× unchanged on iree.
+    """124M ``gpt2`` packed → **5** inputs instead of 197, runs 12× unchanged on iree.
 
     The unpacked 124M GPT-2 compiles and loads fine on ``iree``/llvm-cpu and then
     dies on the first run — IREE's Python runtime SIGSEGVs on a program that
     consumes more than ~161 distinct inputs (measured control, in its own
     subprocess: **exit 139, empty stderr**, 197 declared inputs).  Packing
     (:mod:`etl_hf.pack`, ``pack_weights=True``) is what makes the case runnable:
-    the same weights arrive as 3 concatenated inputs and are sliced back in-graph.
+    the same weights arrive as 4 concatenated inputs and are sliced back in-graph.
 
     What this pins:
 
-    * the packed plan really is the small number (3 weight inputs, 4 declared with
-      ``input_ids``) and covers every canonical element exactly once;
+    * the packed plan really is the small number (4 weight inputs, 5 declared with
+      ``input_ids``) and covers every canonical element exactly once, plus one
+      pre-transposed copy of the tied head;
     * the compiled executable **runs 12 times without crashing** and every run is
       **bit-identical** to the first (the unpacked program never reaches run #1);
     * the numbers are unchanged by packing: fp32 parity against the numpy
@@ -1138,7 +1140,7 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
     cfg, params = loaded.config, loaded.params
     assert len(params) == 196, f"expected 196 canonical keys, got {len(params)}"
 
-    # --- the packed plan: 196 canonical arrays → 3 concatenated inputs -------
+    # --- the packed plan: 196 canonical arrays → 4 concatenated inputs -------
     plan = pack_plan(param_specs(cfg))
     assert len(plan.specs) == PACKED_GPT2_INPUTS, (
         f"the 124M gpt2 must pack to {PACKED_GPT2_INPUTS} weight inputs, got "
@@ -1160,9 +1162,16 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
         for spec in plan.specs.values()
     )
     canonical_elements = sum(int(array.size) for array in params.values())
-    assert packed_elements == canonical_elements == 124_439_808, (
-        f"packing must be lossless: packed={packed_elements:,} vs "
-        f"canonical={canonical_elements:,} elements"
+    # Lossless, plus exactly ONE extra weight-sized buffer: the tied head's
+    # pre-transposed copy (``(hidden, vocab)``), written once here on the host
+    # so the graph never transposes a weight-sized operand per call.
+    assert canonical_elements == 124_439_808, (
+        f"unexpected canonical element count {canonical_elements:,}"
+    )
+    assert packed_elements == canonical_elements + cfg.vocab_size * cfg.hidden_size, (
+        f"packing must be the canonical tree plus one transposed head copy: "
+        f"packed={packed_elements:,} vs canonical={canonical_elements:,} + "
+        f"{cfg.vocab_size * cfg.hidden_size:,}"
     )
     packed = pack_params(plan, params)
     assert set(packed) == set(plan.specs), (

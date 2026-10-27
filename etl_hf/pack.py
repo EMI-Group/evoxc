@@ -37,9 +37,27 @@ prefix sums. A rank-0 *scalar* key cannot be concatenated, so it gets its own
 single-key bucket of shape ``(1,)`` and is un-packed as a slice + reshape to
 ``()``.
 
-Import-time constraint: only ``numpy`` + ``etl`` + :mod:`etl_hf.errors` are
-imported here (no torch/transformers/iree), so ``import etl_hf`` stays
-numpy-only.
+Derived (transposed) entries
+----------------------------
+A tied-embedding config has ONE ``embed.weight`` ``(vocab, hidden)`` graph input
+that also serves as the output projection, whose ``(in_features,
+out_features)`` layout is ``(hidden, vocab)``. Transposing the whole table
+inside the graph would materialise it on every call, so the plan declares that
+copy instead — inferred from the spec tree by
+:func:`etl_hf._specs.transposed_aliases` (a tree with an ``embed.weight`` and no
+``lm_head.weight`` is a tied tree), or passed explicitly as
+``pack_plan(..., transposed_aliases=...)`: the plan stores
+``np.ascontiguousarray(params["embed.weight"].T)`` **once** as its own packed
+entry under the derived key ``lm_head.weight``, and ``unpack`` slices it with the
+same static :class:`~etl_hf.pack.PackEntry` (``transposed=True``,
+``source="embed.weight"``, ``shape=(hidden, vocab)``). Packing therefore carries
+one extra weight-sized buffer; the graph carries no weight-sized transpose.
+Derived entries never appear in ``params`` — the host tree is still exactly the
+family's canonical ``canonicalize_weights`` tree.
+
+Import-time constraint: only ``numpy`` + ``etl`` + :mod:`etl_hf.errors` +
+:mod:`etl_hf._specs` are imported here (no torch/transformers/iree), so
+``import etl_hf`` stays numpy-only.
 """
 
 from __future__ import annotations
@@ -50,6 +68,7 @@ from dataclasses import dataclass
 import numpy as np
 
 import etl
+from etl_hf._specs import transposed_aliases as _declared_aliases
 from etl_hf.errors import HFUnsupportedError, HFWeightError
 
 __all__ = [
@@ -160,12 +179,38 @@ def _as_array(name: str, value: object, want_dtype: np.dtype) -> np.ndarray:
     return array
 
 
+def _transposed_source(source: str, array: np.ndarray, entry: "PackEntry") -> np.ndarray:
+    """Validate and transpose one derived entry's source array (host side).
+
+    Args:
+        source: the canonical key the derived entry is built from (error text).
+        array: the validated host array read from ``params[source]``.
+        entry: the derived :class:`PackEntry` (its ``shape`` is the **stored**,
+            transposed shape).
+
+    Returns:
+        np.ndarray: ``array.T`` as a fresh C-contiguous array.
+
+    Raises:
+        HFWeightError: ``array`` is not the reverse of the declared stored shape
+            (i.e. the caller passed a tree packed for another config).
+    """
+    expected = tuple(reversed(entry.shape))
+    if tuple(array.shape) != expected:
+        raise HFWeightError(
+            f"PackPlan.pack: parameter {source!r} feeds the derived packed entry "
+            f"stored as {entry.shape} (a transposed copy), so its shape must be "
+            f"{expected}, got {tuple(array.shape)}"
+        )
+    return np.ascontiguousarray(array.T)
+
+
 # ---------------------------------------------------------------------------
 # the plan value objects
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PackEntry:
-    """One canonical key's position inside a packed graph input.
+    """One key's position inside a packed graph input.
 
     Attributes:
         input: the packed input name, e.g. ``"packed.3"``.
@@ -173,12 +218,30 @@ class PackEntry:
             concatenation axis). A rank-0 key's packed input is rank 1 of length
             1, so its ``start`` holds that single offset while ``shape`` is
             ``()``.
-        shape: the canonical tensor's static shape (the slice's ``lengths``).
+        shape: the static shape of what the slice yields — the canonical tensor's
+            shape, or the **transposed** shape for a derived entry (whose
+            ``source`` array is stored as ``source.T``).
+        source: the canonical ``params`` key whose data this entry stores, or
+            ``None`` when the entry's own key (its name in
+            :attr:`PackPlan.entries`) is the source — i.e. the usual case.
+            A non-``None`` ``source`` marks a **derived** entry: an extra packed
+            copy that ``params`` never contains and only ``unpack`` produces
+            (a tied-embedding head stored pre-transposed, so the graph never
+            transposes a weight-sized operand per call).
+        transposed: whether the stored data is ``params[source].T`` — always
+            ``True`` for a derived entry, ``False`` for every canonical one.
     """
 
     input: str
     start: tuple[int, ...]
     shape: tuple[int, ...]
+    source: str | None = None
+    transposed: bool = False
+
+    @property
+    def canonical(self) -> bool:
+        """Whether ``params`` supplies this entry directly (not derived)."""
+        return self.source is None
 
 
 @dataclass(frozen=True)
@@ -188,8 +251,10 @@ class PackPlan:
     Attributes:
         specs: the **packed** params graph inputs (a handful of
             :class:`etl.TensorSpec` values, e.g. ``{"packed.0": …, …}``).
-        entries: canonical key → :class:`PackEntry` (its packed input and static
-            slice position).
+        entries: key → :class:`PackEntry` (its packed input and static slice
+            position) for every key the plan unpacks — the canonical keys
+            (``entry.canonical``) plus any derived, pre-transposed copies
+            (:attr:`derived_keys`).
     """
 
     specs: dict[str, etl.TensorSpec]
@@ -198,8 +263,33 @@ class PackPlan:
     # -- introspection ------------------------------------------------------
     @property
     def canonical_keys(self) -> tuple[str, ...]:
-        """The canonical parameter keys this plan covers, sorted."""
+        """The canonical parameter keys :meth:`pack` takes as input, sorted."""
+        return tuple(sorted(name for name, entry in self.entries.items() if entry.canonical))
+
+    @property
+    def derived_keys(self) -> tuple[str, ...]:
+        """The derived keys :meth:`unpack` yields on top of the canonical ones, sorted.
+
+        Each is stored as the transposed copy of its :attr:`PackEntry.source`
+        (empty for a config that needs none, e.g. an untied head).
+        """
+        return tuple(sorted(name for name, entry in self.entries.items() if not entry.canonical))
+
+    @property
+    def unpacked_keys(self) -> tuple[str, ...]:
+        """Every key :meth:`unpack` returns (canonical + derived), sorted."""
         return tuple(sorted(self.entries))
+
+    def has(self, name: str) -> bool:
+        """Whether :meth:`unpack` yields ``name`` (canonical or derived).
+
+        Args:
+            name: a key to look up.
+
+        Returns:
+            bool: ``True`` when the plan carries that key.
+        """
+        return name in self.entries
 
     @property
     def input_names(self) -> tuple[str, ...]:
@@ -222,7 +312,7 @@ class PackPlan:
         }
 
     def __len__(self) -> int:
-        """Number of canonical parameters covered."""
+        """Number of entries the plan unpacks (canonical + derived keys)."""
         return len(self.entries)
 
     # -- host packing -------------------------------------------------------
@@ -231,11 +321,14 @@ class PackPlan:
 
         One ``np.concatenate`` per packed input, in deterministic order — no
         per-call cost once the packed tree is reused (pack at build/params time,
-        never per run).
+        never per run). A derived entry (a tied head, :attr:`PackEntry.source`)
+        is written as the **transposed** copy of its source array, once, here on
+        the host.
 
         Args:
             params: canonical params (the exact keys of the family's
-                ``param_specs``), host arrays.
+                ``param_specs`` — the canonical tree, never including derived
+                keys), host arrays.
 
         Returns:
             dict[str, np.ndarray]: the packed tree (the exact keys of
@@ -251,7 +344,7 @@ class PackPlan:
                 f"PackPlan.pack expects a mapping of canonical name -> host array, "
                 f"got {type(params).__name__}"
             )
-        expected = set(self.entries)
+        expected = set(self.canonical_keys)
         got = set(params)
         if got != expected:
             raise HFWeightError(
@@ -263,8 +356,11 @@ class PackPlan:
         arrays: dict[str, np.ndarray] = {}
         for name, entry in self.entries.items():
             want = np.dtype(self.specs[entry.input].dtype)
-            array = _as_array(name, params[name], want)
-            if tuple(array.shape) != entry.shape:
+            source = entry.source or name
+            array = _as_array(source, params[source], want)
+            if entry.transposed:
+                array = _transposed_source(source, array, entry)
+            elif tuple(array.shape) != entry.shape:
                 raise HFWeightError(
                     f"PackPlan.pack: parameter {name!r} has shape "
                     f"{tuple(array.shape)}, expected {entry.shape}"
@@ -287,13 +383,17 @@ class PackPlan:
         (``etl.slice(t, start, lengths)``), so the compiled program is identical
         to the unpacked one up to a concatenation-free copy.
 
+        Derived entries (:attr:`derived_keys`, e.g. a tied head stored
+        pre-transposed) come back as extra keys holding the static slice of the
+        stored — already transposed — shape; no in-graph transpose is involved.
+
         Args:
             packed: packed params mapping (the exact keys of :attr:`specs`) of
                 ``SymbolicTensor`` values inside a trace.
 
         Returns:
             dict[str, etl.SymbolicTensor]: the canonical params dict the family
-            forward body expects.
+            forward body expects, plus one entry per derived key (when any).
 
         Raises:
             TypeError: ``packed`` is not a mapping, or a value is not a
@@ -388,28 +488,105 @@ def is_packed_tree(tree: object) -> bool:
 # ---------------------------------------------------------------------------
 # public builders
 # ---------------------------------------------------------------------------
+def _alias_shapes(
+    shapes: Mapping[str, tuple[int, ...]],
+    transposed_aliases: Mapping[str, str],
+) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """Validate derived-entry declarations and return their stored shapes.
+
+    Args:
+        shapes: canonical key → static shape (already validated).
+        transposed_aliases: ``{derived_key: source_key}`` — each derived key is
+            stored as the transposed copy of ``source_key``.
+
+    Returns:
+        dict: derived key → ``(source key, stored shape)``.
+
+    Raises:
+        TypeError: a key or source is not a string, or ``transposed_aliases`` is
+            not a mapping.
+        HFWeightError: a source key is absent, or a derived key shadows a
+            canonical key (the plan could not tell which data to store).
+        HFUnsupportedError: the source is not a rank-2 static tensor (a transpose
+            is only defined — and only needed — for a 2-D weight table).
+    """
+    if not isinstance(transposed_aliases, Mapping):
+        raise TypeError(
+            "pack_plan(transposed_aliases=...) must be a mapping of derived name "
+            f"-> canonical source name, got {type(transposed_aliases).__name__}"
+        )
+    derived: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for name, source in transposed_aliases.items():
+        if not isinstance(name, str) or not isinstance(source, str):
+            raise TypeError(
+                "pack_plan(transposed_aliases=...) must map derived weight name -> "
+                f"canonical source name (both strings), got {name!r} -> {source!r}"
+            )
+        if name in shapes:
+            raise HFWeightError(
+                f"pack_plan: derived packed key {name!r} collides with a canonical "
+                f"parameter of the same name; a derived entry is an EXTRA copy "
+                f"(e.g. a tied head stored transposed), so it needs its own key"
+            )
+        if source not in shapes:
+            raise HFWeightError(
+                f"pack_plan: derived packed key {name!r} needs canonical source "
+                f"{source!r}, which is not in the specs tree "
+                f"({sorted(shapes)[:8]}…)"
+            )
+        source_shape = shapes[source]
+        if len(source_shape) != 2:
+            raise HFUnsupportedError(
+                f"pack_plan: derived packed key {name!r} is a transposed copy of "
+                f"{source!r}, which has rank {len(source_shape)} (shape "
+                f"{source_shape}); only a rank-2 weight table has a meaningful "
+                f"(in_features, out_features) transpose"
+            )
+        derived[name] = (source, source_shape[::-1])
+    return derived
+
+
 def pack_plan(
-    specs: Mapping[str, etl.TensorSpec], *, prefix: str = PACKED_PREFIX
+    specs: Mapping[str, etl.TensorSpec],
+    *,
+    prefix: str = PACKED_PREFIX,
+    transposed_aliases: Mapping[str, str] | None = None,
 ) -> PackPlan:
     """Build the packed-input plan for one canonical ``param_specs`` tree.
 
     Generic over any family: the plan depends only on the spec tree's dtypes,
-    ranks and trailing dims (see the module docstring's bucketing rule).
+    ranks and trailing dims (see the module docstring's bucketing rule), plus any
+    derived (pre-transposed) copies the tree declares.
 
     Args:
         specs: the canonical params graph inputs (e.g.
-            ``FamilySpec.param_specs(cfg)``) — static shapes only.
+            ``FamilySpec.param_specs(cfg)``) — static shapes only, and a plain
+            ``dict`` (etl's tree machinery keys on the exact container type, so
+            the declaration rides on the *plan*, not on the mapping). A tied tree
+            (``embed.weight`` present, ``lm_head.weight`` absent) declares its
+            ``(hidden, vocab)`` head transpose automatically.
         prefix: name prefix of the packed inputs (default :data:`PACKED_PREFIX`,
             i.e. ``"packed.0"``, ``"packed.1"`` …).
+        transposed_aliases: explicit ``{derived_key: source_key}`` derived-copy
+            declarations, overriding the inferred ones. Each derived key is
+            stored once as ``params[source_key].T`` and unpacked as its own
+            static slice, so no weight-sized transpose happens in the graph.
+            ``None`` (default) uses :func:`etl_hf._specs.transposed_aliases`
+            (a tied-embedding tree declares its head); passing ``{}`` forces a
+            plan with no derived entries.
 
     Returns:
-        PackPlan: the packed specs plus one :class:`PackEntry` per canonical key.
+        PackPlan: the packed specs plus one :class:`PackEntry` per unpacked key —
+        the canonical keys of ``specs`` and any derived ones.
 
     Raises:
-        TypeError: ``specs`` is not a mapping, a key is not a string, or
-            ``prefix`` is not a non-empty string.
+        TypeError: ``specs`` is not a mapping, a key is not a string,
+            ``prefix`` is not a non-empty string, or ``transposed_aliases`` is
+            malformed.
         HFUnsupportedError: a spec has a symbolic/dynamic dim (packing needs
-            static shapes).
+            static shapes), or a derived source is not rank 2.
+        HFWeightError: a derived key shadows a canonical key or names a missing
+            source.
     """
     if not isinstance(specs, Mapping):
         raise TypeError(
@@ -421,7 +598,11 @@ def pack_plan(
             f"pack_plan(prefix=...) must be a non-empty string, got {prefix!r} of "
             f"type {type(prefix).__name__}"
         )
+    declared = (
+        _declared_aliases(specs) if transposed_aliases is None else transposed_aliases
+    )
     shapes: dict[str, tuple[int, ...]] = {}
+    dtypes: dict[str, np.dtype] = {}
     buckets: dict[tuple, list[str]] = {}
     for name, spec in specs.items():
         if not isinstance(name, str):
@@ -431,12 +612,21 @@ def pack_plan(
             )
         shape = _static_shape(name, spec)
         shapes[name] = shape
+        dtypes[name] = np.dtype(spec.dtype)
         buckets.setdefault(_bucket_key(name, shape, spec.dtype), []).append(name)
+
+    derived = _alias_shapes(shapes, declared) if declared else {}
+    for name, (source, stored_shape) in derived.items():
+        shapes[name] = stored_shape
+        dtypes[name] = dtypes[source]
+        buckets.setdefault(
+            _bucket_key(name, stored_shape, dtypes[source]), []
+        ).append(name)
 
     entries: dict[str, PackEntry] = {}
     packed_specs: dict[str, etl.TensorSpec] = {}
     for index, names in enumerate(
-        sorted(buckets.values(), key=min)  # deterministic: min canonical key
+        sorted(buckets.values(), key=min)  # deterministic: min bucket key
     ):
         input_name = f"{prefix}{index}"
         ordered = sorted(names)
@@ -446,12 +636,19 @@ def pack_plan(
             length = shape[0] if shape else 1
             # Static starts: zeros except the concatenation axis (axis 0).
             start = (offset,) + (0,) * (len(shape) - 1) if shape else (offset,)
-            entries[name] = PackEntry(input=input_name, start=start, shape=shape)
+            source = derived[name][0] if name in derived else None
+            entries[name] = PackEntry(
+                input=input_name,
+                start=start,
+                shape=shape,
+                source=source,
+                transposed=source is not None,
+            )
             offset += length
         first = shapes[ordered[0]]
         packed_shape = (offset,) if not first else (offset,) + first[1:]
         packed_specs[input_name] = etl.TensorSpec(
-            shape=packed_shape, dtype=specs[ordered[0]].dtype
+            shape=packed_shape, dtype=dtypes[ordered[0]]
         )
     return PackPlan(specs=packed_specs, entries=entries)
 

@@ -25,7 +25,7 @@ raises :class:`etl.DeviceError`, one explicit ``.to(cpu)`` yields logits matchin
 the numpy interpreter and the stored HF golden within a *relative-to-absmax* fp32
 budget); **host inputs rejected** at the run boundary (params *and* ids); the
 **same-device loop** with **zero** ``iree.runtime.asdevicearray`` calls; **packed +
-device-resident** (3–5 staged leaves instead of ~21/36, bit-identical to the
+device-resident** (4–5 staged leaves instead of ~21/36, bit-identical to the
 unpacked device run); true-fp32 ``dot`` (``dot_precision="HIGHEST"``, the knob
 xla/rocm needs, is a no-op); and, under ``ETL_HF_BIG=1``, ``distilgpt2`` / the
 124M ``gpt2`` as 4-input packed programs with 5 / 10 consecutive bit-identical
@@ -339,7 +339,7 @@ def host_tree(slug: str, seq_len: int, *, pack: bool = False) -> dict[str, np.nd
     """The host params tree an executable for ``(slug, pack)`` takes.
 
     ``pack=True`` packs **on the host first** (the supported order), so the
-    explicit H2D step transfers 3–5 leaves instead of one per weight."""
+    explicit H2D step transfers 4–5 leaves instead of one per weight."""
     loaded = loaded_for(slug)
     if not pack:
         return loaded.params
@@ -641,7 +641,7 @@ def test_packed_device_resident_matches_unpacked(slug: str) -> None:
 
     The packed tree is built on the host (``pack_params(pack_plan(
     param_specs(config)), params)``) and *then* placed, so ``place_params``
-    stages 3–5 leaves instead of one per weight; the device logits are
+    stages 4–5 leaves instead of one per weight; the device logits are
     bit-identical (≤ ``PACKED_REL_TOL``) to the unpacked device run and within
     ``REL_TOL`` of the numpy interpreter."""
     label = _label(slug, True)
@@ -658,8 +658,8 @@ def test_packed_device_resident_matches_unpacked(slug: str) -> None:
 
     packed_device = placed_tree(slug, SEQ_LEN, pack=True)
     canonical = len(loaded.params)
-    assert 3 <= len(packed_device) <= 5 < canonical, (
-        f"{slug}: the packed placement must stage 3–5 leaves (the measured count), "
+    assert 4 <= len(packed_device) <= 5 < canonical, (
+        f"{slug}: the packed placement must stage 4–5 leaves (the measured count), "
         f"fewer than the {canonical} canonical weights; got {len(packed_device)}"
     )
 
@@ -719,17 +719,17 @@ def _assert_real_checkpoint_device_resident(slug: str, runs: int) -> None:
     loaded = loaded_for(slug)
     params = loaded.params
     plan = pack_plan(param_specs(loaded.config))
-    assert len(plan.specs) == 3, f"{slug} must pack to 3 inputs, got {len(plan.specs)}"
+    assert len(plan.specs) == 4, f"{slug} must pack to 4 inputs, got {len(plan.specs)}"
     exe, build_s = executable_for(slug, BIG_SEQ_LEN, pack=True)
     declared = len(exe.signature.input_specs)
-    assert declared == 4, (
-        f"{slug} packed must declare 3 weight inputs + ids = 4, got {declared} (the "
+    assert declared == 5, (
+        f"{slug} packed must declare 4 weight inputs + ids = 5, got {declared} (the "
         f"unpacked graph declares {len(params) + 1} — the shape that dies on llvm-cpu "
         f"above ~161 consumed inputs)"
     )
     packed_device = placed_tree(slug, BIG_SEQ_LEN, pack=True)
-    assert len(packed_device) == 3, (
-        f"{slug}: place_params must stage only the 3 packed leaves, got "
+    assert len(packed_device) == 4, (
+        f"{slug}: place_params must stage only the 4 packed leaves, got "
         f"{len(packed_device)} (vs {len(params)} canonical weights)"
     )
 

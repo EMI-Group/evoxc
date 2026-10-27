@@ -582,6 +582,15 @@ def param_specs(cfg: ModelConfig) -> dict[str, etl.TensorSpec]:
     set is exactly one key smaller. An untied config carries the separate
     ``(hidden, vocab)`` head exactly as before.
 
+    A tied config's ONE ``(vocab, hidden)`` embedding input is also the output
+    head, whose ``(in_features, out_features)`` layout is ``(hidden, vocab)``;
+    a packed plan built from this tree therefore declares the derived
+    pre-transposed ``lm_head.weight`` copy (:func:`etl_hf._specs.transposed_aliases`
+    — static, shape-derived metadata, no carrier class, so the tree this returns
+    is a plain ``dict`` etl's tree machinery matches exactly) that
+    :func:`etl_hf.pack.pack_plan` materialises ONCE on the host, so the packed
+    graph never transposes a weight-sized operand.
+
     Args:
         cfg: the GPT-2 config.
 
@@ -669,6 +678,13 @@ def graph(
     scale = cfg.head_dim**-0.5
     n_layers = cfg.num_hidden_layers
     tied = cfg.tie_word_embeddings
+    # A packed plan built from this config's `param_specs` carries a derived,
+    # pre-transposed `lm_head.weight` entry (`embed.weight.T`, materialised once at
+    # pack time), so the graph slices a packed input instead of transposing the
+    # whole embedding table on every call. A plan without it (e.g. one built from a
+    # plain-dict spec tree) keeps the in-graph transpose: same numbers, one
+    # weight-sized copy per call.
+    packed_head = pack_plan is not None and pack_plan.has("lm_head.weight")
 
     @etl.defn
     def gpt2_forward(params, input_ids):
@@ -747,6 +763,10 @@ def graph(
             x, params["final_norm.weight"], params["final_norm.bias"], eps
         )
         if tied:
+            if packed_head:
+                # The pack plan already stores the transposed copy as a packed
+                # weight input: one static slice, no per-call materialisation.
+                return linear(normed, params["lm_head.weight"])
             # The tied head IS the embedding `(vocab, hidden)`, so it is
             # transposed to `(hidden, vocab)` — the `(in_features,
             # out_features)` shape `linear`/`etl.dot` needs — and reused here

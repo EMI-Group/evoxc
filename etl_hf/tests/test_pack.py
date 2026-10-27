@@ -26,7 +26,12 @@ The property this suite pins is *equivalence*, not a new numerics claim:
 * nothing is baked: the packed graph is still all graph inputs, so the
   StableHLO export keeps the same ``stablehlo.constant`` ceiling
   (``test_packed_graph_bakes_no_weights``);
-* the real 124M ``gpt2`` — the case packing exists for — builds a 3-input packed
+* a tied head carries **no weight-sized layout op**: the transposed copy is a
+  packed input written once on the host, so the traced graph's only transposes
+  are ≤2 MB activation head reshuffles and the head ``dot``'s RHS traces to a
+  ``slice`` of a packed input (``test_tied_head_has_no_weight_sized_transpose``,
+  ``test_untied_path_is_unchanged``);
+* the real 124M ``gpt2`` — the case packing exists for — builds a 4-input packed
   executable whose numpy forward reproduces the stored HuggingFace golden
   (``test_real_size_gpt2_packed_matches_golden``, ``ETL_HF_BIG=1``).
 
@@ -55,6 +60,7 @@ from etl_hf.load import LoadedModel, load_hf, validate_params
 from etl_hf.models import gpt2 as gpt2_module
 from etl_hf.models import llama as llama_module
 from etl_hf.pipeline import build, place_params, predict, run
+from etl_hf._specs import transposed_aliases as _declared_aliases
 from etl_hf.program import forward_fn, param_specs, reference_logits
 from etl_hf.tests import hf_download
 
@@ -152,13 +158,15 @@ REAL_GPT2: dict[str, object] = {
 _FAMILIES = {"llama": llama_module, "gpt2": gpt2_module}
 
 #: ``(label, raw config, expected packed input count)`` — the counts this host
-#: measured with the ``(dtype, rank, shape[1:])`` bucketing rule; ``gpt2`` tied is
-#: one bucket fewer because a tied config has no ``lm_head.weight`` at all.
+#: measured with the ``(dtype, rank, shape[1:])`` bucketing rule. A tied config
+#: stores its pre-transposed head as one more entry, and that ``(hidden, vocab)``
+#: bucket is exactly the one an untied head uses — so tied and untied configs of
+#: one family now pack to the same number of inputs.
 _COUNT_CASES = [
     ("llama_untied", LLAMA_UNTIED, 5),
-    ("llama_tied", LLAMA_TIED, 4),
+    ("llama_tied", LLAMA_TIED, 5),
     ("gpt2_untied", GPT2_UNTIED, 4),
-    ("gpt2_tied", GPT2_TIED, 3),
+    ("gpt2_tied", GPT2_TIED, 4),
 ]
 _COUNT_CASES_BY_LABEL = {label: (raw, want) for label, raw, want in _COUNT_CASES}
 
@@ -210,20 +218,21 @@ def _host_unpack(
 
     Deliberately written against :class:`PackEntry`'s ``start``/``shape`` (not by
     re-deriving offsets), so a wrong plan is detected by comparing this to the
-    original canonical tree.
+    original canonical tree. A derived entry comes back as the slice of its
+    stored (already transposed) copy — it carries no ``params`` key of its own.
     """
-    canonical: dict[str, np.ndarray] = {}
+    unpacked: dict[str, np.ndarray] = {}
     for name, entry in plan.entries.items():
         block = packed[entry.input]
         if len(entry.shape) == 0:
-            canonical[name] = block[entry.start[0]].reshape(())
+            unpacked[name] = block[entry.start[0]].reshape(())
         else:
             index = tuple(
                 slice(start, start + length)
                 for start, length in zip(entry.start, entry.shape)
             )
-            canonical[name] = block[index]
-    return canonical
+            unpacked[name] = block[index]
+    return unpacked
 
 
 def _max_abs(a: np.ndarray, b: np.ndarray) -> float:
@@ -262,6 +271,92 @@ def _count_ops(graph: object) -> dict[str, int]:
     return counts
 
 
+def _graph_ops(graph: object) -> list[object]:
+    """Every op of a traced graph in source order, nested regions included."""
+    ops: list[object] = []
+
+    def walk(block: object) -> None:
+        for op in block.ops:  # type: ignore[attr-defined]
+            ops.append(op)
+            for region in op.regions:
+                for nested in region.blocks:
+                    walk(nested)
+
+    walk(graph.module.functions[0].entry_block)  # type: ignore[attr-defined]
+    return ops
+
+
+def _value_nbytes(value: object) -> int:
+    """Static byte size of an ``ir.Value`` (0 when a dim is not a plain int)."""
+    shape = tuple(value.type.shape)  # type: ignore[attr-defined]
+    if not shape or any(not isinstance(dim, int) for dim in shape):
+        return 0
+    count = 1
+    for dim in shape:
+        count *= dim
+    return count * np.dtype(value.type.dtype).itemsize  # type: ignore[attr-defined]
+
+
+#: Ops that copy data without changing its values — a weight-sized one is the
+#: per-call materialization the packed pre-transposed head exists to remove.
+_LAYOUT_OPS = frozenset({"transpose", "reshape", "broadcast", "flip", "roll", "tile"})
+
+
+def _layout_ops(graph: object, min_bytes: int = 0) -> list[tuple[str, int]]:
+    """``(op name, largest operand/result byte size)`` for layout ops ≥ ``min_bytes``."""
+    found: list[tuple[str, int]] = []
+    for op in _graph_ops(graph):
+        if op.opdef.name not in _LAYOUT_OPS:
+            continue
+        values = list(op.operands) + list(op.results)
+        size = max([_value_nbytes(value) for value in values] or [0])
+        if size >= min_bytes:
+            found.append((op.opdef.name, size))
+    return found
+
+
+def _dot_rhs(graph: object) -> list[tuple[tuple, str, bool]]:
+    """``(rhs shape, producer op name, reads a graph input directly)`` per ``dot``.
+
+    The RHS is the weight operand: a packed weight is a static ``slice`` reading a
+    packed graph input, so ``reads_input`` is ``True`` for it and ``False`` for an
+    activation operand (llama's ``kᵀ`` transpose, ``repeat_kv`` broadcast).
+    """
+    described: list[tuple[tuple, str, bool]] = []
+    for op in _graph_ops(graph):
+        if op.opdef.name != "dot":
+            continue
+        rhs = op.operands[1]
+        owner = rhs.owner
+        name = getattr(getattr(owner, "opdef", None), "name", type(owner).__name__)
+        base = owner.operands[0] if hasattr(owner, "operands") and owner.operands else None
+        reads_input = (
+            name == "slice" and base is not None and not hasattr(base.owner, "opdef")
+        )
+        described.append((tuple(rhs.type.shape), name, reads_input))
+    return described
+
+
+def _assert_every_weight_dot_slices(graph: object, label: str) -> None:
+    """Every weight-shaped ``dot`` RHS must be a static slice of a packed input.
+
+    A rank-2 RHS produced by any other op would be a materialized weight — the
+    per-call tied-head transpose this design removes. The only non-slice RHSs
+    allowed are batched (rank ≥ 3) activation operands such as ``kᵀ`` /
+    ``repeat_kv``.
+    """
+    rhs_operands = _dot_rhs(graph)
+    assert rhs_operands, f"{label}: expected weight dots in the graph"
+    for shape, producer, reads_input in rhs_operands:
+        if reads_input:
+            continue
+        assert producer in {"transpose", "reshape"} and len(shape) >= 3, (
+            f"{label}: a dot RHS of shape {shape} comes from {producer!r} instead "
+            f"of a static slice of a packed graph input — that materializes a "
+            f"weight"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. exact packed input counts (the whole point of the exercise)
 # ---------------------------------------------------------------------------
@@ -291,15 +386,18 @@ def test_packed_input_counts(label: str, raw: dict, want: int) -> None:
 def test_real_size_gpt2_plan_clears_the_iree_input_cliff() -> None:
     """The 124M GPT-2's plan fits far below IREE's ~161-input runtime cliff.
 
-    Config-only (no checkpoint): 196 canonical weights → 3 packed inputs, so the
-    one-graph forward stops being a SIGSEGV waiting to happen.
+    Config-only (no checkpoint): 196 canonical weights → 4 packed inputs (the
+    embedding bucket, the 1-D norms, the per-layer matrices and the
+    pre-transposed tied head), so the one-graph forward stops being a SIGSEGV
+    waiting to happen.
     """
     cfg = _config(REAL_GPT2)
     specs = _specs(cfg)
     plan = _plan(cfg)
     assert len(specs) == 196, f"unexpected canonical key count {len(specs)}"
-    assert len(plan.specs) == 3, (
-        f"the 124M gpt2 must pack to 3 inputs, got {len(plan.specs)}: "
+    assert plan.derived_keys == ("lm_head.weight",), plan.derived_keys
+    assert len(plan.specs) == 4, (
+        f"the 124M gpt2 must pack to 4 inputs, got {len(plan.specs)}: "
         f"{ {name: tuple(spec.shape) for name, spec in plan.specs.items()} }"
     )
     # The executable declares the packed inputs + one ids leaf.
@@ -323,15 +421,31 @@ def test_every_canonical_key_is_covered_exactly_once(
     cfg = _config(raw)
     specs = _specs(cfg)
     plan = _plan(cfg)
-    assert set(plan.entries) == set(specs), f"{label}: entries must match the specs"
+    assert set(plan.entries) == set(specs) | set(plan.derived_keys), (
+        f"{label}: entries must be the specs plus the derived keys"
+    )
 
     used: set[str] = set()
     for name, entry in plan.entries.items():
         assert isinstance(entry, pack_module.PackEntry)
-        assert entry.shape == tuple(int(dim) for dim in specs[name].shape), (
-            f"{label}/{name}: entry shape {entry.shape} != spec shape "
-            f"{tuple(specs[name].shape)}"
-        )
+        if entry.canonical:
+            assert not entry.transposed, f"{label}/{name}: canonical entries are verbatim"
+            assert entry.shape == tuple(int(dim) for dim in specs[name].shape), (
+                f"{label}/{name}: entry shape {entry.shape} != spec shape "
+                f"{tuple(specs[name].shape)}"
+            )
+        else:
+            # A derived entry stores the TRANSPOSE of its source array.
+            assert entry.transposed, f"{label}/{name}: derived entries are transposed"
+            assert entry.source in specs, (
+                f"{label}/{name}: source {entry.source!r} must be a canonical key"
+            )
+            assert entry.shape == tuple(
+                reversed(tuple(int(dim) for dim in specs[entry.source].shape))
+            ), (
+                f"{label}/{name}: derived shape {entry.shape} must be the source's "
+                f"{tuple(specs[entry.source].shape)} reversed"
+            )
         assert len(entry.start) == max(len(entry.shape), 1), (
             f"{label}/{name}: start {entry.start} must have one entry per axis "
             f"(or one for a rank-0 scalar)"
@@ -346,6 +460,7 @@ def test_every_canonical_key_is_covered_exactly_once(
     assert used == set(plan.specs), (
         f"{label}: every packed input must be used (unused={sorted(set(plan.specs) - used)})"
     )
+    assert plan.unpacked_keys == tuple(sorted(set(specs) | set(plan.derived_keys)))
 
     # Contiguous, gapless, in-bounds offsets within each bucket.
     for input_name, names in plan.names_by_input().items():
@@ -378,8 +493,9 @@ def test_every_canonical_key_is_covered_exactly_once(
             f"{first[1:]}"
         )
         assert spec.device is None, f"{label}: packed specs are device-agnostic"
-        assert spec.dtype == specs[names[0]].dtype, (
-            f"{label}: {input_name} dtype {spec.dtype} != {specs[names[0]].dtype}"
+        source = plan.entries[names[0]].source or names[0]
+        assert spec.dtype == specs[source].dtype, (
+            f"{label}: {input_name} dtype {spec.dtype} != {specs[source].dtype}"
         )
 
 
@@ -393,9 +509,16 @@ def test_bucket_count_is_shape_driven_not_family_driven() -> None:
         f"a vocab==intermediate llama must merge two buckets (4 inputs), got "
         f"{len(plan.specs)}: {sorted(plan.specs)}"
     )
-    assert len(plan.specs) == len(_plan(_config(LLAMA_TIED)).specs), (
+    assert len(plan.specs) == len(_plan(_config(dict(LLAMA_TIED, vocab_size=32))).specs), (
         "with colliding shapes the tied/untied counts coincide — that is the "
         "evidence the rule is shape-driven only"
+    )
+    # The pre-transposed tied head is bucketed by its STORED (hidden, vocab) shape,
+    # which is exactly an untied head's — so the derived entry costs no input.
+    tied = _plan(_config(LLAMA_TIED))
+    assert len(tied.specs) == len(_plan(_config(LLAMA_UNTIED)).specs), (
+        "a tied config now packs to as many inputs as an untied one: its derived "
+        "head lands in the head bucket the untied head would use"
     )
 
 
@@ -404,8 +527,11 @@ def test_plan_is_deterministic(label: str, raw: dict, want: int) -> None:
     """Equal (but distinct) spec trees produce equal plans: same names, offsets, order."""
     cfg = _config(raw)
     first = _plan(cfg)
-    # A fresh dict with reversed insertion order: bucket order must not depend on it.
-    second = pack_module.pack_plan(dict(reversed(list(_specs(cfg).items()))))
+    specs = _specs(cfg)
+    # A fresh plain-dict copy with reversed insertion order: the declaration is
+    # inferred from the tree's keys, so bucket order must not depend on insertion
+    # order or on the container's provenance.
+    second = pack_module.pack_plan(dict(reversed(list(specs.items()))))
     assert list(first.specs) == list(second.specs), (
         f"{label}: bucket order must be deterministic, got {list(first.specs)} vs "
         f"{list(second.specs)}"
@@ -415,6 +541,7 @@ def test_plan_is_deterministic(label: str, raw: dict, want: int) -> None:
     }, f"{label}: packed shapes drifted between equal plans"
     assert first.entries == second.entries, f"{label}: entry offsets drifted"
     assert first.canonical_keys == second.canonical_keys
+    assert first.derived_keys == second.derived_keys
     assert first.input_names == tuple(f"packed.{i}" for i in range(want))
 
 
@@ -463,7 +590,7 @@ def test_host_round_trip_is_bit_identical(label: str, raw: dict, want: int) -> N
             f"{label}/{name}: packed shape {array.shape} != plan {want_shape}"
         )
     restored = _host_unpack(plan, packed)
-    assert set(restored) == set(params)
+    assert set(restored) == set(params) | set(plan.derived_keys)
     for name, array in params.items():
         got = restored[name]
         assert got.shape == array.shape, f"{label}/{name}: shape drifted"
@@ -473,6 +600,17 @@ def test_host_round_trip_is_bit_identical(label: str, raw: dict, want: int) -> N
                 f"(max-abs {_max_abs(got, array):g}, entry "
                 f"{plan.entries[name]})"
             )
+    # ... and a derived (pre-transposed) entry round-trips through the same
+    # static slice, exactly as the source's transpose.
+    for name in plan.derived_keys:
+        entry = plan.entries[name]
+        want = params[entry.source].T
+        got = restored[name]
+        assert got.shape == want.shape, f"{label}/{name}: derived shape drifted"
+        assert np.array_equal(got, want), (
+            f"{label}/{name}: derived entry must be exactly the transposed "
+            f"{entry.source!r} (max-abs {_max_abs(got, want):g})"
+        )
     # The cached-class API must agree with the module-level shorthand.
     assert all(
         np.array_equal(plan_module_value, packed[name])
@@ -480,6 +618,55 @@ def test_host_round_trip_is_bit_identical(label: str, raw: dict, want: int) -> N
             plan, params
         ).items()
     ), f"{label}: etl_hf.pack_params must equal PackPlan.pack"
+
+
+@pytest.mark.parametrize(
+    "label,raw", (("llama_tied", LLAMA_TIED), ("gpt2_tied", GPT2_TIED)),
+    ids=["llama_tied", "gpt2_tied"],
+)
+def test_transposed_entry_is_written_once_and_unpacked_by_a_static_slice(
+    label: str, raw: dict
+) -> None:
+    """The tied head: one host transpose at pack time, one static slice in-graph."""
+    cfg = _config(raw)
+    specs = _specs(cfg)
+    plan = _plan(cfg)
+    entry = plan.entries["lm_head.weight"]
+    assert entry.transposed and entry.source == "embed.weight"
+    assert entry.shape == tuple(reversed(tuple(int(d) for d in specs["embed.weight"].shape)))
+
+    params = _params(specs)
+    packed = plan.pack(params)
+    stored = packed[entry.input][
+        entry.start[0] : entry.start[0] + entry.shape[0]
+    ]
+    assert stored.flags.c_contiguous, f"{label}: the stored copy must be C-contiguous"
+    assert np.array_equal(stored, np.ascontiguousarray(params["embed.weight"].T)), (
+        f"{label}: the derived packed entry must be the embedding's transpose"
+    )
+    # Packing never mutates the caller's tree (the gather table stays as-is).
+    assert params["embed.weight"].shape == tuple(
+        reversed(entry.shape)
+    ), f"{label}: packing must not transpose the embedding in place"
+
+    # A one-entry plan isolates the derived head's own slice from the rest.
+    only_head = pack_module.PackPlan(
+        specs=plan.specs, entries={"lm_head.weight": entry}
+    )
+
+    def head(packed_params: dict) -> object:
+        return only_head.unpack(packed_params)["lm_head.weight"]
+
+    graph = etl.trace(head, plan.specs)
+    graph.verify()
+    assert [op.opdef.name for op in _graph_ops(graph)] == ["slice", "return"], (
+        f"{label}: the derived head must be recovered by exactly one static slice, "
+        f"got {[op.opdef.name for op in _graph_ops(graph)]}"
+    )
+    got = etl.evaluate(head, packed)
+    assert np.array_equal(got.numpy(), params["embed.weight"].T), (
+        f"{label}: the in-graph derived head must reproduce the transposed embedding"
+    )
 
 
 @pytest.mark.parametrize(
@@ -710,6 +897,122 @@ def test_packed_graph_bakes_no_weights() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 5b. the tied head costs no per-call materialization
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "label,raw,family",
+    (
+        ("gpt2_tied", GPT2_TIED, gpt2_module),
+        ("llama_tied", LLAMA_TIED, llama_module),
+    ),
+    ids=["gpt2_tied", "llama_tied"],
+)
+def test_tied_head_has_no_weight_sized_transpose(
+    label: str, raw: dict, family: object
+) -> None:
+    """A tied packed graph transposes nothing weight-sized: the head is an input.
+
+    The head projection needs ``(hidden, vocab)`` while the embedding table is
+    ``(vocab, hidden)``; before the derived packed entry this cost a full
+    embedding-sized ``etl.transpose`` **per call** (154 MB for the 124M ``gpt2``).
+    Now the transposed copy is written once at pack time and the head ``dot``'s
+    RHS traces straight to a static ``slice`` of a packed graph input.
+    """
+    cfg = _config(raw)
+    specs = _specs(cfg)
+    plan = _plan(cfg)
+    entry = plan.entries["lm_head.weight"]
+    assert entry.transposed and entry.source == "embed.weight"
+
+    graph = etl.trace(
+        family.graph(cfg, _SEQ, _BATCH, pack_plan=plan),  # type: ignore[attr-defined]
+        plan.specs,
+        etl.TensorSpec((_BATCH, _SEQ), etl.int32),
+    )
+    graph.verify()
+    assert len(graph.tensor_specs) == len(plan.specs) + 1
+
+    # (a) nothing weight-sized is copied between layouts.
+    assert _layout_ops(graph, min_bytes=1_000_000) == [], (
+        f"{label}: weight-sized layout ops: {_layout_ops(graph, 1_000_000)}"
+    )
+    embedding_bytes = int(
+        np.prod([int(dim) for dim in specs["embed.weight"].shape])
+        * np.dtype(etl.float32).itemsize
+    )
+    transposes = [size for name, size in _layout_ops(graph) if name == "transpose"]
+    assert transposes, f"{label}: expected the small activation head transposes"
+    assert max(transposes) < embedding_bytes, (
+        f"{label}: a transpose is {max(transposes)} B — the embedding itself is "
+        f"{embedding_bytes} B, so a weight-sized transpose is back"
+    )
+
+    # (b) every weight dot consumes a static slice of a packed input, and the
+    # head dot is the one whose RHS is the derived (hidden, vocab) shape.
+    _assert_every_weight_dot_slices(graph, label)
+    head_dots = [
+        op
+        for op in _graph_ops(graph)
+        if op.opdef.name == "dot" and tuple(op.operands[1].type.shape) == entry.shape
+    ]
+    assert len(head_dots) == 1, f"{label}: expected exactly one head dot"
+    rhs = head_dots[0].operands[1]
+    assert rhs.owner.opdef.name == "slice", (
+        f"{label}: the head dot RHS must be a static slice, got "
+        f"{rhs.owner.opdef.name}"
+    )
+    base = rhs.owner.operands[0]
+    assert not hasattr(base.owner, "opdef"), (
+        f"{label}: the head slice must read a packed graph input directly"
+    )
+    assert tuple(base.type.shape) == tuple(plan.specs[entry.input].shape), (
+        f"{label}: the head slice must read {entry.input}"
+    )
+
+
+@pytest.mark.parametrize(
+    "label,raw,family,want",
+    (
+        ("llama_untied", LLAMA_UNTIED, llama_module, 5),
+        ("gpt2_untied", GPT2_UNTIED, gpt2_module, 4),
+    ),
+    ids=["llama_untied", "gpt2_untied"],
+)
+def test_untied_path_is_unchanged(
+    label: str, raw: dict, family: object, want: int
+) -> None:
+    """An untied head declares nothing derived: same plan, same inputs, same IR."""
+    cfg = _config(raw)
+    specs = _specs(cfg)
+    plan = _plan(cfg)
+    # An untied tree declares no derived entries (it has a real lm_head.weight),
+    # so the plan is exactly what the same specs produced before this machinery.
+    assert _declared_aliases(specs) == {}
+    assert plan.derived_keys == ()
+    assert plan.canonical_keys == tuple(sorted(specs))
+    assert plan == pack_module.pack_plan(dict(specs)), (
+        f"{label}: a plain dict copy of the specs must yield the identical plan"
+    )
+    assert len(plan.specs) == want, (
+        f"{label}: the untied packed input count must stay {want}, got "
+        f"{len(plan.specs)}"
+    )
+
+    graph = etl.trace(
+        family.graph(cfg, _SEQ, _BATCH, pack_plan=plan),  # type: ignore[attr-defined]
+        plan.specs,
+        etl.TensorSpec((_BATCH, _SEQ), etl.int32),
+    )
+    graph.verify()
+    assert len(graph.tensor_specs) == want + 1, (
+        f"{label}: the untied packed graph must declare {want} weight inputs + "
+        f"ids, got {len(graph.tensor_specs)}"
+    )
+    assert _layout_ops(graph, min_bytes=1_000_000) == []
+    _assert_every_weight_dot_slices(graph, label)
+
+
+# ---------------------------------------------------------------------------
 # 6. predict: pack_params + build/predict with pack_weights
 # ---------------------------------------------------------------------------
 def _loaded(raw: dict) -> LoadedModel:
@@ -893,11 +1196,11 @@ def _golden(slug: str) -> tuple[np.ndarray, np.ndarray]:
 
 @_BIG
 def test_real_size_gpt2_packed_matches_golden() -> None:
-    """The case packing exists for: 124M GPT-2, 197 inputs → 4, logits unchanged.
+    """The case packing exists for: 124M GPT-2, 197 inputs → 5, logits unchanged.
 
     ``gpt2`` at ``seq_len=32`` is the checkpoint IREE's Python runtime cannot run
     unpacked (196 weights + ids = 197 consumed inputs > the ~161 cliff). Here it
-    builds a packed executable with 3 weight inputs and its **numpy-backend**
+    builds a packed executable with 4 weight inputs and its **numpy-backend**
     forward must reproduce the stored HuggingFace golden — i.e. packing changed
     the program's signature and nothing else.
     """
@@ -910,8 +1213,8 @@ def test_real_size_gpt2_packed_matches_golden() -> None:
     assert len(params) == 196, f"expected 196 canonical keys, got {len(params)}"
 
     plan = pack_module.pack_plan(param_specs(cfg))
-    assert len(plan.specs) == 3, (
-        f"the 124M gpt2 must pack to 3 inputs, got {len(plan.specs)}: "
+    assert len(plan.specs) == 4, (
+        f"the 124M gpt2 must pack to 4 inputs, got {len(plan.specs)}: "
         f"{ {name: tuple(spec.shape) for name, spec in plan.specs.items()} }"
     )
     packed = pack_module.pack_params(plan, params)

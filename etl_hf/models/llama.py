@@ -501,6 +501,15 @@ def param_specs(cfg: ModelConfig) -> dict[str, etl.TensorSpec]:
     set is exactly one key smaller. An untied config keeps the separate
     ``(hidden_size, vocab_size)`` head.
 
+    A tied config's ONE ``(vocab, hidden)`` embedding input is also the output
+    head, whose ``(in_features, out_features)`` layout is ``(hidden, vocab)``;
+    a packed plan built from this tree therefore declares the derived
+    pre-transposed ``lm_head.weight`` copy (:func:`etl_hf._specs.transposed_aliases`
+    — static, shape-derived metadata, no carrier class, so the tree this returns
+    is a plain ``dict`` etl's tree machinery matches exactly) that
+    :func:`etl_hf.pack.pack_plan` materialises ONCE on the host, so the packed
+    graph never transposes a weight-sized operand.
+
     Args:
         cfg: the ``family == "llama"`` config.
 
@@ -562,7 +571,11 @@ def graph(
     Weight tying: a tied config feeds the SAME ``params["embed.weight"]``
     ``SymbolicTensor`` to the token gather and — transposed to the
     ``(in_features, out_features)`` orientation ``etl.dot`` needs — to the output
-    projection; there is no extra ``lm_head`` graph input.
+    projection; there is no extra ``lm_head`` graph input. When ``pack_plan``
+    declares the derived pre-transposed head (:func:`param_specs` does, for a tied
+    config) the projection instead slices that packed entry, so the traced graph
+    holds no weight-sized transpose at all; a plan without it keeps the in-graph
+    ``etl.transpose`` (identical numbers, one embedding-sized copy per call).
 
     Packed weights (opt-in): when ``pack_plan`` is an
     :class:`etl_hf.pack.PackPlan` the forward's FIRST statement maps the packed
@@ -621,6 +634,13 @@ def graph(
     act = ops.resolve_activation(cfg.hidden_act)
     tied = cfg.tie_word_embeddings
     qk_norm = cfg.qk_norm
+    # A packed plan built from this config's `param_specs` carries a derived,
+    # pre-transposed `lm_head.weight` entry (`embed.weight.T`, materialised once at
+    # pack time), so the graph slices a packed input instead of transposing the
+    # whole embedding table on every call. A plan without it (e.g. one built from a
+    # plain-dict spec tree) keeps the in-graph transpose: same numbers, one
+    # weight-sized copy per call.
+    packed_head = pack_plan is not None and pack_plan.has("lm_head.weight")
     b, s = batch_size, seq_len
 
     @etl.defn
@@ -665,6 +685,10 @@ def graph(
             )
         x = ops.rms_norm(x, params["final_norm.weight"], eps)
         if tied:
+            if packed_head:
+                # The pack plan already stores the transposed copy as a packed
+                # weight input: one static slice, no per-call materialisation.
+                return _common.linear(x, params["lm_head.weight"])
             # The tied head IS the embedding `(vocab, hidden)`: transposed to
             # `(in_features, out_features)` it is the output projection, so the
             # one embedding graph input is reused instead of adding a duplicate.
