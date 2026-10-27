@@ -1,14 +1,14 @@
-"""Tests for etl pytrees: ``flatten`` / ``unflatten`` / ``TreeSpec`` /
+"""Tests for evoxc pytrees: ``flatten`` / ``unflatten`` / ``TreeSpec`` /
 ``register_pytree_node``.
 
-Authoritative source: ``etl/core/tree.py``. Contract under test:
+Authoritative source: ``evoxc/core/tree.py``. Contract under test:
 
 - ``flatten(obj) -> (leaves, treespec)`` collects leaves in pre-order;
   ``unflatten(leaves, treespec)`` is the exact inverse (signature order:
   leaves first, treespec second).
 - Built-in container nodes: ``tuple``, ``list``, ``dict`` (keys sorted for
   determinism), ``namedtuple`` instances, *user-defined* ``dataclass``
-  instances (fields as children). etl's own dataclass value types
+  instances (fields as children). evoxc's own dataclass value types
   (``TensorSpec``, ``Device``, ``TreeSpec``, ...) are LEAVES; ``Tensor`` is
   a plain class and therefore naturally a leaf too.
 - Anything else (``None``, scalars, str/bytes, ndarrays, ...) is a leaf.
@@ -30,9 +30,9 @@ from dataclasses import FrozenInstanceError, dataclass
 import numpy as np
 import pytest
 
-from etl import dim
-from etl.core import Device, Tensor, TensorSpec, flatten, unflatten
-from etl.core.tree import _PYTREE_NODE_REGISTRY, TreeSpec, register_pytree_node
+from evoxc import dim
+from evoxc.core import Device, Tensor, TensorSpec, flatten, unflatten
+from evoxc.core.tree import _PYTREE_NODE_REGISTRY, TreeSpec, register_pytree_node
 
 # ---------------------------------------------------------------------------
 # Test-local pytree types
@@ -223,8 +223,8 @@ def test_treespec_is_frozen():
         spec.node_data = None
 
 
-def test_etl_value_types_are_leaves():
-    # TensorSpec: an etl-module dataclass → leaf, not a container.
+def test_evoxc_value_types_are_leaves():
+    # TensorSpec: an evoxc-module dataclass → leaf, not a container.
     spec_obj = TensorSpec((2, 3), np.float32)
     leaves, spec = flatten(spec_obj)
     assert leaves == [spec_obj] and leaves[0] is spec_obj
@@ -238,20 +238,20 @@ def test_etl_value_types_are_leaves():
     assert spec.num_leaves == 1
     assert unflatten(leaves, spec) == tensor_obj
 
-    # Device: an etl-module dataclass → leaf.
+    # Device: an evoxc-module dataclass → leaf.
     device_obj = Device("cpu", 0)
     leaves, spec = flatten(device_obj)
     assert leaves == [device_obj] and leaves[0] is device_obj
     assert spec.num_leaves == 1
 
-    # TreeSpec itself is an etl-module dataclass → leaf.
+    # TreeSpec itself is an evoxc-module dataclass → leaf.
     tree_spec_obj = TreeSpec(type=int)
     leaves, spec = flatten(tree_spec_obj)
     assert leaves == [tree_spec_obj] and leaves[0] is tree_spec_obj
     assert spec.num_leaves == 1
 
 
-def test_etl_value_types_nested_in_pytree():
+def test_evoxc_value_types_nested_in_pytree():
     spec_obj = TensorSpec((2, 3), np.float32)
     tensor_obj = Tensor(np.zeros((1,)))
     device_obj = Device("cpu", 0)
@@ -378,7 +378,7 @@ def test_unflatten_does_not_mutate_leaves():
 # (contract: defaultdict with a None/class ``default_factory`` and ``Counter``
 # roundtrip; an unpreservable factory, mixed-type dict keys and dataclasses
 # with InitVar/init=False fields fail with explicit messages; plain
-# unregistered classes stay leaves; etl value types are single leaves;
+# unregistered classes stay leaves; evoxc value types are single leaves;
 # 'object' itself can never be registered.)
 # ---------------------------------------------------------------------------
 
@@ -477,7 +477,7 @@ def test_unregistered_plain_class_stays_a_leaf():
     assert unflatten(leaves, spec) is obj
 
 
-def test_etl_value_types_are_single_leaves():
+def test_evoxc_value_types_are_single_leaves():
     assert len(flatten(Device("cpu", 0))[0]) == 1
     assert len(flatten(dim(3))[0]) == 1
     assert len(flatten(TensorSpec((2, 3), np.float32))[0]) == 1

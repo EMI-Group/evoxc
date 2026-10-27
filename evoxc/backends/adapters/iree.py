@@ -1,0 +1,3200 @@
+"""IREE compiler adapter — ``evoxc.backends.adapters.iree``.
+
+Pluggable compiler backend that consumes the shared StableHLO payload
+(``CompilerBackend.lower``, see ``../compiler.py``) and compiles it with the
+external IREE compiler, producing an IREE VM flatbuffer executed through the
+IREE runtime on the ``local-task`` CPU driver, the ``cuda`` HAL driver, the
+``hip`` ROCm HAL driver, or the ``vulkan`` HAL driver — all four drivers are
+compiled into the runtime wheel (validated on IREE 3.11.0,
+``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316; ROCm validated
+on an AMD Instinct MI300X VF, gfx942, ROCm 7.1; Vulkan validated on Mesa
+lavapipe — the software Vulkan implementation, see ``_acquire_vulkan_device``
+for the device-discovery rules).
+
+Exact IREE Python APIs used (all inside function bodies — the heavy-import
+rule: ``iree`` / ``iree.compiler`` / ``iree.runtime`` / ``numpy`` are NEVER
+imported at module top level, so ``import evoxc`` stays light):
+
+- ``iree.compiler.compile_str(text, target_backends=..., input_type=
+  "stablehlo", extra_args=[...])`` — compiles the StableHLO MLIR payload
+  in-process (spawns ``iree-compile``) and returns the VM flatbuffer as
+  ``bytes``. The compile ``target_backends`` option selects the targets
+  (default ``["llvm-cpu"]``; v1 supported set ``{"llvm-cpu", "cuda",
+  "rocm", "vulkan-spirv"}`` — anything else is rejected with
+  ``core.BackendError`` naming
+  it, never a silent fallback). ``"cuda"`` emits default sm_60 PTX, JIT'd
+  by the CUDA driver to newer archs at load (validated on 3.11.0 to
+  sm_86 / RTX A6000 — no arch flag needed). ``"rocm"`` emits the AMDGPU
+  code object for the target arch, which IREE requires to be named
+  EXPLICITLY (compile fails without it — there is no auto-detection): the
+  adapter supplies ``--iree-rocm-target=<arch>`` as a default, with the
+  arch DETECTED at compile time from the installed ROCm tooling
+  (``amdgpu-arch``/``rocm_agent_enumerator``) so the adapter is not
+  hardcoded to one GPU; a user ``--iree-rocm-target=...`` in
+  ``iree_compile_args`` overrides the detected default by name, and a
+  detection failure with no user flag raises an actionable
+  ``core.BackendError`` (see ``_IREE_DEFAULT_ROCM_ARGS_NAME`` /
+  ``_detect_rocm_target``). ``"vulkan-spirv"`` needs NO target flag by
+  default (iree's codegen falls back to its ``vp_android_baseline_2022``
+  profile); the optional ``vulkan_target`` compile option adds
+  ``--iree-vulkan-target=<profile>`` for a real GPU/profile, and — like
+  every other default — a user ``--iree-vulkan-target=...`` wins by name
+  (never both). ``extra_args`` = evoxc's MINIMAL defaults — ALL
+  OVERRIDABLE via the ``iree_compile_args`` compile option (a user flag
+  overriding a default by name replaces it; the small documented deny list
+  ``_IREE_DENIED_COMPILE_FLAGS`` guards only the genuinely required flags;
+  every other flag passes through to the compiler, which validates it):
+  ``--iree-input-demote-f64-to-f32=false`` (IREE demotes f64 to f32 by
+  default for StableHLO input — silent dtype coercion, which evoxc's error
+  strategy forbids; disabling it keeps f64 semantics exact) and, ONLY when
+  ``llvm-cpu`` is among the requested targets,
+  ``--iree-llvmcpu-target-cpu=generic`` (portable generic-CPU codegen; also
+  silences IREE's generic-CPU warning — llvm-cpu-specific and meaningless for
+  cuda, so not passed there) and
+  ``--iree-llvmcpu-link-embedded=false`` (the default embedded
+  ``-nostdlib -static`` link cannot resolve libm symbols — ``log``/``cos``/
+  ``floor`` — that f64 math ops lower to; the dynamically-linked dylib
+  resolves them from the system libc/libm at load time) and, ONLY when
+  ``rocm`` is among the requested targets, ``--iree-rocm-target=<arch>``
+  (IREE's ROCm HAL has no target auto-detection — compilation fails without
+  it; ``--iree-hal-target-device=rocm`` is NOT required, the HAL target is
+  implied by the compile target — both verified on iree-base-compiler
+  3.11.0 / ROCm 7.1).
+- ``iree.runtime.get_driver("local-task")`` / ``get_driver("cuda")`` /
+  ``get_driver("hip")`` / ``get_driver("vulkan")`` →
+  ``driver.create_default_device()`` (GPU 0 for the GPU drivers) — the
+  RELIABLE device-acquisition path. The historical
+  ``rt.system_setup(config=rt.Config("local-task"))`` recipe fails with
+  ``TypeError: 'module' object is not callable`` because
+  ``iree.runtime.system_setup`` is a MODULE in IREE 20241104.1068
+  (distributed at the time as ``iree-runtime``; the current PyPI
+  distribution is ``iree-base-runtime``); its function was replaced by
+  ``system_api.Config``. This path was validated repeatedly (fresh
+  processes and in-process loops).
+- ``driver.create_device(device_id=N)`` — IREE CUDA *and* ROCm/HIP device
+  ids are 1-BASED: N maps to physical GPU index N-1 (verified empirically
+  on 3.11.0 cuda: device_id=4 -> GPU 3; device_id=1 -> GPU 0; verified on
+  the ROCm path on an MI300X VF: device_id=1 -> the only GPU, device_id=0
+  and device_id=2 raise ValueError); device_id=0 raises ValueError
+  "Device id 0 not found" — never pass 0. evoxc maps ``Device("cuda", index)``
+  and ``Device("rocm"|"hip", index)`` to ``device_id=index+1`` (default
+  index 0 -> device_id 1).
+- ``driver.create_device(info_dict)`` — the VULKAN form. IREE Vulkan
+  ``device_id`` values are QUERIED PER-PROCESS HASHES, not ordinals (the
+  cuda/rocm ``index + 1`` mapping does not apply and raises
+  "Device id N not found"), so the adapter enumerates
+  ``driver.query_available_devices()`` and creates the HAL device from the
+  info dict of ``Device("vulkan", index)`` — see
+  ``_acquire_vulkan_device``.
+- ``iree.runtime.load_vm_flatbuffer(flatbuffer_bytes, driver="local-task")``
+  — loads the VM flatbuffer into a ``BoundModule`` (CPU path); entry
+  functions are resolved as attributes (``module.main``). This driver-name
+  form ALWAYS creates the DEFAULT device, so it cannot select a CUDA/ROCm/
+  Vulkan index — the CUDA, ROCm and Vulkan paths instead load via
+  ``rt.Config(device=device)`` +
+  ``rt.VmModule.copy_buffer(config.vm_instance, vmfb)`` +
+  ``rt.load_vm_module(vm_module, config)``, which binds the module to a
+  SPECIFIC acquired device.
+- ``iree.runtime.asdevicearray(device, np_array)`` — copies a host numpy
+  array into a HAL device buffer for function input. Plain llvm-cpu runs
+  use it as the host-ndarray representation path (host→host ABI
+  adaptation); plain GPU runs (cuda, rocm and vulkan) NEVER accept host
+  inputs —
+  placement is the explicit ``t.to(Device('cuda'|'rocm'|'vulkan', N))``
+  first (see
+  ``upload_tensor``), and a non-device input at a GPU run is rejected with
+  ``core.DeviceError``. Host-mode external-kernel boundaries still stage
+  host tensors at kernel boundaries via ``_staged_input`` (cuda AND rocm
+  segment executables each have their own persistent staging cache — see
+  ``_staged_input`` for the two per-kind fast paths; a vulkan boundary has
+  NO staging tier and uses ``rt.asdevicearray`` directly);
+  ``rt.asdevicearray`` remains the fallback for oversized/unmappable inputs
+  and for any failure on a kind's fast path.
+- ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
+  handle, already resident on the device. Run outputs are wrapped into
+  ``core.Tensor(IreeDevicePayload(...))`` — device-resident tensors whose
+  host copy is materialized LAZILY and EXPLICITLY: ``.numpy()`` performs the
+  fresh host copy (``DeviceArray.to_host()``) for CPU-kind outputs, while
+  non-cpu outputs are read back via the explicit
+  ``t.to(core.Device('cpu', 0)).numpy()`` transfer (no implicit
+  device-to-host transfer), so the hot run() path performs no host
+  round-trip. Same-device DeviceArray inputs are handed to the invoke
+  directly (no copy).
+
+Staging is explicit and honest: ``compile`` NEVER loads, ``load`` NEVER
+re-lowers/re-compiles. Compiler failures surface as
+``core.BackendError`` carrying the ``iree.compiler.CompilerToolError``
+diagnostics — never silently swallowed or papered over.
+
+Capability notes (all validated end-to-end on IREE 3.11.0 —
+``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316 — llvm-cpu CPU,
+cuda GPU, rocm GPU and vulkan (Mesa lavapipe, a SOFTWARE device); the notes
+below apply to ALL targets — fp64/fp16 etc. all work on cuda, rocm and
+vulkan, and the v1 wgp list includes fp64):
+
+- ``dtypes``: float16/float32/float64/int8/int16/int32/int64/bool_. NOT
+  declared: uint8/uint16 (iree-compile cannot legalize unsigned-int
+  ``reduce`` on these — deterministic failure), uint32/uint64
+  (iree-compile 20241104 legalizes the same unsigned-reduce module
+  NON-DETERMINISTICALLY — an upstream race: identical input+flags flip
+  between success and "failed to legalize unresolved materialization" across
+  trials, so they cannot be a reliable capability), complex64/complex128
+  (the StableHLO exporter v1 defers complex computation beyond ``cast``).
+- ``collectives=False``: NONE of the six ``evoxc.dist`` collectives can run.
+  ``stablehlo.collective_broadcast`` (``evoxc.dist.broadcast``) cannot be
+  LEGALIZED by iree-compile 20241104 ("failed to legalize operation
+  'stablehlo.collective_broadcast' that was explicitly marked illegal" —
+  upstream limitation); the other five compile but the local-task/local-sync
+  CPU and cuda/hip HAL drivers of the IREE runtime wheels (3.11.0 validated)
+  raise "UNIMPLEMENTED; collectives not implemented" at ``hal.channel.create``
+  (the Python wheels ship no communicating channel provider). With this flag
+  False, the SHARED ``lower()`` rejects every collective-effect op explicitly
+  with ``core.BackendError`` naming it — never a silent fallback.
+- ``dynamic_shapes=True``: a symbolic-dim graph compiles and runs correctly
+  with different concrete sizes. Scalar-constant broadcasts over dynamic
+  shapes (e.g. ``relu`` on a dynamic tensor) are emitted as
+  ``stablehlo.dynamic_broadcast_in_dim`` with a
+  ``get_dimension_size``-built runtime ``output_dimensions`` chain —
+  validated end-to-end on 3.11.0 at multiple concrete sizes.
+
+Import acyclicity (binding, ``../CONTEXT.md``): top-level imports restricted
+to stdlib + ``evoxc.core`` + the sibling modules ``compiler`` / ``registry`` /
+``program`` / ``backend``. ``evoxc.pipeline`` is never imported.
+"""
+from __future__ import annotations
+
+import base64
+import os
+import threading
+import warnings
+from typing import TYPE_CHECKING, Any
+
+from evoxc import core
+from evoxc.core import Device
+
+from ..backend import Capabilities
+from ..compiler import CompilerBackend, CompilerExecutable
+from ..program import CompiledArtifact, LoweredProgram, Signature
+from ..registry import register as _registry_register
+
+# ---------------------------------------------------------------------------
+# CUDA host->device upload configuration (measured on IREE 3.11.0, RTX A6000)
+# ---------------------------------------------------------------------------
+# Host data reaches a cuda HAL device through PERSISTENT staging buffers
+# cached per (input index, shape, dtype), in TWO tiers:
+#   * TINY inputs (<= _PINNED_DIRECT_MAX_BYTES, measured crossover ~16-32 KB
+#     on IREE 3.11.0 / RTX A6000): the host values are memcpy'd straight
+#     into the mapped view of a persistent DEVICE_LOCAL | HOST_VISIBLE
+#     ("pinned") buffer that the dispatches read DIRECTLY — no queue_copy,
+#     no semaphore, no wait. The driver serializes the host write against
+#     device reads of the mapped memory, which is what makes the dispatch
+#     see the new values (and what makes large pinned writes slow — the
+#     measured 0.5-1.2 ms/call at 160 KB — hence the size cutoff). Measured
+#     for the DE step's rank-0 int64 key (8 B): ~0.05-0.06 ms incl. entry,
+#     vs ~0.11-0.12 ms for the DMA path, and it does NOT degrade when the
+#     upload follows another invoke (the DMA path's fresh-semaphore wait
+#     inflates to 0.24-0.39 ms in that pattern).
+#   * LARGER inputs: the DMA tier — np.copyto into the mapped view of a
+#     persistent HOST_LOCAL source buffer, then a per-call async queue_copy
+#     into a persistent DEVICE_LOCAL staging buffer the dispatches read,
+#     waiting on a FRESH semaphore signaled by the copy (~0.04 ms idle;
+#     the copy itself is a ~0.01 ms DMA). A fresh semaphore per call is
+#     REQUIRED: reusing a semaphore whose event was already waited aborts
+#     the CUDA event semaphore inside the next invoke (verified:
+#     event_semaphore.c:354 ABORTED on the second use). No per-call device
+#     allocation in either tier.
+# NOTE (measured, do not "optimize" back): the queue_copy and the invoke's
+# dispatches are NOT reliably ordered on the cuda HAL — dropping the DMA
+# tier's semaphore wait races the dispatch against the copy (~0.4 % of runs
+# return garbage; verified by 1000-run alternating-value stress). The wait
+# is load-bearing. The pinned tier avoids the race by construction (no DMA).
+# WHO USES THIS MACHINERY (binding — explicit device placement, R6.2):
+# plain runs NEVER stage host inputs on cuda; an input that is not already
+# on the executable's device is rejected with core.DeviceError (the
+# pipeline run-boundary check does this first). The two consumers left are
+#   * the placement provider ``upload_tensor`` (``Tensor.to``; R6.3) — a
+#     ONE-SHOT upload per call through a FRESH per-call staging dict (fresh
+#     buffers, no cache);
+#   * the split external-call SEGMENT executables (``_IreeSegmentExecutable``)
+#     — host-mode external kernels legitimately stage host tensors at
+#     kernel boundaries; each cuda segment retains its own per-
+#     (index, shape, dtype) staging cache.
+# Two invariants keep the staging path correct and fast:
+#   * the DMA tier's fresh-semaphore wait is load-bearing (see above) — never
+#     drop it;
+#   * each cuda segment executable retains a small DEVICE-LOCAL anchor
+#     buffer (_pool_anchor) that keeps the classic allocator's pool from
+#     emptying, so per-call result allocation/free stays in-pool
+#     (~0.04 ms measured) for users who opt into the classic allocator via
+#     --cuda_async_allocations=false (see _configure_cuda_runtime_flags).
+# The CUDA allocator flag itself is NOT set by evoxc: iree's process-global
+# default (--cuda_async_allocations=true, the stream-ordered allocator) is
+# the fast, validated state on iree 3.11.0 — forcing it false measured
+# ~2-3x slower per step on fused DE/PSO 4096x50 graphs (see
+# _configure_cuda_runtime_flags).
+# DESIGN NOTE (measured, do not "simplify" back): the earlier fast path had
+# dispatches read the host values directly from a persistent DEVICE_LOCAL |
+# HOST_VISIBLE ("pinned", host-mapped DEVICE memory) buffer, memcpy'd from
+# host every call. That pattern measured ~0.5-1.2 ms/call on cuda while the
+# pure invoke was 0.04-0.08 ms: host writes into the host-mapped DEVICE
+# memory go over PCIe write-through AND the driver serializes a host write
+# against any outstanding device read of that memory (~0.3-0.6 ms stall),
+# so the "pinned direct-read" idea is inherently slow. Writing into
+# HOST_LOCAL memory is a plain cached memcpy (~0.01 ms for 160 KB) and the
+# DMA queue_copy is ~0.01 ms, so the staged path tracks the pure invoke
+# cost (measured 0.08-0.13 ms/call quiet, ~0.3 ms under PCIe contention on
+# this busy 8-GPU box).
+# The staging and the anchor are pure performance configuration —
+# correctness-neutral (identical buffers, copies, and synchronization as
+# the default paths).
+_CUDA_FLAGS_CONFIGURED = False
+_STAGED_INPUT_MAX_BYTES = 16 * 1024 * 1024  # larger inputs keep asdevicearray
+# Pinned direct-write tier cutoff: host writes into DEVICE_LOCAL|HOST_VISIBLE
+# mapped memory are serialized by the driver against device reads, so large
+# pinned uploads stall (0.5-1.2 ms at 160 KB, measured); below ~4 KB the
+# pinned tier is both faster than the DMA tier AND immune to its race.
+_PINNED_DIRECT_MAX_BYTES = 4 * 1024
+_STAGED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
+# ROCm/HIP staging (see ``_rocm_staged_input``): the reusable host-source
+# buffer cache is THREAD-LOCAL and bounded separately (host-pinned buffers
+# are more expensive to hold than the per-executable device staging buffers,
+# so the bound is tighter).
+_ROCM_SOURCE_CACHE_MAX = 16
+# THREAD-LOCAL HAL device cache for the placement provider's rocm path (see
+# ``_acquire_cached_rocm_device``). Thread-local is REQUIRED: HAL devices are
+# thread-affine (Known Issue #12 in ``./CONTEXT.md``), so a process-global
+# cache would hand the ``evoxc.io`` worker thread a device created on another
+# thread and break it.
+_HAL_DEVICE_CACHE = threading.local()
+# THREAD-LOCAL reusable host-source buffers for the rocm staging path,
+# keyed by (shape, dtype) with the owning runtime device checked by identity.
+_ROCM_SOURCE = threading.local()
+
+# ---------------------------------------------------------------------------
+# Compile-flag policy (the options-override contract — see ../options.py)
+# ---------------------------------------------------------------------------
+# evoxc's compile flags are MINIMAL and every one of them is OVERRIDABLE by
+# the user via the ``iree_compile_args`` compile option (a user flag whose
+# NAME matches a default's name replaces the default — never both) or the
+# ``EVOXC_IREE_COMPILE_ARGS`` env var (resolved by the pipeline, precedence:
+# explicit option > env var > evoxc default). The design lesson behind this
+# policy: a hardcoded, non-overridable iree flag once disabled iree's
+# stream-ordered allocator (``--cuda_async_allocations=false``) and caused a
+# ~100x per-call regression users could not fix. evoxc never hardcodes flags
+# users cannot override.
+# The evoxc-defined ``opt_level`` compile option (``"O0"``-``"O3"`` / 0-3,
+# validated via ``..options.normalize_opt_level``) translates to the DERIVED
+# flag ``--iree-opt-level=N``, which participates in the same name-based
+# default-drop machinery as the other defaults: a user ``--iree-opt-level=N``
+# in ``iree_compile_args`` (or ``EVOXC_IREE_COMPILE_ARGS``) replaces the
+# derived flag — never both. ``--iree-opt-level`` is deliberately NOT in
+# ``_IREE_DENIED_COMPILE_FLAGS`` — it is a legitimately overridable flag.
+_IREE_DEFAULT_COMPILE_ARGS = ("--iree-input-demote-f64-to-f32=false",)
+# llvm-cpu-only defaults — added ONLY when "llvm-cpu" is among the requested
+# targets (meaningless for cuda):
+#   --iree-llvmcpu-target-cpu=generic   portable generic-CPU codegen (also
+#                                       silences IREE's generic-CPU warning)
+#   --iree-llvmcpu-link-embedded=false  the default embedded -nostdlib -static
+#                                       link cannot resolve libm symbols
+#                                       (log/cos/floor) that f64 math ops lower
+#                                       to; the dynamically-linked dylib
+#                                       resolves them from system libc/libm
+#                                       at load
+_IREE_DEFAULT_LLVMCPU_ARGS = (
+    "--iree-llvmcpu-target-cpu=generic",
+    "--iree-llvmcpu-link-embedded=false",
+)
+# rocm-only default — added ONLY when "rocm" is among the requested targets:
+#   --iree-rocm-target=<arch>   the AMDGPU target arch of the ROCm code
+#                               object. IREE's ROCm HAL has NO target
+#                               auto-detection (verified on iree-base-compiler
+#                               3.11.0: compiling with
+#                               target_backends=["rocm"] and no target flag
+#                               fails, and --iree-hal-target-device=rocm does
+#                               NOT supply it), so the arch MUST be named.
+#                               evoxc resolves the arch at compile time from the
+#                               installed ROCm tooling (amdgpu-arch /
+#                               rocm_agent_enumerator — see
+#                               ``_detect_rocm_target``) rather than
+#                               hardcoding one GPU model; a user
+#                               ``--iree-rocm-target=...`` in
+#                               ``iree_compile_args`` overrides it by name
+#                               (the standard collision rule), and an
+#                               undetectable arch with no user flag raises an
+#                               actionable BackendError — never a guess.
+_IREE_DEFAULT_ROCM_ARGS_NAME = "--iree-rocm-target"
+
+
+def _detect_rocm_target() -> str | None:
+    """Detect the ROCm/AMDGPU target arch of an installed AMD GPU.
+
+    Best-effort and side-effect-free (no evoxc import, no GPU allocation): the
+    ROCm arch enumerators are invoked as subprocesses and the first
+    ``gfx<digits>...`` token of their stdout is returned. Resolution order:
+    ``amdgpu-arch`` (the LLVM tool iree uses), then
+    ``rocm_agent_enumerator`` (the ROCm runtime tool — returns one
+    ``gfxNNNN`` line per detected agent). Each is looked up in
+    ``$ROCM_PATH/bin`` / ``$ROCM_HOME/bin`` (falling back to ``/opt/rocm``)
+    and then on ``PATH``.
+
+    Returns the arch string (e.g. ``"gfx942"``) or ``None`` when no
+    enumerator is available / produced a ``gfx*`` arch — the caller then
+    raises an actionable error naming the ``--iree-rocm-target`` flag (the
+    adapter never guesses an arch; a wrong-arch ROCm code object fails at
+    device load with an obscure message).
+    """
+    import re
+    import shutil
+    import subprocess
+
+    tools = ("amdgpu-arch", "rocm_agent_enumerator")
+    roots = [
+        os.path.join(root, "bin")
+        for root in (
+            os.environ.get("ROCM_PATH"),
+            os.environ.get("ROCM_HOME"),
+            "/opt/rocm",
+        )
+        if root
+    ]
+    for tool in tools:
+        candidates = [os.path.join(root, tool) for root in roots]
+        found = shutil.which(tool)
+        if found:
+            candidates.append(found)
+        for candidate in candidates:
+            if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+                continue
+            try:
+                completed = subprocess.run(
+                    [candidate],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            match = re.search(r"\bgfx[0-9a-f]+\b", completed.stdout or "")
+            if match:
+                return match.group(0)
+    return None
+
+
+def _rocm_target_default(user_args: list[str] | None) -> tuple[str, ...]:
+    """The ``--iree-rocm-target=<arch>`` default for a rocm compile.
+
+    A user ``--iree-rocm-target=...`` in ``iree_compile_args`` (or
+    ``EVOXC_IREE_COMPILE_ARGS``) suppresses the default entirely — the same
+    name-collision rule the other defaults follow, applied BEFORE detection
+    so a user-specified arch never triggers a probe. Otherwise the arch is
+    detected (``_detect_rocm_target``); an undetectable arch raises an
+    actionable ``core.BackendError`` naming the flag and the remedy (a
+    silently omitted flag would fail inside iree-compile with an unrelated
+    diagnostic).
+    """
+    for flag in user_args or ():
+        if _flag_name(flag) == _IREE_DEFAULT_ROCM_ARGS_NAME:
+            return ()
+    arch = _detect_rocm_target()
+    if arch is None:
+        raise core.BackendError(
+            f"the {IreeBackend.name} backend needs the ROCm/AMDGPU target arch "
+            f"to compile for the 'rocm' target, and none could be auto-detected "
+            f"(no 'amdgpu-arch'/'rocm_agent_enumerator' on PATH or under "
+            f"$ROCM_PATH/$ROCM_HOME//opt/rocm). IREE's ROCm HAL has no target "
+            f"auto-detection. Pass it explicitly, e.g. "
+            f"iree_compile_args=['--iree-rocm-target=gfx942'] (or set "
+            f"EVOXC_IREE_COMPILE_ARGS)"
+        )
+    return (f"{_IREE_DEFAULT_ROCM_ARGS_NAME}={arch}",)
+# Genuinely required flags — the small documented DENY list. Overriding these
+# would break evoxc's own machinery contract with ``iree.compiler.compile_str``
+# (targets/input format are passed as its parameters; the vmfb output format
+# is what the adapter loads), so they are rejected with an actionable message
+# — never silently overwritten, never passed through. EVERY other iree-compile
+# flag passes through unvalidated (the compiler validates flag values and its
+# diagnostics are surfaced as BackendError).
+_IREE_DENIED_COMPILE_FLAGS = {
+    "--iree-hal-target-backends": (
+        "use the 'target_backends' compile option instead"
+    ),
+    "--iree-input-type": (
+        "evoxc always feeds StableHLO; the input type is fixed by the adapter"
+    ),
+    "--iree-vm-bytecode-module-output-format": (
+        "the adapter requires the default VM flatbuffer output; changing it "
+        "would break artifact loading"
+    ),
+}
+
+
+def _flag_name(flag: str) -> str:
+    """The flag name part (the text before '=') — override/deny matching."""
+    return flag.partition("=")[0]
+
+
+def _resolve_iree_compile_args(
+    target_backends: tuple[str, ...],
+    user_args: list[str] | None,
+    opt_level_args: tuple[str, ...] = (),
+    vulkan_target_args: tuple[str, ...] = (),
+) -> list[str]:
+    """Final ``extra_args`` for ``iree.compiler.compile_str``.
+
+    = surviving evoxc defaults (a default whose name is overridden by a user
+    flag is dropped — the user wins) + the user's flags, deny-checked.
+
+    ``opt_level_args`` carries the DERIVED flag for the evoxc ``opt_level``
+    compile option (``("--iree-opt-level=N",)``, or ``()`` when unset). It
+    joins ``defaults``, so the same name-collision machinery applies: a user
+    ``--iree-opt-level=N`` in ``iree_compile_args``/``EVOXC_IREE_COMPILE_ARGS``
+    replaces the derived flag — never both.
+
+    ``vulkan_target_args`` is the same mechanism for the evoxc ``vulkan_target``
+    compile option (``("--iree-vulkan-target=<profile>",)``, or ``()`` when
+    unset — byte-identical to the pre-option behavior, where IREE's compiler
+    default profile ``vp_android_baseline_2022`` applies): it joins
+    ``defaults``, so a user ``--iree-vulkan-target=<profile>`` in
+    ``iree_compile_args``/``EVOXC_IREE_COMPILE_ARGS`` wins by name and the
+    derived flag is dropped — never both.
+
+    Target-specific defaults join ``defaults`` only when their target is
+    requested: the llvm-cpu codegen/link flags for ``"llvm-cpu"``, the
+    detected ``--iree-rocm-target=<arch>`` for ``"rocm"`` (see
+    ``_rocm_target_default``) and the explicit ``--iree-vulkan-target`` for
+    ``"vulkan-spirv"`` (see ``vulkan_target_args``).
+    """
+    defaults = (
+        list(_IREE_DEFAULT_COMPILE_ARGS)
+        + list(opt_level_args)
+        + list(vulkan_target_args)
+    )
+    if "llvm-cpu" in target_backends:
+        defaults.extend(_IREE_DEFAULT_LLVMCPU_ARGS)
+    if "rocm" in target_backends:
+        defaults.extend(_rocm_target_default(user_args))
+    if not user_args:
+        return defaults
+    user_names = [_flag_name(flag) for flag in user_args]
+    for flag, name in zip(user_args, user_names):
+        reason = _IREE_DENIED_COMPILE_FLAGS.get(name)
+        if reason is not None:
+            raise core.BackendError(
+                f"the {IreeBackend.name} backend denies the iree-compile "
+                f"flag {flag!r}: {reason}"
+            )
+    return [
+        default
+        for default in defaults
+        if _flag_name(default) not in user_names
+    ] + list(user_args)
+
+
+def _artifact_target(target_backends: tuple[str, ...]) -> str:
+    """The ``CompiledArtifact.target`` label for a target-backends tuple."""
+    if set(target_backends) == {"llvm-cpu"}:
+        return "cpu"
+    if set(target_backends) == {"cuda"}:
+        return "cuda"
+    if set(target_backends) == {"rocm"}:
+        return "rocm"
+    if set(target_backends) == {"vulkan-spirv"}:
+        return "vulkan"
+    return "+".join(target_backends)
+
+
+def _runtime_dependencies() -> dict:
+    """Self-describing runtime-dependency versions for CompiledArtifacts."""
+    import numpy as np
+
+    return {
+        "numpy": np.__version__,
+        "iree-base-compiler": _iree_distribution_version(
+            "iree-base-compiler", "iree-compiler"
+        ),
+        "iree-base-runtime": _iree_distribution_version(
+            "iree-base-runtime", "iree-runtime"
+        ),
+    }
+
+
+_GPU_DEVICE_KINDS = frozenset({"cuda", "rocm", "vulkan"})
+# ``_GPU_DEVICE_KINDS`` is the "device-resident GPU-class kind" set: a kind in
+# it takes the ``rt.Config(device=...)`` module-LOAD path (the only path that
+# binds a module to a specific non-``local-task`` HAL device — see
+# ``_load_vm_module``), the device-resident run branch (same-device
+# pass-through, ``core.DeviceError`` for host inputs — see
+# ``IreeExecutable.run``), the segment executables' staging-cache slot and the
+# placement provider's kind gate. It is NOT "takes the cuda staging tier": the
+# pinned/DMA tier in ``_staged_input`` stays CUDA-ONLY, because its
+# correctness rests on a CUDA-driver ordering guarantee that is unverified
+# elsewhere (a vulkan upload uses the plain ``rt.asdevicearray`` path).
+
+
+def _normalize_device_kind(kind: str) -> str:
+    """Normalize a ``core.Device`` kind to its HAL driver kind.
+
+    ``"hip"`` is an accepted ALIAS for the ROCm/HIP path and normalizes to
+    ``"rocm"`` — the alias exists so users may write
+    ``Device("hip", 0)``; the ``core.Device`` LABEL is never rewritten (the
+    alias affects driver/module dispatch only, exactly like a cuda kind is
+    used verbatim). ``"cuda"``/``"cpu"``/``"vulkan"`` pass through unchanged.
+    """
+    return "rocm" if kind == "hip" else kind
+
+
+def _runtime_driver_name(device_kind: str) -> str:
+    """The IREE runtime driver name for a normalized device kind.
+
+    Every GPU-class kind loads its modules through the ``rt.Config(device=...)``
+    path (``load_vm_flatbuffer``'s driver-name form cannot select an index or
+    a non-default device); the ROCm kind is dispatched through iree's ``"hip"``
+    driver, while the ``"cuda"`` and ``"vulkan"`` kinds pass through unchanged
+    to iree's drivers of the same names.
+    """
+    return "hip" if device_kind == "rocm" else device_kind
+
+
+#: normalized device kind -> the compile target that must be in an artifact's
+#: ``target_backends`` for that kind to run. ONE table, consumed by BOTH load
+#: paths (``IreeBackend.load`` and ``IreeBackend._load_segments``) through
+#: ``_expected_target_for_kind`` so the two copies can never drift.
+_EXPECTED_TARGET_BY_KIND: dict[str, str] = {
+    "cpu": "llvm-cpu",
+    "cuda": "cuda",
+    "rocm": "rocm",
+    "vulkan": "vulkan-spirv",
+}
+
+
+def _expected_target_for_kind(device_kind: str) -> str:
+    """The compile target a normalized device kind requires (see the table).
+
+    An UNKNOWN kind raises the same ``KeyError`` the inlined dict lookups it
+    replaced did — unreachable from the public entry points, which validate
+    the kind first and raise ``core.BackendError`` naming it.
+    """
+    return _EXPECTED_TARGET_BY_KIND[device_kind]
+
+
+def _acquire_runtime_device(
+    device_kind: str, device: Device | None, runtime_args: list[str]
+) -> Any:
+    """Acquire the IREE runtime HAL device (shared by single/segment loads).
+
+    CPU: the reliable path (``rt.get_driver("local-task")`` +
+    ``create_default_device()``). CUDA: ``rt.get_driver("cuda")`` +
+    ``driver.create_device(device_id=index+1)`` (IREE cuda device ids are
+    1-BASED: evoxc ``Device("cuda", index)`` maps to ``device_id = index + 1``
+    — verified empirically on 3.11.0: device_id=4 -> physical GPU 3;
+    device_id=0 raises ValueError "Device id 0 not found", never pass 0).
+    ROCm (normalized kind ``"rocm"``, also reached via the ``"hip"`` alias):
+    the SAME 1-based mapping through iree's ``"hip"`` driver
+    (``rt.get_driver("hip")`` + ``create_device(device_id=index+1)`` —
+    verified on IREE 3.11.0 / ROCm 7.1 / MI300X VF: device_id=1 is the only
+    GPU; device_id=0 and 2 raise ValueError). The driver's ``ValueError``
+    for an out-of-range index is surfaced as ``core.BackendError`` naming
+    the index.
+
+    Vulkan (normalized kind ``"vulkan"``): NOT the 1-based ordinal mapping —
+    IREE Vulkan ``device_id`` values are queried per-process HASHES, so the
+    HAL device is created from the enumerated device-info dict of
+    ``Device("vulkan", index)`` and CACHED per ``(index, runtime args)`` on
+    the calling thread (``_acquire_vulkan_device``), which is what makes
+    ``load()`` and the placement provider share ONE HAL device.
+    """
+    import iree.runtime as rt
+
+    if device_kind == "vulkan":
+        return _acquire_vulkan_device(device, runtime_args)
+    if device_kind in _GPU_DEVICE_KINDS:
+        if device_kind == "cuda":
+            _configure_cuda_runtime_flags()
+        driver = rt.get_driver(_runtime_driver_name(device_kind))
+        device_id = device.index + 1
+        try:
+            return driver.create_device(device_id=device_id)
+        except ValueError as exc:
+            label = "CUDA" if device_kind == "cuda" else "ROCm/HIP"
+            check = "nvidia-smi" if device_kind == "cuda" else "rocminfo"
+            raise core.BackendError(
+                f"IREE could not acquire {label} device id {device_id} "
+                f"(1-based; physical GPU index {device.index}): {exc}. "
+                f"IREE {label} device ids are 1-based and device_id=0 does "
+                f"not exist; the requested index must be less than the "
+                f"number of available GPUs (check {check})"
+            ) from exc
+    driver = rt.get_driver("local-task")
+    return driver.create_default_device()
+
+
+def _cached_hal_device(key: tuple, factory: Any) -> Any:
+    """Return the THREAD-LOCAL HAL device cached under ``key`` (create once).
+
+    ``factory()`` acquires the device on a cache miss; the result is stored in
+    the module THREAD-LOCAL ``_HAL_DEVICE_CACHE`` dict for the lifetime of the
+    thread (the cache HOLDS the device, exactly like ``evoxc.io``'s worker holds
+    its bootstrap devices).
+
+    THREAD-LOCAL IS REQUIRED (not an optimization choice): HAL devices are
+    THREAD-AFFINE — the ``evoxc.io`` worker thread separately uploads and must
+    get a device it created itself (see Known Issue #12 in ``./CONTEXT.md``
+    and ``evoxc/io.py::_bootstrap_worker_context``). A process-global cache
+    would hand the worker a device created on another thread and break every
+    copy scheduled through it.
+    """
+    cache = getattr(_HAL_DEVICE_CACHE, "devices", None)
+    if cache is None:
+        cache = {}
+        _HAL_DEVICE_CACHE.devices = cache
+    runtime_device = cache.get(key)
+    if runtime_device is None:
+        runtime_device = factory()
+        cache[key] = runtime_device
+    return runtime_device
+
+
+def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> Any:
+    """Acquire (or reuse) ONE Vulkan HAL device per thread.
+
+    IREE Vulkan ``device_id`` values are QUERIED PER-PROCESS HASHES (the
+    enumerated device-info dicts carry ``'device_id'``, ``'path'`` and
+    ``'name'`` — verified on iree-base-runtime 3.11.0, where the value is e.g.
+    ``857002912``), so the cuda/rocm ``device_id = index + 1`` ordinal form
+    does NOT exist here: the HAL device is created from the enumerated info
+    dict of ``Device("vulkan", index)``.
+
+    The device is CACHED per ``(index, runtime args)`` on the calling thread
+    via ``_cached_hal_device`` — the same thread-local cache the rocm
+    placement path uses, and for the same reason (HAL devices are
+    thread-affine and repeated ``create_device`` calls are costly). Because
+    the cache lookup lives HERE, ``load()`` and the ``upload_tensor``
+    placement provider automatically share ONE HAL device — a placed tensor's
+    buffer is then accepted by the loaded executable's invoke (iree accepts
+    same-physical-device buffers across instances; kind+index equality is the
+    sufficient check).
+
+    Zero enumerated devices, or an index outside the enumerated range, raises
+    an actionable ``core.BackendError``: IREE 3.11 HIDES software-rasterizer
+    devices whose name begins with ``llvmpipe``, so a host whose only Vulkan
+    device is one must point ``VK_ICD_FILENAMES`` at an ICD whose device name
+    IREE accepts (never a hard-coded path here — the hint names the variable
+    only). A ``create_device`` failure is surfaced as ``core.BackendError``
+    naming the requested device, never a raw iree exception.
+    """
+    import iree.runtime as rt
+
+    index = 0 if device is None else device.index
+
+    def _create() -> Any:
+        driver = rt.get_driver(_runtime_driver_name("vulkan"))
+        infos = driver.query_available_devices()
+        if not infos:
+            raise core.BackendError(
+                f"IREE's vulkan driver enumerated no devices (requested "
+                f"device {device!r}, index {index}): no Vulkan device is "
+                f"visible to IREE in this process. IREE 3.11 hides software-"
+                f"rasterizer devices by name (its vulkan driver drops every "
+                f"device whose name begins with 'llvmpipe'), so a host whose "
+                f"only Vulkan device is one must select an ICD whose device "
+                f"name IREE accepts via the VK_ICD_FILENAMES environment "
+                f"variable. Check what IREE sees with "
+                f'iree.runtime.get_driver("vulkan").query_available_devices()'
+            )
+        if index < 0 or index >= len(infos):
+            raise core.BackendError(
+                f"IREE's vulkan driver enumerated {len(infos)} device(s) "
+                f"{[info.get('name') for info in infos]}; the requested "
+                f"device {device!r} asks for index {index}, which does not "
+                f"exist. IREE Vulkan device ids are QUERIED HASHES, not "
+                f"ordinals: evoxc maps Device('vulkan', N) to the N-th "
+                f"ENUMERATED device."
+            )
+        shown = {
+            key: infos[index].get(key) for key in ("name", "device_id", "path")
+        }
+        try:
+            # ``create_device`` takes the enumerated info dict (its
+            # ``device_id`` entry is the queried hash the HAL expects).
+            return driver.create_device(infos[index])
+        except core.EVOXCError:
+            raise
+        except Exception as exc:
+            raise core.BackendError(
+                f"IREE could not create the vulkan HAL device for {device!r} "
+                f"(enumerated device {shown}): {exc}"
+            ) from exc
+
+    return _cached_hal_device(
+        ("vulkan", index, tuple(runtime_args or ())), _create
+    )
+
+
+def _acquire_cached_rocm_device(device: Device, runtime_args: list[str]) -> Any:
+    """Acquire (or reuse) ONE ROCm/HIP HAL device per thread.
+
+    ``driver.create_device`` measured ~46 ms per call on the ROCm HIP driver
+    (IREE 3.11.0 / MI300X) and does NOT warm up, so a fresh device per
+    ``upload_tensor`` made every rocm placement pay ~34-40 ms of pure setup
+    on top of the copy. This cache reuses the device across uploads on the
+    SAME THREAD, keyed by ``(normalized kind, device index, runtime args)``.
+
+    THREAD-LOCAL IS REQUIRED (not an optimization choice): CUDA/ROCm HAL
+    devices are THREAD-AFFINE — the ``evoxc.io`` worker thread separately calls
+    ``upload_tensor`` for ``prefetch`` and must get a device it created
+    itself (see Known Issue #12 in ``./CONTEXT.md`` and
+    ``evoxc/io.py::_bootstrap_worker_context``). A process-global cache would
+    hand the worker a device created on another thread and break every copy
+    scheduled through it. The cached devices are referenced for process
+    lifetime (the thread-local dict holds them), exactly like the worker's
+    ``_bootstrap_devices``.
+
+    Only the rocm/hip kind routes through here (``upload_tensor``);
+    ``load()`` and the cuda placement path keep their existing per-call
+    ``_acquire_runtime_device`` strategy.
+    """
+    # Same acquisition path load() uses ("hip" driver + 1-based
+    # device_id = index + 1), with the same ValueError ->
+    # core.BackendError surfacing; flags are applied by the caller
+    # (``upload_tensor``) exactly as before.
+    return _cached_hal_device(
+        ("rocm", device.index, tuple(runtime_args)),
+        lambda: _acquire_runtime_device("rocm", device, runtime_args),
+    )
+
+
+def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
+    """Load one VM flatbuffer onto ``runtime_device`` (shared load path).
+
+    CUDA, ROCm and Vulkan (``device_kind`` in ``_GPU_DEVICE_KINDS``): the
+    ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(config.
+    vm_instance, vmfb)`` + ``rt.load_vm_module(vm_module, config)`` path —
+    ``load_vm_flatbuffer``'s driver-name form always creates the DEFAULT
+    device and cannot select a CUDA/ROCm/Vulkan index. CPU: ``load_vm_flatbuffer(
+    vmfb, driver="local-task")``; a ``ValueError`` (the runtime VM verifier
+    rejecting the module's required features — the mixed-install trap, see
+    ``adapters/CONTEXT.md`` Known Issue #7) is surfaced as an actionable
+    ``core.BackendError`` naming the cause and remedy.
+    """
+    import iree.runtime as rt
+
+    if device_kind in _GPU_DEVICE_KINDS:
+        config = rt.Config(device=runtime_device)
+        vm_module = rt.VmModule.copy_buffer(config.vm_instance, vmfb)
+        return rt.load_vm_module(vm_module, config)
+    try:
+        return rt.load_vm_flatbuffer(vmfb, driver="local-task")
+    except ValueError as exc:
+        # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md): the
+        # legacy iree-compiler/iree-runtime distributions and the current
+        # iree-base-* distributions share the SAME 'iree' Python namespace
+        # and must NOT coexist; a mixed/residual install makes the runtime
+        # VM verifier reject the module ("required module features [Ch] are
+        # not available in this runtime configuration") with a raw ValueError
+        # deep inside the runtime. Surface it as an actionable BackendError
+        # instead of the cryptic raw error.
+        raise core.BackendError(
+            f"IREE could not load the compiled VM module: the runtime "
+            f"rejected the module's required features at load ({exc}). "
+            f"This is almost certainly a MIXED IREE INSTALL: the legacy "
+            f"'iree-compiler'/'iree-runtime' distributions and the "
+            f"current 'iree-base-compiler'/'iree-base-runtime' "
+            f"distributions share the SAME 'iree' Python namespace and "
+            f"must NOT coexist — a mixed or residual install (e.g. pip "
+            f"uninstall leaving dist-info/egg-info residue) makes the "
+            f"runtime verifier claim the module's features are "
+            f"unavailable. Remedy: purge ALL 'iree*' distributions from "
+            f"site-packages (including stale dist-info/egg-info residue) "
+            f"and reinstall ONLY 'iree-base-compiler' and "
+            f"'iree-base-runtime'."
+        ) from exc
+
+
+def _configure_cuda_runtime_flags(user_args: tuple[str, ...] = ()) -> None:
+    """CUDA allocator-flag policy point — evoxc forces NOTHING by default.
+
+    iree's process-global default for ``--cuda_async_allocations`` is
+    ``true`` (stream-ordered allocations). evoxc deliberately never parses the
+    flag itself: measured with interleaved same-session A/B runs on iree
+    3.11.0 / RTX A6000 (fused DE/PSO step graphs, one ``evoxc.run`` per step,
+    pop 32..4096 x dim 10..50), the async pool is the fast state everywhere
+    — 4096x50: ~1.16 ms/step vs ~2.2-3.5 ms/step with the flag forced to
+    ``false`` (every per-call result alloc/free round-trips the CUDA driver
+    with a full device sync); the historic "async-ON re-trims the pool ~1.1
+    ms per invocation" observation (ceb2ba2-era comments) did NOT reproduce
+    on the current stack. This function is the single place a future default
+    could be pinned; today it intentionally stays a no-op.
+
+    Users who need the classic allocator pool opt in per load via the
+    ``iree_runtime_args`` load option (e.g. ``["--cuda_async_allocations=false"]``
+    — parsed with LOUD errors by ``_apply_iree_runtime_args``) or the
+    ``IREE_PY_RUNTIME_FLAGS`` env var (parsed by iree.runtime at import).
+    The flag is process-global and parsed once: the first cuda load in a
+    process fixes the state for every later load.
+    """
+    global _CUDA_FLAGS_CONFIGURED
+    if _CUDA_FLAGS_CONFIGURED:
+        return
+    _CUDA_FLAGS_CONFIGURED = True
+
+
+def _apply_iree_runtime_args(runtime_args: list[str] | None) -> None:
+    """Parse user-provided iree runtime/loader flags (LOUD — never swallowed).
+
+    ``iree.runtime.flags.parse_flags`` may be called multiple times per
+    process (empirically verified) and parses AFTER ``IREE_PY_RUNTIME_FLAGS``
+    (parsed at iree import), so the explicit option wins by last-wins flag
+    semantics. A flag the runtime rejects raises ``core.BackendError`` naming
+    the option, the flags, and the iree error — per evoxc's error strategy, a
+    user's flag value is never silently dropped.
+    """
+    if not runtime_args:
+        return
+    import iree.runtime as rt
+
+    try:
+        rt.flags.parse_flags(*runtime_args)
+    except Exception as exc:
+        raise core.BackendError(
+            f"the {IreeBackend.name} backend could not parse the "
+            f"'iree_runtime_args' load option {runtime_args!r}: {exc} — the "
+            "iree runtime rejected the flags; remove or fix them. Note: "
+            "IREE_PY_RUNTIME_FLAGS is parsed at iree import time; explicit "
+            "iree_runtime_args are parsed after it and win on conflict"
+        ) from exc
+
+
+def _runtime_args_from_env() -> list[str]:
+    """Resolve the ``iree_runtime_args`` load option from ``EVOXC_IREE_RUNTIME_ARGS``.
+
+    ``upload_tensor`` (the placement provider) is not a pipeline stage, so
+    it performs here the env resolution the pipeline normally applies to
+    ``load`` (``evoxc.pipeline_options.apply_env_options``, stage ``"load"``)
+    — byte-identical parsing, so a placement honors process-global HAL
+    flags (e.g. the classic-allocator opt-in
+    ``--cuda_async_allocations=false``) exactly like a load does.
+    Precedence/laziness/malformed-value rules are the shared ones (explicit
+    values never exist here — upload_tensor has no options dict; a
+    malformed env value raises ``core.BackendError`` naming the variable
+    and value).
+    """
+    from evoxc.pipeline_options import apply_env_options  # lazy: stdlib+core
+
+    resolved = apply_env_options("iree", {}, "load")
+    return resolved.get("iree_runtime_args", [])
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from evoxc.ir import Module  # noqa: F401
+
+__all__ = [
+    "IreeBackend",
+    "IreeExecutable",
+    "iree_backend",
+    "register",
+    "upload_tensor",
+]
+
+
+def _dtype_capabilities() -> frozenset:
+    """The dtype capability set (core dtype constants — validated end-to-end).
+
+    Kept as a factory so the module body performs no numpy import; ``core``
+    dtype constants ARE numpy dtype objects.
+    """
+    return frozenset(
+        {
+            core.float16,
+            core.float32,
+            core.float64,
+            core.int8,
+            core.int16,
+            core.int32,
+            core.int64,
+            core.bool_,
+        }
+    )
+
+
+def _iree_distribution_version(*distribution_names: str) -> str:
+    """Version of the first installed IREE distribution (diagnostics only).
+
+    IREE renamed its PyPI distributions: ``iree-compiler`` →
+    ``iree-base-compiler`` and ``iree-runtime`` → ``iree-base-runtime`` (the
+    old names are deprecated and stale on PyPI — last released
+    20241104.1068; the Python namespaces ``iree.compiler`` /
+    ``iree.runtime`` are unchanged by the rename). Either distribution set
+    may be installed, so probe the current names first and fall back to the
+    old names for environments still on the stale packages. Returns
+    ``"unknown"`` when none are found (``compile`` only reaches here after
+    ``check_available`` succeeded on the Python namespaces).
+    """
+    import importlib.metadata as metadata
+
+    for name in distribution_names:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+class IreeBackend(CompilerBackend):
+    """IREE compiler backend: shared StableHLO lowering + IREE compilation.
+
+    ``lower`` is inherited from ``CompilerBackend`` (verify -> capability
+    pre-check -> portable inlining -> verify -> StableHLO export -> signature
+    -> MLIR-text payload). This class adds the compiler-specific half:
+
+    - ``check_available`` — probes the IREE packages; missing deps raise
+      ``core.BackendError`` with the install hint ``pip install evoxc[iree]``.
+    - ``compile`` — invokes ``iree.compiler.compile_str`` on the MLIR payload
+      (targets from the ``target_backends`` compile option, default
+      ``["llvm-cpu"]``; ``"cuda"`` supported) and records the VM flatbuffer
+      (base64, JSON-safe) in the artifact.
+    - ``load`` — decodes the flatbuffer, validates artifact/device target
+      compatibility, acquires the runtime device (``cpu`` via the
+      ``local-task`` driver; ``cuda`` via the ``cuda`` driver with the
+      1-based device-id mapping), and builds an ``IreeExecutable``.
+
+    Staging never composes: ``compile`` never loads; ``load`` never
+    re-lowers/re-compiles.
+    """
+
+    name = "iree"
+
+    #: Options-override contract (see ../options.py): the compile option
+    #: ``iree_compile_args`` (arbitrary iree-compile flags — evoxc's minimal
+    #: defaults are overridable by name collision, a small documented deny
+    #: list guards the genuinely required flags), ``target_backends``, and
+    #: ``opt_level`` (evoxc-defined: ``"O0"``-``"O3"`` / 0-3, value validated
+    #: via ``..options.normalize_opt_level``; translated to the derived flag
+    #: ``--iree-opt-level=N``, which is overridable by name collision like
+    #: every other default — a user ``--iree-opt-level=N`` wins, never both);
+    #: the load option ``iree_runtime_args`` (iree runtime/loader flags,
+    #: parsed loudly at load). No run options in v1 (a non-empty run options
+    #: dict raises BackendError). The reserved exporter lower options
+    #: ``sort_emission``/``while_init_rewrite``/``dot_precision`` are
+    #: consumed by the shared CompilerBackend (see ../compiler.py) and
+    #: declared here so they pass validation. ``dot_precision``
+    #: (``"DEFAULT"``/``"HIGH"``/``"HIGHEST"``, default ``"DEFAULT"``)
+    #: emits a ``precision_config`` attribute on every ``dot_general``:
+    #: iree-compile PARSES, COMPILES and RUNS it on llvm-cpu and the
+    #: result is BIT-IDENTICAL to the ``"DEFAULT"`` export (probed), so it
+    #: is accepted — it only matters on reduced-precision fp32 matmul
+    #: accelerators (the XLA/ROCm TF32 class). Two more reserved exporter
+    #: lower options are declared for validation only (the Writer validates
+    #: their values): ``eigh_algorithm`` (``"jacobi"`` | ``"jacobi_batched"``,
+    #: case-insensitive, default ``"jacobi_batched"``) selects the ``eigh``
+    #: cyclic-Jacobi while composition — the batched composition applies all
+    #: mutually disjoint rotations of an odd-even round-robin round per while
+    #: iteration and measures 65-74x faster at n=100 and 4-5.7x at n=10
+    #: (n=100 iree/llvm-cpu 9532 ms -> 128 ms on an MI300X host), and it
+    #: avoids an iree/llvm-cpu compile crash at n in {4,8,12,16};
+    #: ``"jacobi"`` is the single-pair-per-iteration composition (byte-identical
+    #: to the pre-option text). ``split_reduction`` (bool, default ``True``)
+    #: emits the two-stage split reductions for rank-0-result reductions
+    #: (7.1-8.1x on those ops, 2.7-3.5x end-to-end on population-scale SO
+    #: steps); ``False`` emits the byte-identical single-stage text.
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = {
+        "lower": frozenset(
+            {
+                "rng_bit_generator",
+                "sort_emission",
+                "while_init_rewrite",
+                "dot_precision",
+                "eigh_algorithm",
+                "split_reduction",
+            }
+        ),
+        "compile": frozenset(
+            {
+                "target_backends",
+                "iree_compile_args",
+                "opt_level",
+                "vulkan_target",
+            }
+        ),
+        "load": frozenset({"iree_runtime_args"}),
+        "run": frozenset(),
+    }
+    # "auto" sort emission: the iree-cuda HAL cannot bufferize multi-operand
+    # `stablehlo.sort` whenever the sorted-axis extent is >= 32 (upstream
+    # iree 3.11.0 bug) — the count-based composition (bit-exact vs numpy on
+    # both targets) is used for those argsorts, the two-operand sort for the
+    # rest. On CUDA TARGETS the default is upgraded to "count" (see
+    # ``_exporter_options`` below: the 1-operand VALUES sort that `evoxc.sort`
+    # / topk's values composition emits lowers to a SINGLE-THREADED O(n²)
+    # kernel on iree-cuda — sort n=1001 = 33.8 ms, n=10001 = 3.39 s, the
+    # evox SO step cost at scale — while the count composition's sorted
+    # values are bit-exact and ~120-134× faster there; llvm-cpu keeps "auto"
+    # because its count values-composition is ~1.6× slower than the
+    # 1-operand sort at n ≥ 10000). Explicit per-call override:
+    # `lower(..., sort_emission="pair"|"count")`.
+    default_sort_emission = "auto"
+    capabilities = Capabilities(
+        dynamic_shapes=True,
+        dtypes=_dtype_capabilities(),
+        collectives=False,
+        runtime_calls=False,
+        custom_blocks=False,
+        async_collectives=False,
+        # Round 2: adapter host-dispatch for ``external_call`` — graphs
+        # containing the op are split at lower() time into compiled segments
+        # (``CompilerBackend._lower_external_segments`` + ``external_split``)
+        # and the kernel calls are dispatched on the HOST between segment
+        # runs (staging via the existing device-resident Tensor paths). See
+        # ``evoxc/CONTEXT.md`` "External kernels" and ``IreeExternalExecutable``.
+        external_calls=True,
+        # {"threefry2x32"} (measured): native THREE_FRY via
+        # stablehlo.rng_bit_generator is verified BIT-EXACT vs numpy on
+        # llvm-cpu AND cuda (iree 3.11.0) and faster than the inline
+        # expansion (benchmark in evoxc/bench/rng_bench.py: ~1.6-2.1x, e.g.
+        # cuda randint 2^24: 3.84 ms native vs 8.16 ms inline; uniform
+        # 4.27 vs 7.64; llvm-cpu uniform 2^24: 100 vs 164). PHILOX is
+        # excluded because iree cannot legalize RNG_ALG_PHILOX on either
+        # target (see adapters/CONTEXT.md Known Issues) — philox graphs
+        # use the exporter's bit-exact inline expansion.
+        rng_bit_generator=frozenset({"threefry2x32"}),
+    )
+
+    @classmethod
+    def check_available(cls) -> None:
+        """Probe the IREE compiler/runtime packages (function-body imports).
+
+        Raises ``core.BackendError`` with the install hint
+        ``pip install evoxc[iree]`` when either package is missing; does
+        nothing when available. Called from ``compile`` / ``load`` / the
+        module ``register()`` so a missing dependency fails with an
+        actionable message instead of an obscure ``ImportError`` deep inside
+        the vendor API.
+        """
+        try:
+            import iree.compiler  # noqa: F401
+            import iree.runtime  # noqa: F401
+        except ImportError as exc:
+            raise core.BackendError(
+                f"the {cls.name} backend requires the IREE Python packages "
+                f"(iree-base-compiler + iree-base-runtime), which are "
+                f"unavailable: {exc}. Install them with "
+                f"`pip install evoxc[iree]`"
+            ) from exc
+
+    def _exporter_options(self, options: dict | None) -> dict:
+        """Shared exporter options + the iree-target ``sort_emission`` default.
+
+        The reserved ``sort_emission`` lower option defaults to this
+        adapter's class default (``"auto"``); when it is unset (or
+        explicitly ``"auto"``) AND the caller's lower options carry
+        ``target_backends`` containing ``"cuda"``, the default is upgraded
+        to ``"count"`` (see ``default_sort_emission``): on iree-cuda the
+        1-operand ``stablehlo.sort`` the VALUES sort emission produces
+        lowers to a single-threaded O(n²) kernel, while the count
+        composition's sorted values are bit-exact there and ~120-134×
+        faster. llvm-cpu keeps ``"auto"`` (its count values-composition is
+        ~1.6× slower than the 1-operand sort at n ≥ 10000). The sugar
+        pipeline (``build``/``evaluate``) forwards the resolved
+        ``target_backends`` to ``lower()`` (see
+        ``pipeline._resolve_backend_device`` — for an iree-family backend
+        with a cuda device it is ``["cuda"]``), and the explicit pipeline
+        may pass it to ``lower()`` as well (an accepted compile-stage key),
+        so this default resolves at lower() time; an explicit per-call
+        ``sort_emission="pair"|"count"`` always wins.
+        """
+        opts = super()._exporter_options(options)
+        if opts["sort_emission"] == "auto":
+            targets = (options or {}).get("target_backends")
+            if isinstance(targets, (list, tuple)) and "cuda" in targets:
+                opts["sort_emission"] = "count"
+        return opts
+
+    def compile(
+        self, lowered: LoweredProgram, options: dict | None = None
+    ) -> CompiledArtifact:
+        """Compile a shared StableHLO ``LoweredProgram`` into an IREE artifact.
+
+        1. Validate ``lowered.backend == "iree"`` (``core.BackendError``
+           naming the producing backend otherwise — never cross-backend
+           compilation).
+        2. Validate the payload is the shared StableHLO record (dict with
+           ``format == "stablehlo"`` and a ``mlir_text`` string; a malformed
+           payload raises ``core.BackendError`` "corrupt").
+        3. ``check_available``.
+        4. Validate options against ``KNOWN_OPTIONS`` (unknown keys =>
+           ``core.BackendError``; keys valid for other stages pass). Resolve
+           the compile ``target_backends`` option (default ``["llvm-cpu"]``;
+           v1 supported set ``{"llvm-cpu", "cuda", "rocm", "vulkan-spirv"}`` — a
+           non-list/tuple, an
+           empty list, or an unknown target raises ``core.BackendError``
+           naming the offending value, never a silent fallback) and the
+           ``iree_compile_args`` option (arbitrary iree-compile flags —
+           list/tuple of flag strings; the values are never validated by
+           evoxc, the compiler validates them). ``iree.compiler.compile_str``
+           is called with those targets, ``input_type="stablehlo"``
+           and ``extra_args`` = evoxc's MINIMAL defaults (f64 semantics
+           preserved; portable generic-CPU codegen + dynamically-linked
+           llvm-cpu link for ``llvm-cpu``; the detected ``--iree-rocm-target``
+           for ``rocm`` —
+           see the module constants) MINUS any default a user flag overrides
+           by name, PLUS the user's flags (deny-checked against the small
+           documented ``_IREE_DENIED_COMPILE_FLAGS`` list — genuinely
+           required flags fail with an actionable message; every other flag
+           passes through). ``iree.compiler.CompilerToolError`` is re-raised
+           as ``core.BackendError`` CARRYING the compiler diagnostics —
+           honest, never silent.
+        5. Record a self-describing ``CompiledArtifact``: JSON-safe payload
+           (``format == "iree-vmfb"``, the MLIR text, the base64 VM
+           flatbuffer, the entry-function names, and the ``target_backends``
+           tuple — ``load`` validates artifact/device compatibility against
+           it), ``required_custom_ops=()`` (the shared ``lower`` already
+           inlined every portable block), and ``runtime_dependencies`` (numpy
+           + IREE package versions). ``CompiledArtifact.target`` is ``"cpu"``
+           for ``["llvm-cpu"]``, ``"cuda"`` for ``["cuda"]``, and the
+           ``"+"``-joined targets for mixed lists.
+
+        ``compile`` NEVER loads (no runtime is touched here).
+        """
+        if lowered.backend != self.name:
+            raise core.BackendError(
+                f"cannot compile a LoweredProgram produced by backend "
+                f"{lowered.backend!r} with the {self.name} backend — never "
+                "silently re-lower"
+            )
+        payload = lowered.payload
+        if isinstance(payload, dict) and payload.get("format") == "stablehlo-segments":
+            return self._compile_segments(lowered, payload, options)
+        if not (
+            isinstance(payload, dict)
+            and payload.get("format") == "stablehlo"
+            and isinstance(payload.get("mlir_text"), str)
+        ):
+            raise core.BackendError(
+                f"the {self.name} backend cannot compile the lowered payload "
+                f"of type {type(payload).__name__} — corrupt: expected the "
+                "shared StableHLO record (dict with format='stablehlo' and "
+                "an 'mlir_text' string)"
+            )
+        self.check_available()
+
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
+
+        import numpy as np
+
+        entry_functions = tuple(payload.get("entry_functions", ()))
+        if not entry_functions or not all(
+            isinstance(name, str) for name in entry_functions
+        ):
+            raise core.BackendError(
+                f"corrupt: the {self.name} lowered payload records no "
+                "entry functions"
+            )
+        mlir_text = payload["mlir_text"]
+        target_backends, extra_args = self._resolve_compile_options(options)
+        vmfb = self._compile_mlir(mlir_text, target_backends, extra_args)
+
+        artifact_target = _artifact_target(target_backends)
+        artifact_payload = {
+            "format": "iree-vmfb",
+            "format_version": 1,
+            "mlir_text": mlir_text,
+            "vmfb_base64": base64.b64encode(vmfb).decode("ascii"),
+            "entry_functions": entry_functions,
+            "target_backends": target_backends,
+        }
+        return CompiledArtifact(
+            backend=self.name,
+            signature=lowered.signature,
+            target=artifact_target,
+            payload=artifact_payload,
+            required_custom_ops=(),
+            runtime_dependencies=_runtime_dependencies(),
+        )
+
+    # -------------------------------------------------- external-call split
+
+    def _resolve_compile_options(
+        self, options: dict | None
+    ) -> tuple[tuple[str, ...], list[str]]:
+        """Resolve the ``target_backends`` + ``iree_compile_args`` options.
+
+        Compile targets come from the ``target_backends`` compile option
+        (default ``["llvm-cpu"]`` — unchanged CPU behavior). v1 supported
+        set: ``{"llvm-cpu", "cuda", "rocm", "vulkan-spirv"}``.
+        ``iree_compile_args`` carries
+        arbitrary iree-compile flags (list/tuple of flag strings; values are
+        NEVER validated here — the compiler validates them and its
+        diagnostics surface as BackendError). evoxc's minimal defaults are
+        dropped when a user flag overrides them by name; the small
+        documented deny list guards the genuinely required flags (see module
+        constants). A ``"rocm"`` target additionally carries the detected
+        ``--iree-rocm-target=<arch>`` default (IREE has no ROCm target
+        auto-detection — see ``_rocm_target_default``). The ``opt_level``
+        compile option (``"O0"``-``"O3"`` /
+        0-3; UNSET = ``None`` — the derived flag must NOT appear, byte-for-
+        byte current behavior) is validated via ``..options.normalize_opt_level``
+        and translated to the derived flag ``--iree-opt-level=N``; the
+        derived flag joins ``defaults``, so the same conflict rule applies: a
+        user ``--iree-opt-level=N`` in ``iree_compile_args`` replaces it —
+        never both. The ``vulkan_target`` compile option
+        (``"vulkan-spirv"`` targets only; UNSET = ``None`` — no flag, so
+        IREE's compiler default profile applies byte-identically to the
+        pre-option behavior) must be a non-empty string and is translated to
+        the derived flag ``--iree-vulkan-target=<profile>`` (IREE has no
+        Vulkan target auto-detection). That derived flag joins ``defaults``
+        too, so a user ``--iree-vulkan-target=<profile>`` wins by name —
+        never both. Setting ``vulkan_target`` without requesting
+        ``"vulkan-spirv"`` is a loud ``core.BackendError`` (an explicit
+        option is never silently ignored). Returns
+        ``(target_backends, extra_args)``.
+        """
+        raw_targets = (options or {}).get("target_backends", ["llvm-cpu"])
+        if (
+            not isinstance(raw_targets, (list, tuple))
+            or not raw_targets
+            or not all(isinstance(target, str) for target in raw_targets)
+        ):
+            raise core.BackendError(
+                f"the {self.name} 'target_backends' compile option must be a "
+                f"non-empty list/tuple of strings, got {raw_targets!r}"
+            )
+        supported_targets = {"llvm-cpu", "cuda", "rocm", "vulkan-spirv"}
+        for target in raw_targets:
+            if target not in supported_targets:
+                raise core.BackendError(
+                    f"the {self.name} backend does not support compile "
+                    f"target {target!r} — supported targets: "
+                    f"{', '.join(sorted(supported_targets))}"
+                )
+        target_backends = tuple(raw_targets)
+        raw_extra = (options or {}).get("iree_compile_args")
+        if raw_extra is None:
+            user_args: list[str] = []
+        elif isinstance(raw_extra, (list, tuple)) and all(
+            isinstance(flag, str) for flag in raw_extra
+        ):
+            user_args = list(raw_extra)
+        else:
+            raise core.BackendError(
+                f"the {self.name} 'iree_compile_args' compile option must be "
+                f"a list/tuple of flag strings (e.g. "
+                f'["--iree-llvmcpu-target-cpu=native"]), got {raw_extra!r}'
+            )
+        raw_opt_level = (options or {}).get("opt_level")
+        if raw_opt_level is None:
+            opt_level_args: tuple[str, ...] = ()
+        else:
+            from ..options import normalize_opt_level
+
+            level = normalize_opt_level(raw_opt_level)
+            # iree-compile accepts ONLY the "O" form (verified empirically on
+            # iree-base-compiler 3.11.0: '--iree-opt-level=3' fails with
+            # "'3' value not a valid optimization level, use O0/O1/O2/O3").
+            opt_level_args = (f"--iree-opt-level=O{level}",)
+        raw_vulkan_target = (options or {}).get("vulkan_target")
+        if raw_vulkan_target is None:
+            vulkan_target_args: tuple[str, ...] = ()
+        elif not isinstance(raw_vulkan_target, str) or not raw_vulkan_target:
+            raise core.BackendError(
+                f"the {self.name} 'vulkan_target' compile option must be a "
+                f"non-empty string naming an IREE Vulkan target profile (e.g. "
+                f'vulkan_target="rtx4090" -> --iree-vulkan-target=rtx4090), '
+                f"got {raw_vulkan_target!r}"
+            )
+        elif "vulkan-spirv" not in target_backends:
+            raise core.BackendError(
+                f"the {self.name} 'vulkan_target' compile option was set to "
+                f"{raw_vulkan_target!r} but 'vulkan-spirv' is not among the "
+                f"requested 'target_backends' ({', '.join(target_backends)}) "
+                f"— vulkan_target only applies to vulkan-spirv compilation"
+            )
+        else:
+            vulkan_target_args = (f"--iree-vulkan-target={raw_vulkan_target}",)
+        extra_args = _resolve_iree_compile_args(
+            target_backends,
+            user_args,
+            opt_level_args=opt_level_args,
+            vulkan_target_args=vulkan_target_args,
+        )
+        return target_backends, extra_args
+
+    def _compile_mlir(
+        self, mlir_text: str, target_backends: tuple[str, ...], extra_args: list[str]
+    ) -> bytes:
+        """Invoke iree-compile on one MLIR text; diagnostics -> BackendError."""
+        import iree.compiler as iree_compiler
+
+        try:
+            return iree_compiler.compile_str(
+                mlir_text,
+                target_backends=list(target_backends),
+                input_type="stablehlo",
+                extra_args=extra_args,
+            )
+        except iree_compiler.CompilerToolError as exc:
+            raise core.BackendError(
+                f"iree-compile failed to compile the StableHLO program for "
+                f"the {self.name} backend (targets: "
+                f"{', '.join(target_backends)}):\n{exc}"
+            ) from exc
+
+    def _compile_segments(
+        self, lowered: LoweredProgram, payload: dict, options: dict | None
+    ) -> CompiledArtifact:
+        """Compile a split external-call payload (``stablehlo-segments``).
+
+        Every segment's MLIR text is compiled to its own VM flatbuffer with
+        the SAME ``target_backends`` / ``iree_compile_args`` options as the
+        single-program path; the artifact records the per-segment vmfbs plus
+        the kernel-call plan (JSON-safe, so the artifact persists without
+        re-lowering). The artifact format is ``iree-vmfb-segments`` — ``load``
+        reconstructs an ``IreeExternalExecutable`` from it.
+        """
+        self.check_available()
+
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
+
+        raw_segments = payload.get("segments")
+        plan = payload.get("plan")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split payload records no segments"
+            )
+        if not isinstance(plan, dict):
+            raise core.BackendError(
+                f"corrupt: the {self.name} split payload records no plan"
+            )
+        from ..external_split import decode_plan
+
+        try:
+            decode_plan(plan)
+        except core.BackendError as exc:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split payload has a malformed "
+                f"plan: {exc}"
+            ) from exc
+
+        target_backends, extra_args = self._resolve_compile_options(options)
+        segments = []
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, dict) or not isinstance(
+                raw.get("mlir_text"), str
+            ):
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split payload segment "
+                    f"{index} is malformed (expected dict with an "
+                    "'mlir_text' string)"
+                )
+            entry_functions = tuple(raw.get("entry_functions", ()))
+            if not entry_functions or not all(
+                isinstance(name, str) for name in entry_functions
+            ):
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split payload segment "
+                    f"{index} records no entry functions"
+                )
+            vmfb = self._compile_mlir(
+                raw["mlir_text"], target_backends, extra_args
+            )
+            segments.append(
+                {
+                    "vmfb_base64": base64.b64encode(vmfb).decode("ascii"),
+                    "entry_functions": entry_functions,
+                    "target_backends": target_backends,
+                }
+            )
+        artifact_payload = {
+            "format": "iree-vmfb-segments",
+            "format_version": 1,
+            "segments": segments,
+            "plan": plan,
+        }
+        return CompiledArtifact(
+            backend=self.name,
+            signature=lowered.signature,
+            target=_artifact_target(target_backends),
+            payload=artifact_payload,
+            required_custom_ops=(),
+            runtime_dependencies=_runtime_dependencies(),
+        )
+
+    def load(
+        self,
+        artifact: CompiledArtifact,
+        device: Device | None = None,
+        options: dict | None = None,
+    ) -> "IreeExecutable":
+        """Reconstruct an ``IreeExecutable`` from an artifact. Never re-compiles.
+
+        1. Validate ``artifact.backend == "iree"`` (mismatch =>
+           ``core.PersistenceError`` naming both — artifacts are never
+           silently reinterpreted).
+        2. Validate the payload (``format == "iree-vmfb"``, base64 vmfb,
+           entry functions; malformed => ``core.BackendError`` "corrupt").
+        3. ``check_available``.
+        4. Validate options against ``KNOWN_OPTIONS`` (unknown keys =>
+           ``core.BackendError``) and parse the ``iree_runtime_args`` load
+           option (list/tuple of iree runtime/loader flags, e.g.
+           ``["--cuda_async_allocations=false"]`` — the classic-allocator
+           opt-in) via ``iree.runtime.flags.parse_flags`` — the explicit
+           option is parsed AFTER ``IREE_PY_RUNTIME_FLAGS`` (parsed at iree
+           import) and wins by last-wins semantics; a flag the runtime
+           rejects raises ``core.BackendError`` (never silent). evoxc itself
+           sets NO process-global runtime flag — iree's own defaults stand
+           (cuda: ``--cuda_async_allocations=true``, see
+           ``_configure_cuda_runtime_flags``) — the hardcoded-flag lesson:
+           every flag a user can name is theirs to set.
+        5. Validate the device: ``None`` (CPU default) or a ``core.Device``
+           of kind ``"cpu"``/``"cuda"``/``"rocm"``/``"vulkan"`` (``"hip"`` is
+           accepted as an alias for ``"rocm"``) — a non-``Device`` object
+           raises ``core.DeviceError``; another kind raises
+           ``core.BackendError`` naming it.
+        6. Artifact/device target compatibility — never silent: the artifact
+           payload's ``target_backends`` must include the driver matching the
+           requested device kind (``"llvm-cpu"`` for cpu, ``"cuda"`` for
+           cuda, ``"rocm"`` for the rocm/hip kind, ``"vulkan-spirv"`` for
+           vulkan — ONE table, ``_expected_target_for_kind``); absent
+           ``target_backends`` (artifacts saved before CUDA support) is
+           treated as ``["llvm-cpu"]``. A mismatch raises
+           ``core.BackendError`` naming both the artifact's compile targets
+           and the requested device.
+        7. Base64-decode the VM flatbuffer; acquire the runtime device. CPU:
+           the reliable path (``rt.get_driver("local-task")`` +
+           ``create_default_device()``) then ``load_vm_flatbuffer``. CUDA:
+           ``rt.get_driver("cuda")`` + ``driver.create_device(device_id=
+           index+1)`` (IREE cuda ids are 1-BASED: evoxc index N -> device_id
+           N+1; the driver's ``ValueError`` for an out-of-range index is
+           surfaced as ``core.BackendError`` naming the index). ROCm
+           (including the ``"hip"`` alias): the SAME 1-based mapping through
+           iree's ``"hip"`` driver. VULKAN: NOT an ordinal mapping at all —
+           IREE Vulkan ``device_id`` values are queried per-process HASHES,
+           so ``Device("vulkan", N)`` maps to the N-th entry of
+           ``rt.get_driver("vulkan").query_available_devices()`` and the HAL
+           device is created with ``driver.create_device(info_dict)``,
+           cached per ``(index, runtime args)`` on the calling thread
+           (``_acquire_vulkan_device``) — zero devices or an out-of-range
+           index is an explicit ``core.BackendError``. All three GPU kinds
+           then take the ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(
+           config.vm_instance, vmfb)`` + ``rt.load_vm_module(vm_module,
+           config)`` path (the ``load_vm_flatbuffer`` driver-name form always
+           creates the DEFAULT device and cannot select an index). Then resolve
+           the v1 entry function (``"main"``, else the single recorded
+           entry). A ``ValueError`` from the CPU ``load_vm_flatbuffer`` (the
+           runtime VM verifier rejecting the module's required features — see
+           ``adapters/CONTEXT.md`` Known Issue #7, the mixed-install trap) is
+           surfaced as an actionable ``core.BackendError`` naming the cause
+           and remedy, with the original exception as ``__cause__``.
+
+        NEVER re-traces / re-lowers / re-compiles — load-time mismatches fail
+        clearly (root error strategy).
+        """
+        if artifact.backend != self.name:
+            raise core.PersistenceError(
+                f"artifact was produced by backend {artifact.backend!r}; "
+                f"the {self.name} backend cannot load it — never silently "
+                "recompile"
+            )
+        payload = artifact.payload
+        if isinstance(payload, dict) and payload.get("format") == "iree-vmfb-segments":
+            return self._load_segments(artifact, payload, device, options)
+        if not (
+            isinstance(payload, dict)
+            and payload.get("format") == "iree-vmfb"
+            and isinstance(payload.get("vmfb_base64"), str)
+        ):
+            raise core.BackendError(
+                f"corrupt: the {self.name} artifact payload must be the "
+                "iree-vmfb record (dict with format='iree-vmfb' and a "
+                "'vmfb_base64' string)"
+            )
+        entry_functions = tuple(payload.get("entry_functions", ()))
+        if not entry_functions:
+            raise core.BackendError(
+                f"corrupt: the {self.name} artifact records no entry "
+                "functions"
+            )
+        self.check_available()
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
+        # ``iree_runtime_args`` — iree runtime/loader flags (list/tuple of
+        # flag strings; values are NEVER validated by evoxc — the runtime
+        # validates them and its rejection surfaces as BackendError below).
+        raw_runtime = (options or {}).get("iree_runtime_args")
+        if raw_runtime is None:
+            runtime_args: list[str] = []
+        elif isinstance(raw_runtime, (list, tuple)) and all(
+            isinstance(flag, str) for flag in raw_runtime
+        ):
+            runtime_args = list(raw_runtime)
+        else:
+            raise core.BackendError(
+                f"the {self.name} 'iree_runtime_args' load option must be a "
+                f"list/tuple of flag strings (e.g. "
+                f'["--cuda_async_allocations=false"]), got {raw_runtime!r}'
+            )
+        _apply_iree_runtime_args(runtime_args)
+        device_kind = "cpu"  # device=None = default CPU device
+        if device is not None:
+            if not isinstance(device, Device):
+                raise core.DeviceError(
+                    f"device must be a core.Device, got "
+                    f"{type(device).__name__}"
+                )
+            if device.kind not in ("cpu", "cuda", "rocm", "hip", "vulkan"):
+                raise core.BackendError(
+                    f"the {self.name} backend supports cpu, cuda, rocm/hip and "
+                    f"vulkan devices only, got device kind {device.kind!r}"
+                )
+            # ``"hip"`` is an alias for the ROCm/HIP path (normalized for
+            # driver/module dispatch only — the core.Device label is kept).
+            device_kind = _normalize_device_kind(device.kind)
+
+        # Artifact/device target compatibility — never silent: the artifact's
+        # compile targets must include the driver matching the requested
+        # device kind. Absent target_backends (artifacts saved before CUDA
+        # support) is treated as ["llvm-cpu"].
+        raw_targets = payload.get("target_backends")
+        if raw_targets is None:
+            target_backends = ("llvm-cpu",)
+        elif isinstance(raw_targets, str):
+            target_backends = (raw_targets,)
+        else:
+            target_backends = tuple(raw_targets)
+        expected_target = _expected_target_for_kind(device_kind)
+        if expected_target not in target_backends:
+            raise core.BackendError(
+                f"the {self.name} artifact was compiled for target(s) "
+                f"{', '.join(target_backends) or '(none)'} and cannot run on "
+                f"the requested device {device!r} (device kind "
+                f"{device_kind!r} requires compile target {expected_target!r})"
+                f" — never silently recompile"
+            )
+
+        import iree.runtime as rt
+
+        vmfb = base64.b64decode(payload["vmfb_base64"].encode("ascii"))
+        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
+        module = _load_vm_module(vmfb, device_kind, runtime_device)
+        return IreeExecutable(
+            artifact=artifact,
+            signature=artifact.signature,
+            device=device,
+            module=module,
+            entry_functions=entry_functions,
+            runtime_device=runtime_device,
+        )
+
+    def _load_segments(
+        self,
+        artifact: CompiledArtifact,
+        payload: dict,
+        device: Device | None,
+        options: dict | None,
+    ) -> "IreeExternalExecutable":
+        """Reconstruct an ``IreeExternalExecutable`` from a split artifact.
+
+        The artifact records one VM flatbuffer per segment plus the kernel-
+        call plan (``format == "iree-vmfb-segments"``). The device is
+        acquired ONCE and every segment module is loaded onto it — segment
+        modules are ordinary compiled functions (no ``external_call``
+        inside), so the same load path as the single-program case applies
+        per segment. The plan is decoded and validated here (malformed =>
+        ``core.BackendError`` "corrupt"); the executable interprets it at
+        run time.
+        """
+        self.check_available()
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
+        raw_runtime = (options or {}).get("iree_runtime_args")
+        if raw_runtime is None:
+            runtime_args: list[str] = []
+        elif isinstance(raw_runtime, (list, tuple)) and all(
+            isinstance(flag, str) for flag in raw_runtime
+        ):
+            runtime_args = list(raw_runtime)
+        else:
+            raise core.BackendError(
+                f"the {self.name} 'iree_runtime_args' load option must be a "
+                f"list/tuple of flag strings (e.g. "
+                f'["--cuda_async_allocations=false"]), got {raw_runtime!r}'
+            )
+        _apply_iree_runtime_args(runtime_args)
+        device_kind = "cpu"  # device=None = default CPU device
+        if device is not None:
+            if not isinstance(device, Device):
+                raise core.DeviceError(
+                    f"device must be a core.Device, got "
+                    f"{type(device).__name__}"
+                )
+            if device.kind not in ("cpu", "cuda", "rocm", "hip", "vulkan"):
+                raise core.BackendError(
+                    f"the {self.name} backend supports cpu, cuda, rocm/hip and "
+                    f"vulkan devices only, got device kind {device.kind!r}"
+                )
+            # ``"hip"`` is an alias for the ROCm/HIP path (normalized for
+            # driver/module dispatch only — the core.Device label is kept).
+            device_kind = _normalize_device_kind(device.kind)
+        expected_target = _expected_target_for_kind(device_kind)
+
+        raw_segments = payload.get("segments")
+        plan = payload.get("plan")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split artifact records no segments"
+            )
+        if not isinstance(plan, dict):
+            raise core.BackendError(
+                f"corrupt: the {self.name} split artifact records no plan"
+            )
+        from ..external_split import decode_plan
+
+        try:
+            decoded_plan = decode_plan(plan)
+        except core.BackendError as exc:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split artifact has a malformed "
+                f"plan: {exc}"
+            ) from exc
+
+        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
+        segment_execs: list[_IreeSegmentExecutable] = []
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, dict) or not isinstance(
+                raw.get("vmfb_base64"), str
+            ):
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split artifact segment "
+                    f"{index} is malformed (expected dict with a "
+                    "'vmfb_base64' string)"
+                )
+            entry_functions = tuple(raw.get("entry_functions", ()))
+            if not entry_functions:
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split artifact segment "
+                    f"{index} records no entry functions"
+                )
+            # Per-segment artifact/device target compatibility (same rule as
+            # the single-program path).
+            raw_targets = raw.get("target_backends")
+            if raw_targets is None:
+                segment_targets = ("llvm-cpu",)
+            elif isinstance(raw_targets, str):
+                segment_targets = (raw_targets,)
+            else:
+                segment_targets = tuple(raw_targets)
+            if expected_target not in segment_targets:
+                raise core.BackendError(
+                    f"the {self.name} split artifact segment {index} was "
+                    f"compiled for target(s) "
+                    f"{', '.join(segment_targets) or '(none)'} and cannot "
+                    f"run on the requested device {device!r} (device kind "
+                    f"{device_kind!r} requires compile target "
+                    f"{expected_target!r}) — never silently recompile"
+                )
+            vmfb = base64.b64decode(raw["vmfb_base64"].encode("ascii"))
+            module = _load_vm_module(vmfb, device_kind, runtime_device)
+            core_device = device if device is not None else Device("cpu", 0)
+            input_specs = tuple(
+                core.TensorSpec(shape=value_type.shape, dtype=value_type.dtype)
+                for value_type in decoded_plan[index]["input_specs"]
+            )
+            segment_execs.append(
+                _IreeSegmentExecutable(
+                    module=module,
+                    runtime_device=runtime_device,
+                    core_device=core_device,
+                    input_specs=input_specs,
+                    # The per-call staging fast path (persistent staging
+                    # buffers) is enabled for every GPU kind: cuda uses the
+                    # two-tier pinned/DMA machinery, rocm the host-local
+                    # source + queue_copy path (both far cheaper than the
+                    # generic asdevicearray upload a host-mode boundary
+                    # would otherwise pay per kernel call).
+                    device_kind=device_kind,
+                )
+            )
+        return IreeExternalExecutable(
+            artifact=artifact,
+            signature=artifact.signature,
+            device=device,
+            segments=segment_execs,
+            plan=decoded_plan,
+            runtime_device=runtime_device,
+        )
+
+
+class IreeExecutable(CompilerExecutable):
+    """IREE runtime executable (satisfies the backend ``Executable`` protocol).
+
+    Runs the compiled VM module on the acquired IREE HAL device (``local-task``
+    CPU, or a ``cuda`` / ``rocm``/``hip`` / ``vulkan`` GPU-class device):
+
+    1. Validate flat inputs against the recorded ``Signature``: count
+       (``core.BackendError``), per-input dtype (``core.BackendError``),
+       per-input shape — rank and STATIC dims must match
+       (``core.ShapeError``); symbolic dims pass through (IREE executes
+       runtime-dynamic shapes — validated).
+    2. Per input (EXPLICIT placement — no implicit host<->device transfers,
+       R6.2): a device-resident tensor whose payload is an IREE
+       ``DeviceArray`` on THIS executable's device (kind+index) is passed
+       to the invoke directly — no host round-trip, no copy. Any other
+       input is REJECTED on a cuda/rocm/vulkan executable with
+       ``core.DeviceError`` directing to ``t.to(...)`` (defensive — the
+       pipeline run-boundary check in ``evoxc/pipeline.py`` normally rejects
+       foreign-device inputs first with its own message; place inputs
+       explicitly via ``t.to(Device('cuda'|'rocm'|'vulkan', N))`` before the
+       run). On an llvm-cpu
+       executable a host numpy-backed input takes the
+       ``rt.asdevicearray`` representation path (host->host ABI
+       adaptation — llvm-cpu tests depend on it). Plain runs build FRESH
+       buffers every call — no staging cache, no anchor.
+    3. Invoke the entry function; handle single/multiple results (the
+       invoker returns the value or a tuple).
+    4. Wrap each result in ``core.Tensor(IreeDevicePayload(...))`` — a
+       DEVICE-RESIDENT tensor: ``.data`` is the payload (the DeviceArray
+       already on the device), ``.device`` is this executable's
+       ``core.Device`` (``Device("cpu", 0)`` for the default CPU device).
+       Host materialization is explicit: CPU-kind outputs get a LAZY fresh
+       host copy in ``.numpy()`` (``DeviceArray.to_host()`` — on
+       ``local-task`` the mapping is zero-copy for mappable buffers), while
+       non-cpu outputs raise ``DeviceError`` in ``.numpy()`` and are read
+       back via ``t.to(core.Device('cpu', 0)).numpy()`` — the run() hot
+       path never touches host memory either way.
+    5. Validate output count + dtype against the signature output specs.
+
+    ``run`` already blocks on the device queue, so ``synchronize()`` is a
+    documented no-op — it exists so every compiler executable exposes the
+    same call shape (the xla adapter's device-resident run is asynchronous
+    and needs it).
+
+    ``save`` / ``load`` are inherited from ``CompilerExecutable``: ``save``
+    persists the underlying ``CompiledArtifact`` (device handles are NEVER
+    serialized — reconstruction is explicit); ``load`` reads the artifact,
+    validates its backend, and routes reconstruction through the registry
+    (which auto-activates this adapter lazily).
+    """
+
+    backend_name = "iree"
+
+    # Run-stage option validation table — mirrors ``IreeBackend.KNOWN_OPTIONS``
+    # (single source of truth; the class attribute is defined here so the
+    # executable validates independently of the backend instance).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = IreeBackend.KNOWN_OPTIONS
+
+    def __init__(
+        self,
+        artifact: CompiledArtifact,
+        signature: Signature | None,
+        device: core.Device | None,
+        module: Any,
+        entry_functions: tuple[str, ...],
+        runtime_device: Any,
+    ) -> None:
+        super().__init__(
+            artifact=artifact,
+            signature=signature,
+            device=device,
+            native_module=module,
+            entry_functions=entry_functions,
+        )
+        self.runtime_device = runtime_device
+        # Per-call invariants cached at load time (never re-derived per run):
+        # the core.Device label of this executable (output tensors + the
+        # same-device pass-through rule), the flat spec tuples, and the
+        # resolved entry function (resolution constructs a new
+        # ``FunctionInvoker`` — ABI JSON parse + argument packer — on every
+        # BoundModule attribute access, so it must happen once).
+        self._core_device: Device = (
+            device if device is not None else Device("cpu", 0)
+        )
+        self._input_specs = (
+            tuple(signature.input_specs) if signature is not None else ()
+        )
+        self._output_specs = (
+            tuple(signature.output_specs) if signature is not None else ()
+        )
+        # Per-call validation contracts, derived ONCE here (specs are
+        # immutable): the input plan of ``(dtype, shape, needs_dim_walk)``
+        # entries and the flat tuple of expected output dtypes. Plans hold no
+        # values — ``run`` compares its actual argument metadata against them.
+        self._input_plan = _input_plan(self._input_specs)
+        self._output_dtypes = tuple(spec.dtype for spec in self._output_specs)
+        self._entry: Any = None
+        # R6.2: plain runs carry NO staging machinery (no _staged_inputs
+        # cache, no _pool_anchor anchor) — inputs must already be on this
+        # executable's device (pass-through) or host ndarray on llvm-cpu
+        # (asdevicearray representation); buffers are built FRESH per call.
+        # The staging machinery lives on in _IreeSegmentExecutable
+        # (host-mode external-kernel boundaries) and in the upload_tensor
+        # placement provider (one-shot).
+
+    # ------------------------------------------------------------------ run
+
+    def run(
+        self,
+        flat_input_tensors: list[core.Tensor],
+        options: dict | None = None,
+    ) -> list[core.Tensor]:
+        """Execute the compiled program on flat input tensors.
+
+        See the class docstring for the exact validation/invocation model.
+        Runtime IREE errors propagate as-is (they are explicit hardware/runtime
+        failures, never silently swallowed); evoxc-level mismatches raise
+        ``core.BackendError`` / ``core.ShapeError``.
+
+        ``options``: per-run options, validated against ``KNOWN_OPTIONS`` —
+        the iree run stage has NO known options in v1, so any non-empty
+        options dict raises ``core.BackendError`` (loud; never silently
+        swallowed). Runtime/loader flags are load-time options
+        (``iree_runtime_args``), not per-run.
+        """
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
+
+        input_specs = self._input_specs
+        input_plan = self._input_plan
+        n_inputs = len(input_specs)
+        if len(flat_input_tensors) != n_inputs:
+            raise core.BackendError(
+                f"program expects {n_inputs} input tensor(s), got "
+                f"{len(flat_input_tensors)}"
+            )
+        core_device = self._core_device
+        runtime_device = self.runtime_device
+        np, rt = _runtime_modules()
+        reject_foreign = core_device.kind != "cpu"
+        # Pre-sized buffers filled by index: per-IO leaf work (validate +
+        # buffer build) is the dominant non-invoke cost, so it happens in ONE
+        # pass instead of a validation walk followed by a ``_build_buffers``
+        # walk over the same list.
+        buffers = [None] * n_inputs
+        for i, tensor in enumerate(flat_input_tensors):
+            if not isinstance(tensor, core.Tensor):
+                raise core.BackendError(
+                    f"input {i} must be a core.Tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+            data = tensor.data
+            want_dtype, want_shape, needs_dim_walk = input_plan[i]
+            # dtype: one comparison in the steady state (all payload/ndarray
+            # dtypes are numpy dtypes); anything exotic is normalized exactly
+            # like ``Tensor.dtype`` before the verdict, so the comparison —
+            # and a ``core.DTypeError`` for a non-normalizable dtype — is
+            # unchanged. The message is built from the same expressions as
+            # before (on the failure path only).
+            dtype = data.dtype
+            if dtype != want_dtype and core.dtype(dtype) != want_dtype:
+                raise core.BackendError(
+                    f"input {i}: expected dtype {input_specs[i].dtype}, got "
+                    f"{tensor.dtype} — never silently coerce"
+                )
+            shape = data.shape
+            if type(shape) is not tuple:
+                shape = tuple(shape)
+            # Static specs (the steady state) pass on one tuple compare; any
+            # non-int declared dim goes straight to the walker, which applies
+            # the exact per-dim semantics (symbolic passes, ``None`` skipped,
+            # a static-dim mismatch raises ``core.ShapeError``).
+            if needs_dim_walk or shape != want_shape:
+                _validate_input_shape(i, want_shape, shape)
+
+            # Buffer build, fused into this pass — the plain-run form of
+            # ``_build_buffers`` below, same branch order: a same-device
+            # payload/raw-DeviceArray input passes through with ZERO
+            # ``asdevicearray``/``numpy()`` calls, a non-pass-through input on
+            # a cuda/rocm/vulkan executable is rejected (no implicit
+            # host-to-device transfer), and an llvm-cpu executable takes the
+            # asdevicearray
+            # representation path (host->host ABI adaptation). Plain runs
+            # never stage, so there is no staging-cache branch here.
+            if isinstance(data, IreeDevicePayload):
+                if tensor.device == core_device:
+                    buffers[i] = data.device_array
+                    continue
+            elif (
+                not isinstance(data, np.ndarray)
+                and isinstance(data, rt.DeviceArray)
+                and tensor.device == core_device
+            ):
+                buffers[i] = data
+                continue
+            if reject_foreign:
+                # Plain cuda/rocm/vulkan run with a non-pass-through input
+                # (ndarray-backed host tensor or a payload on another device).
+                # Normally unreachable — the pipeline run-boundary check
+                # rejects wrong-device inputs first; this guards direct
+                # backend-level users of the executable.
+                raise core.DeviceError(
+                    f"input {i} is not a device-resident tensor on this "
+                    f"executable's device ({core_device!r}) and plain GPU runs "
+                    "(cuda/rocm/vulkan) never stage host inputs: there is no implicit "
+                    "host-to-device transfer at the run boundary. Place the "
+                    f"input on the device explicitly first, e.g. "
+                    f"t.to({core_device!r}), or run the executable on the "
+                    "llvm-cpu device with host ndarray inputs"
+                )
+            # llvm-cpu host input -> HAL buffer (host->host ABI
+            # representation). A foreign DEVICE payload reaching here fails
+            # inside ``tensor.numpy()`` with core's own DeviceError (no
+            # implicit device-to-host transfer) — normally unreachable (the
+            # run-boundary check rejects first).
+            buffers[i] = rt.asdevicearray(runtime_device, tensor.numpy())
+
+        entry = self._entry_function()
+        results = entry(*buffers)
+        if results is None:
+            results = ()
+        elif not isinstance(results, tuple):
+            results = (results,)
+        # Device-resident outputs: wrap the returned DeviceArrays (already on
+        # the device) in core.Tensor with the lazy IreeDevicePayload — the
+        # D2H copy happens only if/when .numpy() is called. Wrapping and the
+        # dtype check share ONE pass over a pre-sized output list.
+        output_specs = self._output_specs
+        n_results = len(results)
+        outputs = [None] * n_results
+        if self.signature is not None:
+            if n_results != len(output_specs):
+                raise core.BackendError(
+                    f"program produced {n_results} output tensor(s), "
+                    f"expected {len(output_specs)}"
+                )
+            output_dtypes = self._output_dtypes
+            for i, result in enumerate(results):
+                payload = IreeDevicePayload(result, core_device)
+                tensor = core.Tensor(payload)
+                outputs[i] = tensor
+                dtype = payload._dtype
+                if dtype != output_dtypes[i] and core.dtype(dtype) != output_dtypes[i]:
+                    raise core.BackendError(
+                        f"output {i}: expected dtype {output_specs[i].dtype}, got "
+                        f"{tensor.dtype} — never silently coerce"
+                    )
+        else:
+            for i, result in enumerate(results):
+                outputs[i] = core.Tensor(IreeDevicePayload(result, core_device))
+        return outputs
+
+    # --------------------------------------------------------- synchronize
+    def synchronize(self) -> None:
+        """Explicit no-op: ``run`` already blocks on the device queue.
+
+        IREE's ``run`` is synchronous — the input buffers are handed to the
+        invoke and the outputs are its results, so nothing is outstanding by
+        the time ``run`` returns. This method exists purely so every compiler
+        executable exposes the same call shape (``exe.synchronize()``) and
+        callers never need to know which backend they hold; it adds no
+        per-call sync, flag or FFI call. The xla adapter's device-resident
+        run IS asynchronous and needs it.
+
+        Returns ``None``; calling it repeatedly is harmless.
+        """
+        return None
+
+    # ------------------------------------------------------------- internals
+
+    def _entry_function(self) -> Any:
+        """Resolve the v1 entry function: ``"main"``, else the single one.
+
+        Resolved ONCE and cached: resolution is a ``BoundModule`` attribute
+        access that constructs a fresh ``FunctionInvoker`` (ABI JSON parse +
+        argument packer) every time — per-call re-resolution would redo that
+        work on every run.
+
+        Raises:
+            core.BackendError: no ``"main"`` function and not exactly one
+                recorded entry function.
+        """
+        if self._entry is not None:
+            return self._entry
+        if "main" in self._entry_functions:
+            entry = getattr(self.native_module, "main")
+        elif len(self._entry_functions) == 1:
+            entry = getattr(self.native_module, self._entry_functions[0])
+        else:
+            raise core.BackendError(
+                f"the {self.backend_name} executable has "
+                f"{len(self._entry_functions)} entry functions and no 'main' "
+                "entry function"
+            )
+        self._entry = entry
+        return entry
+
+def _wait_copy_semaphore(sem: Any) -> None:
+    """Block until a queue_copy's completion semaphore reaches 1.
+
+    Query-first fast path: ``HalSemaphore.query()`` is a cheap host-side
+    read (no kernel sync), and a copy issued on a short queue often
+    completes before the host reaches the wait — in that case the
+    heavyweight ``HalFence.wait()`` (fixed host-side cost ~0.02-0.2 ms on
+    the cuda HAL, measured) is skipped entirely. The ordering guarantee is
+    UNCHANGED: when the query shows the copy still pending (value < 1),
+    the full fence wait runs exactly as before — the invoke never races
+    the copy (the wait remains load-bearing; queue_copy is not reliably
+    stream-ordered ahead of invoke dispatches on the iree cuda HAL).
+    Semaphore values are monotonic, so query-then-wait is race-free.
+    Falls back to the plain wait when the runtime lacks ``query``
+    (legacy iree-runtime distributions).
+    """
+    query = getattr(sem, "query", None)
+    if query is None or query() >= 1:
+        return
+    import iree.runtime as rt
+
+    rt.HalFence.create_at(sem, 1).wait()
+
+
+def _staged_input(
+    staged_inputs: dict | None,
+    runtime_device: Any,
+    index: int,
+    tensor: core.Tensor,
+    device_kind: str = "cuda",
+) -> Any | None:
+    """Upload a host tensor through staging buffers (segment boundaries + placement).
+
+    R6.2+ consumers (binding — plain ``IreeExecutable`` runs NEVER stage):
+    this helper now serves (a) the split external-call SEGMENT executables
+    (``_IreeSegmentExecutable``) — host-mode external kernels legitimately
+    stage host tensors at kernel boundaries, and (b) the ``upload_tensor``
+    placement provider, which passes a FRESH per-call staging dict so every
+    upload uses fresh buffers (one-shot, no cache).
+
+    The staging fast path is chosen EXPLICITLY by the NORMALIZED device kind
+    (``device_kind``): ``"cuda"`` takes the two-tier pinned/DMA path below,
+    ``"rocm"`` takes ``_rocm_staged_input`` (host-local source + queue_copy,
+    the same shapes, wired for the hip HAL driver). Both are fully
+    synchronous. ANY OTHER KIND — notably ``"vulkan"`` — takes NO staging
+    tier and returns ``None`` immediately (before any buffer work), so the
+    caller uses the plain ``rt.asdevicearray`` path: the CUDA tiers'
+    correctness rests on a CUDA-driver host-write-vs-dispatch ordering
+    guarantee (see the fresh-semaphore note below) that is NOT verified on
+    IREE's vulkan HAL driver, so the plain path is the v1 choice for it.
+    Anything the selected path cannot handle — oversized inputs, unmappable
+    dtypes, or ANY failure on the fast path — returns ``None`` as well
+    (semantics identical either way).
+
+    CUDA fast path replacing ``rt.asdevicearray`` for host tensors, in
+    two tiers (both fully synchronous — nothing is left racing):
+
+    * TINY inputs (nbytes <= ``_PINNED_DIRECT_MAX_BYTES``): the values
+      are memcpy'd (``np.copyto``) into the mapped view of a persistent
+      DEVICE_LOCAL | HOST_VISIBLE ("pinned") buffer that the dispatches
+      read DIRECTLY — no queue_copy, no semaphore, no wait. The driver
+      serializes the host write against device reads of the mapped
+      memory, so the dispatch always sees the new values; that same
+      serialization is what makes large pinned uploads slow (hence the
+      cutoff — measured 0.5-1.2 ms at 160 KB vs ~0.05-0.06 ms at 8 B
+      including the invoke, and the pinned tier does NOT degrade when
+      the upload follows another invoke, unlike the DMA tier's wait).
+    * LARGER inputs: the values are memcpy'd into the mapped view of a
+      persistent HOST_LOCAL (plain host memory) source buffer, then a
+      per-call ``queue_copy`` (DMA) transfers them into a persistent
+      DEVICE_LOCAL staging buffer the dispatches read, waiting on a
+      FRESH semaphore signaled by the copy before returning. The fresh
+      semaphore is REQUIRED (reusing a waited event-semaphore aborts
+      the cuda HAL, event_semaphore.c:354, on the second use) and the
+      wait is REQUIRED for correctness: the copy and the invoke's
+      dispatches are NOT reliably ordered on the cuda HAL — dropping
+      the wait races the dispatch against the copy (~0.4 % of runs
+      return garbage under alternating-value stress).
+
+    The DeviceArray over the staging/pinned buffer is built ONCE per
+    (input index, shape, dtype) and cached in ``staged_inputs`` (per
+    executable); every call re-copies the current host values into the
+    same mapped view (runs are synchronous, so reuse cannot race).
+
+    Why not use the pinned tier for everything? Measured on IREE
+    3.11.0 / RTX A6000: host writes into host-mapped DEVICE memory go
+    over PCIe write-through AND the driver serializes a host write
+    against outstanding device reads of that memory (~0.3-0.6 ms stall
+    per call at 160 KB), while HOST_LOCAL writes are a plain cached
+    memcpy (~0.01 ms for 160 KB) and the DMA queue_copy is ~0.01 ms —
+    the DMA tier tracks the pure invoke cost at scale.
+
+    Falls back to ``None`` (caller uses ``asdevicearray``) for
+    non-cuda executables (``staged_inputs is None``), device kinds with no
+    staging tier (anything but ``"cuda"``/``"rocm"``), oversized inputs,
+    unmappable dtypes, and a full cache — semantics identical either way.
+    """
+    if staged_inputs is None:
+        return None
+    if device_kind not in ("cuda", "rocm"):
+        # Explicit kind dispatch (never a "defaults to cuda" fallthrough):
+        # only the cuda and rocm kinds have a staging tier. ``"vulkan"``
+        # uploads therefore go through the plain ``rt.asdevicearray`` path
+        # (the CUDA tiers' ordering guarantee is unverified on the vulkan
+        # HAL driver). Returns BEFORE any buffer work.
+        return None
+    import numpy as np
+    import iree.runtime as rt
+    from iree.runtime.array_interop import map_dtype_to_element_type
+
+    dtype = tensor.dtype
+    shape = tuple(tensor.shape)
+    nbytes = int(np.prod(shape)) * dtype.itemsize
+    if nbytes > _STAGED_INPUT_MAX_BYTES:
+        return None
+    element_type = map_dtype_to_element_type(dtype)
+    if element_type is None:
+        return None
+    if device_kind == "rocm":
+        return _rocm_staged_input(
+            staged_inputs,
+            runtime_device,
+            index,
+            tensor,
+            shape,
+            dtype,
+            element_type,
+            nbytes,
+        )
+    key = (index, shape, dtype)
+    cached = staged_inputs.get(key)
+    if cached is not None:
+        kind, payload = cached
+        if kind == "pin":
+            da, view = payload
+            np.copyto(view, tensor.numpy())
+            return da
+        hl_buf, hl_view, staging_da = payload
+        np.copyto(hl_view, tensor.numpy())
+        sem = runtime_device.create_semaphore(0)
+        runtime_device.queue_copy(
+            hl_buf,
+            staging_da._buffer_view.get_buffer(),
+            rt.HalFence.create_at(sem, 0),
+            rt.HalFence.create_at(sem, 1),
+        )
+        _wait_copy_semaphore(sem)
+        return staging_da
+    if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+        staged_inputs.clear()  # bounded cache; correctness unaffected
+    if nbytes <= _PINNED_DIRECT_MAX_BYTES:
+        # Pinned direct-read tier: dispatch reads the host-mapped
+        # DEVICE_LOCAL buffer directly; the driver's write/read
+        # serialization orders the host write before the dispatch.
+        buf = runtime_device.allocator.allocate_buffer(
+            rt.MemoryType.DEVICE_LOCAL | rt.MemoryType.HOST_VISIBLE,
+            rt.BufferUsage.DEFAULT | rt.BufferUsage.MAPPING,
+            nbytes,
+        )
+        view = buf.map().asarray(shape, np.dtype(dtype))
+        da = rt.DeviceArray(
+            runtime_device,
+            rt.HalBufferView(buf, shape, element_type),
+            implicit_host_transfer=False,
+            override_dtype=dtype,
+        )
+        np.copyto(view, tensor.numpy())
+        staged_inputs[key] = ("pin", (da, view))
+        return da
+    # DMA tier: host-local source (plain host memory — cached writes) +
+    # persistent device staging buffer (dispatch storage).
+    hl_buf = runtime_device.allocator.allocate_buffer(
+        rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
+        rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
+        nbytes,
+    )
+    hl_view = hl_buf.map().asarray(shape, np.dtype(dtype))
+    stg_buf = runtime_device.allocator.allocate_buffer(
+        rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+    )
+    staging_da = rt.DeviceArray(
+        runtime_device,
+        rt.HalBufferView(stg_buf, shape, element_type),
+        implicit_host_transfer=False,
+        override_dtype=dtype,
+    )
+    np.copyto(hl_view, tensor.numpy())
+    sem = runtime_device.create_semaphore(0)
+    runtime_device.queue_copy(
+        hl_buf,
+        staging_da._buffer_view.get_buffer(),
+        rt.HalFence.create_at(sem, 0),
+        rt.HalFence.create_at(sem, 1),
+    )
+    _wait_copy_semaphore(sem)
+    staged_inputs[key] = ("dma", (hl_buf, hl_view, staging_da))
+    return staging_da
+
+
+def _rocm_source_buffer(
+    runtime_device: Any, shape: tuple, dtype: Any, nbytes: int
+) -> tuple[Any, Any]:
+    """Return a reusable THREAD-LOCAL host source buffer for the rocm path.
+
+    ``_rocm_staged_input`` memcpy's current host values into the mapped view
+    of a ``HOST_LOCAL | DEVICE_VISIBLE`` (``TRANSFER_SOURCE | MAPPING``)
+    buffer and then ``queue_copy``s it to the device. The SOURCE buffer is
+    safe to reuse across calls (runs are synchronous), and reusing it avoids
+    a per-call mapped-buffer allocation — the same idea as the cuda DMA
+    tier's persistent ``hl_buf``/``hl_view``, but shared across rocm
+    uploads on the thread instead of per executable (the one-shot placement
+    path has no per-executable cache to hang it off).
+
+    THREAD-LOCAL because the mapped buffer and the HAL device that owns it
+    are both thread-affine (``evoxc.io``'s worker thread uploads separately);
+    keyed by ``(shape, dtype)`` with the owning runtime device checked by
+    IDENTITY so a thread that talks to two devices never reuses across them.
+    Bounded at ``_ROCM_SOURCE_CACHE_MAX`` entries (a bounded cache; clearing
+    it is performance-neutral, never a correctness change).
+    """
+    cache = getattr(_ROCM_SOURCE, "buffers", None)
+    if cache is None:
+        cache = {}
+        _ROCM_SOURCE.buffers = cache
+    entry = cache.get((shape, dtype))
+    if entry is not None and entry[0] is runtime_device:
+        return entry[1], entry[2]
+    import numpy as np
+    import iree.runtime as rt
+
+    buf = runtime_device.allocator.allocate_buffer(
+        rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
+        rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
+        nbytes,
+    )
+    view = buf.map().asarray(shape, np.dtype(dtype))
+    if len(cache) >= _ROCM_SOURCE_CACHE_MAX:
+        cache.clear()
+    cache[(shape, dtype)] = (runtime_device, buf, view)
+    return buf, view
+
+
+def _rocm_staged_input(
+    staged_inputs: dict,
+    runtime_device: Any,
+    index: int,
+    tensor: core.Tensor,
+    shape: tuple,
+    dtype: Any,
+    element_type: Any,
+    nbytes: int,
+) -> Any | None:
+    """ROCm/HIP staging fast path replacing ``rt.asdevicearray``.
+
+    The hip HAL driver offers no mapped DEVICE_LOCAL host-write path that
+    matches the cuda pinned tier's cost, so rocm uses a single-tier
+    equivalent of the cuda DMA tier, measured on IREE 3.11.0 / MI300X:
+
+    * the values are memcpy'd (``np.copyto``) into the mapped view of a
+      reusable THREAD-LOCAL ``HOST_LOCAL | DEVICE_VISIBLE`` source buffer
+      (see ``_rocm_source_buffer`` — a plain cached memcpy), then a
+      per-call ``queue_copy`` transfers them into a ``DEVICE_LOCAL``
+      destination, waiting on a FRESH semaphore via the shared
+      query-first ``_wait_copy_semaphore`` before returning.
+
+    The fresh semaphore and the wait are LOAD-BEARING, exactly as on cuda
+    (reusing a waited event-semaphore aborts the HAL; and the copy is not
+    guaranteed to be ordered ahead of the invoke's dispatches — the wait is
+    what makes the staging synchronous).
+
+    Destination lifetime: for the SEGMENT executables the ``DEVICE_LOCAL``
+    destination is cached per ``(index, shape, dtype)`` in the caller's
+    ``staged_inputs`` (persistent, like the cuda tiers). For the ONE-SHOT
+    ``upload_tensor`` placement the caller passes a FRESH dict, so the
+    destination is FRESH every call — the returned ``core.Tensor`` owns its
+    buffer and must never share it with a later upload.
+
+    Returns ``None`` (caller falls back to ``rt.asdevicearray``, semantics
+    identical) on ANY failure of the fast path — a hip HAL that lacks one of
+    the primitives, an unmappable buffer, or a host-materialization error
+    other than an explicit ``core.EVOXCError`` (which always propagates: it is
+    the documented no-implicit-transfer error and the fallback would re-raise
+    it anyway).
+    """
+    import numpy as np
+    import iree.runtime as rt
+
+    try:
+        src_buf, src_view = _rocm_source_buffer(
+            runtime_device, shape, dtype, nbytes
+        )
+        np.copyto(src_view, tensor.numpy())
+        key = (index, shape, dtype)
+        dest = staged_inputs.get(key)
+        if dest is None:
+            if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+                staged_inputs.clear()  # bounded cache; correctness unaffected
+            dest_buf = runtime_device.allocator.allocate_buffer(
+                rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+            )
+            dest = rt.DeviceArray(
+                runtime_device,
+                rt.HalBufferView(dest_buf, shape, element_type),
+                implicit_host_transfer=False,
+                override_dtype=dtype,
+            )
+            staged_inputs[key] = dest
+        sem = runtime_device.create_semaphore(0)
+        runtime_device.queue_copy(
+            src_buf,
+            dest._buffer_view.get_buffer(),
+            rt.HalFence.create_at(sem, 0),
+            rt.HalFence.create_at(sem, 1),
+        )
+        _wait_copy_semaphore(sem)
+        return dest
+    except core.EVOXCError:
+        raise
+    except Exception:
+        # Fall back to rt.asdevicearray — same bytes, same semantics.
+        return None
+
+
+def _build_buffers(
+    flat_input_tensors: list[core.Tensor],
+    input_specs: tuple,
+    runtime_device: Any,
+    core_device: Device,
+    staged_inputs: dict | None,
+    *,
+    reject_foreign: bool = False,
+    device_kind: str,
+) -> list:
+    """Build the HAL buffers for one invoke from validated input tensors.
+
+    Serves the per-segment executor (``_IreeSegmentExecutable.run``).
+    ``IreeExecutable.run`` performs the PLAIN-RUN form of these branches
+    inline, fused into its single validation pass; the branch order, the
+    pass-through rule and every error are identical, so a change here must be
+    mirrored there (and vice versa).
+
+    An input tensor already living on THIS device (payload-backed with a
+    matching ``core.Device`` — our own ``IreeDevicePayload`` (run outputs of
+    this or another iree executable, unwrapped to the underlying DeviceArray)
+    or a raw iree ``DeviceArray``) is handed to the invoke as-is — no host
+    round-trip, no re-upload; the caller's validation loop already proved
+    dtype/shape, so the payload is guaranteed correct.
+
+    Foreign (non-pass-through) input handling depends on the caller (R6.2 —
+    explicit device placement, no implicit host<->device transfers):
+
+    * plain runs (``staged_inputs=None`` — now inlined in
+      ``IreeExecutable.run``): a host ndarray-backed input takes the
+      ``rt.asdevicearray`` representation path on an llvm-cpu executable
+      (host->host ABI adaptation), and is REJECTED with ``core.DeviceError``
+      on a cuda/rocm/vulkan executable (``reject_foreign=True`` —
+      defensive: the pipeline run-boundary check normally rejects
+      foreign-device inputs first with its own message; place inputs
+      explicitly via ``t.to(Device('cuda'|'rocm'|'vulkan', N))``).
+    * segment executables pass their per-segment staging cache
+      (``reject_foreign=False``): host-mode external-kernel boundaries
+      legitimately stage host tensors via ``_staged_input`` on cuda and rocm
+      (``device_kind`` selects the kind's fast path), else the asdevicearray
+      fallback (non-GPU kinds, llvm-cpu, and every other device kind —
+      notably vulkan, which has no staging tier).
+
+    ``device_kind`` is a REQUIRED keyword (the NORMALIZED kind) — there is
+    deliberately no ``"cuda"`` default, so a caller with another kind can
+    never silently inherit the cuda staging tier.
+    """
+    import numpy as np
+    import iree.runtime as rt
+
+    buffers = []
+    for i, tensor in enumerate(flat_input_tensors):
+        data = tensor.data
+        if isinstance(data, IreeDevicePayload) and tensor.device == core_device:
+            buffers.append(data.device_array)
+        elif (
+            not isinstance(data, np.ndarray)
+            and isinstance(data, rt.DeviceArray)
+            and tensor.device == core_device
+        ):
+            buffers.append(data)
+        elif reject_foreign:
+            # Plain cuda/rocm/vulkan run with a non-pass-through input
+            # (ndarray-backed host tensor or a payload on another device).
+            # Normally unreachable — the pipeline run-boundary check rejects
+            # wrong-device inputs first; this guards direct backend-level
+            # users of the executable.
+            raise core.DeviceError(
+                f"input {i} is not a device-resident tensor on this "
+                f"executable's device ({core_device!r}) and plain GPU runs "
+                "(cuda/rocm/vulkan) never stage host inputs: there is no implicit "
+                "host-to-device transfer at the run boundary. Place the "
+                f"input on the device explicitly first, e.g. "
+                f"t.to({core_device!r}), or run the executable on the "
+                "llvm-cpu device with host ndarray inputs"
+            )
+        elif staged_inputs is not None:
+            staged = _staged_input(
+                staged_inputs, runtime_device, i, tensor, device_kind
+            )
+            if staged is not None:
+                buffers.append(staged)
+                continue
+            buffers.append(rt.asdevicearray(runtime_device, tensor.numpy()))
+        else:
+            # Plain llvm-cpu executable: host ndarray input -> HAL buffer
+            # (host->host ABI representation). A foreign DEVICE payload
+            # reaching here fails inside tensor.numpy() with core's own
+            # DeviceError (no implicit device-to-host transfer) — also
+            # normally unreachable (the run-boundary check rejects first).
+            buffers.append(rt.asdevicearray(runtime_device, tensor.numpy()))
+    return buffers
+
+
+class _IreeSegmentExecutable:
+    """One compiled segment of an external-call graph (internal).
+
+    A segment is an ordinary compiled function (no ``external_call``
+    inside) with its own static input spec list. ``run`` mirrors
+    ``IreeExecutable.run``'s validation + buffer-building + invoke + lazy
+    device-resident output wrapping (shared helpers), against the segment's
+    own input specs.
+
+    The ``device_kind`` (the NORMALIZED kind — ``"hip"`` already folded to
+    ``"rocm"``) enables the per-call persistent staging fast path used when
+    a host-mode external kernel's boundary stages host tensors: the cuda
+    two-tier pinned/DMA path (+ the pool anchor) for ``"cuda"``, the rocm
+    host-local source + queue_copy path for ``"rocm"``. ``llvm-cpu``
+    segments keep ``_staged_inputs=None`` and stage through the generic
+    ``rt.asdevicearray`` representation (host->host ABI adaptation).
+    """
+
+    def __init__(
+        self,
+        module: Any,
+        runtime_device: Any,
+        core_device: Device,
+        input_specs: tuple,
+        device_kind: str,
+    ) -> None:
+        self.module = module
+        self.runtime_device = runtime_device
+        self.core_device = core_device
+        self.input_specs = input_specs
+        self.device_kind = device_kind
+        self._entry: Any = None
+        # Per-call fast path (R6.2: removed from the plain IreeExecutable —
+        # retained HERE, one cache per segment, because host-mode
+        # external-kernel boundaries legitimately stage host tensors at
+        # kernel boundaries): the kind's persistent staging machinery, the
+        # same one the placement provider's one-shot uploads use.
+        self._staged_inputs: dict | None = None
+        self._pool_anchor: Any = None
+        if device_kind in _GPU_DEVICE_KINDS:
+            # One staging cache per segment for the kinds that HAVE a staging
+            # tier (see ``_staged_input``): cuda and rocm. A vulkan segment
+            # gets the dict but never uses it — ``_staged_input`` returns
+            # ``None`` for vulkan, so its segment boundaries stage through
+            # the plain ``rt.asdevicearray`` path.
+            self._staged_inputs = {}
+            if device_kind == "cuda":
+                # cuda-only classic-allocator pool anchor (see the staging
+                # notes at the top of this module) — the rocm and vulkan
+                # paths need no anchor.
+                import iree.runtime as rt
+
+                try:
+                    self._pool_anchor = runtime_device.allocator.allocate_buffer(
+                        rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
+                    )
+                except Exception:
+                    self._pool_anchor = None  # best-effort perf anchor, no-op
+
+    def _entry_function(self) -> Any:
+        """Resolve the segment's "main" entry function (cached once)."""
+        if self._entry is None:
+            self._entry = getattr(self.module, "main")
+        return self._entry
+
+    def run(self, flat_input_tensors: list[core.Tensor]) -> list[core.Tensor]:
+        """Validate + invoke the segment; outputs stay DEVICE-RESIDENT."""
+        input_specs = self.input_specs
+        if len(flat_input_tensors) != len(input_specs):
+            raise core.BackendError(
+                f"external-call segment expects {len(input_specs)} input "
+                f"tensor(s), got {len(flat_input_tensors)}"
+            )
+        for i, tensor in enumerate(flat_input_tensors):
+            if not isinstance(tensor, core.Tensor):
+                raise core.BackendError(
+                    f"external-call segment input {i} must be a core.Tensor, "
+                    f"got {type(tensor).__name__}"
+                )
+            spec = input_specs[i]
+            if tensor.dtype != spec.dtype:
+                raise core.BackendError(
+                    f"external-call segment input {i}: expected dtype "
+                    f"{spec.dtype}, got {tensor.dtype} — never silently "
+                    "coerce"
+                )
+            shape = tensor.shape
+            if spec.shape != shape:
+                # Static-shape fast path (see IreeExecutable.run): exact
+                # tuple equality skips the per-dim walk; symbolic/dynamic
+                # entries fall into the walk with identical semantics.
+                _validate_input_shape(i, spec.shape, shape)
+        buffers = _build_buffers(
+            flat_input_tensors,
+            input_specs,
+            self.runtime_device,
+            self.core_device,
+            self._staged_inputs,
+            device_kind=self.device_kind,
+        )
+        results = self._entry_function()(*buffers)
+        if results is None:
+            results = ()
+        elif not isinstance(results, tuple):
+            results = (results,)
+        return [
+            core.Tensor(IreeDevicePayload(result, self.core_device))
+            for result in results
+        ]
+
+
+class IreeExternalExecutable(CompilerExecutable):
+    """IREE executable for a SPLIT external-call graph (round 2+ dispatch).
+
+    Runs the graph's compiled segments strictly in plan order on the IREE
+    HAL device; at each ``external_call`` boundary the kernel's operand
+    tensors (the DEVICE-RESIDENT outputs of the producing segment — never
+    pre-staged) are dispatched through the SAME name-keyed registry the
+    numpy backend uses (``evoxc.external``; an unregistered name raises
+    ``core.BackendError`` pointing at ``evoxc.register_external_kernel``).
+    Two kernel modes:
+
+    - HOST mode (default registration, ``device_resident=False``): the
+      dispatcher stages the operands to host numpy arrays (lazy
+      ``.numpy()``), calls the kernel, and its validated host results are
+      staged BACK into the following segment's inputs (the segment
+      executables' host-tensor staging machinery — ``_staged_input`` on
+      cuda, ``asdevicearray`` on llvm-cpu and rocm — uploads them).
+    - DEVICE mode (``device_resident=True`` registration): the dispatcher
+      passes the device tensors DIRECTLY (zero host staging on the way in);
+      the kernel may return ``core.Tensor`` s, duck-typed device payloads
+      (e.g. ``IreeDevicePayload``), raw iree ``DeviceArray`` s (wrapped with
+      the run's ``core.Device``), numpy arrays, or tuple/list mixes of them;
+      results are validated METADATA-ONLY (count/dtype/shape — never a
+      forced host copy) and occupy the plan's result slots, where the next
+      segment's same-device pass-through consumes device results with ZERO
+      host round-trips (host-array results are staged back by the segment
+      input machinery).
+
+    Carried plain values that are NOT kernel operands stay device-resident
+    across segment runs — zero extra host round-trips for them.
+
+    Execution model / determinism:
+    - Segments execute strictly sequentially in plan order; the ``callback``
+      effect anchors of the original graph are preserved (a kernel call is
+      never reordered against the compiled ops around it).
+    - Kernels are assumed PURE (same inputs -> same outputs): the same
+      inputs + the same registered kernels produce the same results.
+    - A ``UserWarning`` is emitted once per executable when the FIRST
+      boundary that actually stages tensors host<->device executes (a
+      host-mode kernel, or device-mode results that are host-backed) —
+      fully device-resident boundaries never warn; the message notes that
+      ``device_resident=True`` registrations skip per-boundary host staging
+      (see ``run``).
+    - The graph's structured I/O contract (the recorded ``Signature``) is
+      unchanged: ``run`` validates flat inputs against it and returns the
+      graph's flat outputs (the final segment's module outputs).
+    """
+
+    backend_name = "iree"
+
+    # Run-stage option validation table — mirrors ``IreeBackend.KNOWN_OPTIONS``
+    # (the iree run stage has NO known options in v1).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = IreeBackend.KNOWN_OPTIONS
+
+    def __init__(
+        self,
+        artifact: CompiledArtifact,
+        signature: Signature | None,
+        device: core.Device | None,
+        segments: list[_IreeSegmentExecutable],
+        plan: list[dict],
+        runtime_device: Any,
+    ) -> None:
+        super().__init__(
+            artifact=artifact,
+            signature=signature,
+            device=device,
+            native_module=None,  # segments are held per-segment
+            entry_functions=(),
+        )
+        self.runtime_device = runtime_device
+        self._core_device: Device = (
+            device if device is not None else Device("cpu", 0)
+        )
+        self._segments = tuple(segments)
+        self._plan = tuple(plan)
+        self._input_specs = (
+            tuple(signature.input_specs) if signature is not None else ()
+        )
+        self._output_specs = (
+            tuple(signature.output_specs) if signature is not None else ()
+        )
+        if not plan:
+            raise core.BackendError(
+                "corrupt: the external-call plan records no segments"
+            )
+        self._final_module_outputs = plan[-1]["module_outputs"]
+        self._staging_warned = False  # once-per-executable staging warning
+
+    # ------------------------------------------------------------------ run
+
+    def run(
+        self,
+        flat_input_tensors: list[core.Tensor],
+        options: dict | None = None,
+    ) -> list[core.Tensor]:
+        """Execute the split graph: per-segment device runs + kernel dispatch.
+
+        1. Validate flat inputs against the recorded ``Signature`` (the
+           original graph's I/O contract — count/dtype/shape, same rules as
+           ``IreeExecutable.run``).
+        2. For each segment in plan order: build its flat input list from
+           (graph inputs) ∪ (carried values from earlier segment outputs —
+           device-resident tensors pass through with no host round-trip) and
+           run it on the device. If the segment ends in an ``external_call``:
+           dispatch the registered kernel with the segment's device-resident
+           operand tensors — a HOST-mode kernel (``device_resident=False``)
+           receives host numpy arrays (staged here), a DEVICE-mode kernel
+           (``device_resident=True``) receives the device tensors DIRECTLY
+           and may return device tensors / duck payloads (wrapped via
+           ``_wrap_device_result``) / host arrays; outputs are validated
+           METADATA-ONLY against the declared result specs — count/dtype/
+           shape, never silent coercion, never a forced host copy — and
+           stored at the plan's result slots. Missing kernel =>
+           ``core.BackendError`` naming the kernel and pointing at
+           ``register_external_kernel``. The once-per-executable
+           "host-dispatch" staging ``UserWarning`` fires ONLY when a
+           boundary actually stages tensors host<->device (a host-mode
+           kernel, or device-mode results that are host-backed numpy —
+           ``device_resident=True`` registrations with fully device-resident
+           results never warn).
+        3. Return the final segment's module outputs (the graph's outputs),
+           validated against the signature output specs.
+        """
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
+        from ..external_split import dispatch_external_kernel  # lazy
+
+        input_specs = self._input_specs
+        if len(flat_input_tensors) != len(input_specs):
+            raise core.BackendError(
+                f"program expects {len(input_specs)} input tensor(s), got "
+                f"{len(flat_input_tensors)}"
+            )
+        for i, tensor in enumerate(flat_input_tensors):
+            if not isinstance(tensor, core.Tensor):
+                raise core.BackendError(
+                    f"input {i} must be a core.Tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+            spec = input_specs[i]
+            if tensor.dtype != spec.dtype:
+                raise core.BackendError(
+                    f"input {i}: expected dtype {spec.dtype}, got "
+                    f"{tensor.dtype} — never silently coerce"
+                )
+            _validate_input_shape(i, spec.shape, tensor.shape)
+
+        # segment_outputs[j] = the run-time output slot list of segment j:
+        # slots [0, module_outputs) are the module's return values
+        # (device-resident Tensors); slots [module_outputs, ...) are the
+        # kernel results (device-resident for device-mode kernels, host
+        # Tensors for host-mode kernels — staged back by the next segment's
+        # input machinery at dispatch time).
+        segment_outputs: list[list[core.Tensor]] = []
+        for segment_index, (segment, plan_segment) in enumerate(
+            zip(self._segments, self._plan)
+        ):
+            seg_inputs = []
+            for entry in plan_segment["inputs"]:
+                kind = entry["kind"]
+                if kind == "graph":
+                    seg_inputs.append(flat_input_tensors[entry["index"]])
+                elif kind in ("carry", "kernel"):
+                    seg_inputs.append(
+                        segment_outputs[entry["segment"]][entry["output"]]
+                    )
+                else:
+                    raise core.BackendError(
+                        f"corrupt: external-call plan segment "
+                        f"{segment_index} has an unknown input kind "
+                        f"{kind!r}"
+                    )
+            outputs = segment.run(seg_inputs)
+            out_slots: list[core.Tensor] = list(outputs)
+            call = plan_segment.get("call")
+            if call is not None:
+                name = call["name"]
+                label = f"op 'external_call' (kernel {name!r})"
+                operand_tensors = [
+                    outputs[slot]
+                    for slot in call["operand_outputs"]
+                ]
+                results, staged = dispatch_external_kernel(
+                    name,
+                    operand_tensors,
+                    call["result_specs"],
+                    label,
+                    wrap_device_result=self._wrap_device_result,
+                )
+                if staged and not self._staging_warned:
+                    self._staging_warned = True
+                    warnings.warn(
+                        "iree host-dispatch: this external_call boundary "
+                        "staged tensors device -> host -> device "
+                        "(per-boundary host round-trips, v1 mechanism; "
+                        "device_resident=True registrations skip "
+                        "per-boundary host staging). Lower-time "
+                        "restrictions: no control-flow bodies around calls, "
+                        "host-mode boundaries require static (integer) "
+                        "result dims, at least one tensor operand, "
+                        "kernels assumed pure",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                out_slots.extend([None] * len(call["result_specs"]))
+                for slot, tensor in zip(call["result_outputs"], results):
+                    out_slots[slot] = tensor
+            segment_outputs.append(out_slots)
+
+        final = segment_outputs[-1]
+        outputs = final[: self._final_module_outputs]
+        if self.signature is not None:
+            if len(outputs) != len(self._output_specs):
+                raise core.BackendError(
+                    f"program produced {len(outputs)} output tensor(s), "
+                    f"expected {len(self._output_specs)}"
+                )
+            for i, (tensor, spec) in enumerate(zip(outputs, self._output_specs)):
+                if tensor.dtype != spec.dtype:
+                    raise core.BackendError(
+                        f"output {i}: expected dtype {spec.dtype}, got "
+                        f"{tensor.dtype} — never silently coerce"
+                    )
+        return outputs
+
+    def _wrap_device_result(self, entry: Any) -> core.Tensor:
+        """Wrap one raw DEVICE-kernel result entry into a ``core.Tensor``.
+
+        Passed to ``dispatch_external_kernel`` as ``wrap_device_result``: a
+        raw iree runtime ``DeviceArray`` is wrapped in
+        ``core.Tensor(IreeDevicePayload(entry, self._core_device))`` — the
+        result lives on THIS executable's device (``DeviceArray`` handles
+        returned by device kernels are HAL buffers on the run's device);
+        any other entry (a duck-typed device payload carrying its own
+        ``core.Device``) wraps as ``core.Tensor(entry)`` directly. Never
+        materializes a host copy. ``iree.runtime`` is imported lazily
+        inside the function body (import acyclicity).
+        """
+        import iree.runtime as rt
+
+        if isinstance(entry, rt.DeviceArray):
+            return core.Tensor(IreeDevicePayload(entry, self._core_device))
+        return core.Tensor(entry)
+
+
+# ---------------------------------------------------------------------------
+# Per-call run-path helpers
+# ---------------------------------------------------------------------------
+# Nothing here caches VALUES or runtime tensors: the entries below are static
+# metadata (plans, dtype mappings) or module handles, re-checked against the
+# ACTUAL run arguments on every call.
+#
+# ``numpy`` / ``iree.runtime`` memoized once for the run path: the heavy-import
+# rule keeps them out of module top level, but a per-call ``import`` statement
+# still pays a ``sys.modules`` lookup on every run.
+_RUNTIME_MODULES: list = []
+
+
+def _runtime_modules() -> tuple[Any, Any]:
+    """Return the memoized ``(numpy, iree.runtime)`` module pair."""
+    mods = _RUNTIME_MODULES
+    if not mods:
+        import numpy as np
+
+        import iree.runtime as rt
+
+        mods += (np, rt)
+    return mods[0], mods[1]
+
+
+# HAL element-type int -> numpy dtype, resolved lazily through iree's own
+# mapping helper and memoized per element type (a STATIC mapping: an element
+# type's numpy dtype never changes).
+_HAL_ELEMENT_DTYPES: dict[int, Any] = {}
+
+
+def _hal_element_dtype(element_type: int) -> Any:
+    """numpy dtype for an IREE HAL element-type int (memoized lookup).
+
+    ``DeviceArray.dtype`` resolves this through nanobind on EVERY access
+    (~0.4-0.5 us, measured) — the dominant cost of wrapping run outputs in
+    ``IreeDevicePayload`` before the memo existed.
+    """
+    dtype = _HAL_ELEMENT_DTYPES.get(element_type)
+    if dtype is None:
+        from iree.runtime.array_interop import HalElementType
+
+        dtype = HalElementType.map_to_dtype(element_type)
+        _HAL_ELEMENT_DTYPES[element_type] = dtype
+    return dtype
+
+
+def _input_plan(input_specs: tuple) -> tuple:
+    """Static per-input validation contract, derived ONCE per executable.
+
+    Entries are ``(dtype, shape, needs_dim_walk)`` from the declared specs
+    (``TensorSpec`` normalizes ``dtype`` to a numpy dtype and ``shape`` to a
+    tuple), where ``needs_dim_walk`` is True iff the declared shape holds a
+    non-``int`` entry (symbolic ``Dim``/``DimExpr`` or ``None``) — such a spec
+    can never tuple-match a concrete runtime shape, so the per-dim walker runs
+    instead of a plain tuple compare.
+    """
+    return tuple(
+        (
+            spec.dtype,
+            spec.shape,
+            any(not isinstance(dim, int) for dim in spec.shape),
+        )
+        for spec in input_specs
+    )
+
+
+def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
+    """Walk a declared input shape against the concrete shape.
+
+    Rank must match exactly (``core.ShapeError``). Per-dim: a static ``int``
+    dim must equal the runtime size (``core.ShapeError`` naming input/dim);
+    symbolic entries (``Dim``/``DimExpr``) pass through — IREE executes
+    runtime-dynamic shapes (validated) — and ``None`` (runtime-dynamic,
+    unchecked) is skipped, mirroring the interpreter's unchecked-dim rule.
+    """
+    if len(actual) != len(declared):
+        raise core.ShapeError(
+            f"input {index}: rank mismatch — declared rank {len(declared)} "
+            f"vs runtime rank {len(actual)}"
+        )
+    for dim, (want, got) in enumerate(zip(declared, actual)):
+        if want is None:
+            continue  # runtime-dynamic dim: unchecked by design
+        if isinstance(want, int) and want != got:
+            raise core.ShapeError(
+                f"input {index}: shape mismatch at dim {dim} — expected "
+                f"{want}, got runtime size {got}"
+            )
+
+
+class IreeDevicePayload:
+    """Public duck-typed device payload for ``core.Tensor`` (the payload protocol).
+
+    Wraps an IREE runtime ``DeviceArray`` — a HAL buffer-view handle that is
+    ALREADY resident on the executable's device — plus the ``core.Device`` it
+    lives on. Host materialization (``to_host``) is LAZY and EXPLICIT: the
+    D2H copy happens only when the wrapping tensor's host-access path asks
+    for it (CPU-kind outputs materialize in ``.numpy()``; a non-cpu
+    wrapping tensor is read back via the explicit
+    ``t.to(core.Device('cpu', 0)).numpy()`` transfer — no implicit
+    device-to-host transfer), so the hot ``IreeExecutable.run`` path never
+    touches host memory.
+
+    PUBLIC interop contract (device-resident external kernels): kernel authors
+    may isinstance-check ``evoxc.backends.adapters.iree.IreeDevicePayload`` (the
+    ``.data`` of the ``core.Tensor`` operands a device kernel receives) and
+    use:
+
+    - ``.device_array`` — the wrapped iree runtime ``DeviceArray`` (the HAL
+      buffer handle, already on the executable's device; also gives access to
+      the underlying HAL device for running further modules on the SAME
+      device);
+    - ``.shape`` / ``.dtype`` — metadata (tuple of ints / numpy dtype);
+    - ``.to_host()`` — an EXPLICIT materialization to a host numpy array (a
+      device kernel may deliberately materialize; the adapter itself NEVER
+      forces host copies of device results);
+    - ``.device`` — the ``core.Device`` the tensor lives on.
+
+    A device-resident kernel runs on the executable's device and may e.g.
+    compile/run additional vmfb modules on the SAME HAL device via
+    ``iree.runtime`` and return their ``DeviceArray`` s (raw or wrapped).
+
+    Payload protocol (see ``evoxc/core/tensor.py``): ``.shape`` (tuple of
+    ints), ``.dtype`` (numpy-normalizable — DeviceArray is override-aware,
+    e.g. bool results), optional ``.device`` (the core.Device), and
+    ``to_host() -> np.ndarray`` tried first by ``Tensor.numpy()`` (with
+    ``np.asarray`` as the fallback, via ``__array__``). On ``local-task``
+    (llvm-cpu) buffers the to_host mapping is zero-copy for mappable memory;
+    on cuda/rocm/vulkan it is a fresh D2H copy per call (the explicit
+    ``t.to(Device("cpu", 0))`` download path — no per-kind code needed).
+    """
+
+    __slots__ = ("_array", "_shape", "_dtype", "device")
+
+    def __init__(self, array: Any, device: Device) -> None:
+        # Metadata cached at construction: an iree runtime ``DeviceArray`` is
+        # immutable in shape/dtype for its lifetime (run outputs, staged
+        # inputs, and external-kernel results are all created once with fixed
+        # metadata), and every access to the raw ``DeviceArray`` shape/dtype
+        # is a nanobind round-trip through iree's array_interop. ``run`` reads
+        # a payload's dtype/shape on every call and user code reads
+        # ``.shape``/``.dtype`` freely, so resolving once here keeps the
+        # per-call Python overhead flat.
+        #
+        # Resolved from the HAL BUFFER VIEW rather than through the public
+        # ``DeviceArray.shape`` / ``.dtype`` accessors: those go through
+        # numpy's ``__array_function__`` dispatch and iree's nanobind dtype
+        # mapping (~0.35 us + ~0.4 us, measured — the largest component of
+        # output wrapping at 12 outputs). The buffer view is the same source
+        # those accessors read: the shape is a tuple of ints and the dtype is
+        # the element-type int resolved through the module-level memo.
+        self._array = array
+        try:
+            view = array._buffer_view
+            # ``DeviceArray``'s explicit dtype override WINS whenever set,
+            # exactly as ``DeviceArray.dtype`` does (bool results and other
+            # dtypes the HAL element type cannot express).
+            dtype = array._override_dtype
+            if dtype is None:
+                dtype = _hal_element_dtype(view.element_type)
+            shape = tuple(view.shape)
+        except (AttributeError, ValueError):
+            # Defensive: a runtime without the private buffer-view protocol —
+            # fall back to the public accessors (cached afterwards either
+            # way, so the payload protocol is unchanged).
+            shape = tuple(array.shape)
+            dtype = array.dtype
+        self._shape = shape
+        self._dtype = dtype
+        self.device = device
+
+    @property
+    def device_array(self) -> Any:
+        """The wrapped IREE runtime ``DeviceArray`` (the HAL buffer handle).
+
+        Used by ``IreeExecutable.run`` for the same-device pass-through rule:
+        an input tensor produced by an iree executable can be handed to the
+        next invoke without a host round-trip.
+        """
+        return self._array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._shape
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._dtype
+
+    def to_host(self) -> np.ndarray:
+        """Materialize a host copy of the device buffer (lazy D2H)."""
+        return self._array.to_host()
+
+    def __array__(self, dtype: Any = None) -> np.ndarray:
+        """``np.asarray`` fallback for host materialization.
+
+        ``core.Tensor`` prefers ``to_host()``; this keeps
+        ``np.asarray(payload)`` correct for direct payload users too (a
+        fresh host copy per call, like ``to_host``).
+        """
+        return self._array.to_host().__array__(dtype)
+
+
+# Backward-compat alias: the payload was private (``_IreeDevicePayload``)
+# before the device-resident external-kernel round; old isinstance checks
+# keep working.
+_IreeDevicePayload = IreeDevicePayload
+
+
+# ---------------------------------------------------------------------------
+# Explicit placement provider (R6.3): Tensor.to(Device('cuda', N)) upload
+# ---------------------------------------------------------------------------
+
+
+def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
+    """Placement provider: copy a HOST tensor onto a cuda/rocm/vulkan HAL device.
+
+    Registered for the device kinds ``"cuda"``, ``"rocm"``, ``"hip"`` and
+    ``"vulkan"`` in the core device-transfer provider registry
+    (``core.register_backend_device_transfer_provider``; ``"vulkan"`` also
+    gets the FLAT default slot from ``register()`` below), so
+    ``tensor.to(core.Device('cuda'|'rocm'|'vulkan', N))`` dispatches here
+    (the lazy backends-level thunk also delegates here by attribute
+    lookup).
+    Provider contract (core, v1): receives a HOST ndarray-backed
+    ``Device("cpu", 0)`` tensor plus the target ``core.Device`` and returns
+    a ``core.Tensor`` placed on the target device — a fresh device-resident
+    tensor wrapping an ``IreeDevicePayload`` over the freshly uploaded iree
+    ``DeviceArray``. The returned tensor carries the EXACT target ``device``
+    object passed in (the ``hip`` ALIAS is normalized for the driver call
+    only — the label stays as the user wrote it).
+
+    Implementation:
+    1. Source check: a non-host source raises ``core.DeviceError`` directing
+       to the explicit two-hop ``t.to(cpu).to(target)`` (cross-device copies
+       are not implemented in v1 — per the core provider contract).
+    2. Runtime flags: ``EVOXC_IREE_RUNTIME_ARGS`` is honored exactly like
+       ``load`` does (same env parsing via ``_runtime_args_from_env``; loud
+       parse errors) so placement respects process-global HAL flags.
+    3. HAL device: cuda keeps acquiring a FRESH HAL device instance per call
+       through ``_acquire_runtime_device`` (the same path ``load`` uses;
+       feeding such buffers into a separately-loaded executable on the same
+       physical device works — iree accepts same-physical-device buffers
+       across instances, verified empirically, see the R6.4 note in
+       ``evoxc/backends/adapters/CONTEXT.md``). rocm instead reuses ONE
+       THREAD-LOCAL HAL device per ``(index, runtime args)``
+       (``_acquire_cached_rocm_device``): the hip driver's ``create_device``
+       measured ~46 ms per call and does not warm up, so a fresh device per
+       placement was the dominant cost of every rocm upload. VULKAN goes
+       through ``_acquire_vulkan_device``, which caches ONE device per
+       ``(index, runtime args)`` on the calling thread too (the same
+       thread-local cache, same thread-affinity rationale) — so an upload
+       and a later ``load`` on that thread share the SAME HAL device
+       instance (``Device("vulkan", N)`` maps to the N-th enumerated device
+       info dict; see ``_acquire_vulkan_device``). All these caches are
+       thread-local because HAL devices are thread-affine (the ``evoxc.io``
+       worker thread uploads separately and must get its own device).
+    4. Upload: a ONE-SHOT host->device copy through ``_staged_input`` with a
+       FRESH per-call staging dict (fresh DESTINATION buffers, no cache —
+       the returned tensor owns its buffer): the correctness-pinned
+       pinned/DMA tiers on cuda (the DMA tier's fresh-semaphore wait is
+       load-bearing), the host-local-source + queue_copy path on rocm —
+       both falling back to ``rt.asdevicearray`` for oversized/unmappable
+       inputs or any failure on the fast path. VULKAN has NO staging tier
+       in v1 (``_staged_input`` returns ``None`` for it), so its upload IS
+       the plain ``rt.asdevicearray`` copy.
+    5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
+
+    The DOWNLOAD direction needs no code here: ``t.to(Device("cpu", 0))`` on
+    a vulkan-resident tensor goes through the payload host-copy path
+    (``IreeDevicePayload.to_host()``) exactly like cuda/rocm, and
+    ``.numpy()`` on a non-cpu payload raises ``core.DeviceError`` as usual.
+
+    Failures surface as ``core.DeviceError`` / ``core.BackendError`` with an
+    actionable message — never a raw iree exception.
+    """
+    import numpy as np
+    import iree.runtime as rt
+
+    if not isinstance(tensor, core.Tensor):
+        raise core.DeviceError(
+            f"Tensor.to upload requires a core.Tensor source, got "
+            f"{type(tensor).__name__}"
+        )
+    if not isinstance(device, Device):
+        raise core.DeviceError(
+            f"Tensor.to upload requires a core.Device target, got "
+            f"{type(device).__name__}"
+        )
+    device_kind = _normalize_device_kind(device.kind)
+    if device_kind not in _GPU_DEVICE_KINDS:
+        raise core.DeviceError(
+            f"the {IreeBackend.name} placement provider places data on cuda, "
+            f"rocm/hip and vulkan devices only, got {device!r}"
+        )
+    # Provider source contract: a HOST ndarray-backed cpu:0 tensor in v1. A
+    # device-resident source cannot be copied device->device by this
+    # provider — suggest the explicit two-hop transfer.
+    if not isinstance(tensor.data, np.ndarray) or tensor.device != Device("cpu", 0):
+        raise core.DeviceError(
+            f"Tensor.to cannot copy {tensor.device!r} tensor data directly "
+            f"to {device!r}: cross-device copies are not implemented in v1. "
+            "Transfer in two explicit hops instead: "
+            "t.to(core.Device('cpu', 0)) first, then .to(target)."
+        )
+    # Runtime flags exactly like load (env EVOXC_IREE_RUNTIME_ARGS; loud
+    # parse errors), then the HAL-device acquisition: cuda keeps the
+    # fresh-per-call path, rocm reuses one THREAD-LOCAL device
+    # (create_device measured ~46 ms per call on the hip driver).
+    runtime_args = _runtime_args_from_env()
+    _apply_iree_runtime_args(runtime_args)
+    try:
+        if device_kind == "rocm":
+            runtime_device = _acquire_cached_rocm_device(device, runtime_args)
+        else:
+            runtime_device = _acquire_runtime_device(
+                device_kind, device, runtime_args
+            )
+    except core.EVOXCError:
+        raise
+    except Exception as exc:
+        raise core.BackendError(
+            f"Tensor.to could not acquire the IREE {device_kind} HAL device "
+            f"for {device!r} (the {IreeBackend.name} placement provider): "
+            f"{exc}"
+        ) from exc
+    # One-shot upload: a FRESH staging dict per call, so the DESTINATION
+    # buffer is fresh every time (the returned tensor owns it) while the
+    # reusable SOURCE machinery is the kind's fast path (pinned/DMA on cuda
+    # with the load-bearing fresh-semaphore wait; host-local source +
+    # queue_copy on rocm). A kind with NO staging tier -- vulkan -- always
+    # returns None here and takes the plain asdevicearray copy below, as do
+    # oversized/unmappable inputs or any failure on a fast path.
+    try:
+        staged = _staged_input({}, runtime_device, 0, tensor, device_kind)
+        if staged is None:
+            staged = rt.asdevicearray(runtime_device, tensor.numpy())
+    except core.EVOXCError:
+        raise
+    except Exception as exc:
+        raise core.BackendError(
+            f"Tensor.to could not upload the host tensor to {device!r} via "
+            f"the {IreeBackend.name} backend: {exc}"
+        ) from exc
+    return core.Tensor(IreeDevicePayload(staged, device))
+
+
+# ---------------------------------------------------------------------------
+# Adapter activation: singleton + register-on-first-use entry point
+# ---------------------------------------------------------------------------
+
+
+iree_backend = IreeBackend()
+
+
+def register() -> IreeBackend:
+    """Probe IREE availability and register the singleton (idempotent).
+
+    Called by ``registry.get("iree")`` on first use (``OPTIONAL_ADAPTERS``
+    auto-activation) and when loading persisted artifacts. Raises
+    ``core.BackendError`` with the hint ``pip install evoxc[iree]`` when the
+    IREE packages are missing; re-registering the SAME instance is a no-op
+    (the registry tolerates idempotent re-registration).
+
+    Registers this adapter's DIRECT ``upload_tensor`` under the PER-BACKEND
+    slots ``("cuda", "iree")``, ``("rocm", "iree")``, ``("hip", "iree")``
+    and ``("vulkan", "iree")`` (R6.3): ``evoxc.backends`` registers a lazy
+    thunk over this module in the flat DEFAULT slot at import time; once the
+    adapter is active (packages available — ``check_available`` above),
+    ``registry.get("iree")`` records iree as the preferred transfer backend
+    for the kinds it serves and ``Tensor.to`` routes through the direct
+    provider. The flat slot is NEVER overwritten and per-backend slots are
+    keyed per backend, so activation order cannot clobber any backend's
+    provider (no last-wins across backends). Registering both the ``rocm``
+    and the ``hip`` kind means a ``Device("hip", N)`` label resolves through
+    this provider too (the provider normalizes the kind for the driver
+    call).
+
+    ``"vulkan"`` is the ONE documented exception to the per-backend-only
+    rule: it is ALSO registered in the FLAT default slot. The flat slot is
+    normally filled by ``evoxc.backends``' lazy iree thunks at import time,
+    which cover cuda/rocm/hip only, and no other backend serves a vulkan
+    device kind — so without this registration
+    ``Tensor.to(Device("vulkan", N))`` would have no provider before the
+    first ``registry.get("iree")`` records the preference. Nothing else
+    serves vulkan, so the slot cannot clobber another backend's provider.
+    """
+    iree_backend.check_available()
+    for kind in ("cuda", "rocm", "hip", "vulkan"):
+        core.register_backend_device_transfer_provider(
+            kind, iree_backend.name, upload_tensor
+        )
+    # See the docstring: vulkan has no evoxc.backends-level flat thunk, and no
+    # other backend places data on a vulkan device.
+    core.register_device_transfer_provider("vulkan", upload_tensor)
+    return _registry_register(iree_backend)

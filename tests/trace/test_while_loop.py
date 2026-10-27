@@ -1,8 +1,8 @@
-"""Tests for `etl.while_loop` — runtime tensor control flow traced into a
+"""Tests for `evoxc.while_loop` — runtime tensor control flow traced into a
 `while` op.
 
-Contract under test (see ``etl/trace/CONTEXT.md``, "Control-flow region
-conventions"): `etl.while_loop(cond_fn, body_fn, init)` traces one `while` op
+Contract under test (see ``evoxc/trace/CONTEXT.md``, "Control-flow region
+conventions"): `evoxc.while_loop(cond_fn, body_fn, init)` traces one `while` op
 whose operands are the loop-carried SymbolicTensors (≥1 — an all-static init
 raises) with two single-block regions: `regions[0]` = condition (its `return`
 yields ONE 0-d bool) and `regions[1]` = body (its `return` yields the next
@@ -18,7 +18,7 @@ import dataclasses
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ import etl
 
 def _const(value, dtype):
     """Embed a static value as a constant op (valid only inside a trace)."""
-    return etl.constant(etl.tensor(value, dtype=dtype))
+    return evoxc.constant(evoxc.tensor(value, dtype=dtype))
 
 
 def _all_ops(function):
@@ -53,16 +53,16 @@ def _trace_count_loop(n, x_shape=(3,)):
     def f(x):
         def cond_fn(state):
             i, acc = state
-            return etl.less(i, _const(n, etl.int32))
+            return evoxc.less(i, _const(n, evoxc.int32))
 
         def body_fn(state):
             i, acc = state
-            return (etl.add(i, _const(1, etl.int32)), etl.add(acc, x))
+            return (evoxc.add(i, _const(1, evoxc.int32)), evoxc.add(acc, x))
 
-        init = (_const(0, etl.int32), etl.constant(etl.zeros(x_shape, etl.float32)))
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32), evoxc.constant(evoxc.zeros(x_shape, evoxc.float32)))
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    return etl.trace(f, etl.TensorSpec(x_shape, etl.float32))
+    return evoxc.trace(f, evoxc.TensorSpec(x_shape, evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -84,22 +84,22 @@ def test_structured_dict_state(run_graph, as_numpy):
 
     def f(x):
         def cond_fn(state):
-            return etl.less(state["i"], _const(3, etl.int32))
+            return evoxc.less(state["i"], _const(3, evoxc.int32))
 
         def body_fn(state):
             return {
-                "i": etl.add(state["i"], _const(1, etl.int32)),
-                "acc": etl.add(state["acc"], x),
+                "i": evoxc.add(state["i"], _const(1, evoxc.int32)),
+                "acc": evoxc.add(state["acc"], x),
             }
 
         init = {
-            "i": _const(0, etl.int32),
-            "acc": etl.constant(etl.zeros((2,), etl.float32)),
+            "i": _const(0, evoxc.int32),
+            "acc": evoxc.constant(evoxc.zeros((2,), evoxc.float32)),
         }
-        return etl.while_loop(cond_fn, body_fn, init)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
     x = np.array([2.0, 4.0], dtype=np.float32)
-    graph = etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
     result = as_numpy(run_graph(graph, x))
     assert isinstance(result, dict) and set(result) == {"i", "acc"}
     assert result["i"] == 3
@@ -111,26 +111,26 @@ def test_nested_tuple_state(run_graph, as_numpy):
 
     def f(x):
         def cond_fn(state):
-            return etl.less(state[0], _const(2, etl.int32))
+            return evoxc.less(state[0], _const(2, evoxc.int32))
 
         def body_fn(state):
             counter, (a, b) = state
             return (
-                etl.add(counter, _const(1, etl.int32)),
-                (etl.add(a, x), etl.add(b, x)),
+                evoxc.add(counter, _const(1, evoxc.int32)),
+                (evoxc.add(a, x), evoxc.add(b, x)),
             )
 
         init = (
-            _const(0, etl.int32),
+            _const(0, evoxc.int32),
             (
-                etl.constant(etl.zeros((2,), etl.float32)),
-                etl.constant(etl.zeros((2,), etl.float32)),
+                evoxc.constant(evoxc.zeros((2,), evoxc.float32)),
+                evoxc.constant(evoxc.zeros((2,), evoxc.float32)),
             ),
         )
-        return etl.while_loop(cond_fn, body_fn, init)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
     x = np.array([1.0, 2.0], dtype=np.float32)
-    graph = etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
     counter, (a, b) = as_numpy(run_graph(graph, x))
     assert counter == 2
     np.testing.assert_allclose(a, 2 * x)
@@ -149,24 +149,24 @@ def test_dataclass_carry(run_graph):
 
     def f(x):
         def cond_fn(s):
-            return etl.less(s.i, _const(3, etl.int32))
+            return evoxc.less(s.i, _const(3, evoxc.int32))
 
         def body_fn(s):
             return State(
-                etl.add(s.i, _const(1, etl.int32)),
-                etl.add(s.acc, x),
+                evoxc.add(s.i, _const(1, evoxc.int32)),
+                evoxc.add(s.acc, x),
                 s.tag,
             )
 
         init = State(
-            _const(0, etl.int32),
-            etl.constant(etl.zeros((2,), etl.float32)),
+            _const(0, evoxc.int32),
+            evoxc.constant(evoxc.zeros((2,), evoxc.float32)),
             "static-tag",
         )
-        return etl.while_loop(cond_fn, body_fn, init)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
     x = np.array([1.0, 2.0], dtype=np.float32)
-    graph = etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
     result = run_graph(graph, x)
     assert isinstance(result, State)
     assert result.tag == "static-tag"
@@ -178,15 +178,15 @@ def test_zero_iterations_returns_init_unchanged(run_graph, as_numpy):
 
     def f():
         def cond_fn(state):
-            return etl.less(state[0], _const(0, etl.int32))
+            return evoxc.less(state[0], _const(0, evoxc.int32))
 
         def body_fn(state):
             return state
 
-        init = (_const(7, etl.int32), etl.constant(etl.zeros((2,), etl.float32)))
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(7, evoxc.int32), evoxc.constant(evoxc.zeros((2,), evoxc.float32)))
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    graph = etl.trace(f)
+    graph = evoxc.trace(f)
     counter, acc = as_numpy(run_graph(graph))
     assert counter == 7
     np.testing.assert_allclose(acc, np.zeros((2,), dtype=np.float32))
@@ -216,8 +216,8 @@ def test_while_op_ir_structure():
         assert len(region.blocks) == 1
         args = region.entry.arguments
         assert len(args) == len(while_op.operands)
-        assert args[0].type.dtype == etl.int32 and args[0].type.shape == ()
-        assert args[1].type.dtype == etl.float32 and args[1].type.shape == (3,)
+        assert args[0].type.dtype == evoxc.int32 and args[0].type.shape == ()
+        assert args[1].type.dtype == evoxc.float32 and args[1].type.shape == (3,)
 
     # operands == the carried values (the two constants in main's block).
     constants = [op for op in function.entry_block if op.name == "constant"]
@@ -226,7 +226,7 @@ def test_while_op_ir_structure():
 
     # cond region returns one value; body region returns the carried count.
     assert len(cond_region.entry.terminator.operands) == 1
-    assert cond_region.entry.terminator.operands[0].type.dtype == etl.bool_
+    assert cond_region.entry.terminator.operands[0].type.dtype == evoxc.bool_
     assert len(body_region.entry.terminator.operands) == 2
 
     # op results = final carried values = main's return operands.
@@ -240,7 +240,7 @@ def test_while_op_ir_structure():
 # ---------------------------------------------------------------------------
 
 def _cond_vector(state):
-    return etl.greater(state[0], etl.constant(etl.zeros((3,), etl.int32)))
+    return evoxc.greater(state[0], evoxc.constant(evoxc.zeros((3,), evoxc.int32)))
 
 
 def _cond_int32(state):
@@ -265,66 +265,66 @@ def test_cond_fn_result_must_be_scalar_bool_symbolic(cond_fn, match):
         def body_fn(state):
             return state
 
-        init = (etl.constant(etl.zeros((3,), etl.int32)),)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (evoxc.constant(evoxc.zeros((3,), evoxc.int32)),)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    with pytest.raises(etl.TraceError, match=match):
-        etl.trace(f)
+    with pytest.raises(evoxc.TraceError, match=match):
+        evoxc.trace(f)
 
 
 def test_body_fn_tree_mismatch_raises():
     def f():
         def cond_fn(state):
-            return _const(True, etl.bool_)
+            return _const(True, evoxc.bool_)
 
         def body_fn(state):
             return (state[0], state[0])
 
-        init = (_const(0, etl.int32),)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32),)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    with pytest.raises(etl.TraceError, match="must match init's tree"):
-        etl.trace(f)
+    with pytest.raises(evoxc.TraceError, match="must match init's tree"):
+        evoxc.trace(f)
 
 
 def test_body_fn_dtype_change_raises():
     def f():
         def cond_fn(state):
-            return _const(True, etl.bool_)
+            return _const(True, evoxc.bool_)
 
         def body_fn(state):
-            return (_const(1.5, etl.float32),)
+            return (_const(1.5, evoxc.float32),)
 
-        init = (_const(0, etl.int32),)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32),)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    with pytest.raises(etl.DTypeError, match="dtype"):
-        etl.trace(f)
+    with pytest.raises(evoxc.DTypeError, match="dtype"):
+        evoxc.trace(f)
 
 
 def test_body_fn_shape_change_raises():
     def f():
         def cond_fn(state):
-            return _const(True, etl.bool_)
+            return _const(True, evoxc.bool_)
 
         def body_fn(state):
-            return (etl.constant(etl.zeros((3,), etl.float32)),)
+            return (evoxc.constant(evoxc.zeros((3,), evoxc.float32)),)
 
-        init = (etl.constant(etl.zeros((2,), etl.float32)),)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (evoxc.constant(evoxc.zeros((2,), evoxc.float32)),)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    with pytest.raises(etl.ShapeError, match="shape"):
-        etl.trace(f)
+    with pytest.raises(evoxc.ShapeError, match="shape"):
+        evoxc.trace(f)
 
 
 def test_all_static_init_rejected():
     """A loop over static values only is plain Python control flow."""
 
     def f():
-        return etl.while_loop(lambda s: True, lambda s: s, (1, 2))
+        return evoxc.while_loop(lambda s: True, lambda s: s, (1, 2))
 
-    with pytest.raises(etl.TraceError, match="at least one SymbolicTensor"):
-        etl.trace(f)
+    with pytest.raises(evoxc.TraceError, match="at least one SymbolicTensor"):
+        evoxc.trace(f)
 
 
 def test_ndarray_static_init_leaf_preserved(run_graph, as_numpy):
@@ -335,15 +335,15 @@ def test_ndarray_static_init_leaf_preserved(run_graph, as_numpy):
         arr = np.array([1.0, 2.0])
 
         def cond_fn(state):
-            return etl.less(state[0], _const(3, etl.int32))
+            return evoxc.less(state[0], _const(3, evoxc.int32))
 
         def body_fn(state):
-            return (etl.add(state[0], _const(1, etl.int32)), arr)
+            return (evoxc.add(state[0], _const(1, evoxc.int32)), arr)
 
-        init = (_const(0, etl.int32), arr)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32), arr)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    graph = etl.trace(f)
+    graph = evoxc.trace(f)
     counter, arr = as_numpy(run_graph(graph))
     assert counter == 3
     np.testing.assert_array_equal(arr, np.array([1.0, 2.0]))
@@ -357,16 +357,16 @@ def test_ndarray_static_leaf_change_rejected():
         arr = np.array([1.0, 2.0])
 
         def cond_fn(state):
-            return etl.less(state[0], _const(3, etl.int32))
+            return evoxc.less(state[0], _const(3, evoxc.int32))
 
         def body_fn(state):
-            return (etl.add(state[0], _const(1, etl.int32)), np.array([2.0, 3.0]))
+            return (evoxc.add(state[0], _const(1, evoxc.int32)), np.array([2.0, 3.0]))
 
-        init = (_const(0, etl.int32), arr)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32), arr)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    with pytest.raises(etl.TraceError, match="must equal init's static value"):
-        etl.trace(f)
+    with pytest.raises(evoxc.TraceError, match="must equal init's static value"):
+        evoxc.trace(f)
 
 
 def test_static_leaf_change_rejected():
@@ -374,16 +374,16 @@ def test_static_leaf_change_rejected():
 
     def f():
         def cond_fn(state):
-            return etl.less(state[0], _const(3, etl.int32))
+            return evoxc.less(state[0], _const(3, evoxc.int32))
 
         def body_fn(state):
-            return (etl.add(state[0], _const(1, etl.int32)), 99)
+            return (evoxc.add(state[0], _const(1, evoxc.int32)), 99)
 
-        init = (_const(0, etl.int32), 3)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32), 3)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    with pytest.raises(etl.TraceError, match="must equal init's static value"):
-        etl.trace(f)
+    with pytest.raises(evoxc.TraceError, match="must equal init's static value"):
+        evoxc.trace(f)
 
 
 def test_static_leaf_preserved_in_result(run_graph, as_numpy):
@@ -392,18 +392,18 @@ def test_static_leaf_preserved_in_result(run_graph, as_numpy):
 
     def f():
         def cond_fn(state):
-            return etl.less(state[0], _const(3, etl.int32))
+            return evoxc.less(state[0], _const(3, evoxc.int32))
 
         def body_fn(state):
-            return (etl.add(state[0], _const(1, etl.int32)), 3)
+            return (evoxc.add(state[0], _const(1, evoxc.int32)), 3)
 
-        init = (_const(0, etl.int32), 3)
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32), 3)
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    graph = etl.trace(f)
+    graph = evoxc.trace(f)
     counter, static_leaf = as_numpy(run_graph(graph))
     assert counter == 3
-    assert static_leaf == 3 and not isinstance(static_leaf, etl.Tensor)
+    assert static_leaf == 3 and not isinstance(static_leaf, evoxc.Tensor)
 
 
 # ---------------------------------------------------------------------------
@@ -411,21 +411,21 @@ def test_static_leaf_preserved_in_result(run_graph, as_numpy):
 # ---------------------------------------------------------------------------
 
 def test_while_loop_inside_defn_verifies_and_runs(run_graph, as_numpy):
-    @etl.defn
+    @evoxc.defn
     def f(x):
         def cond_fn(state):
-            return etl.less(state[0], _const(3, etl.int32))
+            return evoxc.less(state[0], _const(3, evoxc.int32))
 
         def body_fn(state):
             return (
-                etl.add(state[0], _const(1, etl.int32)),
-                etl.add(state[1], x),
+                evoxc.add(state[0], _const(1, evoxc.int32)),
+                evoxc.add(state[1], x),
             )
 
-        init = (_const(0, etl.int32), etl.constant(etl.zeros((2,), etl.float32)))
-        return etl.while_loop(cond_fn, body_fn, init)
+        init = (_const(0, evoxc.int32), evoxc.constant(evoxc.zeros((2,), evoxc.float32)))
+        return evoxc.while_loop(cond_fn, body_fn, init)
 
-    graph = etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
     graph.verify()
     x = np.array([1.0, 2.0], dtype=np.float32)
     counter, acc = as_numpy(run_graph(graph, x))

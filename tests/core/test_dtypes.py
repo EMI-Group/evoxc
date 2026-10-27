@@ -1,6 +1,6 @@
-"""Tests for etl dtype constants and the ``dtype`` normalizer.
+"""Tests for evoxc dtype constants and the ``dtype`` normalizer.
 
-Covers the contract in ``etl/core/CONTEXT.md``: ``dtype(obj) -> np.dtype``
+Covers the contract in ``evoxc/core/CONTEXT.md``: ``dtype(obj) -> np.dtype``
 normalizer (passthrough / type / string / ``.dtype``-attribute / errors) and
 the 14 dtype constants (numpy dtype objects, ``bool_`` instead of ``bool``).
 """
@@ -8,11 +8,11 @@ the 14 dtype constants (numpy dtype objects, ``bool_`` instead of ``bool``).
 import numpy as np
 import pytest
 
-import etl
-import etl.core
+import evoxc
+import evoxc.core
 
 # (identifier, np.dtype.name, itemsize in bytes, kind)
-# Note: the etl identifier is ``bool_``, but the underlying numpy dtype's
+# Note: the evoxc identifier is ``bool_``, but the underlying numpy dtype's
 # canonical ``.name`` is "bool" (``bool_ = np.dtype("bool")``).
 DTYPE_CONSTANTS = [
     ("float16", "float16", 2, "f"),
@@ -39,7 +39,7 @@ ALL_NAMES = [name for name, _, _, _ in DTYPE_CONSTANTS]
 
 @pytest.mark.parametrize("name,dtype_name,itemsize,kind", DTYPE_CONSTANTS)
 def test_constants_are_np_dtypes(name, dtype_name, itemsize, kind):
-    dt = getattr(etl.core, name)
+    dt = getattr(evoxc.core, name)
     assert isinstance(dt, np.dtype)
     assert dt.name == dtype_name
     assert dt.itemsize == itemsize
@@ -47,18 +47,18 @@ def test_constants_are_np_dtypes(name, dtype_name, itemsize, kind):
 
 
 @pytest.mark.parametrize("name,dtype_name,itemsize,kind", DTYPE_CONSTANTS)
-def test_constants_exported_from_etl_and_etl_core(name, dtype_name, itemsize, kind):
-    assert hasattr(etl.core, name)
-    assert hasattr(etl, name)
+def test_constants_exported_from_evoxc_and_evoxc_core(name, dtype_name, itemsize, kind):
+    assert hasattr(evoxc.core, name)
+    assert hasattr(evoxc, name)
     # same object re-exported, not a copy
-    assert getattr(etl, name) is getattr(etl.core, name)
+    assert getattr(evoxc, name) is getattr(evoxc.core, name)
 
 
 def test_bool_constant_is_named_bool_():
-    assert etl.bool_ == np.dtype(bool)
-    assert etl.bool_.name == "bool"  # numpy's canonical name for the dtype
+    assert evoxc.bool_ == np.dtype(bool)
+    assert evoxc.bool_.name == "bool"  # numpy's canonical name for the dtype
     # the constant must not be exported as the bare builtin name `bool`
-    assert not isinstance(getattr(etl, "bool", None), np.dtype)
+    assert not isinstance(getattr(evoxc, "bool", None), np.dtype)
 
 
 # --- dtype() normalizer -----------------------------------------------------
@@ -66,7 +66,7 @@ def test_bool_constant_is_named_bool_():
 
 def test_dtype_np_dtype_passthrough_is_same_object():
     d = np.dtype("float32")
-    assert etl.dtype(d) is d
+    assert evoxc.dtype(d) is d
 
 
 @pytest.mark.parametrize(
@@ -79,7 +79,7 @@ def test_dtype_np_dtype_passthrough_is_same_object():
     ],
 )
 def test_dtype_python_types(py_type, expected_name):
-    assert etl.dtype(py_type) == np.dtype(expected_name)
+    assert evoxc.dtype(py_type) == np.dtype(expected_name)
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,7 @@ def test_dtype_python_types(py_type, expected_name):
     ],
 )
 def test_dtype_numpy_scalar_types(np_type, expected_name):
-    assert etl.dtype(np_type) == np.dtype(expected_name)
+    assert evoxc.dtype(np_type) == np.dtype(expected_name)
 
 
 @pytest.mark.parametrize(
@@ -103,13 +103,13 @@ def test_dtype_numpy_scalar_types(np_type, expected_name):
     ["float16", "float32", "float64", "int8", "int64", "uint8", "complex128", "bool"],
 )
 def test_dtype_strings(name):
-    assert etl.dtype(name) == np.dtype(name)
+    assert evoxc.dtype(name) == np.dtype(name)
 
 
 @pytest.mark.parametrize("name", ALL_NAMES)
 def test_dtype_constants_pass_through(name):
-    c = getattr(etl.core, name)
-    assert etl.dtype(c) is c
+    c = getattr(evoxc.core, name)
+    assert evoxc.dtype(c) is c
 
 
 class _HasDType:
@@ -120,9 +120,9 @@ class _HasDType:
 
 
 def test_dtype_objects_with_dtype_attribute():
-    assert etl.dtype(_HasDType(np.dtype("float32"))) == etl.float32
-    assert etl.dtype(_HasDType(etl.int64)) is etl.int64
-    assert etl.dtype(np.zeros(2)) == etl.float64
+    assert evoxc.dtype(_HasDType(np.dtype("float32"))) == evoxc.float32
+    assert evoxc.dtype(_HasDType(evoxc.int64)) is evoxc.int64
+    assert evoxc.dtype(np.zeros(2)) == evoxc.float64
 
 
 @pytest.mark.parametrize(
@@ -137,5 +137,5 @@ def test_dtype_objects_with_dtype_attribute():
     ],
 )
 def test_dtype_invalid_input_raises_dtypeerror(bad):
-    with pytest.raises(etl.DTypeError):
-        etl.dtype(bad)
+    with pytest.raises(evoxc.DTypeError):
+        evoxc.dtype(bad)

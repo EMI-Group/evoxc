@@ -1,8 +1,8 @@
-"""``etl.ir.verify(module)`` violation-class tests.
+"""``evoxc.ir.verify(module)`` violation-class tests.
 
 ``verify`` is the EvoXIR contract checker: it validates module / function /
 region / block / op / value / SSA invariants and raises ``VerificationError``
-(owned by ``etl.core``) on the FIRST violation, with a source-location
+(owned by ``evoxc.core``) on the FIRST violation, with a source-location
 annotation (``[at file:line:col]``) whenever the offending op carries one.
 
 This file exercises every violation class documented in ``verify``'s
@@ -13,15 +13,15 @@ assert the module verifies again.  Modules that the Builder's eager checks
 would refuse (bad attributes, wrong result types, wrong parent wiring) are
 built valid and then mutated in place.
 
-The ``./etl/`` package is read-only from here; if a test below exposes a real
-bug in etl it stays as a failing test with a ``# BUG(etl)`` marker.
+The ``./evoxc/`` package is read-only from here; if a test below exposes a real
+bug in evoxc it stays as a failing test with a ``# BUG(evoxc)`` marker.
 """
 
 import numpy as np
 import pytest
 
-from etl import ir
-from etl.core import VerificationError
+from evoxc import ir
+from evoxc.core import VerificationError
 
 F32_2X3 = ir.ValueType(np.dtype("float32"), (2, 3))
 F64_2X3 = ir.ValueType(np.dtype("float64"), (2, 3))
@@ -74,7 +74,7 @@ def test_only_opdefs():
     registered under those names before this fixture ran) keeps the global
     registry clean for sibling test modules such as ``test_registry.py``.
     """
-    from etl.ir import op_defs as op_defs_mod
+    from evoxc.ir import op_defs as op_defs_mod
 
     opdefs = _make_test_only_opdefs()
     prior = {

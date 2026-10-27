@@ -1,10 +1,10 @@
 """iree coverage for the ``build_cached``/``CompileCache`` memoized-build
-sugar (Workstream C "True JIT" — ``etl/build_cache.py``; import from
-``etl.build_cache``, the top-level ``etl`` namespace does not export it
+sugar (Workstream C "True JIT" — ``evoxc/build_cache.py``; import from
+``evoxc.build_cache``, the top-level ``evoxc`` namespace does not export it
 yet). Public API under test:
 
 ``build_cached(fn, *specs, backend=None, device=None, cache=None, **options)``
-is documented shorthand for a cache-guarded ``etl.build`` whose exact
+is documented shorthand for a cache-guarded ``evoxc.build`` whose exact
 ``trace -> lower -> compile -> load`` composition runs AT MOST ONCE per
 distinct cache key — (fn identity, the full ``*specs`` tree incl. static
 content, the resolved backend name, the resolved device, canonicalized
@@ -22,10 +22,10 @@ does not apply):
 2. ``opt_level`` participates in the key — "O0" vs "O3" are two distinct
    entries (misses==2) that BOTH run with parity;
 3. semantic-equality hit — the DEFAULT device resolution (cpu:0) vs the
-   EXPLICIT spelling ``etl.core.Device("cpu", 0)`` (and the plain ``"cpu"``
+   EXPLICIT spelling ``evoxc.core.Device("cpu", 0)`` (and the plain ``"cpu"``
    kind string, which normalizes to the same Device) key identically: one
    entry, is-identity. NOTE on the device spelling: a bare ``"cpu:0"``
-   string is NOT a device kind in etl — ``Device("cpu:0")`` would construct
+   string is NOT a device kind in evoxc — ``Device("cpu:0")`` would construct
    the bogus kind ``"cpu:0"`` and the load stage would reject it with
    ``BackendError`` (never cached); the explicit form of the default cpu:0
    device is the ``Device`` object (or the ``"cpu"`` kind string);
@@ -48,25 +48,25 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
-from etl.build_cache import CompileCache, build_cached
+import evoxc
+from evoxc.build_cache import CompileCache, build_cached
 
 # ---------------------------------------------------------------------------
 # llvm-cpu graph (deterministic elementwise fp32; trivial numpy reference)
 # ---------------------------------------------------------------------------
 SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((4, 6), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
 )
 
 XA = np.arange(24, dtype=np.float32).reshape(4, 6) + 0.25
 XB = np.arange(24, dtype=np.float32).reshape(4, 6) / 2.0 + 1.0
 
 
-@etl.defn
+@evoxc.defn
 def mix_fn(x, y):
     """Elementwise fp32 graph: x + 0.5 * y."""
-    return etl.add(x, etl.multiply(y, 0.5))
+    return evoxc.add(x, evoxc.multiply(y, 0.5))
 
 
 def _mix_reference():
@@ -76,8 +76,8 @@ def _mix_reference():
 
 def _np(v):
     """Tensor / ndarray -> ndarray (device-resident -> explicit .to(cpu) hop)."""
-    if isinstance(v, etl.Tensor):
-        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
+    if isinstance(v, evoxc.Tensor):
+        return np.asarray(v.to(evoxc.core.Device("cpu", 0)).numpy())
     return np.asarray(v)
 
 
@@ -91,7 +91,7 @@ def test_compile_once_llvm_cpu_same_object_and_parity():
     assert again is exe  # memoized: the SAME fully loaded executable object
     assert cache.misses == 1 and cache.hits == 1
     assert len(cache) == 1
-    got = _np(etl.run(exe, XA, XB))
+    got = _np(evoxc.run(exe, XA, XB))
     assert np.allclose(got, _mix_reference(), rtol=1e-5, atol=1e-5)
 
 
@@ -113,7 +113,7 @@ def test_opt_level_participates_in_key():
     assert cache.misses == 2 and cache.hits == 1
     ref = _mix_reference()
     for exe in (exe_o0, exe_o3):
-        assert np.allclose(_np(etl.run(exe, XA, XB)), ref, rtol=1e-5, atol=1e-5)
+        assert np.allclose(_np(evoxc.run(exe, XA, XB)), ref, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -123,19 +123,19 @@ def test_default_and_explicit_cpu_device_key_identically():
     cache = CompileCache()
     exe_default = build_cached(mix_fn, *SPECS, backend="iree", cache=cache)
     # The explicit spelling of the resolved default device (cpu:0) — the
-    # bare "cpu:0" STRING is not a device kind in etl (Device("cpu:0")
+    # bare "cpu:0" STRING is not a device kind in evoxc (Device("cpu:0")
     # would be the bogus kind "cpu:0", rejected at load); the Device
     # object is the explicit form, and the plain "cpu" kind string
     # normalizes to the same Device("cpu", 0).
     exe_explicit = build_cached(mix_fn, *SPECS, backend="iree",
-                                device=etl.core.Device("cpu", 0), cache=cache)
+                                device=evoxc.core.Device("cpu", 0), cache=cache)
     assert exe_explicit is exe_default  # same key -> hit, no second compile
     exe_str = build_cached(mix_fn, *SPECS, backend="iree", device="cpu",
                            cache=cache)
     assert exe_str is exe_default
     assert cache.misses == 1 and cache.hits == 2
     assert len(cache) == 1
-    assert np.allclose(_np(etl.run(exe_default, XA, XB)), _mix_reference(),
+    assert np.allclose(_np(evoxc.run(exe_default, XA, XB)), _mix_reference(),
                        rtol=1e-5, atol=1e-5)
 
 
@@ -144,17 +144,17 @@ def test_default_and_explicit_cpu_device_key_identically():
 # ---------------------------------------------------------------------------
 N, D = 128, 16  # small step (this is a compile-once smoke, not a perf test)
 STEP_SPECS = (
-    etl.TensorSpec((), etl.int64),        # splitmix64 key (rank-0 i64)
-    etl.TensorSpec((N, D), etl.float32),  # state
+    evoxc.TensorSpec((), evoxc.int64),        # splitmix64 key (rank-0 i64)
+    evoxc.TensorSpec((N, D), evoxc.float32),  # state
 )
 
 
-@etl.defn
+@evoxc.defn
 def step_fn(key, state):
     """One DE-style step: split the key, add mutation noise, decay state."""
-    k_noise, k_next = etl.random.split(key)
-    noise = etl.random.normal(k_noise, (N, D), mean=0.0, std=0.1)
-    return etl.add(etl.multiply(state, 0.9), noise), k_next
+    k_noise, k_next = evoxc.random.split(key)
+    noise = evoxc.random.normal(k_noise, (N, D), mean=0.0, std=0.1)
+    return evoxc.add(evoxc.multiply(state, 0.9), noise), k_next
 
 
 def _new_key(seed=12345):
@@ -208,7 +208,7 @@ def test_cached_cuda_same_device_inner_loop():
         rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
-    cuda_device = etl.core.Device("cuda", idx)
+    cuda_device = evoxc.core.Device("cuda", idx)
 
     # Compile ONCE via the memoized build (explicit placement: the run
     # boundary rejects host inputs, so the executable lives on the cuda
@@ -223,7 +223,7 @@ def test_cached_cuda_same_device_inner_loop():
     key_ref, state_ref = _new_key(), _new_state()
     refs = []
     for _ in range(5):
-        state_ref, key_ref = etl.evaluate(step_fn, key_ref, state_ref,
+        state_ref, key_ref = evoxc.evaluate(step_fn, key_ref, state_ref,
                                           backend="numpy")
         refs.append((_np(state_ref), _np(key_ref)))
 
@@ -231,12 +231,12 @@ def test_cached_cuda_same_device_inner_loop():
     # values are placed on the device ONCE via the explicit .to() upload;
     # every later call feeds the device-resident outputs (new state + split
     # key) back — zero host round-trips across the whole loop.
-    key = etl.core.Tensor(_new_key()).to(cuda_device)
-    state = etl.core.Tensor(_new_state()).to(cuda_device)
+    key = evoxc.core.Tensor(_new_key()).to(cuda_device)
+    state = evoxc.core.Tensor(_new_state()).to(cuda_device)
     for step in range(5):
-        state, key = etl.run(exe, key, state)
-        assert isinstance(state, etl.Tensor) and state.device == cuda_device
-        assert isinstance(key, etl.Tensor) and key.device == cuda_device
+        state, key = evoxc.run(exe, key, state)
+        assert isinstance(state, evoxc.Tensor) and state.device == cuda_device
+        assert isinstance(key, evoxc.Tensor) and key.device == cuda_device
         assert state.shape == (N, D) and state.dtype == np.dtype("float32")
         state_h, key_h = _np(state), _np(key)
         want_state, want_key = refs[step]

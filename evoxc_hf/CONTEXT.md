@@ -1,0 +1,363 @@
+# evoxc_hf — HuggingFace checkpoints as one evoxc graph
+
+## Intent
+
+Load a HuggingFace checkpoint (`config.json` **and** its weights from disk) and run the **whole model forward pass as ONE evoxc graph** — trace → lower → compile → load → run — with evoxc's explicit semantics applied to a whole model: no hidden tracing, no hidden weight embedding, no hidden device movement.
+`evoxc_hf` is a **separate top-level package**, never a submodule of `evoxc`: evoxc core's non-goals forbid NN modules / loaders / model zoos, so model-level code lives here and only *depends on* the public evoxc API.
+The API is **functional** and split along evoxc's own value model into three layers that never blur:
+
+| Layer | Module | Question it answers | Surface |
+|---|---|---|---|
+| **loading** | `load.py` | *what is this checkpoint?* | `load_config`, `load_params`, `load_hf` → `LoadedModel` (plain immutable data), `validate_params` |
+| **the compute function** | `program.py` | *what does it compute?* | `forward_fn` (the memoised `@evoxc.defn` forward, capturing **no** parameters), `param_specs`, `reference_logits`, `resolve_seq_len`, `DEFAULT_SEQ_LEN` |
+| **staging** | `pipeline.py` | *where and how does it run?* | `build`, `run`, `predict`, `place_params`, `place_ids`, `resolve_build_options`, the `DEFAULT_*` option constants |
+
+Nothing here is a class with behaviour: `LoadedModel` is a `typing.NamedTuple` of field access only, and every operation is a module-level function taking its inputs as arguments.
+Two model families are implemented — **`llama`** (HF `llama`/`mistral`/`qwen2`/`qwen3`, the Qwen3 case adding per-head QK-Norm via the static `qk_norm` config field) and **`gpt2`** (HF `gpt2`, e.g. `gpt2`/`distilgpt2`) — each as one `@evoxc.defn` forward whose weights are ordinary graph inputs.
+Parity is pinned against an **independent pure-numpy oracle** (`reference.py`, no `evoxc` import) and, when `torch`+`transformers` are installed, against the real HuggingFace implementation (`tests/test_torch_oracle.py`).
+Whole-graph StableHLO export is pinned without any compiler (`tests/test_export.py`); the compiled `iree` paths are pinned when `iree` is installed (`tests/test_iree_llvm_cpu.py`, `tests/test_iree_rocm.py`), and the compiled `xla` path is validated by the benchmark harness (`../bench_logs/hf_bench.py` → `../bench_logs/hf_bench_results.md`), not by a gated test.
+
+## Package boundary & distribution status
+
+- **Hard dependency: `numpy` + `evoxc`, nothing else.** `safetensors` and `pytorch_model.bin` files are parsed with `numpy` + `struct` + `json` + `zipfile`/`pickle`; `torch`/`transformers`/`safetensors`/`iree` are **never** imported at module scope (pinned in a subprocess by `tests/test_public_api.py`).
+- **Not shipped in the `evoxc` distribution — a source-only top-level package used from this checkout.** `pyproject.toml`'s `[tool.setuptools.packages.find]` uses `include = ["evoxc", "evoxc.*"]`, which cannot match `evoxc_hf` / `evoxc_hf.*` (the `evoxc.` prefix is literal), so neither a wheel nor an sdist of `evoxc` contains `evoxc_hf` and nothing installs it for you: `pip install evoxc` gives you evoxc only, and `import evoxc_hf` works from the repo checkout (or any tree where `evoxc_hf/` sits beside `evoxc/` on `sys.path`). The colocated tests stay excluded as belt-and-braces (`exclude = ["evoxc_hf.tests", "evoxc_hf.tests.*"]` — never shipped), and `testpaths = ["tests", "evoxc_hf/tests"]` covers both suites in the checkout. `../tests/test_packaging.py` pins the boundary (find config vs. real packages, numpy-only runtime deps, a built wheel's RECORD).
+- **Every optional capability is an optional extra, never a requirement**: `pip install evoxc[hf]` pulls ONLY the `hf` extra — `torch` + `transformers`, the reference oracles used to validate and benchmark `evoxc_hf` against the real HuggingFace implementation (never a runtime requirement; the checkpoint readers are numpy + stdlib) — and `pip install evoxc[iree]` (or `evoxc[tvm]`, or a user-provided PJRT plugin `.so` for `xla`) enables the compiled path. `evoxc_hf` itself needs nothing beyond `numpy` + `evoxc`.
+- Nothing here changes evoxc's public API or import DAG; `evoxc_hf` imports only public evoxc entry points (`evoxc.trace`, `evoxc.build_cached`, `evoxc.run`, `evoxc.TensorSpec`, `evoxc.core`, `evoxc.backends.stablehlo` in tests).
+- **Import layering inside the package**: `errors`/`_validate` bottom, then `config` → `weights` → `ops`/`reference` → `models/*` → `families` → `pack` → `load` → `program` → `pipeline` → `__init__`. `models/__init__.py` re-exports nothing (each family module is discovered by `families`), and `models/**` never imports `pipeline`/`load`.
+
+## API Surface
+
+Top-level `evoxc_hf/__init__.py` re-exports exactly: `LoadedModel`, `ModelConfig`, `load_config`, `load_hf`, `load_params`, `validate_params`, `forward_fn`, `param_specs`, `reference_logits`, `build`, `place_ids`, `place_params`, `predict`, `run`, `PackPlan`, `pack_params`, `pack_plan`, `FAMILIES`, `FamilySpec`, `family_for_model_type`, `get_family`, `HFConfigError`, `HFError`, `HFUnsupportedError`, `HFWeightError`, the submodules `config`/`families`/`load`/`ops`/`pack`/`pipeline`/`program`/`reference`/`weights`, and `__version__ = "0.1.0"`.
+`evoxc_hf.build` is the **function** `build` — there is no `build` submodule and no `HFModel`; `evoxc_hf.models` is reachable as a subpackage but is deliberately not in `__all__`.
+
+### `evoxc_hf/load.py` — checkpoint → static config + host params (the data half)
+
+```python
+class LoadedModel(NamedTuple):      # immutable, field access only — NO methods, NO seq_len/batch_size
+    config: ModelConfig
+    params: dict[str, np.ndarray]   # canonical (in_features, out_features) tree, exactly param_specs' keys
+    family: str                     # "llama" | "gpt2"
+    model_dir: Path | None          # where it came from, or None
+
+def load_config(model_dir, *, family: str | None = None) -> ModelConfig
+def load_params(model_dir, config: ModelConfig, *, family: str | None = None) -> dict[str, np.ndarray]
+def load_hf(model_dir, *, family: str | None = None) -> LoadedModel      # == load_config + load_params
+def validate_params(config, params: Mapping[str, np.ndarray], *, family=None) -> dict[str, np.ndarray]
+```
+
+- `load_hf` is the documented one-call composition of the other two and **nothing more**: no compilation, no `seq_len`/`batch_size` (those are *build*-time specialisation values owned by `forward_fn`), no caching of a graph.
+- `load_config` requires a **directory**: it reads `<dir>/config.json` before any weight is touched, so a single checkpoint *file* path fails with `HFConfigError` naming the missing `config.json` (file-level loading is `weights.load_checkpoint`'s job).
+- `load_params` reads the checkpoint (`weights.load_checkpoint`), canonicalises it for the family (orientation, fused-QKV split, tied head), `del`s the raw HF state dict as soon as the map is built (a checkpoint is never held twice), and validates the result with `validate_params` — a mis-shaped canonicalisation raises here, not deep inside a run.
+- `validate_params` is the documented pre-flight check for a params mapping that did **not** come from `load_params` (hand-edited tree, converted checkpoint); keys and shapes must match `param_specs` exactly.
+- `LoadedModel` is the **only** thing "a loaded model" means: config plus params. Every call that needs a graph takes `loaded.config` (and `loaded.params`) explicitly — nothing is implicit in the record.
+
+### `evoxc_hf/program.py` — the compute function (specs, forward, oracle)
+
+```python
+DEFAULT_SEQ_LEN: int = 32
+def resolve_seq_len(config: ModelConfig, seq_len: int | None = None) -> int      # min(max_position_embeddings, 32)
+def forward_fn(config, *, seq_len=None, batch_size=None, family=None,
+               pack_weights=None) -> Callable                                  # the memoised @evoxc.defn
+def param_specs(config, *, family=None, pack_weights=None) -> dict[str, evoxc.TensorSpec]
+def reference_logits(config, params, input_ids, *, family=None) -> np.ndarray
+```
+
+- `forward_fn` returns the **whole model pass** — `(params, input_ids) -> logits`, every weight an ordinary graph **input**, all shapes static. It captures **no parameters** and knows nothing about backends, devices or compilation: build it here, stage it with `build`.
+- **Memoised** on `(family, config.digest, seq_len, batch_size, pack_weights)` in a bounded 64-entry LRU (built outside the lock, first-insert-wins): identical calls return the **same object**, so `id(fwd)` — the identity component of `evoxc.build_cached`'s key — is stable, and two identical `build` calls return the identical `Executable`.
+- The returned object carries its specialisation as `fwd._evoxc_hf_specialisation = {"family", "digest", "seq_len", "batch_size", "pack_weights"}`; `build`/`predict` read their `seq_len`/`batch_size`/`pack_weights` defaults from it and reject an explicit value that disagrees (`HFConfigError` naming `evoxc_hf.forward_fn`) rather than tracing to a mismatched ids spec.
+- `param_specs` is the specs tree `build` traces with and `run` validates against; `pack_weights=True` returns the packed inputs (`PackPlan.specs`), default `False`/`None` the canonical per-weight tree.
+- `reference_logits` is the parity oracle — same numbers from a *deliberately different* formulation, both inputs explicit (nothing defaults to a checkpoint's own weights).
+- `seq_len=None` everywhere means `resolve_seq_len(config, None)` = `min(config.max_position_embeddings, DEFAULT_SEQ_LEN)`; `batch_size=None` means 1.
+
+### `evoxc_hf/pipeline.py` — staging (build / run / predict / placement)
+
+```python
+DEFAULT_LLVM_CPU_COMPILE_ARGS: tuple[str, ...] = ("--iree-llvmcpu-target-cpu=host", "--iree-opt-data-tiling")
+DEFAULT_OPT_LEVEL: str = "O3"
+DEFAULT_ROCM_OPT_LEVEL: str = "O1"
+def resolve_build_options(backend, device, options: Mapping) -> tuple[str, dict]
+def build(fwd, config, *, seq_len=None, batch_size=None, backend=None, device=None, cache=None,
+          pack_weights=None, family=None, **options) -> evoxc.Executable
+def run(executable, params: Mapping[str, np.ndarray], input_ids) -> evoxc.Tensor
+def place_params(params: Mapping[str, np.ndarray], device: evoxc.core.Device) -> dict[str, evoxc.Tensor]
+def place_ids(input_ids, device: evoxc.core.Device) -> evoxc.Tensor
+def predict(loaded, input_ids=None, *, params=None, seq_len=None, batch_size=None, backend=None,
+            device=None, cache=None, pack_weights=None, family=None, **options) -> np.ndarray
+```
+
+- **`build`** is the explicit build stage: `evoxc.build_cached(forward_fn(...), param_specs(config), TensorSpec((batch_size, seq_len), int32), backend=..., device=..., cache=..., **resolved_options)` — trace → lower → compile → load, memoised so an identical specialisation returns the **same** `Executable`. Weight identity is deliberately **not** in the key.
+- `build` validates in this order: config / positive `seq_len` / `batch_size` / `seq_len <= max_position_embeddings` → family resolution → `resolve_build_options` → **activation gate before any tracing** → the memoised forward → the cache call. A `pack_weights`/`seq_len` disagreement with `fwd` is an `HFConfigError`.
+- **`run`** is validation + `evoxc.run`: `input_ids` may be a host integral array (2-D, matching the executable's ids spec; the **one** documented host-side coercion is the cast to `int32`, non-integral → `evoxc.DTypeError`) or an `evoxc.Tensor`, validated from **metadata only** and forwarded **verbatim** (no `np.asarray`, no cast, no device move). `params` is passed through **untouched**; the only exception is a packed-vs-canonical mix, which raises `HFWeightError` naming `pack_weights` and the `pack_params` remedy. Outputs are `evoxc.Tensor`s on the executable's device — never copied to the host.
+- **`predict`** is the ONE host-facing shorthand: `build(forward_fn(loaded.config, ...), loaded.config, ...)` → `run` → one explicit `Tensor.to(Device("cpu", 0))` when the output is non-cpu → `np.asarray(..., np.float32)`. Non-cpu `params` are rejected up front with `evoxc.DeviceError` naming the device-resident recipe; `params=None` means `loaded.params`, `input_ids=None` all-zero ids of the static shape, and a canonical tree under `pack_weights=True` is packed once on the host before the run.
+- **`place_params`/`place_ids`** are the explicit placement primitives: one `Tensor.to(device)` per leaf (host ids cast to `int32`; a `Tensor` is never re-typed, only moved). Place **once** and keep the placed tree; the device-resident recipe is `build(..., device=d)` + `place_params` + `place_ids` + `run`, which stages nothing per call and never round-trips to the host.
+- **`resolve_build_options`** is the ONE implementation of the default matrix; precedence is binding: **explicit argument > environment > evoxc_hf default**.
+
+| Situation | Resolution |
+|---|---|
+| `backend` explicit | used verbatim (a name, or an evoxc backend instance with `.name`) |
+| `backend=None`, `EVOXC_BACKEND` set | that value (honoured, not fought — evoxc itself would apply it) |
+| `backend=None`, device `None`/cpu | `"numpy"` (the interpreter) |
+| `backend=None`, device cuda/rocm/vulkan/other | `"iree"` (the compiled path) |
+| any non-numpy backend whose effective IREE targets are **all** `rocm`/`hip` | `opt_level="O1"` injected unless passed (`DEFAULT_ROCM_OPT_LEVEL`) — O2/O3 hit an upstream `iree-compile` `'func.func' op failed to distribute` on gpt2-class LayerNorm-reduce shapes, while O0/O1/default emit a byte-identical vmfb |
+| any other non-numpy backend | `opt_level="O3"` injected unless passed (`DEFAULT_OPT_LEVEL`) |
+| `opt_level` passed explicitly, or `EVOXC_OPT_LEVEL` set | nothing injected |
+| `"iree"` whose effective targets are exactly `["llvm-cpu"]` | `iree_compile_args=list(DEFAULT_LLVM_CPU_COMPILE_ARGS)` injected unless passed |
+| `"numpy"` | options returned as an unchanged copy — nothing injected |
+
+- Effective IREE targets: `options["target_backends"]`, else `EVOXC_TARGET_BACKENDS`, else derived from the device (`None`/cpu → `["llvm-cpu"]`, cuda → `["cuda"]`, rocm/hip → `["rocm"]`, **vulkan → `["vulkan-spirv"]`** — a device *kind* is not a target-backend name, so the bare `vulkan` would be an unknown-target error at compile time — otherwise `[device.kind]`); the llvm-cpu flags are injected only for that exact target.
+- `iree_compile_args` is a **compile-stage** option: `build` forwards options to both `lower` and `compile` through `evoxc.build_cached`, so the flags reach `evoxc.compile` structurally (passing them to `evoxc.lower` alone is silently ineffective).
+- **`vulkan` is an accepted device kind for `build(...)`**: `build(fwd, config, device=Device("vulkan", 0))` resolves to backend `"iree"` with the `vulkan-spirv` compile target, the `O3` `opt_level` default (it is not an all-ROCm target set) and **no** injected `iree_compile_args` — the same shape as cuda/rocm; placement and the device-resident same-device loop are the ordinary `place_params`/`place_ids`/`run` recipe, and `predict` still makes the one explicit `Tensor.to(Device("cpu", 0))`. Practical caveat (measured on the only Vulkan device this host can reach — lavapipe, i.e. software Vulkan on a CPU): the default IREE Vulkan target profile `vp_android_baseline_2022` allows only **16384 bytes** of workgroup shared memory, so at the default `opt_level="O3"` the 124M-class graphs do not compile (`function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; exceeded the limit of 16384 bytes` at `seq_len=32`; `failed to legalize operation 'vector.from_elements'` at `seq_len=128`) — the measured remedy is an explicit **`opt_level="O1"`**, which compiles all of them (tiny checkpoints compile with the defaults). A larger-profile `--iree-vulkan-target=<profile>` in `iree_compile_args` (e.g. `gfx942`, 64 KiB) lifts the shared-memory limit but `O3` then still stops later in vector-dialect lowering. evoxc_hf injects nothing for either knob: both are explicit caller options. Host/driver details and the full measured matrix: [`../bench_logs/vulkan_findings.md`](../bench_logs/vulkan_findings.md).
+
+### `evoxc_hf/config.py` — HF `config.json` → frozen static `ModelConfig`
+
+```python
+FAMILY_BY_MODEL_TYPE: dict[str, str] = {"llama": "llama", "mistral": "llama", "qwen2": "llama", "qwen3": "llama", "gpt2": "gpt2"}
+@dataclass(frozen=True)
+class ModelConfig:
+    model_type, family, vocab_size, hidden_size, num_hidden_layers, num_attention_heads,
+    num_key_value_heads, intermediate_size, hidden_act, layer_norm_eps, max_position_embeddings,
+    tie_word_embeddings, rope_theta, head_dim, qk_norm, raw              # `raw`: parsed JSON, diagnostics only
+    @staticmethod
+    def from_json(path) -> "ModelConfig"
+    @staticmethod
+    def from_dir(model_dir) -> "ModelConfig"
+    @classmethod
+    def from_dict(cls, raw, *, source: str = "<dict>") -> "ModelConfig"
+    @property
+    def digest(self) -> str          # 16-hex sha256 over every graph-specialising field, `raw` excluded
+```
+
+Llama reads `rms_norm_eps` (1e-6), `hidden_act` (`"silu"`), `rope_theta` (10000.0), `num_key_value_heads` (= heads), `tie_word_embeddings` (False) and an explicit `head_dim` override else `hidden_size // num_attention_heads`; `qk_norm` is derived from `model_type` alone (`"qwen3"` → `True`, everything else `False`) — a static graph specialisation value, never inferred at run time from checkpoint contents, and covered by `digest` like every other non-`raw` field.
+GPT-2 normalises its compact keys (`n_embd`/`n_head`/`n_layer`/`n_vocab`/`n_positions`/`n_inner`/`activation_function`/`layer_norm_epsilon`, with canonical fallbacks), defaults `n_inner` to `4 × hidden_size` (HF writes `null`), activation to `"gelu_new"`, eps to 1e-5, ties embeddings, pins `rope_theta`/`head_dim` to `None` and `qk_norm` to `False`.
+Validation raises `HFConfigError` for head-count divisibility, non-positive/non-int sizes and unknown `model_type` (listing the supported set), and `HFUnsupportedError` for non-empty `rope_scaling` (a scaled-RoPE model would silently diverge from HF, so it is refused rather than approximated).
+A `qwen3` config additionally runs the Qwen3 guard: any request for sliding-window attention is an explicit `HFUnsupportedError` — truthy `use_sliding_window`, a non-empty `layer_types` list with any entry other than `"full_attention"`, or a positive integer `sliding_window` while `use_sliding_window` is not explicitly `False` (so `sliding_window: null`/absent and the real `Qwen/Qwen3-0.6B` config pass).
+`ModelConfig` values are **static graph specialisation values**: one config = one graph, and `digest` is directly usable as a cache key (configs differing only in harmless extra HF fields digest equal).
+
+### `evoxc_hf/weights.py` — checkpoint readers (numpy + stdlib only, no key mapping)
+
+```python
+read_safetensors(path) / read_torch_bin(path) / load_checkpoint(model_dir_or_file) -> dict[str, np.ndarray]
+widen_to_float32(arr) -> np.ndarray
+state_dict_parameter_count(state_dict) -> int
+```
+
+- **safetensors**: 8-byte LE u64 header length + JSON header + raw buffer; `__metadata__` skipped; dtype/shape/offsets validated against the buffer; sharded checkpoints merged through the index `weight_map`.
+- **torch**: zip format (`*/data.pkl` + `*/data/<storage-key>`) vs legacy format (magic → protocol 1001 → `sys_info` → pickled state dict → storage-key list → per key an **int64 element count followed by raw bytes**), chosen by `zipfile.is_zipfile`, never by name; views/offsets/strides (negative included) resolved; `{"state_dict": {...}}` unwrapped.
+- **Security boundary**: `_RestrictedUnpickler` allows only `collections.OrderedDict`, the three `torch._utils` rebuild helpers, storage classes from its dtype table, inert placeholders and `copyreg` reconstructors — any other global raises `HFWeightError` instead of executing code (no `allow_pickle`, no torch import).
+- **Dtype policy**: float32 preserved, float16/bfloat16 widened to float32 (bfloat16 via `u16 << 16`), float64/integer/bool kept; every array is writable and C-contiguous.
+- **Directory candidate order**: `model.safetensors` → `pytorch_model.bin` → `model.safetensors.index.json` → `pytorch_model.bin.index.json` (an absent checkpoint lists every candidate); a file argument is dispatched by suffix, else by content sniffing.
+- Returned names are the **on-disk** keys — orientation and canonical naming happen in the family canonicalisers, never here.
+
+### `evoxc_hf/ops.py` — the transformer idioms `evoxc` does not ship (graph→graph compositions)
+
+```python
+softmax, layer_norm, rms_norm, silu, gelu_tanh, gelu_erf, resolve_activation, activation_is_export_safe,
+ACTIVATIONS, EXPORT_UNSAFE_ACTIVATIONS, MASK_NEG,
+causal_mask(seq_len), rope_cos_sin(seq_len, head_dim, theta), rope_tables(...), apply_rope(x, cos, sin),
+split_heads(x, n_heads), merge_heads(x), repeat_kv(x, n_rep)
+```
+
+Every helper is a composition of public evoxc ops on `SymbolicTensor`s (no new IR op, no eager path — a concrete `Tensor` surfaces the underlying `evoxc.TraceError`), **static-shape only** (`_static_dim` is the single enforcement point; a symbolic `Dim`/`DimExpr` raises `HFUnsupportedError` naming the axis), and never casts implicitly.
+`EXPORT_UNSAFE_ACTIVATIONS`/`activation_is_export_safe` exist so the pack/build layer can refuse the compiled path up front for erf-based GELU; `rope_tables` is host numpy for the oracle only and must never feed the graph.
+
+### `evoxc_hf/reference.py` — the independent pure-numpy oracle
+
+`softmax`, `layer_norm`, `rms_norm`, `silu`, `gelu_tanh`, `gelu_erf`, `relu`, `resolve_activation`, `rope_tables`, `apply_rope`, `additive_causal_mask`, `attention`, `param_count`, `MASK_NEG`, `ACTIVATIONS`.
+Deliberately written twice in a *different* formulation (per-head Python loops in `attention`, hand-written mean/variance, `math.erf`), so a parity failure points at exactly one side.
+Hard rules: numpy + stdlib only (the single `evoxc_hf` import is `HFUnsupportedError`), every numeric input/return normalised to `float32`, explicit `ValueError`/`TypeError` on malformed shapes/dtypes.
+
+### `evoxc_hf/families.py` — the family registry (the one place families are enumerated)
+
+```python
+@dataclass(frozen=True, slots=True)
+class FamilySpec:
+    name: str                      # "llama" | "gpt2"
+    model_types: tuple[str, ...]   # every HF model_type it covers, sorted
+    canonicalize_weights: Callable # (cfg, raw) -> dict[str, np.ndarray]
+    param_specs: Callable          # (cfg) -> dict[str, evoxc.TensorSpec]
+    graph: Callable                # (cfg, seq_len, batch_size=1, *, pack_plan=None) -> @evoxc.defn forward
+    reference: Callable            # (cfg, params, input_ids) -> np.ndarray
+FAMILIES: MappingProxyType[str, FamilySpec]
+get_family(name) -> FamilySpec                       # HFUnsupportedError otherwise
+family_for_model_type(model_type) -> FamilySpec
+resolve_family(config, family=None) -> FamilySpec    # the ONE "config + optional override" resolver
+```
+
+`resolve_family` is the single place the disagreement rule lives — `load`, `program` and `pipeline` all go through it, so it can never drift between the loading half and the compute half.
+Two invariants are checked at **import** time (`RuntimeError`): every `FamilySpec.name` equals its `FAMILIES` key and its module's `FAMILY`, and a module-declared `MODEL_TYPES` must agree with the config map.
+Adding a family is one module plus one `FAMILIES` entry — `load`/`program`/`pipeline` never hard-code a family.
+
+### `evoxc_hf/models/_common.py`, `llama.py`, `gpt2.py` — one family per module
+
+```python
+# _common.py (shared verbatim by both families)
+linear(x, weight, bias=None), attention(q, k, v, mask, scale),
+gated_mlp(x, w_gate, w_up, w_down, act), two_layer_mlp(x, w1, b1, w2, b2, act)
+# per family
+FAMILY: str; MODEL_TYPES: tuple[str, ...]
+canonicalize_weights(cfg, raw), param_specs(cfg), graph(cfg, seq_len, batch_size=1, *, pack_plan=None), reference(cfg, params, ids)
+```
+
+Graph contract (both families): `params` is the flat canonical dict (exactly the `param_specs` keys), `input_ids` is `(batch_size, seq_len)` `int32`, `logits` is `(batch_size, seq_len, vocab_size)` float32; all shapes static; every weight a graph **input**, never `evoxc.constant`.
+**Orientation rule — `(in_features, out_features)`** for every weight fed to `evoxc.dot(x, W)`: llama linears are `(out, in)` in HF and transposed at load; GPT-2 `Conv1D` weights are already `(in, out)` and are **not** transposed; `lm_head.weight` is `(hidden, vocab)` in both (HF stores `(vocab, hidden)`).
+**Tied embeddings — one graph input, never two**: `tie_word_embeddings=True` omits `lm_head.weight` from both `param_specs` and `canonicalize_weights`, and the graph feeds `params["embed.weight"]` to the token gather and to the final projection — as `evoxc.transpose(embed)` on the canonical (unpacked) path, or as the head key the **packed** path supplies pre-transposed (`params["lm_head.weight"]`, a static slice of its own packed entry, when `pack_plan.has("lm_head.weight")`), so a packed tied graph contains no weight-sized transpose at all. A tied tree carries one key fewer (`gpt2` 196 keys / 124 439 808 params, `distilgpt2` 100 / 81 912 576, `tiny_gpt2` 36 / 102 714; untied `tiny_llama` 21 / 1 032 272).
+**llama canonical keys (`2 + 9·L + 1` untied, `2 + 9·L` tied; Qwen3 adds `2·L` QK-Norm keys)**: `embed.weight` ← `model.embed_tokens.weight`; per layer `attn_norm.weight` ← `input_layernorm.weight`, `attn.{q,k,v,o}.weight` ← `self_attn.*_proj.weight`.T, `mlp_norm.weight` ← `post_attention_layernorm.weight`, `mlp.{gate,up,down}.weight` ← `mlp.*_proj.weight`.T; then `final_norm.weight` ← `model.norm.weight` and, untied only, `lm_head.weight` ← `lm_head.weight`.T. A `cfg.qk_norm` (Qwen3) config adds per layer `attn.q_norm.weight` ← `self_attn.q_norm.weight` and `attn.k_norm.weight` ← `self_attn.k_norm.weight`, both **verbatim** (never transposed) and both `(head_dim,)` — per head, not `(hidden_size,)`; one `_layer_records(cfg)` list drives `_expected_shapes`, `canonicalize_weights` and `reference`, so specs/weights/oracle cannot drift, and the `qk_norm=False` path returns the unchanged 9-record order.
+**QK-Norm placement**: in both the graph and the numpy oracle, `rms_norm(q, attn.q_norm.weight, eps)` / `rms_norm(k, attn.k_norm.weight, eps)` run **after `split_heads` and before `apply_rope`**, over the last axis `head_dim` — the HF `Qwen3Attention` order. A Qwen3 config missing those checkpoint keys is a `HFWeightError` naming QK-Norm; a non-Qwen3 config carrying them is a `HFWeightError` whose leftover-key hint explains that only `model_type == "qwen3"` declares QK-Norm.
+**gpt2 canonical keys (`16·L + 5` untied, `16·L + 4` tied)**: `embed.weight` ← `wte.weight`, `pos_embed.weight` ← `wpe.weight`; per layer `attn_norm.{weight,bias}` ← `ln_1.*`, `attn.{q,k,v}.{weight,bias}` ← column blocks `[0:H]`/`[H:2H]`/`[2H:3H]` of the fused `attn.c_attn.*`, `attn.o.*` ← `attn.c_proj.*`, `mlp_norm.*` ← `ln_2.*`, `mlp.fc1.*` ← `mlp.c_fc.*`, `mlp.fc2.*` ← `mlp.c_proj.*`; then `final_norm.*` ← `ln_f.*` and, untied only, `lm_head.weight` ← `lm_head.weight`.T.
+Llama attention dims derive from `cfg.head_dim`; GPT-2 always uses `hidden_size // num_attention_heads`.
+Both canonicalisers resolve tied heads explicitly: a tied config shipping `lm_head.weight` is verified (`np.allclose`), consumed and dropped; a disagreeing tied head is `HFWeightError`, and an untied config without it is `HFWeightError` listing the remedy.
+Unexpected/duplicate keys are errors, never silently dropped; each family has one documented ignore list — llama `model.rotary_emb.inv_freq`, GPT-2 `h.{i}.attn.bias` / `h.{i}.attn.masked_bias`.
+Llama rejects **any** `*.bias` tensor (`HFUnsupportedError`, v1 builds are bias-free); GPT-2 tolerates a `transformer.` prefix in any mix (duplicates rejected).
+Both graphs compose the causal mask and (llama) the RoPE tables **in-graph** and read every weight from `params` by its flat canonical key.
+
+### `evoxc_hf/pack.py` — opt-in packed weights (few graph inputs, static in-graph slices)
+
+```python
+PACKED_PREFIX: str = "packed."
+@dataclass(frozen=True)
+class PackEntry:
+    input: str; start: tuple[int, ...]; shape: tuple[int, ...]   # shape = the STORED (unpacked) shape
+    source: str | None = None     # None → a canonical key; else the canonical key this entry derives from
+    transposed: bool = False      # stored data is params[source].T
+    @property
+    def canonical(self) -> bool   # == (source is None)
+@dataclass(frozen=True)
+class PackPlan:
+    specs: dict[str, evoxc.TensorSpec]   # the PACKED params inputs (4-5 for these families)
+    entries: dict[str, PackEntry]      # canonical + derived key -> entry
+    canonical_keys / derived_keys / unpacked_keys   # introspection (sorted tuples)
+    def has(self, name) -> bool
+    def pack(self, params) -> dict[str, np.ndarray]
+    def unpack(self, packed) -> dict[str, SymbolicTensor]   # canonical keys + derived keys
+def pack_plan(specs: Mapping[str, evoxc.TensorSpec], *, prefix=PACKED_PREFIX,
+              transposed_aliases: Mapping[str, str] | None = None) -> PackPlan
+def pack_params(plan: PackPlan, params) -> dict[str, np.ndarray]
+def is_packed_tree(tree) -> bool
+```
+
+**Derived (pre-transposed) entries** — the orientation of a weight is decided at `param_specs` time, not per call. `pack_plan` resolves its declaration from the spec tree itself (`evoxc_hf._specs.transposed_aliases(specs)`: an `embed.weight` with no `lm_head.weight` is a tied tree, so it declares `{"lm_head.weight": "embed.weight"}`); an explicit `transposed_aliases=` mapping overrides it and `{}` forces none. The declaration deliberately rides on the **plan**, never on the returned mapping — a `dict` subclass would break evoxc's typed pytree structure matching at the run boundary (`param_specs(cfg)` is handed straight to `evoxc.trace`/`evoxc.build`/`evoxc.run`). The derived key gets its own bucket keyed by its **stored** (transposed) shape, `PackEntry.shape` is the stored shape, `source`/`transposed` say where the data came from, `pack()` writes `np.ascontiguousarray(params[source].T)` exactly once, and `unpack()` returns it as a STATIC `evoxc.slice` of that stored bucket — so the graph never transposes a weight-sized operand. `pipeline.build` flattens a `ParamSpecs` to a plain `dict` before handing it to `evoxc.build_cached` (the cache key codec cannot encode a `dict` subclass); any plain-dict conversion is a safe fallback to the canonical in-graph `transpose`.
+
+Generic over any `param_specs` tree — **no family-specific code**: buckets are `(dtype, rank, shape[1:])` groups concatenated along axis 0, ordered by their minimum canonical key, keys sorted inside a bucket, offsets = prefix sums, so a plan is deterministic for equal spec trees.
+Rank-0 scalars get their own bucket and unpack through `reshape(slice(...), ())` (a static slice cannot yield rank 0).
+Measured packed input counts: llama untied **5** / tied **5**, gpt2 untied **4** / tied **4**, real 124M `gpt2` **4** against 196 canonical keys (5 declared inputs with `input_ids`, versus 197 unpacked). The packed element count equals the canonical total **plus exactly one transposed copy of the tied head** (`vocab_size × hidden_size`; 38 597 376 elements for `gpt2`) — that duplicate is the price of removing the per-call transpose, everything else is lossless and bit-identical. Counts are shape-driven, not role-driven — read them from `pack_plan(...).specs`, never assume a number.
+Families opt in with one line: `graph(cfg, seq_len, batch_size, *, pack_plan=None)` and, as the forward's **first** statement, `params = pack_plan.unpack(params)`.
+Pure graph→graph composition: **no new IR ops** (one `evoxc.slice` per canonical key) and never an `evoxc.constant` of weights. Explicit errors: symbolic/dynamic dims → `HFUnsupportedError`; missing/extra keys or shape/dtype mismatches → `HFWeightError` naming the key.
+Packing therefore costs the compiled program exactly **1× the weight bytes per call**: every bucket is an axis-0 concatenation of same-trailing-shape matrices (each canonical matrix keeps its canonical `(in, out)` orientation, so no transpose/gather/arbitrary reshape is needed to feed `evoxc.dot`) and every slice has exactly one consumer (traced qwen3_14b packed graph: 362 ≥1 MB slice operands consumed = 59.176 GB against 59.073 GB of weights, no multi-consumer weight slice).
+The graph now contains **no weight-sized layout op at all**: the tied head is a derived packed entry (measured on the real 124M `gpt2`: 60 transposes total, the largest 0.10 MB — the activation head reshuffles — and every `dot` RHS tracing to a `slice` of a packed input).
+
+### `evoxc_hf/_specs.py` — the packing-orientation rule
+
+```python
+EMBED_WEIGHT = "embed.weight"; HEAD_WEIGHT = "lm_head.weight"
+TRANSPOSED_ALIASES: Mapping[str, str] = {HEAD_WEIGHT: EMBED_WEIGHT}
+def transposed_aliases(specs: Mapping[str, object]) -> dict[str, str]
+```
+
+Stdlib-only, no carrier class: it owns the ONE static rule "a spec tree with an embedding and no head of its own is a tied tree, so its head is the transposed embedding", returning `{}` otherwise. Deterministic on the tree, so equal trees always produce equal plans.
+
+### `evoxc_hf/errors.py` and `evoxc_hf/_validate.py`
+
+```python
+class HFError(evoxc.core.EVOXCError)      # catch-all for the whole integration
+class HFConfigError(HFError)          # malformed/unsupported config.json, bad seq_len/batch_size, family override disagreement, forward specialisation mismatch
+class HFWeightError(HFError)          # checkpoint reading, key mapping, tensor shapes, tied-head disagreement, packed-vs-canonical mix
+class HFUnsupportedError(HFError)     # outside the v1 matrix: unknown family, unknown activation, erf-GELU on a compiled backend, llama biases, rope_scaling, symbolic dims
+```
+
+Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a non-numeric `input_ids` in `reference.py`) raise `ValueError`/`TypeError`, never an evoxc error class.
+`_validate.py` holds the internal argument guards (`positive_int`, `require_config`, `require_bool`, `require_device`) shared by `load`/`program`/`pipeline`, so the same message shape is used everywhere.
+
+## Design Decisions
+
+- **Functional, not OOP.** Behaviour lives in module functions that take their inputs as arguments; `LoadedModel` is a `NamedTuple` of field access only. There is no object that bundles config + params + a graph, so no call can silently reuse a stale `seq_len`, a stale backend or a stale placed tree — every piece is passed explicitly, exactly like `evoxc`'s own pipeline-object model.
+- **The compute function captures no parameters.** `forward_fn(config, seq_len=..., batch_size=..., pack_weights=...)` is pure in its static specialisation; weights are graph inputs (`param_specs`). This is why the build cache can exclude weight identity, why one graph serves every checkpoint with the same config, and why a test can assert that no ndarray appears in any closure or default of the returned forward.
+- **`seq_len`/`batch_size`/`pack_weights` are *build*-time specialisation values**, not load-time ones: `LoadedModel` carries no `seq_len`, and `forward_fn` stamps its choice on the returned object (`_evoxc_hf_specialisation`) so `build`/`predict` derive the ids spec from the graph that actually exists instead of guessing — an explicit disagreement is an `HFConfigError`, never a silently mismatched spec.
+- **Memoisation on both layers.** `forward_fn` memoises the graph (64-entry LRU on `(family, digest, seq_len, batch_size, pack_weights)`), which keeps `id(fwd)` stable so `evoxc.build_cached` returns the **same** `Executable` for an identical `build` call; weight identity is excluded because weights cannot change the traced program.
+- **Static shapes are baked in**, not symbolic: symbolic reshape/reduce-with-dynamic-dims paths are the exporter's per-op limitation, and "one graph per `(config, seq_len, batch_size)`" is the documented, memoised contract — a mismatched length is an explicit error, never a recompile surprise.
+- **In-graph RoPE and mask, not host tables.** `ops.rope_cos_sin` builds the cos/sin tables from `arange` + `power` + `cos`/`sin` (all StableHLO-exportable), keeping the graph signature at exactly `(params, input_ids)`, the emitted IR op count independent of `seq_len` (pinned by `tests/test_export.py`), and the MLIR free of inlined payload bytes. `ops.rope_tables` is oracle-only.
+- **Flat canonical param dict** (`dict[str, ndarray]` / `dict[str, TensorSpec]`), not a nested pytree: keys map one-to-one onto HF keys (nearest-miss suggestions via `difflib`) and the graph reads them by explicit key strings.
+- **The activation export gate runs before any tracing** (`_check_activation`): an erf-GELU config on a compiled backend fails immediately with `HFUnsupportedError` naming the activation, the backend and both remedies (`backend="numpy"`, or a `gelu_new` config — measured max |gelu_tanh − gelu_erf| = 4.7e-4 near |x| ≈ 2.7) instead of failing deep inside lowering; the numpy interpreter accepts every supported activation.
+- **`run`'s id-dtype coercion is the only host-side type coercion.** Integral token ids are cast to `int32` (evoxc's run boundary is dtype-strict, ids are integral by definition); params are never filtered, renamed or cast, and an `evoxc.Tensor` of ids is forwarded verbatim — which is exactly what makes the device-resident recipe reachable.
+- **`predict` is the only place a host transfer happens**, and it is one documented `Tensor.to(Device("cpu", 0))` on the *output* of a non-cpu executable; it refuses non-cpu params with the device-resident recipe rather than copying or dying inside `np.asarray`.
+- **Device-resident is explicit on both sides**: `place_params` (weights) + `place_ids` (ids) then `run`; the run boundary rejects host inputs for a non-cpu executable by design.
+- **Packed weights are an explicit, opt-in composition, never a silent default.** The limitation it removes is IREE's Python-runtime ~161-*consumed*-input cliff on llvm-cpu; bucketing by `(dtype, rank, shape[1:])` beats a hand-written per-role scheme (4 inputs for the 124M `gpt2` instead of ~12), costs no family code, and keeps every weight a graph input. Unpacked stays default because packing is not free (~475 MB + one 154 MB head copy of concatenated host arrays for the 124M model).
+- **A weight's orientation is a pack-time decision, not a per-call op.** The tied head needs `(hidden, vocab)` while the token gather needs `(vocab, hidden)`, and `evoxc.dot` has no `b_transposed` (so the graph either transposes a weight-sized table on EVERY call — a full embedding copy per forward, 154 MB for `gpt2` and 1.2 GB for `qwen3_1_7b` — or the pack stores the transposed copy once). The derived-entry design keeps the graph free of weight-layout ops for the price of one extra weight-sized host+device buffer, and it is decidable at `param_specs` time from static metadata (`tie_word_embeddings` + shapes), so nothing is decided at run time. The alternative (an axis-1 token gather over the single untransposed table) would save the duplicate but puts a gather — neither static-slice nor demoed through every adapter — on the hot path; the copy is the cheaper trade and the storage is documented.
+- **Pack once on the host, then place — never per call.** `pack_params` runs at build/params time and `place_params` then stages 3-5 leaves instead of ~200, so the same-device loop keeps its zero-host-round-trip property.
+- **`opt_level` is per-target** — `"O3"` generally, `"O1"` when every effective IREE target is ROCm — because O2/O3 trip an upstream `iree-compile` failure on these LayerNorm-reduce shapes while O0/O1/default emit a byte-identical vmfb; encoding it as a default (rather than a workaround users must know) is what makes `build(..., backend="iree", device=Device("rocm", 0))` work for real-size checkpoints, and an explicit `opt_level`/`EVOXC_OPT_LEVEL` still wins.
+- **Legacy pickles are a security boundary** (`weights._RestrictedUnpickler`): an explicit allowlist, every rejection naming the offending `module.name`.
+- **HF layout knowledge lives only in the family modules** (`canonicalize_weights`): readers stay format-only, so a mapping bug is testable one layer at a time and a new family is one module plus one registry entry.
+- **Two-formulation parity**: the graphs use evoxc ops, the oracle uses plain numpy in different shapes of code, so a shared bug would have to be written twice to pass.
+
+## Constraints
+
+- **No new hard dependency**; `torch`/`transformers` appear only in tests behind availability guards as external golden oracles, `iree` only behind `skipif` guards, and no `safetensors`/`huggingface_hub` package is required.
+- **Never modify `./evoxc/`** (sibling node — read-only; escalate core gaps to the parent agent). Gaps are composed around here and documented: `rsqrt` → `1/sqrt`, `erf` → numpy-backend-only GELU.
+- **Explicit errors only**: everything derives from `evoxc.core.EVOXCError` via `HFError` (or `ValueError`/`TypeError` for pure host-side argument errors), messages name the file/field/tensor/key, and there is never a silent fallback, dtype swap or positional guess.
+- **Static-shape-first**: dynamic dims are not a goal; a mismatched `seq_len`/`batch_size` is an explicit `HFConfigError`/`evoxc.ShapeError`.
+- **Files stay small** (~1000 lines baseline, one concern per module); no duplicate family logic — shared attention/norm/MLP pieces live in `ops.py` / `models/_common.py`. `pipeline.py` sits at ~1110 lines: one concern (the verbatim option matrix plus `build`/`run`/`predict`/placement), each function documented in place.
+- **Tests are colocated** in `./evoxc_hf/tests/`; `pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]` and its package list excludes `evoxc_hf.tests`.
+- **Status (measured)**: **725 collected — 695 passed / 30 skipped** in the base env (`uv run --with pytest python -m pytest evoxc_hf/tests`), zero failures; skips are host/dependency guards only (torch/transformers absent, `EVOXC_HF_BIG` unset, `iree` absent). The real `Qwen/Qwen3-0.6B` legs were run explicitly with `EVOXC_HF_BIG=1` + `EVOXC_HF_MODELS_DIR=…/evoxc_hf_models_qwen3`: `test_real_checkpoints.py -k qwen3` 1 passed (23 s) and `test_torch_oracle.py -k qwen3` 1 passed under the torch/transformers venv (30 s).
+- **Status (capability)**: both families trace, verify, export to StableHLO and run on the numpy interpreter, and the same graph compiles and runs on **every validated compiler adapter** — one IREE program on `llvm-cpu` and — packed where needed — device-resident on ROCm, plus device-resident **XLA/ROCm** via a user-provided PJRT plugin. Adapter coverage for the whole forward: `numpy` (host), `iree` (llvm-cpu + ROCm), `xla` (ROCm — the first `evoxc_hf` runs on XLA anywhere, measured by the benchmark harness, not a gated test); **`tvm` is UNVALIDATED for `evoxc_hf`** (no whole-model run has been recorded on the TVM adapter — its option handling is unit-tested only).
+  Measured best-of-5 warm, llvm-cpu: `tiny_llama` `seq_len=32` build 1.5 s / 3.3 ms per call (1.0e-7 vs numpy), `tiny_gpt2` 1.1 s / 3.7 ms (2.2e-8), `distilgpt2` 1.9 s / 346 ms (2.1e-4) — against 6.0 / 1.9 / 12.1 ms for the numpy interpreter, whose OpenBLAS matmuls win on CPU.
+  On ROCm/MI300X (`Device("rocm", 0)`, `target_backends=["rocm"]`): `tiny_llama` build 1.15 s / 0.21 ms warm (5.2× the interpreter), `tiny_gpt2` 0.99 s / 0.25 ms (5.0×, bit-exact), `distilgpt2` packed 3.99 s / 1.12 ms (12.4×), 124M `gpt2` packed 7.22 s / 2.75 ms (~13×), 2.4e-6 relative-to-absmax, 10/10 bit-identical runs.
+  Parity against the real HuggingFace implementation (`tests/test_torch_oracle.py`): `Qwen/Qwen3-0.6B` (fp32, CPU, eager attention) at `seq_len=8` batch 1 — `reference_logits` 6.58e-5 max-abs (2.89e-6 of the 22.79 absmax) and the numpy-backend graph 6.06e-5 (2.66e-6), argmax agreement 1.0 at every position, graph-vs-oracle 4.15e-5; batch 2 7.61e-5 / 7.82e-5 (≤3.3e-6 relative) and `seq_len=4` 4.98e-5 / 4.10e-5, all bit-identical on repeat; scaling `layers.0.attn.q_norm.weight` by 1.5 moves the logits by 2.0067 identically in HF, the oracle and the graph (the real QK-Norm weights are load-bearing). `tiny_llama` 8.9e-8, `tiny_mistral` 1.8e-7, `sshleifer/tiny-gpt2` 2.2e-8 max-abs at `seq_len=8`, argmax identical at every non-tie position; the torch-free golden cases over `../bench_logs/hf_goldens/` are `tiny_gpt2` bit-exact, `tiny_random_llama` 8.9e-8, `tiny_random_mistral` 1.2e-7, `distilgpt2` 1.07e-4, `gpt2` 1.53e-4 (1.1e-6 of a 138.7 absmax), with strict golden→checkpoint resolution.
+- **Status (vs PyTorch, `../bench_logs/hf_bench_results.md`)**: measured on an AMD Instinct MI300X VF (gfx942, ROCm 7.1) over five checkpoints (`tiny_llama`, `tiny_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2` 124M), `seq_len` 32 plus 128 for the two real ones, batch 1, the whole forward as ONE graph in the device-resident same-device loop (`asdevicearray` = 0). **`xla`/rocm beats torch-rocm in 6/6 measured cells, 7.18×–9.99×** (21.6×–35.6× vs torch-cpu on the real models) and **`iree`/rocm in 5/6, 0.73×–9.13×** — the single loss is `gpt2` at `seq_len=128` (7.276 ms vs 5.286). XLA's default fp32 `dot` is TF32-class (rel-to-absmax 1.5e-3–2.6e-3, argmax as low as 0.969 on `gpt2`), so the opt-in `dot_precision="HIGHEST"` leg is the bit-accurate one (rel-to-absmax 1.5e-6–2.9e-6, argmax agreement 1.0, for 3%–29% more latency). On CPU the numpy/OpenBLAS interpreter still wins the large matmuls (`gpt2` s32: 28.9 ms interpreted vs 403 ms on llvm-cpu). Legs that cannot run fail explicitly, never silently: `tiny_mistral` on `iree`/`xla` (its `gelu` needs `evoxc.erf`, a StableHLO export v1 deferral) and `distilgpt2`/`gpt2` at `seq_len=128` on iree-llvm-cpu (upstream `iree-compile` stack-allocation limit); there is no XLA CPU plugin on that host, so the xla legs are ROCm-only. Harness: `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `hf_bench_data/`).
+
+## Known Issues
+
+- **Exact-erf GELU is numpy-backend-only**: `hidden_act: "gelu"`/`"erf"` builds `ops.gelu_erf` (which uses `evoxc.erf`, a v1 StableHLO export deferral), so the graph runs on the numpy interpreter and raises an explicit `evoxc.BackendError` on any compiler backend — with `HFUnsupportedError` from the activation gate even earlier, and never a silent tanh substitute.
+- **Static shapes only** — one graph per `(config, seq_len, batch_size)`; `seq_len > max_position_embeddings` is `HFConfigError` and a mismatched `input_ids` shape is `evoxc.ShapeError` telling you to build another length rather than reshape.
+- **The llama family is bias-free**: any `*.bias` key raises `HFUnsupportedError` (v1 covers `attention_bias=False`/`mlp_bias=False` models only).
+- **Qwen3 is full-attention only**: `model_type: "qwen3"` is supported (Llama architecture + per-head QK-Norm, validated on the real `Qwen/Qwen3-0.6B` — 310 canonical params / 596,049,920 weights — on the numpy interpreter plus whole-graph StableHLO export; no compiler-adapter run has been recorded for a Qwen3 checkpoint yet), but any sliding-window request raises `HFUnsupportedError` from the config guard — a truthy `use_sliding_window`, a `layer_types` entry other than `"full_attention"`, or a positive `sliding_window` without `use_sliding_window: false`. QK-Norm is declared by the config (`qk_norm`, derived from `model_type`) and never inferred from checkpoint keys. bf16/fp16 checkpoints load normally (the readers widen them to float32 — the real 0.6B checkpoint is entirely bf16), while fp8 safetensors tags (`F8_E4M3`/`F8_E5M2`) raise `HFWeightError: … unsupported safetensors dtype …`, and a scaled-RoPE (`rope_scaling`) Qwen3 config hits the global `HFUnsupportedError`.
+- **Per-family key allowlists**: llama ignores `model.rotary_emb.inv_freq`; GPT-2 ignores `h.{i}.attn.bias` / `h.{i}.attn.masked_bias`. Everything else must map onto the canonical scheme or it is an `HFWeightError` listing the offending keys.
+- **`rope_scaling` is unsupported** (`HFUnsupportedError` unless `None`/`{}`/`[]`).
+- **No KV cache, no incremental decode, no sampling, no training**: every call re-runs the whole graph over `seq_len` tokens.
+- **`load_config`/`load_hf` require a directory**: `<dir>/config.json` is read before any weights, so a single checkpoint *file* path fails with `HFConfigError` naming the missing `config.json` (single-file reading is `weights.load_checkpoint`'s job).
+- **numpy-on-CPU vs the compiled graph**: on CPU the interpreter can beat the compiled graph for large matmuls (OpenBLAS) while the compiled path's value is GPU — report both, never conflate them. The opposite holds on this host's GPU (5× tiny, 12-14× `distilgpt2`, ~13× the 124M `gpt2`), and `distilgpt2` on llvm-cpu is 266 ms compiled vs 14.8 ms interpreted.
+- **Device-resident run costs**: the FIRST `place_params` leaf in a process pays a one-time HIP driver init (~0.08-0.29 s), after which a leaf costs ~6e-5 s (tiny) to ~0.10 s (124M-sized); re-placing per call instead of keeping the placed tree costs ~9× the same-device loop (2.04 vs 0.222 ms/call for `tiny_llama`). The first `.to(Device("cpu", 0))` readback pays ~1-17 ms once per process, then ~0.75-1.3 ms per 2 MiB; the first call after build is only 1.1-3× warm.
+- **Packing is not free, just cheap**: the packed 124M `gpt2` tree is ~475 MB of fresh concatenated host arrays **plus the 154 MB pre-transposed tied head** (peak RSS ~1.7 GB on the packed llvm-cpu path vs ~1.1 GB unpacked-numpy, since canonical and packed trees briefly coexist) and the interpreter pays ~0-2% extra latency for the in-graph slices (logits stay bit-identical). Its payoff is the input count (197 → 5) and the staging leaf count (196 → 4).
+- **ROCm `opt_level` O2/O3 fails to compile gpt2-class graphs** (upstream `'func.func' op failed to distribute` on the LayerNorm mean reduce; every probed hidden × heads combination compiles at O1 with a byte-identical vmfb to O0/default). The `"O1"` default for all-ROCm targets is what keeps real-size builds working; an explicit `opt_level`/`EVOXC_OPT_LEVEL` overrides it and owns the risk.
+- **ROCm fp32 `dot` is true fp32**: `dot_precision="HIGHEST"` (needed against xla/ROCm's TF32 default) is a no-op on iree/ROCm — pinned by bit-identical logits. ROCm parity is fp32 accumulation-order noise (`tiny_gpt2` bit-exact, `tiny_llama` 8.9e-8, real-size GPT-2 ~2-3e-6 **relative to absmax**), so real-size comparisons must be relative-to-absmax, never element-wise.
+- **The IREE Python-runtime ~161-consumed-input `_invoke` cliff exists on llvm-cpu only — and `pack_weights=True` removes it**: a graph that **consumes** more than ~161 distinct inputs compiles, loads and then SIGSEGVs at the first run (exit 139, no traceback, `iree/runtime/function.py` `_invoke`). The trigger is input *consumption* (not declared-argument count, op/dispatch count, tensor size or parameter count; bracketed at 161 for a chained-matmul graph and 162 for a fan-out-reduce one; neither `opt_level="O0"` nor dropping `--iree-opt-data-tiling` helps). The 124M `gpt2` (`seq_len=32`, 197 inputs) traces, lowers, compiles (870 IR ops) and loads, then crashes — truncated to 9 layers (149 inputs) it runs while 10 layers (165) already crashes; `pack_weights=True` brings it to 4 weight inputs + ids = 5 and it runs (~405 ms/call median on llvm-cpu, 13 consecutive bit-identical runs, 2.5e-6 relative vs the interpreter). **ROCm has no such cliff** (the unpacked 197-input graph runs at 2.19 ms/call at `seq_len=16`, bit-exact), so packing is optional there and its value is the 196 → 4 staging-leaf reduction. `distilgpt2` (101 inputs) is unaffected at `max_abs` 3.2e-4 (2.8e-6 of an 112.5 absmax), argmax identical, 230 ms/call on llvm-cpu.
+- **A tied head is one array, so a tied tree is the model's true parameter count**: a tied checkpoint that ships its `lm_head.weight` copy is verified against the embedding and dropped, never kept as a second graph input. Retained RSS for `gpt2` at `seq_len=32` is the canonical tree itself (475 MiB), while the *peak* is ~1.06 GiB because the raw safetensors dict and the canonical tree coexist during canonicalisation (`load_params` drops the raw dict afterwards).
+- **A tied head costs no in-graph transpose when PACKED, but an UNPACKED tied graph still transposes the whole embedding per call**: the canonical path (every graph built without `pack_plan`) is unchanged — `models/llama.py` and `models/gpt2.py` build `linear(x, evoxc.transpose(embed))`, one full `(vocab, hidden) → (hidden, vocab)` materialization per forward (gpt2 154 MB, `qwen3_0_6b` 622 MB, `qwen3_1_7b` 1244 MB). With `pack_weights=True` the head arrives as its own derived packed entry (already transposed, sliced statically) and the graph holds no weight-sized layout op: the real 124M `gpt2` packed graph measures 60 transposes, all activation head reshuffles (largest 0.10 MB), and 73 `dot` RHS values that all trace to a `slice` of a packed input. So packing a tied config costs one extra weight-sized host+device buffer (`vocab × hidden` f32: 154 MB for `gpt2`, 622 MB `qwen3_0_6b`, 1244 MB `qwen3_1_7b`) and saves an embedding-sized device copy per call; the untied path (`params["lm_head.weight"]`, `(hidden, vocab)`) has neither. Pinned by `tests/test_pack.py` (`test_tied_head_has_no_weight_sized_transpose`, no ≥1 MB layout op; `test_untied_path_is_unchanged`, no extra input) — `evoxc.dot` still has no dimension-number/`b_transposed` parameter (`evoxc/ops/linalg.py:150`), which is why the orientation is encoded at pack time.
+- **IREE/ROCm trails XLA/ROCm by ~5–12× on this same single-graph forward, and it is a backend-throughput gap, not weight duplication**: from the committed `../bench_logs/hf_bench_data/` records the achieved GEMM throughput at `seq_len=32` is iree/rocm 1.1–4.0 TFLOPS vs xla/rocm 7.3–31.2 (torch-rocm eager 17.8, torch.compile-rocm 35.0 on the 8B cell, which XLA does at 28.7 and IREE at 3.5), and quadrupling `seq_len` costs IREE 1.62–2.32× against XLA's 1.23–1.40× — XLA is weight-bandwidth-bound (~1.7 TB/s effective) while IREE streams the same weights at only ~200 GB/s *and* stays far below fp32 peak. The latency ratio is smallest exactly where the tied transpose exists (`distilgpt2` 1.62×, gpt2 3.2× at s128) and largest on the untied 8B/14B cells (8.2×/7.9× at s32), so the transpose does not explain the gap. Load-time facts belong to the iree ROCm adapter rather than here: placing 32.8 GB of packed weights takes 23.1 s on iree/rocm versus 2.3 s on xla/rocm, and the iree leg's peak RSS is 141.6 GB against xla's 73.0 GB for identical packed weights.
+- **Vulkan (`device=Device("vulkan", 0)` → `iree` + `vulkan-spirv`) is compile-limited on real-size models**: IREE's default Vulkan target profile `vp_android_baseline_2022` allows only **16384 bytes** of workgroup shared memory, so at the default `opt_level="O3"` the 124M-class graphs fail to compile (`function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; exceeded the limit of 16384 bytes`, and `failed to legalize operation 'vector.from_elements'` at `seq_len=128`) — the measured remedy is an explicit `opt_level="O1"`, and a larger-profile `--iree-vulkan-target=<profile>` in `iree_compile_args` lifts the shared-memory limit but not the later vector-lowering failure at `O3`. Tiny checkpoints compile with the defaults. Both knobs are explicit caller options — evoxc_hf injects neither, and nothing else about `build` changes for this kind. Host/driver reality and the measured software-Vulkan (lavapipe) matrix: [`../bench_logs/vulkan_findings.md`](../bench_logs/vulkan_findings.md).
+- **`evoxc` ships no `rsqrt`, top-level `where`, `softmax`, `layer_norm`, `rms_norm`, `silu` or `iota`**, and its `slice` takes static start/limit tuples (no data-dependent slice): all composed in `ops.py`.
+- **Legacy `pytorch_model.bin` layout**: the legacy format writes an **int64 element count before each storage's bytes** (after the pickled state dict and the storage-key list) and stores storages in trailer key order; consuming `numel × itemsize` bytes per storage **without** that prefix shifts every storage, so `weights._read_torch_legacy` must read the count first (verified on a real legacy file: trailing bytes exceed the summed storage sizes by exactly 8 per storage). A shifted parse still yields correctly-shaped, plausible tensors and graph-vs-`reference` parity cannot detect it (both sides read the same arrays) — validate a legacy `.bin` against an external oracle or assert the reader consumes the file exactly. `sshleifer/tiny-gpt2` has ordinary logits (`max |logit| ≈ 0.1285` with the prefix), so the `~1e-44` "degenerate checkpoint" figure in `../bench_logs/hf_feasibility_findings.md` describes a shifted parse, not the checkpoint (that file is a read-only sibling; this is a fact about the layout, not a change log).
+
+## Routing Table
+
+| Path / module | Area |
+|---|---|
+| `./evoxc_hf/load.py` | Loading half: `LoadedModel`, `load_config`, `load_params`, `load_hf`, `validate_params`. |
+| `./evoxc_hf/program.py` | Compute half: `forward_fn` (+ memoisation/specialisation stamp), `param_specs`, `reference_logits`, `resolve_seq_len`, `DEFAULT_SEQ_LEN`. |
+| `./evoxc_hf/pipeline.py` | Staging: `build`, `run`, `predict`, `place_params`, `place_ids`, `resolve_build_options`, the `DEFAULT_*` option constants and the default backend/option matrix. |
+| `./evoxc_hf/config.py` | HF `config.json` → `ModelConfig`, `digest`, `FAMILY_BY_MODEL_TYPE`. |
+| `./evoxc_hf/weights.py` | Checkpoint reading: safetensors, torch zip/legacy, sharded indices, dtype policy, restricted unpickler (no key mapping). |
+| `./evoxc_hf/ops.py` | Graph idioms (norms/activations/softmax/mask/RoPE/head layout) + `ACTIVATIONS`/`EXPORT_UNSAFE_ACTIVATIONS`. |
+| `./evoxc_hf/reference.py` | Independent pure-numpy oracle primitives (no `evoxc` import) — the thing graphs are validated against. |
+| `./evoxc_hf/families.py` | `FamilySpec`, the `FAMILIES` registry, `get_family`, `family_for_model_type`, `resolve_family`. |
+| `./evoxc_hf/models/` | Per-family graph builders (`llama.py` — llama/mistral/qwen2/qwen3, the Qwen3 case adding per-head QK-Norm — and `gpt2.py`) plus the shared block assembly `_common.py`; `models/__init__.py` re-exports nothing (import acyclicity). |
+| `./evoxc_hf/pack.py` | Opt-in packed weights: `PackPlan`/`PackEntry`/`pack_plan`/`pack_params`/`is_packed_tree` — bucket the canonical `param_specs` by `(dtype, rank, shape[1:])`, concatenate along axis 0 on the host, unpack inside the graph with static `evoxc.slice`; derived entries (`source`/`transposed`) store a pre-transposed copy so the graph never transposes a weight. |
+| `./evoxc_hf/_specs.py` | The packing-orientation rule: `transposed_aliases(specs)` → `{derived_key: source_key}` (a tied tree declares its pre-transposed head; nothing else does). |
+| `./evoxc_hf/errors.py` | The `HFError` hierarchy (rooted at `evoxc.core.EVOXCError`). |
+| `./evoxc_hf/_validate.py` | Internal argument guards shared by `load`/`program`/`pipeline`. |
+| `./evoxc_hf/tests/` | pytest suite (parity, export, iree/llvm-cpu + iree/ROCm device-resident gates, packed-weight pins, real-checkpoint gates, and the functional-API design pins in `test_public_api.py`); `tests/hf_download.py` is the guarded checkpoint downloader used by the network-dependent tests. |
+
+Cross-references (read-only): `../evoxc/` → the tensor language this package builds on (public API contract in `../evoxc/CONTEXT.md`); `../bench_logs/` → the HF feasibility spike, probe scripts and measured results — notably the current HF-vs-PyTorch benchmark harness `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `../bench_logs/hf_bench_data/`) and its report `../bench_logs/hf_bench_results.md`, the older `../bench_logs/hf_perf_results.md`, and `../bench_logs/hf_goldens/`, the torch-golden fixtures read by `tests/test_torch_oracle.py`.
+
+## Notes for Agents
+
+- **The functional surface is the contract.** No re-introduction of a loaded-model class with methods, no `HFModel`, no `build_model`/`run_model`, and no `seq_len` on the loaded record: config data (`load_*`), compute function (`forward_fn`), and staging (`build`/`run`/`predict`) stay separate layers.
+- The StableHLO exporter defers `erf`, `gelu`, `tril`, `triu`, `cumsum`, `cumprod`, `flip`, `roll` (all verified to raise `BackendError`) — do not put them in a compiled graph; compose from comparisons/`select`/arithmetic instead, as `ops.py` does.
+- `evoxc.dot` does not auto-cast mixed dtypes (unlike elementwise ops): pass weights of the same dtype as the activations (every `evoxc_hf` spec is float32).
+- Never `evoxc.constant` a weight — it inlines the payload into the emitted MLIR text; weights are graph inputs (`param_specs`) by contract.
+- Export needs an explicit trace first: `fwd = forward_fn(config, seq_len=s)` → `evoxc.trace(fwd, param_specs(config), evoxc.TensorSpec((b, s), evoxc.int32))` → `graph.verify()` → `stablehlo.export(graph)` (`stablehlo.export` on a `Defn` raises `TypeError`).
+- `param_specs` is a **function** (`param_specs(config)`), never a mapping.
+- `pytest` is not in the base uv env: run `uv run --with pytest python -m pytest evoxc_hf/tests` (add `--extra iree` for the compiled path). The `iree` adapter's nanobind teardown can swallow the `-q` summary line — always count with `--junit-xml`.
+- `uv run --extra iree` **mutates the shared venv**: after such a run, `uv sync` restores the documented base env (otherwise the "iree-absent" skips silently disappear).
+- Use `$TMPDIR` for checkpoints, never `/tmp` (`hf_download` defaults to `$TMPDIR/evoxc_hf_models`, overridable with `$EVOXC_HF_MODELS_DIR`); real-size checkpoints are opt-in with `EVOXC_HF_BIG=1`, which also satisfies `require_model` for locally cached checkpoints offline.
+- Packed weights are opt-in and generic: `build(forward_fn(cfg, pack_weights=True), cfg, pack_weights=True)` + `pack_params(pack_plan(param_specs(cfg)), params)` (or `predict(..., pack_weights=True)` which packs a canonical tree once on the host); pack on the **host first**, then `place_params`, then `run`. Never re-concatenate per call, and never assume a fixed packed count — read it from `pack_plan(...).specs`. A tied config's pre-transposed head entry is declared automatically (`_specs.transposed_aliases`); pass `transposed_aliases={}` to `pack_plan` for a plan without it (which then keeps the in-graph `transpose`).
+- GPU work needs `uv run --isolated --extra iree …` (the base env has no iree, so `evoxc.devices()` shows only cpu); the ROCm device is `Device("rocm", 0)` (HAL `device_id` is 1-based), the adapter auto-detects the `gfxNNN` target, and the ROCm cases are GPU-guarded so the suite stays green on a CPU-only host. Run the ROCm module with `PYTHONUNBUFFERED=1`.
+- Real-size (`gpt2`/`distilgpt2`) work is memory-hungry (packed 124M ≈ 1.7 GB peak, canonical tree ≈ 475 MB): guard such cases on available memory and keep GPU runs short (this host's GPU is often shared).

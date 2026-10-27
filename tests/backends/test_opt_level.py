@@ -1,18 +1,18 @@
 """Unit tests for the first-class ``opt_level`` option (the 53-test suite).
 
-Ported from the in-package ``etl/backends/opt_level_test.py`` (which was NOT
+Ported from the in-package ``evoxc/backends/opt_level_test.py`` (which was NOT
 collected by pytest — ``testpaths = ["tests"]``); this copy lives under
 ``tests/`` and is part of the default run.
 
-Covers the etl-defined optimization-level option (``"O0"``..``"O3"`` /
-``"0"``..``"3"`` / int 0..3 — the FIRST etl-validated common option,
-``etl.backends.options.normalize_opt_level``) implemented across the
+Covers the evoxc-defined optimization-level option (``"O0"``..``"O3"`` /
+``"0"``..``"3"`` / int 0..3 — the FIRST evoxc-validated common option,
+``evoxc.backends.options.normalize_opt_level``) implemented across the
 compiler adapters: the iree derived flag ``--iree-opt-level=N`` (with the
 name-collision conflict rule), the xla protobuf wire-format editor
 (``xla_util.set_opt_level`` — field 24 of ``executable_build_options``), the
 tvm version-adaptive kwarg (loud ``BackendError`` on TVM builds without the
-parameter), the ``KNOWN_OPTIONS`` union declarations, the ``ETL_OPT_LEVEL``
-env half of ``etl.pipeline_options`` (now wired — the coordinated-feature
+parameter), the ``KNOWN_OPTIONS`` union declarations, the ``EVOXC_OPT_LEVEL``
+env half of ``evoxc.pipeline_options`` (now wired — the coordinated-feature
 guards below never skip), and end-to-end pipeline smokes.
 """
 
@@ -21,14 +21,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import etl
-from etl.core import BackendError
-from etl.backends.options import OPT_LEVEL, normalize_opt_level, validate_options
-from etl.backends.adapters import iree as iree_adapt
-from etl.backends.adapters import tvm as tvm_adapt
-from etl.backends.adapters import xla as xla_adapt
-from etl.backends.adapters import xla_util
-from etl.pipeline_options import ENV_OPTION_TABLE, apply_env_options
+import evoxc
+from evoxc.core import BackendError
+from evoxc.backends.options import OPT_LEVEL, normalize_opt_level, validate_options
+from evoxc.backends.adapters import iree as iree_adapt
+from evoxc.backends.adapters import tvm as tvm_adapt
+from evoxc.backends.adapters import xla as xla_adapt
+from evoxc.backends.adapters import xla_util
+from evoxc.pipeline_options import ENV_OPTION_TABLE, apply_env_options
 
 # ---------------------------------------------------------------------------
 # Shared tiny graph (used by the end-to-end smokes): y = x*x + 1
@@ -36,18 +36,18 @@ from etl.pipeline_options import ENV_OPTION_TABLE, apply_env_options
 
 
 def _tiny_fn(x):
-    return etl.add(etl.multiply(x, x), 1.0)
+    return evoxc.add(evoxc.multiply(x, x), 1.0)
 
 
-_TINY_SPEC = etl.TensorSpec((2, 2), etl.float32)
+_TINY_SPEC = evoxc.TensorSpec((2, 2), evoxc.float32)
 _TINY_INPUT = np.array([[1.0, 2.0], [3.0, 4.0]], dtype="float32")
 _TINY_EXPECTED = _TINY_INPUT * _TINY_INPUT + 1.0
 
 
 def _run_parity(backend, **build_options):
     """Build the tiny graph on ``backend`` and assert numpy parity."""
-    exe = etl.build(_tiny_fn, _TINY_SPEC, backend=backend, **build_options)
-    got = etl.run(exe, _TINY_INPUT).numpy()
+    exe = evoxc.build(_tiny_fn, _TINY_SPEC, backend=backend, **build_options)
+    got = evoxc.run(exe, _TINY_INPUT).numpy()
     np.testing.assert_allclose(got, _TINY_EXPECTED, rtol=0, atol=1e-6)
     return got
 
@@ -115,7 +115,7 @@ def test_iree_resolve_compile_args_derived_flag():
 def test_iree_resolve_compile_args_conflict_rule():
     pytest.importorskip("iree.compiler")
     # A user flag whose NAME collides with the derived flag replaces it —
-    # never both (the same machinery as every other etl default).
+    # never both (the same machinery as every other evoxc default).
     out = iree_adapt._resolve_iree_compile_args(
         ("llvm-cpu",),
         ["--iree-opt-level=O1"],
@@ -276,32 +276,32 @@ def test_xla_known_options_union(stage):
 
 
 # ---------------------------------------------------------------------------
-# 5. Env half — ETL_OPT_LEVEL in etl.pipeline_options (wired)
+# 5. Env half — EVOXC_OPT_LEVEL in evoxc.pipeline_options (wired)
 # ---------------------------------------------------------------------------
 
 
 def _env_has_opt_level(backend):
     entries = ENV_OPTION_TABLE.get((backend, "compile"), ())
-    return any(env_var == "ETL_OPT_LEVEL" for env_var, _, _ in entries)
+    return any(env_var == "EVOXC_OPT_LEVEL" for env_var, _, _ in entries)
 
 
 def _require_env_opt_level(backend):
     if not _env_has_opt_level(backend):
         pytest.skip(
-            "ETL_OPT_LEVEL not yet wired into etl.pipeline_options "
+            "EVOXC_OPT_LEVEL not yet wired into evoxc.pipeline_options "
             "(coordinated feature)"
         )
 
 
 def test_env_opt_level_applied(monkeypatch):
     _require_env_opt_level("iree")
-    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    monkeypatch.setenv("EVOXC_OPT_LEVEL", "O2")
     assert apply_env_options("iree", {}, "compile") == {"opt_level": 2}
 
 
 def test_env_opt_level_explicit_wins(monkeypatch):
     _require_env_opt_level("iree")
-    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    monkeypatch.setenv("EVOXC_OPT_LEVEL", "O2")
     assert apply_env_options("iree", {"opt_level": "O1"}, "compile") == {
         "opt_level": "O1"
     }
@@ -309,21 +309,21 @@ def test_env_opt_level_explicit_wins(monkeypatch):
 
 def test_env_opt_level_malformed(monkeypatch):
     _require_env_opt_level("iree")
-    monkeypatch.setenv("ETL_OPT_LEVEL", "banana")
+    monkeypatch.setenv("EVOXC_OPT_LEVEL", "banana")
     with pytest.raises(BackendError) as excinfo:
         apply_env_options("iree", {}, "compile")
     msg = str(excinfo.value)
     # Accept either substring — the sibling's wrapping choice (raw
     # normalize_opt_level error names 'opt_level'; a wrapped one names the
-    # variable ETL_OPT_LEVEL).
-    assert "ETL_OPT_LEVEL" in msg or "opt_level" in msg
+    # variable EVOXC_OPT_LEVEL).
+    assert "EVOXC_OPT_LEVEL" in msg or "opt_level" in msg
 
 
 def test_env_opt_level_numpy_unaffected(monkeypatch):
     # No guard needed: numpy has NO table entry by design (and never will),
     # so the env var is always a no-op for it — the assert below is true
     # with or without the sibling wiring.
-    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    monkeypatch.setenv("EVOXC_OPT_LEVEL", "O2")
     assert apply_env_options("numpy", {}, "compile") == {}
 
 
@@ -335,8 +335,8 @@ def test_env_opt_level_numpy_unaffected(monkeypatch):
 def test_smoke_numpy_opt_level_accepted_and_ignored():
     # The numpy reference backend documents-ignores unknown options:
     # opt_level="O3" flows through lower/compile without validation.
-    exe = etl.build(_tiny_fn, _TINY_SPEC, opt_level="O3")
-    got = etl.run(exe, _TINY_INPUT).numpy()
+    exe = evoxc.build(_tiny_fn, _TINY_SPEC, opt_level="O3")
+    got = evoxc.run(exe, _TINY_INPUT).numpy()
     np.testing.assert_array_equal(got, _TINY_EXPECTED)
 
 
@@ -362,5 +362,5 @@ def test_smoke_tvm_opt_level():
     # BackendError naming 'opt_level' and the installed version — never a
     # silently dropped option.
     with pytest.raises(BackendError) as excinfo:
-        etl.build(_tiny_fn, _TINY_SPEC, backend="tvm", opt_level=3)
+        evoxc.build(_tiny_fn, _TINY_SPEC, backend="tvm", opt_level=3)
     assert "opt_level" in str(excinfo.value)

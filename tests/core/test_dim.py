@@ -1,7 +1,7 @@
-"""Tests for etl symbolic shape dimensions: ``Dim``, ``DimExpr``, ``dim()``.
+"""Tests for evoxc symbolic shape dimensions: ``Dim``, ``DimExpr``, ``dim()``.
 
-Authoritative source: ``etl/core/dim.py`` (contract summarized in
-``etl/core/CONTEXT.md``). Dims and dim-expressions are pure ASTs: arithmetic
+Authoritative source: ``evoxc/core/dim.py`` (contract summarized in
+``evoxc/core/CONTEXT.md``). Dims and dim-expressions are pure ASTs: arithmetic
 dunders only build ``DimExpr`` nodes (ops are named ``add/sub/mul/floordiv/mod/
 min/max``), ``min``/``max`` are *methods*, ``DimExpr.evaluate(dim_sizes)`` does
 explicit substitution (bindings take precedence over known sizes) with Python
@@ -14,9 +14,9 @@ import operator
 
 import pytest
 
-import etl
-import etl.core
-from etl import Dim, DimExpr, ShapeError, dim
+import evoxc
+import evoxc.core
+from evoxc import Dim, DimExpr, ShapeError, dim
 
 
 # ---------------------------------------------------------------------------
@@ -294,14 +294,14 @@ def test_dim_invalid_inputs_raise_type_error(bad):
 # Public exports
 # ---------------------------------------------------------------------------
 
-def test_importable_from_etl_and_etl_core():
-    from etl import Dim as D1, DimExpr as E1, ShapeError as S1, dim as f1
-    from etl.core import Dim as D2, DimExpr as E2, ShapeError as S2, dim as f2
+def test_importable_from_evoxc_and_evoxc_core():
+    from evoxc import Dim as D1, DimExpr as E1, ShapeError as S1, dim as f1
+    from evoxc.core import Dim as D2, DimExpr as E2, ShapeError as S2, dim as f2
 
     assert D1 is D2
     assert E1 is E2
     assert S1 is S2
     assert f1 is f2
     # Also reachable as attributes of the package modules.
-    assert etl.Dim is etl.core.Dim
-    assert etl.dim is etl.core.dim
+    assert evoxc.Dim is evoxc.core.Dim
+    assert evoxc.dim is evoxc.core.dim

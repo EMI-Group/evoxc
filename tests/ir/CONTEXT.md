@@ -2,8 +2,8 @@
 
 ## Intent
 
-pytest suite validating the `etl.ir` package (sibling — the contract lives in
-`../etl/ir/CONTEXT.md`, read it before touching these tests). These tests are
+pytest suite validating the `evoxc.ir` package (sibling — the contract lives in
+`../evoxc/ir/CONTEXT.md`, read it before touching these tests). These tests are
 the executable spec of the IR layer: the op registry (canonical 105-op v1 set),
 `verify()` invariants, serialization round-trips/integrity, `pretty_print`
 golden output, the `Builder`, shape-inference hooks, and the SSA data model.
@@ -21,10 +21,10 @@ golden output, the `Builder`, shape-inference hooks, and the SSA data model.
 | `test_inference.py` | 23 of the 49 shape-inference hooks (the argsort/tile/diag/random/sparse-era hooks are not exercised here): static + symbolic (`Dim`/`DimExpr`) + `None` dims, numpy dtype promotion/reduction rules, ShapeError/ValueError cases, world-group collectives (group_size=None → None dims) |
 | `test_model.py` | structural attrs of Module/Function/Region/Block/Op/Value/Use/ValueType/Location/effects, use-def chains, RAUW (`replace_all_uses_with`), Dim/DimExpr interop |
 
-## Known etl bugs
+## Known evoxc bugs
 
 None found — every test passes against the current implementation; the documented
-contracts in `../etl/ir/CONTEXT.md` (including the Known Issues section) hold.
+contracts in `../evoxc/ir/CONTEXT.md` (including the Known Issues section) hold.
 Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
 - `divide` uses `infer_elementwise_binary` (int/int stays int) and unary math ops
   are dtype-preserving — the ops-layer true-division/float64-promotion contract
@@ -40,7 +40,7 @@ Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
 - **Registry is global — never leave test-only OpDefs registered.** Two tests
   in `test_verify.py` need fake ops (`_test_halt`, `_test_no_rule`); they are
   registered by the `test_only_opdefs` fixture, which restores the registry to
-  its exact pre-fixture state in a `finally` (pops from `etl.ir.op_defs._REGISTRY`).
+  its exact pre-fixture state in a `finally` (pops from `evoxc.ir.op_defs._REGISTRY`).
   Import-time registration broke `test_registry.py`'s canonical-set assertions
   when the two files ran in one pytest process.
 - Test modules must NOT import each other's helpers; keep fixtures/helpers local
@@ -49,7 +49,7 @@ Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
   the `Builder`, mutate ONE thing in place (bypasses the Builder's eager checks),
   assert `verify` fails with a specific message, restore, assert it passes again.
 - The package is READ-ONLY from here: if a test finds a genuine contract
-  violation in `etl`, keep the failing test with a `# BUG(etl): ...` comment and
+  violation in `evoxc`, keep the failing test with a `# BUG(evoxc): ...` comment and
   escalate the fix to the parent (do not weaken the test).
 - Run: `python3 -m pytest -q tests/ir` from the repo root (root `conftest.py`
   puts the repo root on sys.path). CPU only, no GPU/network.

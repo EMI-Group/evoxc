@@ -1,6 +1,6 @@
-"""pytest suite for etl elementwise + comparison ops.
+"""pytest suite for evoxc elementwise + comparison ops.
 
-Asserts the contracts of ``etl/ops/CONTEXT.md`` (binding) for the public
+Asserts the contracts of ``evoxc/ops/CONTEXT.md`` (binding) for the public
 elementwise/comparison functions: broadcast shape rules (incl. symbolic
 ``Dim``/``DimExpr``), dtype promotion (numpy ``result_type`` for
 tensor⊕tensor, NEP-50 weak scalar promotion for Python scalars), op
@@ -17,11 +17,11 @@ import math
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 # ---------------------------------------------------------------------------
-# op tables (public etl.* names; the IR registry stores the SAME plain names
+# op tables (public evoxc.* names; the IR registry stores the SAME plain names
 # with category "elementwise"/"comparison" — verified via ops_of)
 # ---------------------------------------------------------------------------
 
@@ -68,10 +68,10 @@ ALL_BINARY = BINARY_ARITH + COMPARISONS + BITWISE + LOGICAL
 #: require bool operands, bitwise ops require integer/bool).
 def _binary_spec_dtype(op_name):
     if op_name in ("logical_and", "logical_or"):
-        return etl.bool_
+        return evoxc.bool_
     if op_name.startswith("bitwise"):
-        return etl.int32
-    return etl.float32
+        return evoxc.int32
+    return evoxc.float32
 
 
 def _trace_and_capture(fn, *specs):
@@ -116,7 +116,7 @@ BROADCAST_CASES = [
     ids=[c[3] for c in BROADCAST_CASES],
 )
 def test_binary_broadcast_shapes(op_name, shape_a, shape_b, expected):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
     dtype = _binary_spec_dtype(op_name)
 
     def traced(x, y):
@@ -124,8 +124,8 @@ def test_binary_broadcast_shapes(op_name, shape_a, shape_b, expected):
 
     graph, out = _trace_and_capture(
         traced,
-        etl.TensorSpec(shape_a, dtype),
-        etl.TensorSpec(shape_b, dtype),
+        evoxc.TensorSpec(shape_a, dtype),
+        evoxc.TensorSpec(shape_b, dtype),
     )
     # SymbolicTensor side: the result shape is the numpy broadcast shape.
     assert out.shape == expected
@@ -141,17 +141,17 @@ def test_binary_broadcast_shapes(op_name, shape_a, shape_b, expected):
 def test_binary_static_broadcast_error_at_trace_time(op_name):
     """Unequal static int dims fail at TRACE time with ShapeError (never
     deferred to run time)."""
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
     dtype = _binary_spec_dtype(op_name)
 
     def traced(x, y):
         return fn(x, y)
 
-    with pytest.raises(etl.ShapeError, match="cannot broadcast incompatible dims 2 and 4"):
+    with pytest.raises(evoxc.ShapeError, match="cannot broadcast incompatible dims 2 and 4"):
         trace_fn(
             traced,
-            etl.TensorSpec((2, 3), dtype),
-            etl.TensorSpec((4, 3), dtype),
+            evoxc.TensorSpec((2, 3), dtype),
+            evoxc.TensorSpec((4, 3), dtype),
         )
 
 
@@ -162,11 +162,11 @@ def test_binary_static_broadcast_error_at_trace_time(op_name):
 _SYMBOLIC_CASES = [
     # (shape_a, shape_b, expected) — symbolic dims unify by name, conflicts
     # defer as DimExpr.max, 1 still broadcasts.
-    ((etl.dim("n"), 3), (5, 1), (etl.DimExpr("max", etl.dim("n"), 5), 3), "dim-vs-int"),
-    ((etl.dim("n"), 3), (etl.dim("n"), 3), (etl.dim("n"), 3), "same-dim-passthrough"),
-    ((1, 3), (etl.dim("n"), 1), (etl.dim("n"), 3), "one-broadcasts"),
-    ((etl.dim("n"), etl.dim("m")), (etl.dim("m"), 2),
-     (etl.DimExpr("max", etl.dim("n"), etl.dim("m")), etl.DimExpr("max", etl.dim("m"), 2)),
+    ((evoxc.dim("n"), 3), (5, 1), (evoxc.DimExpr("max", evoxc.dim("n"), 5), 3), "dim-vs-int"),
+    ((evoxc.dim("n"), 3), (evoxc.dim("n"), 3), (evoxc.dim("n"), 3), "same-dim-passthrough"),
+    ((1, 3), (evoxc.dim("n"), 1), (evoxc.dim("n"), 3), "one-broadcasts"),
+    ((evoxc.dim("n"), evoxc.dim("m")), (evoxc.dim("m"), 2),
+     (evoxc.DimExpr("max", evoxc.dim("n"), evoxc.dim("m")), evoxc.DimExpr("max", evoxc.dim("m"), 2)),
      "two-symbolic"),
 ]
 
@@ -177,7 +177,7 @@ _SYMBOLIC_CASES = [
     ids=[c[3] for c in _SYMBOLIC_CASES],
 )
 def test_binary_symbolic_broadcast(op_name, shape_a, shape_b, expected):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
     dtype = _binary_spec_dtype(op_name)
 
     def traced(x, y):
@@ -185,8 +185,8 @@ def test_binary_symbolic_broadcast(op_name, shape_a, shape_b, expected):
 
     graph, out = _trace_and_capture(
         traced,
-        etl.TensorSpec(shape_a, dtype),
-        etl.TensorSpec(shape_b, dtype),
+        evoxc.TensorSpec(shape_a, dtype),
+        evoxc.TensorSpec(shape_b, dtype),
     )
     assert out.shape == expected
     op = ops_of(graph, op_name)[0]
@@ -195,54 +195,54 @@ def test_binary_symbolic_broadcast(op_name, shape_a, shape_b, expected):
 
 @pytest.mark.parametrize("unary_name", UNARY_PRESERVING + UNARY_MATH + ["logical_not"])
 def test_unary_preserves_symbolic_shape(unary_name):
-    fn = getattr(etl, unary_name)
-    n = etl.dim("n")
-    dtype = etl.bool_ if unary_name == "logical_not" else etl.float32
+    fn = getattr(evoxc, unary_name)
+    n = evoxc.dim("n")
+    dtype = evoxc.bool_ if unary_name == "logical_not" else evoxc.float32
 
     def traced(x):
         return fn(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((n, 3), dtype))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((n, 3), dtype))
     assert out.shape == (n, 3)
     assert ops_of(graph, unary_name)[0].results[0].type.shape == (n, 3)
 
 
 def test_unary_of_python_scalar_is_0d():
-    graph, out = _trace_and_capture(lambda: etl.sqrt(4.0))
+    graph, out = _trace_and_capture(lambda: evoxc.sqrt(4.0))
     assert out.shape == ()
     assert out.dtype == np.dtype("float64")
 
 
 def test_symbolic_runtime_binding_happy_path():
     """A symbolic-dim graph runs once dims are bound from concrete inputs."""
-    n = etl.dim("n")
+    n = evoxc.dim("n")
 
     def fn(x, y):
-        return etl.add(x, y)
+        return evoxc.add(x, y)
 
-    exe = etl.build(
+    exe = evoxc.build(
         fn,
-        etl.TensorSpec((n, 3), etl.float32),
-        etl.TensorSpec((5, 1), etl.float32),
+        evoxc.TensorSpec((n, 3), evoxc.float32),
+        evoxc.TensorSpec((5, 1), evoxc.float32),
     )
-    out = etl.run(exe, np.ones((5, 3), np.float32), np.full((5, 1), 2.0, np.float32))
+    out = evoxc.run(exe, np.ones((5, 3), np.float32), np.full((5, 1), 2.0, np.float32))
     assert out.numpy().shape == (5, 3)
     assert np.all(out.numpy() == 3.0)
 
 
 def test_runtime_broadcast_conflict_raises_shape_error():
-    n = etl.dim("n")
+    n = evoxc.dim("n")
 
     def fn(x, y):
-        return etl.add(x, y)
+        return evoxc.add(x, y)
 
-    exe = etl.build(
+    exe = evoxc.build(
         fn,
-        etl.TensorSpec((n, 3), etl.float32),
-        etl.TensorSpec((5, 1), etl.float32),
+        evoxc.TensorSpec((n, 3), evoxc.float32),
+        evoxc.TensorSpec((5, 1), evoxc.float32),
     )
-    with pytest.raises(etl.ShapeError):
-        etl.run(exe, np.ones((7, 3), np.float32), np.full((5, 1), 2.0, np.float32))
+    with pytest.raises(evoxc.ShapeError):
+        evoxc.run(exe, np.ones((7, 3), np.float32), np.full((5, 1), 2.0, np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -250,17 +250,17 @@ def test_runtime_broadcast_conflict_raises_shape_error():
 # ---------------------------------------------------------------------------
 
 DTYPE_PAIRS = [
-    (etl.int8, etl.uint8, np.dtype("int16"), "int8+uint8->int16"),
-    (etl.float32, etl.int64, np.dtype("float64"), "float32+int64->float64"),
-    (etl.float16, etl.float16, np.dtype("float16"), "float16+float16->float16"),
-    (etl.int32, etl.int32, np.dtype("int32"), "int32+int32->int32"),
-    (etl.bool_, etl.bool_, np.dtype("bool"), "bool+bool->bool"),
-    (etl.int32, etl.bool_, np.dtype("int32"), "int32+bool->int32"),
-    (etl.uint8, etl.uint16, np.dtype("uint16"), "uint8+uint16->uint16"),
-    (etl.int64, etl.uint64, np.dtype("float64"), "int64+uint64->float64"),
-    (etl.int8, etl.float16, np.dtype("float16"), "int8+float16->float16"),
-    (etl.complex64, etl.float32, np.dtype("complex64"), "complex64+float32->complex64"),
-    (etl.float16, etl.float64, np.dtype("float64"), "float16+float64->float64"),
+    (evoxc.int8, evoxc.uint8, np.dtype("int16"), "int8+uint8->int16"),
+    (evoxc.float32, evoxc.int64, np.dtype("float64"), "float32+int64->float64"),
+    (evoxc.float16, evoxc.float16, np.dtype("float16"), "float16+float16->float16"),
+    (evoxc.int32, evoxc.int32, np.dtype("int32"), "int32+int32->int32"),
+    (evoxc.bool_, evoxc.bool_, np.dtype("bool"), "bool+bool->bool"),
+    (evoxc.int32, evoxc.bool_, np.dtype("int32"), "int32+bool->int32"),
+    (evoxc.uint8, evoxc.uint16, np.dtype("uint16"), "uint8+uint16->uint16"),
+    (evoxc.int64, evoxc.uint64, np.dtype("float64"), "int64+uint64->float64"),
+    (evoxc.int8, evoxc.float16, np.dtype("float16"), "int8+float16->float16"),
+    (evoxc.complex64, evoxc.float32, np.dtype("complex64"), "complex64+float32->complex64"),
+    (evoxc.float16, evoxc.float64, np.dtype("float64"), "float16+float64->float64"),
 ]
 
 
@@ -269,13 +269,13 @@ DTYPE_PAIRS = [
     "dt_a,dt_b,expected", [p[:3] for p in DTYPE_PAIRS], ids=[p[3] for p in DTYPE_PAIRS]
 )
 def test_binary_dtype_promotion_tensor_tensor(op_name, dt_a, dt_b, expected):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y):
         return fn(x, y)
 
     graph, out = _trace_and_capture(
-        traced, etl.TensorSpec((2,), dt_a), etl.TensorSpec((2,), dt_b)
+        traced, evoxc.TensorSpec((2,), dt_a), evoxc.TensorSpec((2,), dt_b)
     )
     assert out.dtype == expected
     op = ops_of(graph, op_name)[0]
@@ -287,22 +287,22 @@ def test_binary_dtype_promotion_tensor_tensor(op_name, dt_a, dt_b, expected):
 def test_divide_true_division_dtypes():
     """divide is true division: promoted-integral operands yield float64."""
     cases = [
-        (etl.int64, etl.int64, np.dtype("float64"), True),
-        (etl.int8, etl.uint8, np.dtype("float64"), True),
-        (etl.int16, etl.bool_, np.dtype("float64"), True),
-        (etl.float16, etl.int8, np.dtype("float16"), False),
-        (etl.int64, etl.float32, np.dtype("float64"), False),
-        (etl.float32, etl.int64, np.dtype("float64"), False),
-        (etl.complex64, etl.int64, np.dtype("complex128"), False),
-        (etl.complex64, etl.float32, np.dtype("complex64"), False),
-        (etl.float32, etl.float16, np.dtype("float32"), False),
+        (evoxc.int64, evoxc.int64, np.dtype("float64"), True),
+        (evoxc.int8, evoxc.uint8, np.dtype("float64"), True),
+        (evoxc.int16, evoxc.bool_, np.dtype("float64"), True),
+        (evoxc.float16, evoxc.int8, np.dtype("float16"), False),
+        (evoxc.int64, evoxc.float32, np.dtype("float64"), False),
+        (evoxc.float32, evoxc.int64, np.dtype("float64"), False),
+        (evoxc.complex64, evoxc.int64, np.dtype("complex128"), False),
+        (evoxc.complex64, evoxc.float32, np.dtype("complex64"), False),
+        (evoxc.float32, evoxc.float16, np.dtype("float32"), False),
     ]
     for dt_a, dt_b, expected, integral in cases:
         def traced(x, y):
-            return etl.divide(x, y)
+            return evoxc.divide(x, y)
 
         graph, out = _trace_and_capture(
-            traced, etl.TensorSpec((2,), dt_a), etl.TensorSpec((2,), dt_b)
+            traced, evoxc.TensorSpec((2,), dt_a), evoxc.TensorSpec((2,), dt_b)
         )
         assert out.dtype == expected
         div = ops_of(graph, "divide")
@@ -321,15 +321,15 @@ def test_divide_true_division_dtypes():
     "op_name", [name for name, _ in COMPARISONS]
 )
 def test_comparison_result_is_bool(op_name):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y):
         return fn(x, y)
 
     graph, out = _trace_and_capture(
         traced,
-        etl.TensorSpec((2, 3), etl.float32),
-        etl.TensorSpec((1, 3), etl.int32),
+        evoxc.TensorSpec((2, 3), evoxc.float32),
+        evoxc.TensorSpec((1, 3), evoxc.int32),
     )
     assert out.dtype == np.dtype("bool")
     op = ops_of(graph, op_name)[0]
@@ -343,39 +343,39 @@ def test_comparison_result_is_bool(op_name):
 
 WEAK_SCALAR_CASES = [
     # int scalars weak toward float/complex tensors when exactly representable
-    (etl.float32, 3, np.dtype("float32"), "int+float32->float32"),
-    (etl.float16, 3, np.dtype("float16"), "int+float16->float16"),
-    (etl.float64, 3, np.dtype("float64"), "int+float64->float64"),
-    (etl.complex64, 3, np.dtype("complex64"), "int+complex64->complex64"),
-    (etl.complex128, 3, np.dtype("complex128"), "int+complex128->complex128"),
+    (evoxc.float32, 3, np.dtype("float32"), "int+float32->float32"),
+    (evoxc.float16, 3, np.dtype("float16"), "int+float16->float16"),
+    (evoxc.float64, 3, np.dtype("float64"), "int+float64->float64"),
+    (evoxc.complex64, 3, np.dtype("complex64"), "int+complex64->complex64"),
+    (evoxc.complex128, 3, np.dtype("complex128"), "int+complex128->complex128"),
     # ... else float64 / complex128 (mantissa bits 11/24/53)
-    (etl.float32, 2 ** 24, np.dtype("float64"), "huge-int+float32->float64"),
-    (etl.float16, 4096, np.dtype("float64"), "huge-int+float16->float64"),
-    (etl.complex64, 2 ** 24, np.dtype("complex128"), "huge-int+complex64->complex128"),
+    (evoxc.float32, 2 ** 24, np.dtype("float64"), "huge-int+float32->float64"),
+    (evoxc.float16, 4096, np.dtype("float64"), "huge-int+float16->float64"),
+    (evoxc.complex64, 2 ** 24, np.dtype("complex128"), "huge-int+complex64->complex128"),
     # int/bool scalars vs int/bool tensors: plain result_type (scalar = int64)
-    (etl.int32, 3, np.dtype("int64"), "int+int32->int64"),
-    (etl.int32, True, np.dtype("int32"), "bool+int32->int32"),
-    (etl.uint8, 3, np.dtype("int64"), "int+uint8->int64"),
-    (etl.bool_, 3, np.dtype("int64"), "int+bool->int64"),
-    (etl.bool_, True, np.dtype("bool"), "bool+bool->bool"),
+    (evoxc.int32, 3, np.dtype("int64"), "int+int32->int64"),
+    (evoxc.int32, True, np.dtype("int32"), "bool+int32->int32"),
+    (evoxc.uint8, 3, np.dtype("int64"), "int+uint8->int64"),
+    (evoxc.bool_, 3, np.dtype("int64"), "int+bool->int64"),
+    (evoxc.bool_, True, np.dtype("bool"), "bool+bool->bool"),
     # float scalars weak toward ALL float/complex tensors
-    (etl.float32, 2.5, np.dtype("float32"), "float+float32->float32"),
-    (etl.float16, 2.5, np.dtype("float16"), "float+float16->float16"),
-    (etl.float64, 2.5, np.dtype("float64"), "float+float64->float64"),
-    (etl.complex64, 2.5, np.dtype("complex64"), "float+complex64->complex64"),
-    (etl.complex128, 2.5, np.dtype("complex128"), "float+complex128->complex128"),
-    (etl.float32, True, np.dtype("float32"), "bool+float32->float32"),
+    (evoxc.float32, 2.5, np.dtype("float32"), "float+float32->float32"),
+    (evoxc.float16, 2.5, np.dtype("float16"), "float+float16->float16"),
+    (evoxc.float64, 2.5, np.dtype("float64"), "float+float64->float64"),
+    (evoxc.complex64, 2.5, np.dtype("complex64"), "float+complex64->complex64"),
+    (evoxc.complex128, 2.5, np.dtype("complex128"), "float+complex128->complex128"),
+    (evoxc.float32, True, np.dtype("float32"), "bool+float32->float32"),
     # float scalars vs int tensors promote via float64
-    (etl.int32, 2.5, np.dtype("float64"), "float+int32->float64"),
+    (evoxc.int32, 2.5, np.dtype("float64"), "float+int32->float64"),
     # complex scalars weak toward complex64/128 ONLY
-    (etl.float32, 1j, np.dtype("complex64"), "complex+float32->complex64"),
-    (etl.float16, 1j, np.dtype("complex64"), "complex+float16->complex64"),
-    (etl.float64, 1j, np.dtype("complex128"), "complex+float64->complex128"),
-    (etl.complex64, 1j, np.dtype("complex64"), "complex+complex64->complex64"),
-    (etl.complex128, 1j, np.dtype("complex128"), "complex+complex128->complex128"),
+    (evoxc.float32, 1j, np.dtype("complex64"), "complex+float32->complex64"),
+    (evoxc.float16, 1j, np.dtype("complex64"), "complex+float16->complex64"),
+    (evoxc.float64, 1j, np.dtype("complex128"), "complex+float64->complex128"),
+    (evoxc.complex64, 1j, np.dtype("complex64"), "complex+complex64->complex64"),
+    (evoxc.complex128, 1j, np.dtype("complex128"), "complex+complex128->complex128"),
     # complex scalars vs int tensors promote via complex128
-    (etl.int32, 1j, np.dtype("complex128"), "complex+int32->complex128"),
-    (etl.uint8, 1j, np.dtype("complex128"), "complex+uint8->complex128"),
+    (evoxc.int32, 1j, np.dtype("complex128"), "complex+int32->complex128"),
+    (evoxc.uint8, 1j, np.dtype("complex128"), "complex+uint8->complex128"),
 ]
 
 
@@ -385,9 +385,9 @@ WEAK_SCALAR_CASES = [
 )
 def test_weak_scalar_promotion(tensor_dtype, scalar, expected):
     def traced(x):
-        return etl.add(x, scalar)
+        return evoxc.add(x, scalar)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), tensor_dtype))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), tensor_dtype))
     assert out.dtype == expected
     # the scalar became a 0-d Constant pre-promoted to the weak dtype
     consts = ops_of(graph, "constant")
@@ -413,9 +413,9 @@ def test_weak_scalar_promotion(tensor_dtype, scalar, expected):
 
 def test_scalar_promotion_builds_constant_op():
     def traced(x):
-        return etl.add(x, 3)
+        return evoxc.add(x, 3)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((2, 3), etl.float32))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((2, 3), evoxc.float32))
     ops = ops_of(graph)
     const = ops_of(graph, "constant")[0]
     add = ops_of(graph, "add")[0]
@@ -437,9 +437,9 @@ def test_scalar_promotion_builds_constant_op():
 
 def test_scalar_on_left_promotes_identically():
     def traced(x):
-        return etl.add(3, x)
+        return evoxc.add(3, x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((2,), etl.float32))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((2,), evoxc.float32))
     add = ops_of(graph, "add")[0]
     assert add.operands[0] is ops_of(graph, "constant")[0].results[0]
     assert add.operands[1] is graph.module.functions[0].region.blocks[0].arguments[0]
@@ -454,19 +454,19 @@ def test_scalar_on_left_promotes_identically():
 @pytest.mark.parametrize(
     "in_dtype,out_dtype",
     [
-        (etl.int8, etl.int8), (etl.uint8, etl.uint8),
-        (etl.int32, etl.int32), (etl.bool_, etl.bool_),
-        (etl.float16, etl.float16), (etl.float32, etl.float32),
+        (evoxc.int8, evoxc.int8), (evoxc.uint8, evoxc.uint8),
+        (evoxc.int32, evoxc.int32), (evoxc.bool_, evoxc.bool_),
+        (evoxc.float16, evoxc.float16), (evoxc.float32, evoxc.float32),
     ],
     ids=str,
 )
 def test_unary_preserving_dtypes(unary_name, in_dtype, out_dtype):
-    fn = getattr(etl, unary_name)
+    fn = getattr(evoxc, unary_name)
 
     def traced(x):
         return fn(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), in_dtype))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), in_dtype))
     assert out.dtype == np.dtype(out_dtype)
     assert ops_of(graph, unary_name)[0].results[0].type.dtype == np.dtype(out_dtype)
 
@@ -474,8 +474,8 @@ def test_unary_preserving_dtypes(unary_name, in_dtype, out_dtype):
 @pytest.mark.parametrize(
     "in_dtype,out_dtype",
     [
-        (etl.complex64, etl.float32),
-        (etl.complex128, etl.float64),
+        (evoxc.complex64, evoxc.float32),
+        (evoxc.complex128, evoxc.float64),
     ],
     ids=str,
 )
@@ -483,9 +483,9 @@ def test_abs_complex_gives_real_magnitude_dtype(in_dtype, out_dtype):
     """numpy abs of a complex value is the REAL magnitude (via a transparent
     post-cast on the abs op)."""
     def traced(x):
-        return etl.abs(x)
+        return evoxc.abs(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), in_dtype))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), in_dtype))
     assert out.dtype == np.dtype(out_dtype)
     abs_ops = ops_of(graph, "abs")
     assert len(abs_ops) == 1
@@ -496,9 +496,9 @@ def test_abs_complex_gives_real_magnitude_dtype(in_dtype, out_dtype):
 
 def test_sign_complex_keeps_complex_dtype():
     def traced(x):
-        return etl.sign(x)
+        return evoxc.sign(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), etl.complex64))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), evoxc.complex64))
     assert out.dtype == np.dtype("complex64")
 
 
@@ -506,21 +506,21 @@ def test_sign_complex_keeps_complex_dtype():
 @pytest.mark.parametrize(
     "in_dtype,out_dtype",
     [
-        (etl.int8, etl.float64), (etl.int32, etl.float64),
-        (etl.uint8, etl.float64), (etl.bool_, etl.float64),
-        (etl.float16, etl.float16), (etl.float32, etl.float32),
-        (etl.float64, etl.float64),
+        (evoxc.int8, evoxc.float64), (evoxc.int32, evoxc.float64),
+        (evoxc.uint8, evoxc.float64), (evoxc.bool_, evoxc.float64),
+        (evoxc.float16, evoxc.float16), (evoxc.float32, evoxc.float32),
+        (evoxc.float64, evoxc.float64),
     ],
     ids=str,
 )
 def test_unary_math_dtypes(unary_name, in_dtype, out_dtype):
     """Unary math: integral/bool input -> float64, float keeps its dtype."""
-    fn = getattr(etl, unary_name)
+    fn = getattr(evoxc, unary_name)
 
     def traced(x):
         return fn(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), in_dtype))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), in_dtype))
     assert out.dtype == np.dtype(out_dtype)
     op = ops_of(graph, unary_name)[0]
     assert op.results[0].type.dtype == np.dtype(out_dtype)
@@ -534,9 +534,9 @@ def test_unary_math_dtypes(unary_name, in_dtype, out_dtype):
 
 def test_logical_not_dtypes():
     def traced(x):
-        return etl.logical_not(x)
+        return evoxc.logical_not(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), etl.bool_))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), evoxc.bool_))
     assert out.dtype == np.dtype("bool")
     assert ops_of(graph, "logical_not")[0].results[0].type.dtype == np.dtype("bool")
 
@@ -545,15 +545,15 @@ def test_logical_not_dtypes():
 # 6. cast
 # ---------------------------------------------------------------------------
 
-CAST_TARGETS = [etl.float16, etl.float64, etl.uint8, etl.bool_, etl.complex64]
+CAST_TARGETS = [evoxc.float16, evoxc.float64, evoxc.uint8, evoxc.bool_, evoxc.complex64]
 
 
 @pytest.mark.parametrize("target", CAST_TARGETS, ids=str)
 def test_cast_is_exact(target):
     def traced(x):
-        return etl.cast(x, target)
+        return evoxc.cast(x, target)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((2, 3), etl.int32))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((2, 3), evoxc.int32))
     assert out.dtype == np.dtype(target)
     assert out.shape == (2, 3)
     cast = ops_of(graph, "cast")
@@ -569,19 +569,19 @@ def test_cast_is_exact(target):
 
 
 def test_cast_preserves_symbolic_shape():
-    n = etl.dim("n")
+    n = evoxc.dim("n")
 
     def traced(x):
-        return etl.cast(x, etl.float16)
+        return evoxc.cast(x, evoxc.float16)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((n, 3), etl.int32))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((n, 3), evoxc.int32))
     assert out.shape == (n, 3)
     assert ops_of(graph, "cast")[0].results[0].type.shape == (n, 3)
 
 
 def test_cast_of_python_scalar():
     def traced():
-        return etl.cast(3, etl.float32)
+        return evoxc.cast(3, evoxc.float32)
 
     graph, out = _trace_and_capture(traced)
     assert out.shape == ()
@@ -591,10 +591,10 @@ def test_cast_of_python_scalar():
 
 def test_cast_invalid_dtype_raises():
     def traced(x):
-        return etl.cast(x, "not_a_dtype")
+        return evoxc.cast(x, "not_a_dtype")
 
-    with pytest.raises(etl.DTypeError, match="not a valid dtype"):
-        trace_fn(traced, etl.TensorSpec((2,), etl.int32))
+    with pytest.raises(evoxc.DTypeError, match="not a valid dtype"):
+        trace_fn(traced, evoxc.TensorSpec((2,), evoxc.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -602,55 +602,55 @@ def test_cast_invalid_dtype_raises():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("op_name", ["logical_and", "logical_or", "logical_not"])
-@pytest.mark.parametrize("bad_dtype", [etl.int32, etl.float32], ids=str)
+@pytest.mark.parametrize("bad_dtype", [evoxc.int32, evoxc.float32], ids=str)
 def test_logical_ops_require_bool(op_name, bad_dtype):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y=None):
         if op_name == "logical_not":
             return fn(x)
         return fn(x, y)
 
-    with pytest.raises(etl.DTypeError, match="must have bool dtype"):
+    with pytest.raises(evoxc.DTypeError, match="must have bool dtype"):
         trace_fn(
             traced,
-            etl.TensorSpec((2,), bad_dtype),
-            etl.TensorSpec((2,), etl.bool_),
+            evoxc.TensorSpec((2,), bad_dtype),
+            evoxc.TensorSpec((2,), evoxc.bool_),
         )
 
 
 @pytest.mark.parametrize("op_name", [name for name, _ in BITWISE])
-@pytest.mark.parametrize("bad_dtype", [etl.float32, etl.float16], ids=str)
+@pytest.mark.parametrize("bad_dtype", [evoxc.float32, evoxc.float16], ids=str)
 def test_bitwise_ops_require_integer_or_bool(op_name, bad_dtype):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y):
         return fn(x, y)
 
-    with pytest.raises(etl.DTypeError, match="must have integer or bool"):
+    with pytest.raises(evoxc.DTypeError, match="must have integer or bool"):
         trace_fn(
             traced,
-            etl.TensorSpec((2,), bad_dtype),
-            etl.TensorSpec((2,), etl.int32),
+            evoxc.TensorSpec((2,), bad_dtype),
+            evoxc.TensorSpec((2,), evoxc.int32),
         )
 
 
 @pytest.mark.parametrize("op_name", ["bitwise_left_shift", "bitwise_right_shift"])
-@pytest.mark.parametrize("bad_dtype", [etl.bool_, etl.float32], ids=str)
+@pytest.mark.parametrize("bad_dtype", [evoxc.bool_, evoxc.float32], ids=str)
 def test_shift_ops_require_integer_dtype(op_name, bad_dtype):
     """Shifts accept integer dtypes ONLY — bool is rejected with an explicit
     DTypeError (numpy's bool shift is a promotion artifact and StableHLO
     defines no shift on i1), never silently promoted."""
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y):
         return fn(x, y)
 
-    with pytest.raises(etl.DTypeError, match="must have integer dtype"):
+    with pytest.raises(evoxc.DTypeError, match="must have integer dtype"):
         trace_fn(
             traced,
-            etl.TensorSpec((2,), bad_dtype),
-            etl.TensorSpec((2,), etl.int32),
+            evoxc.TensorSpec((2,), bad_dtype),
+            evoxc.TensorSpec((2,), evoxc.int32),
         )
 
 
@@ -664,40 +664,40 @@ def test_shift_ops_require_integer_dtype(op_name, bad_dtype):
      "equal", "less", "logical_and", "bitwise_and", "bitwise_or"],
 )
 def test_both_python_scalars_raise_trace_error(op_name):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced():
         return fn(1, 2)
 
-    with pytest.raises(etl.TraceError, match="at least one operand must be a SymbolicTensor"):
+    with pytest.raises(evoxc.TraceError, match="at least one operand must be a SymbolicTensor"):
         trace_fn(traced)
 
 
 @pytest.mark.parametrize("call", [
-    lambda: etl.add(1, 2),
-    lambda: etl.sqrt(4.0),
-    lambda: etl.cast(3, etl.float32),
-    lambda: etl.equal(1, 2),
-    lambda: etl.logical_not(True),
+    lambda: evoxc.add(1, 2),
+    lambda: evoxc.sqrt(4.0),
+    lambda: evoxc.cast(3, evoxc.float32),
+    lambda: evoxc.equal(1, 2),
+    lambda: evoxc.logical_not(True),
 ], ids=["add", "sqrt", "cast", "equal", "logical_not"])
 def test_op_outside_trace_raises_trace_error(call):
-    with pytest.raises(etl.TraceError, match="No active trace"):
+    with pytest.raises(evoxc.TraceError, match="No active trace"):
         call()
 
 
 def test_concrete_tensor_operand_raises_trace_error():
     def traced(x):
-        return etl.add(x, etl.from_numpy(np.ones(2)))
+        return evoxc.add(x, evoxc.from_numpy(np.ones(2)))
 
-    with pytest.raises(etl.TraceError, match="no eager mode"):
-        trace_fn(traced, etl.TensorSpec((2,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="no eager mode"):
+        trace_fn(traced, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_concrete_tensor_unary_operand_raises_trace_error():
     def traced():
-        return etl.abs(etl.tensor([1.0, -2.0]))
+        return evoxc.abs(evoxc.tensor([1.0, -2.0]))
 
-    with pytest.raises(etl.TraceError, match="no eager mode"):
+    with pytest.raises(evoxc.TraceError, match="no eager mode"):
         trace_fn(traced)
 
 
@@ -711,10 +711,10 @@ def test_concrete_tensor_unary_operand_raises_trace_error():
 ], ids=["ndarray", "list", "np-float", "np-int", "str", "None"])
 def test_unsupported_operand_kind_raises_type_error(bad):
     def traced(x):
-        return etl.add(x, bad)
+        return evoxc.add(x, bad)
 
     with pytest.raises(TypeError, match="unsupported operand type"):
-        trace_fn(traced, etl.TensorSpec((2,), etl.float32))
+        trace_fn(traced, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +748,7 @@ _BINARY_NUMERIC_CASES = [
     ids=[c[0] for c in _BINARY_NUMERIC_CASES],
 )
 def test_binary_numerics(op_name, np_fn, a, b):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y):
         return fn(x, y)
@@ -772,10 +772,10 @@ def test_equal_not_equal_complex_numerics():
     b = np.array([1 + 2j, 4 + 0j], np.complex64)
 
     def eq(x, y):
-        return etl.equal(x, y)
+        return evoxc.equal(x, y)
 
     def ne(x, y):
-        return etl.not_equal(x, y)
+        return evoxc.not_equal(x, y)
 
     assert np.array_equal(run_numpy(eq, a, b), np.equal(a, b))
     assert np.array_equal(run_numpy(ne, a, b), np.not_equal(a, b))
@@ -783,7 +783,7 @@ def test_equal_not_equal_complex_numerics():
 
 def test_divide_numerics():
     def traced(x, y):
-        return etl.divide(x, y)
+        return evoxc.divide(x, y)
 
     x = np.array([6, 7, -8], np.int64)
     y = np.array([2, 2, 3], np.int64)
@@ -815,7 +815,7 @@ _PROMOTED_NUMERIC_CASES = [
     ids=[f"{c[0]}:{c[4].name}" for c in _PROMOTED_NUMERIC_CASES],
 )
 def test_promoted_dtype_numerics(op_name, np_fn, a, b, out_dtype):
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
 
     def traced(x, y):
         return fn(x, y)
@@ -846,7 +846,7 @@ _UNARY_MATH_NUMERIC_CASES = [
     ids=[c[0] for c in _UNARY_MATH_NUMERIC_CASES],
 )
 def test_unary_math_numerics(unary_name, np_fn):
-    fn = getattr(etl, unary_name)
+    fn = getattr(evoxc, unary_name)
     x = np.array([0.1, 0.5, 1.0, 2.0], np.float32)
 
     def traced(t):
@@ -868,7 +868,7 @@ def test_unary_math_numerics(unary_name, np_fn):
     ids=["sigmoid", "relu", "gelu", "erf"],
 )
 def test_activation_numerics(unary_name, ref_fn):
-    fn = getattr(etl, unary_name)
+    fn = getattr(evoxc, unary_name)
     x = np.array([-2.0, -0.5, 0.0, 0.7], np.float32)
 
     def traced(t):
@@ -881,7 +881,7 @@ def test_activation_numerics(unary_name, ref_fn):
 
 def test_unary_math_integral_input_runs_in_float64():
     def traced(x):
-        return etl.sqrt(x)
+        return evoxc.sqrt(x)
 
     x = np.array([1, 4, 9], np.int32)
     got = run_numpy(traced, x)
@@ -891,7 +891,7 @@ def test_unary_math_integral_input_runs_in_float64():
 
 def test_acos_numerics_in_domain():
     def traced(x):
-        return etl.acos(x)
+        return evoxc.acos(x)
 
     x = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], np.float32)
     got = run_numpy(traced, x)
@@ -901,7 +901,7 @@ def test_acos_numerics_in_domain():
 
 def test_acos_out_of_domain_matches_numpy_nan():
     def traced(x):
-        return etl.acos(x)
+        return evoxc.acos(x)
 
     x = np.array([-1.5, 2.0], np.float32)
     got = run_numpy(traced, x)
@@ -913,7 +913,7 @@ _ROUND_HALF_EVEN = np.array([0.5, 1.5, 2.5, -0.5, -1.5, 2.675], np.float64)
 
 def test_round_half_to_even_numerics():
     def traced(x):
-        return etl.round(x)
+        return evoxc.round(x)
 
     got = run_numpy(traced, _ROUND_HALF_EVEN)
     assert got.dtype == np.dtype("float64")
@@ -922,7 +922,7 @@ def test_round_half_to_even_numerics():
 
 def test_round_preserves_int_dtype():
     def traced(x):
-        return etl.round(x)
+        return evoxc.round(x)
 
     x = np.array([-3, 2], np.int32)
     got = run_numpy(traced, x)
@@ -931,13 +931,13 @@ def test_round_preserves_int_dtype():
 
 
 def test_round_bool_input_gives_float64():
-    """numpy's round ufunc promotes bool ARRAYS to float16 (an artifact); etl
+    """numpy's round ufunc promotes bool ARRAYS to float16 (an artifact); evoxc
     follows the scalar convention ``round(True) → 1.0`` (float64) via an
     explicit frontend cast."""
     def traced(x):
-        return etl.round(x)
+        return evoxc.round(x)
 
-    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), etl.bool_))
+    graph, out = _trace_and_capture(traced, evoxc.TensorSpec((3,), evoxc.bool_))
     assert out.dtype == np.dtype("float64")
     assert len(ops_of(graph, "cast")) == 1
     assert len(ops_of(graph, "round")) == 1
@@ -949,14 +949,14 @@ def test_round_bool_input_gives_float64():
 
 @pytest.mark.parametrize("op_name", ["floor", "ceil", "round"])
 def test_rounding_ops_reject_complex_at_runtime(op_name):
-    """numpy defines no rounding of complex numbers (bare TypeError); etl
+    """numpy defines no rounding of complex numbers (bare TypeError); evoxc
     surfaces the failure as an explicit BackendError naming the op."""
     z = np.array([1 + 2j, -3 - 4j], np.complex64)
 
     def traced(x):
-        return getattr(etl, op_name)(x)
+        return getattr(evoxc, op_name)(x)
 
-    with pytest.raises(etl.BackendError, match=op_name):
+    with pytest.raises(evoxc.BackendError, match=op_name):
         run_numpy(traced, z)
 
 
@@ -967,7 +967,7 @@ def test_rounding_ops_reject_complex_at_runtime(op_name):
 )
 @pytest.mark.parametrize("dtype", [np.int32, np.float32], ids=str)
 def test_unary_preserving_numerics(unary_name, np_fn, dtype):
-    fn = getattr(etl, unary_name)
+    fn = getattr(evoxc, unary_name)
     x = np.array([-3, -1, 0, 2], dtype=dtype)
 
     def traced(t):
@@ -980,7 +980,7 @@ def test_unary_preserving_numerics(unary_name, np_fn, dtype):
 
 def test_sign_numerics():
     def traced(x):
-        return etl.sign(x)
+        return evoxc.sign(x)
 
     x = np.array([-3.5, 0.0, 2.5], np.float32)
     got = run_numpy(traced, x)
@@ -995,7 +995,7 @@ def test_sign_numerics():
 
 def test_abs_complex_numerics_give_real_magnitude():
     def traced(x):
-        return etl.abs(x)
+        return evoxc.abs(x)
 
     z = np.array([3 + 4j, -1.5 + 0j], np.complex64)
     got = run_numpy(traced, z)
@@ -1005,7 +1005,7 @@ def test_abs_complex_numerics_give_real_magnitude():
 
 def test_logical_not_numerics():
     def traced(x):
-        return etl.logical_not(x)
+        return evoxc.logical_not(x)
 
     x = np.array([True, False, True])
     got = run_numpy(traced, x)
@@ -1015,7 +1015,7 @@ def test_logical_not_numerics():
 
 def test_comparison_with_python_scalar():
     def traced(x):
-        return etl.less(x, 3)
+        return evoxc.less(x, 3)
 
     x = np.array([1, 3, 5], np.int32)
     got = run_numpy(traced, x)
@@ -1029,23 +1029,23 @@ def test_comparison_with_python_scalar():
 # ---------------------------------------------------------------------------
 
 _SHIFT_NUMERIC_CASES = [
-    ("left_i32", etl.bitwise_left_shift, np.left_shift,
+    ("left_i32", evoxc.bitwise_left_shift, np.left_shift,
      np.array([1, -8, 255], np.int32), np.array([1, 3, 4], np.int32)),
-    ("left_i64", etl.bitwise_left_shift, np.left_shift,
+    ("left_i64", evoxc.bitwise_left_shift, np.left_shift,
      np.array([1, 2, 3], np.int64), np.array([1, 40, 8], np.int64)),
-    ("left_u32", etl.bitwise_left_shift, np.left_shift,
+    ("left_u32", evoxc.bitwise_left_shift, np.left_shift,
      np.array([1, 2, 3], np.uint32), np.array([1, 3, 8], np.uint32)),
-    ("right_i32_arith", etl.bitwise_right_shift, np.right_shift,
+    ("right_i32_arith", evoxc.bitwise_right_shift, np.right_shift,
      np.array([1, -8, 255, -1], np.int32), np.array([3, 2, 4, 1], np.int32)),
-    ("right_i64_arith", etl.bitwise_right_shift, np.right_shift,
+    ("right_i64_arith", evoxc.bitwise_right_shift, np.right_shift,
      np.array([1, -8, 255], np.int64), np.array([3, 3, 3], np.int64)),
     # sign-filling on signed: -8 >> 2 == -2 (arithmetic), never 0x3FFFFFFE
-    ("right_i32_arith_sign", etl.bitwise_right_shift, np.right_shift,
+    ("right_i32_arith_sign", evoxc.bitwise_right_shift, np.right_shift,
      np.array([-8], np.int32), np.array([2], np.int32)),
-    ("right_u64_logical", etl.bitwise_right_shift, np.right_shift,
+    ("right_u64_logical", evoxc.bitwise_right_shift, np.right_shift,
      np.array([2 ** 63, 0xFFFFFFFFFFFFFFFF, 0], np.uint64),
      np.array([3, 3, 3], np.uint64)),
-    ("right_u32_logical", etl.bitwise_right_shift, np.right_shift,
+    ("right_u32_logical", evoxc.bitwise_right_shift, np.right_shift,
      np.array([0x80000000, 0xFFFFFFFF, 1], np.uint32),
      np.array([1, 4, 1], np.uint32)),
 ]
@@ -1075,7 +1075,7 @@ def test_shift_scalar_promotes_via_result_type():
         x = np.array([1, 2, 255], dtype=dtype)
 
         def traced(t):
-            return etl.bitwise_right_shift(t, 3)
+            return evoxc.bitwise_right_shift(t, 3)
 
         got = run_numpy(traced, x)
         promoted = np.result_type(dtype, np.int64)
@@ -1090,10 +1090,10 @@ def test_shift_scalar_on_uint64_promotes_to_float_and_is_rejected():
     x = np.array([1, 2 ** 63], np.uint64)
 
     def traced(t):
-        return etl.bitwise_right_shift(t, 3)
+        return evoxc.bitwise_right_shift(t, 3)
 
-    with pytest.raises(etl.DTypeError, match="must have integer dtype"):
-        trace_fn(traced, etl.TensorSpec((2,), etl.uint64))
+    with pytest.raises(evoxc.DTypeError, match="must have integer dtype"):
+        trace_fn(traced, evoxc.TensorSpec((2,), evoxc.uint64))
 
 
 def test_shift_amount_tensor_promotes_dtype():
@@ -1102,7 +1102,7 @@ def test_shift_amount_tensor_promotes_dtype():
     s = np.array([1, 3, 8], np.int32)
 
     def traced(t, sh):
-        return etl.bitwise_left_shift(t, sh)
+        return evoxc.bitwise_left_shift(t, sh)
 
     got = run_numpy(traced, x, s)
     assert got.dtype == np.dtype("int64")
@@ -1127,21 +1127,21 @@ _IR_CASES = (
 def test_ir_construction_contract(kind, op_name):
     """Every op: right IR name, arity, pure effect, location captured, and
     the IR result type agrees with the returned SymbolicTensor."""
-    fn = getattr(etl, op_name)
+    fn = getattr(evoxc, op_name)
     if kind == "binary":
         dtype = _binary_spec_dtype(op_name)
-        spec_a, spec_b = etl.TensorSpec((2, 3), dtype), etl.TensorSpec((1, 3), dtype)
+        spec_a, spec_b = evoxc.TensorSpec((2, 3), dtype), evoxc.TensorSpec((1, 3), dtype)
         arity = 2
     elif kind == "divide":
-        spec_a, spec_b = etl.TensorSpec((2, 3), etl.float32), etl.TensorSpec((1, 3), etl.float32)
+        spec_a, spec_b = evoxc.TensorSpec((2, 3), evoxc.float32), evoxc.TensorSpec((1, 3), evoxc.float32)
         arity = 2
     elif kind == "cast":
-        spec_a = etl.TensorSpec((2, 3), etl.int32)
+        spec_a = evoxc.TensorSpec((2, 3), evoxc.int32)
         spec_b = None
         arity = 1
     else:
-        dtype = etl.bool_ if op_name == "logical_not" else etl.float32
-        spec_a = etl.TensorSpec((2, 3), dtype)
+        dtype = evoxc.bool_ if op_name == "logical_not" else evoxc.float32
+        spec_a = evoxc.TensorSpec((2, 3), dtype)
         spec_b = None
         arity = 1
 
@@ -1149,7 +1149,7 @@ def test_ir_construction_contract(kind, op_name):
         if arity == 2:
             return fn(x, y)
         if kind == "cast":
-            return fn(x, etl.float16)
+            return fn(x, evoxc.float16)
         return fn(x)
 
     graph, out = _trace_and_capture(traced, spec_a, spec_b) if arity == 2 else _trace_and_capture(traced, spec_a)
@@ -1174,12 +1174,12 @@ def test_ir_construction_contract(kind, op_name):
 
 
 def test_location_capture_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("ETL_DISABLE_LOCATIONS", "1")
+    monkeypatch.setenv("EVOXC_DISABLE_LOCATIONS", "1")
 
     def traced(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    graph, _ = _trace_and_capture(traced, etl.TensorSpec((2,), etl.float32))
+    graph, _ = _trace_and_capture(traced, evoxc.TensorSpec((2,), evoxc.float32))
     op = ops_of(graph, "add")[0]
     assert op.location.file == "<unknown>"
     assert op.location.line == 0

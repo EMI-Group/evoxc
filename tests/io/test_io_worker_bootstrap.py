@@ -1,9 +1,9 @@
-"""Device-free plumbing pins for the ``etl.io`` worker's non-cpu bootstrap.
+"""Device-free plumbing pins for the ``evoxc.io`` worker's non-cpu bootstrap.
 
-``etl/io.py::_bootstrap_worker_context(device)`` is the worker thread's
+``evoxc/io.py::_bootstrap_worker_context(device)`` is the worker thread's
 one-time, best-effort CUDA/ROCm/Vulkan primary-context bootstrap: for a copy
 whose handle device is not ``Device("cpu", ...)`` it lazily imports
-``iree.runtime``, maps the etl device kind to an iree HAL driver name
+``iree.runtime``, maps the evoxc device kind to an iree HAL driver name
 (``"rocm"``/``"hip"`` -> ``"hip"``, everything else verbatim, so
 ``"vulkan"`` keeps ``"vulkan"``), creates a throwaway HAL device and keeps it
 alive in ``io._bootstrap_devices`` — swallowing every failure so the copy's
@@ -31,7 +31,7 @@ incidental ``importlib.util.find_spec("iree")`` during the window does not
 raise.
 
 **Driving a real worker copy.** ``io.prefetch``/``io.sink`` cannot be used as
-the driver: ``etl.backends`` registers REAL lazy device-transfer providers for
+the driver: ``evoxc.backends`` registers REAL lazy device-transfer providers for
 kinds ``"cuda"``/``"rocm"``/``"hip"``/``"vulkan"`` (plus per-backend slots once
 the iree adapter activates), so a prefetch would attempt a real GPU upload.
 Instead the worker's own copy-execution path is driven directly with a
@@ -52,10 +52,10 @@ import types
 
 import pytest
 
-import etl  # noqa: F401  (import-order A: parent package first)
-import etl.io as io
+import evoxc  # noqa: F401  (import-order A: parent package first)
+import evoxc.io as io
 
-from etl.core import Device, DeviceError
+from evoxc.core import Device, DeviceError
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +228,7 @@ def _drain_outstanding():
     yield
     _wait_until(
         lambda: not io._outstanding, 10.0,
-        f"etl.io worker never drained its outstanding set: {io._outstanding!r}",
+        f"evoxc.io worker never drained its outstanding set: {io._outstanding!r}",
     )
 
 

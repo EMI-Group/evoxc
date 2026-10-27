@@ -1,8 +1,8 @@
-"""Contract tests for `etl.scan`.
+"""Contract tests for `evoxc.scan`.
 
 `scan` desugars to ordinary while-loop IR: a static-length loop over xs's
 leading axis calling ``f(carry, x_step) -> (new_carry, y_step)``, stacking
-the y steps. v1 scope (see `etl/trace/CONTEXT.md`): STATIC scan length only —
+the y steps. v1 scope (see `evoxc/trace/CONTEXT.md`): STATIC scan length only —
 an explicit int, or derived from xs's static leading dim. Symbolic/dynamic
 lengths are reserved and raise `TraceError`. These tests pin the semantics,
 the desugared IR structure, and the error surface.
@@ -13,7 +13,7 @@ import dataclasses
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 
 # --- helpers -----------------------------------------------------------------
@@ -40,48 +40,48 @@ def _op_names(graph):
     return [op.name for op in _all_ops(graph.module)]
 
 
-# --- scan step functions (executed under etl.scan) ----------------------------
+# --- scan step functions (executed under evoxc.scan) ----------------------------
 
 
 def cumsum_step(carry, x):
-    return etl.add(carry, x), etl.add(carry, x)
+    return evoxc.add(carry, x), evoxc.add(carry, x)
 
 
 def cumsum_scan(xs):
-    init = etl.constant(etl.tensor(0.0, dtype=etl.float32))
-    return etl.scan(cumsum_step, init, xs)
+    init = evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32))
+    return evoxc.scan(cumsum_step, init, xs)
 
 
 def cumsum_scan_with_length(xs, length):
-    init = etl.constant(etl.tensor(0.0, dtype=etl.float32))
-    return etl.scan(cumsum_step, init, xs, length=length)
+    init = evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32))
+    return evoxc.scan(cumsum_step, init, xs, length=length)
 
 
 def running_max_step(carry, x):
-    new_carry = etl.maximum(carry, x)
+    new_carry = evoxc.maximum(carry, x)
     return new_carry, new_carry
 
 
 def running_max_scan(xs):
-    init = etl.constant(etl.tensor(float("-inf"), dtype=etl.float32))
-    return etl.scan(running_max_step, init, xs)
+    init = evoxc.constant(evoxc.tensor(float("-inf"), dtype=evoxc.float32))
+    return evoxc.scan(running_max_step, init, xs)
 
 
 def structured_step(carry, x):
     acc_a, acc_b, tag = carry
     xa, xb = x
-    new_a = etl.add(acc_a, xa)
-    new_b = etl.add(acc_b, xb)
+    new_a = evoxc.add(acc_a, xa)
+    new_b = evoxc.add(acc_b, xb)
     return (new_a, new_b, tag), (new_a, new_b)
 
 
 def structured_scan(xs):
     init = (
-        etl.constant(etl.tensor(0.0, dtype=etl.float32)),
-        etl.constant(etl.tensor(1.0, dtype=etl.float32)),
+        evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32)),
+        evoxc.constant(evoxc.tensor(1.0, dtype=evoxc.float32)),
         7,  # a static leaf inside the carried tree
     )
-    return etl.scan(structured_step, init, xs)
+    return evoxc.scan(structured_step, init, xs)
 
 
 # --- semantics ----------------------------------------------------------------
@@ -90,7 +90,7 @@ def structured_scan(xs):
 @pytest.mark.parametrize("n", [1, 2, 4, 7])
 def test_scan_cumsum(n, run_graph, as_numpy):
     xs = np.arange(1, n + 1, dtype=np.float32)
-    graph = etl.trace(cumsum_scan, etl.TensorSpec((n,), etl.float32))
+    graph = evoxc.trace(cumsum_scan, evoxc.TensorSpec((n,), evoxc.float32))
 
     carry, stacked = as_numpy(run_graph(graph, xs))
 
@@ -102,7 +102,7 @@ def test_scan_cumsum(n, run_graph, as_numpy):
 
 def test_scan_running_max(run_graph, as_numpy):
     xs = np.array([3.0, -1.0, 5.0, 2.0, 8.0, 4.0, 9.0], dtype=np.float32)
-    graph = etl.trace(running_max_scan, etl.TensorSpec(xs.shape, etl.float32))
+    graph = evoxc.trace(running_max_scan, evoxc.TensorSpec(xs.shape, evoxc.float32))
 
     carry, stacked = as_numpy(run_graph(graph, xs))
 
@@ -115,7 +115,7 @@ def test_scan_running_max(run_graph, as_numpy):
 
 def test_scan_length_override_shortens_xs(run_graph, as_numpy):
     xs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    graph = etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), 2)
+    graph = evoxc.trace(cumsum_scan_with_length, evoxc.TensorSpec((4,), evoxc.float32), 2)
 
     carry, stacked = as_numpy(run_graph(graph, xs, 2))
 
@@ -126,7 +126,7 @@ def test_scan_length_override_shortens_xs(run_graph, as_numpy):
 
 def test_scan_explicit_length_equal_to_dim(run_graph, as_numpy):
     xs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    graph = etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), 4)
+    graph = evoxc.trace(cumsum_scan_with_length, evoxc.TensorSpec((4,), evoxc.float32), 4)
 
     carry, stacked = as_numpy(run_graph(graph, xs, 4))
 
@@ -136,8 +136,8 @@ def test_scan_explicit_length_equal_to_dim(run_graph, as_numpy):
 
 @pytest.mark.parametrize("length", [5, 8])
 def test_scan_length_larger_than_static_dim_raises(length):
-    with pytest.raises(etl.TraceError, match="does not match xs's static leading dim"):
-        etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), length)
+    with pytest.raises(evoxc.TraceError, match="does not match xs's static leading dim"):
+        evoxc.trace(cumsum_scan_with_length, evoxc.TensorSpec((4,), evoxc.float32), length)
 
 
 # --- structured xs and init ---------------------------------------------------
@@ -146,9 +146,9 @@ def test_scan_length_larger_than_static_dim_raises(length):
 def test_scan_structured_xs_and_init(run_graph, as_numpy):
     xa = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     xb = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32)
-    graph = etl.trace(
+    graph = evoxc.trace(
         structured_scan,
-        (etl.TensorSpec((4,), etl.float32), etl.TensorSpec((4,), etl.float32)),
+        (evoxc.TensorSpec((4,), evoxc.float32), evoxc.TensorSpec((4,), evoxc.float32)),
     )
 
     carry, stacked = as_numpy(run_graph(graph, (xa, xb)))
@@ -172,22 +172,22 @@ def test_scan_dataclass_xs_and_carry(run_graph):
         b: object
 
     def step(carry, x):
-        return Pair(etl.add(carry.a, x.a), etl.add(carry.b, x.b)), x
+        return Pair(evoxc.add(carry.a, x.a), evoxc.add(carry.b, x.b)), x
 
     def f(xs_a, xs_b):
         init = Pair(
-            etl.constant(etl.tensor(0.0, dtype=etl.float32)),
-            etl.constant(etl.tensor(0.0, dtype=etl.float32)),
+            evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32)),
+            evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32)),
         )
-        final, stacked = etl.scan(step, init, Pair(xs_a, xs_b))
+        final, stacked = evoxc.scan(step, init, Pair(xs_a, xs_b))
         return final.a, stacked.a, stacked.b
 
     xa = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     xb = np.array([10.0, 20.0, 30.0], dtype=np.float32)
-    graph = etl.trace(
+    graph = evoxc.trace(
         f,
-        etl.TensorSpec((3,), etl.float32),
-        etl.TensorSpec((3,), etl.float32),
+        evoxc.TensorSpec((3,), evoxc.float32),
+        evoxc.TensorSpec((3,), evoxc.float32),
     )
     final_a, stacked_a, stacked_b = run_graph(graph, xa, xb)
     np.testing.assert_allclose(final_a.numpy(), 6.0, rtol=0, atol=0)
@@ -201,7 +201,7 @@ def test_scan_dataclass_xs_and_carry(run_graph):
 
 def test_scan_ir_structure(run_graph, as_numpy):
     xs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    graph = etl.trace(cumsum_scan, etl.TensorSpec((4,), etl.float32))
+    graph = evoxc.trace(cumsum_scan, evoxc.TensorSpec((4,), evoxc.float32))
 
     graph.verify()  # must not raise
 
@@ -219,81 +219,81 @@ def test_scan_ir_structure(run_graph, as_numpy):
 
 
 def test_scan_symbolic_leading_dim_raises():
-    with pytest.raises(etl.TraceError, match="reserved"):
-        etl.trace(cumsum_scan, etl.TensorSpec((etl.Dim("N"),), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="reserved"):
+        evoxc.trace(cumsum_scan, evoxc.TensorSpec((evoxc.Dim("N"),), evoxc.float32))
 
 
 def test_scan_dynamic_leading_dim_raises():
-    with pytest.raises(etl.TraceError, match="reserved"):
-        etl.trace(cumsum_scan, etl.TensorSpec((None,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="reserved"):
+        evoxc.trace(cumsum_scan, evoxc.TensorSpec((None,), evoxc.float32))
 
 
 def test_scan_rank_zero_xs_raises():
-    with pytest.raises(etl.TraceError, match="rank"):
-        etl.trace(cumsum_scan, etl.TensorSpec((), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="rank"):
+        evoxc.trace(cumsum_scan, evoxc.TensorSpec((), evoxc.float32))
 
 
 def test_scan_xs_without_tensor_leaves_raises():
     # a static-only xs (bare int) has no SymbolicTensor leaf
-    with pytest.raises(etl.TraceError, match="must be a core.SymbolicTensor"):
-        etl.trace(cumsum_scan, 3)
+    with pytest.raises(evoxc.TraceError, match="must be a core.SymbolicTensor"):
+        evoxc.trace(cumsum_scan, 3)
     # an empty xs tree has no leaves at all
-    with pytest.raises(etl.TraceError, match="at least one SymbolicTensor"):
-        etl.trace(cumsum_scan, ())
+    with pytest.raises(evoxc.TraceError, match="at least one SymbolicTensor"):
+        evoxc.trace(cumsum_scan, ())
 
 
 def test_scan_ndarray_xs_leaf_raises():
     # ndarray IS a static value now, so a bare-ndarray xs passes the trace
     # input boundary and is rejected at the scan level instead: xs needs
     # SymbolicTensor leaves (declare tensor inputs via TensorSpec).
-    with pytest.raises(etl.TraceError, match="must be a core.SymbolicTensor"):
-        etl.trace(cumsum_scan, np.array([1.0, 2.0], dtype=np.float32))
+    with pytest.raises(evoxc.TraceError, match="must be a core.SymbolicTensor"):
+        evoxc.trace(cumsum_scan, np.array([1.0, 2.0], dtype=np.float32))
 
 
 @pytest.mark.parametrize("length", [0, -1])
 def test_scan_nonpositive_length_raises(length):
-    with pytest.raises(etl.TraceError, match="empty scans are not supported"):
-        etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), length)
+    with pytest.raises(evoxc.TraceError, match="empty scans are not supported"):
+        evoxc.trace(cumsum_scan_with_length, evoxc.TensorSpec((4,), evoxc.float32), length)
 
 
 @pytest.mark.parametrize("length", [2.5, "4", True], ids=["float", "str", "bool"])
 def test_scan_non_int_length_raises(length):
-    with pytest.raises(etl.TraceError, match="must be a static int"):
-        etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), length)
+    with pytest.raises(evoxc.TraceError, match="must be a static int"):
+        evoxc.trace(cumsum_scan_with_length, evoxc.TensorSpec((4,), evoxc.float32), length)
 
 
 def test_scan_result_must_be_a_pair():
     def bad_scan(xs):
         def step(carry, x):
-            return etl.add(carry, x)  # not a (new_carry, y_step) pair
+            return evoxc.add(carry, x)  # not a (new_carry, y_step) pair
 
-        return etl.scan(step, etl.constant(etl.tensor(0.0, dtype=etl.float32)), xs)
+        return evoxc.scan(step, evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32)), xs)
 
-    with pytest.raises(etl.TraceError, match=r"must return a \(new_carry, y_step\) pair"):
-        etl.trace(bad_scan, etl.TensorSpec((4,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match=r"must return a \(new_carry, y_step\) pair"):
+        evoxc.trace(bad_scan, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 def test_scan_carry_tree_must_match_init():
     def bad_scan(xs):
         def step(carry, x):
-            new = etl.add(carry, x)
+            new = evoxc.add(carry, x)
             return (new, new), new  # carry tree (tensor, tensor) vs init tensor
 
-        return etl.scan(step, etl.constant(etl.tensor(0.0, dtype=etl.float32)), xs)
+        return evoxc.scan(step, evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32)), xs)
 
-    with pytest.raises(etl.TraceError, match="must match init's tree"):
-        etl.trace(bad_scan, etl.TensorSpec((4,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="must match init's tree"):
+        evoxc.trace(bad_scan, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 def test_scan_static_only_y_raises():
     def bad_scan(xs):
         def step(carry, x):
-            return etl.add(carry, x), 3  # y has no tensor leaves
+            return evoxc.add(carry, x), 3  # y has no tensor leaves
 
-        return etl.scan(step, etl.constant(etl.tensor(0.0, dtype=etl.float32)), xs)
+        return evoxc.scan(step, evoxc.constant(evoxc.tensor(0.0, dtype=evoxc.float32)), xs)
 
-    with pytest.raises(etl.TraceError, match="SymbolicTensors"):
-        etl.trace(bad_scan, etl.TensorSpec((4,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="SymbolicTensors"):
+        evoxc.trace(bad_scan, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 # --- equivalence with a manual loop -------------------------------------------
@@ -304,12 +304,12 @@ def test_scan_matches_manual_loop(run_graph, as_numpy):
 
     def step(carry, x):
         # non-commutative on purpose: iteration order matters
-        return etl.subtract(carry, x), etl.multiply(x, carry)
+        return evoxc.subtract(carry, x), evoxc.multiply(x, carry)
 
     def scan_fn(xs):
-        return etl.scan(step, etl.constant(etl.tensor(10.0, dtype=etl.float32)), xs)
+        return evoxc.scan(step, evoxc.constant(evoxc.tensor(10.0, dtype=evoxc.float32)), xs)
 
-    graph = etl.trace(scan_fn, etl.TensorSpec((5,), etl.float32))
+    graph = evoxc.trace(scan_fn, evoxc.TensorSpec((5,), evoxc.float32))
     carry, stacked = as_numpy(run_graph(graph, xs))
 
     expected_carry, expected_ys = 10.0, []

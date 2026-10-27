@@ -1,9 +1,9 @@
-"""Packaging contract: the `etl` distribution ships ONLY `etl`, never `etl_hf`.
+"""Packaging contract: the `evoxc` distribution ships ONLY `evoxc`, never `evoxc_hf`.
 
-`etl_hf` (the HuggingFace integration) is a separate top-level package living in
-this repository checkout. It must never end up in a wheel/sdist of `etl`, and
-`etl`'s hard runtime dependencies must stay numpy-only — the three reference
-oracles used to validate `etl_hf` (torch + transformers) live behind the
+`evoxc_hf` (the HuggingFace integration) is a separate top-level package living in
+this repository checkout. It must never end up in a wheel/sdist of `evoxc`, and
+`evoxc`'s hard runtime dependencies must stay numpy-only — the three reference
+oracles used to validate `evoxc_hf` (torch + transformers) live behind the
 optional `hf` extra.
 
 These tests are numeric-free, network-free and fast: they read `pyproject.toml`
@@ -49,7 +49,7 @@ _SKIP_DIRS = frozenset(
     }
 )
 
-HF_TOP_LEVEL = "etl_hf"
+HF_TOP_LEVEL = "evoxc_hf"
 
 
 def _pyproject() -> dict:
@@ -68,8 +68,8 @@ def _matches(package: str, patterns: Sequence[str]) -> bool:
 
     setuptools' own filter (``setuptools.discovery._Filter``) is
     ``any(fnmatch.fnmatchcase(item, pat) ...)``: ``*`` matches any characters
-    (dots included), but the literal prefix must be there — so ``etl.*``
-    matches ``etl.core`` and NOT ``etl_hf``.
+    (dots included), but the literal prefix must be there — so ``evoxc.*``
+    matches ``evoxc.core`` and NOT ``evoxc_hf``.
     """
     return any(fnmatch.fnmatchcase(package, pattern) for pattern in patterns)
 
@@ -88,8 +88,8 @@ def _repo_packages() -> set[str]:
     return packages
 
 
-def _etl_packages(packages: Iterable[str]) -> set[str]:
-    return {p for p in packages if p == "etl" or p.startswith("etl.")}
+def _evoxc_packages(packages: Iterable[str]) -> set[str]:
+    return {p for p in packages if p == "evoxc" or p.startswith("evoxc.")}
 
 
 def _hf_packages(packages: Iterable[str]) -> set[str]:
@@ -97,55 +97,55 @@ def _hf_packages(packages: Iterable[str]) -> set[str]:
 
 
 # --------------------------------------------------------------------------
-# 1. package discovery: `etl` in, `etl_hf` out
+# 1. package discovery: `evoxc` in, `evoxc_hf` out
 # --------------------------------------------------------------------------
 
 
 def test_repo_walk_sees_both_packages():
     """Guard against a vacuous test: both top-level packages exist on disk."""
     packages = _repo_packages()
-    etl_pkgs = _etl_packages(packages)
+    evoxc_pkgs = _evoxc_packages(packages)
     hf_pkgs = _hf_packages(packages)
 
-    # The etl distribution is a real package tree (top level + subpackages).
-    assert "etl" in etl_pkgs
-    assert "etl.core" in etl_pkgs
-    assert len(etl_pkgs) > 10, sorted(etl_pkgs)
+    # The evoxc distribution is a real package tree (top level + subpackages).
+    assert "evoxc" in evoxc_pkgs
+    assert "evoxc.core" in evoxc_pkgs
+    assert len(evoxc_pkgs) > 10, sorted(evoxc_pkgs)
     # ... and the HuggingFace integration is a separate top-level package tree.
     assert HF_TOP_LEVEL in hf_pkgs
     assert f"{HF_TOP_LEVEL}.models" in hf_pkgs
 
 
-def test_find_include_matches_every_etl_package():
-    """The pattern must not be over-narrow: all `etl` / `etl.*` are selected."""
+def test_find_include_matches_every_evoxc_package():
+    """The pattern must not be over-narrow: all `evoxc` / `evoxc.*` are selected."""
     include, exclude = _find_config()
-    etl_pkgs = _etl_packages(_repo_packages())
-    assert etl_pkgs
+    evoxc_pkgs = _evoxc_packages(_repo_packages())
+    assert evoxc_pkgs
 
-    missed = sorted(p for p in etl_pkgs if not _matches(p, include))
-    assert not missed, f"packages.find include={include} misses real etl packages: {missed}"
+    missed = sorted(p for p in evoxc_pkgs if not _matches(p, include))
+    assert not missed, f"packages.find include={include} misses real evoxc packages: {missed}"
 
-    dropped = sorted(p for p in etl_pkgs if _matches(p, exclude))
-    assert not dropped, f"packages.find exclude={exclude} drops real etl packages: {dropped}"
+    dropped = sorted(p for p in evoxc_pkgs if _matches(p, exclude))
+    assert not dropped, f"packages.find exclude={exclude} drops real evoxc packages: {dropped}"
 
 
-def test_find_include_never_matches_etl_hf_packages():
-    """`etl_hf` must be unreachable from the `etl` distribution's find config."""
+def test_find_include_never_matches_evoxc_hf_packages():
+    """`evoxc_hf` must be unreachable from the `evoxc` distribution's find config."""
     include, exclude = _find_config()
     hf_pkgs = _hf_packages(_repo_packages())
     assert hf_pkgs
 
     matched = sorted(p for p in hf_pkgs if _matches(p, include) and not _matches(p, exclude))
     assert not matched, (
-        f"packages.find include={include} would ship etl_hf packages {matched} "
-        "inside the etl distribution"
+        f"packages.find include={include} would ship evoxc_hf packages {matched} "
+        "inside the evoxc distribution"
     )
 
-    # Explicit pins for the classic traps — the old greedy `etl*` include
+    # Explicit pins for the classic traps — the old greedy `evoxc*` include
     # matched all of these, and would silently bundle the HF integration.
-    for name in ("etl_hf", "etl_hf.models", "etl_hf.tests", "etl_hf.tests.foo"):
+    for name in ("evoxc_hf", "evoxc_hf.models", "evoxc_hf.tests", "evoxc_hf.tests.foo"):
         assert not _matches(name, include), f"{name!r} matched include={include}"
-    assert "etl*" not in include, f"greedy include pattern 'etl*' matches etl_hf: {include}"
+    assert "evoxc*" not in include, f"greedy include pattern 'evoxc*' matches evoxc_hf: {include}"
 
     # The colocated-tests exclusion is kept as belt-and-braces.
     assert exclude, "packages.find must keep its tests exclusion"
@@ -168,7 +168,7 @@ def _requirement_name(requirement: str) -> str:
 def test_runtime_dependencies_are_numpy_only():
     project = _pyproject()["project"]
     assert project["dependencies"] == ["numpy>=1.24"], (
-        "etl's hard runtime dependencies must stay numpy-only (etl_hf and its "
+        "evoxc's hard runtime dependencies must stay numpy-only (evoxc_hf and its "
         "oracles are optional)"
     )
     names = {_requirement_name(dep) for dep in project["dependencies"]}
@@ -186,7 +186,7 @@ def test_hf_extra_declares_the_optional_hf_oracles():
     base = {_requirement_name(dep) for dep in _pyproject()["project"]["dependencies"]}
     assert not ({"torch", "transformers", HF_TOP_LEVEL} | names) & base
 
-    # `etl_hf` is a repo-checkout package, never a pip requirement of anything.
+    # `evoxc_hf` is a repo-checkout package, never a pip requirement of anything.
     all_requirements = list(_pyproject()["project"]["dependencies"])
     for deps in extras.values():
         all_requirements.extend(deps)
@@ -194,17 +194,17 @@ def test_hf_extra_declares_the_optional_hf_oracles():
 
 
 # --------------------------------------------------------------------------
-# 3. `import etl` works and never pulls the optional HF stack
+# 3. `import evoxc` works and never pulls the optional HF stack
 # --------------------------------------------------------------------------
 
 
-def test_import_etl_does_not_import_etl_hf_or_the_hf_oracles():
+def test_import_evoxc_does_not_import_evoxc_hf_or_the_hf_oracles():
     probe = (
-        "import sys, etl;"
-        "etl.build, etl.evaluate, etl.lower, etl.trace, etl.tree_map;"
-        "heavy = [m for m in ('etl_hf', 'torch', 'transformers') if m in sys.modules];"
+        "import sys, evoxc;"
+        "evoxc.build, evoxc.evaluate, evoxc.lower, evoxc.trace, evoxc.tree_map;"
+        "heavy = [m for m in ('evoxc_hf', 'torch', 'transformers') if m in sys.modules];"
         "assert not heavy, heavy;"
-        "print(etl.__version__)"
+        "print(evoxc.__version__)"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
@@ -216,19 +216,19 @@ def test_import_etl_does_not_import_etl_hf_or_the_hf_oracles():
     assert proc.returncode == 0, proc.stderr[-4000:]
 
 
-def test_installed_distribution_metadata_lists_only_etl():
-    """The installed `etl` distribution must not claim `etl_hf` as its own."""
+def test_installed_distribution_metadata_lists_only_evoxc():
+    """The installed `evoxc` distribution must not claim `evoxc_hf` as its own."""
     try:
-        dist = importlib.metadata.distribution("etl")
+        dist = importlib.metadata.distribution("evoxc")
     except importlib.metadata.PackageNotFoundError:  # pragma: no cover - env guard
-        pytest.skip("the `etl` distribution is not installed in this environment")
+        pytest.skip("the `evoxc` distribution is not installed in this environment")
 
     top_level = dist.read_text("top_level.txt")
     if top_level is not None:
         names = [line.strip() for line in top_level.splitlines() if line.strip()]
-        assert "etl" in names
+        assert "evoxc" in names
         assert HF_TOP_LEVEL not in names, (
-            f"installed etl metadata declares the top-level package {HF_TOP_LEVEL!r} "
+            f"installed evoxc metadata declares the top-level package {HF_TOP_LEVEL!r} "
             f"(top_level.txt={names}) — the packages.find include pattern is too broad; "
             "reinstall after fixing pyproject.toml"
         )
@@ -243,7 +243,7 @@ def test_installed_distribution_metadata_lists_only_etl():
             for line in record.splitlines()
             if line.split(",", 1)[0].startswith(HF_TOP_LEVEL + "/")
         ]
-        assert not shipped, f"installed etl distribution ships etl_hf files: {shipped[:5]}"
+        assert not shipped, f"installed evoxc distribution ships evoxc_hf files: {shipped[:5]}"
 
 
 # --------------------------------------------------------------------------
@@ -297,16 +297,16 @@ _COPY_IGNORE = shutil.ignore_patterns(
     "bench_logs",  # large scratch area, never a build input
 )
 
-_STALE_EGG_INFO = "etl.egg-info"
+_STALE_EGG_INFO = "evoxc.egg-info"
 
 
 def _sanitize_source_tree(src: Path) -> list[str]:
-    """Delete stale build artifacts from a copied tree (`rm -rf etl.egg-info build`).
+    """Delete stale build artifacts from a copied tree (`rm -rf evoxc.egg-info build`).
 
     MEASURED TRAP (setuptools 68.1.2 and 84.0.0): `sdist` *reads* an existing
-    `etl.egg-info/SOURCES.txt` and keeps every entry that still exists on disk,
+    `evoxc.egg-info/SOURCES.txt` and keeps every entry that still exists on disk,
     so an artifact left by an earlier build can silently re-ship a broken,
-    partial `etl_hf/`. `_COPY_IGNORE` already drops these when copying; this
+    partial `evoxc_hf/`. `_COPY_IGNORE` already drops these when copying; this
     removes any that survive or that a test deliberately planted.
     """
     removed: list[str] = []
@@ -336,7 +336,7 @@ def _build_distribution(dist: str, src: Path, out_dir: Path) -> tuple[Path | Non
         return None, f"no build backend available (setuptools/build/uv) — {dist} leg skipped"
 
     proc = subprocess.run(command, cwd=str(src), capture_output=True, text=True, timeout=900)
-    artifacts = sorted(out_dir.glob("etl-*.whl" if dist == "wheel" else "etl-*.tar.gz"))
+    artifacts = sorted(out_dir.glob("evoxc-*.whl" if dist == "wheel" else "evoxc-*.tar.gz"))
     if proc.returncode != 0 or not artifacts:
         detail = (proc.stderr or proc.stdout or "no output")[-500:]
         return None, f"{dist} build unavailable: {detail}"
@@ -344,12 +344,12 @@ def _build_distribution(dist: str, src: Path, out_dir: Path) -> tuple[Path | Non
 
 
 def _hf_entries(entries: Iterable[str]) -> list[str]:
-    """Paths whose first component is `etl_hf` (a file OR a bare directory)."""
+    """Paths whose first component is `evoxc_hf` (a file OR a bare directory)."""
     return [e for e in entries if e == HF_TOP_LEVEL or e.startswith(HF_TOP_LEVEL + "/")]
 
 
 def _relative_entries(archive: Path) -> list[str]:
-    """Member paths of an sdist tarball, relative to the `etl-<version>/` root."""
+    """Member paths of an sdist tarball, relative to the `evoxc-<version>/` root."""
     with tarfile.open(archive) as tar:
         names = tar.getnames()
     root = names[0].split("/", 1)[0] if names else ""
@@ -358,25 +358,25 @@ def _relative_entries(archive: Path) -> list[str]:
 
 
 _STALE_HINT = (
-    "Cause and fix: setuptools' sdist READS an existing etl.egg-info/SOURCES.txt and keeps "
-    "every listed path that still exists on disk, so a STALE etl.egg-info/ from an earlier "
-    "build silently re-ships a broken partial etl_hf. `rm -rf etl.egg-info build dist` and "
-    "rebuild — etl_hf must only ever be reachable from the checkout."
+    "Cause and fix: setuptools' sdist READS an existing evoxc.egg-info/SOURCES.txt and keeps "
+    "every listed path that still exists on disk, so a STALE evoxc.egg-info/ from an earlier "
+    "build silently re-ships a broken partial evoxc_hf. `rm -rf evoxc.egg-info build dist` and "
+    "rebuild — evoxc_hf must only ever be reachable from the checkout."
 )
 
 
-def _assert_distribution_ships_no_etl_hf(entries: Sequence[str], kind: str) -> None:
-    """Anti-vacuity (`etl/` + `pyproject.toml` are shipped) + zero `etl_hf` entries."""
-    assert any(e.startswith("etl/") for e in entries), (
-        f"{kind} does not ship the etl package (the etl_hf pin would be vacuous): {entries[:5]}"
+def _assert_distribution_ships_no_evoxc_hf(entries: Sequence[str], kind: str) -> None:
+    """Anti-vacuity (`evoxc/` + `pyproject.toml` are shipped) + zero `evoxc_hf` entries."""
+    assert any(e.startswith("evoxc/") for e in entries), (
+        f"{kind} does not ship the evoxc package (the evoxc_hf pin would be vacuous): {entries[:5]}"
     )
     assert "pyproject.toml" in entries, f"{kind} does not ship pyproject.toml: {entries[:5]}"
     hf_entries = _hf_entries(entries)
-    assert not hf_entries, f"{kind} ships etl_hf source entries: {hf_entries[:5]}\n{_STALE_HINT}"
+    assert not hf_entries, f"{kind} ships evoxc_hf source entries: {hf_entries[:5]}\n{_STALE_HINT}"
 
 
-def test_wheel_contains_no_etl_hf(tmp_path):
-    """A real `etl` wheel must contain no `etl_hf` module (skips without tooling)."""
+def test_wheel_contains_no_evoxc_hf(tmp_path):
+    """A real `evoxc` wheel must contain no `evoxc_hf` module (skips without tooling)."""
     src = _copy_checkout(tmp_path / "src")
     wheel, reason = _build_distribution("wheel", src, tmp_path / "wheel")
     if wheel is None:
@@ -390,13 +390,13 @@ def test_wheel_contains_no_etl_hf(tmp_path):
 
     shipped = [line.split(",", 1)[0] for line in record if line.split(",", 1)[0]]
     assert shipped, "empty RECORD"
-    assert any(n.startswith("etl/") for n in shipped), "wheel does not ship the etl package"
+    assert any(n.startswith("evoxc/") for n in shipped), "wheel does not ship the evoxc package"
     hf_entries = _hf_entries(shipped)
-    assert not hf_entries, f"wheel ships etl_hf files: {hf_entries[:5]}\n{_STALE_HINT}"
+    assert not hf_entries, f"wheel ships evoxc_hf files: {hf_entries[:5]}\n{_STALE_HINT}"
 
 
-def test_sdist_contains_no_etl_hf(tmp_path):
-    """A real `etl` sdist must contain no `etl_hf` source (skips without tooling).
+def test_sdist_contains_no_evoxc_hf(tmp_path):
+    """A real `evoxc` sdist must contain no `evoxc_hf` source (skips without tooling).
 
     The sdist is the distribution that ships `pyproject.toml` + the sources, so
     it is the one a stale build artifact can corrupt: it is built from an
@@ -408,29 +408,29 @@ def test_sdist_contains_no_etl_hf(tmp_path):
     if archive is None:
         pytest.skip(reason)
 
-    _assert_distribution_ships_no_etl_hf(_relative_entries(archive), "sdist")
+    _assert_distribution_ships_no_evoxc_hf(_relative_entries(archive), "sdist")
 
 # The exact stale artifact that can poison an sdist: a leftover `SOURCES.txt`
-# from an earlier build listing `etl_hf/` modules. One entry points at a file
+# from an earlier build listing `evoxc_hf/` modules. One entry points at a file
 # that no longer exists, to pin setuptools' pruning of dead manifest entries.
 _STALE_SOURCES = (
-    "etl_hf/__init__.py\n"
-    "etl_hf/config.py\n"
-    "etl_hf/stale_module_that_no_longer_exists.py\n"
-    "etl/__init__.py\n"
+    "evoxc_hf/__init__.py\n"
+    "evoxc_hf/config.py\n"
+    "evoxc_hf/stale_module_that_no_longer_exists.py\n"
+    "evoxc/__init__.py\n"
     "pyproject.toml\n"
 )
 
 
-def test_sdist_built_from_a_stale_egg_info_tree_ships_no_etl_hf(tmp_path):
-    """The stale-`etl.egg-info` regression pin: sanitizing the tree is what saves us.
+def test_sdist_built_from_a_stale_egg_info_tree_ships_no_evoxc_hf(tmp_path):
+    """The stale-`evoxc.egg-info` regression pin: sanitizing the tree is what saves us.
 
     MEASURED (setuptools 68.1.2 and 84.0.0): the trap is real — an sdist built
-    from a tree carrying a stale `etl.egg-info/SOURCES.txt` DOES ship the listed
-    `etl_hf/` paths that still exist on disk (3 of the 5 planted entries:
-    `etl_hf/`, `etl_hf/__init__.py`, `etl_hf/config.py`; the entry naming a file
+    from a tree carrying a stale `evoxc.egg-info/SOURCES.txt` DOES ship the listed
+    `evoxc_hf/` paths that still exist on disk (3 of the 5 planted entries:
+    `evoxc_hf/`, `evoxc_hf/__init__.py`, `evoxc_hf/config.py`; the entry naming a file
     that no longer exists is silently pruned), even though `packages.find`
-    excludes `etl_hf`. So this test asserts the documented-safe path rather than
+    excludes `evoxc_hf`. So this test asserts the documented-safe path rather than
     the impossible one: plant the artifact, prove the trap manifests (when it
     does), sanitize the SAME tree, assert the rebuild is clean.
     """
@@ -439,7 +439,7 @@ def test_sdist_built_from_a_stale_egg_info_tree_ships_no_etl_hf(tmp_path):
     # Plant the stale artifact exactly as an earlier build would have left it.
     egg_info = src / _STALE_EGG_INFO
     egg_info.mkdir(parents=True, exist_ok=True)
-    (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\nName: etl\nVersion: 0.1.0\n")
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\nName: evoxc\nVersion: 0.1.0\n")
     (egg_info / "SOURCES.txt").write_text(_STALE_SOURCES)
 
     stale_archive, reason = _build_distribution("sdist", src, tmp_path / "stale")
@@ -447,11 +447,11 @@ def test_sdist_built_from_a_stale_egg_info_tree_ships_no_etl_hf(tmp_path):
         pytest.skip(reason)
     stale_hf = _hf_entries(_relative_entries(stale_archive))
     if stale_hf:  # trap live (measured): existing entries ship, the dead one is pruned
-        assert "etl_hf/__init__.py" in stale_hf, stale_hf
-        assert "etl_hf/config.py" in stale_hf, stale_hf
+        assert "evoxc_hf/__init__.py" in stale_hf, stale_hf
+        assert "evoxc_hf/config.py" in stale_hf, stale_hf
         assert not [e for e in stale_hf if "stale_module_that_no_longer_exists" in e], stale_hf
     # The documented-safe path: drop the stale artifacts, rebuild the SAME tree.
-    # (The first build also wrote a fresh `etl.egg-info/` + `build/`.)
+    # (The first build also wrote a fresh `evoxc.egg-info/` + `build/`.)
     removed = _sanitize_source_tree(src)
     assert _STALE_EGG_INFO in removed, (removed, sorted(p.name for p in src.iterdir()))
 
@@ -460,4 +460,4 @@ def test_sdist_built_from_a_stale_egg_info_tree_ships_no_etl_hf(tmp_path):
         pytest.skip(reason)
 
     entries = _relative_entries(clean_archive)
-    _assert_distribution_ships_no_etl_hf(entries, f"sdist rebuilt after removing {removed}")
+    _assert_distribution_ships_no_evoxc_hf(entries, f"sdist rebuilt after removing {removed}")

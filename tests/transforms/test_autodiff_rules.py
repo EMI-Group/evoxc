@@ -10,8 +10,8 @@ to the dtype under test (see the F64/F32 settings).
 import numpy as np
 import pytest
 
-import etl
-from etl.transforms.autodiff import ZeroTangent
+import evoxc
+from evoxc.transforms.autodiff import ZeroTangent
 from tests.transforms._fd_utils import (
     central_directional,
     central_grad,
@@ -32,11 +32,11 @@ def test_grad_dot_2d_both_args(cfg):
     rng = np.random.RandomState(0)
     x = rng.uniform(0.2, 1.2, (3, 4)).astype(dt)
     y = rng.uniform(0.2, 1.2, (4, 3)).astype(dt)
-    spec_x = etl.TensorSpec((3, 4), dt)
-    spec_y = etl.TensorSpec((4, 3), dt)
+    spec_x = evoxc.TensorSpec((3, 4), dt)
+    spec_y = evoxc.TensorSpec((4, 3), dt)
 
     def f(x, y):
-        return etl.sum(etl.dot(x, y))
+        return evoxc.sum(evoxc.dot(x, y))
 
     grads = run_grad(f, (0, 1), (spec_x, spec_y), x, y)
     x64, y64 = x.astype(np.float64), y.astype(np.float64)
@@ -52,18 +52,18 @@ def test_grad_dot_2d_both_args(cfg):
 
 
 def test_grad_inner_product_1d_scalar():
-    """1D·1D → scalar inner product. `etl.dot` is a batched matmul that
+    """1D·1D → scalar inner product. `evoxc.dot` is a batched matmul that
     requires rank ≥ 2 by design (asserted below), so the vector dot product
     is composed from ordinary ops (multiply + sum)."""
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(0.2, 1.2, 6)
     y = np.linspace(1.3, 0.4, 6)
 
-    with pytest.raises(etl.ShapeError, match="rank"):
-        etl.trace(lambda a, b: etl.dot(a, b), spec, spec)
+    with pytest.raises(evoxc.ShapeError, match="rank"):
+        evoxc.trace(lambda a, b: evoxc.dot(a, b), spec, spec)
 
     def f(x, y):
-        return etl.sum(etl.multiply(x, y))
+        return evoxc.sum(evoxc.multiply(x, y))
 
     grads = run_grad(f, (0, 1), (spec, spec), x, y)
     np.testing.assert_allclose(grads[0], y, rtol=1e-7, atol=1e-6)
@@ -80,11 +80,11 @@ def test_grad_inner_product_1d_scalar():
 @pytest.mark.parametrize("cfg", [F64, F32], ids=["float64", "float32"])
 def test_grad_sigmoid_elementwise(cfg):
     dt = cfg["dtype"]
-    spec = etl.TensorSpec((6,), dt)
+    spec = evoxc.TensorSpec((6,), dt)
     x = np.linspace(-1.2, 1.2, 6).astype(dt)
 
     def f(x):
-        return etl.sum(etl.sigmoid(x))
+        return evoxc.sum(evoxc.sigmoid(x))
 
     grad = run_grad(f, 0, (spec,), x)
     x64 = x.astype(np.float64)
@@ -102,11 +102,11 @@ def test_grad_sigmoid_elementwise(cfg):
 @pytest.mark.parametrize("cfg", [F64, F32], ids=["float64", "float32"])
 def test_grad_reduce_sum_square_is_2x(cfg):
     dt = cfg["dtype"]
-    spec = etl.TensorSpec((6,), dt)
+    spec = evoxc.TensorSpec((6,), dt)
     x = np.linspace(0.2, 1.2, 6).astype(dt)
 
     def f(x):
-        return etl.reduce_sum(etl.square(x))
+        return evoxc.reduce_sum(evoxc.square(x))
 
     grad = run_grad(f, 0, (spec,), x)
     x64 = x.astype(np.float64)
@@ -121,11 +121,11 @@ def test_grad_reduce_sum_square_is_2x(cfg):
 @pytest.mark.parametrize("cfg", [F64, F32], ids=["float64", "float32"])
 def test_grad_through_reshape(cfg):
     dt = cfg["dtype"]
-    spec = etl.TensorSpec((3, 4), dt)
+    spec = evoxc.TensorSpec((3, 4), dt)
     x = np.random.RandomState(4).uniform(0.2, 1.2, (3, 4)).astype(dt)
 
     def f(x):
-        return etl.sum(etl.square(etl.reshape(x, (12,))))
+        return evoxc.sum(evoxc.square(evoxc.reshape(x, (12,))))
 
     grad = run_grad(f, 0, (spec,), x)
     x64 = x.astype(np.float64)
@@ -140,13 +140,13 @@ def test_grad_through_reshape(cfg):
 @pytest.mark.parametrize("cfg", [F64, F32], ids=["float64", "float32"])
 def test_grad_through_transpose(cfg):
     dt = cfg["dtype"]
-    spec = etl.TensorSpec((3, 4), dt)
+    spec = evoxc.TensorSpec((3, 4), dt)
     c = np.random.RandomState(5).uniform(0.2, 1.2, (4, 3)).astype(dt)
     x = np.random.RandomState(6).uniform(0.2, 1.2, (3, 4)).astype(dt)
 
     def f(x):
-        return etl.sum(
-            etl.multiply(etl.transpose(x), etl.constant(etl.tensor(c)))
+        return evoxc.sum(
+            evoxc.multiply(evoxc.transpose(x), evoxc.constant(evoxc.tensor(c)))
         )
 
     grad = run_grad(f, 0, (spec,), x)
@@ -163,12 +163,12 @@ def test_grad_through_transpose(cfg):
 
 
 def test_grad_through_broadcast():
-    spec = etl.TensorSpec((3, 1), np.float64)
+    spec = evoxc.TensorSpec((3, 1), np.float64)
     b = np.full((1, 4), 3.0)
     x = np.random.RandomState(7).uniform(0.2, 1.2, (3, 1))
 
     def f(x):
-        return etl.sum(etl.multiply(x, etl.constant(etl.tensor(b))))
+        return evoxc.sum(evoxc.multiply(x, evoxc.constant(evoxc.tensor(b))))
 
     grad = run_grad(f, 0, (spec,), x)
     fnp = lambda z: np.sum(z * b)  # noqa: E731
@@ -179,15 +179,15 @@ def test_grad_through_broadcast():
 
 def test_jvp_and_vjp_through_dot():
     """Both AD modes through sum(dot(x, y)); vjp cotangent vs ct @ J."""
-    spec_x = etl.TensorSpec((3, 4), np.float64)
-    spec_y = etl.TensorSpec((4, 3), np.float64)
+    spec_x = evoxc.TensorSpec((3, 4), np.float64)
+    spec_y = evoxc.TensorSpec((4, 3), np.float64)
     x = np.random.RandomState(10).uniform(0.2, 1.2, (3, 4))
     y = np.random.RandomState(11).uniform(0.2, 1.2, (4, 3))
     tx = np.random.RandomState(12).uniform(-1.0, 1.0, (3, 4))
     ty = np.random.RandomState(13).uniform(-1.0, 1.0, (4, 3))
 
     def f(x, y):
-        return etl.sum(etl.dot(x, y))
+        return evoxc.sum(evoxc.dot(x, y))
 
     fnp = lambda a, b: np.sum(a @ b)  # noqa: E731
 
@@ -203,7 +203,7 @@ def test_jvp_and_vjp_through_dot():
     # vjp with an explicit scalar cotangent ct: input cotangents = ct * grad.
     ct = 1.5
     _, primal, in_cts = run_vjp(
-        f, etl.TensorSpec((), np.float64), (spec_x, spec_y), (x, y),
+        f, evoxc.TensorSpec((), np.float64), (spec_x, spec_y), (x, y),
         (np.array(ct),),
     )
     np.testing.assert_allclose(primal, fnp(x, y), rtol=1e-7, atol=1e-6)
@@ -218,13 +218,13 @@ def test_jvp_and_vjp_through_dot():
 def test_jvp_and_vjp_through_sigmoid():
     """Vector-output sigmoid: jvp vs central direction; vjp with a vector
     cotangent vs the finite-difference ct @ J."""
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(-1.2, 1.2, 6)
     t = np.array([0.3, -0.6, 0.9, 0.4, -0.2, 0.7])
     c = np.array([1.0, -2.0, 0.5, 3.0, -0.4, 1.1])
 
     def f(x):
-        return etl.sigmoid(x)
+        return evoxc.sigmoid(x)
 
     sig = lambda z: 1.0 / (1.0 + np.exp(-z))  # noqa: E731
 
@@ -248,12 +248,12 @@ def test_jvp_and_vjp_through_sigmoid():
 
 
 def test_jvp_and_vjp_through_reshape():
-    spec = etl.TensorSpec((3, 4), np.float64)
+    spec = evoxc.TensorSpec((3, 4), np.float64)
     x = np.random.RandomState(20).uniform(0.2, 1.2, (3, 4))
     t = np.random.RandomState(21).uniform(-1.0, 1.0, (3, 4))
 
     def f(x):
-        return etl.sum(etl.square(etl.reshape(x, (12,))))
+        return evoxc.sum(evoxc.square(evoxc.reshape(x, (12,))))
 
     fnp = lambda z: np.sum(z.reshape(12) ** 2)  # noqa: E731
 
@@ -266,7 +266,7 @@ def test_jvp_and_vjp_through_reshape():
 
     ct = 2.0
     _, primal, in_cts = run_vjp(
-        f, etl.TensorSpec((), np.float64), (spec,), (x,), (np.array(ct),)
+        f, evoxc.TensorSpec((), np.float64), (spec,), (x,), (np.array(ct),)
     )
     np.testing.assert_allclose(primal, fnp(x), rtol=1e-7, atol=1e-6)
     np.testing.assert_allclose(
@@ -276,14 +276,14 @@ def test_jvp_and_vjp_through_reshape():
 
 
 def test_jvp_and_vjp_through_transpose():
-    spec = etl.TensorSpec((3, 4), np.float64)
+    spec = evoxc.TensorSpec((3, 4), np.float64)
     c = np.random.RandomState(22).uniform(0.2, 1.2, (4, 3))
     x = np.random.RandomState(23).uniform(0.2, 1.2, (3, 4))
     t = np.random.RandomState(24).uniform(-1.0, 1.0, (3, 4))
 
     def f(x):
-        return etl.sum(
-            etl.multiply(etl.transpose(x), etl.constant(etl.tensor(c)))
+        return evoxc.sum(
+            evoxc.multiply(evoxc.transpose(x), evoxc.constant(evoxc.tensor(c)))
         )
 
     fnp = lambda z: np.sum(z.T * c)  # noqa: E731
@@ -297,7 +297,7 @@ def test_jvp_and_vjp_through_transpose():
 
     ct = 0.7
     _, primal, in_cts = run_vjp(
-        f, etl.TensorSpec((), np.float64), (spec,), (x,), (np.array(ct),)
+        f, evoxc.TensorSpec((), np.float64), (spec,), (x,), (np.array(ct),)
     )
     np.testing.assert_allclose(primal, fnp(x), rtol=1e-7, atol=1e-6)
     np.testing.assert_allclose(
@@ -309,11 +309,11 @@ def test_grad_stop_gradient_x_times_const_is_x():
     """f(x) = sum(x * stop_gradient(x)) differentiates like sum(x * const):
     the gradient is x — NOT the 2x that the numerical function sum(x**2)
     would give (that deviation is exactly what blocking means)."""
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(0.2, 1.2, 6)
 
     def f(x):
-        return etl.sum(etl.multiply(x, etl.stop_gradient(x)))
+        return evoxc.sum(evoxc.multiply(x, evoxc.stop_gradient(x)))
 
     grad = run_grad(f, 0, (spec,), x)
     np.testing.assert_allclose(grad, x, rtol=1e-7, atol=1e-6)
@@ -321,23 +321,23 @@ def test_grad_stop_gradient_x_times_const_is_x():
 
 def test_grad_stop_gradient_blocks_gradient_flow():
     """f(x) = sum(stop_gradient(x**2)) — the gradient is exactly zero."""
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(0.2, 1.2, 6)
 
     def f(x):
-        return etl.sum(etl.stop_gradient(etl.square(x)))
+        return evoxc.sum(evoxc.stop_gradient(evoxc.square(x)))
 
     grad = run_grad(f, 0, (spec,), x)
     assert np.all(grad == 0.0)
 
 
 def test_jvp_stop_gradient_gives_zero_tangent():
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(0.2, 1.2, 6)
     t = np.full(6, 0.5)
 
     def f(x):
-        return etl.sum(etl.stop_gradient(etl.square(x)))
+        return evoxc.sum(evoxc.stop_gradient(evoxc.square(x)))
 
     _, primal, tangent = run_jvp(f, spec, (spec,), (x,), (t,))
     np.testing.assert_allclose(primal, np.sum(x ** 2), rtol=1e-7, atol=1e-6)
@@ -346,11 +346,11 @@ def test_jvp_stop_gradient_gives_zero_tangent():
 
 CHAIN_CASES = {
     "tanh_sigmoid": (
-        lambda x: etl.sum(etl.tanh(etl.sigmoid(x))),
+        lambda x: evoxc.sum(evoxc.tanh(evoxc.sigmoid(x))),
         lambda z: np.sum(np.tanh(1.0 / (1.0 + np.exp(-z)))),
     ),
     "exp_sin": (
-        lambda x: etl.sum(etl.exp(etl.sin(x))),
+        lambda x: evoxc.sum(evoxc.exp(evoxc.sin(x))),
         lambda z: np.sum(np.exp(np.sin(z))),
     ),
 }
@@ -360,12 +360,12 @@ CHAIN_CASES = {
 @pytest.mark.parametrize("name", list(CHAIN_CASES))
 def test_chain_multiple_elementwise_ops(name, cfg):
     """Gradient through several chained elementwise ops in one graph."""
-    etl_fn, np_fn = CHAIN_CASES[name]
+    evoxc_fn, np_fn = CHAIN_CASES[name]
     dt = cfg["dtype"]
-    spec = etl.TensorSpec((6,), dt)
+    spec = evoxc.TensorSpec((6,), dt)
     x = np.linspace(-0.8, 0.8, 6).astype(dt)
 
-    grad = run_grad(etl_fn, 0, (spec,), x)
+    grad = run_grad(evoxc_fn, 0, (spec,), x)
     x64 = x.astype(np.float64)
     np.testing.assert_allclose(
         grad, central_grad(np_fn, (x64,), 0, cfg["eps"]),
@@ -375,11 +375,11 @@ def test_chain_multiple_elementwise_ops(name, cfg):
 
 def test_nondifferentiable_output_op_gives_zero_gradient():
     """argmax has a builtin ZeroTangent rule: zero gradient, not an error."""
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(-1.0, 1.0, 6)
 
     def f(x):
-        return etl.sum(etl.cast(etl.argmax(x), etl.float64))
+        return evoxc.sum(evoxc.cast(evoxc.argmax(x), evoxc.float64))
 
     grad = run_grad(f, 0, (spec,), x)
     assert np.all(grad == 0.0)
@@ -387,39 +387,39 @@ def test_nondifferentiable_output_op_gives_zero_gradient():
 
 def test_conv_vjp_is_a_deferred_transform_error():
     """conv VJP is a documented v1 deferral: TransformError, never silent."""
-    spec_x = etl.TensorSpec((1, 1, 4, 4), np.float64)
-    spec_w = etl.TensorSpec((1, 1, 2, 2), np.float64)
+    spec_x = evoxc.TensorSpec((1, 1, 4, 4), np.float64)
+    spec_w = evoxc.TensorSpec((1, 1, 2, 2), np.float64)
 
     def f(x, w):
-        return etl.sum(etl.conv(x, w, padding="SAME"))
+        return evoxc.sum(evoxc.conv(x, w, padding="SAME"))
 
-    with pytest.raises(etl.TransformError, match="conv"):
-        etl.grad(f)(spec_x, spec_w)
+    with pytest.raises(evoxc.TransformError, match="conv"):
+        evoxc.grad(f)(spec_x, spec_w)
 
 
 def test_runtime_call_grad_is_a_transform_error():
-    spec = etl.TensorSpec((4,), np.float64)
+    spec = evoxc.TensorSpec((4,), np.float64)
 
     def f(x):
-        return etl.sum(etl.runtime_call(lambda v: v, x, result=spec))
+        return evoxc.sum(evoxc.runtime_call(lambda v: v, x, result=spec))
 
-    with pytest.raises(etl.TransformError, match="runtime_call"):
-        etl.grad(f)(spec)
+    with pytest.raises(evoxc.TransformError, match="runtime_call"):
+        evoxc.grad(f)(spec)
 
 
 def test_defn_evaluate_and_grad_shorthand():
-    """@etl.defn functions work with the documented evaluate shorthand and
+    """@evoxc.defn functions work with the documented evaluate shorthand and
     with the grad TransformCallable."""
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.sum(etl.tanh(etl.sigmoid(x)))
+        return evoxc.sum(evoxc.tanh(evoxc.sigmoid(x)))
 
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
     x = np.linspace(-0.8, 0.8, 6)
     fnp = lambda z: np.sum(np.tanh(1.0 / (1.0 + np.exp(-z))))  # noqa: E731
 
-    np.testing.assert_allclose(to_np(etl.evaluate(f, x)), fnp(x), rtol=1e-7, atol=1e-6)
+    np.testing.assert_allclose(to_np(evoxc.evaluate(f, x)), fnp(x), rtol=1e-7, atol=1e-6)
     grad = run_grad(f, 0, (spec,), x)
     np.testing.assert_allclose(
         grad, central_grad(fnp, (x,), 0, 1e-6), rtol=1e-7, atol=1e-6
@@ -429,16 +429,16 @@ def test_defn_evaluate_and_grad_shorthand():
 def test_transformed_graphs_contain_only_ordinary_ops():
     """grad/jvp/vjp results are ordinary graphs of ordinary ops — no
     autodiff op names leak into the IR."""
-    spec = etl.TensorSpec((6,), np.float64)
+    spec = evoxc.TensorSpec((6,), np.float64)
 
     def f(x):
-        return etl.sum(etl.tanh(etl.sigmoid(x)))
+        return evoxc.sum(evoxc.tanh(evoxc.sigmoid(x)))
 
     x = np.linspace(-0.8, 0.8, 6)
     graphs = [
-        etl.grad(f, 0)(spec),
-        etl.jvp(f, spec)(spec),
-        etl.vjp(f, etl.TensorSpec((), np.float64))(spec),
+        evoxc.grad(f, 0)(spec),
+        evoxc.jvp(f, spec)(spec),
+        evoxc.vjp(f, evoxc.TensorSpec((), np.float64))(spec),
     ]
     for graph in graphs:
         graph.verify()
@@ -452,7 +452,7 @@ def test_transformed_graphs_contain_only_ordinary_ops():
 #
 # `external_call` ops resolve derivative rules under the namespaced
 # `external:<name>` key (mirroring `block:<name>` for block calls), registered
-# through the handle returned by `etl.register_external_kernel`. Without an
+# through the handle returned by `evoxc.register_external_kernel`. Without an
 # explicit rule, a registered portable decomposition (`@handle.portable`) is
 # the fallback: grad/vjp inline it and run a LOCAL reverse sweep seeded on the
 # decomposition's outputs (the post-inline seeding pattern); jvp derives from
@@ -461,8 +461,8 @@ def test_transformed_graphs_contain_only_ordinary_ops():
 
 
 def _sym(value):
-    """Wrap an ir.Value as a SymbolicTensor so etl.ops can build on it."""
-    return etl.SymbolicTensor(
+    """Wrap an ir.Value as a SymbolicTensor so evoxc.ops can build on it."""
+    return evoxc.SymbolicTensor(
         value=value, dtype=value.type.dtype, shape=value.type.shape
     )
 
@@ -475,7 +475,7 @@ def _ext_sq(x):
     return x * x
 
 
-ext_sq = etl.register_external_kernel("tx_ext_sq", _ext_sq)
+ext_sq = evoxc.register_external_kernel("tx_ext_sq", _ext_sq)
 
 
 @ext_sq.vjp_rule
@@ -484,22 +484,22 @@ def _ext_sq_vjp(op, cotangents, primals):
     (ct,) = cotangents
     if ct is None or isinstance(ct, ZeroTangent):
         return (ZeroTangent(),)
-    return (etl.multiply(etl.multiply(_sym(ct), 2), _sym(primals[0])).value,)
+    return (evoxc.multiply(evoxc.multiply(_sym(ct), 2), _sym(primals[0])).value,)
 
 
-@etl.defn
+@evoxc.defn
 def _ext_sq_vec(x):
     """Vector-output kernel call: y = x*x, shape (EXT_DIM,)."""
-    return etl.external_call(
-        "tx_ext_sq", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.external_call(
+        "tx_ext_sq", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
-@etl.defn
+@evoxc.defn
 def _ext_sq_loss(x):
-    return etl.sum(
-        etl.external_call(
-            "tx_ext_sq", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.sum(
+        evoxc.external_call(
+            "tx_ext_sq", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
         )
     )
 
@@ -509,7 +509,7 @@ def _ext_sq2(x):
     return x * x
 
 
-ext_sq2 = etl.register_external_kernel("tx_ext_sq2", _ext_sq2)
+ext_sq2 = evoxc.register_external_kernel("tx_ext_sq2", _ext_sq2)
 
 
 @ext_sq2.vjp_rule
@@ -517,7 +517,7 @@ def _ext_sq2_vjp(op, cotangents, primals):
     (ct,) = cotangents
     if ct is None or isinstance(ct, ZeroTangent):
         return (ZeroTangent(),)
-    return (etl.multiply(etl.multiply(_sym(ct), 2), _sym(primals[0])).value,)
+    return (evoxc.multiply(evoxc.multiply(_sym(ct), 2), _sym(primals[0])).value,)
 
 
 @ext_sq2.jvp_rule
@@ -526,13 +526,13 @@ def _ext_sq2_jvp(op, tangents):
     (t,) = tangents
     if t is None or isinstance(t, ZeroTangent):
         return (ZeroTangent(),)
-    return (etl.multiply(etl.multiply(_sym(t), 2), _sym(op.operands[0])).value,)
+    return (evoxc.multiply(evoxc.multiply(_sym(t), 2), _sym(op.operands[0])).value,)
 
 
-@etl.defn
+@evoxc.defn
 def _ext_sq2_vec(x):
-    return etl.external_call(
-        "tx_ext_sq2", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.external_call(
+        "tx_ext_sq2", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
@@ -547,29 +547,29 @@ def _ext_swish_deriv(x):
     return s * (1.0 + x * (1.0 - s))
 
 
-ext_swish = etl.register_external_kernel("tx_ext_swish", _ext_swish)
+ext_swish = evoxc.register_external_kernel("tx_ext_swish", _ext_swish)
 
 
 @ext_swish.portable
-@etl.defn
+@evoxc.defn
 def _ext_swish_portable(
-    x: etl.TensorSpec((EXT_DIM,), etl.float32),
-) -> etl.TensorSpec((EXT_DIM,), etl.float32):
-    return etl.sigmoid(x) * x
+    x: evoxc.TensorSpec((EXT_DIM,), evoxc.float32),
+) -> evoxc.TensorSpec((EXT_DIM,), evoxc.float32):
+    return evoxc.sigmoid(x) * x
 
 
-@etl.defn
+@evoxc.defn
 def _ext_swish_vec(x):
-    return etl.external_call(
-        "tx_ext_swish", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.external_call(
+        "tx_ext_swish", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
-@etl.defn
+@evoxc.defn
 def _ext_swish_loss(x):
-    return etl.sum(
-        etl.external_call(
-            "tx_ext_swish", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.sum(
+        evoxc.external_call(
+            "tx_ext_swish", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
         )
     )
 
@@ -584,7 +584,7 @@ def _ext_x():
 def test_grad_external_call_explicit_vjp_rule():
     """grad over external_call with an explicit vjp rule under
     external:<name>: d/dx sum(x²) == 2x."""
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     grad = run_grad(_ext_sq_loss, 0, (spec,), _ext_x())
     np.testing.assert_allclose(grad, 2 * _ext_x(), rtol=1e-5, atol=1e-6)
 
@@ -592,7 +592,7 @@ def test_grad_external_call_explicit_vjp_rule():
 def test_vjp_external_call_explicit_vjp_rule():
     """vjp over the vector output with an explicit cotangent: input
     cotangent == ct * 2x."""
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     ct = np.array([1.0, 0.5, 2.0, -1.0], dtype=np.float32)
     graph, primal, in_cts = run_vjp(_ext_sq_vec, spec, (spec,), (_ext_x(),), (ct,))
     np.testing.assert_allclose(primal, _ext_x() * _ext_x(), rtol=1e-6)
@@ -602,7 +602,7 @@ def test_vjp_external_call_explicit_vjp_rule():
 def test_jvp_external_call_derived_from_vjp_rule():
     """No explicit jvp rule: jvp derives from the explicit vjp rule via the
     adjoint — output tangent == 2x·dx on the vector output."""
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     dx = np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float32)
     graph, primal, tangent = run_jvp(_ext_sq_vec, spec, (spec,), (_ext_x(),), (dx,))
     np.testing.assert_allclose(primal, _ext_x() * _ext_x(), rtol=1e-6)
@@ -612,10 +612,10 @@ def test_jvp_external_call_derived_from_vjp_rule():
 def test_jvp_external_call_explicit_jvp_rule():
     """An explicitly registered jvp rule (external:<name>) drives forward
     mode directly."""
-    from etl import transforms
+    from evoxc import transforms
 
     assert transforms.jvp_rules["external:tx_ext_sq2"] is _ext_sq2_jvp
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     dx = np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float32)
     graph, primal, tangent = run_jvp(_ext_sq2_vec, spec, (spec,), (_ext_x(),), (dx,))
     np.testing.assert_allclose(primal, _ext_x() * _ext_x(), rtol=1e-6)
@@ -628,7 +628,7 @@ def test_jvp_external_call_explicit_jvp_rule():
 def test_grad_external_call_portable_fallback():
     """No explicit rule: grad inlines the portable decomposition and
     differentiates it — d/dx sum(swish(x)) == swish'(x)."""
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     grad = run_grad(_ext_swish_loss, 0, (spec,), _ext_x())
     np.testing.assert_allclose(grad, _ext_swish_deriv(_ext_x()), rtol=1e-5, atol=1e-5)
 
@@ -637,7 +637,7 @@ def test_vjp_external_call_portable_fallback_real_cotangent():
     """vjp through the portable fallback with an explicit (non-scalar)
     cotangent: the reverse sweep seeds on the INLINED decomposition outputs
     (the post-inline seeding pattern) — input cotangent == swish'(x) * ct."""
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     ct = np.array([1.0, 0.5, 2.0, -1.0], dtype=np.float32)
     graph, primal, in_cts = run_vjp(_ext_swish_vec, spec, (spec,), (_ext_x(),), (ct,))
     np.testing.assert_allclose(primal, _ext_swish(_ext_x()), rtol=1e-6)
@@ -654,7 +654,7 @@ def _ext_inner(x):
     return x * x
 
 
-ext_inner = etl.register_external_kernel("tx_ext_inner", _ext_inner)
+ext_inner = evoxc.register_external_kernel("tx_ext_inner", _ext_inner)
 
 
 @ext_inner.vjp_rule
@@ -662,28 +662,28 @@ def _ext_inner_vjp(op, cotangents, primals):
     (ct,) = cotangents
     if ct is None or isinstance(ct, ZeroTangent):
         return (ZeroTangent(),)
-    return (etl.multiply(etl.multiply(_sym(ct), 2), _sym(primals[0])).value,)
+    return (evoxc.multiply(evoxc.multiply(_sym(ct), 2), _sym(primals[0])).value,)
 
 
-@etl.block
-@etl.defn
+@evoxc.block
+@evoxc.defn
 def tx_ext_nested(
-    x: etl.TensorSpec((EXT_DIM,), etl.float32),
-) -> etl.TensorSpec((EXT_DIM,), etl.float32):
-    return etl.external_call(
-        "tx_ext_inner", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    x: evoxc.TensorSpec((EXT_DIM,), evoxc.float32),
+) -> evoxc.TensorSpec((EXT_DIM,), evoxc.float32):
+    return evoxc.external_call(
+        "tx_ext_inner", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
-@etl.defn
+@evoxc.defn
 def _ext_nested_loss(x):
-    return etl.sum(tx_ext_nested(x))
+    return evoxc.sum(tx_ext_nested(x))
 
 
 def test_grad_block_portable_with_nested_external_call():
     """grad through a block portable whose body contains an external_call:
     the block vjp fallback sweep resolves the nested op's OWN
     external:<name> rule — d/dx sum(x²) == 2x."""
-    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    spec = evoxc.TensorSpec((EXT_DIM,), np.float32)
     grad = run_grad(_ext_nested_loss, 0, (spec,), _ext_x())
     np.testing.assert_allclose(grad, 2 * _ext_x(), rtol=1e-5, atol=1e-6)

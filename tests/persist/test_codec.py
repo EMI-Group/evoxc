@@ -1,4 +1,4 @@
-"""pytest suite for the etl persistence value codec (``encode_value``/``decode_value``).
+"""pytest suite for the evoxc persistence value codec (``encode_value``/``decode_value``).
 
 Covers the envelope contract, round-trips for every built-in type,
 JSON-serializability, error behavior, and the ``register_codec`` extension.
@@ -15,7 +15,7 @@ from enum import Enum
 import numpy as np
 import pytest
 
-from etl.core import (
+from evoxc.core import (
     Device,
     Dim,
     DimExpr,
@@ -24,8 +24,8 @@ from etl.core import (
     TreeSpec,
     flatten,
 )
-from etl.persist import codec as codec_mod
-from etl.persist import decode_value, encode_value, register_codec
+from evoxc.persist import codec as codec_mod
+from evoxc.persist import decode_value, encode_value, register_codec
 
 # --- deep-equality helpers (NaN-aware; TreeSpec needs a recursive comparator) ---
 
@@ -109,7 +109,7 @@ def test_scalar_roundtrip(value):
 )
 def test_envelope_format(value, type_name, data):
     assert encode_value(value) == {
-        "__etl_encoded__": True,
+        "__evoxc_encoded__": True,
         "type": type_name,
         "data": data,
     }
@@ -274,7 +274,7 @@ def test_numpy_dtype_roundtrip(name):
     assert decoded == dt
 
 
-# --- etl value-model types ---
+# --- evoxc value-model types ---
 
 
 @pytest.mark.parametrize(
@@ -401,7 +401,7 @@ def test_encode_does_not_mutate_input():
         "junk",
         [1, 2],
         {"type": "int", "data": 5},  # missing envelope tag
-        {"__etl_encoded__": False, "type": "int", "data": 5},
+        {"__evoxc_encoded__": False, "type": "int", "data": 5},
     ],
 )
 def test_decode_rejects_non_envelope(payload):
@@ -411,13 +411,13 @@ def test_decode_rejects_non_envelope(payload):
 
 def test_decode_rejects_corrupt_envelopes():
     with pytest.raises(PersistenceError, match="unknown encoded type"):
-        decode_value({"__etl_encoded__": True, "type": "no.such.Type", "data": 1})
+        decode_value({"__evoxc_encoded__": True, "type": "no.such.Type", "data": 1})
     with pytest.raises(PersistenceError, match="no 'data'"):
-        decode_value({"__etl_encoded__": True, "type": "int"})
+        decode_value({"__evoxc_encoded__": True, "type": "int"})
     with pytest.raises(PersistenceError, match="corrupt"):
-        decode_value({"__etl_encoded__": True, "type": "int", "data": "not-an-int"})
+        decode_value({"__evoxc_encoded__": True, "type": "int", "data": "not-an-int"})
     with pytest.raises(PersistenceError, match="corrupt"):
-        decode_value({"__etl_encoded__": True, "type": "NoneType", "data": 1})
+        decode_value({"__evoxc_encoded__": True, "type": "NoneType", "data": 1})
 
 
 class _TestEnum(Enum):

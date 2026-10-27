@@ -5,7 +5,7 @@ iree 3.11.0 SEGVs (SIGSEGV, ``CompilerToolError "Error code: -11"``) inside
 values used as while-loop INIT operands — the upstream AffinityAnalysis bug
 behind the real evox NSGA2 ``non_dominate_rank`` loop crashing iree-compile
 ~9/10 on llvm-cpu and ~3/5 on cuda (root-cause + trigger analysis in
-``etl/backends/stablehlo/CONTEXT.md`` Known Issues).
+``evoxc/backends/stablehlo/CONTEXT.md`` Known Issues).
 
 The exporter workaround (default ON, opt out with
 ``lower(..., while_init_rewrite=False)``): every all-zero rank>=1 constant
@@ -37,7 +37,7 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # graph builders
@@ -50,31 +50,31 @@ def _tiny_ndr_while(dominates):
     while init the rewrite must replace (reduce path: the (4, 4) i1 input is
     one axis larger than the (4,) target)."""
     n = 4
-    zero_i32 = etl.constant(etl.tensor(np.int32(0)))
-    one_i32 = etl.constant(etl.tensor(np.int32(1)))
-    count = etl.sum(etl.enp.astype(dominates, etl.int32), axes=0)
-    rank = etl.constant(etl.tensor(np.zeros(n, dtype=np.int32)))
+    zero_i32 = evoxc.constant(evoxc.tensor(np.int32(0)))
+    one_i32 = evoxc.constant(evoxc.tensor(np.int32(1)))
+    count = evoxc.sum(evoxc.enp.astype(dominates, evoxc.int32), axes=0)
+    rank = evoxc.constant(evoxc.tensor(np.zeros(n, dtype=np.int32)))
 
     def cond_fn(carry):
         c, r, cur = carry
-        return etl.greater_equal(etl.max(c), zero_i32)
+        return evoxc.greater_equal(evoxc.max(c), zero_i32)
 
     def body_fn(carry):
         c, r, cur = carry
-        front = etl.equal(c, zero_i32)
-        r = etl.enp.where(front, cur, r)
-        front_dom = etl.sum(
-            etl.enp.astype(
-                etl.logical_and(dominates, etl.enp.expand_dims(front, 1)),
-                etl.int32,
+        front = evoxc.equal(c, zero_i32)
+        r = evoxc.enp.where(front, cur, r)
+        front_dom = evoxc.sum(
+            evoxc.enp.astype(
+                evoxc.logical_and(dominates, evoxc.enp.expand_dims(front, 1)),
+                evoxc.int32,
             ),
             axes=0,
         )
-        c = etl.subtract(c, front_dom)
-        c = etl.subtract(c, etl.enp.astype(front, etl.int32))
-        return (c, r, etl.add(cur, one_i32))
+        c = evoxc.subtract(c, front_dom)
+        c = evoxc.subtract(c, evoxc.enp.astype(front, evoxc.int32))
+        return (c, r, evoxc.add(cur, one_i32))
 
-    _, rank, _ = etl.while_loop(cond_fn, body_fn, (count, rank, zero_i32))
+    _, rank, _ = evoxc.while_loop(cond_fn, body_fn, (count, rank, zero_i32))
     return rank
 
 
@@ -84,44 +84,44 @@ def _non_dominate_rank(x):
     fitness comparisons, then a while_loop carrying (count, rank,
     current_rank) with intra-body reductions and bool→int32 cast chains."""
     n = x.shape[0]
-    x_i = etl.enp.expand_dims(x, 1)
-    x_j = etl.enp.expand_dims(x, 0)
-    le = etl.less_equal(x_i, x_j)
-    lt = etl.less(x_i, x_j)
-    le_all = etl.min(le, axes=2)
-    lt_any = etl.max(lt, axes=2)
-    dominates = etl.logical_and(le_all, lt_any)
-    zero_i32 = etl.constant(etl.tensor(np.int32(0)))
-    one_i32 = etl.constant(etl.tensor(np.int32(1)))
-    count = etl.sum(etl.enp.astype(dominates, etl.int32), axes=0)
-    rank = etl.constant(etl.tensor(np.zeros(n, dtype=np.int32)))
+    x_i = evoxc.enp.expand_dims(x, 1)
+    x_j = evoxc.enp.expand_dims(x, 0)
+    le = evoxc.less_equal(x_i, x_j)
+    lt = evoxc.less(x_i, x_j)
+    le_all = evoxc.min(le, axes=2)
+    lt_any = evoxc.max(lt, axes=2)
+    dominates = evoxc.logical_and(le_all, lt_any)
+    zero_i32 = evoxc.constant(evoxc.tensor(np.int32(0)))
+    one_i32 = evoxc.constant(evoxc.tensor(np.int32(1)))
+    count = evoxc.sum(evoxc.enp.astype(dominates, evoxc.int32), axes=0)
+    rank = evoxc.constant(evoxc.tensor(np.zeros(n, dtype=np.int32)))
 
     def cond_fn(carry):
         c, r, cur = carry
-        return etl.greater_equal(etl.max(c), zero_i32)
+        return evoxc.greater_equal(evoxc.max(c), zero_i32)
 
     def body_fn(carry):
         c, r, cur = carry
-        front = etl.equal(c, zero_i32)
-        r = etl.enp.where(front, cur, r)
-        front_dom = etl.sum(
-            etl.enp.astype(
-                etl.logical_and(dominates, etl.enp.expand_dims(front, 1)),
-                etl.int32,
+        front = evoxc.equal(c, zero_i32)
+        r = evoxc.enp.where(front, cur, r)
+        front_dom = evoxc.sum(
+            evoxc.enp.astype(
+                evoxc.logical_and(dominates, evoxc.enp.expand_dims(front, 1)),
+                evoxc.int32,
             ),
             axes=0,
         )
-        c = etl.subtract(c, front_dom)
-        c = etl.subtract(c, etl.enp.astype(front, etl.int32))
-        return (c, r, etl.add(cur, one_i32))
+        c = evoxc.subtract(c, front_dom)
+        c = evoxc.subtract(c, evoxc.enp.astype(front, evoxc.int32))
+        return (c, r, evoxc.add(cur, one_i32))
 
-    _, rank, _ = etl.while_loop(cond_fn, body_fn, (count, rank, zero_i32))
+    _, rank, _ = evoxc.while_loop(cond_fn, body_fn, (count, rank, zero_i32))
     return rank
 
 
 def _np_non_dominate_rank(x):
     """Independent numpy front-peeling reference (mirrors the kernels' math,
-    never imports etl kernels): ranks = iterative front extraction."""
+    never imports evoxc kernels): ranks = iterative front extraction."""
     le_all = (x[:, None, :] <= x[None, :, :]).all(axis=2)
     lt_any = (x[:, None, :] < x[None, :, :]).any(axis=2)
     a = le_all & lt_any
@@ -149,11 +149,11 @@ _DOM = (
     (_XFIT[:, None, :] <= _XFIT[None, :, :]).all(axis=2)
     & (_XFIT[:, None, :] < _XFIT[None, :, :]).any(axis=2)
 )
-_TINY_SPEC = etl.TensorSpec((4, 4), np.bool_)
+_TINY_SPEC = evoxc.TensorSpec((4, 4), np.bool_)
 
 _N = 32
 _X32 = np.abs(_RNG.standard_normal((_N, 2)).astype(np.float32))
-_REAL_SPEC = etl.TensorSpec((_N, 2), etl.float32)
+_REAL_SPEC = evoxc.TensorSpec((_N, 2), evoxc.float32)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -162,21 +162,21 @@ _REAL_SPEC = etl.TensorSpec((_N, 2), etl.float32)
 
 def _np(v):
     """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays."""
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
 
 def _export(graph, **options):
     """Export a traced graph's MLIR with the given exporter options."""
-    from etl.backends.stablehlo import export
+    from evoxc.backends.stablehlo import export
 
     return export(graph, options=options)
 
@@ -209,7 +209,7 @@ def _init_def_line(mlir, init_index=1):
 
 
 def test_small_graph_rewrite_chain_in_mlir():
-    graph = etl.trace(_tiny_ndr_while, _TINY_SPEC)
+    graph = evoxc.trace(_tiny_ndr_while, _TINY_SPEC)
     mlir = _export(graph)  # while_init_rewrite defaults ON
     assert "stablehlo.not" in mlir, "computed-zeros chain (not) missing"
     assert "stablehlo.and" in mlir, "computed-zeros chain (and) missing"
@@ -235,14 +235,14 @@ def test_small_graph_compile_10x_no_segv():
     """The SEGV regression pin: 10 consecutive iree-llvm-cpu compiles of the
     const-init while loop with the rewrite ON must all succeed (the upstream
     AffinityAnalysis SEGV crashed ~9/10 on the un-rewritten shape)."""
-    graph = etl.trace(_tiny_ndr_while, _TINY_SPEC)
+    graph = evoxc.trace(_tiny_ndr_while, _TINY_SPEC)
     for _ in range(10):
-        lowered = etl.lower(graph, backend="iree")
-        etl.compile(lowered)  # any SEGV surfaces as a raised error here
+        lowered = evoxc.lower(graph, backend="iree")
+        evoxc.compile(lowered)  # any SEGV surfaces as a raised error here
     # one run for parity (compile once more through the pipeline sugar).
-    want = etl.evaluate(_tiny_ndr_while, _DOM)
-    exe = etl.build(_tiny_ndr_while, _TINY_SPEC, backend="iree")
-    _assert_exact(etl.run(exe, _DOM), want)
+    want = evoxc.evaluate(_tiny_ndr_while, _DOM)
+    exe = evoxc.build(_tiny_ndr_while, _TINY_SPEC, backend="iree")
+    _assert_exact(evoxc.run(exe, _DOM), want)
 
 
 # ---------------------------------------------------------------------------
@@ -251,27 +251,27 @@ def test_small_graph_compile_10x_no_segv():
 
 
 def test_real_graph_style_llvm_cpu_bit_exact():
-    graph = etl.trace(_non_dominate_rank, _REAL_SPEC)
+    graph = evoxc.trace(_non_dominate_rank, _REAL_SPEC)
     # the rewrite must fire on the REAL shape too (input-derived (n, n) i1
     # le_all/lt_any sources one axis larger than the (n,) i32 init).
     mlir = _export(graph)
     assert "stablehlo.not" in mlir
     assert '"stablehlo.reduce"' in _init_def_line(mlir)
 
-    want = etl.evaluate(_non_dominate_rank, _X32)  # numpy backend reference
+    want = evoxc.evaluate(_non_dominate_rank, _X32)  # numpy backend reference
     assert np.array_equal(_np(want), _np_non_dominate_rank(_X32)), (
         "numpy-backend reference must match the independent front-peeling ref"
     )
-    exe = etl.build(_non_dominate_rank, _REAL_SPEC, backend="iree")
-    _assert_exact(etl.run(exe, _X32), want)
+    exe = evoxc.build(_non_dominate_rank, _REAL_SPEC, backend="iree")
+    _assert_exact(evoxc.run(exe, _X32), want)
 
 
 def test_opt_out_while_init_rewrite_false():
     """``while_init_rewrite=False`` must be accepted by ``lower()`` and
     restore the constant init — asserted on MLIR text ONLY (the opt-out shape
     is the upstream SEGV trigger and is deliberately never compiled)."""
-    graph = etl.trace(_non_dominate_rank, _REAL_SPEC)
-    lowered = etl.lower(graph, backend="iree", while_init_rewrite=False)
+    graph = evoxc.trace(_non_dominate_rank, _REAL_SPEC)
+    lowered = evoxc.lower(graph, backend="iree", while_init_rewrite=False)
     mlir = lowered.payload["mlir_text"]
     assert "stablehlo.not" not in mlir, "rewrite must be disabled"
     assert "stablehlo.constant" in _init_def_line(mlir), (
@@ -279,6 +279,6 @@ def test_opt_out_while_init_rewrite_false():
         + _init_def_line(mlir)
     )
     # and the same graph WITHOUT the option keeps the rewrite (default ON).
-    lowered_on = etl.lower(graph, backend="iree")
+    lowered_on = evoxc.lower(graph, backend="iree")
     mlir_on = lowered_on.payload["mlir_text"]
     assert '"stablehlo.reduce"' in _init_def_line(mlir_on)

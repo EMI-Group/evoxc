@@ -2,7 +2,7 @@
 batched-variant sugar (vmap/vectorize) — Workstream-A follow-up suite.
 
 Pins the extended, MODE-AWARE result-dim contract of the iree adapter's
-external-call host-dispatch path (``etl/backends/external_split.py``,
+external-call host-dispatch path (``evoxc/backends/external_split.py``,
 round 4+): the lower-time STATIC-dims gate now applies to HOST-mode
 boundaries only — host staging genuinely needs concrete shapes — while
 DEVICE-RESIDENT boundaries (``device_resident=True`` registrations)
@@ -20,8 +20,8 @@ regardless of boundary mode ("adapter host-dispatch requires STATIC
 now is too, for device-resident kernels:
 
 * Gap-2 pin (``batch_variant``): the DERIVED batched kernel
-  (``<name>__etl_batched``, registered ``backend="iree",
-  device_resident=True``) runs through ``etl.vmap`` AND ``etl.vectorize``
+  (``<name>__evoxc_batched``, registered ``backend="iree",
+  device_resident=True``) runs through ``evoxc.vmap`` AND ``evoxc.vectorize``
   on iree llvm-cpu — bit-exact vs the numpy reference; the kernel receives
   the FULL batched stack directly as ``core.Tensor``\\ s wrapping the
   public ``IreeDevicePayload`` (never host-staged; asserted inside every
@@ -66,9 +66,9 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
-from etl import transforms
-from etl.backends.adapters.iree import IreeDevicePayload
+import evoxc
+from evoxc import transforms
+from evoxc.backends.adapters.iree import IreeDevicePayload
 
 # ---------------------------------------------------------------------------
 # data (exactly representable in fp32 -> bit-exact comparisons)
@@ -81,7 +81,7 @@ X = np.arange(B * H * W, dtype=np.float32).reshape(B, H, W)  # 0..23
 # intermediate is exactly representable in fp32 on every backend.
 EXPECTED = (X * 2.0 + 1.0) * 2.0
 
-_BATCH_SUFFIX = "__etl_batched"
+_BATCH_SUFFIX = "__evoxc_batched"
 
 
 def _derived(name):
@@ -98,14 +98,14 @@ def _np(v):
     Tensors are host-materialized via the explicit ``to(cpu)`` transfer (a
     no-op for cpu-kind payloads whose lazy ``.numpy()`` then applies; the
     D2H hop for cuda payloads whose bare ``.numpy()`` raises DeviceError)."""
-    if isinstance(v, etl.Tensor):
-        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
+    if isinstance(v, evoxc.Tensor):
+        return np.asarray(v.to(evoxc.core.Device("cpu", 0)).numpy())
     return np.asarray(v)
 
 
 def _assert_bit_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
@@ -131,7 +131,7 @@ def _cleanup(name):
     batching rules are graph-level and survive unregister by design; tests
     must clean them up so later tests start from a blank registry."""
     try:
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
     except KeyError:
         pass  # the test may already have unregistered mid-test
     transforms.batching_rules.pop(f"external:{name}", None)
@@ -144,7 +144,7 @@ _EXECUTABLES: dict = {}
 def _build_exe(key, graph, device=None, target_backends=None):
     """One iree compile per (key, device, target_backends), shared
     module-wide. Uses the EXPLICIT lower/compile/load pipeline: a vmapped
-    Graph is already traced — ``etl.build`` traces callables only."""
+    Graph is already traced — ``evoxc.build`` traces callables only."""
     cache_key = (
         key,
         device,
@@ -152,12 +152,12 @@ def _build_exe(key, graph, device=None, target_backends=None):
     )
     exe = _EXECUTABLES.get(cache_key)
     if exe is None:
-        lowered = etl.lower(graph, backend="iree")
+        lowered = evoxc.lower(graph, backend="iree")
         if target_backends is None:
-            artifact = etl.compile(lowered)
+            artifact = evoxc.compile(lowered)
         else:
-            artifact = etl.compile(lowered, target_backends=list(target_backends))
-        exe = etl.load(artifact, backend="iree", device=device)
+            artifact = evoxc.compile(lowered, target_backends=list(target_backends))
+        exe = evoxc.load(artifact, backend="iree", device=device)
         _EXECUTABLES[cache_key] = exe
     return exe
 
@@ -165,7 +165,7 @@ def _build_exe(key, graph, device=None, target_backends=None):
 def _run_numpy(graph, *arrays):
     """Reference run of a vmapped Graph on the numpy backend (resolves the
     default-slot kernels — the batched-variant sugar's host registrations)."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *arrays)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *arrays)
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +179,10 @@ def _row_fn(name):
     symbolic batch dims through a real stablehlo op (per-op exporter
     symbolic-shape support decides compilability)."""
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        y = etl.external_call(
-            name, x, result=etl.TensorSpec((H, W), etl.float32)
+        y = evoxc.external_call(
+            name, x, result=evoxc.TensorSpec((H, W), evoxc.float32)
         )
         return y * 2.0
 
@@ -192,13 +192,13 @@ def _row_fn(name):
 def _vmapped_graph(name):
     """vmap (function-side sugar) of the row function over a (B, H, W)
     batch spec."""
-    return etl.vmap(_row_fn(name))(etl.TensorSpec((B, H, W), etl.float32))
+    return evoxc.vmap(_row_fn(name))(evoxc.TensorSpec((B, H, W), evoxc.float32))
 
 
 def _vectorized_graph(name):
     """vectorize (the graph->graph primitive) of the traced row function."""
-    return etl.vectorize(
-        etl.trace(_row_fn(name), etl.TensorSpec((H, W), etl.float32)), 0
+    return evoxc.vectorize(
+        evoxc.trace(_row_fn(name), evoxc.TensorSpec((H, W), evoxc.float32)), 0
     )
 
 
@@ -207,7 +207,7 @@ def _assert_batched_device_operand(x, device):
     arrives DIRECTLY as a ``core.Tensor`` whose ``.data`` is the public
     ``IreeDevicePayload`` holding the FULL (B, H, W) stack on ``device`` —
     never a host ndarray, never host-staged at the boundary."""
-    assert isinstance(x, etl.Tensor), type(x)
+    assert isinstance(x, evoxc.Tensor), type(x)
     assert isinstance(x.data, IreeDevicePayload), type(x.data)
     assert not isinstance(x.data, np.ndarray)
     assert tuple(x.data.shape) == (B, H, W)
@@ -309,7 +309,7 @@ def _make_cuda_relay_kernel(calls, device):
 
 def test_llvm_cpu_device_resident_batch_variant_through_vmap_and_vectorize():
     """Gap-2 pin. A DEVICE-RESIDENT batched variant (derived kernel
-    ``<name>__etl_batched`` in the exact "iree" slot with
+    ``<name>__evoxc_batched`` in the exact "iree" slot with
     ``device_resident=True``) composes with vmap AND vectorize on iree
     llvm-cpu: the vmapped graphs LOWER (symbolic batch result dims are
     allowed on device-resident boundaries — the mode-aware gate), the
@@ -320,12 +320,12 @@ def test_llvm_cpu_device_resident_batch_variant_through_vmap_and_vectorize():
     device-resident boundary)."""
     name = "eb_iree_bv_gap2"
     calls = []
-    handle = etl.register_external_kernel(name, _make_host_kernel(calls, "base"))
+    handle = evoxc.register_external_kernel(name, _make_host_kernel(calls, "base"))
     # Default-slot HOST batched variant: the numpy-reference kernel.
     handle.batch_variant(_make_host_kernel(calls, "host"))
     # Exact-"iree"-slot DEVICE-RESIDENT batched variant: the iree kernel.
     handle.batch_variant(
-        _make_device_vmfb_kernel(calls, etl.core.Device("cpu", 0)),
+        _make_device_vmfb_kernel(calls, evoxc.core.Device("cpu", 0)),
         backend="iree",
         device_resident=True,
     )
@@ -340,7 +340,7 @@ def test_llvm_cpu_device_resident_batch_variant_through_vmap_and_vectorize():
         exe = _build_exe("bv_vmap", graph)
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out = etl.run(exe, etl.Tensor(X))
+            out = evoxc.run(exe, evoxc.Tensor(X))
         assert not _staging_warnings(records)  # fully device-resident boundary
         _assert_bit_exact(out, EXPECTED)
         assert calls == [("device", (B, H, W))]  # ONE full-stack device call
@@ -356,7 +356,7 @@ def test_llvm_cpu_device_resident_batch_variant_through_vmap_and_vectorize():
         exe_v = _build_exe("bv_vectorize", vgraph)
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out_v = etl.run(exe_v, etl.Tensor(X))
+            out_v = evoxc.run(exe_v, evoxc.Tensor(X))
         assert not _staging_warnings(records)
         _assert_bit_exact(out_v, EXPECTED)
         assert calls == [("device", (B, H, W))]
@@ -372,12 +372,12 @@ def test_llvm_cpu_device_resident_batch_invariant_through_vmap():
     received directly."""
     name = "eb_iree_bi"
     calls = []
-    handle = etl.register_external_kernel(
+    handle = evoxc.register_external_kernel(
         name, _make_host_kernel(calls, "host")
     )
-    etl.register_external_kernel(
+    evoxc.register_external_kernel(
         name,
-        _make_device_vmfb_kernel(calls, etl.core.Device("cpu", 0)),
+        _make_device_vmfb_kernel(calls, evoxc.core.Device("cpu", 0)),
         backend="iree",
         device_resident=True,
     )
@@ -392,7 +392,7 @@ def test_llvm_cpu_device_resident_batch_invariant_through_vmap():
         exe = _build_exe("bi", graph)
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out = etl.run(exe, etl.Tensor(X))
+            out = evoxc.run(exe, evoxc.Tensor(X))
         assert not _staging_warnings(records)
         _assert_bit_exact(out, EXPECTED)
         assert calls == [("device", (B, H, W))]
@@ -419,10 +419,10 @@ def test_llvm_cpu_vmapped_device_boundary_zero_host_round_trip(monkeypatch):
     copy — not a kernel-boundary stage)."""
     name = "eb_iree_nowarn"
     calls = []
-    handle = etl.register_external_kernel(name, _make_host_kernel(calls, "host"))
+    handle = evoxc.register_external_kernel(name, _make_host_kernel(calls, "host"))
     handle.batch_variant(_make_host_kernel(calls, "host"))
     handle.batch_variant(
-        _make_device_vmfb_kernel(calls, etl.core.Device("cpu", 0)),
+        _make_device_vmfb_kernel(calls, evoxc.core.Device("cpu", 0)),
         backend="iree",
         device_resident=True,
     )
@@ -434,9 +434,9 @@ def test_llvm_cpu_vmapped_device_boundary_zero_host_round_trip(monkeypatch):
         # llvm-cpu), zero warnings, payload-backed output.
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out1 = etl.run(exe, etl.Tensor(X))
+            out1 = evoxc.run(exe, evoxc.Tensor(X))
         assert not _staging_warnings(records)
-        assert isinstance(out1, etl.Tensor)
+        assert isinstance(out1, evoxc.Tensor)
         assert isinstance(out1.data, IreeDevicePayload)  # payload-out
         assert not isinstance(out1.data, np.ndarray)
         _assert_bit_exact(out1, EXPECTED)
@@ -456,7 +456,7 @@ def test_llvm_cpu_vmapped_device_boundary_zero_host_round_trip(monkeypatch):
         monkeypatch.setattr(rt, "asdevicearray", _forbid)
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out2 = etl.run(exe, out1)
+            out2 = evoxc.run(exe, out1)
         assert not _staging_warnings(records)
         assert isinstance(out2.data, IreeDevicePayload)
         # out2 = f(out1): the full graph f(x) = (x * 2 + 1) * 2 applied to
@@ -481,13 +481,13 @@ def test_lower_rejects_host_mode_batched_variant_symbolic_result_dims():
     fallback. (Pins the pre-existing host-mode vmap'd-kernel STATIC
     deferral under the batched-variant sugar.)"""
     name = "eb_iree_host_defer"
-    handle = etl.register_external_kernel(name, _make_host_kernel([], "base"))
+    handle = evoxc.register_external_kernel(name, _make_host_kernel([], "base"))
     handle.batch_variant(_make_host_kernel([], "host"))  # default slot ONLY
     try:
         graph = _vmapped_graph(name)
         assert _ext_names(graph) == [_derived(name)]
-        with pytest.raises(etl.BackendError) as exc:
-            etl.lower(graph, backend="iree")
+        with pytest.raises(evoxc.BackendError) as exc:
+            evoxc.lower(graph, backend="iree")
         message = str(exc.value)
         assert "STATIC" in message
         assert "HOST-mode" in message
@@ -544,11 +544,11 @@ def cuda_device():
     import iree.runtime as rt
 
     try:
-        # etl Device("cuda", idx) maps to iree device_id idx + 1 (1-based ids).
+        # evoxc Device("cuda", idx) maps to iree device_id idx + 1 (1-based ids).
         rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001 — any driver/device failure skips
         pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
-    return etl.core.Device("cuda", idx)
+    return evoxc.core.Device("cuda", idx)
 
 
 def test_cuda_device_resident_batch_variant_through_vmap_bit_exact(cuda_device):
@@ -563,7 +563,7 @@ def test_cuda_device_resident_batch_variant_through_vmap_bit_exact(cuda_device):
     via the explicit ``out.to(core.Device('cpu', 0))`` transfer."""
     name = "eb_iree_cuda"
     calls = []
-    handle = etl.register_external_kernel(name, _make_host_kernel(calls, "host"))
+    handle = evoxc.register_external_kernel(name, _make_host_kernel(calls, "host"))
     handle.batch_variant(_make_host_kernel(calls, "host"))
     handle.batch_variant(
         _make_cuda_relay_kernel(calls, cuda_device),
@@ -581,16 +581,16 @@ def test_cuda_device_resident_batch_variant_through_vmap_bit_exact(cuda_device):
         exe = _build_exe(
             "cuda", graph, device=cuda_device, target_backends=["cuda"]
         )
-        x_in = etl.core.Tensor(X).to(cuda_device)
+        x_in = evoxc.core.Tensor(X).to(cuda_device)
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out = etl.run(exe, x_in)
+            out = evoxc.run(exe, x_in)
         assert not _staging_warnings(records)
-        assert isinstance(out, etl.Tensor)
+        assert isinstance(out, evoxc.Tensor)
         assert out.data.device == cuda_device  # stays on the GPU
-        with pytest.raises(etl.core.DeviceError):
+        with pytest.raises(evoxc.core.DeviceError):
             out.numpy()  # no implicit device-to-host transfer
-        _assert_bit_exact(out.to(etl.core.Device("cpu", 0)), ref)
+        _assert_bit_exact(out.to(evoxc.core.Device("cpu", 0)), ref)
         assert calls == [("device", (B, H, W))]  # ONE full-stack device call
     finally:
         _cleanup(name)

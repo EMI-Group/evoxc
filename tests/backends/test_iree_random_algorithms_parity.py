@@ -1,28 +1,28 @@
 """iree-llvm-cpu round-trip parity for the algorithm-aware RNG lowering
 (Threefry2x32 / Philox4x32_10 — merged with commit 119854b).
 
-Covered here (see ``etl/backends/stablehlo/random_export.py``):
+Covered here (see ``evoxc/backends/stablehlo/random_export.py``):
 
 * the INLINE threefry2x32/philox4x32_10 word-stream expansions — on iree
   these are now pinned EXPLICITLY via the per-call lower override
   ``rng_bit_generator=frozenset()``, because the iree adapter declares
   ``Capabilities.rng_bit_generator=frozenset({"threefry2x32"})``: native
   THREE_FRY is the DEFAULT path for threefry graphs (bit-exact on
-  llvm-cpu + cuda, ~1.6-2.1x faster — see ``etl/bench/rng_bench.py``),
+  llvm-cpu + cuda, ~1.6-2.1x faster — see ``evoxc/bench/rng_bench.py``),
   while PHILOX stays inline (iree 3.11 fails to legalize RNG_ALG_PHILOX —
   an explicit ``BackendError`` at compile, never a silent fallback);
 * the ADAPTER-DEFAULT native ``stablehlo.rng_bit_generator`` THREE_FRY
   path — the exporter option accepts a bool (``True`` → both ciphers,
   backward compat) or a collection of algorithm names, and the native
   emission is selected PER-ALGORITHM iff the name is in the set (the
-  per-call override flows through ``etl.lower``/``etl.build``/
-  ``etl.evaluate``); and
+  per-call override flows through ``evoxc.lower``/``evoxc.build``/
+  ``evoxc.evaluate``); and
 * the NATIVE path via a manual ``LoweredProgram`` (exporter option
   ``{"rng_bit_generator": True}``), whose iree-legalized words were
   empirically verified to match the inline cipher.
 
 Bit-exactness contract (the numpy kernels in
-``etl/backends/numpy/kernels/random.py`` are the reference — the word-stream
+``evoxc/backends/numpy/kernels/random.py`` are the reference — the word-stream
 contract is pinned there): per-op pi-hex salts XOR-folded onto the key words;
 counter (p, 0); element i <- flat word i; normal pairs words 2i/2i+1;
 uniform = ``w * 2^-32`` for 32-bit-word streams (FULL-word scaling —
@@ -30,7 +30,7 @@ pinned), ``(w >> 11) * 2^-53`` for 64-bit streams; randint = floor(u*span)
 in f64; permutation = stable argsort of the sign-flipped words; key_mix =
 one cipher block at counter (0, 0) -> the algorithm's key shape. So
 uniform/randint/permutation/key_mix (``split``/``split_n``) are bit-exact vs
-``etl.evaluate``; ``random_normal`` with f64 output is bit-exact (or within
+``evoxc.evaluate``; ``random_normal`` with f64 output is bit-exact (or within
 1 ulp), and with f32 output takes the DOCUMENTED f32 Box-Muller fast path —
 deterministic (same key => bit-identical across runs) but ~1e-6 vs the numpy
 f64 math, so the f32 parity checks are tolerance-based
@@ -39,18 +39,18 @@ f64 math, so the f32 parity checks are tolerance-based
 The xla adapter declares
 ``Capabilities.rng_bit_generator=frozenset({"threefry2x32",
 "philox4x32_10"})``, but xla run tests stay gate-skipped without a
-user-provided PJRT plugin (``ETL_PJRT_PLUGIN``/``plugin_path``) — there
+user-provided PJRT plugin (``EVOXC_PJRT_PLUGIN``/``plugin_path``) — there
 are NO xla tests here.
 
 The iree-cuda smoke set (``target_backends=["cuda"]``) runs on a free GPU
-scanned via nvidia-smi (most-free device; ``etl Device("cuda", idx)`` maps to
+scanned via nvidia-smi (most-free device; ``evoxc Device("cuda", idx)`` maps to
 iree device_id ``idx + 1``) and skips when the IREE cuda HAL driver or any GPU
 is unavailable (same guard style as ``test_iree_emitters_parity.py``;
 while-loop graphs are not involved here). Under the explicit-placement model
 the smokes PLACE their host key inputs on the cuda device before the run
-(``etl.core.Tensor(key).to(cuda_device)`` — plain cuda runs never stage host
+(``evoxc.core.Tensor(key).to(cuda_device)`` — plain cuda runs never stage host
 inputs) and read the device-resident run outputs via an EXPLICIT
-device-to-host copy (``Tensor.to(etl.core.Device("cpu", 0)).numpy()`` — see
+device-to-host copy (``Tensor.to(evoxc.core.Device("cpu", 0)).numpy()`` — see
 ``_np``); the uniform parity pins stay bit-exact vs numpy.
 """
 
@@ -60,8 +60,8 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
-from etl.backends.program import LoweredProgram, Signature
+import evoxc
+from evoxc.backends.program import LoweredProgram, Signature
 
 # ---------------------------------------------------------------------------
 # data (fixed seed — same convention as test_iree_emitters_parity.py)
@@ -72,25 +72,25 @@ ALGORITHMS = ("threefry2x32", "philox4x32_10")
 #: The algorithm's key layout (dtype + shape) per canonical algorithm:
 #: threefry2x32 -> (2,) int32; philox4x32_10 -> (4,) int32.
 KEY_SPECS = {
-    "threefry2x32": etl.TensorSpec((2,), etl.int32),
-    "philox4x32_10": etl.TensorSpec((4,), etl.int32),
+    "threefry2x32": evoxc.TensorSpec((2,), evoxc.int32),
+    "philox4x32_10": evoxc.TensorSpec((4,), evoxc.int32),
 }
 
 #: Raw key-word arrays per algorithm (the explicit-input form): (0, 0),
 #: (0xFFFFFFFF, 0xFFFFFFFF) as np.int32 -1s, a mixed word, and one
-#: seed-derived key via etl.random.key(42, algorithm=...).
+#: seed-derived key via evoxc.random.key(42, algorithm=...).
 KEYS = {
     "threefry2x32": (
         np.array([0, 0], dtype=np.int32),  # (0, 0)
         np.array([-1, -1], dtype=np.int32),  # (0xFFFFFFFF, 0xFFFFFFFF)
         np.array([-1, 0], dtype=np.int32),  # (0xFFFFFFFF, 0)
-        etl.random.key(42, algorithm="threefry2x32").numpy(),
+        evoxc.random.key(42, algorithm="threefry2x32").numpy(),
     ),
     "philox4x32_10": (
         np.array([0, 0, 0, 0], dtype=np.int32),
         np.array([-1, -1, -1, -1], dtype=np.int32),
         np.array([-1, 0, -1, 0], dtype=np.int32),
-        etl.random.key(42, algorithm="philox4x32_10").numpy(),
+        evoxc.random.key(42, algorithm="philox4x32_10").numpy(),
     ),
 }
 
@@ -111,52 +111,52 @@ def _np(v):
 
     Host materialization is EXPLICIT under the explicit-placement model:
     any payload-backed tensor (llvm-cpu or cuda) is transferred to host via
-    ``Tensor.to(etl.core.Device("cpu", 0))`` first (``.numpy()`` on a
+    ``Tensor.to(evoxc.core.Device("cpu", 0))`` first (``.numpy()`` on a
     non-cpu-kind payload would raise ``DeviceError`` — no implicit
     device-to-host transfer). ndarray-backed tensors already live on cpu:0,
     so ``.to`` returns them unchanged (zero-copy preserved).
     """
-    if isinstance(v, etl.Tensor):
-        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
+    if isinstance(v, evoxc.Tensor):
+        return np.asarray(v.to(evoxc.core.Device("cpu", 0)).numpy())
     if isinstance(v, (list, tuple)):
         return type(v)(_np(x) for x in v)
     return np.asarray(v)
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
 
 def _assert_close(got, want, rtol=1e-5, atol=1e-5):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.allclose(gp, wp, rtol=rtol, atol=atol), f"{gp} != {wp}"
 
 
 def _parity(fn, spec, key, exact=True, **iree_kwargs):
-    """Build on iree, run, and compare vs ``etl.evaluate`` (numpy reference).
+    """Build on iree, run, and compare vs ``evoxc.evaluate`` (numpy reference).
 
     Explicit-placement semantics: when ``iree_kwargs`` names a NON-cpu
     ``device`` (cuda), the host ``key`` is PLACED on that device before the
-    run (``etl.core.Tensor(key).to(device)`` — a cuda run never stages host
+    run (``evoxc.core.Tensor(key).to(device)`` — a cuda run never stages host
     inputs at the run boundary); run outputs are compared after an explicit
     device-to-host copy (``_np`` materializes through
     ``Tensor.to(Device('cpu', 0))``). On cpu devices the raw numpy key stays
     legal (host-input representation path unchanged).
     """
     device = iree_kwargs.get("device")
-    want = etl.evaluate(fn, key)
-    exe = etl.build(fn, spec, backend="iree", **iree_kwargs)
+    want = evoxc.evaluate(fn, key)
+    exe = evoxc.build(fn, spec, backend="iree", **iree_kwargs)
     run_input = (
         key
         if device is None or device.kind == "cpu"
-        else etl.core.Tensor(key).to(device)
+        else evoxc.core.Tensor(key).to(device)
     )
-    got = etl.run(exe, run_input)
+    got = evoxc.run(exe, run_input)
     if exact:
         _assert_exact(got, want)
     else:
@@ -201,16 +201,16 @@ def cuda_device():
     import iree.runtime as rt
 
     try:
-        # etl Device("cuda", idx) maps to iree device_id idx + 1 (1-based).
+        # evoxc Device("cuda", idx) maps to iree device_id idx + 1 (1-based).
         rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001 — any driver/device failure skips
         pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
-    return etl.core.Device("cuda", idx)
+    return evoxc.core.Device("cuda", idx)
 
 
 def _signature(graph) -> Signature:
     """Rebuild a ``Signature`` from a traced graph (the compiler.py recipe)."""
-    from etl.backends.numpy.interpreter import entry_function
+    from evoxc.backends.numpy.interpreter import entry_function
 
     main_fn = entry_function(graph.module)
     return Signature(
@@ -218,7 +218,7 @@ def _signature(graph) -> Signature:
         output_tree=graph.output_tree,
         input_specs=tuple(graph.tensor_specs),
         output_specs=tuple(
-            etl.core.TensorSpec(shape=value_type.shape, dtype=value_type.dtype)
+            evoxc.core.TensorSpec(shape=value_type.shape, dtype=value_type.dtype)
             for value_type in main_fn.output_types
         ),
         static_values=tuple(record.value for record in graph.static_values),
@@ -234,7 +234,7 @@ def _lowered_native(graph) -> LoweredProgram:
     this now matches the iree adapter's DEFAULT lowering; the manual
     recipe is kept as the explicit-option form (and lets the cuda native
     smoke test control ``target_backends`` at compile)."""
-    mlir = etl.backends.stablehlo.export(
+    mlir = evoxc.backends.stablehlo.export(
         graph, options={"rng_bit_generator": True}
     )
     return LoweredProgram(
@@ -255,40 +255,40 @@ def _lowered_native(graph) -> LoweredProgram:
 
 
 def _uniform5(k):
-    return etl.random.uniform(k, (5,), dtype=etl.float32)
+    return evoxc.random.uniform(k, (5,), dtype=evoxc.float32)
 
 
 def _uniform2d(k):
-    return etl.random.uniform(k, (4, 5), dtype=etl.float32)
+    return evoxc.random.uniform(k, (4, 5), dtype=evoxc.float32)
 
 
 def _randint8(k):
-    return etl.random.randint(k, (8,), low=0, high=100)
+    return evoxc.random.randint(k, (8,), low=0, high=100)
 
 
 def _perm5(k):
-    return etl.random.permutation(k, 5)
+    return evoxc.random.permutation(k, 5)
 
 
 def _perm8(k):
-    return etl.random.permutation(k, 8)
+    return evoxc.random.permutation(k, 8)
 
 
 def _normal_f64(k):
-    return etl.random.normal(k, (4, 5), dtype=etl.float64)
+    return evoxc.random.normal(k, (4, 5), dtype=evoxc.float64)
 
 
 def _normal_f32(k):
-    return etl.random.normal(k, (4, 5), dtype=etl.float32)
+    return evoxc.random.normal(k, (4, 5), dtype=evoxc.float32)
 
 
 def _split(k):
-    a, b = etl.random.split(k)
+    a, b = evoxc.random.split(k)
     return a, b
 
 
 def _split_n3(k):
-    return etl.random.split_n(k, 3)
+    return evoxc.random.split_n(k, 3)
 
 
 INLINE_CASES = [
@@ -323,14 +323,14 @@ def test_inline_bit_exact(case_id, fn, spec, algorithm):
     list runs through the same executable. The INLINE path is pinned via
     the per-call ``rng_bit_generator=frozenset()`` override (for threefry
     the adapter default is now native THREE_FRY). Bit-exact vs
-    ``etl.evaluate`` (numpy reference) AND bit-identical across repeated
+    ``evoxc.evaluate`` (numpy reference) AND bit-identical across repeated
     runs of the same executable (determinism folded into the loop)."""
-    exe = etl.build(fn, spec, backend="iree", rng_bit_generator=frozenset())
+    exe = evoxc.build(fn, spec, backend="iree", rng_bit_generator=frozenset())
     for key in KEYS[algorithm]:
-        want = etl.evaluate(fn, key)
-        got = etl.run(exe, key)
+        want = evoxc.evaluate(fn, key)
+        got = evoxc.run(exe, key)
         _assert_exact(got, want)
-        _assert_exact(etl.run(exe, key), got)  # same exe, second call
+        _assert_exact(evoxc.run(exe, key), got)  # same exe, second call
         if "uniform" in case_id:
             assert _np(got).dtype == np.float32
         if "permutation" in case_id:
@@ -347,13 +347,13 @@ def test_inline_bit_exact(case_id, fn, spec, algorithm):
 def test_normal_f64_bit_exact(algorithm):
     """f64 output normal: bit-exact vs the numpy kernel (both algorithms;
     the INLINE path, pinned via the per-call override)."""
-    exe = etl.build(
+    exe = evoxc.build(
         _normal_f64, KEY_SPECS[algorithm], backend="iree",
         rng_bit_generator=frozenset(),
     )
     for key in KEYS[algorithm]:
-        want = etl.evaluate(_normal_f64, key)
-        got = etl.run(exe, key)
+        want = evoxc.evaluate(_normal_f64, key)
+        got = evoxc.run(exe, key)
         assert _np(got).dtype == np.float64
         _assert_exact(got, want)
 
@@ -363,14 +363,14 @@ def test_normal_f32_tolerance_and_determinism(algorithm):
     """f32 output normal: within the documented f32 fast-path budget vs
     numpy AND bit-identical across two separate runs of the same exe (the
     INLINE path, pinned via the per-call override)."""
-    exe = etl.build(
+    exe = evoxc.build(
         _normal_f32, KEY_SPECS[algorithm], backend="iree",
         rng_bit_generator=frozenset(),
     )
     for key in KEYS[algorithm]:
-        want = etl.evaluate(_normal_f32, key)
-        g1 = etl.run(exe, key)
-        g2 = etl.run(exe, key)
+        want = evoxc.evaluate(_normal_f32, key)
+        g1 = evoxc.run(exe, key)
+        g2 = evoxc.run(exe, key)
         assert _np(g1).dtype == np.float32
         _assert_close(g1, want, **RANDOM_NORMAL_TOL)
         _assert_exact(g1, g2)  # the hard same-key determinism contract
@@ -385,15 +385,15 @@ def test_split_bit_exact(algorithm):
     """``split(k)`` -> two keys of the algorithm's key shape ((2,) / (4,)
     int32), bit-exact vs numpy (the INLINE path, pinned via the per-call
     override)."""
-    exe = etl.build(
+    exe = evoxc.build(
         _split, KEY_SPECS[algorithm], backend="iree",
         rng_bit_generator=frozenset(),
     )
     for key in KEYS[algorithm]:
-        want = etl.evaluate(_split, key)
-        got = etl.run(exe, key)
+        want = evoxc.evaluate(_split, key)
+        got = evoxc.run(exe, key)
         _assert_exact(got, want)
-        for leaf in etl.tree_leaves(etl.tree_map(_np, got)):
+        for leaf in evoxc.tree_leaves(evoxc.tree_map(_np, got)):
             assert leaf.dtype == np.int32
             assert leaf.shape == KEY_SPECS[algorithm].shape
 
@@ -402,13 +402,13 @@ def test_split_bit_exact(algorithm):
 def test_split_n_bit_exact(algorithm):
     """``split_n(k, 3)`` -> a 3-tuple of keys, bit-exact vs numpy (the
     INLINE path, pinned via the per-call override)."""
-    exe = etl.build(
+    exe = evoxc.build(
         _split_n3, KEY_SPECS[algorithm], backend="iree",
         rng_bit_generator=frozenset(),
     )
     for key in KEYS[algorithm]:
-        want = etl.evaluate(_split_n3, key)
-        got = etl.run(exe, key)
+        want = evoxc.evaluate(_split_n3, key)
+        got = evoxc.run(exe, key)
         assert len(got) == 3
         _assert_exact(got, want)
 
@@ -420,7 +420,7 @@ def test_split_n_bit_exact(algorithm):
 
 def _lowered_mlir(fn, spec, **lower_kwargs) -> str:
     """Lower via the iree adapter and return the recorded StableHLO MLIR."""
-    lowered = etl.lower(etl.trace(fn, spec), backend="iree", **lower_kwargs)
+    lowered = evoxc.lower(evoxc.trace(fn, spec), backend="iree", **lower_kwargs)
     return lowered.payload["mlir_text"]
 
 
@@ -429,7 +429,7 @@ def test_adapter_default_threefry_native_bit_exact():
     (``rng_bit_generator=frozenset({"threefry2x32"})``) lowers a threefry
     graph to a NATIVE ``stablehlo.rng_bit_generator`` call (algorithm
     THREE_FRY) — and that default path runs bit-exact vs
-    ``etl.evaluate``."""
+    ``evoxc.evaluate``."""
     spec = KEY_SPECS["threefry2x32"]
     mlir = _lowered_mlir(_uniform5, spec)
     rng_line = next(
@@ -437,9 +437,9 @@ def test_adapter_default_threefry_native_bit_exact():
         if "stablehlo.rng_bit_generator" in line
     )
     assert "algorithm = THREE_FRY" in rng_line
-    exe = etl.build(_uniform5, spec, backend="iree")
+    exe = evoxc.build(_uniform5, spec, backend="iree")
     for key in KEYS["threefry2x32"]:
-        _assert_exact(etl.run(exe, key), etl.evaluate(_uniform5, key))
+        _assert_exact(evoxc.run(exe, key), evoxc.evaluate(_uniform5, key))
 
 
 def test_inline_override_flows_to_lowering():
@@ -460,9 +460,9 @@ def test_adapter_default_philox_inline_bit_exact():
     the MLIR) and runs bit-exact."""
     spec = KEY_SPECS["philox4x32_10"]
     assert "rng_bit_generator" not in _lowered_mlir(_uniform5, spec)
-    exe = etl.build(_uniform5, spec, backend="iree")
+    exe = evoxc.build(_uniform5, spec, backend="iree")
     for key in KEYS["philox4x32_10"]:
-        _assert_exact(etl.run(exe, key), etl.evaluate(_uniform5, key))
+        _assert_exact(evoxc.run(exe, key), evoxc.evaluate(_uniform5, key))
 
 
 def test_adapter_native_philox_override_fails_at_compile():
@@ -471,8 +471,8 @@ def test_adapter_native_philox_override_fails_at_compile():
     call and fails CLEANLY at compile: iree cannot legalize RNG_ALG_PHILOX,
     surfaced as an explicit ``BackendError`` carrying the compiler
     diagnostics — never a silent fallback."""
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.build(
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.build(
             _uniform5, KEY_SPECS["philox4x32_10"], backend="iree",
             rng_bit_generator={"philox4x32_10"},
         )
@@ -502,25 +502,25 @@ NATIVE_CASES = [
 def test_native_threefry_rng_bit_generator(case_id, fn):
     """The manual recipe: trace -> export with ``rng_bit_generator=True`` ->
     LoweredProgram -> iree adapter compile/load -> ``exe.run([key_tensor])``
-    (flat input list). Native output must be bit-exact vs ``etl.evaluate``
+    (flat input list). Native output must be bit-exact vs ``evoxc.evaluate``
     AND bit-identical to the inline-path output (the inline path is pinned
     via the per-call override — the adapter default is now native)."""
     spec = KEY_SPECS["threefry2x32"]
-    graph = etl.trace(fn, spec)
-    mlir = etl.backends.stablehlo.export(
+    graph = evoxc.trace(fn, spec)
+    mlir = evoxc.backends.stablehlo.export(
         graph, options={"rng_bit_generator": True}
     )
     assert "rng_bit_generator" in mlir
-    adapter = etl.backends.registry.get("iree")
+    adapter = evoxc.backends.registry.get("iree")
     artifact = adapter.compile(_lowered_native(graph))
     exe = adapter.load(artifact)
     # the inline path, pinned via the per-call override
-    inline_exe = etl.build(fn, spec, backend="iree", rng_bit_generator=frozenset())
+    inline_exe = evoxc.build(fn, spec, backend="iree", rng_bit_generator=frozenset())
     for key in KEYS["threefry2x32"]:
-        want = etl.evaluate(fn, key)
-        got = exe.run([etl.core.Tensor(key.copy())])  # list of flat Tensors
+        want = evoxc.evaluate(fn, key)
+        got = exe.run([evoxc.core.Tensor(key.copy())])  # list of flat Tensors
         _assert_exact(got, want)
-        _assert_exact(got, etl.run(inline_exe, key))  # native == inline
+        _assert_exact(got, evoxc.run(inline_exe, key))  # native == inline
         if "permutation" in case_id:
             perm = _np(got[0])  # the flat-output list's single tensor
             assert sorted(perm.tolist()) == list(range(perm.shape[-1]))
@@ -532,14 +532,14 @@ def test_native_threefry_rng_bit_generator(case_id, fn):
 
 
 def test_cross_roundtrip_determinism():
-    """Two separate etl.build + etl.run round-trips (same key) give
+    """Two separate evoxc.build + evoxc.run round-trips (same key) give
     bit-identical output — the hard same-key determinism contract."""
     for algorithm in ALGORITHMS:
         key = KEYS[algorithm][-1]  # the seed-derived key
         spec = KEY_SPECS[algorithm]
-        exe1 = etl.build(_uniform5, spec, backend="iree")
-        exe2 = etl.build(_uniform5, spec, backend="iree")
-        _assert_exact(etl.run(exe1, key), etl.run(exe2, key))
+        exe1 = evoxc.build(_uniform5, spec, backend="iree")
+        exe2 = evoxc.build(_uniform5, spec, backend="iree")
+        _assert_exact(evoxc.run(exe1, key), evoxc.run(exe2, key))
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +551,7 @@ def test_cross_roundtrip_determinism():
 def test_iree_cuda_threefry_inline_uniform_smoke(cuda_device):
     """INLINE threefry on cuda — pinned via the per-call override (the
     adapter default on cuda is native THREE_FRY). The host key is PLACED on
-    the cuda device before the run (``etl.core.Tensor(key).to(cuda_device)``
+    the cuda device before the run (``evoxc.core.Tensor(key).to(cuda_device)``
     — plain cuda runs never stage host inputs) and the device-resident
     output is compared bit-exact via an explicit device-to-host copy
     (``_np`` → ``t.to(Device('cpu', 0)).numpy()``)."""
@@ -584,12 +584,12 @@ def test_iree_cuda_threefry_native_uniform_smoke(cuda_device):
     explicit device-to-host copy (``_np`` → ``t.to(Device('cpu', 0)).numpy()``)."""
     spec = KEY_SPECS["threefry2x32"]
     key = KEYS["threefry2x32"][-1]
-    graph = etl.trace(_uniform5, spec)
-    adapter = etl.backends.registry.get("iree")
+    graph = evoxc.trace(_uniform5, spec)
+    adapter = evoxc.backends.registry.get("iree")
     artifact = adapter.compile(
         _lowered_native(graph), options={"target_backends": ["cuda"]}
     )
     exe = adapter.load(artifact, device=cuda_device)
-    want = etl.evaluate(_uniform5, key)
-    got = exe.run([etl.core.Tensor(key.copy()).to(cuda_device)])
+    want = evoxc.evaluate(_uniform5, key)
+    got = exe.run([evoxc.core.Tensor(key.copy()).to(cuda_device)])
     _assert_exact(got, want)

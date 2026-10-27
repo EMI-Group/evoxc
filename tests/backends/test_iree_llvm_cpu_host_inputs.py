@@ -1,6 +1,6 @@
 """iree llvm-cpu host-input path under explicit device placement (regression
-suite for the R6.2 device-placement rules — ``etl/core/tensor.py``,
-``etl/core/device.py``, ``etl/pipeline.py`` ``_check_run_device``, and the
+suite for the R6.2 device-placement rules — ``evoxc/core/tensor.py``,
+``evoxc/core/device.py``, ``evoxc/pipeline.py`` ``_check_run_device``, and the
 iree adapter's buffer-building path):
 
 Explicit placement is now binding: ``Tensor.to(device)`` is the ONLY transfer
@@ -22,7 +22,7 @@ no-regression contract:
   ``core.Device("cpu", 0)`` whose host copy materializes LAZILY and
   PER-CALL: zero ``IreeDevicePayload.to_host`` invocations after ``run()``,
   one fresh materialization per ``.numpy()`` call — the Tensor never caches
-  the host array (the etl-level freshness contract, pinned exactly like
+  the host array (the evoxc-level freshness contract, pinned exactly like
   ``tests/core/test_tensor.py::test_numpy_fresh_host_copy_per_call`` counts
   a dummy payload's ``to_host``). NOTE on object identity: for MAPPABLE
   llvm-cpu memory iree's own ``DeviceArray.to_host()`` maps the buffer ONCE
@@ -47,7 +47,7 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # data (deterministic; exactly representable in fp32 → bit-exact elementwise)
@@ -56,25 +56,25 @@ import etl
 XA = np.arange(24, dtype=np.float32).reshape(4, 6) + 0.25
 XB = np.arange(24, dtype=np.float32).reshape(4, 6) / 2.0 + 1.0
 ADD_SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((4, 6), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
 )
 
 
 def _add(x, y):
-    return etl.add(x, y)
+    return evoxc.add(x, y)
 
 
 def _np(v):
     """Tensor / ndarray → ndarray (host copy for payload-backed tensors)."""
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
@@ -87,7 +87,7 @@ def _build_exe(fn, specs):
     key = (fn, specs)
     exe = _EXECUTABLES.get(key)
     if exe is None:
-        exe = etl.build(fn, *specs, backend="iree")  # default llvm-cpu device
+        exe = evoxc.build(fn, *specs, backend="iree")  # default llvm-cpu device
         _EXECUTABLES[key] = exe
     return exe
 
@@ -120,8 +120,8 @@ def test_host_ndarray_inputs_accepted():
     # Raw numpy arrays (never wrapped in a core.Tensor) are auto-wrapped as
     # cpu:0 at the run boundary and accepted by the llvm-cpu executable.
     exe = _build_exe(_add, ADD_SPECS)
-    out = etl.run(exe, XA, XB)
-    _assert_exact(out, etl.evaluate(_add, XA, XB))  # bit-exact fp32 add
+    out = evoxc.run(exe, XA, XB)
+    _assert_exact(out, evoxc.evaluate(_add, XA, XB))  # bit-exact fp32 add
 
 
 def test_host_ndarray_inputs_upload_via_asdevicearray(monkeypatch):
@@ -130,11 +130,11 @@ def test_host_ndarray_inputs_upload_via_asdevicearray(monkeypatch):
     # one call per input leaf — never silently dropped or pass-through'd.
     exe = _build_exe(_add, ADD_SPECS)
     calls = _count_asdevicearray_calls(monkeypatch)
-    out = etl.run(exe, XA, XB)
+    out = evoxc.run(exe, XA, XB)
     assert len(calls) == 2, (
         f"expected one asdevicearray call per host input, got {len(calls)}"
     )
-    _assert_exact(out, etl.evaluate(_add, XA, XB))
+    _assert_exact(out, evoxc.evaluate(_add, XA, XB))
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +147,8 @@ def test_cpu0_tensor_inputs_accepted():
     # executable — accepted and bit-exact (the ndarray-backed path is
     # unchanged: still asdevicearray-hosted on llvm-cpu, never rejected).
     exe = _build_exe(_add, ADD_SPECS)
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
-    _assert_exact(out, etl.evaluate(_add, XA, XB))
+    out = evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
+    _assert_exact(out, evoxc.evaluate(_add, XA, XB))
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +160,11 @@ def test_cpu0_payload_output_lazy_numpy(monkeypatch):
     exe = _build_exe(_add, ADD_SPECS)
     # The run output is a DEVICE-payload-backed tensor on the executable's
     # cpu:0 device — NOT an ndarray-backed tensor.
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
-    assert isinstance(out, etl.Tensor)
+    out = evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
+    assert isinstance(out, evoxc.Tensor)
     assert not isinstance(out.data, np.ndarray)
-    assert out.device == etl.core.Device("cpu", 0)
-    assert out.data.device == etl.core.Device("cpu", 0)
+    assert out.device == evoxc.core.Device("cpu", 0)
+    assert out.data.device == evoxc.core.Device("cpu", 0)
     assert out.shape == (4, 6)
     assert out.dtype == np.dtype("float32")
 
@@ -174,9 +174,9 @@ def test_cpu0_payload_output_lazy_numpy(monkeypatch):
     # re-invokes the payload's host-copy path — the Tensor never caches the
     # host array. (For mappable llvm-cpu memory iree's DeviceArray.to_host()
     # maps the buffer once and returns the same zero-copy view afterwards,
-    # so we pin the per-call re-materialization — the etl-owned half of the
+    # so we pin the per-call re-materialization — the evoxc-owned half of the
     # freshness contract — not ndarray object identity.)
-    from etl.backends.adapters.iree import IreeDevicePayload
+    from evoxc.backends.adapters.iree import IreeDevicePayload
 
     real_to_host = IreeDevicePayload.to_host
     calls = []
@@ -186,7 +186,7 @@ def test_cpu0_payload_output_lazy_numpy(monkeypatch):
         return real_to_host(self)
 
     monkeypatch.setattr(IreeDevicePayload, "to_host", _counting)
-    out2 = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    out2 = evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     assert calls == []  # run() never materializes the host copy
     a1 = out2.numpy()
     assert len(calls) == 1
@@ -205,13 +205,13 @@ def test_cpu0_payload_output_lazy_numpy(monkeypatch):
 
 def test_to_same_device_returns_self():
     exe = _build_exe(_add, ADD_SPECS)
-    cpu0 = etl.core.Device("cpu", 0)
+    cpu0 = evoxc.core.Device("cpu", 0)
     # Payload-backed run output: to(cpu:0) is a no-op returning the SAME
     # tensor object — never a host copy.
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    out = evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     assert out.to(cpu0) is out
     # ndarray-backed cpu:0 tensors ("on the host") behave identically.
-    t = etl.core.Tensor(XA)
+    t = evoxc.core.Tensor(XA)
     assert t.device == cpu0
     assert t.to(cpu0) is t
 
@@ -232,15 +232,15 @@ def test_foreign_device_tensor_rejected_at_run_boundary():
 
         shape = (4, 6)
         dtype = np.dtype("float32")
-        device = etl.core.Device("cuda", 0)
+        device = evoxc.core.Device("cuda", 0)
 
-    foreign = etl.core.Tensor(_FakeCudaPayload())
-    assert foreign.device == etl.core.Device("cuda", 0)
+    foreign = evoxc.core.Tensor(_FakeCudaPayload())
+    assert foreign.device == evoxc.core.Device("cuda", 0)
     exe = _build_exe(_add, ADD_SPECS)
     with pytest.raises(
-        etl.DeviceError,
+        evoxc.DeviceError,
         match=r"input at path \[0\] is on device Device\(kind='cuda', index=0\), "
               r"but the executable runs on device Device\(kind='cpu', index=0\): "
               r"no implicit .* run boundary .* t\.to\(",
     ):
-        etl.run(exe, foreign, etl.core.Tensor(XB))
+        evoxc.run(exe, foreign, evoxc.core.Tensor(XB))

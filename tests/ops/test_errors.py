@@ -1,14 +1,14 @@
-"""Error semantics of the full public op surface (contract: ``etl/ops/CONTEXT.md``).
+"""Error semantics of the full public op surface (contract: ``evoxc/ops/CONTEXT.md``).
 
-Every public op in ``etl.ops.__all__`` (102 names) is exercised in three
+Every public op in ``evoxc.ops.__all__`` (102 names) is exercised in three
 parametrized error categories:
 
 (a) called OUTSIDE a trace -> ``TraceError`` with the directing message
     ("No active trace: tensor ops can only be called while tracing", naming
-    ``etl.trace`` / ``etl.evaluate``);
+    ``evoxc.trace`` / ``evoxc.evaluate``);
 (b) called INSIDE a trace with a concrete ``Tensor`` operand ->
     ``TraceError`` with the mandated three-option message (explicit input /
-    ``etl.constant`` / ``etl.evaluate`` — no eager mode);
+    ``evoxc.constant`` / ``evoxc.evaluate`` — no eager mode);
 (c) contracted wrong-dtype / static-shape failures -> ``DTypeError`` /
     ``ShapeError`` (logical on non-bool, bitwise on float, float gather
     indices, static broadcast mismatch).
@@ -24,7 +24,7 @@ import os
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 from tests.ops.conftest import ops_of
 
@@ -35,22 +35,22 @@ from tests.ops.conftest import ops_of
 # valid call; ``kwargs`` are constant per op.
 # ---------------------------------------------------------------------------
 
-_CONST_TENSOR = etl.tensor(np.array([1.0, 2.0], dtype=np.float32))
+_CONST_TENSOR = evoxc.tensor(np.array([1.0, 2.0], dtype=np.float32))
 _RUNTIME_CALLBACK = np.add
-_RUNTIME_RESULT = etl.TensorSpec((4,), etl.float32)
+_RUNTIME_RESULT = evoxc.TensorSpec((4,), evoxc.float32)
 
 # Symbolic tensors every traced fn receives, in this exact order.
 _TENSOR_SPECS = (
-    ("x", (4,), etl.float32),  # general elementwise operand
-    ("y", (4,), etl.float32),
-    ("xi", (4,), etl.int32),  # integer operand (bitwise)
-    ("xb", (4,), etl.bool_),  # bool operand (logical / select)
-    ("a", (2, 2), etl.float32),  # linalg operands
-    ("b", (2, 2), etl.float32),
-    ("xc", (1, 1, 2), etl.float32),  # conv input (N, C, spatial)
-    ("wc", (1, 1, 1), etl.float32),  # conv kernel (C_out, C_in, k)
-    ("idx", (2,), etl.int32),  # gather/scatter indices
-    ("u", (2,), etl.float32),  # scatter updates
+    ("x", (4,), evoxc.float32),  # general elementwise operand
+    ("y", (4,), evoxc.float32),
+    ("xi", (4,), evoxc.int32),  # integer operand (bitwise)
+    ("xb", (4,), evoxc.bool_),  # bool operand (logical / select)
+    ("a", (2, 2), evoxc.float32),  # linalg operands
+    ("b", (2, 2), evoxc.float32),
+    ("xc", (1, 1, 2), evoxc.float32),  # conv input (N, C, spatial)
+    ("wc", (1, 1, 1), evoxc.float32),  # conv kernel (C_out, C_in, k)
+    ("idx", (2,), evoxc.int32),  # gather/scatter indices
+    ("u", (2,), evoxc.float32),  # scatter updates
 )
 
 OP_CALLS = {
@@ -83,7 +83,7 @@ OP_CALLS = {
     "ceil": (lambda t: (t["x"],), {}),
     "floor": (lambda t: (t["x"],), {}),
     "round": (lambda t: (t["x"],), {}),
-    "cast": (lambda t: (t["x"],), {"dtype": etl.float64}),
+    "cast": (lambda t: (t["x"],), {"dtype": evoxc.float64}),
     "acos": (lambda t: (t["x"],), {}),
     "floor": (lambda t: (t["x"],), {}),
     "ceil": (lambda t: (t["x"],), {}),
@@ -189,18 +189,18 @@ _STANDINS = {
 
 
 def _specs():
-    return [etl.TensorSpec(shape, dtype) for _, shape, dtype in _TENSOR_SPECS]
+    return [evoxc.TensorSpec(shape, dtype) for _, shape, dtype in _TENSOR_SPECS]
 
 
 def _op_ref(op_name):
     """Map an op name to the callable.
 
-    ``etl.trace`` is the TRACING function (foundational API) — the
-    matrix-trace op is fetched from ``etl.ops`` instead.
+    ``evoxc.trace`` is the TRACING function (foundational API) — the
+    matrix-trace op is fetched from ``evoxc.ops`` instead.
     """
     if op_name == "trace":
-        return etl.ops.trace
-    return getattr(etl, op_name)
+        return evoxc.ops.trace
+    return getattr(evoxc, op_name)
 
 
 def _trace_call(op_name, args_builder, kwargs=None):
@@ -214,7 +214,7 @@ def _trace_call(op_name, args_builder, kwargs=None):
         }
         return _op_ref(op_name)(*args_builder(t), **kwargs)
 
-    return etl.trace(fn, *_specs())
+    return evoxc.trace(fn, *_specs())
 
 
 def _tensor_variant(op_name, args_builder):
@@ -239,12 +239,12 @@ def _tensor_variant(op_name, args_builder):
 def _op_ref(op_name):
     """Map an op name to the callable.
 
-    ``etl.trace`` is the TRACING function (foundational API) — the
-    matrix-trace op is fetched from ``etl.ops`` instead.
+    ``evoxc.trace`` is the TRACING function (foundational API) — the
+    matrix-trace op is fetched from ``evoxc.ops`` instead.
     """
     if op_name == "trace":
-        return etl.ops.trace
-    return getattr(etl, op_name)
+        return evoxc.ops.trace
+    return getattr(evoxc, op_name)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +253,8 @@ def _op_ref(op_name):
 
 def test_op_table_covers_all_public_ops():
     """The table must exercise exactly the 102 public op names."""
-    assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 102
+    assert set(OP_CALLS) == set(evoxc.ops.__all__)
+    assert len(evoxc.ops.__all__) == 102
 
 
 # ---------------------------------------------------------------------------
@@ -264,24 +264,24 @@ def test_op_table_covers_all_public_ops():
 @pytest.mark.parametrize("op_name", sorted(OP_CALLS))
 def test_op_outside_trace_raises_directing_trace_error(op_name):
     args_builder, kwargs = OP_CALLS[op_name]
-    with pytest.raises(etl.TraceError) as exc:
+    with pytest.raises(evoxc.TraceError) as exc:
         _op_ref(op_name)(*args_builder(_STANDINS), **kwargs)
     message = str(exc.value)
     assert message.startswith(
         "No active trace: tensor ops can only be called while tracing"
     )
-    assert "etl.trace" in message
-    assert "etl.evaluate" in message
+    assert "evoxc.trace" in message
+    assert "evoxc.evaluate" in message
 
 
 def test_no_trace_message_mentions_defn():
-    """Binding contract (etl/ops/CONTEXT.md, "Unified semantics" #2): the
-    no-active-trace message must mention ``etl.trace`` / ``@etl.defn`` /
-    ``etl.evaluate``.
+    """Binding contract (evoxc/ops/CONTEXT.md, "Unified semantics" #2): the
+    no-active-trace message must mention ``evoxc.trace`` / ``@evoxc.defn`` /
+    ``evoxc.evaluate``.
     """
-    with pytest.raises(etl.TraceError) as exc:
-        etl.add(1.0, 1.0)
-    assert "@etl.defn" in str(exc.value)
+    with pytest.raises(evoxc.TraceError) as exc:
+        evoxc.add(1.0, 1.0)
+    assert "@evoxc.defn" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -300,17 +300,17 @@ _TENSOR_OPERAND_SKIP = {"constant", "eye", "linspace"}
 @pytest.mark.parametrize("op_name", sorted(set(OP_CALLS) - _TENSOR_OPERAND_SKIP))
 def test_op_inside_trace_rejects_concrete_tensor_operand(op_name):
     args_builder, kwargs = OP_CALLS[op_name]
-    with pytest.raises(etl.TraceError) as exc:
+    with pytest.raises(evoxc.TraceError) as exc:
         _trace_call(op_name, _tensor_variant(op_name, args_builder), kwargs)
     message = str(exc.value)
     assert message.startswith(
         "Concrete Tensor operands are not allowed in graph ops "
-        "(etl has no eager mode)"
+        "(evoxc has no eager mode)"
     )
     # The mandated three options all appear.
     assert "explicit input" in message
-    assert "etl.constant" in message
-    assert "etl.evaluate" in message
+    assert "evoxc.constant" in message
+    assert "evoxc.evaluate" in message
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +324,9 @@ def test_logical_ops_require_bool_dtype(op_name):
         return op(x) if op_name == "logical_not" else op(x, x)
 
     with pytest.raises(
-        etl.DTypeError, match=rf"{op_name}: operands must have bool dtype"
+        evoxc.DTypeError, match=rf"{op_name}: operands must have bool dtype"
     ):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 @pytest.mark.parametrize("op_name", ["bitwise_and", "bitwise_or", "bitwise_xor"])
@@ -335,38 +335,38 @@ def test_bitwise_ops_reject_float_dtype(op_name):
         return _op_ref(op_name)(x, x)
 
     with pytest.raises(
-        etl.DTypeError,
+        evoxc.DTypeError,
         match=rf"{op_name}: operands must have integer or bool dtype",
     ):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 def test_gather_rejects_float_indices():
     def fn(x, indices):
-        return etl.gather(x, indices)
+        return evoxc.gather(x, indices)
 
     with pytest.raises(
-        etl.DTypeError,
+        evoxc.DTypeError,
         match=r"gather: indices must be an integer dtype \(int32/int64\), got float32",
     ):
-        etl.trace(
+        evoxc.trace(
             fn,
-            etl.TensorSpec((4,), etl.float32),
-            etl.TensorSpec((2,), etl.float32),
+            evoxc.TensorSpec((4,), evoxc.float32),
+            evoxc.TensorSpec((2,), evoxc.float32),
         )
 
 
 def test_static_broadcast_mismatch_raises_shape_error():
     def fn(a, b):
-        return etl.add(a, b)
+        return evoxc.add(a, b)
 
     with pytest.raises(
-        etl.ShapeError, match=r"cannot broadcast incompatible dims 2 and 4"
+        evoxc.ShapeError, match=r"cannot broadcast incompatible dims 2 and 4"
     ):
-        etl.trace(
+        evoxc.trace(
             fn,
-            etl.TensorSpec((2, 3), etl.float32),
-            etl.TensorSpec((4, 5), etl.float32),
+            evoxc.TensorSpec((2, 3), evoxc.float32),
+            evoxc.TensorSpec((4, 5), evoxc.float32),
         )
 
 
@@ -379,9 +379,9 @@ def test_op_locations_are_captured_for_plain_fn_trace():
     (inspect stack frames), so a graph location EXISTS for the error contract
     below."""
     def fn(a):
-        return etl.add(a, a)
+        return evoxc.add(a, a)
 
-    graph = etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+    graph = evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
     (op,) = ops_of(graph, "add")
     assert op.location.file == __file__
     assert op.location.line > 0
@@ -389,22 +389,22 @@ def test_op_locations_are_captured_for_plain_fn_trace():
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["plain-fn", "defn"])
 def test_shape_error_message_includes_call_site_location(wrapped):
-    """Contract (etl/core/errors.py + root CONTEXT.md): error messages
+    """Contract (evoxc/core/errors.py + root CONTEXT.md): error messages
     include the call-site location whenever a graph location exists. The
     location IS captured here (see the control test above) — for both a plain
-    fn and an ``@etl.defn``-wrapped one.
+    fn and an ``@evoxc.defn``-wrapped one.
     """
     def fn(a, b):
-        return etl.add(a, b)
+        return evoxc.add(a, b)
 
-    traced = etl.defn(fn) if wrapped else fn
+    traced = evoxc.defn(fn) if wrapped else fn
     with pytest.raises(
-        etl.ShapeError, match=r"cannot broadcast incompatible dims 2 and 4"
+        evoxc.ShapeError, match=r"cannot broadcast incompatible dims 2 and 4"
     ) as exc:
-        etl.trace(
+        evoxc.trace(
             traced,
-            etl.TensorSpec((2, 3), etl.float32),
-            etl.TensorSpec((4, 5), etl.float32),
+            evoxc.TensorSpec((2, 3), evoxc.float32),
+            evoxc.TensorSpec((4, 5), evoxc.float32),
         )
     assert f"{os.path.basename(__file__)}:" in str(exc.value)
 
@@ -428,9 +428,9 @@ def test_binary_op_with_two_python_scalars_raises_trace_error(op_name):
         return _op_ref(op_name)(1, 2)
 
     with pytest.raises(
-        etl.TraceError, match="at least one operand must be a SymbolicTensor"
+        evoxc.TraceError, match="at least one operand must be a SymbolicTensor"
     ):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 @pytest.mark.parametrize("op_name", ["dot", "conv", "solve"])
@@ -438,8 +438,8 @@ def test_linalg_binary_op_with_two_python_scalars_raises(op_name):
     def fn(x):
         return _op_ref(op_name)(1.0, 2.0)
 
-    with pytest.raises(etl.TraceError, match="both operands are Python scalars"):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="both operands are Python scalars"):
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 @pytest.mark.parametrize(
@@ -455,15 +455,15 @@ def test_linalg_binary_op_with_two_python_scalars_raises(op_name):
 )
 def test_unsupported_operand_kind_raises_type_error(bad, kind):
     def fn(x):
-        return etl.add(x, bad)
+        return evoxc.add(x, bad)
 
     with pytest.raises(TypeError, match=rf"unsupported operand type {kind}"):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 def test_unary_op_with_ndarray_raises_type_error():
     def fn(x):
-        return etl.exp(np.array([1.0, 2.0]))
+        return evoxc.exp(np.array([1.0, 2.0]))
 
     with pytest.raises(TypeError, match="unsupported operand type ndarray"):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))

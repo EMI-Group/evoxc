@@ -1,7 +1,7 @@
-"""Backend impl registration + execution for `etl.block` custom ops.
+"""Backend impl registration + execution for `evoxc.block` custom ops.
 
 Covers the finalized v1 numpy impl call convention
-(`etl/backends/numpy/kernels/custom.py`)::
+(`evoxc/backends/numpy/kernels/custom.py`)::
 
     impl(*numpy_arrays, **static_args) -> ndarray | tuple/list of ndarrays
 
@@ -20,8 +20,8 @@ process-wide — a name can only ever be declared once per process.
 import numpy as np
 import pytest
 
-import etl
-from etl.block import block
+import evoxc
+from evoxc.block import block
 
 # ---------------------------------------------------------------------------
 # Declarations (declaration IS registration — module level, unique names)
@@ -29,8 +29,8 @@ from etl.block import block
 
 impl_double = block(
     "impl_double",
-    inputs=[etl.TensorSpec((4,), etl.float32)],
-    outputs=[etl.TensorSpec((4,), etl.float32)],
+    inputs=[evoxc.TensorSpec((4,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4,), evoxc.float32)],
 )
 
 
@@ -41,16 +41,16 @@ def double_impl(x):
 
 
 def test_basic_impl_execution():
-    @etl.defn
+    @evoxc.defn
     def f(x):
         return impl_double(x)
 
     x = np.arange(4, dtype=np.float32)
-    y = etl.evaluate(f, x)
+    y = evoxc.evaluate(f, x)
 
-    assert isinstance(y, etl.Tensor)
+    assert isinstance(y, evoxc.Tensor)
     assert y.shape == (4,)
-    assert y.dtype == etl.float32
+    assert y.dtype == evoxc.float32
     assert np.allclose(y.numpy(), x * 2.0)
 
 
@@ -65,8 +65,8 @@ def test_impl_registry_lookup():
 
 impl_scaled = block(
     "impl_scaled",
-    inputs=[etl.TensorSpec((4,), etl.float32)],
-    outputs=[etl.TensorSpec((4,), etl.float32)],
+    inputs=[evoxc.TensorSpec((4,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4,), evoxc.float32)],
     attributes={"scale": float},
 )
 
@@ -83,12 +83,12 @@ def scaled_impl(x, **kwargs):
 
 
 def test_static_attributes_flow_as_payload_kwargs():
-    @etl.defn
+    @evoxc.defn
     def f(x):
         return impl_scaled(x, 2.5)
 
     x = np.arange(4, dtype=np.float32)
-    y = etl.evaluate(f, x)
+    y = evoxc.evaluate(f, x)
 
     assert _scaled_kwargs["seen"] == {"scale": {"kind": "float", "value": 2.5}}
     assert np.allclose(y.numpy(), x * 2.5)
@@ -100,8 +100,8 @@ def test_static_attributes_flow_as_payload_kwargs():
 
 impl_multi_list = block(
     "impl_multi_list",
-    inputs=[etl.TensorSpec((4,), etl.float32)],
-    outputs=[etl.TensorSpec((4,), etl.float32), etl.TensorSpec((4,), etl.float32)],
+    inputs=[evoxc.TensorSpec((4,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4,), evoxc.float32), evoxc.TensorSpec((4,), evoxc.float32)],
 )
 
 
@@ -112,8 +112,8 @@ def multi_list_impl(x):
 
 impl_multi_tuple = block(
     "impl_multi_tuple",
-    inputs=[etl.TensorSpec((4,), etl.float32)],
-    outputs=[etl.TensorSpec((4,), etl.float32), etl.TensorSpec((4,), etl.float32)],
+    inputs=[evoxc.TensorSpec((4,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4,), evoxc.float32), evoxc.TensorSpec((4,), evoxc.float32)],
 )
 
 
@@ -126,16 +126,16 @@ def multi_tuple_impl(x):
     "blk", [impl_multi_list, impl_multi_tuple], ids=["list", "tuple"]
 )
 def test_multi_output_impl(blk):
-    @etl.defn
+    @evoxc.defn
     def f(x):
         return blk(x)
 
     x = np.arange(4, dtype=np.float32)
-    y = etl.evaluate(f, x)
+    y = evoxc.evaluate(f, x)
 
     assert isinstance(y, tuple)
     assert len(y) == 2
-    assert all(isinstance(out, etl.Tensor) for out in y)
+    assert all(isinstance(out, evoxc.Tensor) for out in y)
     assert np.allclose(y[0].numpy(), x * 2.0)
     assert np.allclose(y[1].numpy(), x + 1.0)
 
@@ -146,23 +146,23 @@ def test_multi_output_impl(blk):
 
 impl_none = block(
     "impl_none",
-    inputs=[etl.TensorSpec((4,), etl.float32)],
-    outputs=[etl.TensorSpec((4,), etl.float32)],
+    inputs=[evoxc.TensorSpec((4,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4,), evoxc.float32)],
 )  # deliberately NO portable and NO numpy impl
 
 
 def test_missing_impl_fails_at_lower_not_trace():
-    @etl.defn
+    @evoxc.defn
     def f(x):
         return impl_none(x)
 
-    graph = etl.trace(f, etl.TensorSpec((4,), etl.float32))  # tracing succeeds
+    graph = evoxc.trace(f, evoxc.TensorSpec((4,), evoxc.float32))  # tracing succeeds
 
     with pytest.raises(
-        etl.BackendError,
+        evoxc.BackendError,
         match="impl_none.*has neither a portable decomposition nor a registered numpy impl",
     ):
-        etl.lower(graph)
+        evoxc.lower(graph)
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +173,8 @@ _call_counter = {"n": 0}
 
 impl_counted = block(
     "impl_counted",
-    inputs=[etl.TensorSpec((4,), etl.float32)],
-    outputs=[etl.TensorSpec((4,), etl.float32)],
+    inputs=[evoxc.TensorSpec((4,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4,), evoxc.float32)],
 )
 
 
@@ -185,19 +185,19 @@ def counted_impl(x):
 
 
 def test_impl_not_called_at_trace_time_only_at_run_time():
-    @etl.defn
+    @evoxc.defn
     def f(x):
         return impl_counted(x)
 
     x = np.arange(4, dtype=np.float32)
 
     _call_counter["n"] = 0
-    graph = etl.trace(f, etl.TensorSpec((4,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((4,), evoxc.float32))
     assert _call_counter["n"] == 0  # tracing never executes the impl
 
-    etl.lower(graph)
+    evoxc.lower(graph)
     assert _call_counter["n"] == 0  # lowering keeps the op (impl registered)
 
-    y = etl.evaluate(f, x)
+    y = evoxc.evaluate(f, x)
     assert _call_counter["n"] == 1  # exactly once, at run time
     assert np.allclose(y.numpy(), x + 1.0)

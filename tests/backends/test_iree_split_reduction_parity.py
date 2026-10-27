@@ -1,14 +1,14 @@
 """``split_reduction`` exporter option — iree/llvm-cpu numeric parity.
 
 The StableHLO exporter's ``split_reduction`` option (default ``True``, see
-``etl/backends/stablehlo/split_reduce.py``) rewrites a reduction whose RESULT
+``evoxc/backends/stablehlo/split_reduce.py``) rewrites a reduction whose RESULT
 is rank-0 (or otherwise tiny) and whose reduced extent is large and STATIC
 into a two-stage emission: pad to ``R * C``, reshape ``N -> (R, C)``, reduce
 the inner axis (``R`` partials — a rank >= 1 intermediate the compiler can
 parallelize) and then reduce the tiny partial vector. This file pins that the
 rewrite is **numerically transparent** on iree/llvm-cpu: every graph is
 compiled through the real adapter and compared against the numpy reference
-backend (``etl.evaluate``), which is the ground truth for etl semantics.
+backend (``evoxc.evaluate``), which is the ground truth for evoxc semantics.
 
 Exactness classes (see ``split_reduce.py``) and how they are asserted here:
 
@@ -69,15 +69,15 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl  # noqa: E402  (must come AFTER the importorskip gates)
-from etl.backends import stablehlo  # noqa: E402
-from etl.backends.program import LoweredProgram  # noqa: E402
+import evoxc  # noqa: E402  (must come AFTER the importorskip gates)
+from evoxc.backends import stablehlo  # noqa: E402
+from evoxc.backends.program import LoweredProgram  # noqa: E402
 from tests.backends import _adapter_utils as u  # noqa: E402
 
 #: The one-line MLIR comment the split emission puts before its stage-1 reduce
 #: (``split_reduce.split_comment``) — its presence is how these tests prove a
 #: given reduction was actually split (the marker text names the geometry).
-SPLIT_MARKER = "etl split reduction"
+SPLIT_MARKER = "evoxc split reduction"
 
 #: Documented tolerance for the NON-EXACT (float) class: the error of a
 #: reassociated float accumulation, measured RELATIVE TO THE INPUT MAGNITUDE
@@ -124,7 +124,7 @@ _DTYPE_SHAPES = (
 def _graph(axes):
     """One graph computing ALL seven reductions over the same input.
 
-    ``axes=None`` reduces every axis (``etl.argmin``/``argmax`` take the
+    ``axes=None`` reduces every axis (``evoxc.argmin``/``argmax`` take the
     singular ``axis`` kwarg, the others a tuple ``axes``).
     """
 
@@ -132,13 +132,13 @@ def _graph(axes):
         kw_r = {} if axes is None else {"axes": axes}
         kw_a = {} if axes is None else {"axis": axes[0]}
         return (
-            etl.min(x, **kw_r),
-            etl.max(x, **kw_r),
-            etl.argmin(x, **kw_a),
-            etl.argmax(x, **kw_a),
-            etl.sum(x, **kw_r),
-            etl.prod(x, **kw_r),
-            etl.mean(x, **kw_r),
+            evoxc.min(x, **kw_r),
+            evoxc.max(x, **kw_r),
+            evoxc.argmin(x, **kw_a),
+            evoxc.argmax(x, **kw_a),
+            evoxc.sum(x, **kw_r),
+            evoxc.prod(x, **kw_r),
+            evoxc.mean(x, **kw_r),
         )
 
     return fn
@@ -158,13 +158,13 @@ def _single_op_graph(op, axes):
 
 
 _OP_CALLS = {
-    "min": lambda x, kw: etl.min(x, **kw),
-    "max": lambda x, kw: etl.max(x, **kw),
-    "argmin": lambda x, kw: etl.argmin(x, **kw),
-    "argmax": lambda x, kw: etl.argmax(x, **kw),
-    "sum": lambda x, kw: etl.sum(x, **kw),
-    "prod": lambda x, kw: etl.prod(x, **kw),
-    "mean": lambda x, kw: etl.mean(x, **kw),
+    "min": lambda x, kw: evoxc.min(x, **kw),
+    "max": lambda x, kw: evoxc.max(x, **kw),
+    "argmin": lambda x, kw: evoxc.argmin(x, **kw),
+    "argmax": lambda x, kw: evoxc.argmax(x, **kw),
+    "sum": lambda x, kw: evoxc.sum(x, **kw),
+    "prod": lambda x, kw: evoxc.prod(x, **kw),
+    "mean": lambda x, kw: evoxc.mean(x, **kw),
 }
 
 
@@ -191,10 +191,10 @@ def _build(fn, spec, *, split=None, exporter_options=None):
     if split is None:
         _, lowered, artifact = u.stage("iree", fn, (spec,))
     else:
-        graph = etl.trace(fn, spec)
-        lowered = etl.lower(graph, backend="iree", split_reduction=split)
-        artifact = etl.compile(lowered)
-    return etl.load(artifact), lowered.text()
+        graph = evoxc.trace(fn, spec)
+        lowered = evoxc.lower(graph, backend="iree", split_reduction=split)
+        artifact = evoxc.compile(lowered)
+    return evoxc.load(artifact), lowered.text()
 
 
 def _compile_with_exporter_options(fn, spec, exporter_options):
@@ -203,20 +203,20 @@ def _compile_with_exporter_options(fn, spec, exporter_options):
     ``split_reduction_non_exact`` and ``split_reduction_threshold`` are
     exporter-only keys today: ``CompilerBackend._exporter_options`` forwards
     only ``split_reduction`` (and the adapters' ``KNOWN_OPTIONS["lower"]``
-    lists only that one), so ``etl.build(..., split_reduction_non_exact=True)``
+    lists only that one), so ``evoxc.build(..., split_reduction_non_exact=True)``
     raises the adapter's unrecognized-lower-option ``BackendError``. This
     helper produces the exact MLIR the option emits and swaps it into the
     lowered payload (the compile/load/run stages stay the product's).
     """
-    graph = etl.trace(fn, spec)
-    base = etl.lower(graph, backend="iree")  # for the recorded Signature
+    graph = evoxc.trace(fn, spec)
+    base = evoxc.lower(graph, backend="iree")  # for the recorded Signature
     mlir = stablehlo.export(graph, options=dict(exporter_options))
     lowered = LoweredProgram(
         backend=base.backend,
         signature=base.signature,
         payload={**base.payload, "mlir_text": mlir},
     )
-    return etl.load(etl.compile(lowered)), mlir
+    return evoxc.load(evoxc.compile(lowered)), mlir
 
 
 def _executable(shape, axes, dtype, *, split=None, exporter_options=None):
@@ -231,7 +231,7 @@ def _executable(shape, axes, dtype, *, split=None, exporter_options=None):
     if key not in _COMPILED:
         _COMPILED[key] = _build(
             _graph(axes),
-            etl.TensorSpec(shape, dtype),
+            evoxc.TensorSpec(shape, dtype),
             split=split,
             exporter_options=exporter_options,
         )
@@ -341,8 +341,8 @@ def _magnitude(op, expected, x, axes):
     return np.abs(expected)
 
 
-def etl_np(value):
-    """Unwrap an etl ``Tensor`` (run outputs are ``Tensor``s, not ndarrays)."""
+def evoxc_np(value):
+    """Unwrap an evoxc ``Tensor`` (run outputs are ``Tensor``s, not ndarrays)."""
     return np.asarray(value.numpy()) if hasattr(value, "numpy") else np.asarray(value)
 
 
@@ -415,8 +415,8 @@ def _run_case(shape, axes, dtype, pattern, *, split=None, exporter_options=None)
     # point flags (inf - inf in a sum, nan comparisons) on BOTH sides — those
     # are the behaviour under test, not a problem to report.
     with np.errstate(invalid="ignore"):
-        expected = etl.evaluate(fn, x)  # numpy reference backend
-        got = etl.run(executable, x)
+        expected = evoxc.evaluate(fn, x)  # numpy reference backend
+        got = evoxc.run(executable, x)
         expected = expected if isinstance(expected, tuple) else (expected,)
         got = got if isinstance(got, tuple) else (got,)
         assert len(got) == len(OPS)
@@ -489,7 +489,7 @@ _GEOMETRY_CASES = (
 )
 def test_exact_class_splits_with_expected_geometry(shape, axes, dtype, op, geometry):
     """The exact class splits BY DEFAULT, with the expected ``R x C`` text."""
-    graph = etl.trace(_single_op_graph(op, axes), etl.TensorSpec(shape, dtype))
+    graph = evoxc.trace(_single_op_graph(op, axes), evoxc.TensorSpec(shape, dtype))
     mlir = stablehlo.export(graph, options={})
     lines = [line for line in mlir.splitlines() if SPLIT_MARKER in line]
     assert len(lines) == 1, f"expected exactly one split marker, got {lines}"
@@ -513,7 +513,7 @@ def test_exact_class_splits_with_expected_geometry(shape, axes, dtype, op, geome
 )
 def test_not_split_outside_the_gates(shape, axes, dtype, op):
     """Below the extent threshold / large result / float sum-prod-mean: one stage."""
-    graph = etl.trace(_single_op_graph(op, axes), etl.TensorSpec(shape, dtype))
+    graph = evoxc.trace(_single_op_graph(op, axes), evoxc.TensorSpec(shape, dtype))
     mlir = stablehlo.export(graph, options={})
     assert SPLIT_MARKER not in mlir
     assert mlir.count('"stablehlo.reduce"') == 1
@@ -522,8 +522,8 @@ def test_not_split_outside_the_gates(shape, axes, dtype, op):
 @pytest.mark.parametrize("op", ("sum", "prod", "mean"))
 def test_float_accumulation_splits_only_with_split_reduction_non_exact(op):
     """Opt-in ``split_reduction_non_exact`` splits float sum/prod (hence mean)."""
-    graph = etl.trace(
-        _single_op_graph(op, None), etl.TensorSpec((10001,), np.float32)
+    graph = evoxc.trace(
+        _single_op_graph(op, None), evoxc.TensorSpec((10001,), np.float32)
     )
     mlir = stablehlo.export(
         graph, options={"split_reduction": True, "split_reduction_non_exact": True}
@@ -546,7 +546,7 @@ def test_float_accumulation_splits_only_with_split_reduction_non_exact(op):
 )
 def test_split_reduction_false_emits_the_single_stage_text(shape, axes, dtype, op):
     """The option is a switch: ``False`` keeps the single-stage emission."""
-    graph = etl.trace(_single_op_graph(op, axes), etl.TensorSpec(shape, dtype))
+    graph = evoxc.trace(_single_op_graph(op, axes), evoxc.TensorSpec(shape, dtype))
     mlir = stablehlo.export(graph, options={"split_reduction": False})
     assert SPLIT_MARKER not in mlir
     assert mlir.count('"stablehlo.reduce"') == 1
@@ -656,8 +656,8 @@ def test_arg_ties_resolve_to_first_occurrence_across_split_stages():
     x[7000] = x[7001] = 1.0  # tie for the minimum, same stage-1 row
     x[9000] = 1.0            # tie for the minimum, later stage-1 row
     x[2000] = x[8000] = 9.0  # tie for the maximum, different rows
-    got = etl.run(executable, x)
-    expected = etl.evaluate(_graph(axes), x)
+    got = evoxc.run(executable, x)
+    expected = evoxc.evaluate(_graph(axes), x)
     assert int(got[2].numpy()) == 7000 == int(np.argmin(x))
     assert int(got[3].numpy()) == 2000 == int(np.argmax(x))
     assert int(expected[2].numpy()) == 7000
@@ -672,14 +672,14 @@ def test_arg_ties_resolve_to_first_occurrence_per_column():
     x = np.full(shape, 0.5, dtype=dtype)
     x[4000, :] = x[7500, :] = -1.0  # global min in rows 4000 and 7500
     x[3000, :] = x[9000, :] = 2.0   # global max in rows 3000 and 9000
-    got = etl.run(executable, x)
-    expected = etl.evaluate(_graph(axes), x)
-    np.testing.assert_array_equal(etl_np(got[2]), np.full(100, 4000, dtype=np.int64))
-    np.testing.assert_array_equal(etl_np(got[3]), np.full(100, 3000, dtype=np.int64))
-    np.testing.assert_array_equal(etl_np(got[2]), np.argmin(x, axis=0))
-    np.testing.assert_array_equal(etl_np(got[3]), np.argmax(x, axis=0))
-    np.testing.assert_array_equal(etl_np(expected[2]), np.argmin(x, axis=0))
-    np.testing.assert_array_equal(etl_np(expected[3]), np.argmax(x, axis=0))
+    got = evoxc.run(executable, x)
+    expected = evoxc.evaluate(_graph(axes), x)
+    np.testing.assert_array_equal(evoxc_np(got[2]), np.full(100, 4000, dtype=np.int64))
+    np.testing.assert_array_equal(evoxc_np(got[3]), np.full(100, 3000, dtype=np.int64))
+    np.testing.assert_array_equal(evoxc_np(got[2]), np.argmin(x, axis=0))
+    np.testing.assert_array_equal(evoxc_np(got[3]), np.argmax(x, axis=0))
+    np.testing.assert_array_equal(evoxc_np(expected[2]), np.argmin(x, axis=0))
+    np.testing.assert_array_equal(evoxc_np(expected[3]), np.argmax(x, axis=0))
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +708,7 @@ def test_arg_ties_resolve_to_first_occurrence_per_column():
 def test_bool_sum_matches_numpy_popcount():
     """bool ``sum``/``mean`` promote to the accumulator dtype (i64 / f64).
 
-    ``etl.sum`` over bool is declared ``int64`` and ``etl.mean`` ``float64``
+    ``evoxc.sum`` over bool is declared ``int64`` and ``evoxc.mean`` ``float64``
     (numpy's accumulators). The emitter promotes the operand to the
     accumulator dtype BEFORE reducing, so the reduction is a popcount over
     every True element — never a bitwise OR in ``i1`` — and ``mean`` (the
@@ -716,67 +716,67 @@ def test_bool_sum_matches_numpy_popcount():
 
     Expected values for 7 True out of 2000::
 
-        import numpy as np, etl
-        f = lambda x: etl.sum(x)
-        spec = etl.TensorSpec((2000,), np.bool_)
+        import numpy as np, evoxc
+        f = lambda x: evoxc.sum(x)
+        spec = evoxc.TensorSpec((2000,), np.bool_)
         x = np.zeros(2000, np.bool_); x[:7] = True
-        etl.run(etl.build(f, spec, backend="iree"), x).numpy()   # -> 7
-        etl.evaluate(f, x).numpy()                                # -> 7
+        evoxc.run(evoxc.build(f, spec, backend="iree"), x).numpy()   # -> 7
+        evoxc.evaluate(f, x).numpy()                                # -> 7
     """
     shape, dtype = (2000,), np.bool_
 
     def fn(x):
-        return etl.sum(x), etl.mean(x)
+        return evoxc.sum(x), evoxc.mean(x)
 
     x = np.zeros(shape, dtype=dtype)
     x[:7] = True
-    spec = etl.TensorSpec(shape, dtype)
-    split_on = etl.run(etl.build(fn, spec, backend="iree"), x)
-    split_off = etl.run(
-        etl.build(fn, spec, backend="iree", split_reduction=False), x
+    spec = evoxc.TensorSpec(shape, dtype)
+    split_on = evoxc.run(evoxc.build(fn, spec, backend="iree"), x)
+    split_off = evoxc.run(
+        evoxc.build(fn, spec, backend="iree", split_reduction=False), x
     )
-    expected = etl.evaluate(fn, x)
+    expected = evoxc.evaluate(fn, x)
     # Both emission paths agree: the promotion is a reduce-emitter property.
-    np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(split_off[0]))
-    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(split_off[1]))
-    np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(expected[0]))
-    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(expected[1]))
-    np.testing.assert_array_equal(etl_np(split_on[0]), np.asarray(7, np.int64))
+    np.testing.assert_array_equal(evoxc_np(split_on[0]), evoxc_np(split_off[0]))
+    np.testing.assert_array_equal(evoxc_np(split_on[1]), evoxc_np(split_off[1]))
+    np.testing.assert_array_equal(evoxc_np(split_on[0]), evoxc_np(expected[0]))
+    np.testing.assert_array_equal(evoxc_np(split_on[1]), evoxc_np(expected[1]))
+    np.testing.assert_array_equal(evoxc_np(split_on[0]), np.asarray(7, np.int64))
 
 
 def test_integer_reductions_accumulate_in_i64():
     """int ``sum``/``prod`` promote to i64 before reducing — no 32-bit wrap.
 
-    ``etl.prod``/``etl.sum`` over int32 are declared ``int64`` (numpy
+    ``evoxc.prod``/``evoxc.sum`` over int32 are declared ``int64`` (numpy
     accumulates in int64), and the emitter promotes the operand to i64 BEFORE
     reducing, so a product whose value exceeds the int32 range comes out
     exact.
 
     Expected values for ``arange(1, 14, int32)``::
 
-        import numpy as np, etl
-        f = lambda x: etl.prod(x)
-        spec = etl.TensorSpec((13,), np.int32)
+        import numpy as np, evoxc
+        f = lambda x: evoxc.prod(x)
+        spec = evoxc.TensorSpec((13,), np.int32)
         x = np.arange(1, 14, dtype=np.int32)                    # 13! = 6227020800
-        etl.run(etl.build(f, spec, backend="iree"), x).numpy()  # -> 6227020800
-        etl.evaluate(f, x).numpy()                              # -> 6227020800
+        evoxc.run(evoxc.build(f, spec, backend="iree"), x).numpy()  # -> 6227020800
+        evoxc.evaluate(f, x).numpy()                              # -> 6227020800
     """
     shape, dtype = (13,), np.int32
 
     def fn(x):
-        return etl.sum(x), etl.prod(x)
+        return evoxc.sum(x), evoxc.prod(x)
 
     x = np.arange(1, 14, dtype=dtype)  # prod 13! = 6227020800 > int32 max
-    spec = etl.TensorSpec(shape, dtype)
-    split_on = etl.run(etl.build(fn, spec, backend="iree"), x)
-    split_off = etl.run(
-        etl.build(fn, spec, backend="iree", split_reduction=False), x
+    spec = evoxc.TensorSpec(shape, dtype)
+    split_on = evoxc.run(evoxc.build(fn, spec, backend="iree"), x)
+    split_off = evoxc.run(
+        evoxc.build(fn, spec, backend="iree", split_reduction=False), x
     )
-    expected = etl.evaluate(fn, x)
-    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(split_off[1]))
+    expected = evoxc.evaluate(fn, x)
+    np.testing.assert_array_equal(evoxc_np(split_on[1]), evoxc_np(split_off[1]))
     # numpy accumulates in int64: 13! = 6227020800, and so does the compiler.
-    np.testing.assert_array_equal(etl_np(expected[1]), np.asarray(6227020800, np.int64))
-    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(expected[1]))
+    np.testing.assert_array_equal(evoxc_np(expected[1]), np.asarray(6227020800, np.int64))
+    np.testing.assert_array_equal(evoxc_np(split_on[1]), evoxc_np(expected[1]))
 
 
 def test_arg_reduce_nan_semantics_match_numpy():
@@ -792,29 +792,29 @@ def test_arg_reduce_nan_semantics_match_numpy():
 
     Expected values for a NaN at flat index 5::
 
-        import numpy as np, etl
-        f = lambda x: etl.argmin(x)
-        spec = etl.TensorSpec((10001,), np.float32)
+        import numpy as np, evoxc
+        f = lambda x: evoxc.argmin(x)
+        spec = evoxc.TensorSpec((10001,), np.float32)
         x = np.random.default_rng(0).standard_normal(10001).astype(np.float32)
         x[5] = np.nan
-        etl.run(etl.build(f, spec, backend="iree"), x).numpy()  # -> 5
-        etl.evaluate(f, x).numpy()                              # -> 5
+        evoxc.run(evoxc.build(f, spec, backend="iree"), x).numpy()  # -> 5
+        evoxc.evaluate(f, x).numpy()                              # -> 5
     """
     shape, dtype = (10001,), np.float32
 
     def fn(x):
-        return etl.argmin(x), etl.argmax(x)
+        return evoxc.argmin(x), evoxc.argmax(x)
 
     x = np.random.default_rng(0).standard_normal(shape).astype(dtype)
     x[5] = np.nan
-    spec = etl.TensorSpec(shape, dtype)
-    split_on = etl.run(etl.build(fn, spec, backend="iree"), x)
-    split_off = etl.run(
-        etl.build(fn, spec, backend="iree", split_reduction=False), x
+    spec = evoxc.TensorSpec(shape, dtype)
+    split_on = evoxc.run(evoxc.build(fn, spec, backend="iree"), x)
+    split_off = evoxc.run(
+        evoxc.build(fn, spec, backend="iree", split_reduction=False), x
     )
-    expected = etl.evaluate(fn, x)
-    np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(split_off[0]))
-    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(split_off[1]))
-    np.testing.assert_array_equal(etl_np(expected[0]), np.asarray(5, np.int64))
-    np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(expected[0]))
-    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(expected[1]))
+    expected = evoxc.evaluate(fn, x)
+    np.testing.assert_array_equal(evoxc_np(split_on[0]), evoxc_np(split_off[0]))
+    np.testing.assert_array_equal(evoxc_np(split_on[1]), evoxc_np(split_off[1]))
+    np.testing.assert_array_equal(evoxc_np(expected[0]), np.asarray(5, np.int64))
+    np.testing.assert_array_equal(evoxc_np(split_on[0]), evoxc_np(expected[0]))
+    np.testing.assert_array_equal(evoxc_np(split_on[1]), evoxc_np(expected[1]))

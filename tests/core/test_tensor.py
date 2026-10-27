@@ -1,10 +1,10 @@
-"""Tests for etl concrete ``Tensor``, the concrete creators, and DLPack interop.
+"""Tests for evoxc concrete ``Tensor``, the concrete creators, and DLPack interop.
 
-Mirrors ``etl/core/tensor.py``. Contract points under test:
+Mirrors ``evoxc/core/tensor.py``. Contract points under test:
 
 - ``Tensor`` wraps an ndarray *by reference*: ``.numpy()`` and ``.data`` are
   the same array (zero-copy; mutations are visible both ways).
-- Creators follow etl's default-dtype rule: ``zeros``/``ones``/``empty``
+- Creators follow evoxc's default-dtype rule: ``zeros``/``ones``/``empty``
   default to float32 (the library's documented default dtype — deliberate
   deviation from numpy's float64, matching ``TensorSpec``); ``full`` and
   ``tensor`` infer from the data/fill_value with an inferred float64 coerced
@@ -25,7 +25,7 @@ Mirrors ``etl/core/tensor.py``. Contract points under test:
 - DLPack is zero-copy in both directions. Note (numpy >= 2.0): the
   documented ``np.from_dlpack`` input is an *object exposing* ``__dlpack__``
   (e.g. the tensor itself), not a raw PyCapsule — a capsule has no
-  ``__dlpack__`` method. etl's ``from_dlpack`` follows the same contract
+  ``__dlpack__`` method. evoxc's ``from_dlpack`` follows the same contract
   (accepts any ``__dlpack__``-exposing object; rejects raw capsules with
   ``DeviceError``).
 """
@@ -33,7 +33,7 @@ Mirrors ``etl/core/tensor.py``. Contract points under test:
 import numpy as np
 import pytest
 
-from etl.core import (
+from evoxc.core import (
     Device,
     DeviceError,
     Tensor,
@@ -46,7 +46,7 @@ from etl.core import (
     tensor,
     zeros,
 )
-from etl.core.tensor import _DEVICE_TRANSFER_PROVIDERS
+from evoxc.core.tensor import _DEVICE_TRANSFER_PROVIDERS
 
 CREATOR_SHAPES = [(), (3,), (2, 3), (4, 4)]
 
@@ -126,7 +126,7 @@ class TestCreators:
         t = zeros(shape)
         assert t.shape == shape
         assert t.device == Device("cpu", 0)
-        assert t.dtype == np.dtype("float32")  # etl default dtype (not numpy's float64)
+        assert t.dtype == np.dtype("float32")  # evoxc default dtype (not numpy's float64)
         assert np.all(t.data == 0)
 
     @pytest.mark.parametrize("shape", CREATOR_SHAPES)
@@ -134,7 +134,7 @@ class TestCreators:
         t = ones(shape)
         assert t.shape == shape
         assert t.device == Device("cpu", 0)
-        assert t.dtype == np.dtype("float32")  # etl default dtype (not numpy's float64)
+        assert t.dtype == np.dtype("float32")  # evoxc default dtype (not numpy's float64)
         assert np.all(t.data == 1)
 
     @pytest.mark.parametrize(
@@ -154,7 +154,7 @@ class TestCreators:
     )
     def test_full_default_dtype_inferred_from_fill(self, fill_value, expected_dtype):
         # Contract: defaults to the dtype numpy infers from ``fill_value``,
-        # except an inferred float64 becomes float32 (etl default dtype;
+        # except an inferred float64 becomes float32 (evoxc default dtype;
         # integer fills keep numpy's int64).
         t = full((2, 2), fill_value)
         assert t.dtype == expected_dtype
@@ -164,7 +164,7 @@ class TestCreators:
         t = empty(shape)
         assert t.shape == shape
         assert t.device == Device("cpu", 0)
-        assert t.dtype == np.dtype("float32")  # etl default dtype (not numpy's float64)
+        assert t.dtype == np.dtype("float32")  # evoxc default dtype (not numpy's float64)
         assert t.data.size == int(np.prod(shape, dtype=int))
         t.data.fill(9)  # a real, writable buffer (contents otherwise undefined)
         assert np.all(t.data == 9)
@@ -370,7 +370,7 @@ class TestDLPack:
 class _DummyDevicePayload:
     """Minimal duck-typed device payload (the ``core.Tensor`` payload protocol).
 
-    Mirrors the protocol contract (``etl/core/tensor.py``): ``.shape`` (tuple),
+    Mirrors the protocol contract (``evoxc/core/tensor.py``): ``.shape`` (tuple),
     ``.dtype`` (numpy-normalizable), optional ``.device`` (a ``core.Device``),
     and a ``to_host()`` host-copy path returning a FRESH ndarray per call.
     Counts ``to_host`` calls so tests can prove the lazy-copy semantics.
@@ -560,7 +560,7 @@ class TestTensorTo:
     """``Tensor.to(device)`` semantics (no GPU / no backend code).
 
     Device-transfer provider tests use unique made-up device kinds (never
-    "cuda" — etl.backends registers a lazy iree thunk there at import time,
+    "cuda" — evoxc.backends registers a lazy iree thunk there at import time,
     which would pull in the iree adapter on first call) and clean the
     process-global registry up in ``finally``.
     """

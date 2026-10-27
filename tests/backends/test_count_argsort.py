@@ -30,7 +30,7 @@ Pinned here:
 * the upstream-bug path: argsort axis 64 bit-exact on iree-cuda
   (GPU-guarded via an nvidia-smi free-device scan). Cuda runs use the
   explicit-device-placement semantics: the host input is uploaded via
-  ``Tensor.to`` BEFORE ``etl.run`` (a cuda executable rejects host inputs
+  ``Tensor.to`` BEFORE ``evoxc.run`` (a cuda executable rejects host inputs
   at the run boundary — no implicit device↔host transfer ever happens
   there), and the device-resident output is transferred back to host
   explicitly (``Tensor.numpy()`` on a cuda payload is a ``DeviceError``).
@@ -42,7 +42,7 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # graphs + data (fixed seed — same convention as test_iree_emitters_parity.py)
@@ -50,19 +50,19 @@ import etl
 
 
 def _argsort_axis1(x):
-    return etl.argsort(x, axis=1)
+    return evoxc.argsort(x, axis=1)
 
 
 def _argsort_axis1_desc(x):
-    return etl.argsort(x, axis=1, descending=True)
+    return evoxc.argsort(x, axis=1, descending=True)
 
 
 def _argsort_axis0(x):
-    return etl.argsort(x, axis=0)
+    return evoxc.argsort(x, axis=0)
 
 
 def _argsort_axis1_stable(x):
-    return etl.argsort(x, axis=1, stable=True)
+    return evoxc.argsort(x, axis=1, stable=True)
 
 
 _RNG = np.random.default_rng(7)
@@ -72,9 +72,9 @@ _XF = _RNG.standard_normal((8, 64)).astype(np.float32)
 # tie-heavy: 5 distinct int values over 64 slots.
 _XI = _RNG.integers(0, 5, size=(8, 64)).astype(np.int32)
 
-SPEC_F = etl.TensorSpec((8, 64), etl.float32)
-SPEC_I = etl.TensorSpec((8, 64), etl.int32)
-SPEC_I16 = etl.TensorSpec((8, 16), etl.int32)
+SPEC_F = evoxc.TensorSpec((8, 64), evoxc.float32)
+SPEC_I = evoxc.TensorSpec((8, 64), evoxc.int32)
+SPEC_I16 = evoxc.TensorSpec((8, 16), evoxc.int32)
 
 #: (id, fn, spec, arg, numpy-reference) — the reference is the STABLE numpy
 #: argsort (the count-mode contract); descending = flip of the stable
@@ -88,7 +88,7 @@ PARITY_CASES = [
      np.argsort(_XI, axis=1, kind="stable")),
     ("axis0_tie_heavy_int32", _argsort_axis0, SPEC_I, _XI,
      np.argsort(_XI, axis=0, kind="stable")),
-    # the etl-contract path: stable=True must match the numpy backend too.
+    # the evoxc-contract path: stable=True must match the numpy backend too.
     ("stable_flag_tie_heavy", _argsort_axis1_stable, SPEC_I, _XI,
      np.argsort(_XI, axis=1, kind="stable")),
 ]
@@ -100,23 +100,23 @@ PARITY_CASES = [
 
 def _np(v):
     """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays."""
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
 
 def _export_argsort(fn, spec, **options):
     """Trace + export an argsort graph with the given exporter options."""
-    from etl.backends.stablehlo import export
+    from evoxc.backends.stablehlo import export
 
-    return export(etl.trace(fn, spec), options=options)
+    return export(evoxc.trace(fn, spec), options=options)
 
 
 def _pick_cuda_device_index():
@@ -156,11 +156,11 @@ def cuda_device():
     import iree.runtime as rt
 
     try:
-        # etl Device("cuda", idx) maps to iree device_id idx + 1 (1-based ids).
+        # evoxc Device("cuda", idx) maps to iree device_id idx + 1 (1-based ids).
         rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001 — any driver/device failure skips
         pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
-    return etl.core.Device("cuda", idx)
+    return evoxc.core.Device("cuda", idx)
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ def test_auto_mode_picks_count_iff_extent_ge_32():
     assert "stablehlo.sort" in small, "auto must keep pair at axis extent 16"
     # the iree adapter defaults to "auto": a no-option lower of the axis-64
     # argsort carries the count composition (no sort op) in its payload.
-    lowered = etl.lower(etl.trace(_argsort_axis1, SPEC_I), backend="iree")
+    lowered = evoxc.lower(evoxc.trace(_argsort_axis1, SPEC_I), backend="iree")
     assert "stablehlo.sort" not in lowered.payload["mlir_text"]
 
 
@@ -199,8 +199,8 @@ def test_auto_mode_picks_count_iff_extent_ge_32():
     ids=[c[0] for c in PARITY_CASES],
 )
 def test_count_mode_parity_llvm_cpu(fn, spec, arg, ref):
-    exe = etl.build(fn, spec, backend="iree", sort_emission="count")
-    _assert_exact(etl.run(exe, arg), ref)
+    exe = evoxc.build(fn, spec, backend="iree", sort_emission="count")
+    _assert_exact(evoxc.run(exe, arg), ref)
 
 
 # ---------------------------------------------------------------------------
@@ -226,23 +226,23 @@ def test_cuda_argsort_axis64(fn, spec, arg, ref, cuda_device):
     bit-exact.
 
     Explicit device placement (run-boundary contract): the host input is
-    placed on the cuda device via ``Tensor.to`` BEFORE ``etl.run`` — a
+    placed on the cuda device via ``Tensor.to`` BEFORE ``evoxc.run`` — a
     cuda executable never stages host inputs, so raw numpy arrays (cpu:0
     tensors) are rejected at the run boundary. The output is a
     device-resident payload tensor: ``.numpy()`` raises ``DeviceError``,
     and the explicit ``to(Device('cpu', 0))`` transfer is the only host
     path used for the bit-exact comparison.
     """
-    exe = etl.build(
+    exe = evoxc.build(
         fn, spec, backend="iree", device=cuda_device, target_backends=["cuda"]
     )
     # Place the input on the executable's device first (run never stages
     # host inputs; scalars would need the same placement).
-    arg_dev = etl.core.Tensor(arg).to(cuda_device)
-    got = etl.run(exe, arg_dev)
+    arg_dev = evoxc.core.Tensor(arg).to(cuda_device)
+    got = evoxc.run(exe, arg_dev)
     # Device-resident output: no implicit device-to-host transfer — .numpy()
     # on a cuda payload tensor is a DeviceError.
-    with pytest.raises(etl.core.DeviceError):
+    with pytest.raises(evoxc.core.DeviceError):
         got.numpy()
-    got_host = etl.tree_map(lambda t: t.to(etl.core.Device("cpu", 0)), got)
+    got_host = evoxc.tree_map(lambda t: t.to(evoxc.core.Device("cpu", 0)), got)
     _assert_exact(got_host, ref)

@@ -1,0 +1,207 @@
+"""Backend abstraction layer: Capabilities, Backend ABC, backend Executable protocol.
+
+Import acyclicity (binding, see ../CONTEXT.md and ../../CONTEXT.md):
+- Top-level imports restricted to ``evoxc.core`` (and ``evoxc.ir`` only under TYPE_CHECKING).
+- ``evoxc.ops`` may be imported ONLY inside function bodies (block-impl registration).
+- Never import ``evoxc.pipeline`` (pipeline imports this package).
+
+Backend limitations fail explicitly: raise ``core.BackendError`` — never silently
+fall back to another backend or a partial implementation.
+"""
+from __future__ import annotations
+
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
+
+from evoxc.core import BackendError, Device, Tensor
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from evoxc.ir import Module  # noqa: F401
+    from evoxc.trace import Graph
+    from .program import CompiledArtifact, LoweredProgram
+
+__all__ = ["Capabilities", "Backend", "Executable"]
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """Static capability declaration of a backend.
+
+    Pipeline code consults these flags BEFORE handing unsupported work to a
+    backend and raises ``BackendError`` proactively; backends also re-check
+    defensively inside their staging methods. A ``False`` flag means the
+    feature must be rejected explicitly — never emulated silently.
+
+    Attributes:
+        dynamic_shapes: supports runtime-dynamic (symbolic) dims.
+        dtypes: frozenset of supported numpy dtypes.
+        collectives: supports ``evoxc.dist`` collective ops (numpy: single-process simulation).
+        runtime_calls: supports ``runtime_call`` (executing Python callbacks).
+        external_calls: supports ``external_call`` ops (named external
+            kernels; resolved at run time through the ``evoxc.external``
+            per-backend registry — ``get_external_kernel(name, backend)``
+            with default-slot fallback). numpy: True (direct interpreter
+            dispatch); iree: True (segment-split + host-dispatch at
+            ``lower()``/``run()`` via ``evoxc/backends/external_split.py``);
+            xla/tvm: False (explicit ``BackendError`` at ``lower()``;
+            registered portables may enable a compiler-side inline path in
+            a later package).
+        custom_blocks: supports ``block_call`` ops (registered backend impls).
+        async_collectives: collective execution may be asynchronous (numpy: False).
+        sparse_ops: supports evoxc.sparse sparse-tensor ops (numpy: True).
+        rng_bit_generator: frozenset of random algorithm names for which the
+            backend supports bit-exact native ``stablehlo.rng_bit_generator``
+            emission. Canonical names: ``"threefry2x32"`` and
+            ``"philox4x32_10"`` (splitmix64 has no native form — always the
+            exporter's inline expansion). The empty set = inline expansions
+            only. Per-adapter status: iree ``{"threefry2x32"}`` (native
+            THREE_FRY verified bit-exact on llvm-cpu AND cuda; native PHILOX
+            fails iree legalization on both targets), xla ``frozenset()``
+            (dropped after real-plugin validation: XLA's ``THREE_FRY`` is
+            threefry2x64 and its ``PHILOX`` is 2-word philox4x32-10 — different
+            ciphers than evoxc's threefry2x32 / 4-word philox4x32_10, so native
+            bit-exactness is impossible by design; the bit-exact inline
+            expansions are the default), tvm ``frozenset()`` (the TVM StableHLO
+            frontend has no rng_bit_generator support), numpy ``frozenset()``
+            (no StableHLO emission). The per-call ``rng_bit_generator`` lower
+            option overrides this set for one ``lower()``/``build()`` call.
+    """
+
+    dynamic_shapes: bool = False
+    dtypes: frozenset = field(default_factory=frozenset)
+    collectives: bool = False
+    runtime_calls: bool = False
+    external_calls: bool = False
+    custom_blocks: bool = False
+    async_collectives: bool = False
+    sparse_ops: bool = False
+    rng_bit_generator: frozenset = field(default_factory=frozenset)
+
+    def supports_dtype(self, dtype: Any) -> bool:
+        """True iff ``dtype`` is among ``self.dtypes`` (numpy dtype equality)."""
+        return any(dtype == supported for supported in self.dtypes)
+
+
+@runtime_checkable
+class Executable(Protocol):
+    """Protocol implemented by backend-specific executables.
+
+    A backend ``load()`` returns an object satisfying this protocol. The
+    user-facing ``evoxc.pipeline.Executable`` wraps one of these together with
+    the signature TreeSpecs to provide structured I/O; ``run`` here operates
+    on FLAT lists of ``core.Tensor``.
+
+    Persistence: ``save`` must save the underlying ``CompiledArtifact`` (or an
+    equivalent self-describing form) so the executable can be reconstructed
+    EXPLICITLY at ``load`` — device handles are never serialized.
+
+    Options contract (binding): ``run`` accepts an optional ``options`` dict
+    of backend-specific RUN options (validated against the backend's
+    ``KNOWN_OPTIONS["run"]`` set — unknown keys raise ``core.BackendError``;
+    the numpy reference backend documents ignoring options instead).
+
+    Synchronization (OPTIONAL, deliberately NOT a protocol member so
+    structural ``isinstance`` keeps working for executables without it): a
+    backend whose ``run`` is asynchronous may expose
+    ``synchronize() -> None``, which blocks until device work submitted by
+    previous ``run`` calls has completed — output values are already valid
+    before the call, only their timing needs it. Backends whose ``run``
+    already blocks on the device queue (numpy, iree) omit it or provide a
+    documented no-op; ``evoxc.pipeline.Executable.synchronize`` dispatches via
+    ``getattr`` and is a no-op when the method is absent.
+    """
+
+    functions: tuple[str, ...]
+    device: Device | None
+
+    def run(
+        self, flat_input_tensors: list[Tensor], options: dict | None = None
+    ) -> list[Tensor]:
+        """Execute the program on flat input tensors, returning flat outputs.
+
+        ``options``: backend-specific per-run options (e.g. the numpy
+        backend's ``rank_context`` execution context); validated by the
+        backend against its known run options — unknown keys raise
+        ``core.BackendError`` (never silently swallowed; the numpy reference
+        backend is the documented exception that ignores options).
+
+        Raises ``core.BackendError`` for unsupported ops/features encountered
+        at run time (v1 numpy backend supports everything it compiles, so this
+        is the safety net for capability drift).
+        """
+        ...
+
+    def save(self, path: str | os.PathLike) -> None:
+        """Serialize the executable's underlying artifact (self-describing).
+
+        Reconstruction happens explicitly at ``load``; never serializes device
+        handles or live interpreter state.
+        """
+        ...
+
+    @classmethod
+    def load(cls, path: str | os.PathLike, device: Device | None = None) -> "Executable":
+        """Reconstruct an executable from a saved artifact.
+
+        Mismatched backend/device/ABI or missing required custom ops raise
+        ``core.PersistenceError`` — never a silent re-compile.
+        """
+        ...
+
+
+class Backend(ABC):
+    """Abstract staging backend: graph → lowered program → compiled artifact → executable.
+
+    Subclasses declare a unique ``name`` and a ``Capabilities``. The staging
+    methods are explicit and never compose: ``lower`` must not compile,
+    ``compile`` must not load, ``load`` must not re-lower or re-compile
+    (see the staged-sugar rules in ../../CONTEXT.md).
+    """
+
+    name: ClassVar[str] = ""
+    capabilities: ClassVar[Capabilities] = Capabilities()
+
+    @abstractmethod
+    def lower(self, graph: "Graph", options: dict | None = None) -> "LoweredProgram":
+        """Verify a Graph and produce this backend's lowered form.
+
+        Contract (binding):
+        - MUST call ``graph.verify()`` (surfacing ``core.VerificationError``).
+        - MUST record the input/output ``Signature`` from the Graph (TreeSpecs,
+          per-leaf specs, static values) — passed down, never re-derived.
+        - The payload must be serializable/self-describing so ``save``/``load``
+          round-trips without re-lowering.
+        - Capability violations raise ``core.BackendError`` naming the feature.
+        """
+        ...
+
+    @abstractmethod
+    def compile(self, lowered: "LoweredProgram", options: dict | None = None) -> "CompiledArtifact":
+        """Turn a LoweredProgram into a self-describing CompiledArtifact.
+
+        MUST validate ``lowered.backend == self.name`` (``core.BackendError``
+        otherwise) and record required custom ops / runtime dependencies.
+        """
+        ...
+
+    @abstractmethod
+    def load(
+        self,
+        artifact: "CompiledArtifact",
+        device: Device | None = None,
+        options: dict | None = None,
+    ) -> "Executable":
+        """Reconstruct a backend executable from an artifact.
+
+        NEVER silently re-traces, re-lowers, or re-compiles; backend/device
+        mismatches raise ``core.PersistenceError`` (or ``core.BackendError``
+        for unsupported device kinds).
+
+        ``options``: backend-specific load/loader options (e.g. the iree
+        adapter's ``iree_runtime_args``, the xla adapter's ``plugin_path``),
+        validated against the backend's ``KNOWN_OPTIONS["load"]`` set —
+        unknown keys raise ``core.BackendError`` (never silently swallowed).
+        """
+        ...

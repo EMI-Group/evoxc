@@ -1,24 +1,24 @@
-"""Batching and differentiation tests for ``etl.sparse``: vmap/vectorize
+"""Batching and differentiation tests for ``evoxc.sparse``: vmap/vectorize
 numerics vs pure-numpy dense references, pytree axes contracts (pair-lead
 guard, registered-node container entries), batch-Dim static-leaf behavior,
 grad/vjp/jvp numerics vs analytic references, the three vjp deferrals, and the
 documented vmap∘grad gather gap.
 
-Contract under test: ``../etl/sparse/CONTEXT.md`` ("Differentiation &
-batching") + ``../etl/transforms/CONTEXT.md`` (AD semantics, registered-node
+Contract under test: ``../evoxc/sparse/CONTEXT.md`` ("Differentiation &
+batching") + ``../evoxc/transforms/CONTEXT.md`` (AD semantics, registered-node
 axes normalization). The supported sparse path is GRAPH-level vectorization:
-trace with a ``SparseTensorSpec``, then ``etl.vmap(graph, in_axes=...)`` /
-``etl.vectorize(graph, axes=...)`` (the callable path strips specs per leaf,
+trace with a ``SparseTensorSpec``, then ``evoxc.vmap(graph, in_axes=...)`` /
+``evoxc.vectorize(graph, axes=...)`` (the callable path strips specs per leaf,
 which produces invalid sparse leaf shapes in v1 — documented, not tested
 here).
 
 Conventions pinned in this file (verified against the current implementation):
 
-* ``etl.vmap(graph, in_axes=0)`` on a single-sparse-input graph returns a
+* ``evoxc.vmap(graph, in_axes=0)`` on a single-sparse-input graph returns a
   Graph; the batched run takes a batched sparse (leaves with a leading batch
   dim, ``dense_shape`` UNCHANGED — ``tests.sparse.conftest.batched_coo_example``)
   and yields a concrete sparse with ``dense_shape == (Dim('batch'), 3, 4)``.
-* ``etl.vectorize(graph, axes=0)`` and ``axes=(0,)`` both work; ``axes=[0]``
+* ``evoxc.vectorize(graph, axes=0)`` and ``axes=(0,)`` both work; ``axes=[0]``
   (a LIST) fails with a generic axes-structure mismatch (the graph's input
   tree is a 1-tuple, and list != tuple is a generic pytree structure rule —
   not sparse-specific).
@@ -34,10 +34,10 @@ Conventions pinned in this file (verified against the current implementation):
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl import sparse
-from etl.transforms.autodiff import ZeroTangent, jvp_rules
+import evoxc
+from evoxc import core
+from evoxc import sparse
+from evoxc.transforms.autodiff import ZeroTangent, jvp_rules
 
 from tests.sparse.conftest import (
     batched_coo_example,
@@ -62,9 +62,9 @@ def batched_csr_example():
     cols = np.array([1, 2, 0, 3], dtype=np.int64)
     vals = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     return sparse.SparseTensor.from_parts(
-        etl.core.from_numpy(np.stack([indptr, indptr], axis=0)),
-        etl.core.from_numpy(np.stack([cols, cols], axis=0)),
-        etl.core.from_numpy(np.stack([vals, vals * 2.0], axis=0)),
+        evoxc.core.from_numpy(np.stack([indptr, indptr], axis=0)),
+        evoxc.core.from_numpy(np.stack([cols, cols], axis=0)),
+        evoxc.core.from_numpy(np.stack([vals, vals * 2.0], axis=0)),
         dense_shape=(3, 4),
         format="csr",
     )
@@ -111,9 +111,9 @@ def test_vmap_dense_output_single_sparse_input():
     def f(x):
         return sparse.to_dense(sparse.negate(x))
 
-    graph = etl.trace(f, coo_spec())
-    vgraph = etl.vmap(graph, in_axes=0)
-    assert isinstance(vgraph, etl.Graph)
+    graph = evoxc.trace(f, coo_spec())
+    vgraph = evoxc.vmap(graph, in_axes=0)
+    assert isinstance(vgraph, evoxc.Graph)
 
     out = run_graph(vgraph, batched_coo_example())
     got = materialize(out)
@@ -127,8 +127,8 @@ def test_vmap_sparse_output_matches_negated_batch():
     d = dense_example()
     ref = np.stack([-d, -2.0 * d])
 
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    vgraph = etl.vmap(graph, in_axes=0)
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
+    vgraph = evoxc.vmap(graph, in_axes=0)
 
     out = run_graph(vgraph, batched_coo_example())
     assert sparse.is_sparse(out)
@@ -144,8 +144,8 @@ def test_vmap_csr_input_auto_conversion():
     d = dense_example()
     ref = np.stack([-d, -2.0 * d])
 
-    graph = etl.trace(lambda x: sparse.negate(x), csr_spec())
-    vgraph = etl.vmap(graph, in_axes=0)
+    graph = evoxc.trace(lambda x: sparse.negate(x), csr_spec())
+    vgraph = evoxc.vmap(graph, in_axes=0)
 
     out = run_graph(vgraph, batched_csr_example())
     assert sparse.is_sparse(out)
@@ -159,8 +159,8 @@ def test_vmap_two_sparse_inputs_batched_add():
     d = dense_example()
     ref = np.stack([d + d, 2.0 * d + 2.0 * d])
 
-    graph = etl.trace(lambda a, b: sparse.add(a, b), coo_spec(), coo_spec())
-    vgraph = etl.vmap(graph, in_axes=(0, 0))
+    graph = evoxc.trace(lambda a, b: sparse.add(a, b), coo_spec(), coo_spec())
+    vgraph = evoxc.vmap(graph, in_axes=(0, 0))
 
     out = run_graph(vgraph, batched_coo_example(), batched_coo_example())
     np.testing.assert_allclose(out.to_dense(), ref, rtol=1e-5, atol=1e-6)
@@ -171,8 +171,8 @@ def test_vmap_bare_in_axes_zero_single_sparse_tree():
     broadcasts across the node's tensor leaves; statics map to None)."""
     d = dense_example()
 
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
-    out = run_graph(etl.vmap(graph, in_axes=0), batched_coo_example())
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
+    out = run_graph(evoxc.vmap(graph, in_axes=0), batched_coo_example())
     np.testing.assert_allclose(
         out.numpy(), np.stack([-d, -2.0 * d]), rtol=1e-5, atol=1e-6
     )
@@ -190,9 +190,9 @@ def test_vectorize_equals_vmap_for_sparse_output():
     d = dense_example()
     ref = np.stack([-d, -2.0 * d])
 
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    vec = etl.vectorize(graph, axes=0)
-    vmap_out0 = etl.vmap(graph, in_axes=0, out_axes=0)
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
+    vec = evoxc.vectorize(graph, axes=0)
+    vmap_out0 = evoxc.vmap(graph, in_axes=0, out_axes=0)
 
     assert _op_names(vec) == _op_names(vmap_out0)
 
@@ -211,9 +211,9 @@ def test_vectorize_tuple_axes_spelling():
     d = dense_example()
     ref = np.stack([-d, -2.0 * d])
 
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    got_bare = run_graph(etl.vectorize(graph, axes=0), batched_coo_example())
-    got_tuple = run_graph(etl.vectorize(graph, axes=(0,)), batched_coo_example())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
+    got_bare = run_graph(evoxc.vectorize(graph, axes=0), batched_coo_example())
+    got_tuple = run_graph(evoxc.vectorize(graph, axes=(0,)), batched_coo_example())
     np.testing.assert_allclose(got_bare.to_dense(), ref, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(got_tuple.to_dense(), ref, rtol=1e-5, atol=1e-6)
 
@@ -226,11 +226,11 @@ def test_vectorize_tuple_axes_spelling():
 def test_container_axes_entry_at_sparse_node_raises():
     """A container axes entry at a registered-node position is unsupported in
     v1: one int/None must map the node's tensor leaves."""
-    graph = etl.trace(lambda a, b: sparse.add(a, b), coo_spec(), coo_spec())
+    graph = evoxc.trace(lambda a, b: sparse.add(a, b), coo_spec(), coo_spec())
     with pytest.raises(
         core.TransformError, match="must be a single int/None"
     ) as exc:
-        etl.vmap(graph, in_axes=([0], [0]))
+        evoxc.vmap(graph, in_axes=([0], [0]))
     assert "SparseTensor" in str(exc.value)
     assert "got a container" in str(exc.value)
 
@@ -238,11 +238,11 @@ def test_container_axes_entry_at_sparse_node_raises():
 def test_mixed_in_axes_unmapped_sparse_operand_raises():
     """in_axes=(0, None) on two sparse inputs: an unmapped sparse operand
     cannot broadcast across the batch (the documented pair-lead guard)."""
-    graph = etl.trace(lambda a, b: sparse.add(a, b), coo_spec(), coo_spec())
+    graph = evoxc.trace(lambda a, b: sparse.add(a, b), coo_spec(), coo_spec())
     with pytest.raises(
         core.TransformError, match="cannot batch op 'sparse_add'"
     ) as exc:
-        etl.vmap(graph, in_axes=(0, None))
+        evoxc.vmap(graph, in_axes=(0, None))
     assert "sparse operand 2 carries 0 mapped axes but the op maps 1" in str(
         exc.value
     )
@@ -261,8 +261,8 @@ def test_batch_dim_appears_in_output_statics_only():
     d = dense_example()
     ref = np.stack([-d, -2.0 * d])
 
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    vgraph = etl.vmap(graph, in_axes=0)
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
+    vgraph = evoxc.vmap(graph, in_axes=0)
 
     # Output side: the sparse node's dense_shape[0] record (flat index 2 of
     # the output tree — the tuple wrapper is child 0, dense_shape[0] is the
@@ -291,20 +291,20 @@ def test_batch_dim_appears_in_output_statics_only():
 def test_out_axes_none_on_mapped_sparse_output_raises():
     """out_axes=None on a mapped sparse output: the batch axis is never
     silently dropped."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
     with pytest.raises(
         core.TransformError, match="out_axes=None"
     ) as exc:
-        etl.vmap(graph, in_axes=0, out_axes=None)
+        evoxc.vmap(graph, in_axes=0, out_axes=None)
     assert "mapped batch axis" in str(exc.value)
 
 
 def test_out_axes_zero_default_leaves_graph_unchanged():
     """out_axes=0 (the default) is a no-op for leading mapped outputs: the
     vmap graph is identical to the plain vectorized graph."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    with_default = etl.vmap(graph, in_axes=0)
-    with_explicit = etl.vmap(graph, in_axes=0, out_axes=0)
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
+    with_default = evoxc.vmap(graph, in_axes=0)
+    with_explicit = evoxc.vmap(graph, in_axes=0, out_axes=0)
     assert _op_names(with_default) == _op_names(with_explicit)
     np.testing.assert_allclose(
         run_graph(with_default, batched_coo_example()).to_dense(),
@@ -324,9 +324,9 @@ def test_grad_negate_sum_values_are_minus_one():
     stored position (indices are never differentiated)."""
 
     def loss(x):
-        return etl.sum(sparse.to_dense(sparse.negate(x)))
+        return evoxc.sum(sparse.to_dense(sparse.negate(x)))
 
-    graph = etl.grad(loss, argnums=(1,))(coo_spec())
+    graph = evoxc.grad(loss, argnums=(1,))(coo_spec())
     (got,) = run_graph(graph, coo_example())
     np.testing.assert_allclose(got.numpy(), -1.0, rtol=1e-6, atol=1e-6)
 
@@ -336,10 +336,10 @@ def test_grad_weighted_loss_matches_dense_weights():
     position equals the dense weight at that position."""
 
     def loss(x, w):
-        return etl.sum(sparse.to_dense(x) * w)
+        return evoxc.sum(sparse.to_dense(x) * w)
 
     w = _dense_weights()
-    graph = etl.grad(loss, argnums=(1,))(coo_spec(), etl.TensorSpec((3, 4), etl.float32))
+    graph = evoxc.grad(loss, argnums=(1,))(coo_spec(), evoxc.TensorSpec((3, 4), evoxc.float32))
     (got,) = run_graph(graph, coo_example(), w)
 
     idx = np.array([[0, 1], [1, 2], [2, 0], [2, 3]])
@@ -352,12 +352,12 @@ def test_grad_indices_argnum_raises():
     differentiable — an explicit TransformError (never a silent zero)."""
 
     def loss(x):
-        return etl.sum(sparse.to_dense(sparse.negate(x)))
+        return evoxc.sum(sparse.to_dense(sparse.negate(x)))
 
     with pytest.raises(
         core.TransformError, match="cannot be differentiated"
     ) as exc:
-        etl.grad(loss, argnums=(0,))(coo_spec())
+        evoxc.grad(loss, argnums=(0,))(coo_spec())
     assert "input 0 (dtype int64)" in str(exc.value)
 
 
@@ -378,8 +378,8 @@ def test_vjp_square_multiply_values_cotangent():
         ],
         dtype=np.float32,
     )
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.multiply(x, x)), coo_spec())
-    vjp_graph = etl.vjp(graph, cotangents=etl.TensorSpec((3, 4), etl.float32))
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.multiply(x, x)), coo_spec())
+    vjp_graph = evoxc.vjp(graph, cotangents=evoxc.TensorSpec((3, 4), evoxc.float32))
 
     primal, cts = run_graph(vjp_graph, (coo_example(),), (C,))
     idx = np.array([[0, 1], [1, 2], [2, 0], [2, 3]])
@@ -414,8 +414,8 @@ def test_vjp_dot_dense_accumulates_shared_rows():
     def f(s_, d_):
         return sparse.matmul(s_, d_)
 
-    graph = etl.trace(f, coo_spec(), etl.TensorSpec((4, 3), etl.float32))
-    vjp_graph = etl.vjp(graph, cotangents=etl.TensorSpec((3, 3), etl.float32))
+    graph = evoxc.trace(f, coo_spec(), evoxc.TensorSpec((4, 3), evoxc.float32))
+    vjp_graph = evoxc.vjp(graph, cotangents=evoxc.TensorSpec((3, 3), evoxc.float32))
 
     primal, cts = run_graph(vjp_graph, (s, dense), (C,))
     np.testing.assert_allclose(
@@ -446,8 +446,8 @@ def test_vjp_dense_dot_sparse_accumulates_shared_cols():
     def f(d_, s_):
         return sparse.matmul(d_, s_)
 
-    graph = etl.trace(f, etl.TensorSpec((2, 3), etl.float32), coo_spec())
-    vjp_graph = etl.vjp(graph, cotangents=etl.TensorSpec((2, 4), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.float32), coo_spec())
+    vjp_graph = evoxc.vjp(graph, cotangents=evoxc.TensorSpec((2, 4), evoxc.float32))
 
     primal, cts = run_graph(vjp_graph, (dense, s), (C,))
     np.testing.assert_allclose(
@@ -472,13 +472,13 @@ def test_vjp_sparse_output_flat_leaf_cotangents():
     statics). The result graph runs with (primal_tree, (indices_ct,
     values_ct)); the values cotangent pulls back through negate and the
     input indices cotangent is zero."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
     cotangents = sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(3, 4),
     )
-    vjp_graph = etl.vjp(graph, cotangents=cotangents)
+    vjp_graph = evoxc.vjp(graph, cotangents=cotangents)
 
     values_ct = np.array([2.0, -1.0, 0.5, 3.0], dtype=np.float32)
     primal, cts = run_graph(
@@ -497,14 +497,14 @@ def test_vjp_sparse_output_flat_leaf_cotangents():
 def test_vjp_callable_path_sparse_output_equals_graph_path():
     """The callable path `vjp(f, cotangents=<spec>)(spec)` traces once and
     yields the same sparse-output vjp graph as the graph path."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
     cotangents = sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(3, 4),
     )
-    from_graph = etl.vjp(graph, cotangents=cotangents)
-    from_call = etl.vjp(
+    from_graph = evoxc.vjp(graph, cotangents=cotangents)
+    from_call = evoxc.vjp(
         lambda x: sparse.negate(x), cotangents=cotangents
     )(coo_spec())
     assert _op_names(from_graph) == _op_names(from_call)
@@ -519,17 +519,17 @@ def test_vjp_callable_path_sparse_output_equals_graph_path():
 def test_vjp_sparse_output_cotangents_none_requires_scalar():
     """cotangents=None (scalar-one default) is invalid for a sparse output
     (two flattened tensor outputs) — an explicit ShapeError."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
     with pytest.raises(core.ShapeError, match="requires exactly one tensor output"):
-        etl.vjp(graph)
+        evoxc.vjp(graph)
 
 
 def test_vjp_none_cotangent_at_non_scalar_output_raises():
     """A None cotangent at a non-scalar output seeds a scalar-one, which is
     rejected explicitly."""
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
     with pytest.raises(core.ShapeError, match="requires a scalar output"):
-        etl.vjp(graph, cotangents=(None,))
+        evoxc.vjp(graph, cotangents=(None,))
 
 
 # ---------------------------------------------------------------------------
@@ -542,16 +542,16 @@ def test_vjp_none_cotangent_at_non_scalar_output_raises():
     [
         pytest.param(
             lambda a, b: sparse.to_dense(sparse.concatenate([a, b], axis=0)),
-            etl.TensorSpec((6, 4), etl.float32),
+            evoxc.TensorSpec((6, 4), evoxc.float32),
             "sparse_concatenate",
             id="sparse_concatenate",
         ),
         pytest.param(
             lambda x: sparse.to_csc(x),
             sparse.SparseTensorSpec(
-                etl.TensorSpec((5,), etl.int64),
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((5,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
                 format="csc",
             ),
@@ -560,7 +560,7 @@ def test_vjp_none_cotangent_at_non_scalar_output_raises():
         ),
         pytest.param(
             lambda x: sparse.to_dense(sparse.to_coo(x)),
-            etl.TensorSpec((3, 4), etl.float32),
+            evoxc.TensorSpec((3, 4), evoxc.float32),
             "sparse_csc_to_coo",
             id="sparse_csc_to_coo",
         ),
@@ -574,9 +574,9 @@ def test_vjp_deferrals_raise_transform_error(build, cotangents, op_name):
     specs = (csc_spec(),) if op_name == "sparse_csc_to_coo" else (coo_spec(),)
     if op_name == "sparse_concatenate":
         specs = (coo_spec(), coo_spec())
-    graph = etl.trace(build, *specs)
+    graph = evoxc.trace(build, *specs)
     with pytest.raises(core.TransformError, match="v1 deferral") as exc:
-        etl.vjp(graph, cotangents=cotangents)
+        evoxc.vjp(graph, cotangents=cotangents)
     assert op_name in str(exc.value)
 
 
@@ -602,10 +602,10 @@ def test_jvp_sparse_multiply_gather_product_rule():
     ta = np.array([10.0, 20.0, 40.0], dtype=np.float32)
     tb = np.array([30.0, 50.0, 70.0], dtype=np.float32)
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda x, y: sparse.multiply(x, y), coo_spec(), coo_spec()
     )
-    jvp_graph = etl.jvp(graph, tangents=(coo_spec(), coo_spec()))
+    jvp_graph = evoxc.jvp(graph, tangents=(coo_spec(), coo_spec()))
 
     primal, tout = run_graph(
         jvp_graph,
@@ -635,13 +635,13 @@ def test_jvp_multiply_dense_two_term_product_rule():
     tv = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
     td = np.full((3, 4), 0.5, dtype=np.float32)
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda s, d_: sparse.multiply_dense(s, d_),
         coo_spec(),
-        etl.TensorSpec((3, 4), etl.float32),
+        evoxc.TensorSpec((3, 4), evoxc.float32),
     )
-    jvp_graph = etl.jvp(
-        graph, tangents=(coo_spec(), etl.TensorSpec((3, 4), etl.float32))
+    jvp_graph = evoxc.jvp(
+        graph, tangents=(coo_spec(), evoxc.TensorSpec((3, 4), evoxc.float32))
     )
 
     primal, tout = run_graph(
@@ -663,13 +663,13 @@ def test_jvp_dot_dense_two_term_product_rule():
     tv = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
     td = np.full((4, 3), 0.5, dtype=np.float32)
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda s, d_: sparse.matmul(s, d_),
         coo_spec(),
-        etl.TensorSpec((4, 3), etl.float32),
+        evoxc.TensorSpec((4, 3), evoxc.float32),
     )
-    jvp_graph = etl.jvp(
-        graph, tangents=(coo_spec(), etl.TensorSpec((4, 3), etl.float32))
+    jvp_graph = evoxc.jvp(
+        graph, tangents=(coo_spec(), evoxc.TensorSpec((4, 3), evoxc.float32))
     )
 
     primal, tout = run_graph(
@@ -695,13 +695,13 @@ def test_jvp_zero_tangent_run_level_numerics():
     dense = np.arange(12, dtype=np.float32).reshape(3, 4) + 1.0
     tv = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda s, d_: sparse.multiply_dense(s, d_),
         coo_spec(),
-        etl.TensorSpec((3, 4), etl.float32),
+        evoxc.TensorSpec((3, 4), evoxc.float32),
     )
-    jvp_graph = etl.jvp(
-        graph, tangents=(coo_spec(), etl.TensorSpec((3, 4), etl.float32))
+    jvp_graph = evoxc.jvp(
+        graph, tangents=(coo_spec(), evoxc.TensorSpec((3, 4), evoxc.float32))
     )
     _, tout = run_graph(
         jvp_graph,
@@ -717,7 +717,7 @@ def test_jvp_rule_zero_tangent_short_circuit():
     building any IR: an all-ZeroTangent call returns all-zero tangents (this
     is the registered rule invoked directly — the registry is public API;
     the rule touches the builder only when a term survives)."""
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda x, y: sparse.multiply(x, y), coo_spec(), coo_spec()
     )
     op = next(
@@ -742,16 +742,16 @@ def test_vmap_grad_over_sparse_defers_known_gap():
     transforms gap 'cannot batch op gather with dynamic index dims' — the
     grad vjp emits dense gather ops with dynamic (nnz) index dims, and
     batching dynamic-index gathers is a documented v1 deferral in
-    etl/transforms (it reproduces on pure-dense gather graphs too). This is a
+    evoxc/transforms (it reproduces on pure-dense gather graphs too). This is a
     known limitation, not a regression: the deferral is explicit and names
     the op (no silent fallback)."""
 
     def loss(x):
-        return etl.sum(sparse.to_dense(sparse.negate(x)))
+        return evoxc.sum(sparse.to_dense(sparse.negate(x)))
 
-    grad_graph = etl.grad(loss, argnums=(1,))(coo_spec())
+    grad_graph = evoxc.grad(loss, argnums=(1,))(coo_spec())
     with pytest.raises(
         core.TransformError, match="cannot batch op 'gather'"
     ) as exc:
-        etl.vmap(grad_graph, in_axes=0)
+        evoxc.vmap(grad_graph, in_axes=0)
     assert "dynamic index dims" in str(exc.value)

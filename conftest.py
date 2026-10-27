@@ -1,4 +1,4 @@
-"""Root conftest: ensures the repo root is on sys.path so `import etl` works."""
+"""Root conftest: ensures the repo root is on sys.path so `import evoxc` works."""
 import os
 import sys
 

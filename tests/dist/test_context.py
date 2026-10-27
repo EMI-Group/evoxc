@@ -1,16 +1,16 @@
 """Tests for the runtime rank context and ``rank()``/``world_size()``.
 
-Covers the ``etl.dist.context`` contract (see ``etl/dist/CONTEXT.md``):
+Covers the ``evoxc.dist.context`` contract (see ``evoxc/dist/CONTEXT.md``):
 
 - ``RankContext``: frozen dataclass validating ``0 <= rank < world_size``
   (ints only, ``bool`` rejected as an int subclass), value equality.
 - The thread-local rank-context hook of the numpy reference backend
-  (``etl.backends.numpy.exec_context``): default single-process context
+  (``evoxc.backends.numpy.exec_context``): default single-process context
   (rank 0 / world size 1), set/get/reset, TypeError on non-RankContext.
-- Effect on execution: ``etl.dist.rank()`` / ``etl.dist.world_size()`` are
+- Effect on execution: ``evoxc.dist.rank()`` / ``evoxc.dist.world_size()`` are
   scalar int64 graph values resolved from the runtime context at run time
   (never constant-folded) — both through the thread-local hook inside
-  ``etl.evaluate`` and through the per-``run`` override
+  ``evoxc.evaluate`` and through the per-``run`` override
   (``NumpyExecutable.run(..., rank_context=...)``).
 - Graph-vs-Python semantics: SymbolicTensor inside a trace, TraceError
   outside a trace.
@@ -25,10 +25,10 @@ import dataclasses
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl.backends.numpy.exec_context import get_rank_context, set_rank_context
-from etl.dist import RankContext, rank, world_size
+import evoxc
+from evoxc import core
+from evoxc.backends.numpy.exec_context import get_rank_context, set_rank_context
+from evoxc.dist import RankContext, rank, world_size
 
 
 @pytest.fixture(autouse=True)
@@ -137,9 +137,9 @@ def test_set_rank_context_rejects_non_rank_context(bad):
 # ---------------------------------------------------------------------------
 
 
-@etl.defn
+@evoxc.defn
 def _rank_world():
-    return (etl.dist.rank(), etl.dist.world_size())
+    return (evoxc.dist.rank(), evoxc.dist.world_size())
 
 
 def _assert_rank_world_tensor(tensor, expected):
@@ -153,7 +153,7 @@ def _assert_rank_world_tensor(tensor, expected):
 
 
 def test_evaluate_defaults_to_single_process_context():
-    out_rank, out_world = etl.evaluate(_rank_world)
+    out_rank, out_world = evoxc.evaluate(_rank_world)
     _assert_rank_world_tensor(out_rank, 0)
     _assert_rank_world_tensor(out_world, 1)
 
@@ -164,7 +164,7 @@ def test_evaluate_defaults_to_single_process_context():
 )
 def test_evaluate_resolves_rank_world_from_thread_local_context(rank_, world):
     set_rank_context(RankContext(rank_, world))
-    out_rank, out_world = etl.evaluate(_rank_world)
+    out_rank, out_world = evoxc.evaluate(_rank_world)
     _assert_rank_world_tensor(out_rank, rank_)
     _assert_rank_world_tensor(out_world, world)
 
@@ -179,7 +179,7 @@ def test_evaluate_resolves_rank_world_from_thread_local_context(rank_, world):
     [(0, 1), (2, 5), (3, 4)],
 )
 def test_backend_executable_run_rank_context_override(rank_, world):
-    exe = etl.build(_rank_world)
+    exe = evoxc.build(_rank_world)
     outputs = exe.backend_executable.run(
         [], rank_context=RankContext(rank_, world)
     )
@@ -190,7 +190,7 @@ def test_backend_executable_run_rank_context_override(rank_, world):
 
 
 def test_run_override_does_not_mutate_thread_local_hook():
-    exe = etl.build(_rank_world)
+    exe = evoxc.build(_rank_world)
     outputs = exe.backend_executable.run(
         [], rank_context=RankContext(3, 4)
     )
@@ -201,7 +201,7 @@ def test_run_override_does_not_mutate_thread_local_hook():
 
 def test_run_override_takes_precedence_and_restores_thread_local_context():
     set_rank_context(RankContext(2, 5))
-    exe = etl.build(_rank_world)
+    exe = evoxc.build(_rank_world)
     outputs = exe.backend_executable.run(
         [], rank_context=RankContext(3, 4)
     )
@@ -218,7 +218,7 @@ def test_run_override_takes_precedence_and_restores_thread_local_context():
 def test_rank_world_are_symbolic_tensors_inside_a_trace():
     seen = {}
 
-    @etl.defn
+    @evoxc.defn
     def probe():
         r = rank()
         w = world_size()
@@ -226,7 +226,7 @@ def test_rank_world_are_symbolic_tensors_inside_a_trace():
         seen["world"] = w
         return (r, w)
 
-    etl.trace(probe)
+    evoxc.trace(probe)
     for value in (seen["rank"], seen["world"]):
         assert isinstance(value, core.SymbolicTensor)
         assert not isinstance(value, int)

@@ -1,6 +1,6 @@
 """Vulkan HAL device ACQUISITION, STAGING TIER and TRANSFER PROVIDER (unit).
 
-``"vulkan"`` is a first-class etl device kind served by the iree adapter, and
+``"vulkan"`` is a first-class evoxc device kind served by the iree adapter, and
 its HAL device-discovery rules differ from cuda/rocm in three ways that this
 file pins WITHOUT a device, a Vulkan ICD or a compiler:
 
@@ -13,7 +13,7 @@ file pins WITHOUT a device, a Vulkan ICD or a compiler:
    ``load()`` and the placement provider share ONE HAL device on a thread.
    Zero enumerated devices / an out-of-range index / a failing
    ``create_device`` each raise an actionable ``core.BackendError`` (an
-   already-``ETLError`` propagates unwrapped, never double-wrapped).
+   already-``EVOXCError`` propagates unwrapped, never double-wrapped).
 2. **Staging tier** (``iree._staged_input``): the CUDA pinned/DMA and ROCm
    host-local tiers are CUDA/ROCm ONLY — ``"vulkan"`` has NO staging tier and
    returns ``None`` immediately, so a vulkan upload IS the plain
@@ -21,9 +21,9 @@ file pins WITHOUT a device, a Vulkan ICD or a compiler:
 3. **Transfer provider** (``iree.register()``): the adapter registers
    ``upload_tensor`` under the PER-BACKEND slot ``("vulkan", "iree")`` AND —
    the one documented exception to the per-backend-only rule — in the FLAT
-   default slot for ``"vulkan"``, because ``etl.backends`` installs lazy
+   default slot for ``"vulkan"``, because ``evoxc.backends`` installs lazy
    thunks for cuda/rocm/hip only and no other backend serves vulkan. The flat
-   cuda/rocm/hip slots therefore keep their ``etl.backends`` thunks.
+   cuda/rocm/hip slots therefore keep their ``evoxc.backends`` thunks.
 
 Everything here is device-free and compiler-free: the whole ``iree.runtime``
 surface these paths touch (``get_driver`` + a recording fake vulkan driver,
@@ -34,9 +34,9 @@ the file runs identically with and without a real IREE install. Every
 monkeypatched module, provider registry and thread-local cache is restored
 on teardown so nothing leaks into another suite.
 
-Pinned against ``etl/backends/adapters/iree.py`` (``_acquire_vulkan_device`` /
+Pinned against ``evoxc/backends/adapters/iree.py`` (``_acquire_vulkan_device`` /
 ``_acquire_runtime_device`` / ``_cached_hal_device`` / ``_staged_input`` /
-``upload_tensor`` / ``register``) and ``etl/core/tensor.py`` (the dual
+``upload_tensor`` / ``register``) and ``evoxc/core/tensor.py`` (the dual
 device-transfer provider registry + ``Tensor.to`` resolution order).
 """
 import sys
@@ -46,10 +46,10 @@ import types
 import numpy as np
 import pytest
 
-from etl import core
-from etl.backends import registry as _backends_registry
-from etl.backends.adapters import iree as iree_adapt
-from etl.core.tensor import (  # internal cross-module contract (Tensor.to routing)
+from evoxc import core
+from evoxc.backends import registry as _backends_registry
+from evoxc.backends.adapters import iree as iree_adapt
+from evoxc.core.tensor import (  # internal cross-module contract (Tensor.to routing)
     _BACKEND_DEVICE_TRANSFER_PROVIDERS as _PER_BACKEND_PROVIDERS,
     _DEVICE_TRANSFER_PROVIDERS as _FLAT_PROVIDERS,
     _PREFERRED_TRANSFER_BACKENDS as _PREFERRED_BACKENDS,
@@ -289,7 +289,7 @@ def _register_adapter(monkeypatch):
     """Call ``iree.register()`` with the availability probe bypassed.
 
     ``register()`` first calls ``IreeBackend.check_available`` (the
-    ``pip install etl[iree]`` probe). The provider-registration contract is
+    ``pip install evoxc[iree]`` probe). The provider-registration contract is
     independent of the installed packages, so the probe is patched to a no-op
     at the CLASS level (monkeypatch restores the original classmethod
     descriptor) — that is what lets these pins run with iree absent.
@@ -432,7 +432,7 @@ def test_hal_device_cache_is_thread_local(monkeypatch):
     """A second thread gets (and caches) its OWN HAL device.
 
     THREAD-LOCAL IS REQUIRED, not an optimization: HAL devices are
-    thread-affine (the ``etl.io`` worker thread uploads separately and must
+    thread-affine (the ``evoxc.io`` worker thread uploads separately and must
     get a device it created itself). A process-global cache would hand that
     thread a device created elsewhere.
     """
@@ -556,8 +556,8 @@ def test_create_device_failure_is_wrapped_with_the_enumerated_info(monkeypatch):
 
 
 @pytest.mark.parametrize("error_type", [core.BackendError, core.DeviceError])
-def test_create_device_etl_error_propagates_unwrapped(monkeypatch, error_type):
-    """An ``ETLError`` from ``create_device`` is re-raised as-is (no wrapping)."""
+def test_create_device_evoxc_error_propagates_unwrapped(monkeypatch, error_type):
+    """An ``EVOXCError`` from ``create_device`` is re-raised as-is (no wrapping)."""
     original = error_type("the vulkan HAL refused this device")
     driver = _FakeVulkanDriver(_INFOS, create_error=original)
     _install_fake_runtime(monkeypatch, {"vulkan": driver})
@@ -646,7 +646,7 @@ def test_register_installs_the_vulkan_provider_in_both_registries(monkeypatch):
     )
     assert core._get_device_transfer_provider("vulkan") is iree_adapt.upload_tensor
     # The cuda/rocm/hip kinds get their PER-BACKEND slots from the same call
-    # (their flat slots stay the etl.backends thunks — see the pin below).
+    # (their flat slots stay the evoxc.backends thunks — see the pin below).
     for kind in ("cuda", "rocm", "hip"):
         assert (
             core._get_backend_device_transfer_provider(kind, "iree")
@@ -701,25 +701,25 @@ def test_tensor_to_resolution_would_dispatch_to_that_provider(monkeypatch):
 def test_flat_slots_for_cuda_rocm_hip_keep_the_lazy_backends_thunks(monkeypatch):
     """The asymmetric pin: only ``"vulkan"`` gets a flat slot from ``register()``.
 
-    What is TRUE in this codebase: ``etl.backends`` fills the FLAT default
+    What is TRUE in this codebase: ``evoxc.backends`` fills the FLAT default
     slot for cuda / rocm / hip at import time with LAZY THUNKS over the iree
     adapter (``_cuda_transfer_thunk`` / ``_rocm_transfer_thunk``, which look
     ``upload_tensor`` up by name on first call) — never the adapter's direct
     ``upload_tensor``. The adapter's ``register()`` deliberately leaves those
     flat slots alone; it writes its PER-BACKEND slots for all four kinds and
-    the flat slot for ``"vulkan"`` ONLY (no etl.backends thunk exists for
+    the flat slot for ``"vulkan"`` ONLY (no evoxc.backends thunk exists for
     vulkan and no other backend serves it, so that one slot cannot clobber
     another backend's provider).
     """
-    import etl.backends as etl_backends
+    import evoxc.backends as evoxc_backends
 
     flat_before = {
         kind: core._get_device_transfer_provider(kind)
         for kind in ("cuda", "rocm", "hip")
     }
-    assert flat_before["cuda"] is etl_backends._cuda_transfer_thunk
-    assert flat_before["rocm"] is etl_backends._rocm_transfer_thunk
-    assert flat_before["hip"] is etl_backends._rocm_transfer_thunk
+    assert flat_before["cuda"] is evoxc_backends._cuda_transfer_thunk
+    assert flat_before["rocm"] is evoxc_backends._rocm_transfer_thunk
+    assert flat_before["hip"] is evoxc_backends._rocm_transfer_thunk
     for kind, provider in flat_before.items():
         assert provider is not iree_adapt.upload_tensor, kind
 
@@ -744,7 +744,7 @@ def test_vulkan_upload_is_the_plain_asdevicearray_copy(monkeypatch):
     ``create_semaphore`` / ``queue_copy``, so a staging attempt would raise
     ``AttributeError`` — the plain copy path is what makes this test pass.
     """
-    monkeypatch.delenv("ETL_IREE_RUNTIME_ARGS", raising=False)
+    monkeypatch.delenv("EVOXC_IREE_RUNTIME_ARGS", raising=False)
     driver = _FakeVulkanDriver(_INFOS)
     record = _install_fake_runtime(monkeypatch, {"vulkan": driver})
 

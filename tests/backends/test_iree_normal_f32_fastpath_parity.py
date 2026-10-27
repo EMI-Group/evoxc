@@ -4,7 +4,7 @@ algorithms on the ADAPTER-DEFAULT lowering (round-1 cross-backend finding).
 Round-1 added the numpy-side f32 Box–Muller fast path mirroring the
 stablehlo exporter's f32 semantics EXACTLY (``random.py`` /
 ``random_export.py``). With BOTH sides on the fast path, an iree-llvm-cpu
-f32 ``random_normal`` run vs ``etl.evaluate`` (numpy reference) is NOT
+f32 ``random_normal`` run vs ``evoxc.evaluate`` (numpy reference) is NOT
 bit-exact — the residual is pure libm ``log``/``cos`` drift between numpy
 and the iree CPU runtime, measured max_abs ~5e-7 at 2^16 samples (mean 0 /
 std 1, all three algorithms) — and uniform/randint/permutation stay EXACT.
@@ -27,32 +27,32 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # data (same conventions as test_iree_random_algorithms_parity.py)
 # ---------------------------------------------------------------------------
 ALGORITHMS = ("splitmix64", "threefry2x32", "philox4x32_10")
 KEY_SPECS = {
-    "splitmix64": etl.TensorSpec((), etl.int64),
-    "threefry2x32": etl.TensorSpec((2,), etl.int32),
-    "philox4x32_10": etl.TensorSpec((4,), etl.int32),
+    "splitmix64": evoxc.TensorSpec((), evoxc.int64),
+    "threefry2x32": evoxc.TensorSpec((2,), evoxc.int32),
+    "philox4x32_10": evoxc.TensorSpec((4,), evoxc.int32),
 }
 KEYS = {
     "splitmix64": (
         np.array(0, dtype=np.int64),
         np.array(-1, dtype=np.int64),
-        etl.random.key(42).numpy(),
+        evoxc.random.key(42).numpy(),
     ),
     "threefry2x32": (
         np.array([0, 0], dtype=np.int32),
         np.array([-1, -1], dtype=np.int32),
-        etl.random.key(42, algorithm="threefry2x32").numpy(),
+        evoxc.random.key(42, algorithm="threefry2x32").numpy(),
     ),
     "philox4x32_10": (
         np.array([0, 0, 0, 0], dtype=np.int32),
         np.array([-1, -1, -1, -1], dtype=np.int32),
-        etl.random.key(42, algorithm="philox4x32_10").numpy(),
+        evoxc.random.key(42, algorithm="philox4x32_10").numpy(),
     ),
 }
 #: Documented f32 fast-path budget (same as the parity file's
@@ -65,7 +65,7 @@ RANDOM_NORMAL_TOL = dict(rtol=1e-4, atol=1e-5)
 # helpers (_np/_assert_exact/_assert_close mirror the parity file)
 # ---------------------------------------------------------------------------
 def _np(v):
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
@@ -85,24 +85,24 @@ def _assert_close(got, want, rtol=1e-5, atol=1e-5):
 # ---------------------------------------------------------------------------
 # sampling graphs (each takes the algorithm's key as its only input)
 # ---------------------------------------------------------------------------
-@etl.defn
+@evoxc.defn
 def _uniform(k):
-    return etl.random.uniform(k, (4, 5), dtype=etl.float32)
+    return evoxc.random.uniform(k, (4, 5), dtype=evoxc.float32)
 
 
-@etl.defn
+@evoxc.defn
 def _randint(k):
-    return etl.random.randint(k, (8,), low=0, high=100)
+    return evoxc.random.randint(k, (8,), low=0, high=100)
 
 
-@etl.defn
+@evoxc.defn
 def _perm(k):
-    return etl.random.permutation(k, 5)
+    return evoxc.random.permutation(k, 5)
 
 
-@etl.defn
+@evoxc.defn
 def _normal_f32(k):
-    return etl.random.normal(k, (4, 5), dtype=etl.float32)
+    return evoxc.random.normal(k, (4, 5), dtype=evoxc.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +117,14 @@ def _normal_f32(k):
     ("permutation", _perm),
 ], ids=["uniform", "randint", "permutation"])
 def test_value_ops_bit_exact_adapter_default(algorithm, case_id, fn):
-    """uniform/randint/permutation stay BIT-EXACT vs ``etl.evaluate`` on
+    """uniform/randint/permutation stay BIT-EXACT vs ``evoxc.evaluate`` on
     iree-llvm-cpu — the fast path only touches random_normal."""
-    exe = etl.build(fn, KEY_SPECS[algorithm], backend="iree")
+    exe = evoxc.build(fn, KEY_SPECS[algorithm], backend="iree")
     for key in KEYS[algorithm]:
-        want = etl.evaluate(fn, key)
-        got = etl.run(exe, key)
+        want = evoxc.evaluate(fn, key)
+        got = evoxc.run(exe, key)
         _assert_exact(got, want)
-        _assert_exact(etl.run(exe, key), got)  # same exe, second call
+        _assert_exact(evoxc.run(exe, key), got)  # same exe, second call
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +134,11 @@ def test_value_ops_bit_exact_adapter_default(algorithm, case_id, fn):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("algorithm", ALGORITHMS, ids=ALGORITHMS)
 def test_normal_f32_tolerance_and_determinism(algorithm):
-    exe = etl.build(_normal_f32, KEY_SPECS[algorithm], backend="iree")
+    exe = evoxc.build(_normal_f32, KEY_SPECS[algorithm], backend="iree")
     for key in KEYS[algorithm]:
-        want = etl.evaluate(_normal_f32, key)
-        g1 = etl.run(exe, key)
-        g2 = etl.run(exe, key)
+        want = evoxc.evaluate(_normal_f32, key)
+        g1 = evoxc.run(exe, key)
+        g2 = evoxc.run(exe, key)
         assert _np(g1).dtype == np.float32
         _assert_close(g1, want, **RANDOM_NORMAL_TOL)
         _assert_exact(g1, g2)  # the hard same-key determinism contract

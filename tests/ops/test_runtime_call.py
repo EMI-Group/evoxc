@@ -1,8 +1,8 @@
-"""Contract tests for ``etl.runtime_call`` — the explicit Python escape hatch.
+"""Contract tests for ``evoxc.runtime_call`` — the explicit Python escape hatch.
 
-Assertions on the contract documented in ``etl/ops/CONTEXT.md`` (constant.py
-section, ``runtime_call``), ``etl/ops/constant.py`` and
-``etl/backends/numpy/CONTEXT.md``:
+Assertions on the contract documented in ``evoxc/ops/CONTEXT.md`` (constant.py
+section, ``runtime_call``), ``evoxc/ops/constant.py`` and
+``evoxc/backends/numpy/CONTEXT.md``:
 
 - builds a ``runtime_call`` IR op with effect ``callback``; the callback is
   carried as a registered-id STRING attribute (JSON-safe) and the declared
@@ -20,14 +20,14 @@ import importlib
 import numpy as np
 import pytest
 
-import etl
-from etl import ir
+import evoxc
+from evoxc import ir
 
 from tests.ops.conftest import ops_of, run_numpy
 
-# Module-level access to the callback registry (``etl.ops.constant`` as an
+# Module-level access to the callback registry (``evoxc.ops.constant`` as an
 # attribute is the re-exported function; see test_constant.py).
-constant_module = importlib.import_module("etl.ops.constant")
+constant_module = importlib.import_module("evoxc.ops.constant")
 
 
 # ---------------------------------------------------------------------------
@@ -37,15 +37,15 @@ constant_module = importlib.import_module("etl.ops.constant")
 
 def test_single_output_ir_contract():
     callback = lambda a: a * 2 + 1  # noqa: E731
-    spec = etl.TensorSpec((2, 3), etl.float32)
+    spec = evoxc.TensorSpec((2, 3), evoxc.float32)
     captured = {}
 
     def f(x):
-        out = etl.runtime_call(callback, x, result=spec)
+        out = evoxc.runtime_call(callback, x, result=spec)
         captured["out"] = out
         return out
 
-    graph = etl.trace(f, etl.TensorSpec((2, 3), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.float32))
     (op,) = ops_of(graph, "runtime_call")
 
     # Effect annotation: backends may reject but never silently reorder it.
@@ -74,7 +74,7 @@ def test_single_output_ir_contract():
 
     # The SymbolicTensor wrapper agrees with the IR value type.
     sym = captured["out"]
-    assert isinstance(sym, etl.SymbolicTensor)
+    assert isinstance(sym, evoxc.SymbolicTensor)
     assert sym.dtype == np.dtype("float32")
     assert sym.shape == (2, 3)
 
@@ -86,17 +86,17 @@ def test_single_output_ir_contract():
 def test_multiple_outputs_ir_contract():
     callback = lambda a: (a + 1, a * 2)  # noqa: E731
     specs = (
-        etl.TensorSpec((3,), etl.float32),
-        etl.TensorSpec((3,), etl.int64),
+        evoxc.TensorSpec((3,), evoxc.float32),
+        evoxc.TensorSpec((3,), evoxc.int64),
     )
     captured = {}
 
     def f(x):
-        out = etl.runtime_call(callback, x, result=specs)
+        out = evoxc.runtime_call(callback, x, result=specs)
         captured["out"] = out
         return out
 
-    graph = etl.trace(f, etl.TensorSpec((3,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((3,), evoxc.float32))
     (op,) = ops_of(graph, "runtime_call")
 
     assert op.effect == "callback"
@@ -118,7 +118,7 @@ def test_multiple_outputs_ir_contract():
     syms = captured["out"]
     assert isinstance(syms, tuple)
     assert len(syms) == 2
-    assert all(isinstance(s, etl.SymbolicTensor) for s in syms)
+    assert all(isinstance(s, evoxc.SymbolicTensor) for s in syms)
     assert [s.dtype for s in syms] == [np.dtype("float32"), np.dtype("int64")]
 
 
@@ -126,9 +126,9 @@ def test_scalar_operands_are_promoted_to_0d_constants():
     callback = lambda a, b: a * b  # noqa: E731
 
     def f(x):
-        return etl.runtime_call(callback, x, 3, result=etl.TensorSpec((2,), etl.float64))
+        return evoxc.runtime_call(callback, x, 3, result=evoxc.TensorSpec((2,), evoxc.float64))
 
-    graph = etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
     (op,) = ops_of(graph, "runtime_call")
     assert len(op.operands) == 2
 
@@ -150,7 +150,7 @@ def test_single_output_execution_matches_callback():
         return a * 2 + 1
 
     def f(x):
-        return etl.runtime_call(callback, x, result=etl.TensorSpec((2, 2), etl.float32))
+        return evoxc.runtime_call(callback, x, result=evoxc.TensorSpec((2, 2), evoxc.float32))
 
     x = np.arange(4, dtype=np.float32).reshape(2, 2)
     out = run_numpy(f, x)
@@ -166,7 +166,7 @@ def test_single_output_execution_with_extra_static_capture():
         return a * scale
 
     def f(x):
-        return etl.runtime_call(callback, x, result=etl.TensorSpec((4,), etl.float32))
+        return evoxc.runtime_call(callback, x, result=evoxc.TensorSpec((4,), evoxc.float32))
 
     x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     out = run_numpy(f, x)
@@ -178,20 +178,20 @@ def test_multiple_outputs_execution_returns_tuple():
         return a + 1, a * 2
 
     def f(x):
-        return etl.runtime_call(
+        return evoxc.runtime_call(
             callback,
             x,
             result=(
-                etl.TensorSpec((3,), etl.float32),
-                etl.TensorSpec((3,), etl.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
             ),
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     assert isinstance(out, tuple)
     assert len(out) == 2
-    assert all(isinstance(o, etl.Tensor) for o in out)
+    assert all(isinstance(o, evoxc.Tensor) for o in out)
     expected_a, expected_b = callback(x)
     np.testing.assert_array_equal(out[0].numpy(), expected_a)
     np.testing.assert_array_equal(out[1].numpy(), expected_b)
@@ -202,7 +202,7 @@ def test_scalar_operand_execution():
         return a * b
 
     def f(x):
-        return etl.runtime_call(callback, x, 3, result=etl.TensorSpec((2,), etl.float64))
+        return evoxc.runtime_call(callback, x, 3, result=evoxc.TensorSpec((2,), evoxc.float64))
 
     out = run_numpy(f, np.array([1.0, 2.0], dtype=np.float32))
     # float32 array * int64 array -> float64 (numpy array promotion); the
@@ -218,10 +218,10 @@ def test_scalar_operand_execution():
 
 def test_non_callable_callback_raises_typeerror():
     def f(x):
-        return etl.runtime_call(3.14, x, result=etl.TensorSpec((2,), etl.float32))
+        return evoxc.runtime_call(3.14, x, result=evoxc.TensorSpec((2,), evoxc.float32))
 
     with pytest.raises(TypeError, match="callback must be callable"):
-        etl.trace(f, etl.TensorSpec((2,), etl.float32))
+        evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 @pytest.mark.parametrize(
@@ -231,54 +231,54 @@ def test_non_callable_callback_raises_typeerror():
 )
 def test_result_not_a_tensorspec_raises_typeerror(bad_result):
     def f(x):
-        return etl.runtime_call(lambda a: a, x, result=bad_result)
+        return evoxc.runtime_call(lambda a: a, x, result=bad_result)
 
     with pytest.raises(TypeError, match="result must be a TensorSpec"):
-        etl.trace(f, etl.TensorSpec((2,), etl.float32))
+        evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_result_tuple_with_non_spec_entry_raises_typeerror():
     def f(x):
-        return etl.runtime_call(
+        return evoxc.runtime_call(
             lambda a: a,
             x,
-            result=(etl.TensorSpec((2,), etl.float32), 42),
+            result=(evoxc.TensorSpec((2,), evoxc.float32), 42),
         )
 
     with pytest.raises(TypeError, match="non-empty tuple/list of TensorSpecs"):
-        etl.trace(f, etl.TensorSpec((2,), etl.float32))
+        evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_result_empty_tuple_raises_typeerror():
     def f(x):
-        return etl.runtime_call(lambda a: a, x, result=())
+        return evoxc.runtime_call(lambda a: a, x, result=())
 
     with pytest.raises(TypeError, match="non-empty"):
-        etl.trace(f, etl.TensorSpec((2,), etl.float32))
+        evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_missing_result_spec_raises_typeerror():
     # ``result`` is a required keyword-only parameter: omitting it is a
     # Python-level TypeError raised before any tracing can begin.
     with pytest.raises(TypeError, match="result"):
-        etl.runtime_call(lambda a: a)
+        evoxc.runtime_call(lambda a: a)
 
 
 def test_concrete_tensor_operand_raises_traceerror():
-    captured = etl.tensor(np.ones(2, dtype=np.float32))
+    captured = evoxc.tensor(np.ones(2, dtype=np.float32))
 
     def f(x):
-        return etl.runtime_call(
+        return evoxc.runtime_call(
             lambda a, b: a + b,
             x,
             captured,
-            result=etl.TensorSpec((2,), etl.float32),
+            result=evoxc.TensorSpec((2,), evoxc.float32),
         )
 
-    with pytest.raises(etl.TraceError, match="no eager mode"):
-        etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="no eager mode"):
+        evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_runtime_call_outside_trace_raises_traceerror():
-    with pytest.raises(etl.TraceError, match="No active trace"):
-        etl.runtime_call(lambda a: a, result=etl.TensorSpec((2,), etl.float32))
+    with pytest.raises(evoxc.TraceError, match="No active trace"):
+        evoxc.runtime_call(lambda a: a, result=evoxc.TensorSpec((2,), evoxc.float32))

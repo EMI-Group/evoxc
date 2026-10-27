@@ -4,21 +4,21 @@ concatenate, pad, select.
 Each op is exercised for (1) static shape inference — including symbolic
 ``Dim``/``DimExpr`` dims — (2) its documented error contract (``ShapeError``
 for static failures, ``DTypeError`` for bad dtypes, ``TypeError`` for
-malformed static params; see ``etl/ops/CONTEXT.md``), and (3) numerics against
+malformed static params; see ``evoxc/ops/CONTEXT.md``), and (3) numerics against
 the matching numpy reference on the default numpy backend.
 """
 
 import numpy as np
 import pytest
 
-import etl
-from etl import DTypeError, ShapeError
+import evoxc
+from evoxc import DTypeError, ShapeError
 
 from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 #: Module-level symbolic dims for parametrize lists (Dims with equal names
-#: compare equal, so tests may build their own ``etl.dim("n")`` as well).
-N = etl.dim("n")
+#: compare equal, so tests may build their own ``evoxc.dim("n")`` as well).
+N = evoxc.dim("n")
 
 
 def last_result(graph):
@@ -32,7 +32,7 @@ def last_result(graph):
 def np_scatter_ref(x, indices, updates, axis=0):
     """numpy reference for ``scatter``: functional ``put_along_axis``.
 
-    Mirrors the numpy backend kernel (``etl/backends/numpy/kernels/
+    Mirrors the numpy backend kernel (``evoxc/backends/numpy/kernels/
     indexing.py::_scatter``): copy the input, normalize index rank (0-d →
     all-ones of full rank; low-rank → 1-padded around the axis), then
     ``np.put_along_axis`` (overwrite semantics: last write wins on
@@ -69,9 +69,9 @@ class TestBroadcast:
     )
     def test_numerics_vs_broadcast_to(self, src_shape, target):
         def f(x):
-            return etl.broadcast(x, target)
+            return evoxc.broadcast(x, target)
 
-        g = trace_fn(f, etl.TensorSpec(src_shape, etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec(src_shape, evoxc.float32))
         assert last_result(g).type.shape == target
         arr = np.arange(
             1 if not src_shape else np.prod(src_shape), dtype=np.float32
@@ -82,16 +82,16 @@ class TestBroadcast:
 
     def test_dtype_preserved(self):
         def f(x):
-            return etl.broadcast(x, (2, 3))
+            return evoxc.broadcast(x, (2, 3))
 
-        g = trace_fn(f, etl.TensorSpec((3,), etl.int32))
+        g = trace_fn(f, evoxc.TensorSpec((3,), evoxc.int32))
         assert last_result(g).type.dtype == np.dtype("int32")
         out = run_numpy(f, np.array([1, 2, 3], np.int32))
         assert out.dtype == np.dtype("int32")
 
     def test_scalar_literal_operand(self):
         def f():
-            return etl.broadcast(3, (2, 2))
+            return evoxc.broadcast(3, (2, 2))
 
         g = trace_fn(f)
         assert last_result(g).type.shape == (2, 2)
@@ -112,31 +112,31 @@ class TestBroadcast:
     )
     def test_static_errors(self, src_shape, target, match):
         def f(x):
-            return etl.broadcast(x, target)
+            return evoxc.broadcast(x, target)
 
         with pytest.raises(ShapeError, match=match):
-            trace_fn(f, etl.TensorSpec(src_shape, etl.float32))
+            trace_fn(f, evoxc.TensorSpec(src_shape, evoxc.float32))
 
     def test_shape_must_be_tuple(self):
         def f(x):
-            return etl.broadcast(x, [3, 4])
+            return evoxc.broadcast(x, [3, 4])
 
         with pytest.raises(TypeError, match="shape must be a tuple"):
-            trace_fn(f, etl.TensorSpec((3, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((3, 4), evoxc.float32))
 
     def test_symbolic_target_dims(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.broadcast(x, (2, n, 4))
+            return evoxc.broadcast(x, (2, n, 4))
 
-        g = trace_fn(f, etl.TensorSpec((n, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 4), evoxc.float32))
         assert last_result(g).type.shape == (2, n, 4)
 
         def g1(x):
-            return etl.broadcast(x, (n, 4))
+            return evoxc.broadcast(x, (n, 4))
 
-        gr = trace_fn(g1, etl.TensorSpec((1, 4), etl.float32))
+        gr = trace_fn(g1, evoxc.TensorSpec((1, 4), evoxc.float32))
         assert last_result(gr).type.shape == (n, 4)
 
 
@@ -151,9 +151,9 @@ class TestReshape:
     )
     def test_numerics_vs_reshape(self, src, target):
         def f(x):
-            return etl.reshape(x, target)
+            return evoxc.reshape(x, target)
 
-        g = trace_fn(f, etl.TensorSpec(src, etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec(src, evoxc.float32))
         assert last_result(g).type.shape == target
         arr = np.arange(
             1 if not src else np.prod(src), dtype=np.float32
@@ -170,18 +170,18 @@ class TestReshape:
     )
     def test_minus_one_inferred(self, src, target, expected):
         def f(x):
-            return etl.reshape(x, target)
+            return evoxc.reshape(x, target)
 
-        g = trace_fn(f, etl.TensorSpec(src, etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec(src, evoxc.float32))
         assert last_result(g).type.shape == expected
 
     def test_dim_expr_arithmetic(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.reshape(x, (n * 2, 3))
+            return evoxc.reshape(x, (n * 2, 3))
 
-        g = trace_fn(f, etl.TensorSpec((n, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 6), evoxc.float32))
         assert last_result(g).type.shape == (n * 2, 3)
 
     @pytest.mark.parametrize(
@@ -193,21 +193,21 @@ class TestReshape:
         ],
     )
     def test_symbolic_minus_one_inferred(self, target, expected):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.reshape(x, target)
+            return evoxc.reshape(x, target)
 
-        g = trace_fn(f, etl.TensorSpec((n, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 6), evoxc.float32))
         assert last_result(g).type.shape == expected
 
     def test_symbolic_minus_one_dim_expr_quotient(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.reshape(x, (5, -1))
+            return evoxc.reshape(x, (5, -1))
 
-        g = trace_fn(f, etl.TensorSpec((n, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 6), evoxc.float32))
         # element count n*6 over known target count 5 -> DimExpr quotient.
         assert last_result(g).type.shape == (5, (6 * n) // 5)
 
@@ -222,17 +222,17 @@ class TestReshape:
     )
     def test_static_errors(self, src, target, match):
         def f(x):
-            return etl.reshape(x, target)
+            return evoxc.reshape(x, target)
 
         with pytest.raises(ShapeError, match=match):
-            trace_fn(f, etl.TensorSpec(src, etl.float32))
+            trace_fn(f, evoxc.TensorSpec(src, evoxc.float32))
 
     def test_shape_must_be_tuple(self):
         def f(x):
-            return etl.reshape(x, [2, 12])
+            return evoxc.reshape(x, [2, 12])
 
         with pytest.raises(TypeError, match="shape must be a tuple"):
-            trace_fn(f, etl.TensorSpec((4, 6), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((4, 6), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +242,9 @@ class TestReshape:
 class TestTranspose:
     def test_none_reverses_axes(self):
         def f(x):
-            return etl.transpose(x)
+            return evoxc.transpose(x)
 
-        g = trace_fn(f, etl.TensorSpec((2, 3, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
         assert last_result(g).type.shape == (4, 3, 2)
         arr = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
         np.testing.assert_array_equal(run_numpy(f, arr), np.transpose(arr))
@@ -252,10 +252,10 @@ class TestTranspose:
     @pytest.mark.parametrize("axes", [(1, 2, 0), (2, 0, 1), (0, 2, 1)])
     def test_explicit_permutation(self, axes):
         def f(x):
-            return etl.transpose(x, axes)
+            return evoxc.transpose(x, axes)
 
         src = (2, 3, 4)
-        g = trace_fn(f, etl.TensorSpec(src, etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec(src, evoxc.float32))
         assert last_result(g).type.shape == tuple(src[a] for a in axes)
         arr = np.arange(24, dtype=np.float32).reshape(src)
         np.testing.assert_array_equal(
@@ -263,12 +263,12 @@ class TestTranspose:
         )
 
     def test_symbolic_dims_permuted(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.transpose(x, (2, 0, 1))
+            return evoxc.transpose(x, (2, 0, 1))
 
-        g = trace_fn(f, etl.TensorSpec((n, 3, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 3, 4), evoxc.float32))
         assert last_result(g).type.shape == (4, n, 3)
 
     @pytest.mark.parametrize(
@@ -281,17 +281,17 @@ class TestTranspose:
     )
     def test_invalid_permutation(self, axes, match):
         def f(x):
-            return etl.transpose(x, axes)
+            return evoxc.transpose(x, axes)
 
         with pytest.raises(ShapeError, match=match):
-            trace_fn(f, etl.TensorSpec((2, 3, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
 
     def test_axes_must_be_none_or_tuple(self):
         def f(x):
-            return etl.transpose(x, 1)
+            return evoxc.transpose(x, 1)
 
         with pytest.raises(TypeError, match="axes must be None or a tuple"):
-            trace_fn(f, etl.TensorSpec((2, 3, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -311,10 +311,10 @@ class TestSlice:
     )
     def test_numerics_vs_numpy_slicing(self, start, lengths, strides, ref):
         def f(x):
-            return etl.slice(x, start, lengths, strides=strides)
+            return evoxc.slice(x, start, lengths, strides=strides)
 
         arr = np.arange(24, dtype=np.float32).reshape(4, 6)
-        g = trace_fn(f, etl.TensorSpec((4, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((4, 6), evoxc.float32))
         expected = arr[ref]
         assert last_result(g).type.shape == expected.shape
         np.testing.assert_array_equal(run_numpy(f, arr), expected)
@@ -322,25 +322,25 @@ class TestSlice:
     def test_shape_inference_stride_formula(self):
         # per dim: (length + stride - 1) // stride
         def f(x):
-            return etl.slice(x, 0, (4, 6), strides=(1, 2))
+            return evoxc.slice(x, 0, (4, 6), strides=(1, 2))
 
-        g = trace_fn(f, etl.TensorSpec((4, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((4, 6), evoxc.float32))
         assert last_result(g).type.shape == (4, 3)
 
     def test_empty_result(self):
         def f(x):
-            return etl.slice(x, (4, 0), (0, 6))
+            return evoxc.slice(x, (4, 0), (0, 6))
 
-        g = trace_fn(f, etl.TensorSpec((4, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((4, 6), evoxc.float32))
         assert last_result(g).type.shape == (0, 6)
 
     def test_symbolic_dim_with_static_bounds(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.slice(x, (0, 0), (2, 6))
+            return evoxc.slice(x, (0, 0), (2, 6))
 
-        g = trace_fn(f, etl.TensorSpec((n, 6), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 6), evoxc.float32))
         # axis 0: static length 2 over symbolic n; axis 1: full slice preserved.
         assert last_result(g).type.shape == (2, 6)
 
@@ -357,28 +357,28 @@ class TestSlice:
     )
     def test_bad_params(self, start, lengths, strides, match):
         def f(x):
-            return etl.slice(x, start, lengths, strides=strides)
+            return evoxc.slice(x, start, lengths, strides=strides)
 
         with pytest.raises(ShapeError, match=match):
-            trace_fn(f, etl.TensorSpec((4, 6), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((4, 6), evoxc.float32))
 
     def test_symbolic_length_not_expressible(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.slice(x, 0, n)
+            return evoxc.slice(x, 0, n)
 
         with pytest.raises(ShapeError, match="symbolic length"):
-            trace_fn(f, etl.TensorSpec((4, 6), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((4, 6), evoxc.float32))
 
     def test_negative_start_over_symbolic_dim(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.slice(x, -1, 2)
+            return evoxc.slice(x, -1, 2)
 
         with pytest.raises(ShapeError, match="negative start -1 over symbolic"):
-            trace_fn(f, etl.TensorSpec((n, 6), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, 6), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -397,12 +397,12 @@ class TestGather:
     )
     def test_shape_inference(self, src, idx_shape, axis, expected):
         def f(x, i):
-            return etl.gather(x, i, axis=axis)
+            return evoxc.gather(x, i, axis=axis)
 
         g = trace_fn(
             f,
-            etl.TensorSpec(src, etl.float32),
-            etl.TensorSpec(idx_shape, etl.int64),
+            evoxc.TensorSpec(src, evoxc.float32),
+            evoxc.TensorSpec(idx_shape, evoxc.int64),
         )
         assert last_result(g).type.shape == expected
 
@@ -415,13 +415,13 @@ class TestGather:
     )
     def test_numerics_vs_take(self, axis, src, indices):
         def f(x, i):
-            return etl.gather(x, i, axis=axis)
+            return evoxc.gather(x, i, axis=axis)
 
         arr = np.arange(np.prod(src), dtype=np.float32).reshape(src)
         g = trace_fn(
             f,
-            etl.TensorSpec(src, etl.float32),
-            etl.TensorSpec(indices.shape, etl.int64),
+            evoxc.TensorSpec(src, evoxc.float32),
+            evoxc.TensorSpec(indices.shape, evoxc.int64),
         )
         expected = np.take(arr, indices, axis=axis)
         assert last_result(g).type.shape == expected.shape
@@ -429,7 +429,7 @@ class TestGather:
 
     def test_zero_dim_indices(self):
         def f(x, i):
-            return etl.gather(x, i, axis=0)
+            return evoxc.gather(x, i, axis=0)
 
         arr = np.arange(20, dtype=np.float32).reshape(5, 4)
         idx = np.asarray(2, dtype=np.int64)
@@ -437,71 +437,71 @@ class TestGather:
         np.testing.assert_array_equal(run_numpy(f, arr, idx), expected)
 
     def test_symbolic_dims_spliced(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x, i):
-            return etl.gather(x, i, axis=0)
+            return evoxc.gather(x, i, axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((n, 5), etl.float32),
-            etl.TensorSpec((3,), etl.int64),
+            evoxc.TensorSpec((n, 5), evoxc.float32),
+            evoxc.TensorSpec((3,), evoxc.int64),
         )
         assert last_result(g).type.shape == (3, 5)
 
-    @pytest.mark.parametrize("idx_dtype", [etl.float32, etl.float16, etl.bool_])
+    @pytest.mark.parametrize("idx_dtype", [evoxc.float32, evoxc.float16, evoxc.bool_])
     def test_indices_dtype_errors(self, idx_dtype):
         def f(x, i):
-            return etl.gather(x, i)
+            return evoxc.gather(x, i)
 
         with pytest.raises(DTypeError, match="indices must be an integer dtype"):
             trace_fn(
                 f,
-                etl.TensorSpec((5, 4), etl.float32),
-                etl.TensorSpec((2,), idx_dtype),
+                evoxc.TensorSpec((5, 4), evoxc.float32),
+                evoxc.TensorSpec((2,), idx_dtype),
             )
 
     def test_int32_indices_accepted(self):
         def f(x, i):
-            return etl.gather(x, i, axis=0)
+            return evoxc.gather(x, i, axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((5, 4), etl.float32),
-            etl.TensorSpec((3,), etl.int32),
+            evoxc.TensorSpec((5, 4), evoxc.float32),
+            evoxc.TensorSpec((3,), evoxc.int32),
         )
         assert last_result(g).type.shape == (3, 4)
 
     def test_axis_out_of_range(self):
         def f(x, i):
-            return etl.gather(x, i, axis=2)
+            return evoxc.gather(x, i, axis=2)
 
         with pytest.raises(ShapeError, match="axis 2 out of range for rank 2"):
             trace_fn(
                 f,
-                etl.TensorSpec((3, 5), etl.float32),
-                etl.TensorSpec((2,), etl.int64),
+                evoxc.TensorSpec((3, 5), evoxc.float32),
+                evoxc.TensorSpec((2,), evoxc.int64),
             )
 
     def test_axis_must_be_int(self):
         def f(x, i):
-            return etl.gather(x, i, axis=1.5)
+            return evoxc.gather(x, i, axis=1.5)
 
         with pytest.raises(TypeError, match="axis must be an int"):
             trace_fn(
                 f,
-                etl.TensorSpec((3, 5), etl.float32),
-                etl.TensorSpec((2,), etl.int64),
+                evoxc.TensorSpec((3, 5), evoxc.float32),
+                evoxc.TensorSpec((2,), evoxc.int64),
             )
 
     def test_dtype_preserved(self):
         def f(x, i):
-            return etl.gather(x, i, axis=0)
+            return evoxc.gather(x, i, axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((5, 4), etl.int32),
-            etl.TensorSpec((3,), etl.int64),
+            evoxc.TensorSpec((5, 4), evoxc.int32),
+            evoxc.TensorSpec((3,), evoxc.int64),
         )
         assert last_result(g).type.dtype == np.dtype("int32")
 
@@ -521,15 +521,15 @@ class TestScatter:
     )
     def test_numerics_vs_put_along_axis(self, axis, src, idx, updates_shape):
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=axis)
+            return evoxc.scatter(x, i, u, axis=axis)
 
         arr = np.arange(np.prod(src), dtype=np.float32).reshape(src)
         updates = np.full(updates_shape, -5.0, np.float32)
         g = trace_fn(
             f,
-            etl.TensorSpec(src, etl.float32),
-            etl.TensorSpec(idx.shape, etl.int64),
-            etl.TensorSpec(updates_shape, etl.float32),
+            evoxc.TensorSpec(src, evoxc.float32),
+            evoxc.TensorSpec(idx.shape, evoxc.int64),
+            evoxc.TensorSpec(updates_shape, evoxc.float32),
         )
         assert last_result(g).type.shape == src
         assert last_result(g).type.dtype == np.dtype("float32")
@@ -540,7 +540,7 @@ class TestScatter:
         # The numpy kernel is overwrite semantics (put_along_axis): with a
         # duplicated index the LAST update wins — encode that behavior.
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=0)
+            return evoxc.scatter(x, i, u, axis=0)
 
         arr = np.arange(15, dtype=np.float32).reshape(5, 3)
         idx = np.array([1, 1], dtype=np.int64)
@@ -553,7 +553,7 @@ class TestScatter:
 
     def test_zero_dim_index(self):
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=0)
+            return evoxc.scatter(x, i, u, axis=0)
 
         arr = np.arange(12, dtype=np.float32).reshape(3, 4)
         idx = np.asarray(1, dtype=np.int64)
@@ -563,16 +563,16 @@ class TestScatter:
 
     def test_int32_indices_accepted(self):
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=0)
+            return evoxc.scatter(x, i, u, axis=0)
 
         arr = np.arange(12, dtype=np.float32).reshape(3, 4)
         idx = np.array([0, 2], dtype=np.int32)
         updates = np.full((2, 4), 5.0, np.float32)
         g = trace_fn(
             f,
-            etl.TensorSpec((3, 4), etl.float32),
-            etl.TensorSpec((2,), etl.int32),
-            etl.TensorSpec((2, 4), etl.float32),
+            evoxc.TensorSpec((3, 4), evoxc.float32),
+            evoxc.TensorSpec((2,), evoxc.int32),
+            evoxc.TensorSpec((2, 4), evoxc.float32),
         )
         assert last_result(g).type.shape == (3, 4)
         np.testing.assert_array_equal(
@@ -582,13 +582,13 @@ class TestScatter:
 
     def test_updates_cast_to_x_dtype(self):
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=0)
+            return evoxc.scatter(x, i, u, axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((3, 4), etl.float32),
-            etl.TensorSpec((2,), etl.int64),
-            etl.TensorSpec((2, 4), etl.int32),
+            evoxc.TensorSpec((3, 4), evoxc.float32),
+            evoxc.TensorSpec((2,), evoxc.int64),
+            evoxc.TensorSpec((2, 4), evoxc.int32),
         )
         assert ops_of(g, "cast")  # updates int32 -> float32
         arr = np.arange(12, dtype=np.float32).reshape(3, 4)
@@ -601,16 +601,16 @@ class TestScatter:
         )
 
     def test_symbolic_result_shape(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=0)
+            return evoxc.scatter(x, i, u, axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((n, 3), etl.float32),
-            etl.TensorSpec((2,), etl.int64),
-            etl.TensorSpec((2, 3), etl.float32),
+            evoxc.TensorSpec((n, 3), evoxc.float32),
+            evoxc.TensorSpec((2,), evoxc.int64),
+            evoxc.TensorSpec((2, 3), evoxc.float32),
         )
         assert last_result(g).type.shape == (n, 3)
         assert last_result(g).type.dtype == np.dtype("float32")
@@ -634,26 +634,26 @@ class TestScatter:
         x_shape, i_shape, u_shape = specs
 
         def f(x, i, u):
-            return etl.scatter(x, i, u, axis=axis)
+            return evoxc.scatter(x, i, u, axis=axis)
 
         with pytest.raises(ShapeError, match=match):
             trace_fn(
                 f,
-                etl.TensorSpec(x_shape, etl.float32),
-                etl.TensorSpec(i_shape, etl.int64),
-                etl.TensorSpec(u_shape, etl.float32),
+                evoxc.TensorSpec(x_shape, evoxc.float32),
+                evoxc.TensorSpec(i_shape, evoxc.int64),
+                evoxc.TensorSpec(u_shape, evoxc.float32),
             )
 
     def test_indices_dtype_error(self):
         def f(x, i, u):
-            return etl.scatter(x, i, u)
+            return evoxc.scatter(x, i, u)
 
         with pytest.raises(DTypeError, match="indices must be an integer dtype"):
             trace_fn(
                 f,
-                etl.TensorSpec((5, 3), etl.float32),
-                etl.TensorSpec((2,), etl.float32),
-                etl.TensorSpec((2, 3), etl.float32),
+                evoxc.TensorSpec((5, 3), evoxc.float32),
+                evoxc.TensorSpec((2,), evoxc.float32),
+                evoxc.TensorSpec((2, 3), evoxc.float32),
             )
 
 
@@ -672,12 +672,12 @@ class TestConcatenate:
     )
     def test_numerics_vs_concatenate(self, axis, shapes, expected):
         def f(x, y):
-            return etl.concatenate([x, y], axis=axis)
+            return evoxc.concatenate([x, y], axis=axis)
 
         g = trace_fn(
             f,
-            etl.TensorSpec(shapes[0], etl.float32),
-            etl.TensorSpec(shapes[1], etl.float32),
+            evoxc.TensorSpec(shapes[0], evoxc.float32),
+            evoxc.TensorSpec(shapes[1], evoxc.float32),
         )
         assert last_result(g).type.shape == expected
         a = np.zeros(shapes[0], np.float32)
@@ -687,26 +687,26 @@ class TestConcatenate:
         )
 
     def test_axis_dim_symbolic_sum(self):
-        n, m = etl.dim("n"), etl.dim("m")
+        n, m = evoxc.dim("n"), evoxc.dim("m")
 
         def f(x, y):
-            return etl.concatenate([x, y], axis=0)
+            return evoxc.concatenate([x, y], axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((n, 3), etl.float32),
-            etl.TensorSpec((m, 3), etl.float32),
+            evoxc.TensorSpec((n, 3), evoxc.float32),
+            evoxc.TensorSpec((m, 3), evoxc.float32),
         )
         shape = last_result(g).type.shape
         assert shape == (n + m, 3)
-        assert isinstance(shape[0], etl.DimExpr) and shape[0].op == "add"
+        assert isinstance(shape[0], evoxc.DimExpr) and shape[0].op == "add"
 
     def test_single_tensor(self):
         def f(x):
-            return etl.concatenate([x], axis=0)
+            return evoxc.concatenate([x], axis=0)
 
         arr = np.arange(6, dtype=np.float32).reshape(2, 3)
-        g = trace_fn(f, etl.TensorSpec((2, 3), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((2, 3), evoxc.float32))
         assert last_result(g).type.shape == (2, 3)
         np.testing.assert_array_equal(run_numpy(f, arr), arr)
 
@@ -716,12 +716,12 @@ class TestConcatenate:
     )
     def test_dtype_promotion_result_type(self, dtype_a, dtype_b):
         def f(x, y):
-            return etl.concatenate([x, y], axis=0)
+            return evoxc.concatenate([x, y], axis=0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((2, 3), dtype_a),
-            etl.TensorSpec((4, 3), dtype_b),
+            evoxc.TensorSpec((2, 3), dtype_a),
+            evoxc.TensorSpec((4, 3), dtype_b),
         )
         expected_dtype = np.result_type(dtype_a, dtype_b)
         assert last_result(g).type.dtype == expected_dtype
@@ -743,46 +743,46 @@ class TestConcatenate:
         if error_case == "non_axis_mismatch":
 
             def f(x, y):
-                return etl.concatenate([x, y], axis=0)
+                return evoxc.concatenate([x, y], axis=0)
 
             specs = (
-                etl.TensorSpec((2, 3), etl.float32),
-                etl.TensorSpec((2, 4), etl.float32),
+                evoxc.TensorSpec((2, 3), evoxc.float32),
+                evoxc.TensorSpec((2, 4), evoxc.float32),
             )
         elif error_case == "rank_mismatch":
 
             def f(x, y):
-                return etl.concatenate([x, y], axis=0)
+                return evoxc.concatenate([x, y], axis=0)
 
             specs = (
-                etl.TensorSpec((2, 3), etl.float32),
-                etl.TensorSpec((4, 3, 2), etl.float32),
+                evoxc.TensorSpec((2, 3), evoxc.float32),
+                evoxc.TensorSpec((4, 3, 2), evoxc.float32),
             )
         else:
 
             def f(x, y):
-                return etl.concatenate([x, y], axis=2)
+                return evoxc.concatenate([x, y], axis=2)
 
             specs = (
-                etl.TensorSpec((2, 3), etl.float32),
-                etl.TensorSpec((2, 3), etl.float32),
+                evoxc.TensorSpec((2, 3), evoxc.float32),
+                evoxc.TensorSpec((2, 3), evoxc.float32),
             )
         with pytest.raises(ShapeError, match=match):
             trace_fn(f, *specs)
 
     def test_empty_input(self):
         def f(x):
-            return etl.concatenate([], axis=0)
+            return evoxc.concatenate([], axis=0)
 
         with pytest.raises(ShapeError, match="at least one tensor"):
-            trace_fn(f, etl.TensorSpec((2, 3), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((2, 3), evoxc.float32))
 
     def test_wrong_container(self):
         def f(x):
-            return etl.concatenate(x, axis=0)
+            return evoxc.concatenate(x, axis=0)
 
         with pytest.raises(TypeError, match="non-empty list/tuple"):
-            trace_fn(f, etl.TensorSpec((2, 3), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -800,17 +800,17 @@ class TestPad:
     )
     def test_numerics_vs_np_pad(self, config, pad_width):
         def f(x):
-            return etl.pad(x, config, value=0.0)
+            return evoxc.pad(x, config, value=0.0)
 
         arr = np.arange(6, dtype=np.float32).reshape(2, 3)
-        g = trace_fn(f, etl.TensorSpec((2, 3), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((2, 3), evoxc.float32))
         expected = np.pad(arr, pad_width, mode="constant", constant_values=0.0)
         assert last_result(g).type.shape == expected.shape
         np.testing.assert_array_equal(run_numpy(f, arr), expected)
 
     def test_value_casts_to_tensor_dtype_int(self):
         def f(x):
-            return etl.pad(x, ((1, 0),), value=2.5)
+            return evoxc.pad(x, ((1, 0),), value=2.5)
 
         arr = np.array([1, 2, 3], np.int32)
         out = run_numpy(f, arr)
@@ -821,7 +821,7 @@ class TestPad:
 
     def test_value_casts_to_tensor_dtype_float(self):
         def f(x):
-            return etl.pad(x, ((1, 0),), value=7)
+            return evoxc.pad(x, ((1, 0),), value=7)
 
         arr = np.array([1.5, 2.5], np.float32)
         out = run_numpy(f, arr)
@@ -831,20 +831,20 @@ class TestPad:
         )
 
     def test_symbolic_dim_arithmetic(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
-            return etl.pad(x, ((1, 2), (0, 1)), value=0.0)
+            return evoxc.pad(x, ((1, 2), (0, 1)), value=0.0)
 
-        g = trace_fn(f, etl.TensorSpec((n, 3), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 3), evoxc.float32))
         assert last_result(g).type.shape == (n + 3, 4)
 
     def test_zero_rank_identity(self):
         def f(x):
-            return etl.pad(x, (), value=0.0)
+            return evoxc.pad(x, (), value=0.0)
 
         arr = np.asarray(3.0, np.float32)
-        g = trace_fn(f, etl.TensorSpec((), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((), evoxc.float32))
         assert last_result(g).type.shape == ()
         np.testing.assert_array_equal(run_numpy(f, arr), arr)
 
@@ -861,10 +861,10 @@ class TestPad:
     )
     def test_malformed_config(self, config, value, exc, match):
         def f(x):
-            return etl.pad(x, config, value=value)
+            return evoxc.pad(x, config, value=value)
 
         with pytest.raises(exc, match=match):
-            trace_fn(f, etl.TensorSpec((2, 3), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -874,16 +874,16 @@ class TestPad:
 class TestSelect:
     def test_numerics_vs_where(self):
         def f(p, a, b):
-            return etl.select(p, a, b)
+            return evoxc.select(p, a, b)
 
         pred = np.array([True, False, True, False])
         a = np.arange(4, dtype=np.float32)
         b = np.full(4, -1.0, np.float32)
         g = trace_fn(
             f,
-            etl.TensorSpec((4,), etl.bool_),
-            etl.TensorSpec((4,), etl.float32),
-            etl.TensorSpec((4,), etl.float32),
+            evoxc.TensorSpec((4,), evoxc.bool_),
+            evoxc.TensorSpec((4,), evoxc.float32),
+            evoxc.TensorSpec((4,), evoxc.float32),
         )
         assert last_result(g).type.shape == (4,)
         np.testing.assert_array_equal(
@@ -892,16 +892,16 @@ class TestSelect:
 
     def test_three_operand_broadcast(self):
         def f(p, a, b):
-            return etl.select(p, a, b)
+            return evoxc.select(p, a, b)
 
         pred = np.array([[True], [False], [True], [False]])
         a = np.ones((1, 3), np.float32)
         b = np.zeros((4, 3), np.float32)
         g = trace_fn(
             f,
-            etl.TensorSpec((4, 1), etl.bool_),
-            etl.TensorSpec((1, 3), etl.float32),
-            etl.TensorSpec((4, 3), etl.float32),
+            evoxc.TensorSpec((4, 1), evoxc.bool_),
+            evoxc.TensorSpec((1, 3), evoxc.float32),
+            evoxc.TensorSpec((4, 3), evoxc.float32),
         )
         assert last_result(g).type.shape == (4, 3)
         np.testing.assert_array_equal(
@@ -910,24 +910,24 @@ class TestSelect:
 
     def test_scalar_branches(self):
         def f(p):
-            return etl.select(p, 1, 2)
+            return evoxc.select(p, 1, 2)
 
         pred = np.array([True, False, True])
-        g = trace_fn(f, etl.TensorSpec((3,), etl.bool_))
+        g = trace_fn(f, evoxc.TensorSpec((3,), evoxc.bool_))
         assert last_result(g).type.shape == (3,)
         assert last_result(g).type.dtype == np.dtype("int64")
         np.testing.assert_array_equal(run_numpy(f, pred), np.where(pred, 1, 2))
 
     def test_python_bool_pred(self):
         def f(a, b):
-            return etl.select(True, a, b)
+            return evoxc.select(True, a, b)
 
         a = np.arange(4, dtype=np.float32)
         b = np.full(4, -1.0, np.float32)
         g = trace_fn(
             f,
-            etl.TensorSpec((4,), etl.float32),
-            etl.TensorSpec((4,), etl.float32),
+            evoxc.TensorSpec((4,), evoxc.float32),
+            evoxc.TensorSpec((4,), evoxc.float32),
         )
         assert last_result(g).type.shape == (4,)
         np.testing.assert_array_equal(
@@ -936,7 +936,7 @@ class TestSelect:
 
     def test_all_scalar(self):
         def f():
-            return etl.select(True, 1, 2)
+            return evoxc.select(True, 1, 2)
 
         g = trace_fn(f)
         assert last_result(g).type.shape == ()
@@ -946,63 +946,63 @@ class TestSelect:
 
     def test_static_broadcast_error(self):
         def f(p, a, b):
-            return etl.select(p, a, b)
+            return evoxc.select(p, a, b)
 
         with pytest.raises(ShapeError, match="cannot broadcast incompatible"):
             trace_fn(
                 f,
-                etl.TensorSpec((4,), etl.bool_),
-                etl.TensorSpec((4,), etl.float32),
-                etl.TensorSpec((3,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.bool_),
+                evoxc.TensorSpec((4,), evoxc.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
             )
 
     def test_pred_dtype_error(self):
         def f(p, a, b):
-            return etl.select(p, a, b)
+            return evoxc.select(p, a, b)
 
         with pytest.raises(DTypeError, match="pred must have bool dtype"):
             trace_fn(
                 f,
-                etl.TensorSpec((4,), etl.float32),
-                etl.TensorSpec((4,), etl.float32),
-                etl.TensorSpec((4,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.float32),
+                evoxc.TensorSpec((4,), evoxc.float32),
+                evoxc.TensorSpec((4,), evoxc.float32),
             )
 
     def test_python_int_pred_error(self):
         def f(a, b):
-            return etl.select(1, a, b)
+            return evoxc.select(1, a, b)
 
         with pytest.raises(
             DTypeError, match="bool SymbolicTensor or a Python bool scalar"
         ):
             trace_fn(
                 f,
-                etl.TensorSpec((3,), etl.float32),
-                etl.TensorSpec((3,), etl.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
             )
 
     def test_result_dtype_tensor_plus_tensor(self):
         # result dtype = result_type(on_true, on_false)
         def f(p, a, b):
-            return etl.select(p, a, b)
+            return evoxc.select(p, a, b)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((4,), etl.bool_),
-            etl.TensorSpec((4,), etl.int32),
-            etl.TensorSpec((4,), etl.float32),
+            evoxc.TensorSpec((4,), evoxc.bool_),
+            evoxc.TensorSpec((4,), evoxc.int32),
+            evoxc.TensorSpec((4,), evoxc.float32),
         )
         assert last_result(g).type.dtype == np.dtype("float64")
 
     def test_result_dtype_weak_scalar_branch(self):
         # int scalar branch weak-promotes toward a float32 branch (NEP 50)
         def f(p, a):
-            return etl.select(p, 2, a)
+            return evoxc.select(p, 2, a)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((4,), etl.bool_),
-            etl.TensorSpec((4,), etl.float32),
+            evoxc.TensorSpec((4,), evoxc.bool_),
+            evoxc.TensorSpec((4,), evoxc.float32),
         )
         assert last_result(g).type.dtype == np.dtype("float32")
         const = ops_of(g, "constant")[0]
@@ -1011,29 +1011,29 @@ class TestSelect:
     def test_result_dtype_scalar_against_int_tensor(self):
         # int scalar against an int32 tensor -> plain result_type (int64)
         def f(p, a):
-            return etl.select(p, a, 0)
+            return evoxc.select(p, a, 0)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((4,), etl.bool_),
-            etl.TensorSpec((4,), etl.int32),
+            evoxc.TensorSpec((4,), evoxc.bool_),
+            evoxc.TensorSpec((4,), evoxc.int32),
         )
         assert last_result(g).type.dtype == np.dtype("int64")
 
     def test_symbolic_broadcast_dim_expr_max(self):
         # The three-operand broadcast of the broadcast contract: conflicting
         # symbolic dims combine as DimExpr("max", ...) (runtime-checked).
-        n, m = etl.dim("n"), etl.dim("m")
+        n, m = evoxc.dim("n"), evoxc.dim("m")
 
         def f(p, a, b):
-            return etl.select(p, a, b)
+            return evoxc.select(p, a, b)
 
         g = trace_fn(
             f,
-            etl.TensorSpec((n, 1, 3), etl.bool_),
-            etl.TensorSpec((1, 4, 1), etl.float32),
-            etl.TensorSpec((m, 1, 3), etl.float32),
+            evoxc.TensorSpec((n, 1, 3), evoxc.bool_),
+            evoxc.TensorSpec((1, 4, 1), evoxc.float32),
+            evoxc.TensorSpec((m, 1, 3), evoxc.float32),
         )
         shape = last_result(g).type.shape
         assert shape == (n.max(m), 4, 3)
-        assert isinstance(shape[0], etl.DimExpr) and shape[0].op == "max"
+        assert isinstance(shape[0], evoxc.DimExpr) and shape[0].op == "max"

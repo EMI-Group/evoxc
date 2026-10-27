@@ -1,6 +1,6 @@
-"""Device-free unit tests for the ``etl.io`` module (host ↔ device async copies).
+"""Device-free unit tests for the ``evoxc.io`` module (host ↔ device async copies).
 
-Pins the committed public surface of ``etl/io.py`` (Workstream B):
+Pins the committed public surface of ``evoxc/io.py`` (Workstream B):
 ``prefetch``/``sink`` return ``AsyncCopy`` handles (``.device``/``.direction``/
 ``.done``/``.wait``/``.result``), schedule-time validation is synchronous on
 the calling thread, runtime failures surface at ``wait()``/``result()``/
@@ -30,17 +30,17 @@ import time
 import numpy as np
 import pytest
 
-import etl  # noqa: F401  (import-order A: parent package first)
-import etl.io as io
+import evoxc  # noqa: F401  (import-order A: parent package first)
+import evoxc.io as io
 
-from etl.core import (
+from evoxc.core import (
     Device,
     DeviceError,
     Tensor,
     register_backend_device_transfer_provider,
     register_device_transfer_provider,
 )
-from etl.core.tensor import (
+from evoxc.core.tensor import (
     _BACKEND_DEVICE_TRANSFER_PROVIDERS,
     _DEVICE_TRANSFER_PROVIDERS,
     _PREFERRED_TRANSFER_BACKENDS,
@@ -56,7 +56,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 K_PREF = "fio_pref"        # registered flat-provider kind (prefetch target)
 K_SINK = "fio_sink"        # sink-source kind — payload-only, NEVER registered
 K_ABSENT = "fio_absent"    # never registered → provider DeviceError at wait()
-K_WORKER = "fio_worker"    # provider re-enters etl.io (worker-guard tests)
+K_WORKER = "fio_worker"    # provider re-enters evoxc.io (worker-guard tests)
 K_BACKEND = "fio_backend"  # per-backend provider registration kind
 BACKEND_NAME = "fio_test_backend"
 D_PREF = Device(K_PREF, 0)
@@ -200,7 +200,7 @@ def _drain_outstanding():
     yield
     _wait_until(
         lambda: not io._outstanding, 10.0,
-        f"etl.io worker never drained its outstanding set: {io._outstanding!r}",
+        f"evoxc.io worker never drained its outstanding set: {io._outstanding!r}",
     )
 
 
@@ -208,7 +208,7 @@ def _drain_outstanding():
 # 1. Module surface / API shape
 # ---------------------------------------------------------------------------
 class TestModuleSurface:
-    """Public surface of ``etl.io``. The pristine-state pin below holds only
+    """Public surface of ``evoxc.io``. The pristine-state pin below holds only
     while no copy was scheduled yet in the process: file order guarantees
     that within this file's own run, but an earlier suite in a full-process
     run (tests/backends/ collects before tests/io/) may already have started
@@ -222,7 +222,7 @@ class TestModuleSurface:
     def _require_pristine_process():
         if io._worker_thread is not None:
             pytest.skip(
-                "module-surface pin requires a pristine process; the etl.io "
+                "module-surface pin requires a pristine process; the evoxc.io "
                 "worker was already started by an earlier suite in this run "
                 "(the pin holds in isolated tests/io runs)"
             )
@@ -233,16 +233,16 @@ class TestModuleSurface:
             assert hasattr(io, name)
 
     def test_import_pulls_no_iree(self):
-        # Module imports are stdlib + etl.core only; iree.runtime is imported
+        # Module imports are stdlib + evoxc.core only; iree.runtime is imported
         # lazily inside the worker's non-cpu-context bootstrap and only for
         # non-cpu-kind copies. Pinned in a FRESH interpreter so the check is
         # independent of this process's import history: an earlier suite
         # (e.g. tests/core/test_device.py) may already have pulled
-        # iree.runtime in via etl.core.devices()'s ROCm probe, and this
+        # iree.runtime in via evoxc.core.devices()'s ROCm probe, and this
         # file's own fake-kind copies trigger the worker's lazy import.
         code = (
             "import sys\n"
-            "import etl.io\n"
+            "import evoxc.io\n"
             "bad = sorted(m for m in sys.modules if m == 'iree' or m.startswith('iree.'))\n"
             "assert not bad, bad\n"
         )
@@ -281,7 +281,7 @@ class TestScheduleTimeValidation:
         msg = str(ei.value)
         assert "prefetch() expects a core.Tensor host tensor" in msg
         assert "raw numpy ndarray" in msg
-        assert "etl.tensor(...)" in msg and "core.Tensor(...)" in msg
+        assert "evoxc.tensor(...)" in msg and "core.Tensor(...)" in msg
 
     def test_prefetch_non_tensor_type_errors(self):
         for bad, name in [("nope", "str"), (None, "NoneType"), ([1.0], "list")]:
@@ -299,7 +299,7 @@ class TestScheduleTimeValidation:
             msg = str(ei.value)
             assert "prefetch() expects a core.Device target" in msg
             assert f"got {name}" in msg
-            assert "etl.Device(kind, index)" in msg
+            assert "evoxc.Device(kind, index)" in msg
 
     def test_prefetch_payload_backed_source_device_error(self):
         # A device-payload source (any kind) is not host data → DeviceError
@@ -339,7 +339,7 @@ class TestScheduleTimeValidation:
         msg = str(ei.value)
         assert "sink() expects a core.Tensor device tensor" in msg
         assert "raw numpy ndarray" in msg
-        assert "etl.tensor(...)" in msg and "core.Tensor(...)" in msg
+        assert "evoxc.tensor(...)" in msg and "core.Tensor(...)" in msg
 
     def test_sink_host_ndarray_backed_device_error(self):
         h = _host(np.arange(3.0))
@@ -727,7 +727,7 @@ class TestGcNeverAutoWaits:
 # 9. Worker-thread guards (group 8): RuntimeError with the pinned prefix
 # ---------------------------------------------------------------------------
 class TestWorkerThreadGuards:
-    """Re-entering etl.io from the worker thread would deadlock on its own
+    """Re-entering evoxc.io from the worker thread would deadlock on its own
     queue — every entry point raises RuntimeError naming the worker thread."""
 
     def test_submit_from_worker_raises_runtime_error(self):
@@ -745,7 +745,7 @@ class TestWorkerThreadGuards:
             with pytest.raises(RuntimeError) as ei:
                 h.wait()
             assert str(ei.value).startswith(
-                "prefetch() cannot run on the etl.io worker thread"
+                "prefetch() cannot run on the evoxc.io worker thread"
             )
             assert h.done
         finally:
@@ -757,7 +757,7 @@ class TestWorkerThreadGuards:
             with pytest.raises(RuntimeError) as ei:
                 h2.wait()
             assert str(ei.value).startswith(
-                "sink() cannot run on the etl.io worker thread"
+                "sink() cannot run on the evoxc.io worker thread"
             )
             assert h2.done
         finally:
@@ -783,7 +783,7 @@ class TestWorkerThreadGuards:
             with pytest.raises(RuntimeError) as ei:
                 h.wait()
             assert str(ei.value).startswith(
-                "AsyncCopy.wait() would deadlock on the etl.io worker thread"
+                "AsyncCopy.wait() would deadlock on the evoxc.io worker thread"
             )
             assert h.done
         finally:
@@ -800,7 +800,7 @@ class TestWorkerThreadGuards:
             with pytest.raises(RuntimeError) as ei:
                 h.wait()
             assert str(ei.value).startswith(
-                "wait_all() cannot run on the etl.io worker thread"
+                "wait_all() cannot run on the evoxc.io worker thread"
             )
             assert h.done
         finally:
@@ -820,7 +820,7 @@ class TestWorkerThreadGuards:
 # ---------------------------------------------------------------------------
 class TestPerBackendProviderSlot:
     """``Tensor.to`` resolves the PREFERRED backend's per-backend slot before
-    the flat default slot — pinned end-to-end through ``etl.io.prefetch``."""
+    the flat default slot — pinned end-to-end through ``evoxc.io.prefetch``."""
 
     def test_prefetch_uses_preferred_backend_slot_over_flat(self):
         seen = []
@@ -838,7 +838,7 @@ class TestPerBackendProviderSlot:
         register_device_transfer_provider(K_BACKEND, flat_provider)
         try:
             # The preference is recorded ONLY via the registry's internal
-            # note hook (what etl.backends.registry.get calls on lookup).
+            # note hook (what evoxc.backends.registry.get calls on lookup).
             _note_backend_transfer_preference(BACKEND_NAME)
             r = io.prefetch(_host(np.arange(6.0)), D_BACKEND).result()
             assert r.device == D_BACKEND
@@ -867,9 +867,9 @@ import time
 
 import numpy as np
 
-import etl  # noqa: F401
-import etl.io as io
-from etl.core import Device, Tensor, register_device_transfer_provider
+import evoxc  # noqa: F401
+import evoxc.io as io
+from evoxc.core import Device, Tensor, register_device_transfer_provider
 
 STARTED = threading.Event()
 
@@ -899,9 +899,9 @@ import time
 
 import numpy as np
 
-import etl  # noqa: F401
-import etl.io as io
-from etl.core import Device, Tensor, register_device_transfer_provider
+import evoxc  # noqa: F401
+import evoxc.io as io
+from evoxc.core import Device, Tensor, register_device_transfer_provider
 
 STARTED = threading.Event()
 

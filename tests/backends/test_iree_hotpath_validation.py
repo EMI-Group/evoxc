@@ -1,5 +1,5 @@
 """iree adapter hot-path validation semantics (regression suite for the
-per-call hot-path reductions in ``etl/backends/adapters/iree.py`` — WS-A
+per-call hot-path reductions in ``evoxc/backends/adapters/iree.py`` — WS-A
 round, commits 2622de9/d132b6c):
 
 * ``IreeDevicePayload`` caches ``shape``/``dtype`` at construction: the
@@ -35,7 +35,7 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # data (exactly representable in fp32 -> bit-exact elementwise)
@@ -43,25 +43,25 @@ import etl
 XA = np.arange(24, dtype=np.float32).reshape(4, 6) + 0.25
 XB = np.arange(24, dtype=np.float32).reshape(4, 6) / 2.0 + 1.0
 SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((4, 6), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
 )
 
 
 def _add(x, y):
-    return etl.add(x, y)
+    return evoxc.add(x, y)
 
 
 def _np(v):
     """Tensor / ndarray -> ndarray (host copy)."""
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
 
 def _assert_exact(got, want):
-    for gp, wp in zip(etl.tree_leaves(etl.tree_map(_np, got)),
-                      etl.tree_leaves(etl.tree_map(_np, want))):
+    for gp, wp in zip(evoxc.tree_leaves(evoxc.tree_map(_np, got)),
+                      evoxc.tree_leaves(evoxc.tree_map(_np, want))):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
@@ -73,14 +73,14 @@ def _build_exe(fn, specs):
     key = (fn, specs)
     exe = _EXECUTABLES.get(key)
     if exe is None:
-        exe = etl.build(fn, *specs, backend="iree")  # llvm-cpu default
+        exe = evoxc.build(fn, *specs, backend="iree")  # llvm-cpu default
         _EXECUTABLES[key] = exe
     return exe
 
 
 def _payload_of(tensor):
     """The duck-typed device payload behind a run-out tensor."""
-    assert isinstance(tensor, etl.Tensor)
+    assert isinstance(tensor, evoxc.Tensor)
     assert not isinstance(tensor.data, np.ndarray)
     return tensor.data
 
@@ -90,7 +90,7 @@ def _payload_of(tensor):
 # ---------------------------------------------------------------------------
 def test_payload_metadata_cache_matches_device_array():
     exe = _build_exe(_add, SPECS)
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    out = evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     payload = _payload_of(out)
     # Cached metadata must equal the wrapped DeviceArray's metadata...
     assert payload.shape == tuple(payload.device_array.shape)
@@ -98,11 +98,11 @@ def test_payload_metadata_cache_matches_device_array():
     # ...and the core.Tensor view is consistent with it.
     assert out.shape == payload.shape == (4, 6)
     assert out.dtype == payload.dtype == np.dtype("float32")
-    assert payload.device == etl.core.Device("cpu", 0)
+    assert payload.device == evoxc.core.Device("cpu", 0)
 
 
 def test_payload_metadata_stable_across_host_materialization():
-    out = etl.run(_build_exe(_add, SPECS), etl.core.Tensor(XA), etl.core.Tensor(XB))
+    out = evoxc.run(_build_exe(_add, SPECS), evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     payload = _payload_of(out)
     shape, dtype = payload.shape, payload.dtype
     host = payload.to_host()  # lazy D2H copy must not perturb the cache
@@ -112,13 +112,13 @@ def test_payload_metadata_stable_across_host_materialization():
 
 
 def test_payload_protocol_unchanged():
-    out = etl.run(_build_exe(_add, SPECS), etl.core.Tensor(XA), etl.core.Tensor(XB))
+    out = evoxc.run(_build_exe(_add, SPECS), evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     payload = _payload_of(out)
     assert payload.device_array is payload.device_array  # stable handle
     # np.asarray fallback materializes a correct host copy.
     np.testing.assert_array_equal(np.asarray(payload), XA + XB)
     # .numpy() path is correct end-to-end (bit-exact vs the numpy backend).
-    _assert_exact(out, etl.evaluate(_add, XA, XB))
+    _assert_exact(out, evoxc.evaluate(_add, XA, XB))
 
 
 # ---------------------------------------------------------------------------
@@ -128,41 +128,41 @@ def test_static_shape_fast_path_accepts_matching_inputs():
     # Exact static-shape tuple equality -> the fast path; must pass and be
     # bit-exact (this is the steady-state per-call shape).
     exe = _build_exe(_add, SPECS)
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
-    _assert_exact(out, etl.evaluate(_add, XA, XB))
+    out = evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
+    _assert_exact(out, evoxc.evaluate(_add, XA, XB))
 
 
 def test_static_shape_mismatch_raises_shape_error_naming_dim():
     exe = _build_exe(_add, SPECS)
     bad = np.zeros((4, 7), dtype=np.float32)
     with pytest.raises(
-        etl.ShapeError,
+        evoxc.ShapeError,
         match=r"shape mismatch for input at path \[1\]: spec shape "
               r"\(4, 6\) vs actual shape \(4, 7\) \(dim 1 must be 6, got 7\)",
     ):
-        etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(bad))
+        evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(bad))
 
 
 def test_rank_mismatch_raises_shape_error():
     exe = _build_exe(_add, SPECS)
     flat = np.zeros((4,), dtype=np.float32)
     with pytest.raises(
-        etl.ShapeError,
+        evoxc.ShapeError,
         match=r"rank mismatch for input at path \[0\]: spec shape "
               r"\(4, 6\) has rank 2, got shape \(4,\) with rank 1",
     ):
-        etl.run(exe, etl.core.Tensor(flat), etl.core.Tensor(XB))
+        evoxc.run(exe, evoxc.core.Tensor(flat), evoxc.core.Tensor(XB))
 
 
 def test_dtype_mismatch_raises_dtype_error_never_coerces():
     exe = _build_exe(_add, SPECS)
     f64 = XA.astype(np.float64)
     with pytest.raises(
-        etl.DTypeError,
+        evoxc.DTypeError,
         match=r"dtype mismatch for input at path \[0\]: spec dtype "
               r"float32, got float64",
     ):
-        etl.run(exe, etl.core.Tensor(f64), etl.core.Tensor(XB))
+        evoxc.run(exe, evoxc.core.Tensor(f64), evoxc.core.Tensor(XB))
 
 
 def test_static_shape_mismatch_raises_on_segment_executable():
@@ -173,25 +173,25 @@ def test_static_shape_mismatch_raises_on_segment_executable():
     def _kernel(x):
         return x
 
-    etl.register_external_kernel(name, _kernel)
+    evoxc.register_external_kernel(name, _kernel)
 
-    @etl.defn
+    @evoxc.defn
     def fn(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((4, 6), etl.float32))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((4, 6), evoxc.float32))
 
     try:
         exe = _build_exe(fn, SPECS[:1])
-        ok = etl.run(exe, etl.core.Tensor(XA))
+        ok = evoxc.run(exe, evoxc.core.Tensor(XA))
         _assert_exact(ok, XA)
         bad = np.zeros((4, 7), dtype=np.float32)
         with pytest.raises(
-            etl.ShapeError,
+            evoxc.ShapeError,
             match=r"shape mismatch for input at path \[0\]: spec shape "
                   r"\(4, 6\) vs actual shape \(4, 7\) \(dim 1 must be 6, got 7\)",
         ):
-            etl.run(exe, etl.core.Tensor(bad))
+            evoxc.run(exe, evoxc.core.Tensor(bad))
     finally:
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
 
 
 # ---------------------------------------------------------------------------
@@ -201,26 +201,26 @@ def test_static_shape_mismatch_raises_on_segment_executable():
 # non-static specs — the tuples are unequal, so validation must run).
 # ---------------------------------------------------------------------------
 def test_symbolic_declared_dim_binds_at_run_time():
-    @etl.defn
+    @evoxc.defn
     def fn(x):
         return x * 2 + 1
 
-    exe = etl.build(fn, etl.TensorSpec((etl.dim("B"),), etl.float32),
+    exe = evoxc.build(fn, evoxc.TensorSpec((evoxc.dim("B"),), evoxc.float32),
                     backend="iree")
     x3 = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    out3 = etl.run(exe, x3)
+    out3 = evoxc.run(exe, x3)
     np.testing.assert_array_equal(out3.numpy(), x3 * 2 + 1)
     x5 = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
-    out5 = etl.run(exe, x5)
+    out5 = evoxc.run(exe, x5)
     np.testing.assert_array_equal(out5.numpy(), x5 * 2 + 1)
 
 
 def test_none_declared_dim_unchecked_at_run_time():
-    @etl.defn
+    @evoxc.defn
     def fn(x):
         return x * 2 + 1
 
-    exe = etl.build(fn, etl.TensorSpec((None,), etl.float32), backend="iree")
+    exe = evoxc.build(fn, evoxc.TensorSpec((None,), evoxc.float32), backend="iree")
     for n in (3, 5):
         x = np.arange(n, dtype=np.float32)
-        np.testing.assert_array_equal(etl.run(exe, x).numpy(), x * 2 + 1)
+        np.testing.assert_array_equal(evoxc.run(exe, x).numpy(), x * 2 + 1)

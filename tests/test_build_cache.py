@@ -1,11 +1,11 @@
 """tests/test_build_cache.py — unit coverage for the ``build_cached`` /
-``CompileCache`` memoized-build sugar (``etl.build_cache``, Workstream C).
+``CompileCache`` memoized-build sugar (``evoxc.build_cache``, Workstream C).
 
-The module under test is the memoization sugar over ``etl.build``: the cache
+The module under test is the memoization sugar over ``evoxc.build``: the cache
 key is computed BEFORE any tracing from (fn identity with keepalive, the full
 ``*specs`` tree incl. static content, resolved backend name, resolved device,
-canonicalized options); env defaults ``ETL_BACKEND``/``ETL_DEVICE``/
-``ETL_TARGET_BACKENDS`` resolve per call and participate. Pinned here:
+canonicalized options); env defaults ``EVOXC_BACKEND``/``EVOXC_DEVICE``/
+``EVOXC_TARGET_BACKENDS`` resolve per call and participate. Pinned here:
 
   * key sensitivity (static content, TensorSpec, options, backend, fn id);
   * per-call env resolution, incl. malformed-value errors that count NO miss;
@@ -14,8 +14,8 @@ canonicalized options); env defaults ``ETL_BACKEND``/``ETL_DEVICE``/
     cache (misses increment per attempt), unencodable static leaves raise a
     pre-cache ``TypeError`` naming the component path (no miss counted),
     ``cache=`` type checks, non-callable / Graph ``fn`` rejection;
-  * zero pipeline work on hits (monkeypatched ``etl.pipeline`` /
-    ``etl.trace`` spies);
+  * zero pipeline work on hits (monkeypatched ``evoxc.pipeline`` /
+    ``evoxc.trace`` spies);
   * thread-safety: concurrent distinct-key compiles and the same-key race
     (first-insert-wins, single entry);
   * static args stay in the run signature (validated at run time).
@@ -32,22 +32,22 @@ import threading
 import numpy as np
 import pytest
 
-import etl
-from etl.build_cache import CompileCache, build_cached
+import evoxc
+from evoxc.build_cache import CompileCache, build_cached
 
-SPEC = etl.TensorSpec((4,), etl.float32)
+SPEC = evoxc.TensorSpec((4,), evoxc.float32)
 
 
-@etl.defn
+@evoxc.defn
 def _add_k(x, k):
     """x + static k — the workhorse defn for key-sensitivity tests."""
-    return etl.add(x, k)
+    return evoxc.add(x, k)
 
 
-@etl.defn
+@evoxc.defn
 def _boom(x, k):
     """Raises ZeroDivisionError at TRACE time for the static value k == 3."""
-    return etl.add(x, 1 // (k - 3))
+    return evoxc.add(x, 1 // (k - 3))
 
 
 class _Weird:
@@ -60,8 +60,8 @@ def _x():
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Isolate per-call env resolution: no ETL_* defaults leak between tests."""
-    for var in ("ETL_BACKEND", "ETL_DEVICE", "ETL_TARGET_BACKENDS"):
+    """Isolate per-call env resolution: no EVOXC_* defaults leak between tests."""
+    for var in ("EVOXC_BACKEND", "EVOXC_DEVICE", "EVOXC_TARGET_BACKENDS"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -81,7 +81,7 @@ class TestKeySensitivity:
         # ... with zero extra cache entries and one counted hit.
         assert cache.hits == 1 and cache.misses == 1 and len(cache) == 1
         # And the cached executable is a NORMAL executable.
-        got = etl.run(exe2, _x(), 3).numpy()
+        got = evoxc.run(exe2, _x(), 3).numpy()
         np.testing.assert_allclose(got, _x() + 3, rtol=1e-6, atol=1e-6)
 
     def test_static_content_change_misses(self):
@@ -92,16 +92,16 @@ class TestKeySensitivity:
         assert cache.misses == 2 and cache.hits == 0 and len(cache) == 2
         # Static content participates: 3 and 4 specialize different graphs.
         np.testing.assert_allclose(
-            etl.run(exe3, _x(), 3).numpy(), _x() + 3, rtol=1e-6, atol=1e-6
+            evoxc.run(exe3, _x(), 3).numpy(), _x() + 3, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_allclose(
-            etl.run(exe4, _x(), 4).numpy(), _x() + 4, rtol=1e-6, atol=1e-6
+            evoxc.run(exe4, _x(), 4).numpy(), _x() + 4, rtol=1e-6, atol=1e-6
         )
 
     def test_tensor_spec_shape_change_misses(self):
         cache = CompileCache()
-        spec4 = etl.TensorSpec((4,), etl.float32)
-        spec8 = etl.TensorSpec((8,), etl.float32)
+        spec4 = evoxc.TensorSpec((4,), evoxc.float32)
+        spec8 = evoxc.TensorSpec((8,), evoxc.float32)
         exe1 = build_cached(_add_k, spec4, 3, cache=cache)
         exe2 = build_cached(_add_k, spec8, 3, cache=cache)
         assert exe2 is not exe1
@@ -109,13 +109,13 @@ class TestKeySensitivity:
 
     def test_tensor_spec_dtype_change_misses(self):
         cache = CompileCache()
-        spec_f32 = etl.TensorSpec((4,), etl.float32)
-        spec_f64 = etl.TensorSpec((4,), etl.float64)
+        spec_f32 = evoxc.TensorSpec((4,), evoxc.float32)
+        spec_f64 = evoxc.TensorSpec((4,), evoxc.float64)
         exe1 = build_cached(_add_k, spec_f32, 3, cache=cache)
         exe2 = build_cached(_add_k, spec_f64, 3, cache=cache)
         assert exe2 is not exe1
         assert cache.misses == 2 and len(cache) == 2
-        got = etl.run(exe2, _x().astype(np.float64), 3).numpy()
+        got = evoxc.run(exe2, _x().astype(np.float64), 3).numpy()
         np.testing.assert_allclose(got, _x().astype(np.float64) + 3)
 
     def test_option_change_misses(self):
@@ -160,7 +160,7 @@ class TestKeySensitivity:
         pytest.importorskip("iree.compiler")
         pytest.importorskip("iree.runtime")
         cache = CompileCache()
-        device = etl.Device("cpu", 0)
+        device = evoxc.Device("cpu", 0)
         exe_np = build_cached(_add_k, SPEC, 3, cache=cache)
         assert exe_np.backend == "numpy"
         exe_iree = build_cached(
@@ -176,14 +176,14 @@ class TestKeySensitivity:
         )
         assert exe_iree2 is exe_iree
         assert cache.hits == 1 and cache.misses == 2
-        got = etl.run(exe_iree, _x(), 3).numpy()
+        got = evoxc.run(exe_iree, _x(), 3).numpy()
         np.testing.assert_allclose(got, _x() + 3, rtol=1e-5, atol=1e-5)
 
     def test_unknown_backend_resolution_error_counts_no_miss(self):
         # A resolution failure fires BEFORE any cache access: no miss is
         # counted and nothing is inserted.
         cache = CompileCache()
-        with pytest.raises(etl.BackendError, match="unknown backend 'nope'"):
+        with pytest.raises(evoxc.BackendError, match="unknown backend 'nope'"):
             build_cached(_add_k, SPEC, 3, cache=cache, backend="nope")
         assert cache.hits == 0 and cache.misses == 0 and len(cache) == 0
         # A subsequent healthy call works (first real miss).
@@ -193,46 +193,46 @@ class TestKeySensitivity:
 
 
 # --------------------------------------------------------------------------
-# 2. Per-call env defaults (ETL_BACKEND / ETL_DEVICE)
+# 2. Per-call env defaults (EVOXC_BACKEND / EVOXC_DEVICE)
 # --------------------------------------------------------------------------
 
 
 class TestEnvDefaults:
-    def test_malformed_etl_backend_counts_no_miss(self, monkeypatch):
-        monkeypatch.setenv("ETL_BACKEND", "nonsense")
+    def test_malformed_evoxc_backend_counts_no_miss(self, monkeypatch):
+        monkeypatch.setenv("EVOXC_BACKEND", "nonsense")
         cache = CompileCache()
-        with pytest.raises(etl.BackendError, match="unknown backend 'nonsense'"):
+        with pytest.raises(evoxc.BackendError, match="unknown backend 'nonsense'"):
             build_cached(_add_k, SPEC, 3, cache=cache)
         # Resolution errors never touch the cache.
         assert cache.hits == 0 and cache.misses == 0 and len(cache) == 0
 
-    def test_valid_etl_backend_env_works(self, monkeypatch):
+    def test_valid_evoxc_backend_env_works(self, monkeypatch):
         cache = CompileCache()
-        monkeypatch.setenv("ETL_BACKEND", "nonsense")
-        with pytest.raises(etl.BackendError):
+        monkeypatch.setenv("EVOXC_BACKEND", "nonsense")
+        with pytest.raises(evoxc.BackendError):
             build_cached(_add_k, SPEC, 3, cache=cache)
         assert cache.misses == 0
         # The env var is read lazily per call: a valid value now resolves.
-        monkeypatch.setenv("ETL_BACKEND", "numpy")
+        monkeypatch.setenv("EVOXC_BACKEND", "numpy")
         exe = build_cached(_add_k, SPEC, 3, cache=cache)
-        assert exe.backend == "numpy" and exe.device == etl.Device("cpu", 0)
+        assert exe.backend == "numpy" and exe.device == evoxc.Device("cpu", 0)
         assert cache.misses == 1 and len(cache) == 1
 
-    def test_malformed_etl_device_raises_and_counts_no_miss(self, monkeypatch):
-        monkeypatch.setenv("ETL_DEVICE", "cuda::9")
+    def test_malformed_evoxc_device_raises_and_counts_no_miss(self, monkeypatch):
+        monkeypatch.setenv("EVOXC_DEVICE", "cuda::9")
         cache = CompileCache()
-        with pytest.raises(etl.DeviceError) as excinfo:
+        with pytest.raises(evoxc.DeviceError) as excinfo:
             build_cached(_add_k, SPEC, 3, cache=cache)
         message = str(excinfo.value)
-        assert "ETL_DEVICE" in message and "cuda::9" in message
+        assert "EVOXC_DEVICE" in message and "cuda::9" in message
         assert "expected 'kind' or 'kind:index'" in message
         assert cache.hits == 0 and cache.misses == 0 and len(cache) == 0
 
-    def test_valid_etl_device_env_works(self, monkeypatch):
-        monkeypatch.setenv("ETL_DEVICE", "cpu")
+    def test_valid_evoxc_device_env_works(self, monkeypatch):
+        monkeypatch.setenv("EVOXC_DEVICE", "cpu")
         cache = CompileCache()
         exe = build_cached(_add_k, SPEC, 3, cache=cache)
-        assert exe.device == etl.Device("cpu", 0)
+        assert exe.device == evoxc.Device("cpu", 0)
         assert cache.misses == 1 and len(cache) == 1
 
 
@@ -289,7 +289,7 @@ class TestCacheCountersAndLRU:
 
     def test_direct_cache_api(self):
         cache = CompileCache()
-        assert isinstance(cache, etl.Cache)
+        assert isinstance(cache, evoxc.Cache)
         assert cache.maxsize == 128
         # get with compute_fn on a miss: computes, stores, counts a miss.
         value = cache.get(("key", 1), compute_fn=lambda: "v1")
@@ -323,7 +323,7 @@ class TestCacheCountersAndLRU:
     def test_cache_none_uses_module_default(self, monkeypatch):
         # cache=None -> the process-global module default. Swap the module
         # global so the test stays isolated from the rest of the session.
-        import etl.build_cache as build_cache_module
+        import evoxc.build_cache as build_cache_module
 
         private = CompileCache()
         monkeypatch.setattr(build_cache_module, "_DEFAULT_CACHE", private)
@@ -340,9 +340,9 @@ class TestCacheCountersAndLRU:
 
 class TestFnIdentity:
     def test_two_defns_with_identical_specs_are_distinct_entries(self):
-        @etl.defn
+        @evoxc.defn
         def _add_k_sibling(x, k):
-            return etl.add(x, k)
+            return evoxc.add(x, k)
 
         cache = CompileCache()
         exe1 = build_cached(_add_k, SPEC, 7, cache=cache)
@@ -351,10 +351,10 @@ class TestFnIdentity:
         assert cache.misses == 2 and len(cache) == 2
         # Both are functional.
         np.testing.assert_allclose(
-            etl.run(exe1, _x(), 7).numpy(), _x() + 7, rtol=1e-6, atol=1e-6
+            evoxc.run(exe1, _x(), 7).numpy(), _x() + 7, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_allclose(
-            etl.run(exe2, _x(), 7).numpy(), _x() + 7, rtol=1e-6, atol=1e-6
+            evoxc.run(exe2, _x(), 7).numpy(), _x() + 7, rtol=1e-6, atol=1e-6
         )
 
 
@@ -375,7 +375,7 @@ class TestErrorPropagation:
         # A healthy call afterwards works normally.
         exe = build_cached(_boom, SPEC, 5, cache=cache)
         np.testing.assert_allclose(
-            etl.run(exe, _x(), 5).numpy(), _x(), rtol=1e-6, atol=1e-6
+            evoxc.run(exe, _x(), 5).numpy(), _x(), rtol=1e-6, atol=1e-6
         )
         assert cache.misses == 4 and len(cache) == 1
         # And the healthy entry is cached like any other.
@@ -397,7 +397,7 @@ class TestErrorPropagation:
             build_cached(_add_k, SPEC, leaf, cache=cache)
         message = str(excinfo.value)
         assert f"at specs[1] of type '{typename}'" in message
-        assert "etl.persist covers" in message  # guidance suffix
+        assert "evoxc.persist covers" in message  # guidance suffix
         # Pre-cache TypeError: the cache is untouched, no miss counted.
         assert cache.hits == 0 and cache.misses == 0 and len(cache) == 0
 
@@ -408,12 +408,12 @@ class TestErrorPropagation:
         message = str(excinfo.value)
         assert "options['foo']" in message
         assert "of type '_Weird'" in message
-        assert "etl.persist covers" in message
+        assert "evoxc.persist covers" in message
         assert cache.hits == 0 and cache.misses == 0 and len(cache) == 0
 
     def test_cache_type_checks(self):
         # cache=object() and cache=False: no cache=False escape exists —
-        # plain etl.build is the documented no-cache path.
+        # plain evoxc.build is the documented no-cache path.
         for bad_cache in (object(), False):
             with pytest.raises(
                 TypeError, match="must be a CompileCache instance"
@@ -430,7 +430,7 @@ class TestErrorPropagation:
     def test_graph_fn_typeerror(self):
         # An already-traced Graph is a different pipeline stage: reject with
         # guidance toward the explicit lower/compile/load pipeline.
-        graph = etl.trace(_add_k, SPEC, 3)
+        graph = evoxc.trace(_add_k, SPEC, 3)
         with pytest.raises(TypeError) as excinfo:
             build_cached(graph, SPEC, 3, cache=CompileCache())
         message = str(excinfo.value)
@@ -461,10 +461,10 @@ class TestNoPipelineWorkOnHit:
 
             return wrapper
 
-        monkeypatch.setattr(sys.modules["etl.trace"], "trace", _spy("trace"))
-        monkeypatch.setattr(sys.modules["etl.pipeline"], "lower", _spy("lower"))
-        monkeypatch.setattr(sys.modules["etl.pipeline"], "compile", _spy("compile"))
-        monkeypatch.setattr(sys.modules["etl.pipeline"], "load", _spy("load"))
+        monkeypatch.setattr(sys.modules["evoxc.trace"], "trace", _spy("trace"))
+        monkeypatch.setattr(sys.modules["evoxc.pipeline"], "lower", _spy("lower"))
+        monkeypatch.setattr(sys.modules["evoxc.pipeline"], "compile", _spy("compile"))
+        monkeypatch.setattr(sys.modules["evoxc.pipeline"], "load", _spy("load"))
 
         exe2 = build_cached(_add_k, SPEC, 3, cache=cache)
         assert exe2 is exe1
@@ -497,7 +497,7 @@ class TestThreadSafety:
         assert errors == []
         assert len(cache) == 8 and cache.misses == 8 and cache.hits == 0
         for i in range(8):
-            got = etl.run(results[i], _x(), 100 + i).numpy()
+            got = evoxc.run(results[i], _x(), 100 + i).numpy()
             np.testing.assert_allclose(
                 got, _x() + 100 + i, rtol=1e-6, atol=1e-6
             )
@@ -524,7 +524,7 @@ class TestThreadSafety:
         assert len(cache) == 1
         assert cache.misses >= 1
         # ... and it is fully functional.
-        got = etl.run(results[0], _x(), 999).numpy()
+        got = evoxc.run(results[0], _x(), 999).numpy()
         np.testing.assert_allclose(got, _x() + 999, rtol=1e-6, atol=1e-6)
 
 
@@ -537,14 +537,14 @@ class TestStaticArgsAtRun:
     def test_run_accepts_and_validates_static_value(self):
         cache = CompileCache()
         exe = build_cached(_add_k, SPEC, 3, cache=cache)
-        got = etl.run(exe, _x(), 3).numpy()
+        got = evoxc.run(exe, _x(), 3).numpy()
         np.testing.assert_allclose(got, _x() + 3, rtol=1e-6, atol=1e-6)
 
     def test_run_rejects_wrong_static_value(self):
         cache = CompileCache()
         exe = build_cached(_add_k, SPEC, 3, cache=cache)
-        with pytest.raises(etl.TraceError) as excinfo:
-            etl.run(exe, _x(), 4)
+        with pytest.raises(evoxc.TraceError) as excinfo:
+            evoxc.run(exe, _x(), 4)
         message = str(excinfo.value)
         assert "specialized on 3" in message
         assert "path [1]" in message

@@ -1,8 +1,8 @@
-"""Public-API integration smoke tests for the etl persistence layer.
+"""Public-API integration smoke tests for the evoxc persistence layer.
 
-Everything here goes through the root ``etl`` package exactly as a user
-would consume it: ``etl.persist.*``, ``etl.FileCache`` / ``etl.Cache``, and
-the public error type ``etl.core.PersistenceError``. Full pipeline-type
+Everything here goes through the root ``evoxc`` package exactly as a user
+would consume it: ``evoxc.persist.*``, ``evoxc.FileCache`` / ``evoxc.Cache``, and
+the public error type ``evoxc.core.PersistenceError``. Full pipeline-type
 artifact round-trips (Graph / LoweredProgram / CompiledArtifact saves) are
 covered by ``tests/pipeline_test.py`` and are deliberately not duplicated.
 """
@@ -13,19 +13,19 @@ import struct
 import numpy as np
 import pytest
 
-import etl
-from etl.core import Dim, Device, PersistenceError, TensorSpec
-from etl.persist import ETL_FORMAT_VERSION
+import evoxc
+from evoxc.core import Dim, Device, PersistenceError, TensorSpec
+from evoxc.persist import EVOXC_FORMAT_VERSION
 
 
 def test_public_api_surface():
     """The persistence primitives are reachable through the root package."""
-    assert callable(etl.persist.save_object)
-    assert callable(etl.persist.load_object)
-    assert etl.persist.FileCache is etl.FileCache
-    assert etl.persist.Cache is etl.Cache
+    assert callable(evoxc.persist.save_object)
+    assert callable(evoxc.persist.load_object)
+    assert evoxc.persist.FileCache is evoxc.FileCache
+    assert evoxc.persist.Cache is evoxc.Cache
     # The public error type users catch is the same object everywhere.
-    assert etl.PersistenceError is PersistenceError
+    assert evoxc.PersistenceError is PersistenceError
 
 
 def _artifact_payload():
@@ -56,11 +56,11 @@ def _artifact_payload():
 
 def test_save_load_roundtrip_artifact_payload(tmp_path):
     """save_object/load_object round-trip a realistic payload verbatim."""
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     payload = _artifact_payload()
 
-    etl.persist.save_object(path, "test.artifact", payload)
-    loaded = etl.persist.load_object(path)
+    evoxc.persist.save_object(path, "test.artifact", payload)
+    loaded = evoxc.persist.load_object(path)
     assert loaded.payload_type == "test.artifact"
 
     got = loaded.payload
@@ -86,14 +86,14 @@ def test_save_load_roundtrip_artifact_payload(tmp_path):
 
 
 def test_filecache_smoke_through_root_package(tmp_path):
-    """FileCache put/get/hit-reuse through ``etl.FileCache``."""
+    """FileCache put/get/hit-reuse through ``evoxc.FileCache``."""
     key = ("artifact", "v1", {"dtype": np.dtype("float32")})
     payload = {
         "w": np.arange(6, dtype=np.float32).reshape(2, 3),
         "bias": np.array([0.1, 0.2], dtype=np.float32),
     }
 
-    cache = etl.FileCache(tmp_path / "smoke_cache")
+    cache = evoxc.FileCache(tmp_path / "smoke_cache")
     cache.put(key, payload)
 
     # Hit without a compute_fn: the stored value comes back unchanged.
@@ -111,7 +111,7 @@ def test_filecache_smoke_through_root_package(tmp_path):
         }
 
     # A fresh instance on the same directory hits without recomputing.
-    fresh = etl.FileCache(tmp_path / "smoke_cache")
+    fresh = evoxc.FileCache(tmp_path / "smoke_cache")
     hit = fresh.get(key, compute_fn=compute)
     assert calls["n"] == 0
     assert np.array_equal(hit["w"], payload["w"])
@@ -124,23 +124,23 @@ def test_filecache_smoke_through_root_package(tmp_path):
 
 def test_tampered_payload_raises_persistence_error(tmp_path):
     """One flipped payload byte surfaces as the public PersistenceError."""
-    path = tmp_path / "tampered.etl"
-    etl.persist.save_object(path, "test.tamper", {"x": np.arange(4, dtype=np.int64)})
+    path = tmp_path / "tampered.evoxc"
+    evoxc.persist.save_object(path, "test.tamper", {"x": np.arange(4, dtype=np.int64)})
 
     data = bytearray(path.read_bytes())
-    # Byte layout: magic(7) + version(4) + header_len(4) + header + payload_len(8) + payload.
-    header_len = struct.unpack(">I", bytes(data[11:15]))[0]
-    payload_start = 15 + header_len + 8
+    # Byte layout: magic(9) + version(4) + header_len(4) + header + payload_len(8) + payload.
+    header_len = struct.unpack(">I", bytes(data[13:17]))[0]
+    payload_start = 17 + header_len + 8
     data[payload_start] ^= 0x01  # single-bit flip inside the payload
     path.write_bytes(bytes(data))
 
     with pytest.raises(PersistenceError, match="corrupt"):
-        etl.persist.load_object(path)
+        evoxc.persist.load_object(path)
 
 
 def test_loaded_format_version_matches_public_constant(tmp_path):
-    """loaded.format_version reports the public ETL_FORMAT_VERSION."""
-    path = tmp_path / "version.etl"
-    etl.persist.save_object(path, "test.version", {"v": 1})
-    loaded = etl.persist.load_object(path)
-    assert loaded.format_version == ETL_FORMAT_VERSION
+    """loaded.format_version reports the public EVOXC_FORMAT_VERSION."""
+    path = tmp_path / "version.evoxc"
+    evoxc.persist.save_object(path, "test.version", {"v": 1})
+    loaded = evoxc.persist.load_object(path)
+    assert loaded.format_version == EVOXC_FORMAT_VERSION

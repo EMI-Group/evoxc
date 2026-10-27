@@ -1,0 +1,1466 @@
+"""PJRT C API driver for the XLA adapter (see ``xla.py``).
+
+Everything in this module is imported from ``xla.py`` ONLY (it is not part
+of any public surface). This module replaces the former native-binding
+plumbing with a pure-stdlib ctypes driver over a user-provided PJRT C API
+plugin (``_pjrt_c_api.py`` holds the vendored ABI translation; the header
+provenance and the version-gate contract are documented there).
+
+Plugin flow (the header ``xla/pjrt/c/pjrt_c_api.h`` is the contract):
+
+1. **Discovery.** The plugin .so is NOT shipped with this package (there is
+   no standalone XLA PJRT plugin distribution on PyPI). The user provides
+   it; resolution order: (a) ``options["plugin_path"]`` (the backend
+   compile-options dict, e.g. ``evoxc.compile(lowered, backend="xla",
+   plugin_path="/path/to/pjrt_c_api_cpu_plugin.so")``), (b) the
+   ``EVOXC_PJRT_PLUGIN`` environment variable, (c) a small set of well-known
+   paths (``/usr/local/lib``, ``/usr/lib``, ``$HOME/.local/lib``, the
+   current directory). None found -> ``core.BackendError`` with build
+   instructions (``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin`` from
+   OpenXLA, or any XLA build exporting ``GetPjRtApi``).
+2. **Load.** ``ctypes.CDLL(path)`` -> ``GetPjRtApi()`` -> version gate
+   (``verify_api`` in ``_pjrt_c_api.py``: ABI major + ``struct_size``
+   coverage) -> one-time ``PJRT_Plugin_Initialize``.
+3. **Compile.** ``PJRT_Client_Create`` (empty options) ->
+   ``PJRT_Client_Compile`` with ``PJRT_Program{code=mlir_text,
+   format="mlir"}`` — the plugin accepts StableHLO MLIR text directly (the
+   header documents ``"mlir"`` as "MLIR module bytecode (or string)"). No
+   MLIR parsing happens in this process. Clients come from the
+   process-global refcounted cache (``acquire_client``/``release_client`` —
+   ONE live client per plugin path; see the section note: GPU plugins grab
+   a large BFC pool per client and abort the process on exhaustion).
+4. **Inputs.** ``PJRT_Client_BufferFromHostBuffer`` with dense
+   row-major numpy arrays and ``kImmutableUntilTransferCompletes``
+   semantics: the driver awaits the returned ``done_with_host_buffer``
+   event before returning (and keeps the array alive on the buffer object
+   until the buffer is destroyed — the header's lifetime contract).
+5. **Execute.** ``PJRT_LoadedExecutable_Execute`` with one device, the
+   staged buffers, and a zeroed ``PJRT_ExecuteOptions``. Per-call cost
+   discipline (device-resident hot paths): the executable's output count is
+   queried ONCE per loaded executable and cached, and the ctypes argument
+   scaffolding (input/output pointer arrays, ``PJRT_ExecuteOptions``,
+   ``PJRT_LoadedExecutable_Execute_Args``) is built once per
+   ``(executable, num_args, num_outputs)`` PER THREAD (``threading.local`` —
+   concurrent runs of one executable from different threads never share
+   mutable scaffolding) and reused, so a call writes only the input buffer
+   pointers before invoking. ``execute(output_meta=...)`` may pass the
+   caller's static output ``(shape, dtype)`` pairs, which are prefilled on
+   the returned ``_Buffer`` objects so their metadata costs no plugin FFI
+   (see ``_Buffer``: prefilled values are verified against the real plugin
+   metadata on demand).
+6. **Outputs.** Per output buffer: ``PJRT_Buffer_ElementType`` +
+   ``PJRT_Buffer_Dimensions`` -> allocate a writable numpy array ->
+   ``PJRT_Buffer_ToHostBuffer`` -> await + destroy the completion event.
+   Device-resident execution (see ``xla.py``) skips the copy: output
+   buffers are wrapped as payloads that stay on the device, and
+   same-device payload buffers are handed to
+   ``PJRT_LoadedExecutable_Execute`` directly (no host staging).
+7. **Persistence.** ``PJRT_Executable_Serialize`` (bytes copied out; the
+   serialized wrapper is released via its deleter) and
+   ``PJRT_Executable_DeserializeAndLoad`` for load.
+
+Error handling (binding): every call returns ``PJRT_Error*`` (NULL =
+success); on error the driver extracts ``PJRT_Error_Message`` text,
+destroys the error, and raises ``core.BackendError`` naming the failing
+step. No silent fallbacks. Lifecycle hygiene: every handle the plugin
+creates (errors, events, buffers, executables, clients) is destroyed via
+the matching ``PJRT_*_Destroy`` entry point in ``try/finally`` or the
+handle wrappers' ``close()``; clients additionally follow the shared-cache
+reference discipline (``acquire_client``/``release_client``).
+
+Import discipline (binding): stdlib + ``evoxc.core`` + the sibling
+``_pjrt_c_api`` module only at top level; numpy is imported inside
+function bodies.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import threading
+from typing import Any
+
+from evoxc import core
+
+from . import _pjrt_c_api as pjrt
+
+__all__ = [
+    "_StaticShapeError",
+    "_resolve_static_shape",
+    "PjrtPlugin",
+    "_find_plugin_path",
+    "_load_plugin",
+    "_DEFAULT_PLUGIN_PATHS",
+    "acquire_client",
+    "release_client",
+    "release_payload",
+    "release_payloads",
+    "set_opt_level",
+]
+
+#: Well-known locations probed when no explicit plugin path is configured.
+_DEFAULT_PLUGIN_PATHS = (
+    "/usr/local/lib/pjrt_c_api_cpu_plugin.so",
+    "/usr/lib/pjrt_c_api_cpu_plugin.so",
+    os.path.expanduser("~/.local/lib/pjrt_c_api_cpu_plugin.so"),
+    "./pjrt_c_api_cpu_plugin.so",
+)
+
+#: Environment variable naming the plugin .so path.
+_ENV_PLUGIN = "EVOXC_PJRT_PLUGIN"
+
+_PLUGIN_MISSING_MESSAGE = (
+    "the xla adapter requires a PJRT C API plugin library (.so exporting "
+    "GetPjRtApi) and none was found. Provide one via the backend compile "
+    "options (evoxc.compile(lowered, backend='xla', "
+    "plugin_path='/path/to/pjrt_c_api_cpu_plugin.so')) or the "
+    f"{_ENV_PLUGIN} environment variable; well-known paths searched: "
+    + ", ".join(_DEFAULT_PLUGIN_PATHS)
+    + ". Build one from OpenXLA with `bazel build "
+    "//xla/pjrt/c:pjrt_c_api_cpu_plugin` (or use any XLA build exporting "
+    "GetPjRtApi). There is no pip-installable plugin; this adapter never "
+    "imports a native binding package."
+)
+
+#: dtype name (numpy) -> PJRT_Buffer_Type. Covers ALL 14 evoxc dtypes,
+#: including complex64/complex128 (numpy's complex layout matches C
+#: ``std::complex``: interleaved real/imag pairs).
+_DTYPE_NAME_TO_PJRT = {
+    "float16": pjrt.PJRT_Buffer_Type.F16,
+    "float32": pjrt.PJRT_Buffer_Type.F32,
+    "float64": pjrt.PJRT_Buffer_Type.F64,
+    "int8": pjrt.PJRT_Buffer_Type.S8,
+    "int16": pjrt.PJRT_Buffer_Type.S16,
+    "int32": pjrt.PJRT_Buffer_Type.S32,
+    "int64": pjrt.PJRT_Buffer_Type.S64,
+    "uint8": pjrt.PJRT_Buffer_Type.U8,
+    "uint16": pjrt.PJRT_Buffer_Type.U16,
+    "uint32": pjrt.PJRT_Buffer_Type.U32,
+    "uint64": pjrt.PJRT_Buffer_Type.U64,
+    "bool": pjrt.PJRT_Buffer_Type.PRED,
+    "complex64": pjrt.PJRT_Buffer_Type.C64,
+    "complex128": pjrt.PJRT_Buffer_Type.C128,
+}
+
+_PJRT_TO_DTYPE_NAME = {v: k for k, v in _DTYPE_NAME_TO_PJRT.items()}
+
+
+# ---------------------------------------------------------------------------
+# xla.CompileOptionsProto wire-format editing (pure python — no protobuf
+# runtime; stdlib + evoxc.core only, matching this module's import discipline)
+# ---------------------------------------------------------------------------
+
+#: ``CompileOptionsProto.executable_build_options`` = field 3, wiretype 2
+#: (length-delimited). Tag bytes: (3 << 3) | 2 = 26 -> varint ``1A``.
+_EBO_TAG = bytes((0x1A,))
+
+#: ``ExecutableBuildOptionsProto.optimization_level`` = field 24, wiretype 0
+#: (varint). Tag bytes: (24 << 3) | 0 = 192 -> varint ``C0 01`` (empirically
+#: verified against jaxlib 0.10.2's own serializer — see ``set_opt_level``).
+_OPT_LEVEL_TAG = bytes((0xC0, 0x01))
+
+
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
+    """Decode a base-128 varint starting at ``pos``; return (value, next_pos)."""
+    value = 0
+    shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _encode_varint(value: int) -> bytes:
+    """Encode a non-negative int as a base-128 varint (minimal form)."""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def set_opt_level(compile_options: bytes, level: int) -> bytes:
+    """Inject ``ExecutableBuildOptionsProto.optimization_level`` into a
+    serialized ``xla.CompileOptionsProto`` — pure-python wire-format editor.
+
+    Parses the outer message into ``(key, wiretype, payload)`` segments
+    (multi-byte varint keys and lengths handled), locates the LAST field-3
+    wiretype-2 segment = the ``executable_build_options`` (EBO) submessage
+    (protobuf last-wins), appends a field-24 varint ``c0 01 <level>`` to
+    that payload, rebuilds the field-3 segment with the new length (proper
+    multi-byte varint length encoding), and reassembles the outer message
+    preserving every other segment byte-for-byte.
+
+    Wire-format facts (VERIFIED EMPIRICALLY against jaxlib 0.10.2's own
+    ``CompileOptions.SerializeAsString()``): the outer proto decodes as a
+    single field-3 wiretype-2 submessage = ``executable_build_options``
+    (the adapter's default ``bytes.fromhex("1a0420012801")``: ``1a 04`` =
+    key 3 wt 2, length 4; inner ``20 01`` = num_replicas field 4 varint 1;
+    ``28 01`` = num_partitions field 5 varint 1); setting
+    ``optimization_level`` appends exactly ``c0 01 <N>`` (key 24 wt 0
+    varint) inside the EBO payload — jaxlib's serializer omits the field
+    when 0 (XLA treats unset as default).
+
+    Conflict rule (binding): an explicit optimization level ALREADY present
+    in the user's ``xla_compile_options`` (a field-24 varint in the EBO)
+    WINS — the input bytes are returned UNCHANGED (never both, never
+    override, never corrupt). Level 0 is injected EXPLICITLY (``c0 01 00``
+    is present in the output — no silent skip; XLA reads it as the default,
+    wire-valid). An outer message with NO field-3 segment gets a new
+    field-3 segment containing only the level field (wire-format-valid;
+    protobuf merge semantics make it correct).
+
+    ``level`` must be an int 0..3 (the caller normalizes via
+    ``evoxc.backends.options.normalize_opt_level``). Malformed input
+    (truncated segments, unsupported wiretypes, deprecated group
+    wiretypes) raises ``core.BackendError`` — never silent corruption.
+    """
+    if not isinstance(compile_options, bytes):
+        raise core.BackendError(
+            "set_opt_level expects serialized xla.CompileOptionsProto bytes, "
+            f"got {type(compile_options).__name__}"
+        )
+    if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 3:
+        raise core.BackendError(
+            f"opt_level must be an int 0..3, got {level!r}"
+        )
+
+    # --- Parse the outer message into (key, wiretype, raw, payload) segments.
+    data = compile_options
+    n = len(data)
+    segments: list[tuple[int, int, bytes, bytes | None]] = []
+    ebo_index: int | None = None  # index of the LAST field-3 wt2 segment
+    pos = 0
+    while pos < n:
+        start = pos
+        tag, pos = _read_varint(data, pos)
+        key = tag >> 3
+        wiretype = tag & 0x07
+        if wiretype == 0:  # varint
+            _, pos = _read_varint(data, pos)
+            payload = None
+        elif wiretype == 1:  # 64-bit
+            if pos + 8 > n:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 64-bit field"
+                )
+            pos += 8
+            payload = None
+        elif wiretype == 2:  # length-delimited
+            length, pos = _read_varint(data, pos)
+            end = pos + length
+            if end > n:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated "
+                    "length-delimited field"
+                )
+            payload = data[pos:end]
+            pos = end
+        elif wiretype == 5:  # 32-bit
+            if pos + 4 > n:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 32-bit field"
+                )
+            pos += 4
+            payload = None
+        else:
+            raise core.BackendError(
+                "malformed xla_compile_options: unsupported wiretype "
+                f"{wiretype} (deprecated group wiretypes are not supported)"
+            )
+        segments.append((key, wiretype, data[start:pos], payload))
+        if key == 3 and wiretype == 2:
+            ebo_index = len(segments) - 1  # last field-3 segment wins
+
+    # --- No EBO submessage: append a fresh field-3 segment with only the
+    # --- level field (protobuf merge semantics make it correct).
+    if ebo_index is None:
+        level_field = _OPT_LEVEL_TAG + _encode_varint(level)
+        new_segment = _EBO_TAG + _encode_varint(len(level_field)) + level_field
+        return data + new_segment
+
+    # --- Parse the EBO payload; a field-24 varint = user's explicit level.
+    ebo_key, ebo_wt, ebo_raw, ebo_payload = segments[ebo_index]
+    p = 0
+    m = len(ebo_payload)
+    while p < m:
+        ftag, p = _read_varint(ebo_payload, p)
+        fkey = ftag >> 3
+        fwt = ftag & 0x07
+        if fkey == 24:
+            if fwt == 0:
+                return compile_options  # conflict: user's level wins, unchanged
+            raise core.BackendError(
+                "malformed xla_compile_options: field 24 "
+                "(optimization_level) has wiretype "
+                f"{fwt}, expected varint (0)"
+            )
+        if fwt == 0:
+            _, p = _read_varint(ebo_payload, p)
+        elif fwt == 1:
+            if p + 8 > m:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 64-bit field "
+                    "inside executable_build_options"
+                )
+            p += 8
+        elif fwt == 2:
+            flen, p = _read_varint(ebo_payload, p)
+            if p + flen > m:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated "
+                    "length-delimited field inside executable_build_options"
+                )
+            p += flen
+        elif fwt == 5:
+            if p + 4 > m:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 32-bit field "
+                    "inside executable_build_options"
+                )
+            p += 4
+        else:
+            raise core.BackendError(
+                "malformed xla_compile_options: unsupported wiretype "
+                f"{fwt} inside executable_build_options"
+            )
+
+    # --- Append the level field and rebuild the field-3 segment.
+    new_payload = ebo_payload + _OPT_LEVEL_TAG + _encode_varint(level)
+    new_segment = _EBO_TAG + _encode_varint(len(new_payload)) + new_payload
+    segments[ebo_index] = (ebo_key, ebo_wt, new_segment, new_payload)
+    return b"".join(raw for _, _, raw, _ in segments)
+
+
+class _StaticShapeError(Exception):
+    """Internal: a signature shape is not statically resolvable."""
+
+
+def _resolve_static_shape(shape: tuple[Any, ...], where: str) -> tuple[int, ...]:
+    """Evaluate a declared shape to concrete ints (static-shape gate).
+
+    Accepts plain ints, ``Dim`` with a known size, and ``DimExpr`` that
+    evaluates with NO free runtime dims. A ``None`` entry (runtime-dynamic
+    dim), a ``Dim`` without a known size, an expression with free dims, or
+    any other entry raises ``_StaticShapeError`` naming the offending dim.
+    """
+    resolved: list[int] = []
+    for i, entry in enumerate(shape):
+        if entry is None:
+            raise _StaticShapeError(
+                f"{where}, dim {i} is runtime-dynamic (None) — XLA requires "
+                "a static size here"
+            )
+        if isinstance(entry, bool):
+            raise _StaticShapeError(
+                f"{where}, dim {i} is a Python bool ({entry!r}) — not a "
+                "valid shape entry"
+            )
+        if isinstance(entry, int):
+            resolved.append(entry)
+            continue
+        if isinstance(entry, core.Dim):
+            if entry.size is None:
+                raise _StaticShapeError(
+                    f"{where}, dim {i} is the symbolic dimension "
+                    f"Dim({entry.name!r}) without a known size"
+                )
+            resolved.append(entry.size)
+            continue
+        if isinstance(entry, core.DimExpr):
+            try:
+                resolved.append(entry.evaluate({}))
+            except core.ShapeError as exc:
+                raise _StaticShapeError(
+                    f"{where}, dim {i} is the symbolic expression {entry!r} "
+                    "with free runtime dimensions"
+                ) from exc
+            continue
+        raise _StaticShapeError(
+            f"{where}, dim {i} is an unsupported shape entry {entry!r} of "
+            f"type {type(entry).__name__}"
+        )
+    return tuple(resolved)
+
+
+# ---------------------------------------------------------------------------
+# Plugin discovery / loading
+# ---------------------------------------------------------------------------
+
+#: Paths already initialized (PJRT_Plugin_Initialize is one-time per plugin).
+_initialized_plugins: set[str] = set()
+_initialized_lock = threading.Lock()
+
+
+def _find_plugin_path(options: dict | None = None) -> str:
+    """Resolve the PJRT plugin .so path (discovery order in the docstring)."""
+    if isinstance(options, dict) and options.get("plugin_path"):
+        candidate = options["plugin_path"]
+        source = "options['plugin_path']"
+    else:
+        candidate = os.environ.get(_ENV_PLUGIN) or ""
+        source = f"the {_ENV_PLUGIN} environment variable"
+    if candidate:
+        if not isinstance(candidate, str) or not os.path.isfile(candidate):
+            raise core.BackendError(
+                f"{source} names {candidate!r}, which is not a file — the "
+                "xla adapter needs a PJRT C API plugin library there"
+            )
+        return os.path.abspath(candidate)
+    for candidate in _DEFAULT_PLUGIN_PATHS:
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    raise core.BackendError(_PLUGIN_MISSING_MESSAGE)
+
+
+def _load_plugin(options: dict | None = None) -> "PjrtPlugin":
+    """Load (and cache per path) the PJRT plugin; raise ``core.BackendError``.
+
+    Wraps ``_pjrt_c_api.load_plugin_library`` (``PJRTError`` ->
+    ``core.BackendError`` with an actionable message) and performs the
+    one-time ``PJRT_Plugin_Initialize``.
+    """
+    path = _find_plugin_path(options)
+    try:
+        library, api = pjrt.load_plugin_library(path)
+    except pjrt.PJRTError as exc:
+        raise core.BackendError(
+            f"the PJRT plugin at {path!r} failed the ABI gate: {exc} — "
+            f"point {_ENV_PLUGIN} or options['plugin_path'] at a plugin "
+            "built from the compatible PJRT C API header"
+        ) from exc
+    plugin = PjrtPlugin(path, library, api)
+    with _initialized_lock:
+        if path not in _initialized_plugins:
+            plugin.initialize()
+            _initialized_plugins.add(path)
+    return plugin
+
+
+# ---------------------------------------------------------------------------
+# Process-global shared client (refcounted, one live client per plugin path)
+# ---------------------------------------------------------------------------
+#
+# Real GPU PJRT plugins (jax_cuda12_pjrt's xla_cuda_plugin.so et al.) grab a
+# large BFC allocator pool per PJRT client (measured: ~35.65 GiB on an RTX
+# A6000 — 0.9 x free memory at creation) and the plugin ABORTS THE WHOLE
+# PROCESS (an uncaught C++ exception, not a catchable PJRT_Error) when a new
+# client's pool cannot be allocated. Creating a fresh client per compile/load
+# (the original design) therefore exhausts GPU memory in any long-lived
+# process that loads several executables. The driver now keeps ONE refcounted
+# client per plugin path process-wide: the first acquirer creates it, the
+# last release destroys it — matching how XLA's own frontends use one client
+# per process, and bounding GPU memory to a single pool.
+
+#: path -> [client, refcount] (guarded by ``_shared_clients_lock``).
+_shared_clients: dict[str, list] = {}
+_shared_clients_lock = threading.Lock()
+
+
+def acquire_client(plugin: "PjrtPlugin") -> "_Client":
+    """Return the process-global client for ``plugin`` (creating it once).
+
+    Callers that keep the client across calls (e.g. a loaded executable)
+    MUST pair each ``acquire_client`` with exactly one ``release_client``
+    once they are done with it — the client is destroyed only when the last
+    reference is released. Creating a ``PJRT_Client`` can allocate the
+    plugin's device memory pool, so the single-client-per-path cache is
+    load-bearing for GPU plugins (see the section note above).
+    """
+    with _shared_clients_lock:
+        entry = _shared_clients.get(plugin.path)
+        if entry is None:
+            client = plugin.create_client()
+            _shared_clients[plugin.path] = [client, 1]
+            return client
+        entry[1] += 1
+        return entry[0]
+
+
+def release_client(plugin: "PjrtPlugin") -> None:
+    """Drop one reference on the shared client for ``plugin``.
+
+    Destroys the client (``PJRT_Client_Destroy``) when the reference count
+    reaches zero. Raises ``core.BackendError`` if the plugin fails the
+    destroy call — never silent.
+    """
+    with _shared_clients_lock:
+        entry = _shared_clients.get(plugin.path)
+        if entry is None:
+            return  # nothing to release (defensive; balanced callers)
+        entry[1] -= 1
+        if entry[1] > 0:
+            return
+        del _shared_clients[plugin.path]
+        client = entry[0]
+    client.close()
+
+
+def release_payloads(
+    plugin: "PjrtPlugin", client: "_Client", buffers: Any
+) -> None:
+    """Guarded finalizer for a whole run's device-resident output buffers.
+
+    A device-resident run produces several ``PJRT_Buffer`` objects that
+    share ONE reference on the shared client (see the payload class in
+    ``xla.py``: one reference per run's output set, not per output), so the
+    release must happen once for the set: PJRT buffers must be destroyed
+    BEFORE the client that owns them, so every buffer is closed first; the
+    client is destroyed only when this was the last reference. The
+    cache-identity guard makes the finalizer safe for any ordering: if the
+    client already died (e.g. its executable was closed and no other holder
+    remained), the plugin freed its buffers with it, so nothing is touched
+    — and a LATER re-created client for the same plugin path is never
+    decremented by a stale payload.
+    """
+    with _shared_clients_lock:
+        entry = _shared_clients.get(plugin.path)
+        if entry is None or entry[0] is not client:
+            return  # the owning client is gone; its buffers died with it
+        if entry[1] > 1:
+            entry[1] -= 1
+            is_last = False
+        else:
+            del _shared_clients[plugin.path]
+            is_last = True
+    try:
+        for buffer in buffers:
+            buffer.close()
+    finally:
+        if is_last:
+            client.close()
+
+
+def release_payload(
+    plugin: "PjrtPlugin", client: "_Client", buffer: "_Buffer"
+) -> None:
+    """Guarded finalizer for a single-buffer device-resident payload.
+
+    A thin wrapper over :func:`release_payloads` for the one-buffer case
+    (payloads created outside a run — the explicit placement path and
+    external users), so both paths share the exact same refcount /
+    destroy-ordering / stale-cache semantics.
+    """
+    release_payloads(plugin, client, (buffer,))
+
+
+# ---------------------------------------------------------------------------
+# Per-thread execute scaffolding (hot-path cost discipline — see the
+# ``_LoadedExecutable.execute`` / ``_execute_scaffolding`` docs)
+# ---------------------------------------------------------------------------
+
+#: Per-thread execute scaffolding cache (``threading.local``: concurrent runs
+#: of ONE executable from different threads must never share mutable ctypes
+#: argument structs).
+_execute_scaffolding = threading.local()
+
+#: Bound on the per-thread scaffolding cache (many executables per process).
+_EXECUTE_SCAFFOLDING_MAX = 64
+
+#: ``ctypes.sizeof`` results per argument-struct class. ``ctypes.sizeof`` is
+#: a Python-level call (~0.14 us); the size of a struct class is IMMUTABLE,
+#: so a hot path (one destroy per output buffer per run) reads it from here.
+_SIZEOF_CACHE: dict[type, int] = {}
+
+
+def _sizeof(cls: type) -> int:
+    """``ctypes.sizeof(cls)``, cached (struct class sizes are immutable)."""
+    size = _SIZEOF_CACHE.get(cls)
+    if size is None:
+        size = _SIZEOF_CACHE[cls] = ctypes.sizeof(cls)
+    return size
+
+
+#: Per-thread reusable handle-destroy argument structs, keyed by args class:
+#: a destroy call then only rewrites the handle field instead of allocating
+#: the struct. Thread-local for the same reason as the execute scaffolding —
+#: concurrent callers must never share mutable ctypes state.
+_destroy_args = threading.local()
+
+
+def _destroy_args_for(args_cls: type) -> Any:
+    """The reusable ``PJRT_*_Destroy_Args`` struct for ``args_cls`` (per thread).
+
+    The struct is created once per thread and per class with its constant
+    fields set; ``PjrtPlugin._destroy`` writes the handle pointer into it
+    before every call. Destroy argument structs are read-only to the plugin
+    during the call (which never re-enters Python), so reuse is safe — but the
+    struct must be THREAD-LOCAL, never shared between concurrent callers.
+    """
+    cache = getattr(_destroy_args, "cache", None)
+    if cache is None:
+        cache = _destroy_args.cache = {}
+    args = cache.get(args_cls)
+    if args is None:
+        args = cache[args_cls] = args_cls(
+            struct_size=_sizeof(args_cls), extension_start=None
+        )
+    return args
+
+# ---------------------------------------------------------------------------
+# Handle wrappers (lifecycle hygiene: every plugin-created object is
+# destroyed via the matching PJRT_*_Destroy entry point).
+# ---------------------------------------------------------------------------
+
+
+class _Handle:
+    """Base wrapper for an opaque plugin-owned handle."""
+
+    __slots__ = ("plugin", "ptr", "_closed")
+
+    def __init__(self, plugin: "PjrtPlugin", ptr: int) -> None:
+        self.plugin = plugin
+        self.ptr = ptr
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+
+class _Client(_Handle):
+    """A live ``PJRT_Client`` (destroyed via ``PJRT_Client_Destroy``)."""
+
+    __slots__ = ("_devices",)
+
+    def __init__(self, plugin: "PjrtPlugin", ptr: int) -> None:
+        super().__init__(plugin, ptr)
+        self._devices: tuple[int, ...] | None = None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.plugin._destroy(
+            "PJRT_Client_Destroy", pjrt.PJRT_Client_Destroy_Args, self.ptr
+        )
+
+    def addressable_devices(self) -> tuple[int, ...]:
+        """The client's addressable ``PJRT_Device*`` pointers (cached)."""
+        if self._devices is None:
+            args = pjrt.PJRT_Client_AddressableDevices_Args(
+                struct_size=pjrt.sizeof(pjrt.PJRT_Client_AddressableDevices_Args),
+                client=self.ptr,
+            )
+            self.plugin._check(
+                self.plugin.api.PJRT_Client_AddressableDevices(ctypes.byref(args)),
+                "PJRT_Client_AddressableDevices",
+            )
+            if args.num_addressable_devices == 0:
+                raise core.BackendError(
+                    "the PJRT plugin client reports no addressable devices — "
+                    "cannot stage input buffers or execute"
+                )
+            self._devices = tuple(
+                args.addressable_devices[i]
+                for i in range(args.num_addressable_devices)
+            )
+        return self._devices
+
+    def platform_info(self) -> tuple[str, str]:
+        """``(platform_name, platform_version)`` strings (copied out)."""
+        name = self._string_out(
+            "PJRT_Client_PlatformName",
+            pjrt.PJRT_Client_PlatformName_Args,
+            "platform_name",
+            "platform_name_size",
+        )
+        version = self._string_out(
+            "PJRT_Client_PlatformVersion",
+            pjrt.PJRT_Client_PlatformVersion_Args,
+            "platform_version",
+            "platform_version_size",
+        )
+        return name, version
+
+    def _string_out(
+        self, api_name: str, args_cls: type, ptr_field: str, size_field: str
+    ) -> str:
+        """Copy out a client-owned string (valid only during the call)."""
+        args = args_cls(
+            struct_size=pjrt.sizeof(args_cls), client=self.ptr
+        )
+        self.plugin._check(
+            getattr(self.plugin.api, api_name)(ctypes.byref(args)), api_name
+        )
+        ptr = getattr(args, ptr_field)
+        if not ptr:
+            return ""
+        return ctypes.string_at(ptr, getattr(args, size_field)).decode(
+            "utf-8", "replace"
+        )
+
+    def compile(
+        self, mlir_text: str, compile_options: bytes | None = None
+    ) -> "_LoadedExecutable":
+        """Compile StableHLO MLIR text (``PJRT_Client_Compile``).
+
+        ``compile_options``: an optional SERIALIZED ``xla.CompileOptionsProto``
+        (raw bytes) handed to the plugin through
+        ``PJRT_Client_Compile_Args.compile_options``/``compile_options_size``
+        — the plugin validates the payload (an invalid proto surfaces as a
+        plugin error). Real plugins (jax_cuda12_pjrt 0.4.38's
+        xla_cuda_plugin.so et al.) CHECK-crash on NULL — callers MUST pass
+        the probe-validated single-replica proto bytes (the iree adapter's
+        default ``xla_compile_options``) unless they know the plugin accepts
+        NULL."""
+        code_buf = ctypes.create_string_buffer(mlir_text.encode("utf-8"))
+        fmt_buf = ctypes.create_string_buffer(b"mlir")
+        program = pjrt.PJRT_Program(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Program),
+            code=ctypes.cast(code_buf, ctypes.c_void_p),
+            code_size=len(mlir_text),
+            format=ctypes.cast(fmt_buf, ctypes.c_void_p),
+            format_size=4,  # len("mlir")
+        )
+        compile_opts_buf = (
+            ctypes.create_string_buffer(compile_options)
+            if compile_options is not None
+            else None
+        )
+        args = pjrt.PJRT_Client_Compile_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Client_Compile_Args),
+            client=self.ptr,
+            program=ctypes.pointer(program),
+            compile_options=(
+                ctypes.cast(compile_opts_buf, ctypes.c_void_p)
+                if compile_opts_buf is not None
+                else None
+            ),
+            compile_options_size=(
+                len(compile_options) if compile_options is not None else 0
+            ),
+            executable=None,
+        )
+        try:
+            self.plugin._check(
+                self.plugin.api.PJRT_Client_Compile(ctypes.byref(args)),
+                "PJRT_Client_Compile",
+            )
+        except core.BackendError as exc:
+            if "ptxas" in str(exc):
+                raise core.BackendError(
+                    f"{exc} — ensure ptxas (from the CUDA toolkit) is on "
+                    "PATH (the XLA CUDA plugin invokes it at compile time)"
+                ) from None
+            if "libdevice" in str(exc):
+                raise core.BackendError(
+                    f"{exc} — provide the NVVM libdevice bitcode by "
+                    "setting XLA_FLAGS=--xla_gpu_cuda_data_dir=<dir> where "
+                    "<dir>/nvvm/libdevice/libdevice.10.bc exists (any CUDA "
+                    "12 toolkit layout works, e.g. the libdevice.10.bc "
+                    "shipped in a triton/warp wheel)"
+                ) from None
+            raise
+        return _LoadedExecutable(self.plugin, args.executable)
+
+    def deserialize(self, serialized: bytes) -> "_LoadedExecutable":
+        """Load a serialized executable (``PJRT_Executable_DeserializeAndLoad``)."""
+        buf = ctypes.create_string_buffer(serialized)
+        args = pjrt.PJRT_Executable_DeserializeAndLoad_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Executable_DeserializeAndLoad_Args),
+            client=self.ptr,
+            serialized_executable=ctypes.cast(buf, ctypes.c_void_p),
+            serialized_executable_size=len(serialized),
+            loaded_executable=None,
+            overridden_serialized_compile_options=None,
+            overridden_serialized_compile_options_size=0,
+            load_options=None,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Executable_DeserializeAndLoad(ctypes.byref(args)),
+            "PJRT_Executable_DeserializeAndLoad",
+        )
+        return _LoadedExecutable(self.plugin, args.loaded_executable)
+
+    def buffer_from_host(self, array: Any, device_index: int | None = None) -> "_Buffer":
+        """Stage a numpy array as a device buffer (dense, row-major).
+
+        ``device_index`` selects the client's addressable device to place
+        the buffer on (default ``None`` = the first addressable device —
+        the historical behavior). An out-of-range index raises
+        ``core.BackendError`` naming the index and the device count.
+        """
+        import numpy as np
+
+        # NOTE: np.ascontiguousarray has a hardcoded ndmin=1 (numpy#5300) —
+        # it silently promotes 0-d arrays to shape (1,), which would stage a
+        # rank-0 host tensor as a (1,) buffer. Convert with np.asarray
+        # (0-d-preserving) first and force contiguity only for ndim >= 1.
+        arr = np.asarray(array)
+        if arr.ndim and not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
+        dtype_name = np.dtype(arr.dtype).name
+        try:
+            buffer_type = _DTYPE_NAME_TO_PJRT[dtype_name]
+        except KeyError:
+            raise core.DTypeError(
+                f"the xla adapter cannot stage an input of dtype "
+                f"{dtype_name!r} — supported: "
+                + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
+            ) from None
+        if arr.ndim:
+            dims = (ctypes.c_int64 * arr.ndim)(*arr.shape)
+        else:
+            # rank-0: pass dims=NULL with num_dims=0 — the header-contract
+            # form for a rank-0 dense buffer. RE-PROBED on the real
+            # jax_cuda12_pjrt 0.10.2 plugin: PJRT_Buffer_Dimensions reports
+            # shape () for BOTH NULL and non-NULL dims with num_dims=0 (the
+            # earlier "(1,) for non-NULL dims + num_dims=0" quirk does not
+            # reproduce on 0.10.2 — the historical (1,) symptom was the
+            # np.ascontiguousarray ndmin=1 promotion above, which staged a
+            # genuinely-1-d array with num_dims=1). The fake test plugin
+            # emulates the non-NULL→(1,) quirk as a driver-regression guard
+            # pinning the NULL form regardless.
+            dims = None
+        data_ptr = (
+            ctypes.cast(arr.ctypes.data, ctypes.c_void_p)
+            if arr.size
+            else ctypes.cast((ctypes.c_byte * 1)(), ctypes.c_void_p)
+        )
+        devices = self.addressable_devices()
+        if device_index is None:
+            device = devices[0]
+        else:
+            if not 0 <= device_index < len(devices):
+                raise core.BackendError(
+                    f"the xla plugin client reports {len(devices)} "
+                    f"addressable device(s); cannot stage a buffer on device "
+                    f"index {device_index}"
+                )
+            device = devices[device_index]
+        args = pjrt.PJRT_Client_BufferFromHostBuffer_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Client_BufferFromHostBuffer_Args),
+            client=self.ptr,
+            data=data_ptr,
+            type=int(buffer_type),
+            dims=dims,
+            num_dims=len(arr.shape),
+            byte_strides=None,
+            num_byte_strides=0,
+            host_buffer_semantics=int(
+                pjrt.PJRT_HostBufferSemantics.kImmutableUntilTransferCompletes
+            ),
+            device=device,
+            memory=None,
+            device_layout=None,
+            done_with_host_buffer=None,
+            buffer=None,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Client_BufferFromHostBuffer(ctypes.byref(args)),
+            "PJRT_Client_BufferFromHostBuffer",
+        )
+        event = args.done_with_host_buffer
+        try:
+            if event:
+                self.plugin.await_event(event)
+        finally:
+            if event:
+                self.plugin.destroy_event(event)
+        # Keep the host array alive with the buffer: some plugins alias host
+        # memory beyond the documented transfer-complete point. The metadata
+        # is prefilled HONESTLY (we just staged exactly this array), so the
+        # first shape/dtype read costs no plugin FFI.
+        return _Buffer(
+            self.plugin,
+            args.buffer,
+            keepalive=(arr, dims),
+            shape=arr.shape,
+            dtype=arr.dtype,
+        )
+
+
+class _Executable(_Handle):
+    """An unloaded ``PJRT_Executable`` (destroyed via ``PJRT_Executable_Destroy``)."""
+
+    __slots__ = ()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.plugin._destroy(
+            "PJRT_Executable_Destroy", pjrt.PJRT_Executable_Destroy_Args, self.ptr
+        )
+
+
+class _LoadedExecutable(_Handle):
+    """A loaded executable + its unloaded twin for serialize/num_outputs.
+
+    ``PJRT_LoadedExecutable_GetExecutable`` hands out an unloaded
+    ``PJRT_Executable`` the caller must destroy separately; the driver
+    keeps both and destroys the inner one first.
+
+    Per-call cost discipline: the output count is immutable for a loaded
+    executable, so it is queried ONCE and cached, and ``execute`` reuses a
+    per-thread ctypes scaffolding instead of rebuilding it every call (see
+    the module docstring).
+    """
+
+    __slots__ = ("_inner", "_num_outputs")
+
+    def __init__(self, plugin: "PjrtPlugin", ptr: int) -> None:
+        super().__init__(plugin, ptr)
+        args = pjrt.PJRT_LoadedExecutable_GetExecutable_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_LoadedExecutable_GetExecutable_Args),
+            loaded_executable=ptr,
+            executable=None,
+        )
+        plugin._check(
+            plugin.api.PJRT_LoadedExecutable_GetExecutable(ctypes.byref(args)),
+            "PJRT_LoadedExecutable_GetExecutable",
+        )
+        self._inner = _Executable(plugin, args.executable)
+        self._num_outputs: int | None = None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._inner is not None:
+            self._inner.close()
+            self._inner = None
+        self.plugin._destroy(
+            "PJRT_LoadedExecutable_Destroy",
+            pjrt.PJRT_LoadedExecutable_Destroy_Args,
+            self.ptr,
+        )
+
+    def num_outputs(self) -> int:
+        """Output count per device (``PJRT_Executable_NumOutputs``).
+
+        Immutable for a loaded executable, so the plugin is queried once
+        and the value cached (one FFI instead of one per run).
+        """
+        num_outputs = self._num_outputs
+        if num_outputs is None:
+            args = pjrt.PJRT_Executable_NumOutputs_Args(
+                struct_size=pjrt.sizeof(pjrt.PJRT_Executable_NumOutputs_Args),
+                executable=self._inner.ptr,
+                num_outputs=0,
+            )
+            self.plugin._check(
+                self.plugin.api.PJRT_Executable_NumOutputs(ctypes.byref(args)),
+                "PJRT_Executable_NumOutputs",
+            )
+            num_outputs = self._num_outputs = args.num_outputs
+        return num_outputs
+
+    def serialize(self) -> bytes:
+        """Serialize to bytes (``PJRT_Executable_Serialize``)."""
+        args = pjrt.PJRT_Executable_Serialize_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Executable_Serialize_Args),
+            executable=self._inner.ptr,
+            serialized_bytes=None,
+            serialized_bytes_size=0,
+            serialized_executable=None,
+            # serialized_executable_deleter is an out-only CFUNCTYPE field;
+            # it stays zero-initialized (ctypes rejects None initializers).
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Executable_Serialize(ctypes.byref(args)),
+            "PJRT_Executable_Serialize",
+        )
+        try:
+            return ctypes.string_at(args.serialized_bytes, args.serialized_bytes_size)
+        finally:
+            deleter = args.serialized_executable_deleter
+            if deleter:
+                deleter(args.serialized_executable)
+
+    def execute(
+        self,
+        buffers: list["_Buffer"],
+        execute_device: int | None = None,
+        output_meta: Any = None,
+        events: list | None = None,
+    ) -> list["_Buffer"]:
+        """Execute; return output buffers.
+
+        ``execute_device`` is an optional raw ``PJRT_Device*`` (from the
+        client's ``addressable_devices()``) passed as the execute target —
+        ``None`` (the default, unchanged) means the compile-time device,
+        which is what single-device CPU flows use. The caller owns the
+        returned ``_Buffer`` objects (destroy via ``close()``); input
+        buffers stay owned by the caller and may be destroyed once execute
+        returns.
+
+        ``output_meta`` is an optional sequence of ``(shape, dtype)`` pairs
+        whose length equals the output count: the caller's STATIC output
+        contract (XLA executable output types are static), prefilled on the
+        returned buffers so their metadata costs no plugin FFI. The values
+        are not trusted blindly — ``_Buffer.to_host`` (and the adapter's
+        one-time run-time check) verifies them against the real plugin
+        metadata. ``None`` (the default) keeps the lazy per-buffer queries
+        of the CPU/host-staging path.
+
+        ``events`` is the optional DEVICE-COMPLETE-EVENT sink: passing a
+        list requests ONE per-device ``PJRT_Event*`` completion handle from
+        the plugin (``PJRT_LoadedExecutable_Execute_Args.device_complete_events``;
+        ``num_devices`` is always 1 in this driver) and, ON SUCCESS, appends
+        its RAW handle value to that list — an ``int``, or ``None``/``0``
+        when the plugin returned no event (appended as-is so the caller can
+        detect a plugin that violated the contract). The CALLER OWNS the
+        handle: it must await it (``PjrtPlugin.await_event``) and destroy it
+        (``PjrtPlugin.destroy_event``); this method never waits for the
+        device, never destroys a handle it handed out, and never appends
+        anything on FAILURE — a stray non-NULL handle the plugin may have
+        written is destroyed best-effort there (inside its own
+        ``try``/``except`` so a cleanup failure can never mask the original
+        execute error) and the slot is cleared. ``None`` (the default)
+        leaves ``device_complete_events`` NULL: the byte-identical,
+        zero-plugin-cost enqueue behavior of every earlier version.
+        """
+        num_args = len(buffers)
+        scaffolding = self._execute_scaffolding(num_args)
+        device_ptrs, out_ptrs, args, num_outputs, event_slots = scaffolding
+        metas = output_meta
+        if metas is not None:
+            # Validate the contract BEFORE invoking: a mismatched
+            # ``output_meta`` must never leave the plugin's output buffers
+            # unowned (the driver owns everything it creates). A tuple
+            # (the adapter's plan) is used as-is — no per-call copy.
+            if type(metas) is not tuple:
+                metas = list(metas)
+            if len(metas) != num_outputs:
+                raise core.BackendError(
+                    f"output_meta describes {len(metas)} output(s) but the "
+                    f"loaded executable produces {num_outputs}"
+                )
+        for i, buffer in enumerate(buffers):
+            device_ptrs[i] = buffer.ptr
+        args.execute_device = execute_device
+        # The args struct is SCAFFOLDED (reused across calls), so the event
+        # field is (re)assigned on EVERY call — it must never be left over
+        # from a previous one (`events=None` keeps it NULL: no plugin cost).
+        if events is not None:
+            event_slots[0] = None  # zero the slot the plugin writes through
+            args.device_complete_events = ctypes.cast(
+                event_slots, ctypes.POINTER(ctypes.c_void_p)
+            )
+            try:
+                self.plugin._check(
+                    self.plugin.api.PJRT_LoadedExecutable_Execute(
+                        ctypes.byref(args)
+                    ),
+                    "PJRT_LoadedExecutable_Execute",
+                )
+            except BaseException:
+                # FAILURE: the caller gets nothing. Destroy a stray non-NULL
+                # handle the plugin may have written BEST-EFFORT — the
+                # cleanup is guarded so it can never mask the execute error.
+                stray = event_slots[0]
+                if stray:
+                    try:
+                        self.plugin.destroy_event(stray)
+                    except BaseException:
+                        pass
+                event_slots[0] = None
+                args.device_complete_events = None
+                raise
+            # Hand the raw value over AS-IS (None/0 = the plugin returned no
+            # event), then clear the slot: the handle now belongs to the
+            # caller, never to this scaffolding.
+            events.append(event_slots[0])
+            event_slots[0] = None
+        else:
+            args.device_complete_events = None
+            self.plugin._check(
+                self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
+                "PJRT_LoadedExecutable_Execute",
+            )
+        plugin = self.plugin
+        outputs: list[_Buffer] = [None] * num_outputs
+        if metas is None:
+            for i in range(num_outputs):
+                outputs[i] = _Buffer(plugin, out_ptrs[i])
+            return outputs
+        for i in range(num_outputs):
+            meta = metas[i]
+            outputs[i] = _Buffer(
+                plugin, out_ptrs[i], shape=meta[0], dtype=meta[1]
+            )
+        return outputs
+    def _execute_scaffolding(self, num_args: int) -> tuple:
+        """Return the (cached) execute scaffolding for ``(self, num_args)``.
+
+        ONE set of ctypes argument structs per ``(executable ptr, input
+        arity, output count)`` PER THREAD: a call then only writes the input
+        buffer pointers (and the execute device) before invoking, instead of
+        rebuilding ``PJRT_ExecuteOptions`` + the args struct + four pointer
+        arrays (~10 us of the ~11 us of non-FFI execute overhead). The
+        thread-local storage is what makes concurrent runs of ONE executable
+        from different threads safe — no mutable scaffolding is shared
+        across threads. The output count is part of the key so a reused
+        pointer address (an executable closed and a new one allocated at the
+        same address) can never be served stale, under-sized arrays.
+
+        The result is the 5-tuple ``(device_ptrs, out_ptrs, args,
+        num_outputs, event_slots)``: ``event_slots`` is the ONE-element
+        ``c_void_p`` array the plugin writes its single per-device
+        ``PJRT_Event*`` completion handle through (``num_devices`` is always
+        1 here) when ``execute(..., events=[...])`` asks for one. It lives in
+        the cached scaffolding because it IS the pointer stored in
+        ``args.device_complete_events`` — it must stay alive as long as the
+        struct can be reused.
+        """
+        num_outputs = self.num_outputs()
+        key = (self.ptr, num_args, num_outputs)
+        cache = getattr(_execute_scaffolding, "cache", None)
+        if cache is None:
+            cache = {}
+            _execute_scaffolding.cache = cache
+        scaffolding = cache.get(key)
+        if scaffolding is not None:
+            return scaffolding
+        device_ptrs = (ctypes.c_void_p * max(1, num_args))()
+        argument_lists = (ctypes.c_void_p * 1)(
+            ctypes.cast(device_ptrs, ctypes.c_void_p)
+        )
+        out_ptrs = (ctypes.c_void_p * max(1, num_outputs))()
+        output_lists = (ctypes.c_void_p * 1)(
+            ctypes.cast(out_ptrs, ctypes.c_void_p)
+        )
+        # ONE per-device completion-event slot (num_devices is always 1).
+        event_slots = (ctypes.c_void_p * 1)()
+        options = pjrt.PJRT_ExecuteOptions(
+            struct_size=pjrt.sizeof(pjrt.PJRT_ExecuteOptions)
+        )
+        args = pjrt.PJRT_LoadedExecutable_Execute_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_LoadedExecutable_Execute_Args),
+            executable=self.ptr,
+            options=ctypes.pointer(options),
+            argument_lists=ctypes.cast(
+                argument_lists, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            ),
+            num_devices=1,
+            num_args=num_args,
+            output_lists=ctypes.cast(
+                output_lists, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            ),
+            device_complete_events=None,
+            execute_device=None,
+        )
+        scaffolding = (device_ptrs, out_ptrs, args, num_outputs, event_slots)
+        if len(cache) >= _EXECUTE_SCAFFOLDING_MAX:
+            # Bounded: a meta-level loop that builds many executables must
+            # not grow per-thread state without limit. Clearing is safe —
+            # an in-flight call holds its own references to the arrays.
+            cache.clear()
+        cache[key] = scaffolding
+        return scaffolding
+
+
+class _Buffer(_Handle):
+    """A device buffer (destroyed via ``PJRT_Buffer_Destroy``).
+
+    ``shape``/``dtype`` are metadata queries (``PJRT_Buffer_ElementType``
+    + ``PJRT_Buffer_Dimensions``) cached on the instance — reading them does
+    NOT touch host memory, so device-resident payloads can be validated and
+    wrapped without a host round-trip.
+
+    They may also be PREFILLED (the keyword-only ``shape``/``dtype``
+    arguments) by callers that already know the metadata — the XLA adapter
+    records its static output contract at compile time, and
+    ``buffer_from_host`` just staged exactly that array — so a hot path pays
+    ZERO plugin FFI per buffer (~3.4 us per output). Prefilled values are
+    never trusted blindly: ``_verify_metadata()`` performs the real FFI
+    queries, compares them against the prefilled values and raises
+    ``core.BackendError`` naming declared-vs-actual on a mismatch (never
+    silent), then caches the real values. ``to_host()`` always verifies
+    first, so a host copy can never be produced from unverified metadata.
+    """
+
+    __slots__ = ("_keepalive", "_shape", "_dtype", "_verified")
+
+    def __init__(
+        self,
+        plugin: "PjrtPlugin",
+        ptr: int,
+        keepalive: tuple = (),
+        *,
+        shape: Any = None,
+        dtype: Any = None,
+    ) -> None:
+        # ``_Handle.__init__`` inlined: this is a per-output-buffer hot path.
+        self.plugin = plugin
+        self.ptr = ptr
+        self._closed = False
+        self._keepalive = keepalive  # host memory that must outlive the buffer
+        self._shape: tuple[int, ...] | None = (
+            None
+            if shape is None
+            else (shape if type(shape) is tuple else tuple(shape))
+        )
+        self._dtype: Any | None = dtype
+        # Prefilled (or not-yet-queried) metadata has not been checked
+        # against the plugin's real buffer metadata yet; a lazily-queried
+        # buffer only ever caches real FFI values, so it starts verified.
+        self._verified = shape is None and dtype is None
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._keepalive = ()
+        self.plugin._destroy("PJRT_Buffer_Destroy", pjrt.PJRT_Buffer_Destroy_Args, self.ptr)
+
+    def _query_shape(self) -> tuple[int, ...]:
+        """The buffer's REAL shape from ``PJRT_Buffer_Dimensions`` (FFI)."""
+        dim_args = pjrt.PJRT_Buffer_Dimensions_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_Dimensions_Args),
+            buffer=self.ptr,
+            dims=None,
+            num_dims=0,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Buffer_Dimensions(ctypes.byref(dim_args)),
+            "PJRT_Buffer_Dimensions",
+        )
+        return tuple(dim_args.dims[i] for i in range(dim_args.num_dims))
+
+    def _query_dtype(self) -> Any:
+        """The buffer's REAL numpy dtype from ``PJRT_Buffer_ElementType`` (FFI)."""
+        type_args = pjrt.PJRT_Buffer_ElementType_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_ElementType_Args),
+            buffer=self.ptr,
+            type=0,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Buffer_ElementType(ctypes.byref(type_args)),
+            "PJRT_Buffer_ElementType",
+        )
+        try:
+            dtype_name = _PJRT_TO_DTYPE_NAME[
+                pjrt.PJRT_Buffer_Type(type_args.type)
+            ]
+        except KeyError:
+            raise core.BackendError(
+                f"the PJRT plugin produced an output buffer of element "
+                f"type {type_args.type}, which has no numpy equivalent — "
+                "the xla adapter supports "
+                + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
+            ) from None
+        import numpy as np
+
+        return np.dtype(dtype_name)
+
+    def _verify_metadata(self) -> None:
+        """Check prefilled metadata against the plugin's real buffer metadata.
+
+        Performs the two real FFI queries, compares them with any prefilled
+        values (a mismatch is a loud ``core.BackendError`` naming the
+        declared vs actual shape/dtype — a compiler/contract violation is
+        never silently accepted), and caches the real values. Idempotent:
+        after a successful verification the cached metadata IS the real
+        metadata, so it returns immediately.
+        """
+        if self._verified:
+            return
+        real_shape = self._query_shape()
+        real_dtype = self._query_dtype()
+        if self._shape is not None and self._shape != real_shape:
+            raise core.BackendError(
+                f"the PJRT plugin reports shape {real_shape} for a buffer "
+                f"declared as {self._shape} — the compiled program's "
+                "recorded output contract does not match the buffer the "
+                "plugin produced (never silently accepted)"
+            )
+        if self._dtype is not None and self._dtype != real_dtype:
+            raise core.BackendError(
+                f"the PJRT plugin reports dtype {real_dtype} for a buffer "
+                f"declared as {self._dtype} — the compiled program's "
+                "recorded output contract does not match the buffer the "
+                "plugin produced (never silently accepted)"
+            )
+        self._shape = real_shape
+        self._dtype = real_dtype
+        self._verified = True
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The buffer's concrete shape (cached metadata query, no host copy)."""
+        if self._shape is None:
+            self._shape = self._query_shape()
+        return self._shape
+
+    @property
+    def dtype(self) -> Any:
+        """The buffer's numpy dtype (cached metadata query, no host copy)."""
+        if self._dtype is None:
+            self._dtype = self._query_dtype()
+        return self._dtype
+
+    def to_host(self) -> Any:
+        """Copy the buffer into a fresh row-major numpy array.
+
+        Verifies any prefilled metadata against the plugin's real buffer
+        metadata first — a host copy is always sized from HONEST metadata.
+        """
+        import numpy as np
+
+        self._verify_metadata()
+        shape = self.shape
+        array = np.empty(shape, dtype=self.dtype)
+        dst = (
+            ctypes.cast(array.ctypes.data, ctypes.c_void_p)
+            if array.size
+            else ctypes.cast((ctypes.c_byte * 1)(), ctypes.c_void_p)
+        )
+        host_args = pjrt.PJRT_Buffer_ToHostBuffer_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_ToHostBuffer_Args),
+            src=self.ptr,
+            host_layout=None,
+            dst=dst,
+            dst_size=array.nbytes,
+            event=None,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Buffer_ToHostBuffer(ctypes.byref(host_args)),
+            "PJRT_Buffer_ToHostBuffer",
+        )
+        event = host_args.event
+        try:
+            if event:
+                self.plugin.await_event(event)
+        finally:
+            if event:
+                self.plugin.destroy_event(event)
+        return array
+
+
+# ---------------------------------------------------------------------------
+# The plugin driver
+# ---------------------------------------------------------------------------
+
+
+class PjrtPlugin:
+    """A loaded PJRT C API plugin (ctypes driver; see module docstring).
+
+    Holds the ``ctypes.CDLL`` handle (kept alive for the driver's
+    lifetime) and the validated ``PJRT_Api`` function table. Instances are
+    cached per path by ``_load_plugin``.
+    """
+
+    __slots__ = ("path", "_library", "api", "_destroy_table")
+
+    def __init__(self, path: str, library: ctypes.CDLL, api: pjrt.PJRT_Api) -> None:
+        self.path = path
+        self._library = library
+        self.api = api
+        #: ``api_name -> (entry point, args class, handle field name)`` for
+        #: ``_destroy`` — immutable data only, so it is safe to share across
+        #: threads (the reusable args struct itself is thread-local).
+        self._destroy_table: dict[str, tuple] = {}
+    # ------------------------------------------------------------- plumbing
+
+    def initialize(self) -> None:
+        """One-time ``PJRT_Plugin_Initialize`` (see header: must precede all)."""
+        if not self.api.PJRT_Plugin_Initialize:
+            raise core.BackendError(
+                f"the PJRT plugin at {self.path!r} does not implement the "
+                "mandatory PJRT_Plugin_Initialize entry point"
+            )
+        args = pjrt.PJRT_Plugin_Initialize_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Plugin_Initialize_Args)
+        )
+        self._check(
+            self.api.PJRT_Plugin_Initialize(ctypes.byref(args)),
+            "PJRT_Plugin_Initialize",
+        )
+
+    def _check(self, err: int, step: str) -> None:
+        """Raise ``core.BackendError`` (naming the step) when ``err`` set."""
+        if not err:
+            return
+        message = self._error_message(err)
+        self._destroy_error(err)
+        raise core.BackendError(
+            f"the xla PJRT plugin failed at {step}: {message}"
+        )
+
+    def _error_message(self, err: int) -> str:
+        args = pjrt.PJRT_Error_Message_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Error_Message_Args),
+            error=err,
+            message=None,
+            message_size=0,
+        )
+        try:
+            self.api.PJRT_Error_Message(ctypes.byref(args))
+        except Exception:  # pragma: no cover - defensive; message must not fail
+            return "<unreadable plugin error>"
+        if args.message:
+            return ctypes.string_at(args.message, args.message_size).decode(
+                "utf-8", "replace"
+            )
+        return "<empty plugin error>"
+
+    def _destroy_error(self, err: int) -> None:
+        if not err:
+            return
+        args = pjrt.PJRT_Error_Destroy_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Error_Destroy_Args), error=err
+        )
+        self.api.PJRT_Error_Destroy(ctypes.byref(args))
+
+    def _destroy(self, api_name: str, args_cls: type, ptr: int) -> None:
+        """Destroy a handle through the given PJRT_*_Destroy entry point.
+
+        Per-call cost discipline: the entry point, the (thread-local,
+        reusable) argument struct and its handle field name are resolved
+        ONCE per ``api_name`` and cached on the plugin, so a call only
+        writes the handle pointer before invoking.
+        """
+        if not ptr:
+            return
+        entry = self._destroy_table.get(api_name)
+        if entry is None:
+            entry = self._destroy_table[api_name] = (
+                getattr(self.api, api_name),
+                args_cls,
+                args_cls._fields_[-1][0],
+            )
+        fn, args_cls, field = entry
+        args = _destroy_args_for(args_cls)
+        setattr(args, field, ptr)
+        self._check(fn(ctypes.byref(args)), api_name)
+    # ------------------------------------------------------------ lifecycle
+
+    def create_client(self) -> _Client:
+        """Create a client with empty options (``PJRT_Client_Create``)."""
+        args = pjrt.PJRT_Client_Create_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Client_Create_Args),
+            create_options=None,
+            num_options=0,
+            kv_get_callback=None,
+            kv_get_user_arg=None,
+            kv_put_callback=None,
+            kv_put_user_arg=None,
+            kv_try_get_callback=None,
+            kv_try_get_user_arg=None,
+        )
+        self._check(self.api.PJRT_Client_Create(ctypes.byref(args)), "PJRT_Client_Create")
+        return _Client(self, args.client)
+
+    def await_event(self, event: int) -> None:
+        """Block until an event is ready (``PJRT_Event_Await``)."""
+        args = pjrt.PJRT_Event_Await_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Event_Await_Args), event=event
+        )
+        self._check(self.api.PJRT_Event_Await(ctypes.byref(args)), "PJRT_Event_Await")
+
+    def destroy_event(self, event: int) -> None:
+        if not event:
+            return
+        args = pjrt.PJRT_Event_Destroy_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Event_Destroy_Args), event=event
+        )
+        self._check(self.api.PJRT_Event_Destroy(ctypes.byref(args)), "PJRT_Event_Destroy")

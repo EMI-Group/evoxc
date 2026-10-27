@@ -1,7 +1,7 @@
-"""Tests for ``etl.dist.Group`` — static communication-group values.
+"""Tests for ``evoxc.dist.Group`` — static communication-group values.
 
-Contract under test: ``etl/dist/CONTEXT.md`` ("Group semantics", "Error
-behavior"). A :class:`Group` is a static Python value in etl's value model:
+Contract under test: ``evoxc/dist/CONTEXT.md`` ("Group semantics", "Error
+behavior"). A :class:`Group` is a static Python value in evoxc's value model:
 validated at construction, immutable, hashable, and equal over
 ``(name, ranks, backend)``. ``ranks=None`` ⇔ the world group (all ranks of
 the runtime execution context — membership only known at run time).
@@ -9,7 +9,7 @@ the runtime execution context — membership only known at run time).
 
 import pytest
 
-from etl.dist import WORLD_GROUP, Group, group
+from evoxc.dist import WORLD_GROUP, Group, group
 
 
 # ---------------------------------------------------------------------------

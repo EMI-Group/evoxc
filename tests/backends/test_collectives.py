@@ -1,10 +1,10 @@
 """Tests for dist collectives dispatched through the numpy interpreter.
 
-Contract under test (see ``etl/dist``, ``etl/backends/numpy/kernels/collective.py``,
-``etl/backends/numpy/exec_context.py``):
+Contract under test (see ``evoxc/dist``, ``evoxc/backends/numpy/kernels/collective.py``,
+``evoxc/backends/numpy/exec_context.py``):
 
 - All six communication collectives funnel through the process-wide
-  ``CollectiveExecutor`` hook (``etl.dist.set_collective_executor`` /
+  ``CollectiveExecutor`` hook (``evoxc.dist.set_collective_executor`` /
   ``get_collective_executor``) at RUN time — the interpreter itself has no
   collective semantics. The numpy backend installs
   ``SingleRankCollectiveExecutor`` (identity on one rank) at import time.
@@ -12,8 +12,8 @@ Contract under test (see ``etl/dist``, ``etl/backends/numpy/kernels/collective.p
   the per-execution ``RankContext`` — never constant-folded at lower/compile
   time. ``NumpyExecutable.run(flat_inputs, rank_context=...)`` overrides the
   context per run (thread-local, restored afterwards); the
-  ``etl.backends.numpy.exec_context.set_rank_context`` thread-local hook is
-  the public equivalent for plain ``etl.run``.
+  ``evoxc.backends.numpy.exec_context.set_rank_context`` thread-local hook is
+  the public equivalent for plain ``evoxc.run``.
 - Multi-rank semantics are simulated in-process by installing a custom
   executor implementing the six-method protocol (runtime-checkable — a
   non-conforming object raises TypeError; an unset hook raises BackendError).
@@ -28,7 +28,7 @@ import dataclasses
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +38,9 @@ import etl
 
 @pytest.fixture(autouse=True)
 def _restore_executor_hook():
-    previous = etl.dist.get_collective_executor()
+    previous = evoxc.dist.get_collective_executor()
     yield
-    etl.dist.set_collective_executor(previous)
+    evoxc.dist.set_collective_executor(previous)
 
 
 class _RecordingTwoRankExecutor:
@@ -86,7 +86,7 @@ class _RecordingTwoRankExecutor:
 def fake_executor():
     """Install the recording 2-rank simulator; restore the previous executor."""
     fake = _RecordingTwoRankExecutor()
-    etl.dist.set_collective_executor(fake)
+    evoxc.dist.set_collective_executor(fake)
     return fake
 
 
@@ -99,13 +99,13 @@ def _arange_2x3():
 # ---------------------------------------------------------------------------
 
 _IDENTITY_COLLECTIVES = [
-    ("all_reduce sum", lambda t: etl.dist.all_reduce(t, op="sum")),
-    ("all_reduce max", lambda t: etl.dist.all_reduce(t, op="max")),
-    ("all_gather", lambda t: etl.dist.all_gather(t, axis=0)),
-    ("reduce_scatter", lambda t: etl.dist.reduce_scatter(t, op="sum", axis=0)),
-    ("all_to_all", lambda t: etl.dist.all_to_all(t, split_axis=0, concat_axis=1)),
-    ("broadcast", lambda t: etl.dist.broadcast(t, src_rank=0)),
-    ("collective_permute", lambda t: etl.dist.collective_permute(t, ((0, 1),))),
+    ("all_reduce sum", lambda t: evoxc.dist.all_reduce(t, op="sum")),
+    ("all_reduce max", lambda t: evoxc.dist.all_reduce(t, op="max")),
+    ("all_gather", lambda t: evoxc.dist.all_gather(t, axis=0)),
+    ("reduce_scatter", lambda t: evoxc.dist.reduce_scatter(t, op="sum", axis=0)),
+    ("all_to_all", lambda t: evoxc.dist.all_to_all(t, split_axis=0, concat_axis=1)),
+    ("broadcast", lambda t: evoxc.dist.broadcast(t, src_rank=0)),
+    ("collective_permute", lambda t: evoxc.dist.collective_permute(t, ((0, 1),))),
 ]
 
 
@@ -116,8 +116,8 @@ _IDENTITY_COLLECTIVES = [
 )
 def test_default_executor_is_identity(name, collective):
     x = _arange_2x3()
-    out = etl.evaluate(collective, etl.from_numpy(x.copy()))
-    assert isinstance(out, etl.Tensor)
+    out = evoxc.evaluate(collective, evoxc.from_numpy(x.copy()))
+    assert isinstance(out, evoxc.Tensor)
     assert out.dtype == np.float32
     np.testing.assert_array_equal(out.numpy(), x)
 
@@ -129,12 +129,12 @@ def test_default_executor_is_identity(name, collective):
 
 def test_rank_and_world_size_defaults():
     def fn():
-        return etl.dist.rank(), etl.dist.world_size()
+        return evoxc.dist.rank(), evoxc.dist.world_size()
 
-    executable = etl.build(fn)
-    rank, world_size = etl.run(executable)
-    assert isinstance(rank, etl.Tensor)
-    assert isinstance(world_size, etl.Tensor)
+    executable = evoxc.build(fn)
+    rank, world_size = evoxc.run(executable)
+    assert isinstance(rank, evoxc.Tensor)
+    assert isinstance(world_size, evoxc.Tensor)
     assert rank.dtype == np.int64 and rank.shape == ()
     assert world_size.dtype == np.int64 and world_size.shape == ()
     assert rank.numpy().item() == 0
@@ -148,10 +148,10 @@ def test_rank_and_world_size_defaults():
 
 def test_multi_rank_all_reduce_sums_across_ranks(fake_executor):
     def fn(x):
-        return etl.dist.all_reduce(x, op="sum")
+        return evoxc.dist.all_reduce(x, op="sum")
 
     x = _arange_2x3()
-    out = etl.evaluate(fn, etl.from_numpy(x.copy()))
+    out = evoxc.evaluate(fn, evoxc.from_numpy(x.copy()))
     # local (rank 0) + synthetic peer (rank 1: x + 10) => 2x + 10
     np.testing.assert_array_equal(out.numpy(), 2 * x + 10)
     assert fake_executor.calls == [("all_reduce", "world", "sum")]
@@ -159,10 +159,10 @@ def test_multi_rank_all_reduce_sums_across_ranks(fake_executor):
 
 def test_multi_rank_all_gather_concatenates_along_axis(fake_executor):
     def fn(x):
-        return etl.dist.all_gather(x, axis=0)
+        return evoxc.dist.all_gather(x, axis=0)
 
     x = _arange_2x3()
-    out = etl.evaluate(fn, etl.from_numpy(x.copy()))
+    out = evoxc.evaluate(fn, evoxc.from_numpy(x.copy()))
     expected = np.concatenate([x, x + 10], axis=0)
     assert out.shape == (4, 3)
     np.testing.assert_array_equal(out.numpy(), expected)
@@ -171,10 +171,10 @@ def test_multi_rank_all_gather_concatenates_along_axis(fake_executor):
 
 def test_multi_rank_reduce_scatter_protocol_has_no_reduce_op(fake_executor):
     def fn(x):
-        return etl.dist.reduce_scatter(x, op="sum", axis=0)
+        return evoxc.dist.reduce_scatter(x, op="sum", axis=0)
 
     x = _arange_2x3()
-    out = etl.evaluate(fn, etl.from_numpy(x.copy()))
+    out = evoxc.evaluate(fn, evoxc.from_numpy(x.copy()))
     np.testing.assert_array_equal(out.numpy(), x)
     name, axis, group, extra = fake_executor.calls[0]
     assert (name, axis, group) == ("reduce_scatter", 0, "world")
@@ -185,10 +185,10 @@ def test_multi_rank_reduce_scatter_protocol_has_no_reduce_op(fake_executor):
 
 def test_multi_rank_all_to_all_forwards_only_split_axis(fake_executor):
     def fn(x):
-        return etl.dist.all_to_all(x, split_axis=0, concat_axis=1)
+        return evoxc.dist.all_to_all(x, split_axis=0, concat_axis=1)
 
     x = _arange_2x3()
-    out = etl.evaluate(fn, etl.from_numpy(x.copy()))
+    out = evoxc.evaluate(fn, evoxc.from_numpy(x.copy()))
     np.testing.assert_array_equal(out.numpy(), x)
     name, axis, group, extra = fake_executor.calls[0]
     assert (name, axis, group) == ("all_to_all", 0, "world")
@@ -199,26 +199,26 @@ def test_multi_rank_all_to_all_forwards_only_split_axis(fake_executor):
 
 def test_multi_rank_broadcast_forwards_src_rank(fake_executor):
     def fn(x):
-        return etl.dist.broadcast(x, src_rank=1)
+        return evoxc.dist.broadcast(x, src_rank=1)
 
     x = _arange_2x3()
-    out = etl.evaluate(fn, etl.from_numpy(x.copy()))
+    out = evoxc.evaluate(fn, evoxc.from_numpy(x.copy()))
     np.testing.assert_array_equal(out.numpy(), x)
     name, src_rank, group = fake_executor.calls[0]
     assert (name, group) == ("broadcast", "world")
     # The op's declared src_rank attr (builder default 0) is what the kernel
     # forwards: dist validates the user's src_rank but does not record it on
-    # the op (documented ir-side gap in etl/dist/collectives.py), so the
+    # the op (documented ir-side gap in evoxc/dist/collectives.py), so the
     # executor always sees the default 0 for the world group.
     assert src_rank == 0
 
 
 def test_multi_rank_collective_permute_forwards_mapping(fake_executor):
     def fn(x):
-        return etl.dist.collective_permute(x, ((0, 1),))
+        return evoxc.dist.collective_permute(x, ((0, 1),))
 
     x = _arange_2x3()
-    out = etl.evaluate(fn, etl.from_numpy(x.copy()))
+    out = evoxc.evaluate(fn, evoxc.from_numpy(x.copy()))
     np.testing.assert_array_equal(out.numpy(), x)
     name, mapping, group = fake_executor.calls[0]
     assert (name, group) == ("collective_permute", "world")
@@ -232,47 +232,47 @@ def test_multi_rank_collective_permute_forwards_mapping(fake_executor):
 
 def test_rank_context_override_on_backend_run():
     def fn(x):
-        return etl.dist.rank(), etl.dist.world_size(), x
+        return evoxc.dist.rank(), evoxc.dist.world_size(), x
 
-    executable = etl.build(fn, etl.TensorSpec((2, 3), etl.float32))
+    executable = evoxc.build(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
     backend_executable = executable.backend_executable
 
-    x = etl.tensor(_arange_2x3())
-    rank, world_size, y = etl.run(executable, x)  # baseline
+    x = evoxc.tensor(_arange_2x3())
+    rank, world_size, y = evoxc.run(executable, x)  # baseline
     assert rank.numpy().item() == 0
     assert world_size.numpy().item() == 1
 
     outputs = backend_executable.run(
-        [x], rank_context=etl.dist.RankContext(rank=1, world_size=2)
+        [x], rank_context=evoxc.dist.RankContext(rank=1, world_size=2)
     )
     assert outputs[0].numpy().item() == 1
     assert outputs[1].numpy().item() == 2
     np.testing.assert_array_equal(outputs[2].numpy(), x.numpy())
 
     # The override is per-run: the next plain run sees the default again.
-    rank, world_size, y = etl.run(executable, x)
+    rank, world_size, y = evoxc.run(executable, x)
     assert rank.numpy().item() == 0
     assert world_size.numpy().item() == 1
 
 
 def test_thread_local_rank_context():
-    from etl.backends.numpy.exec_context import get_rank_context, set_rank_context
+    from evoxc.backends.numpy.exec_context import get_rank_context, set_rank_context
 
     def fn(x):
-        return etl.dist.rank(), etl.dist.world_size(), x
+        return evoxc.dist.rank(), evoxc.dist.world_size(), x
 
-    executable = etl.build(fn, etl.TensorSpec((2, 3), etl.float32))
-    x = etl.tensor(_arange_2x3())
+    executable = evoxc.build(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
+    x = evoxc.tensor(_arange_2x3())
 
-    set_rank_context(etl.dist.RankContext(rank=1, world_size=2))
+    set_rank_context(evoxc.dist.RankContext(rank=1, world_size=2))
     try:
-        rank, world_size, y = etl.run(executable, x)
+        rank, world_size, y = evoxc.run(executable, x)
         assert rank.numpy().item() == 1
         assert world_size.numpy().item() == 2
         np.testing.assert_array_equal(y.numpy(), x.numpy())
     finally:
         set_rank_context(None)
-    assert get_rank_context() == etl.dist.RankContext(rank=0, world_size=1)
+    assert get_rank_context() == evoxc.dist.RankContext(rank=0, world_size=1)
 
 
 # ---------------------------------------------------------------------------
@@ -281,16 +281,16 @@ def test_thread_local_rank_context():
 
 
 def test_executor_hook_set_get_reset():
-    default = etl.dist.get_collective_executor()
-    assert etl.dist.get_collective_executor() is default
+    default = evoxc.dist.get_collective_executor()
+    assert evoxc.dist.get_collective_executor() is default
 
     fake = _RecordingTwoRankExecutor()
-    etl.dist.set_collective_executor(fake)
-    assert etl.dist.get_collective_executor() is fake
+    evoxc.dist.set_collective_executor(fake)
+    assert evoxc.dist.get_collective_executor() is fake
 
-    etl.dist.set_collective_executor(None)
-    with pytest.raises(etl.BackendError):
-        etl.dist.get_collective_executor()
+    evoxc.dist.set_collective_executor(None)
+    with pytest.raises(evoxc.BackendError):
+        evoxc.dist.get_collective_executor()
     # (the autouse fixture restores the default executor for the next test)
 
 
@@ -300,7 +300,7 @@ def test_executor_hook_rejects_non_conforming_object():
             return tensor
 
     with pytest.raises(TypeError):
-        etl.dist.set_collective_executor(Partial())
+        evoxc.dist.set_collective_executor(Partial())
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +309,7 @@ def test_executor_hook_rejects_non_conforming_object():
 
 
 def test_rank_context_valid_and_frozen():
-    ctx = etl.dist.RankContext(rank=1, world_size=2)
+    ctx = evoxc.dist.RankContext(rank=1, world_size=2)
     assert ctx.rank == 1
     assert ctx.world_size == 2
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -321,4 +321,4 @@ def test_rank_context_valid_and_frozen():
 )
 def test_rank_context_validation(rank, world_size):
     with pytest.raises(ValueError):
-        etl.dist.RankContext(rank=rank, world_size=world_size)
+        evoxc.dist.RankContext(rank=rank, world_size=world_size)

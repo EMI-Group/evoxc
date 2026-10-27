@@ -1,7 +1,7 @@
 """Tests for ``TensorSpec`` validation/normalization.
 
 ``TensorSpec`` describes a future runtime tensor (no storage). These tests
-pin the documented contract in ``etl/core/spec.py``: shape tuple-ification
+pin the documented contract in ``evoxc/core/spec.py``: shape tuple-ification
 and entry validation, dtype normalization to ``np.dtype``, the ``rank``
 property, frozen immutability, optional device/name fields, equality
 semantics, and import paths.
@@ -12,13 +12,13 @@ import dataclasses
 import numpy as np
 import pytest
 
-from etl import TensorSpec
-from etl.core import DTypeError, Device, Dim, TensorSpec as CoreTensorSpec, float32
+from evoxc import TensorSpec
+from evoxc.core import DTypeError, Device, Dim, TensorSpec as CoreTensorSpec, float32
 
 # --- imports -----------------------------------------------------------------
 
 
-def test_importable_from_etl_and_etl_core():
+def test_importable_from_evoxc_and_evoxc_core():
     assert TensorSpec is CoreTensorSpec
 
 
@@ -138,7 +138,7 @@ def test_invalid_dtype_raises_dtype_error(bad, msg):
 def test_invalid_dtype_type_raises_dtype_error(monkeypatch):
     # On numpy >= 2, np.dtype(<type>) coerces unknown types to `object`
     # instead of raising, so the documented "Cannot interpret type" branch of
-    # etl's normalizer is exercised by rejecting the np.dtype call directly.
+    # evoxc's normalizer is exercised by rejecting the np.dtype call directly.
     class _RejectingDtype:
         # np.dtype cannot be subclassed (numpy >= 2); a plain class works as
         # the isinstance second arg and raises on instantiation.

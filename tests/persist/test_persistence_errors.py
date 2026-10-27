@@ -1,6 +1,6 @@
-"""Error-behavior tests for the etl persistence container.
+"""Error-behavior tests for the evoxc persistence container.
 
-The documented contract (``etl/persist/CONTEXT.md``) says validation
+The documented contract (``evoxc/persist/CONTEXT.md``) says validation
 failures raise ``PersistenceError``: bad magic, newer format version,
 invalid header/payload JSON, integrity hash mismatch, payload_type
 mismatch, unknown codec type, cyclic values, and codec shadowing.
@@ -18,13 +18,13 @@ import struct
 
 import pytest
 
-from etl.core import ETLError, PersistenceError
-from etl.persist import ETL_FORMAT_VERSION, load_object, register_codec, save_object
+from evoxc.core import EVOXCError, PersistenceError
+from evoxc.persist import EVOXC_FORMAT_VERSION, load_object, register_codec, save_object
 
-_MAGIC = b"ETLPERS"
+_MAGIC = b"EVOXCPERS"
 
 
-def _write_container(path, header_bytes, payload_bytes=None, version=ETL_FORMAT_VERSION):
+def _write_container(path, header_bytes, payload_bytes=None, version=EVOXC_FORMAT_VERSION):
     """Assemble a container file at ``path``.
 
     Layout: magic || uint32 version || uint32 header length || header ||
@@ -54,7 +54,7 @@ def _write_container(path, header_bytes, payload_bytes=None, version=ETL_FORMAT_
 def _valid_header_bytes(payload_type="test.payload", **overrides):
     """A fully valid header JSON; ``overrides`` replace individual fields."""
     header = {
-        "format_version": ETL_FORMAT_VERSION,
+        "format_version": EVOXC_FORMAT_VERSION,
         "payload_type": payload_type,
         "backend_info": None,
         "signature_info": None,
@@ -67,9 +67,9 @@ def _valid_header_bytes(payload_type="test.payload", **overrides):
 # --- error hierarchy -------------------------------------------------------
 
 
-def test_persistence_error_is_etl_error():
-    assert issubclass(PersistenceError, ETLError)
-    assert isinstance(PersistenceError("boom"), ETLError)
+def test_persistence_error_is_evoxc_error():
+    assert issubclass(PersistenceError, EVOXCError)
+    assert isinstance(PersistenceError("boom"), EVOXCError)
 
 
 # --- I/O-level failures (not content validation) ---------------------------
@@ -80,7 +80,7 @@ def test_load_missing_file(tmp_path):
     # validation; a missing file is an I/O failure, and open()'s
     # FileNotFoundError propagates unchanged.
     with pytest.raises(FileNotFoundError):
-        load_object(tmp_path / "nope.etlpers")
+        load_object(tmp_path / "nope.evoxcpers")
 
 
 def test_load_directory_as_path(tmp_path):
@@ -95,21 +95,21 @@ def test_load_directory_as_path(tmp_path):
 
 
 def test_load_empty_file(tmp_path):
-    p = tmp_path / "empty.etlpers"
+    p = tmp_path / "empty.evoxcpers"
     p.write_bytes(b"")
     with pytest.raises(PersistenceError, match="too short"):
         load_object(p)
 
 
 def test_load_bad_magic(tmp_path):
-    p = tmp_path / "garbage.etlpers"
+    p = tmp_path / "garbage.evoxcpers"
     p.write_bytes(bytes(range(256)))
     with pytest.raises(PersistenceError, match="bad magic"):
         load_object(p)
 
 
 def test_load_valid_magic_garbage_tail(tmp_path):
-    p = tmp_path / "truncated.etlpers"
+    p = tmp_path / "truncated.evoxcpers"
     p.write_bytes(_MAGIC + b"\x00" * 8)
     with pytest.raises(PersistenceError, match="corrupt"):
         load_object(p)
@@ -119,20 +119,20 @@ def test_load_valid_magic_garbage_tail(tmp_path):
 
 
 def test_load_newer_format_version(tmp_path):
-    p = tmp_path / "future.etlpers"
+    p = tmp_path / "future.evoxcpers"
     save_object(p, "test.payload", {"x": 1})
     blob = bytearray(p.read_bytes())
-    blob[7:11] = struct.pack(">I", ETL_FORMAT_VERSION + 1)
+    blob[9:13] = struct.pack(">I", EVOXC_FORMAT_VERSION + 1)
     p.write_bytes(blob)
     with pytest.raises(PersistenceError, match="newer format"):
         load_object(p)
 
 
 def test_load_unknown_older_format_version(tmp_path):
-    p = tmp_path / "old.etlpers"
+    p = tmp_path / "old.evoxcpers"
     save_object(p, "test.payload", {"x": 1})
     blob = bytearray(p.read_bytes())
-    blob[7:11] = struct.pack(">I", 0)
+    blob[9:13] = struct.pack(">I", 0)
     p.write_bytes(blob)
     with pytest.raises(PersistenceError, match="corrupt"):
         load_object(p)
@@ -142,21 +142,21 @@ def test_load_unknown_older_format_version(tmp_path):
 
 
 def test_load_invalid_header_json(tmp_path):
-    p = tmp_path / "bad-header.etlpers"
+    p = tmp_path / "bad-header.evoxcpers"
     _write_container(p, b"{not json")
     with pytest.raises(PersistenceError, match="corrupt"):
         load_object(p)
 
 
 def test_load_non_dict_header(tmp_path):
-    p = tmp_path / "list-header.etlpers"
+    p = tmp_path / "list-header.evoxcpers"
     _write_container(p, b"[]")  # valid JSON, but not an object
     with pytest.raises(PersistenceError, match="corrupt"):
         load_object(p)
 
 
 def test_load_unsupported_hash_algorithm(tmp_path):
-    p = tmp_path / "md5.etlpers"
+    p = tmp_path / "md5.evoxcpers"
     _write_container(p, _valid_header_bytes(hash_algorithm="md5"))
     with pytest.raises(PersistenceError, match="unsupported hash algorithm"):
         load_object(p)
@@ -166,7 +166,7 @@ def test_load_unsupported_hash_algorithm(tmp_path):
 
 
 def test_load_corrupt_payload_json(tmp_path):
-    p = tmp_path / "bad-payload.etlpers"
+    p = tmp_path / "bad-payload.evoxcpers"
     payload = b"definitely not json"
     # The digest must match the payload bytes, otherwise the integrity
     # check fires before the JSON parse and masks this failure.
@@ -176,9 +176,9 @@ def test_load_corrupt_payload_json(tmp_path):
 
 
 def test_load_unknown_codec_type(tmp_path):
-    p = tmp_path / "unknown-codec.etlpers"
+    p = tmp_path / "unknown-codec.evoxcpers"
     payload = json.dumps(
-        {"__etl_encoded__": True, "type": "no.such.type", "data": None},
+        {"__evoxc_encoded__": True, "type": "no.such.type", "data": None},
         sort_keys=True,
     ).encode("utf-8")
     _write_container(p, _valid_header_bytes(), payload)
@@ -188,12 +188,12 @@ def test_load_unknown_codec_type(tmp_path):
 
 
 def test_load_integrity_hash_mismatch(tmp_path):
-    p = tmp_path / "tampered.etlpers"
+    p = tmp_path / "tampered.evoxcpers"
     save_object(p, "test.payload", {"x": 1})
     blob = bytearray(p.read_bytes())
-    header_len = struct.unpack(">I", blob[11:15])[0]
-    payload_start = 15 + header_len + 8
-    payload_len = struct.unpack(">Q", blob[15 + header_len : payload_start])[0]
+    header_len = struct.unpack(">I", blob[13:17])[0]
+    payload_start = 17 + header_len + 8
+    payload_len = struct.unpack(">Q", blob[17 + header_len : payload_start])[0]
     blob[payload_start + payload_len - 1] ^= 0xFF  # flip the last payload byte
     p.write_bytes(blob)
     with pytest.raises(PersistenceError, match="integrity hash"):

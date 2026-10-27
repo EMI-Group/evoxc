@@ -1,4 +1,4 @@
-"""Cross-cutting explicit-error pins for ``etl.sparse`` v1 deferrals.
+"""Cross-cutting explicit-error pins for ``evoxc.sparse`` v1 deferrals.
 
 Each documented deferral must fail LOUDLY with an explicit error naming the
 reason — never a silent fallback. This file pins the CROSS-CUTTING deferrals
@@ -18,11 +18,11 @@ only (one focused test each); sibling files own the rest:
   not depend on that file.
 
 Pinned here (the "Known issues / v1 deferrals" list of
-``../etl/sparse/CONTEXT.md`` minus what the siblings own):
+``../evoxc/sparse/CONTEXT.md`` minus what the siblings own):
 
-1. No sparse constant in v1 (``etl.constant`` guard).
-2. sparse @ sparse matmul (densify with ``etl.sparse.to_dense``).
-3. Whole-sparse ``etl.bind`` (leaf-level bind works — see
+1. No sparse constant in v1 (``evoxc.constant`` guard).
+2. sparse @ sparse matmul (densify with ``evoxc.sparse.to_dense``).
+3. Whole-sparse ``evoxc.bind`` (leaf-level bind works — see
    ``test_pipeline.py``).
 4. Compiler-backend mechanism: ONE representative capability-drift error +
    ONE representative stablehlo export naming error (the full 16-op matrix
@@ -41,9 +41,9 @@ import re
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl import sparse
+import evoxc
+from evoxc import core
+from evoxc import sparse
 
 from tests.sparse.conftest import (
     assert_capability_drift,
@@ -59,17 +59,17 @@ from tests.sparse.conftest import (
 
 
 def test_no_sparse_constant_in_graph():
-    """etl.constant rejects a concrete sparse tensor inside a trace via the
+    """evoxc.constant rejects a concrete sparse tensor inside a trace via the
     existing constant guard — only concrete core.Tensor data can be embedded."""
 
     def f(x):
-        w = etl.constant(coo_example())
+        w = evoxc.constant(coo_example())
         return sparse.add(x, w)
 
-    with pytest.raises(etl.TraceError, match=re.escape(
-        "etl.constant expects a concrete core.Tensor, got SparseTensor"
+    with pytest.raises(evoxc.TraceError, match=re.escape(
+        "evoxc.constant expects a concrete core.Tensor, got SparseTensor"
     )):
-        etl.trace(f, coo_spec())
+        evoxc.trace(f, coo_spec())
 
 
 # ---------------------------------------------------------------------------
@@ -79,17 +79,17 @@ def test_no_sparse_constant_in_graph():
 
 def test_sparse_sparse_matmul_defers():
     """sparse @ sparse matmul is a v1 deferral: densify one operand with
-    etl.sparse.to_dense."""
+    evoxc.sparse.to_dense."""
 
     def f(a, b):
         return sparse.matmul(a, b)
 
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.trace(f, coo_spec(), coo_spec())
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.trace(f, coo_spec(), coo_spec())
     msg = str(excinfo.value)
     assert "v1 deferral" in msg
     assert "sparse @ sparse" in msg
-    assert "etl.sparse.to_dense" in msg
+    assert "evoxc.sparse.to_dense" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -104,26 +104,26 @@ def _bound_all_leaves_executable():
     """An executable whose sparse input's leaf specs all carry names, with
     every tensor leaf bound."""
     spec = sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64, name="idx"),
-        etl.TensorSpec((None,), etl.float32, name="val"),
+        evoxc.TensorSpec((None, 2), evoxc.int64, name="idx"),
+        evoxc.TensorSpec((None,), evoxc.float32, name="val"),
         dense_shape=(3, 4),
     )
-    exe = etl.build(lambda x: sparse.to_dense(sparse.negate(x)), spec)
+    exe = evoxc.build(lambda x: sparse.to_dense(sparse.negate(x)), spec)
     idx = np.array([[0, 1], [1, 2], [2, 0], [2, 3]], dtype=np.int64)
     vals = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    return etl.bind(exe, idx=idx, val=vals)
+    return evoxc.bind(exe, idx=idx, val=vals)
 
 
 def test_whole_sparse_bind_fails():
-    """Whole-sparse etl.bind is not supported in v1: binding all tensor
+    """Whole-sparse evoxc.bind is not supported in v1: binding all tensor
     leaves leaves the sparse node's static leaves (dense_shape, dtype,
     format) unbound, so running with no arguments fails the unbound-portion
     structure check — an explicit TraceError, never silent. (The identical
     pin lives in test_pipeline.py — kept here because the CONTEXT.md Known
     issues list promises this failure mode.)"""
     bound = _bound_all_leaves_executable()
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.run(bound)
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.run(bound)
     msg = str(excinfo.value)
     assert "run-time input structure does not match the unbound portion" in msg
     assert "first mismatch at pytree path ()" in msg
@@ -138,23 +138,23 @@ def test_whole_sparse_bind_fails():
 def test_compiler_backend_capability_drift_representative():
     """CompilerBackend.lower rejects sparse ops BEFORE any compiler runs:
     the capability-drift BackendError names the op and suggests
-    etl.sparse.to_dense. The drift check itself needs no compiler (it is a
+    evoxc.sparse.to_dense. The drift check itself needs no compiler (it is a
     pure capability pre-check), but REACHING it requires the adapter to
-    activate: ``etl.lower(..., backend="iree")`` resolves the backend through
+    activate: ``evoxc.lower(..., backend="iree")`` resolves the backend through
     the registry, which imports the adapter and runs its ``check_available``
     dependency probe. In a compiler-free env that probe raises the adapter-
     absence BackendError first, so this pin skips on that signature only
     (shared helper — never an ``importorskip``)."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
     assert_capability_drift(graph, "iree", "sparse_negate")
 
 
 def test_stablehlo_export_names_op_representative():
     """The StableHLO exporter names the offending sparse op in its explicit
     v1 BackendError."""
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
     with pytest.raises(core.BackendError) as excinfo:
-        etl.backends.stablehlo.export(graph)
+        evoxc.backends.stablehlo.export(graph)
     msg = str(excinfo.value)
     assert "stablehlo export: op 'sparse_negate'" in msg
     assert "is not supported in v1" in msg
@@ -166,19 +166,19 @@ def test_stablehlo_export_names_op_representative():
 #
 # test_transforms.py was empty when this file was written, so ALL THREE
 # deferrals are pinned here (grad/vjp share the vjp rules — the errors come
-# from the registered rules in etl/sparse/rules.py). Each rule raises
+# from the registered rules in evoxc/sparse/rules.py). Each rule raises
 # core.TransformError naming the op, with "v1 deferral".
 
 
 def test_vjp_defers_sparse_concatenate():
     """sparse_concatenate's vjp rule is an explicit v1 deferral."""
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, b: sparse.to_dense(sparse.concatenate([a, b], axis=0)),
         coo_spec(),
         coo_spec(),
     )
     with pytest.raises(core.TransformError) as excinfo:
-        etl.vjp(graph, cotangents=(core.TensorSpec((6, 4), etl.float32),))
+        evoxc.vjp(graph, cotangents=(core.TensorSpec((6, 4), evoxc.float32),))
     msg = str(excinfo.value)
     assert "v1 deferral" in msg
     assert "sparse_concatenate" in msg
@@ -188,16 +188,16 @@ def test_vjp_defers_sparse_coo_to_csc():
     """sparse_coo_to_csc's vjp rule is an explicit v1 deferral (its CSC
     result feeds the graph output directly — the cotangent tree mirrors the
     sparse output node's children layout)."""
-    graph = etl.trace(lambda x: sparse.to_csc(x), coo_spec())
+    graph = evoxc.trace(lambda x: sparse.to_csc(x), coo_spec())
     cotangents = sparse.SparseTensorSpec(
-        etl.TensorSpec((5,), etl.int64),  # CSC indptr: cols+1 = 4+1
-        etl.TensorSpec((None,), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((5,), evoxc.int64),  # CSC indptr: cols+1 = 4+1
+        evoxc.TensorSpec((None,), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(3, 4),
         format="csc",
     )
     with pytest.raises(core.TransformError) as excinfo:
-        etl.vjp(graph, cotangents=cotangents)
+        evoxc.vjp(graph, cotangents=cotangents)
     msg = str(excinfo.value)
     assert "v1 deferral" in msg
     assert "sparse_coo_to_csc" in msg
@@ -206,15 +206,15 @@ def test_vjp_defers_sparse_coo_to_csc():
 def test_vjp_defers_sparse_csc_to_coo():
     """sparse_csc_to_coo's vjp rule is an explicit v1 deferral (the COO
     result feeds the graph output directly)."""
-    graph = etl.trace(lambda x: sparse.to_coo(x), csc_spec())
+    graph = evoxc.trace(lambda x: sparse.to_coo(x), csc_spec())
     cotangents = sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(3, 4),
         format="coo",
     )
     with pytest.raises(core.TransformError) as excinfo:
-        etl.vjp(graph, cotangents=cotangents)
+        evoxc.vjp(graph, cotangents=cotangents)
     msg = str(excinfo.value)
     assert "v1 deferral" in msg
     assert "sparse_csc_to_coo" in msg
@@ -232,26 +232,26 @@ def test_scan_over_sparse_xs_defers():
     def body(carry, x):
         return carry, x
 
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.trace(lambda x: etl.scan(body, 0, x), coo_spec())
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.trace(lambda x: evoxc.scan(body, 0, x), coo_spec())
     assert str(excinfo.value) == (
-        "etl.scan: xs leaf 2 must be a core.SymbolicTensor, got int"
+        "evoxc.scan: xs leaf 2 must be a core.SymbolicTensor, got int"
     )
 
 
 def test_scan_sparse_y_stacking_defers():
     """scan over sparse y-outputs is also a v1 deferral: the sparse node's
     static leaves make the y-output check fail with an explicit TraceError
-    (documented in etl/sparse/CONTEXT.md "scan over sparse xs / sparse
+    (documented in evoxc/sparse/CONTEXT.md "scan over sparse xs / sparse
     y-stacking is a v1 deferral (explicit TraceError)")."""
 
     def body(carry, x):
         return carry, sparse.from_dense(x)
 
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.trace(
-            lambda x: etl.scan(body, 0, x), etl.TensorSpec((4,), etl.float32)
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.trace(
+            lambda x: evoxc.scan(body, 0, x), evoxc.TensorSpec((4,), evoxc.float32)
         )
     msg = str(excinfo.value)
-    assert "etl.scan: f's y outputs must be SymbolicTensors" in msg
+    assert "evoxc.scan: f's y outputs must be SymbolicTensors" in msg
     assert "cannot be traced" in msg

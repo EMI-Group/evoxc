@@ -1,21 +1,21 @@
-"""Sugar discipline of `etl.numpy` (enp): defer, never invent.
+"""Sugar discipline of `evoxc.numpy` (enp): defer, never invent.
 
-enp is a pure-sugar namespace over etl.ops (no eager numpy fallback, no
+enp is a pure-sugar namespace over evoxc.ops (no eager numpy fallback, no
 numerical kernels). These tests pin the contract that enp either forwards
 calls transparently (errors surface unchanged, IR identical) or defers loudly
 (NotImplementedError / ValueError / AttributeError / TypeError) — it never
-silently invents semantics. See ../etl/numpy/CONTEXT.md for the mapping table
+silently invents semantics. See ../evoxc/numpy/CONTEXT.md for the mapping table
 and the v1 deferral list.
 """
 
 import numpy as np
 import pytest
 
-import etl
-import etl.numpy as enp
+import evoxc
+import evoxc.numpy as enp
 from tests.numpy._ir_utils import normalize_ir
 
-SPEC_2X3 = etl.TensorSpec((2, 3), etl.float32)
+SPEC_2X3 = evoxc.TensorSpec((2, 3), evoxc.float32)
 
 
 # --- file-local helpers -----------------------------------------------------
@@ -23,9 +23,9 @@ SPEC_2X3 = etl.TensorSpec((2, 3), etl.float32)
 
 def _trace_text(fn, *specs):
     """Trace fn, verify the module, and return normalized pretty-printed IR."""
-    graph = etl.trace(fn, *specs)
+    graph = evoxc.trace(fn, *specs)
     graph.verify()
-    return normalize_ir(etl.ir.pretty_print(graph.module))
+    return normalize_ir(evoxc.ir.pretty_print(graph.module))
 
 
 # --- no eager fallback: concrete Tensors raise TraceError like ops ----------
@@ -39,7 +39,7 @@ def _trace_text(fn, *specs):
         pytest.param(lambda t: enp.sum(t), id="sum"),
         pytest.param(lambda t: enp.reshape(t, (2, 2)), id="reshape"),
         pytest.param(
-            lambda t: enp.where(etl.tensor(np.ones((2, 2), np.bool_)), t, t),
+            lambda t: enp.where(evoxc.tensor(np.ones((2, 2), np.bool_)), t, t),
             id="where",
         ),
         pytest.param(lambda t: enp.matmul(t, t), id="matmul"),
@@ -49,18 +49,18 @@ def _trace_text(fn, *specs):
 def test_concrete_tensor_outside_trace_raises_trace_error(call):
     """enp has no eager mode: concrete Tensor args raise TraceError exactly
     like ops (the kernels live only in the backends)."""
-    t = etl.tensor(np.ones((2, 2), np.float32))
-    with pytest.raises(etl.TraceError, match="No active trace"):
+    t = evoxc.tensor(np.ones((2, 2), np.float32))
+    with pytest.raises(evoxc.TraceError, match="No active trace"):
         call(t)
 
 
 def test_trace_error_message_identical_to_ops():
     """enp must not catch or reword ops' errors — same message verbatim."""
-    t = etl.tensor(np.ones((2, 2), np.float32))
-    with pytest.raises(etl.TraceError) as exc_enp:
+    t = evoxc.tensor(np.ones((2, 2), np.float32))
+    with pytest.raises(evoxc.TraceError) as exc_enp:
         enp.add(t, t)
-    with pytest.raises(etl.TraceError) as exc_ops:
-        etl.ops.add(t, t)
+    with pytest.raises(evoxc.TraceError) as exc_ops:
+        evoxc.ops.add(t, t)
     assert str(exc_enp.value) == str(exc_ops.value)
 
 
@@ -72,23 +72,23 @@ def test_pad_nonconstant_modes_deferred(mode):
     """Only mode='constant' exists in v1; other numpy.pad modes are deferred
     (loud NotImplementedError, never a silent constant-pad fallback)."""
 
-    @etl.defn
+    @evoxc.defn
     def f(a):
         return enp.pad(a, 1, mode=mode)
 
     with pytest.raises(NotImplementedError, match="deferred"):
-        etl.trace(f, SPEC_2X3)
+        evoxc.trace(f, SPEC_2X3)
 
 
 def test_clip_both_bounds_none_raises_value_error():
     """numpy parity: clip with both bounds None raises ValueError."""
 
-    @etl.defn
+    @evoxc.defn
     def f(a):
         return enp.clip(a, None, None)
 
     with pytest.raises(ValueError, match="at least one"):
-        etl.trace(f, SPEC_2X3)
+        evoxc.trace(f, SPEC_2X3)
 
 
 @pytest.mark.parametrize(
@@ -127,34 +127,34 @@ def test_add_ufunc_kwargs_not_provided():
     """numpy ufunc kwargs (out/where/dtype/...) are not provided in v1 — the
     sugar signatures are plain forwards."""
 
-    @etl.defn
+    @evoxc.defn
     def f(a, b):
         return enp.add(a, b, out=a)
 
     with pytest.raises(TypeError, match="unexpected keyword argument"):
-        etl.trace(f, SPEC_2X3, SPEC_2X3)
+        evoxc.trace(f, SPEC_2X3, SPEC_2X3)
 
 
 def test_sum_ufunc_kwargs_not_provided():
     """Same for reductions: no `where=` kwarg in v1."""
 
-    @etl.defn
+    @evoxc.defn
     def f(a):
         return enp.sum(a, where=True)
 
     with pytest.raises(TypeError, match="unexpected keyword argument"):
-        etl.trace(f, SPEC_2X3)
+        evoxc.trace(f, SPEC_2X3)
 
 
 def test_reshape_numel_mismatch_surfaces_ops_error():
     """Transparent forward: ops' ShapeError surfaces unchanged through enp."""
 
-    @etl.defn
+    @evoxc.defn
     def f(a):
         return enp.reshape(a, (3, 7))  # 6 elements -> 21: mismatch
 
-    with pytest.raises(etl.ShapeError, match="reshape"):
-        etl.trace(f, SPEC_2X3)
+    with pytest.raises(evoxc.ShapeError, match="reshape"):
+        evoxc.trace(f, SPEC_2X3)
 
 
 # --- pure-sugar forwards build identical IR ---------------------------------
@@ -163,9 +163,9 @@ def test_reshape_numel_mismatch_surfaces_ops_error():
 @pytest.mark.parametrize(
     "enp_fn, ops_fn, unary, op_name",
     [
-        pytest.param(enp.subtract, etl.ops.subtract, False, "subtract",
+        pytest.param(enp.subtract, evoxc.ops.subtract, False, "subtract",
                      id="subtract"),
-        pytest.param(enp.negative, etl.ops.negate, True, "negate",
+        pytest.param(enp.negative, evoxc.ops.negate, True, "negate",
                      id="negative"),
     ],
 )
@@ -173,15 +173,15 @@ def test_sugar_forward_builds_identical_ir(enp_fn, ops_fn, unary, op_name):
     """Smoke test that 1:1 sugar is a forward, not a reimplementation: enp and
     the mapped ops call build identical IR (same op names, operands, attrs)."""
 
-    @etl.defn
+    @evoxc.defn
     def f_enp(a, b):
         return enp_fn(a) if unary else enp_fn(a, b)
 
-    @etl.defn
+    @evoxc.defn
     def f_ops(a, b):
         return ops_fn(a) if unary else ops_fn(a, b)
 
     ir_enp = _trace_text(f_enp, SPEC_2X3, SPEC_2X3)
     ir_ops = _trace_text(f_ops, SPEC_2X3, SPEC_2X3)
     assert ir_enp == ir_ops
-    assert f"etl.{op_name}(" in ir_enp
+    assert f"evoxc.{op_name}(" in ir_enp

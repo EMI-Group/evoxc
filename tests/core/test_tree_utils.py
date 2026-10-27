@@ -1,7 +1,7 @@
-"""Tests for the etl tree utility API: ``tree_map`` / ``tree_leaves`` /
+"""Tests for the evoxc tree utility API: ``tree_map`` / ``tree_leaves`` /
 ``tree_structure`` / ``tree_flatten`` / ``tree_unflatten``.
 
-Authoritative source: ``etl/core/tree.py``. Contract under test:
+Authoritative source: ``evoxc/core/tree.py``. Contract under test:
 
 - ``tree_map(fn, *trees)``: with a single tree, applies ``fn`` to every leaf
   and rebuilds the same structure (same container types). With multiple
@@ -16,8 +16,8 @@ Authoritative source: ``etl/core/tree.py``. Contract under test:
   ``num_leaves`` follow ``flatten``).
 - ``tree_flatten`` is an alias of ``flatten``; ``tree_unflatten`` is an
   alias of ``unflatten`` (identity aliases with identical results).
-- All five names are exported from ``etl``, ``etl.core`` and
-  ``etl.core.tree`` — the very same objects.
+- All five names are exported from ``evoxc``, ``evoxc.core`` and
+  ``evoxc.core.tree`` — the very same objects.
 """
 
 from collections import namedtuple
@@ -25,11 +25,11 @@ from dataclasses import dataclass
 
 import pytest
 
-import etl
-import etl.core
-from etl.core import flatten, unflatten
-from etl.core import tree as tree_module
-from etl.core.tree import (
+import evoxc
+import evoxc.core
+from evoxc.core import flatten, unflatten
+from evoxc.core import tree as tree_module
+from evoxc.core.tree import (
     TreeSpec,
     register_pytree_node,
     tree_flatten,
@@ -97,11 +97,11 @@ TREE_UTIL_NAMES = (
 )
 
 
-def test_tree_utils_exported_from_etl_etl_core_and_tree_module():
+def test_tree_utils_exported_from_evoxc_evoxc_core_and_tree_module():
     # Import the modules and assert the SAME objects are reachable everywhere.
     for name in TREE_UTIL_NAMES:
-        assert getattr(etl, name) is getattr(etl.core, name)
-        assert getattr(etl.core, name) is getattr(tree_module, name)
+        assert getattr(evoxc, name) is getattr(evoxc.core, name)
+        assert getattr(evoxc.core, name) is getattr(tree_module, name)
 
 
 # ---------------------------------------------------------------------------

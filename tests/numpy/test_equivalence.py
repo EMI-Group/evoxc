@@ -1,14 +1,14 @@
-"""The defining property of `etl.numpy` (enp): every enp function builds
-EXACTLY the same IR as its documented `etl.ops` composition — same op
+"""The defining property of `evoxc.numpy` (enp): every enp function builds
+EXACTLY the same IR as its documented `evoxc.ops` composition — same op
 kinds, operands, attrs, and result types (see the mapping table in
-`etl/numpy/CONTEXT.md`).
+`evoxc/numpy/CONTEXT.md`).
 
 Each parametrized case builds two defns from identical TensorSpecs and
 static values — one with enp, one with the documented ops composition —
 traces both, `verify()`s both, and asserts the normalized pretty-printed
 IR is character-for-character identical. The only permitted difference is
 per-op ` loc(...)` tokens (call-site dependent: enp bodies live in
-etl/numpy/*.py, ops bodies in this file), which are stripped per line.
+evoxc/numpy/*.py, ops bodies in this file), which are stripped per line.
 """
 
 from __future__ import annotations
@@ -19,29 +19,29 @@ import operator
 import numpy as np
 import pytest
 
-import etl
-import etl.numpy as enp
-from etl import ops
+import evoxc
+import evoxc.numpy as enp
+from evoxc import ops
 from tests.numpy._ir_utils import normalize_ir
 
-F32 = etl.float32
-F64 = etl.float64
-I32 = etl.int32
-BOOL = etl.bool_
+F32 = evoxc.float32
+F64 = evoxc.float64
+I32 = evoxc.int32
+BOOL = evoxc.bool_
 
 # --- helpers ----------------------------------------------------------------
 
 
 def _spec(shape, dtype=F32):
-    return etl.TensorSpec(shape, dtype)
+    return evoxc.TensorSpec(shape, dtype)
 
 
 def _ir(body, *specs):
-    """Trace `body` (a plain function) via etl.defn, verify, pretty-print
+    """Trace `body` (a plain function) via evoxc.defn, verify, pretty-print
     into normalized SSA text (the entry func is always named `main`)."""
-    graph = etl.trace(etl.defn(body), *specs)
+    graph = evoxc.trace(evoxc.defn(body), *specs)
     graph.verify()
-    return normalize_ir(etl.ir.pretty_print(graph.module))
+    return normalize_ir(evoxc.ir.pretty_print(graph.module))
 
 
 def _assert_same_ir(enp_body, ops_body, *specs):
@@ -51,8 +51,8 @@ def _assert_same_ir(enp_body, ops_body, *specs):
     assert enp_ir == ops_ir
 
 
-# --- documented ops compositions (mirrors of etl/numpy internals) -----------
-# These are the contract from etl/numpy/CONTEXT.md: composed enp functions
+# --- documented ops compositions (mirrors of evoxc/numpy internals) -----------
+# These are the contract from evoxc/numpy/CONTEXT.md: composed enp functions
 # must produce exactly this op sequence.
 
 
@@ -312,45 +312,45 @@ SHAPE_CASES = [
 
 CREATION_CASES = [
     # Creation is graph Constant ops inside defn — same op kind as
-    # etl.constant, never concrete tensors. Constant attrs print as
+    # evoxc.constant, never concrete tensors. Constant attrs print as
     # ndarray<dtype[shape]> summaries, so equal dtype/shape ⇒ equal text.
     pytest.param(lambda: enp.zeros((2, 3)),
-                 lambda: ops.constant(etl.tensor(np.zeros((2, 3), dtype=np.float32))),
+                 lambda: ops.constant(evoxc.tensor(np.zeros((2, 3), dtype=np.float32))),
                  [], id="zeros"),
     pytest.param(lambda: enp.zeros(5),
-                 lambda: ops.constant(etl.tensor(np.zeros(5, dtype=np.float32))),
+                 lambda: ops.constant(evoxc.tensor(np.zeros(5, dtype=np.float32))),
                  [], id="zeros-int-shape"),
     pytest.param(lambda: enp.ones((2, 3)),
-                 lambda: ops.constant(etl.tensor(np.ones((2, 3), dtype=np.float32))),
+                 lambda: ops.constant(evoxc.tensor(np.ones((2, 3), dtype=np.float32))),
                  [], id="ones"),
     pytest.param(lambda: enp.ones((2, 3), dtype=F64),
-                 lambda: ops.constant(etl.tensor(np.ones((2, 3), dtype=np.float64))),
+                 lambda: ops.constant(evoxc.tensor(np.ones((2, 3), dtype=np.float64))),
                  [], id="ones-dtype"),
     # full with dtype=None → np.result_type(fill_value) inference (7 → int64)
     pytest.param(lambda: enp.full((2, 2), 7),
                  lambda: ops.constant(
-                     etl.tensor(np.full((2, 2), 7, dtype=np.result_type(7)))
+                     evoxc.tensor(np.full((2, 2), 7, dtype=np.result_type(7)))
                  ),
                  [], id="full-inferred"),
     pytest.param(lambda: enp.full((2, 3), 0.5, dtype=F32),
                  lambda: ops.constant(
-                     etl.tensor(np.full((2, 3), 0.5, dtype=np.float32))
+                     evoxc.tensor(np.full((2, 3), 0.5, dtype=np.float32))
                  ),
                  [], id="full-dtype"),
     # empty: values unspecified (numpy semantics); dtype defaults float32
     pytest.param(lambda: enp.empty((2, 3)),
-                 lambda: ops.constant(etl.tensor(np.empty((2, 3), dtype=np.float32))),
+                 lambda: ops.constant(evoxc.tensor(np.empty((2, 3), dtype=np.float32))),
                  [], id="empty"),
     pytest.param(lambda: enp.arange(6),
-                 lambda: ops.constant(etl.tensor(np.arange(6))),
+                 lambda: ops.constant(evoxc.tensor(np.arange(6))),
                  [], id="arange-stop"),
     pytest.param(lambda: enp.arange(2, 9, 3, dtype=I32),
                  lambda: ops.constant(
-                     etl.tensor(np.arange(2, 9, 3, dtype=np.int32))
+                     evoxc.tensor(np.arange(2, 9, 3, dtype=np.int32))
                  ),
                  [], id="arange-full"),
     pytest.param(lambda: enp.arange(0.0, 1.0, 0.25),
-                 lambda: ops.constant(etl.tensor(np.arange(0.0, 1.0, 0.25))),
+                 lambda: ops.constant(evoxc.tensor(np.arange(0.0, 1.0, 0.25))),
                  [], id="arange-float"),
 ]
 
@@ -399,21 +399,21 @@ def test_linalg_equivalence(enp_body, ops_body, specs):
 
 
 # --- runtime spot checks ----------------------------------------------------
-# enp is sugar: it must also run — etl.evaluate on an enp defn behaves like
+# enp is sugar: it must also run — evoxc.evaluate on an enp defn behaves like
 # the ops composition and matches numpy.
 
 
 def test_evaluate_runs_enp_defn_numerically():
-    """etl.evaluate runs an enp defn end-to-end; result is an etl.Tensor
+    """evoxc.evaluate runs an enp defn end-to-end; result is an evoxc.Tensor
     matching the numpy reference."""
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
 
-    @etl.defn
+    @evoxc.defn
     def f(v):
         return enp.add(enp.sqrt(v), enp.ones((2, 3)))
 
-    out = etl.evaluate(f, x)
-    assert isinstance(out, etl.Tensor)
+    out = evoxc.evaluate(f, x)
+    assert isinstance(out, evoxc.Tensor)
     np.testing.assert_allclose(
         out.numpy(), np.sqrt(x) + np.ones((2, 3), dtype=np.float32)
     )
@@ -423,12 +423,12 @@ def test_evaluate_python_scalar_raises_type_error():
     """evaluate arguments must be tensors/ndarrays — Python scalars raise
     TypeError (no silent conversion)."""
 
-    @etl.defn
+    @evoxc.defn
     def f(v):
         return enp.add(v, 1.0)
 
     with pytest.raises(TypeError, match="TypeError"):
-        etl.evaluate(f, 1.0)
+        evoxc.evaluate(f, 1.0)
 
 
 def test_enp_and_ops_defns_produce_equal_numbers():
@@ -436,15 +436,15 @@ def test_enp_and_ops_defns_produce_equal_numbers():
     run to the same values."""
     x = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
 
-    @etl.defn
+    @evoxc.defn
     def f_enp(a):
         return enp.clip(a, 1.5, 3.5)
 
-    @etl.defn
+    @evoxc.defn
     def f_ops(a):
         return ops.maximum(ops.minimum(a, 3.5), 1.5)
 
-    r_enp = etl.evaluate(f_enp, x)
-    r_ops = etl.evaluate(f_ops, x)
+    r_enp = evoxc.evaluate(f_enp, x)
+    r_ops = evoxc.evaluate(f_ops, x)
     np.testing.assert_array_equal(r_enp.numpy(), r_ops.numpy())
     np.testing.assert_array_equal(r_enp.numpy(), np.clip(x, 1.5, 3.5))

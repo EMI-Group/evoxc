@@ -9,6 +9,6 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
-*.etlgraph
-*.etlartifact
+*.evoxcgraph
+*.evoxcartifact
 *.executable

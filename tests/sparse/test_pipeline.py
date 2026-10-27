@@ -1,4 +1,4 @@
-"""Staging-pipeline tests for ``etl.sparse``.
+"""Staging-pipeline tests for ``evoxc.sparse``.
 
 Covers the explicit pipeline with sparse values (``trace -> lower -> compile
 -> load -> run``), the ``build``/``evaluate`` sugar (concrete sparse args
@@ -7,22 +7,22 @@ level ``bind`` (works) vs whole-sparse ``bind`` (v1 deferral), ``Graph``
 save/load roundtrips, run-time static-leaf validation (dense_shape / values
 dtype / FORMAT leaves), and stage-type discipline.
 
-Contract under test: ``../etl/sparse/CONTEXT.md`` (pytree contract,
-``SparseTensorSpec.from_concrete``, ``etl.pipeline.evaluate`` — see
-``../etl/pipeline.py`` ~line 894). Sibling files own the deep spec
+Contract under test: ``../evoxc/sparse/CONTEXT.md`` (pytree contract,
+``SparseTensorSpec.from_concrete``, ``evoxc.pipeline.evaluate`` — see
+``../evoxc/pipeline.py`` ~line 894). Sibling files own the deep spec
 validation (``test_value.py``) and op numerics (``test_ops.py``); this file
 pins the pipeline-level behavior only. Small shapes only.
 
 Per-file helpers: ``named_coo_spec`` / ``named_csr_spec`` (leaf specs carry
-``name=`` so ``etl.bind`` can target single leaves).
+``name=`` so ``evoxc.bind`` can target single leaves).
 """
 
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl import sparse
+import evoxc
+from evoxc import core
+from evoxc import sparse
 
 from tests.sparse.conftest import (
     coo_example,
@@ -42,20 +42,20 @@ from tests.sparse.conftest import (
 
 
 def named_coo_spec():
-    """COO spec whose tensor leaves carry names for ``etl.bind``."""
+    """COO spec whose tensor leaves carry names for ``evoxc.bind``."""
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64, name="idx"),
-        etl.TensorSpec((None,), etl.float32, name="val"),
+        evoxc.TensorSpec((None, 2), evoxc.int64, name="idx"),
+        evoxc.TensorSpec((None,), evoxc.float32, name="val"),
         dense_shape=(3, 4),
     )
 
 
 def named_csr_spec():
-    """CSR spec whose tensor leaves carry names for ``etl.bind``."""
+    """CSR spec whose tensor leaves carry names for ``evoxc.bind``."""
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((4,), etl.int64, name="indptr"),
-        etl.TensorSpec((None,), etl.int64, name="cind"),
-        etl.TensorSpec((None,), etl.float32, name="cval"),
+        evoxc.TensorSpec((4,), evoxc.int64, name="indptr"),
+        evoxc.TensorSpec((None,), evoxc.int64, name="cind"),
+        evoxc.TensorSpec((None,), evoxc.float32, name="cval"),
         dense_shape=(3, 4),
         format="csr",
     )
@@ -68,38 +68,38 @@ def named_csr_spec():
 
 def test_explicit_pipeline_negate_coo():
     """trace(coo) -> lower(numpy) -> compile -> load -> run: correct result."""
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
-    lowered = etl.lower(graph)  # backend=None -> numpy
-    artifact = etl.compile(lowered)
-    exe = etl.load(artifact)
-    out = etl.run(exe, coo_example())
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
+    lowered = evoxc.lower(graph)  # backend=None -> numpy
+    artifact = evoxc.compile(lowered)
+    exe = evoxc.load(artifact)
+    out = evoxc.run(exe, coo_example())
     np.testing.assert_allclose(materialize(out), -dense_example(), rtol=1e-6)
 
 
 def test_explicit_pipeline_to_dense_csr():
     """CSR input through the explicit pipeline (conftest run_graph helper)."""
-    graph = etl.trace(lambda x: sparse.to_dense(x), csr_spec())
+    graph = evoxc.trace(lambda x: sparse.to_dense(x), csr_spec())
     out = run_graph(graph, csr_example())
     np.testing.assert_allclose(materialize(out), dense_example(), rtol=1e-6)
 
 
 def test_explicit_pipeline_to_dense_csc():
     """CSC input through the explicit pipeline."""
-    graph = etl.trace(lambda x: sparse.to_dense(x), csc_spec())
+    graph = evoxc.trace(lambda x: sparse.to_dense(x), csc_spec())
     out = run_graph(graph, csc_example())
     np.testing.assert_allclose(materialize(out), dense_example(), rtol=1e-6)
 
 
 def test_explicit_pipeline_negate_csr():
     """A computation op (negate) on a CSR input auto-converts to COO in-graph."""
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.negate(x)), csr_spec())
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.negate(x)), csr_spec())
     out = run_graph(graph, csr_example())
     np.testing.assert_allclose(materialize(out), -dense_example(), rtol=1e-6)
 
 
 def test_lower_defaults_to_numpy_backend():
-    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    lowered = etl.lower(graph)
+    graph = evoxc.trace(lambda x: sparse.negate(x), coo_spec())
+    lowered = evoxc.lower(graph)
     assert lowered.backend == "numpy"
 
 
@@ -109,21 +109,21 @@ def test_lower_defaults_to_numpy_backend():
 
 
 def test_build_sugar_runs_with_sparse_input():
-    """etl.build = trace -> lower -> compile -> load; run takes the concrete."""
-    exe = etl.build(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
-    out = etl.run(exe, coo_example())
+    """evoxc.build = trace -> lower -> compile -> load; run takes the concrete."""
+    exe = evoxc.build(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
+    out = evoxc.run(exe, coo_example())
     np.testing.assert_allclose(materialize(out), -dense_example(), rtol=1e-6)
 
 
 def test_evaluate_coo_arg_derives_spec_and_runs():
-    """etl.evaluate derives a SparseTensorSpec from a concrete COO arg."""
-    out = etl.evaluate(lambda x: sparse.to_dense(sparse.negate(x)), coo_example())
+    """evoxc.evaluate derives a SparseTensorSpec from a concrete COO arg."""
+    out = evoxc.evaluate(lambda x: sparse.to_dense(sparse.negate(x)), coo_example())
     np.testing.assert_allclose(materialize(out), -dense_example(), rtol=1e-6)
 
 
 def test_evaluate_csr_arg_derives_spec_and_runs():
-    """etl.evaluate with a concrete CSR arg (indptr static (4,) in the spec)."""
-    out = etl.evaluate(lambda x: sparse.to_dense(x), csr_example())
+    """evoxc.evaluate with a concrete CSR arg (indptr static (4,) in the spec)."""
+    out = evoxc.evaluate(lambda x: sparse.to_dense(x), csr_example())
     np.testing.assert_allclose(materialize(out), dense_example(), rtol=1e-6)
 
 
@@ -132,7 +132,7 @@ def test_evaluate_mixed_sparse_and_dense_args():
     derives its own spec (SparseTensorSpec for the sparse one)."""
     d = dense_example()
     ones = core.from_numpy(np.ones((3, 4), dtype=np.float32))
-    out = etl.evaluate(
+    out = evoxc.evaluate(
         lambda x, d1, d2: sparse.to_dense(sparse.multiply_dense(x, d1)) * d2,
         coo_example(),
         d,
@@ -143,7 +143,7 @@ def test_evaluate_mixed_sparse_and_dense_args():
 
 def test_evaluate_sparse_result_comes_back_concrete():
     """A sparse graph result returns a CONCRETE sparse tensor (to_dense works)."""
-    out = etl.evaluate(lambda x: sparse.negate(x), coo_example())
+    out = evoxc.evaluate(lambda x: sparse.negate(x), coo_example())
     assert sparse.is_sparse(out)
     np.testing.assert_allclose(out.to_dense(), -dense_example(), rtol=1e-6)
 
@@ -151,7 +151,7 @@ def test_evaluate_sparse_result_comes_back_concrete():
 def test_evaluate_rejects_non_tensor_args():
     """evaluate accepts only concrete tensors / concrete sparse tensors."""
     with pytest.raises(TypeError, match="arguments that are not concrete tensors"):
-        etl.evaluate(lambda x: sparse.to_dense(x), 42)
+        evoxc.evaluate(lambda x: sparse.to_dense(x), 42)
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +170,10 @@ def test_from_concrete_coo_children_align_leaf_for_leaf():
     concrete_children, _ = core.flatten(concrete)
     assert len(spec_children) == len(concrete_children) == 6
     indices_spec, values_spec = spec_children[:2]
-    assert isinstance(indices_spec, etl.TensorSpec)
+    assert isinstance(indices_spec, evoxc.TensorSpec)
     assert indices_spec.shape == (None, 2)
     assert indices_spec.dtype == np.dtype("int64")
-    assert isinstance(values_spec, etl.TensorSpec)
+    assert isinstance(values_spec, evoxc.TensorSpec)
     assert values_spec.shape == (None,)
     assert values_spec.dtype == np.dtype("float32")
     # Static leaves pass through unchanged.
@@ -216,9 +216,9 @@ def test_bind_indices_leaf_coo():
     """Binding ONE tensor leaf (indices) works: run with the unbound portion
     — the sparse structure minus the bound leaf — and the bound tensor is
     supplied."""
-    exe = etl.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
+    exe = evoxc.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
     idx = np.array([[0, 1], [1, 2], [2, 0], [2, 3]], dtype=np.int64)
-    bound = etl.bind(exe, idx=idx)
+    bound = evoxc.bind(exe, idx=idx)
     # Unbound portion: the COO node with the indices leaf removed. from_parts
     # computes the dtype leaf from the remaining (values) leaf -> float32,
     # matching the traced static dtype leaf.
@@ -227,23 +227,23 @@ def test_bind_indices_leaf_coo():
         dense_shape=(3, 4),
         format="coo",
     )
-    out = etl.run(bound, rest)
+    out = evoxc.run(bound, rest)
     np.testing.assert_allclose(materialize(out), -dense_example(), rtol=1e-6)
 
 
 def test_bind_indptr_leaf_csr():
     """The same leaf-level idiom works for a CSR node (bind the static-shaped
     indptr leaf, run with the (indices, values) rest)."""
-    exe = etl.build(lambda x: sparse.to_dense(x), named_csr_spec())
+    exe = evoxc.build(lambda x: sparse.to_dense(x), named_csr_spec())
     indptr = np.array([0, 1, 2, 4], dtype=np.int64)
-    bound = etl.bind(exe, indptr=indptr)
+    bound = evoxc.bind(exe, indptr=indptr)
     rest = sparse.SparseTensor.from_parts(
         np.array([1, 2, 0, 3], dtype=np.int64),
         np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
         dense_shape=(3, 4),
         format="csr",
     )
-    out = etl.run(bound, rest)
+    out = evoxc.run(bound, rest)
     np.testing.assert_allclose(materialize(out), dense_example(), rtol=1e-6)
 
 
@@ -255,16 +255,16 @@ def test_bind_values_leaf_rest_carries_wrong_dtype_leaf():
     dtype leaf is values-owned); the working leaf-level idioms bind a
     non-values leaf (see the two tests above). Not a bug — the contract
     "leaf-level bind works" is satisfied by those idioms."""
-    exe = etl.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
+    exe = evoxc.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
     vals = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    bound = etl.bind(exe, val=vals)
+    bound = evoxc.bind(exe, val=vals)
     rest = sparse.SparseTensor.from_parts(
         np.array([[0, 1], [1, 2], [2, 0], [2, 3]], dtype=np.int64),
         dense_shape=(3, 4),
         format="coo",
     )
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.run(bound, rest)
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.run(bound, rest)
     msg = str(excinfo.value)
     assert "graph was specialized on dtype('float32')" in msg
     assert "at path [0][4] does not match" in msg
@@ -272,9 +272,9 @@ def test_bind_values_leaf_rest_carries_wrong_dtype_leaf():
 
 def test_bind_wrong_dtype_rejected_at_bind_time():
     """bind validates the bound tensor against its leaf spec immediately."""
-    exe = etl.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
-    with pytest.raises(etl.DTypeError, match=r"dtype mismatch for input at path \['val'\]"):
-        etl.bind(exe, val=np.zeros(4, dtype=np.float64))
+    exe = evoxc.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
+    with pytest.raises(evoxc.DTypeError, match=r"dtype mismatch for input at path \['val'\]"):
+        evoxc.bind(exe, val=np.zeros(4, dtype=np.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -287,12 +287,12 @@ def test_whole_sparse_bind_fails():
     (dense_shape, dtype, format) unbound — the reduced input tree keeps the
     sparse node, so running with no arguments is a structure mismatch. The
     failure is explicit (TraceError, never silent)."""
-    exe = etl.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
+    exe = evoxc.build(lambda x: sparse.to_dense(sparse.negate(x)), named_coo_spec())
     idx = np.array([[0, 1], [1, 2], [2, 0], [2, 3]], dtype=np.int64)
     vals = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    bound = etl.bind(exe, idx=idx, val=vals)
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.run(bound)
+    bound = evoxc.bind(exe, idx=idx, val=vals)
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.run(bound)
     msg = str(excinfo.value)
     assert "run-time input structure does not match the unbound portion" in msg
     assert "first mismatch at pytree path ()" in msg
@@ -306,20 +306,20 @@ def test_whole_sparse_bind_fails():
 
 def test_graph_save_load_roundtrip(tmp_path):
     """A traced sparse-input graph survives save/load and runs identically."""
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
-    path = str(tmp_path / "sparse_negate.etlgraph")
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
+    path = str(tmp_path / "sparse_negate.evoxcgraph")
     graph.save(path)
-    loaded = etl.Graph.load(path)
+    loaded = evoxc.Graph.load(path)
     out = run_graph(loaded, coo_example())
     np.testing.assert_allclose(materialize(out), -dense_example(), rtol=1e-6)
 
 
 def test_graph_save_load_roundtrip_csr(tmp_path):
     """The CSR variant (static indptr leaf) also roundtrips."""
-    graph = etl.trace(lambda x: sparse.to_dense(x), csr_spec())
-    path = str(tmp_path / "sparse_to_dense_csr.etlgraph")
+    graph = evoxc.trace(lambda x: sparse.to_dense(x), csr_spec())
+    path = str(tmp_path / "sparse_to_dense_csr.evoxcgraph")
     graph.save(path)
-    loaded = etl.Graph.load(path)
+    loaded = evoxc.Graph.load(path)
     out = run_graph(loaded, csr_example())
     np.testing.assert_allclose(materialize(out), dense_example(), rtol=1e-6)
 
@@ -332,7 +332,7 @@ def test_graph_save_load_roundtrip_csr(tmp_path):
 def test_run_wrong_dense_shape_fails_loudly():
     """dense_shape is a static leaf: a (3,5) concrete vs a (3,4) trace fails
     at run time with the shared static-leaf message."""
-    exe = etl.load(etl.compile(etl.lower(etl.trace(
+    exe = evoxc.load(evoxc.compile(evoxc.lower(evoxc.trace(
         lambda x: sparse.to_dense(x), coo_spec()
     ))))
     wrong = sparse.coo(
@@ -340,8 +340,8 @@ def test_run_wrong_dense_shape_fails_loudly():
         np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
         (3, 5),
     )
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.run(exe, wrong)
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.run(exe, wrong)
     assert str(excinfo.value) == (
         "graph was specialized on 4 (a int); run-time argument 5 (a int) "
         "at path [0][3] does not match"
@@ -351,7 +351,7 @@ def test_run_wrong_dense_shape_fails_loudly():
 def test_run_wrong_values_dtype_fails_loudly():
     """float64 values vs a float32 spec: the values leaf's TensorSpec check
     raises DTypeError (path [0][1] = the values leaf)."""
-    exe = etl.load(etl.compile(etl.lower(etl.trace(
+    exe = evoxc.load(evoxc.compile(evoxc.lower(evoxc.trace(
         lambda x: sparse.to_dense(x), coo_spec()
     ))))
     wrong = sparse.coo(
@@ -359,8 +359,8 @@ def test_run_wrong_values_dtype_fails_loudly():
         np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
         (3, 4),
     )
-    with pytest.raises(etl.DTypeError) as excinfo:
-        etl.run(exe, wrong)
+    with pytest.raises(evoxc.DTypeError) as excinfo:
+        evoxc.run(exe, wrong)
     assert str(excinfo.value) == (
         "dtype mismatch for input at path [0][1]: spec dtype float32, "
         "got float64"
@@ -371,11 +371,11 @@ def test_run_wrong_format_fails_loudly():
     """coo trace + csr run-time input: the FORMAT leaf is a static leaf, but
     the child-count difference (6 vs 7 leaves) already breaks the structure
     match — the mismatch names the sparse node."""
-    exe = etl.load(etl.compile(etl.lower(etl.trace(
+    exe = evoxc.load(evoxc.compile(evoxc.lower(evoxc.trace(
         lambda x: sparse.to_dense(x), coo_spec()
     ))))
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.run(exe, csr_example())
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.run(exe, csr_example())
     msg = str(excinfo.value)
     assert "run-time input structure does not match the traced signature" in msg
     assert "first mismatch at pytree path [0]" in msg
@@ -385,11 +385,11 @@ def test_run_wrong_format_fails_loudly():
 def test_run_dense_ndarray_where_sparse_expected():
     """A plain dense ndarray where the sparse node is expected is a
     structure mismatch naming SparseTensor."""
-    exe = etl.load(etl.compile(etl.lower(etl.trace(
+    exe = evoxc.load(evoxc.compile(evoxc.lower(evoxc.trace(
         lambda x: sparse.to_dense(x), coo_spec()
     ))))
-    with pytest.raises(etl.TraceError) as excinfo:
-        etl.run(exe, dense_example())
+    with pytest.raises(evoxc.TraceError) as excinfo:
+        evoxc.run(exe, dense_example())
     msg = str(excinfo.value)
     assert "first mismatch at pytree path [0]" in msg
     assert "expected SparseTensor, got ndarray" in msg
@@ -403,14 +403,14 @@ def test_run_dense_ndarray_where_sparse_expected():
 def test_stage_type_errors():
     """Each stage maps exactly its documented input type to its output type —
     wrong stage objects raise clear TypeErrors (mirrors pipeline_test)."""
-    graph = etl.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
-    lowered = etl.lower(graph)
-    with pytest.raises(TypeError, match="lower expects an etl.Graph"):
-        etl.lower(coo_example())
-    with pytest.raises(TypeError, match="compile expects an etl.backends.LoweredProgram"):
-        etl.compile(graph)
-    with pytest.raises(TypeError, match="load expects an etl.backends.CompiledArtifact"):
-        etl.load(graph)
-    with pytest.raises(TypeError, match="run expects an etl.Executable"):
-        etl.run(graph, coo_example())
+    graph = evoxc.trace(lambda x: sparse.to_dense(sparse.negate(x)), coo_spec())
+    lowered = evoxc.lower(graph)
+    with pytest.raises(TypeError, match="lower expects an evoxc.Graph"):
+        evoxc.lower(coo_example())
+    with pytest.raises(TypeError, match="compile expects an evoxc.backends.LoweredProgram"):
+        evoxc.compile(graph)
+    with pytest.raises(TypeError, match="load expects an evoxc.backends.CompiledArtifact"):
+        evoxc.load(graph)
+    with pytest.raises(TypeError, match="run expects an evoxc.Executable"):
+        evoxc.run(graph, coo_example())
     assert lowered.backend == "numpy"

@@ -1,12 +1,12 @@
-"""Collective executor hook tests (``etl.dist.context``).
+"""Collective executor hook tests (``evoxc.dist.context``).
 
 Asserts the "Collective executor hook contract" section of
-``etl/dist/CONTEXT.md``:
+``evoxc/dist/CONTEXT.md``:
 
 - the process-global hook slot (default install / set / get / clear /
   protocol validation),
 - per-collective argument forwarding from the numpy interpreter kernels
-  (``etl/backends/numpy/kernels/collective.py``),
+  (``evoxc/backends/numpy/kernels/collective.py``),
 - multi-rank in-process simulation via a custom executor,
 - ``rank``/``world_size`` resolution from the per-execution ``RankContext``
   (NOT the executor hook),
@@ -21,13 +21,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl.backends.numpy import SingleRankCollectiveExecutor
-from etl.dist.context import CollectiveExecutor
+import evoxc
+from evoxc import core
+from evoxc.backends.numpy import SingleRankCollectiveExecutor
+from evoxc.dist.context import CollectiveExecutor
 
 #: Explicit 4-rank group used throughout (group NAME attr: "data").
-G4 = etl.dist.group("data", (0, 1, 2, 3))
+G4 = evoxc.dist.group("data", (0, 1, 2, 3))
 F32 = np.float32
 
 
@@ -100,7 +100,7 @@ class SimExecutor:
     collective's post-collective result for the simulated rank (default 0).
     ``all_to_all_result`` is pre-configured: the protocol forwards only
     ``split_axis`` (documented v1 limitation in
-    ``etl/backends/numpy/kernels/collective.py``), so the simulator cannot
+    ``evoxc/backends/numpy/kernels/collective.py``), so the simulator cannot
     know ``concat_axis`` from the protocol arguments alone.
     """
 
@@ -154,47 +154,47 @@ class SimExecutor:
 # ---------------------------------------------------------------------------
 
 
-@etl.defn
+@evoxc.defn
 def f_all_reduce(x):
-    return etl.dist.all_reduce(x, op="sum", group=G4)
+    return evoxc.dist.all_reduce(x, op="sum", group=G4)
 
 
-@etl.defn
+@evoxc.defn
 def f_broadcast(x):
-    return etl.dist.broadcast(x, group=G4)
+    return evoxc.dist.broadcast(x, group=G4)
 
 
-@etl.defn
+@evoxc.defn
 def f_permute(x):
     # Rotation: rank i sends to rank (i+1)%4 — rank 0 receives rank 3's tensor.
-    return etl.dist.collective_permute(x, ((0, 1), (1, 2), (2, 3), (3, 0)), group=G4)
+    return evoxc.dist.collective_permute(x, ((0, 1), (1, 2), (2, 3), (3, 0)), group=G4)
 
 
-@etl.defn
+@evoxc.defn
 def f_rank_world():
-    return (etl.dist.rank(), etl.dist.world_size())
+    return (evoxc.dist.rank(), evoxc.dist.world_size())
 
 
 def make_all_gather(axis):
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.dist.all_gather(x, axis=axis, group=G4)
+        return evoxc.dist.all_gather(x, axis=axis, group=G4)
 
     return f
 
 
 def make_reduce_scatter(op="sum", axis=0):
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.dist.reduce_scatter(x, op=op, axis=axis, group=G4)
+        return evoxc.dist.reduce_scatter(x, op=op, axis=axis, group=G4)
 
     return f
 
 
 def make_all_to_all(split_axis, concat_axis):
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.dist.all_to_all(
+        return evoxc.dist.all_to_all(
             x, split_axis=split_axis, concat_axis=concat_axis, group=G4
         )
 
@@ -213,13 +213,13 @@ def restore_default_executor():
     try:
         yield
     finally:
-        etl.dist.set_collective_executor(SingleRankCollectiveExecutor())
+        evoxc.dist.set_collective_executor(SingleRankCollectiveExecutor())
 
 
 def _run_once(recorder, fn, x):
     """Evaluate ``fn(x)``, asserting the recorder saw exactly one call."""
     recorder.calls.clear()
-    out = etl.evaluate(fn, x)
+    out = evoxc.evaluate(fn, x)
     assert len(recorder.calls) == 1
     return out, recorder.calls[0]
 
@@ -228,7 +228,7 @@ def _assert_group_name(kwargs):
     """The kernel forwards the group NAME string, never a Group object."""
     group = kwargs["group"]
     assert isinstance(group, str)
-    assert not isinstance(group, etl.dist.Group)
+    assert not isinstance(group, evoxc.dist.Group)
     assert group == "data"
 
 
@@ -239,20 +239,20 @@ def _assert_group_name(kwargs):
 
 def test_default_executor_installed_and_round_trip():
     # The numpy backend installs its default at import time.
-    default = etl.dist.get_collective_executor()
+    default = evoxc.dist.get_collective_executor()
     assert isinstance(default, SingleRankCollectiveExecutor)
     assert isinstance(default, CollectiveExecutor)
 
     custom = RecordingExecutor()
-    etl.dist.set_collective_executor(custom)
-    assert etl.dist.get_collective_executor() is custom
+    evoxc.dist.set_collective_executor(custom)
+    assert evoxc.dist.get_collective_executor() is custom
 
-    etl.dist.set_collective_executor(None)
+    evoxc.dist.set_collective_executor(None)
     with pytest.raises(core.BackendError, match="no collective executor registered"):
-        etl.dist.get_collective_executor()
+        evoxc.dist.get_collective_executor()
 
     with pytest.raises(TypeError, match="CollectiveExecutor"):
-        etl.dist.set_collective_executor(object())
+        evoxc.dist.set_collective_executor(object())
 
     class MissingMethods:
         """Only one of the six protocol methods — must be rejected."""
@@ -261,7 +261,7 @@ def test_default_executor_installed_and_round_trip():
             return tensor
 
     with pytest.raises(TypeError, match="CollectiveExecutor"):
-        etl.dist.set_collective_executor(MissingMethods())
+        evoxc.dist.set_collective_executor(MissingMethods())
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +271,7 @@ def test_default_executor_installed_and_round_trip():
 
 def test_all_reduce_arguments():
     recorder = RecordingExecutor()
-    etl.dist.set_collective_executor(recorder)
+    evoxc.dist.set_collective_executor(recorder)
     x = np.arange(6, dtype=F32).reshape(2, 3)
 
     out, (name, tensor, kwargs) = _run_once(recorder, f_all_reduce, x)
@@ -290,7 +290,7 @@ def test_all_gather_arguments(axis_arg, expected_axis):
     # Negative axes are normalized Python-style at trace time; the executor
     # sees the normalized non-negative int.
     recorder = RecordingExecutor()
-    etl.dist.set_collective_executor(recorder)
+    evoxc.dist.set_collective_executor(recorder)
     x = np.arange(6, dtype=F32).reshape(2, 3)
     recorder.result = np.concatenate([x] * 4, axis=expected_axis)
 
@@ -309,7 +309,7 @@ def test_reduce_scatter_arguments():
     # NOT forwarded (protocol has no reduce_op parameter — documented v1
     # limitation): the executor receives exactly {axis, group}.
     recorder = RecordingExecutor()
-    etl.dist.set_collective_executor(recorder)
+    evoxc.dist.set_collective_executor(recorder)
     x = np.arange(24, dtype=F32).reshape(8, 3)
     recorder.result = np.sum(np.stack([x] * 4), axis=0)[0:2]  # sum-then-slice
 
@@ -327,7 +327,7 @@ def test_all_to_all_arguments():
     # split_axis is forwarded (protocol has a single axis param — documented
     # v1 limitation): the executor receives exactly {axis, group}.
     recorder = RecordingExecutor()
-    etl.dist.set_collective_executor(recorder)
+    evoxc.dist.set_collective_executor(recorder)
     x = np.arange(24, dtype=F32).reshape(8, 3)
     recorder.result = np.full((2, 12), 3.5, dtype=F32)
 
@@ -342,7 +342,7 @@ def test_all_to_all_arguments():
 
 def test_broadcast_arguments():
     recorder = RecordingExecutor()
-    etl.dist.set_collective_executor(recorder)
+    evoxc.dist.set_collective_executor(recorder)
     x = np.ones((2, 3), dtype=F32)
 
     out, (name, tensor, kwargs) = _run_once(recorder, f_broadcast, x)
@@ -356,7 +356,7 @@ def test_broadcast_arguments():
 
 def test_collective_permute_arguments():
     recorder = RecordingExecutor()
-    etl.dist.set_collective_executor(recorder)
+    evoxc.dist.set_collective_executor(recorder)
     x = np.ones((2, 3), dtype=F32)
 
     out, (name, tensor, kwargs) = _run_once(recorder, f_permute, x)
@@ -378,9 +378,9 @@ def test_collective_permute_arguments():
 def test_multi_rank_all_reduce():
     stack = [np.full((2, 3), r + 1, dtype=F32) for r in range(4)]
     sim = SimExecutor(stack)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    out = etl.evaluate(f_all_reduce, stack[0])
+    out = evoxc.evaluate(f_all_reduce, stack[0])
 
     np.testing.assert_array_equal(out.numpy(), np.sum(np.stack(stack), axis=0))
     assert out.shape == (2, 3) and out.dtype == F32
@@ -390,9 +390,9 @@ def test_multi_rank_all_reduce():
 def test_multi_rank_all_gather():
     stack = [np.full((2, 3), r + 1, dtype=F32) for r in range(4)]
     sim = SimExecutor(stack)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    out = etl.evaluate(make_all_gather(0), stack[0])
+    out = evoxc.evaluate(make_all_gather(0), stack[0])
 
     np.testing.assert_array_equal(out.numpy(), np.concatenate(stack, axis=0))
     assert out.shape == (8, 3) and out.dtype == F32
@@ -402,9 +402,9 @@ def test_multi_rank_all_gather():
 def test_multi_rank_reduce_scatter():
     stack = [np.full((8, 3), r + 1, dtype=F32) for r in range(4)]
     sim = SimExecutor(stack)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    out = etl.evaluate(make_reduce_scatter("sum", 0), stack[0])
+    out = evoxc.evaluate(make_reduce_scatter("sum", 0), stack[0])
 
     expected = np.sum(np.stack(stack), axis=0)[0:2]  # rank 0's chunk
     np.testing.assert_array_equal(out.numpy(), expected)
@@ -415,9 +415,9 @@ def test_multi_rank_reduce_scatter():
 def test_multi_rank_broadcast():
     stack = [np.full((2, 3), r + 1, dtype=F32) for r in range(4)]
     sim = SimExecutor(stack)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    out = etl.evaluate(f_broadcast, stack[0])
+    out = evoxc.evaluate(f_broadcast, stack[0])
 
     # src_rank 0's copy (all ones), not the other ranks' arrays.
     np.testing.assert_array_equal(out.numpy(), stack[0])
@@ -428,9 +428,9 @@ def test_multi_rank_broadcast():
 def test_multi_rank_collective_permute():
     stack = [np.full((2, 3), r + 1, dtype=F32) for r in range(4)]
     sim = SimExecutor(stack)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    out = etl.evaluate(f_permute, stack[0])
+    out = evoxc.evaluate(f_permute, stack[0])
 
     # Rotation mapping: rank 0 receives rank 3's tensor (4s).
     np.testing.assert_array_equal(out.numpy(), stack[3])
@@ -442,13 +442,13 @@ def test_multi_rank_collective_permute_no_source():
     # A mapping with no source for rank 0 -> zero tensor of the same shape.
     stack = [np.full((2, 3), r + 1, dtype=F32) for r in range(4)]
     sim = SimExecutor(stack)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    @etl.defn
+    @evoxc.defn
     def f_partial(x):
-        return etl.dist.collective_permute(x, ((0, 1), (1, 2)), group=G4)
+        return evoxc.dist.collective_permute(x, ((0, 1), (1, 2)), group=G4)
 
-    out = etl.evaluate(f_partial, stack[0])
+    out = evoxc.evaluate(f_partial, stack[0])
 
     np.testing.assert_array_equal(out.numpy(), np.zeros_like(stack[0]))
     assert out.shape == (2, 3) and out.dtype == F32
@@ -460,9 +460,9 @@ def test_multi_rank_all_to_all():
     stack = [np.full((8, 3), r + 1, dtype=F32) for r in range(4)]
     configured = np.full((2, 12), 3.5, dtype=F32)
     sim = SimExecutor(stack, all_to_all_result=configured)
-    etl.dist.set_collective_executor(sim)
+    evoxc.dist.set_collective_executor(sim)
 
-    out = etl.evaluate(make_all_to_all(0, 1), stack[0])
+    out = evoxc.evaluate(make_all_to_all(0, 1), stack[0])
 
     np.testing.assert_array_equal(out.numpy(), configured)
     assert out.shape == (2, 12) and out.dtype == F32
@@ -476,11 +476,11 @@ def test_multi_rank_all_to_all():
 
 @pytest.mark.parametrize("rank,world_size", [(1, 2), (3, 4), (0, 1)])
 def test_rank_world_size_per_simulated_rank(rank, world_size):
-    # etl.run/etl.evaluate take no rank_context — the backend executable's
+    # evoxc.run/evoxc.evaluate take no rank_context — the backend executable's
     # run() accepts the per-execution override.
-    exe = etl.build(f_rank_world)
+    exe = evoxc.build(f_rank_world)
     outputs = exe.backend_executable.run(
-        [], rank_context=etl.dist.RankContext(rank, world_size)
+        [], rank_context=evoxc.dist.RankContext(rank, world_size)
     )
 
     assert isinstance(outputs, list) and len(outputs) == 2
@@ -493,7 +493,7 @@ def test_rank_world_size_per_simulated_rank(rank, world_size):
 
 
 def test_rank_world_size_default_context():
-    exe = etl.build(f_rank_world)
+    exe = evoxc.build(f_rank_world)
     outputs = exe.backend_executable.run([])
 
     assert outputs[0].numpy() == 0
@@ -510,9 +510,9 @@ def test_executor_backend_error_propagates():
         def all_reduce(self, tensor, group, op):
             raise core.BackendError("simulated transport failure")
 
-    etl.dist.set_collective_executor(TransportFail())
+    evoxc.dist.set_collective_executor(TransportFail())
     with pytest.raises(core.BackendError, match="simulated transport failure"):
-        etl.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
+        evoxc.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
 
 
 def test_executor_wrong_dtype_rejected():
@@ -520,9 +520,9 @@ def test_executor_wrong_dtype_rejected():
         def all_reduce(self, tensor, group, op):
             return np.zeros(tensor.shape, dtype=np.int32)
 
-    etl.dist.set_collective_executor(WrongDtype())
+    evoxc.dist.set_collective_executor(WrongDtype())
     with pytest.raises(core.BackendError, match="dtype"):
-        etl.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
+        evoxc.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
 
 
 def test_executor_wrong_shape_rejected():
@@ -530,9 +530,9 @@ def test_executor_wrong_shape_rejected():
         def all_reduce(self, tensor, group, op):
             return np.ones((3, 3), dtype=F32)
 
-    etl.dist.set_collective_executor(WrongShape())
+    evoxc.dist.set_collective_executor(WrongShape())
     with pytest.raises(core.ShapeError, match="shape"):
-        etl.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
+        evoxc.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
 
 
 def test_executor_non_tensor_result_rejected():
@@ -542,9 +542,9 @@ def test_executor_non_tensor_result_rejected():
         def all_reduce(self, tensor, group, op):
             return 3.14
 
-    etl.dist.set_collective_executor(NonTensor())
+    evoxc.dist.set_collective_executor(NonTensor())
     with pytest.raises(TypeError):
-        etl.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
+        evoxc.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +557,8 @@ def test_raw_ndarray_result_wrapped_as_tensor():
         def all_reduce(self, tensor, group, op):
             return tensor.numpy() * 2.0
 
-    etl.dist.set_collective_executor(RawNumpy())
-    out = etl.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
+    evoxc.dist.set_collective_executor(RawNumpy())
+    out = evoxc.evaluate(f_all_reduce, np.ones((2, 3), dtype=F32))
 
     assert isinstance(out, core.Tensor)
     assert out.dtype == F32

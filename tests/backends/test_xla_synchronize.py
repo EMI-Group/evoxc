@@ -1,8 +1,8 @@
 """xla adapter EXPLICIT device synchronization (``Executable.synchronize``).
 
 Pins the completion-event lifecycle of ``XlaExecutable.synchronize``
-(``etl/backends/adapters/xla.py``) and of the driver's event sink
-(``etl/backends/adapters/xla_util.py`` — ``execute(..., events=[...])``),
+(``evoxc/backends/adapters/xla.py``) and of the driver's event sink
+(``evoxc/backends/adapters/xla_util.py`` — ``execute(..., events=[...])``),
 exercised against the TEST-ONLY fake PJRT plugin built from C at test time
 (the same fake as ``test_pjrt_ctypes_plugin.py``; zero-filled outputs, ONE
 addressable device, no computation):
@@ -34,16 +34,16 @@ out of scope (real-plugin parity lives in ``test_adapter_xla.py``).
 import numpy as np
 import pytest
 
-import etl
-from etl.backends.adapters import xla
-from etl.backends.adapters import xla_util
+import evoxc
+from evoxc.backends.adapters import xla
+from evoxc.backends.adapters import xla_util
 
 from tests.backends import _adapter_utils as u
 from tests.backends.test_pjrt_ctypes_plugin import _build_plugin, _compile_fake
 
 NAME = "xla"
-CPU = etl.core.Device("cpu", 0)
-CUDA0 = etl.core.Device("cuda", 0)
+CPU = evoxc.core.Device("cpu", 0)
+CUDA0 = evoxc.core.Device("cuda", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ CUDA0 = etl.core.Device("cuda", 0)
 
 def _activate(plugin_path, monkeypatch):
     """Point plugin discovery at the fake .so and (re)activate the adapter."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(plugin_path))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(plugin_path))
     xla.register()  # idempotent; also (re)installs the "cuda" placement provider
 
 
@@ -68,9 +68,9 @@ def _device_resident_executable(tmp_path, so_name, monkeypatch):
     _activate(plug, monkeypatch)
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, plug)
-    raw = etl.backends.get(NAME).load(artifact, device=CUDA0)
+    raw = evoxc.backends.get(NAME).load(artifact, device=CUDA0)
     a, b = u.matmul_relu_sum_args()
-    inputs = [etl.core.Tensor(a).to(CUDA0), etl.core.Tensor(b).to(CUDA0)]
+    inputs = [evoxc.core.Tensor(a).to(CUDA0), evoxc.core.Tensor(b).to(CUDA0)]
     return raw, inputs
 
 
@@ -161,21 +161,21 @@ def test_run_records_events_and_synchronize_awaits_then_destroys(
 
 
 def test_pipeline_executable_synchronize_delegates_to_xla(tmp_path, monkeypatch):
-    """``etl.load(...).synchronize()`` reaches the adapter's real sync."""
+    """``evoxc.load(...).synchronize()`` reaches the adapter's real sync."""
     raw, inputs = _device_resident_executable(
         tmp_path, "fake_sync_pipeline.so", monkeypatch
     )
     log = _spy_events(monkeypatch)
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, raw._plugin.path)
-    exe = etl.load(artifact, device=CUDA0)
+    exe = evoxc.load(artifact, device=CUDA0)
 
     xa, xb = inputs
-    out = etl.run(exe, xa, xb)
+    out = evoxc.run(exe, xa, xb)
     assert isinstance(out.data, xla.XlaDevicePayload)
     backend_exe = exe.backend_executable
     assert isinstance(backend_exe, xla.XlaExecutable)
-    assert len(backend_exe._pending_events) == 1  # etl.run never syncs
+    assert len(backend_exe._pending_events) == 1  # evoxc.run never syncs
 
     handle = backend_exe._pending_events[0]
     assert exe.synchronize() is None
@@ -251,7 +251,7 @@ def test_missing_event_handle_raises_backenderror_once(tmp_path, monkeypatch):
         tmp_path, "fake_sync_no_event.so", monkeypatch
     )
     log = _spy_events(monkeypatch)
-    monkeypatch.setenv("ETL_FAKE_PJRT_NO_DEVICE_EVENT", "1")
+    monkeypatch.setenv("EVOXC_FAKE_PJRT_NO_DEVICE_EVENT", "1")
 
     # run itself never raises for the contract violation and records the
     # reason instead; no handle joins the pending list.
@@ -261,7 +261,7 @@ def test_missing_event_handle_raises_backenderror_once(tmp_path, monkeypatch):
     assert raw._sync_unavailable_reason is not None
 
     # synchronize refuses to claim completion silently.
-    with pytest.raises(etl.BackendError, match="returned no device-complete event"):
+    with pytest.raises(evoxc.BackendError, match="returned no device-complete event"):
         raw.synchronize()
     # ... exactly once: the reason is consumed, so the next call is quiet.
     assert raw.synchronize() is None
@@ -288,7 +288,7 @@ def test_synchronize_after_plugin_release_raises_explicitly(tmp_path, monkeypatc
     # dropped elsewhere.
     raw._plugin = None
     with pytest.raises(
-        etl.BackendError, match="cannot synchronize this closed XlaExecutable"
+        evoxc.BackendError, match="cannot synchronize this closed XlaExecutable"
     ):
         raw.synchronize()
     # The handles are dropped (they can be neither awaited nor destroyed)
@@ -352,10 +352,10 @@ def test_failed_execute_destroys_stray_handle_and_records_nothing(
         tmp_path, "fake_sync_stray.so", monkeypatch
     )
     log = _spy_events(monkeypatch)
-    monkeypatch.setenv("ETL_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT", "1")
+    monkeypatch.setenv("EVOXC_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT", "1")
 
     with pytest.raises(
-        etl.BackendError,
+        evoxc.BackendError,
         match="injected fake failure after writing a device-complete event",
     ):
         raw.run(inputs)
@@ -370,7 +370,7 @@ def test_failed_execute_destroys_stray_handle_and_records_nothing(
     # The next successful run records normally and synchronizes cleanly
     # (the freed stray may be re-used by the allocator, so compare positions,
     # never identity).
-    monkeypatch.delenv("ETL_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT")
+    monkeypatch.delenv("EVOXC_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT")
     raw.run(inputs)
     (handle,) = raw._pending_events
     assert raw.synchronize() is None
@@ -391,12 +391,12 @@ def test_cpu_host_staging_run_requests_no_event(tmp_path, monkeypatch):
     _activate(plug, monkeypatch)
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, plug)
-    raw = etl.backends.get(NAME).load(artifact)  # device None = host staging
+    raw = evoxc.backends.get(NAME).load(artifact)  # device None = host staging
     assert raw.device == CPU
     log = _spy_events(monkeypatch)
 
     a, b = u.matmul_relu_sum_args()
-    (out,) = raw.run([etl.core.Tensor(a), etl.core.Tensor(b)])
+    (out,) = raw.run([evoxc.core.Tensor(a), evoxc.core.Tensor(b)])
     assert isinstance(out.data, np.ndarray)  # already a host copy
     assert raw._pending_events == []
     assert raw._sync_unavailable_reason is None

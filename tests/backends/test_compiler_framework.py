@@ -1,8 +1,8 @@
 """Contract tests for the shared compiler backend framework.
 
-Contract under test: ``etl/backends/compiler.py`` — the shared
+Contract under test: ``evoxc/backends/compiler.py`` — the shared
 ``CompilerBackend`` base that the three optional external-compiler adapters
-(``etl/backends/adapters/iree``, ``xla``, ``tvm``) build on. Pinned here with
+(``evoxc/backends/adapters/iree``, ``xla``, ``tvm``) build on. Pinned here with
 a TEST-ONLY stub subclass defined in this file (test-only code never goes
 into the package):
 
@@ -20,7 +20,7 @@ into the package):
 
 Every test builds its stub through ``_make_stub`` with a DISTINCT backend
 name, so the process-global registry never collides across tests. CPU only;
-tiny shapes; everything imported from ``etl`` directly.
+tiny shapes; everything imported from ``evoxc`` directly.
 """
 
 import json
@@ -28,9 +28,9 @@ import json
 import numpy as np
 import pytest
 
-import etl
-from etl.backends import Capabilities, register
-from etl.backends.compiler import CompilerBackend
+import evoxc
+from evoxc.backends import Capabilities, register
+from evoxc.backends.compiler import CompilerBackend
 
 # ---------------------------------------------------------------------------
 # test-only stub backend
@@ -50,7 +50,7 @@ class _StubExecutable:
         self.device = None
 
     def run(self, flat_input_tensors):
-        raise etl.BackendError(
+        raise evoxc.BackendError(
             "stub compiler backend produces non-executable artifacts"
         )
 
@@ -73,11 +73,11 @@ class _StubCompilerBackend(CompilerBackend):
 
     def compile(self, lowered, options=None):
         if lowered.backend != self.name:
-            raise etl.BackendError(
+            raise evoxc.BackendError(
                 "cannot compile a LoweredProgram produced by backend "
                 f"{lowered.backend!r} with backend {self.name!r}"
             )
-        return etl.backends.CompiledArtifact(
+        return evoxc.backends.CompiledArtifact(
             backend=self.name,
             signature=lowered.signature,
             target="cpu",
@@ -86,7 +86,7 @@ class _StubCompilerBackend(CompilerBackend):
 
     def load(self, artifact, device=None):
         if artifact.backend != self.name:
-            raise etl.PersistenceError(
+            raise evoxc.PersistenceError(
                 "cannot load an artifact produced by backend "
                 f"{artifact.backend!r} with backend {self.name!r}"
             )
@@ -127,16 +127,16 @@ def _make_stub(name, **cap_overrides):
 
 def _add_graph():
     def fn(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    return etl.trace(fn, etl.TensorSpec((2, 3), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 def _collective_graph():
     def fn(x):
-        return etl.dist.all_reduce(x)
+        return evoxc.dist.all_reduce(x)
 
-    return etl.trace(fn, etl.TensorSpec((2, 3), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 def _double_callback(x):
@@ -145,38 +145,38 @@ def _double_callback(x):
 
 def _runtime_call_graph():
     def fn(x):
-        return etl.runtime_call(
-            _double_callback, x, result=etl.TensorSpec((2, 3), etl.float32)
+        return evoxc.runtime_call(
+            _double_callback, x, result=evoxc.TensorSpec((2, 3), evoxc.float32)
         )
 
-    return etl.trace(fn, etl.TensorSpec((2, 3), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 def _symbolic_graph():
     def fn(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    return etl.trace(fn, etl.TensorSpec((etl.dim("B"),), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((evoxc.dim("B"),), evoxc.float32))
 
 
 def _float64_graph():
     def fn(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    return etl.trace(fn, etl.TensorSpec((2, 3), etl.float64))
+    return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float64))
 
 
-@etl.block(outputs=[etl.TensorSpec((2, 3), etl.float32)])
-@etl.defn
-def compiler_framework_portable_double(x: etl.TensorSpec((2, 3), etl.float32)):
-    return etl.add(x, x)
+@evoxc.block(outputs=[evoxc.TensorSpec((2, 3), evoxc.float32)])
+@evoxc.defn
+def compiler_framework_portable_double(x: evoxc.TensorSpec((2, 3), evoxc.float32)):
+    return evoxc.add(x, x)
 
 
 def _block_graph():
     def fn(x):
         return compiler_framework_portable_double(x)
 
-    return etl.trace(fn, etl.TensorSpec((2, 3), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ def test_shared_lower_produces_stablehlo_payload():
 
     lowered = stub.lower(graph)
 
-    assert isinstance(lowered, etl.backends.LoweredProgram)
+    assert isinstance(lowered, evoxc.backends.LoweredProgram)
     assert lowered.backend == "payload-contract"
     payload = lowered.payload
     assert isinstance(payload, dict)
@@ -241,7 +241,7 @@ def test_capability_pre_check_rejects_naming_feature(feature, graph_fn, override
     # the capability pre-check, not from verification.
     graph.verify()
     stub = _make_stub(f"reject-{feature}", **overrides)
-    with pytest.raises(etl.BackendError) as excinfo:
+    with pytest.raises(evoxc.BackendError) as excinfo:
         stub.lower(graph)
     assert feature in str(excinfo.value).lower()
 
@@ -270,7 +270,7 @@ def test_full_capability_stub_lowers_exportable_graphs(name, graph_fn):
     graph = graph_fn()
     graph.verify()
     lowered = stub.lower(graph)
-    assert isinstance(lowered, etl.backends.LoweredProgram)
+    assert isinstance(lowered, evoxc.backends.LoweredProgram)
     assert lowered.backend == "full-caps"
     assert lowered.payload["format"] == "stablehlo"
 
@@ -282,8 +282,8 @@ def test_full_capability_stub_lowers_exportable_graphs(name, graph_fn):
 
 def test_compile_validates_lowered_backend_name():
     stub = _make_stub("compile-validation")
-    foreign = etl.backends.LoweredProgram(backend="some-other-backend", payload={})
-    with pytest.raises(etl.BackendError) as excinfo:
+    foreign = evoxc.backends.LoweredProgram(backend="some-other-backend", payload={})
+    with pytest.raises(evoxc.BackendError) as excinfo:
         stub.compile(foreign)
     msg = str(excinfo.value)
     assert "some-other-backend" in msg
@@ -305,17 +305,17 @@ def test_compile_validates_lowered_backend_name():
 def test_stub_registers_and_resolves_via_pipeline():
     stub = _make_stub("registry-stub")
     assert register(stub) is stub
-    assert etl.backends.get("registry-stub") is stub
+    assert evoxc.backends.get("registry-stub") is stub
 
     graph = _add_graph()
     # String-name resolution through the pipeline (_resolve_backend).
-    lowered = etl.lower(graph, backend="registry-stub")
+    lowered = evoxc.lower(graph, backend="registry-stub")
     assert lowered.backend == "registry-stub"
-    # etl.compile resolves the backend from lowered.backend via the registry.
-    artifact = etl.compile(lowered)
+    # evoxc.compile resolves the backend from lowered.backend via the registry.
+    artifact = evoxc.compile(lowered)
     assert artifact.backend == "registry-stub"
 
-    exe = etl.load(artifact)
+    exe = evoxc.load(artifact)
     assert isinstance(exe.functions, tuple)
     assert "main" in exe.functions
 
@@ -330,16 +330,16 @@ def test_lowered_and_artifact_save_load_roundtrip(tmp_path):
     register(stub)
 
     lowered = stub.lower(_add_graph())
-    lpath = tmp_path / "lowered_stablehlo.etl"
+    lpath = tmp_path / "lowered_stablehlo.evoxc"
     lowered.save(lpath)
-    restored = etl.backends.LoweredProgram.load(lpath)
+    restored = evoxc.backends.LoweredProgram.load(lpath)
     assert restored.backend == lowered.backend == "persist-stub"
     assert restored.payload == lowered.payload
 
     artifact = stub.compile(lowered)
-    apath = tmp_path / "artifact_stablehlo.etl"
+    apath = tmp_path / "artifact_stablehlo.evoxc"
     artifact.save(apath)
-    restored_artifact = etl.backends.CompiledArtifact.load(apath)
+    restored_artifact = evoxc.backends.CompiledArtifact.load(apath)
     assert restored_artifact.backend == artifact.backend == "persist-stub"
     assert restored_artifact.target == "cpu"
     assert restored_artifact.payload == artifact.payload

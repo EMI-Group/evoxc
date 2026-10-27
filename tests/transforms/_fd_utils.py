@@ -12,18 +12,18 @@ never polluted by float32 rounding).
 
 import numpy as np
 
-import etl
+import evoxc
 
 
 def run_graph(graph, *args):
     """Run a graph through the explicit staging pipeline: lower, compile,
     load, run."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *args)
 
 
 def to_np(value):
-    """Recursively replace etl.Tensor leaves with numpy arrays."""
-    if isinstance(value, etl.Tensor):
+    """Recursively replace evoxc.Tensor leaves with numpy arrays."""
+    if isinstance(value, evoxc.Tensor):
         return value.numpy()
     if isinstance(value, (tuple, list)):
         return type(value)(to_np(v) for v in value)
@@ -79,7 +79,7 @@ def run_jvp(fn, tangents, specs, xs, ts):
     `ts` entries may be `None` (zero tangent); runtime args mirror the
     transformed graph's input tree ``(primal tree, flat tangent tuple)``.
     """
-    graph = etl.jvp(fn, tangents)(*specs)
+    graph = evoxc.jvp(fn, tangents)(*specs)
     graph.verify()
     out = to_np(run_graph(graph, tuple(xs), tuple(ts)))
     return graph, out[0], out[1]
@@ -88,7 +88,7 @@ def run_jvp(fn, tangents, specs, xs, ts):
 def run_vjp(fn, cotangents, specs, xs, cs):
     """`vjp(fn, cotangents)` via the spec callable, verify, run; returns
     ``(graph, primal_outputs, input_cotangents)`` (numpy trees)."""
-    graph = etl.vjp(fn, cotangents)(*specs)
+    graph = evoxc.vjp(fn, cotangents)(*specs)
     graph.verify()
     out = to_np(run_graph(graph, tuple(xs), tuple(cs)))
     return graph, out[0], out[1]
@@ -97,6 +97,6 @@ def run_vjp(fn, cotangents, specs, xs, cs):
 def run_grad(fn, argnums, specs, *xs):
     """`grad(fn, argnums)` via the spec callable, verify, run; returns the
     gradient(s): a bare array for an int argnum, a tuple otherwise."""
-    graph = etl.grad(fn, argnums)(*specs)
+    graph = evoxc.grad(fn, argnums)(*specs)
     graph.verify()
     return to_np(run_graph(graph, *xs))

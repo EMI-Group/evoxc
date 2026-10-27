@@ -1,7 +1,7 @@
-"""etl.random — multi-algorithm key-based RNG tests.
+"""evoxc.random — multi-algorithm key-based RNG tests.
 
-The multi-algorithm framework (see ``etl/ops/random.py`` and
-``etl/ir/op_defs/random.py`` — the SINGLE source of truth for the canonical
+The multi-algorithm framework (see ``evoxc/ops/random.py`` and
+``evoxc/ir/op_defs/random.py`` — the SINGLE source of truth for the canonical
 algorithm names) adds two counter-based algorithms alongside the v1
 SplitMix64 default:
 
@@ -34,11 +34,11 @@ import re
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-import etl.ir as ir
+import evoxc
+from evoxc import core
+import evoxc.ir as ir
 
-from etl.backends.numpy.kernels.random import _philox4x32, _threefry2x32
+from evoxc.backends.numpy.kernels.random import _philox4x32, _threefry2x32
 
 from tests.ops.conftest import ops_of, run_numpy
 
@@ -74,13 +74,13 @@ def _counter_key_words(seed, salt, count):
 
 def test_algorithm_accepts_canonical_names_and_enum():
     """Canonical strings and Algorithm enum members produce the SAME key
-    words; ``etl.random.ALGORITHMS`` is re-exported."""
-    assert etl.random.ALGORITHMS == ("splitmix64", "threefry2x32", "philox4x32_10")
-    for alg in etl.random.ALGORITHMS:
-        member = etl.random.Algorithm(alg)
+    words; ``evoxc.random.ALGORITHMS`` is re-exported."""
+    assert evoxc.random.ALGORITHMS == ("splitmix64", "threefry2x32", "philox4x32_10")
+    for alg in evoxc.random.ALGORITHMS:
+        member = evoxc.random.Algorithm(alg)
         assert np.array_equal(
-            etl.random.key(42, algorithm=alg).numpy(),
-            etl.random.key(42, algorithm=member).numpy(),
+            evoxc.random.key(42, algorithm=alg).numpy(),
+            evoxc.random.key(42, algorithm=member).numpy(),
         )
 
 
@@ -88,10 +88,10 @@ def test_default_algorithm_stays_splitmix64():
     """The default algorithm is splitmix64: key(seed) and
     key(seed, "splitmix64") produce identical words (v1 behavior)."""
     assert np.array_equal(
-        etl.random.key(123).numpy(), etl.random.key(123, "splitmix64").numpy()
+        evoxc.random.key(123).numpy(), evoxc.random.key(123, "splitmix64").numpy()
     )
     assert np.array_equal(
-        etl.random.key(-7).numpy(), etl.random.key(-7, algorithm="splitmix64").numpy()
+        evoxc.random.key(-7).numpy(), evoxc.random.key(-7, algorithm="splitmix64").numpy()
     )
 
 
@@ -102,12 +102,12 @@ def test_unknown_algorithm_string_raises_valueerror():
         match="unknown random algorithm 'nope'; expected one of splitmix64, "
         "threefry2x32, philox4x32_10",
     ):
-        etl.random.key(1, algorithm="nope")
+        evoxc.random.key(1, algorithm="nope")
 
 
 def test_non_string_algorithm_raises_typeerror():
     with pytest.raises(TypeError, match="random algorithm must be a string"):
-        etl.random.key(1, algorithm=3)
+        evoxc.random.key(1, algorithm=3)
 
 
 # --- 2. key shape/dtype per algorithm ---------------------------------------
@@ -125,7 +125,7 @@ def test_non_string_algorithm_raises_typeerror():
 def test_key_shape_and_dtype_outside_trace(alg, shape, dtype):
     """Outside a trace key() returns a concrete Tensor whose shape/dtype is
     the algorithm's key type."""
-    k = etl.random.key(42, alg)
+    k = evoxc.random.key(42, alg)
     assert isinstance(k, core.Tensor)
     assert k.shape == shape
     assert k.dtype == dtype
@@ -133,9 +133,9 @@ def test_key_shape_and_dtype_outside_trace(alg, shape, dtype):
 
 def test_key_words_reproducible_across_calls():
     """The same seed + algorithm ⇒ identical key words across calls."""
-    for alg in etl.random.ALGORITHMS:
+    for alg in evoxc.random.ALGORITHMS:
         assert np.array_equal(
-            etl.random.key(42, alg).numpy(), etl.random.key(42, alg).numpy()
+            evoxc.random.key(42, alg).numpy(), evoxc.random.key(42, alg).numpy()
         )
 
 
@@ -151,16 +151,16 @@ def test_key_words_reproducible_across_calls():
 def test_key_inside_trace_builds_constant(alg, shape, dtype):
     """Inside a trace key() builds a Constant with the SAME shape/dtype and
     the same words as the concrete key."""
-    @etl.defn
+    @evoxc.defn
     def f():
-        return etl.random.key(42, alg)
+        return evoxc.random.key(42, alg)
 
-    graph = etl.trace(f)
+    graph = evoxc.trace(f)
     assert [op.name for op in ops_of(graph)] == ["constant", "return"]
-    out = etl.evaluate(f).numpy()
+    out = evoxc.evaluate(f).numpy()
     assert out.shape == shape
     assert out.dtype == dtype
-    assert np.array_equal(out, etl.random.key(42, alg).numpy())
+    assert np.array_equal(out, evoxc.random.key(42, alg).numpy())
 
 
 @pytest.mark.parametrize("alg", ["threefry2x32", "philox4x32_10"])
@@ -168,12 +168,12 @@ def test_counter_key_usable_as_explicit_graph_input(alg):
     """A concrete counter-based key is usable as an explicit graph input
     (same as the v1 splitmix64 key)."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (4,))
+        return evoxc.random.uniform(key, (4,))
 
-    out1 = run_numpy(f, etl.random.key(7, alg))
-    out2 = run_numpy(f, etl.random.key(7, alg))
+    out1 = run_numpy(f, evoxc.random.key(7, alg))
+    out2 = run_numpy(f, evoxc.random.key(7, alg))
     assert np.array_equal(out1, out2)
 
 
@@ -183,10 +183,10 @@ def test_counter_key_usable_as_explicit_graph_input(alg):
 @pytest.mark.parametrize(
     ("shape", "dtype"),
     [
-        ((3,), etl.int32),  # matches no algorithm's key type
-        ((2,), etl.int64),  # threefry shape with the wrong dtype
-        ((4,), etl.int64),  # philox shape with the wrong dtype
-        ((), etl.int32),  # scalar but not int64
+        ((3,), evoxc.int32),  # matches no algorithm's key type
+        ((2,), evoxc.int64),  # threefry shape with the wrong dtype
+        ((4,), evoxc.int64),  # philox shape with the wrong dtype
+        ((), evoxc.int32),  # scalar but not int64
     ],
     ids=["3xi32", "2xi64", "4xi64", "scalar-i32"],
 )
@@ -199,23 +199,23 @@ def test_key_matching_no_algorithm_form_raises_shapeerror(shape, dtype):
         f"tensor (philox4x32_10), got dtype={core.dtype(dtype)} shape={shape}"
     )
     with pytest.raises(core.ShapeError, match=re.escape(expected)):
-        etl.trace(
-            lambda key: etl.random.uniform(key, (2,)), etl.TensorSpec(shape, dtype)
+        evoxc.trace(
+            lambda key: evoxc.random.uniform(key, (2,)), evoxc.TensorSpec(shape, dtype)
         )
 
 
 @pytest.mark.parametrize(
     "fn",
     [
-        lambda key: etl.random.uniform(key, (2,)),
-        lambda key: etl.random.normal(key, (2,)),
-        lambda key: etl.random.randint(key, (2,), 0, 5),
-        lambda key: etl.random.permutation(key, 4),
-        lambda key: etl.random.multinomial(
+        lambda key: evoxc.random.uniform(key, (2,)),
+        lambda key: evoxc.random.normal(key, (2,)),
+        lambda key: evoxc.random.randint(key, (2,), 0, 5),
+        lambda key: evoxc.random.permutation(key, 4),
+        lambda key: evoxc.random.multinomial(
             key, np.array([0.5, 0.5], dtype=np.float32), 3
         ),
-        lambda key: etl.random.split(key),
-        lambda key: etl.random.split_n(key, 2),
+        lambda key: evoxc.random.split(key),
+        lambda key: evoxc.random.split_n(key, 2),
     ],
     ids=["uniform", "normal", "randint", "permutation", "multinomial", "split", "split_n"],
 )
@@ -223,7 +223,7 @@ def test_malformed_key_rejected_by_every_op(fn):
     """Every random op (other than key) rejects a (3,) int32 key with the
     three-forms ShapeError — the key check runs before any other validation."""
     with pytest.raises(core.ShapeError, match="key must be"):
-        etl.trace(fn, etl.TensorSpec((3,), etl.int32))
+        evoxc.trace(fn, evoxc.TensorSpec((3,), evoxc.int32))
 
 
 def test_ir_level_algorithm_attr_mismatch_raises_shapeerror():
@@ -255,11 +255,11 @@ def test_ops_stamp_the_algorithm_attribute():
     """Every random op stamps the inferred algorithm into its ``algorithm``
     attribute (the default splitmix64 is stamped explicitly, too)."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (2,)), etl.random.split(key)
+        return evoxc.random.uniform(key, (2,)), evoxc.random.split(key)
 
-    graph = etl.trace(f, etl.TensorSpec((), etl.int64))
+    graph = evoxc.trace(f, evoxc.TensorSpec((), evoxc.int64))
     stamped = [
         op.attributes["algorithm"]
         for op in ops_of(graph)
@@ -276,16 +276,16 @@ def test_cross_evaluate_determinism_per_algorithm(alg):
     """Same key + same operands ⇒ bit-identical draws across separate
     evaluate calls for every algorithm (uniform/normal/randint/permutation)."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
         return (
-            etl.random.uniform(key, (5, 3)),
-            etl.random.normal(key, (5, 3)),
-            etl.random.randint(key, (7,), 0, 10),
-            etl.random.permutation(key, 6),
+            evoxc.random.uniform(key, (5, 3)),
+            evoxc.random.normal(key, (5, 3)),
+            evoxc.random.randint(key, (7,), 0, 10),
+            evoxc.random.permutation(key, 6),
         )
 
-    key = etl.random.key(123, alg)
+    key = evoxc.random.key(123, alg)
     r1 = run_numpy(f, key)
     r2 = run_numpy(f, key)
     for a, b in zip(r1, r2):
@@ -300,12 +300,12 @@ def test_split_children_shape_distinct_and_deterministic(alg):
     """split() derives two decorrelated keys of the algorithm's key shape;
     the pair is reproducible and each child differs from the parent key."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        a, b = etl.random.split(key)
+        a, b = evoxc.random.split(key)
         return a, b
 
-    parent = etl.random.key(99, alg)
+    parent = evoxc.random.key(99, alg)
     a1, b1 = run_numpy(f, parent)
     a2, b2 = run_numpy(f, parent)
     assert a1.shape == b1.shape == parent.shape
@@ -321,13 +321,13 @@ def test_split_of_split_works_per_algorithm(alg):
     """Children of children are valid keys of the same shape, pairwise
     distinct from each other and from the first-generation keys."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        a, b = etl.random.split(key)
-        a1, a2 = etl.random.split(a)
+        a, b = evoxc.random.split(key)
+        a1, a2 = evoxc.random.split(a)
         return a, b, a1, a2
 
-    parent = etl.random.key(5, alg)
+    parent = evoxc.random.key(5, alg)
     a, b, a1, a2 = run_numpy(f, parent)
     assert {x.shape for x in (a, b, a1, a2)} == {parent.shape}
     assert len({x.tobytes() for x in (a, b, a1, a2)}) == 4
@@ -338,15 +338,15 @@ def test_split_n_distinct_and_deterministic(alg):
     """split_n(key, n) yields n pairwise-distinct keys of the algorithm's
     key shape, deterministically."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.split_n(key, 5)
+        return evoxc.random.split_n(key, 5)
 
-    keys = run_numpy(f, etl.random.key(99, alg))
+    keys = run_numpy(f, evoxc.random.key(99, alg))
     assert len(keys) == 5
-    assert all(k.shape == etl.random.key(1, alg).shape for k in keys)
+    assert all(k.shape == evoxc.random.key(1, alg).shape for k in keys)
     assert len({k.tobytes() for k in keys}) == 5  # pairwise distinct
-    keys2 = run_numpy(f, etl.random.key(99, alg))
+    keys2 = run_numpy(f, evoxc.random.key(99, alg))
     assert all(np.array_equal(a, b) for a, b in zip(keys, keys2))
 
 
@@ -399,11 +399,11 @@ def test_threefry_uniform_stream_matches_manual_cipher():
         words.extend([int(x0), int(x1)])
     manual = np.array([w * 2.0**-32 for w in words], dtype=np.float32)
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (4,))
+        return evoxc.random.uniform(key, (4,))
 
-    out = run_numpy(f, etl.random.key(seed, "threefry2x32"))
+    out = run_numpy(f, evoxc.random.key(seed, "threefry2x32"))
     assert np.array_equal(out, manual)
 
 
@@ -432,11 +432,11 @@ def test_philox_uniform_stream_matches_manual_cipher():
         words.extend([int(v) for v in w])
     manual = np.array([w * 2.0**-32 for w in words], dtype=np.float32)
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (8,))
+        return evoxc.random.uniform(key, (8,))
 
-    out = run_numpy(f, etl.random.key(seed, "philox4x32_10"))
+    out = run_numpy(f, evoxc.random.key(seed, "philox4x32_10"))
     assert np.array_equal(out, manual)
 
 
@@ -457,12 +457,12 @@ def test_threefry_split_matches_manual_cipher():
     x0, x1 = _threefry2x32(0, 0, k0 ^ gl, k1 ^ gh)
     child_b = np.array([x0, x1], dtype=np.uint32).astype(np.int32)
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        a, b = etl.random.split(key)
+        a, b = evoxc.random.split(key)
         return a, b
 
-    a, b = run_numpy(f, etl.random.key(seed, "threefry2x32"))
+    a, b = run_numpy(f, evoxc.random.key(seed, "threefry2x32"))
     assert np.array_equal(a, child_a)
     assert np.array_equal(b, child_b)
 
@@ -472,11 +472,11 @@ def test_threefry_split_matches_manual_cipher():
 
 @pytest.mark.parametrize("alg", ["splitmix64", "threefry2x32", "philox4x32_10"])
 def test_uniform_range_and_mean_per_algorithm(alg):
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (20000,), 0.0, 1.0)
+        return evoxc.random.uniform(key, (20000,), 0.0, 1.0)
 
-    u = run_numpy(f, etl.random.key(1, alg))
+    u = run_numpy(f, evoxc.random.key(1, alg))
     assert u.min() >= 0.0 and u.max() < 1.0
     assert abs(u.mean() - 0.5) < 0.05
 
@@ -484,22 +484,22 @@ def test_uniform_range_and_mean_per_algorithm(alg):
 @pytest.mark.parametrize("alg", ["splitmix64", "threefry2x32", "philox4x32_10"])
 def test_uniform_affine_mapping_per_algorithm(alg):
     """The low/high affine mapping holds for every algorithm."""
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (20000,), 2.0, 5.0)
+        return evoxc.random.uniform(key, (20000,), 2.0, 5.0)
 
-    u = run_numpy(f, etl.random.key(1, alg))
+    u = run_numpy(f, evoxc.random.key(1, alg))
     assert u.min() >= 2.0 and u.max() < 5.0
     assert abs(u.mean() - 3.5) < 0.05
 
 
 @pytest.mark.parametrize("alg", ["splitmix64", "threefry2x32", "philox4x32_10"])
 def test_randint_range_per_algorithm(alg):
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.randint(key, (20000,), 0, 10)
+        return evoxc.random.randint(key, (20000,), 0, 10)
 
-    r = run_numpy(f, etl.random.key(1, alg))
+    r = run_numpy(f, evoxc.random.key(1, alg))
     assert r.dtype == np.int32
     assert r.min() >= 0 and r.max() <= 9  # high exclusive
     assert set(np.unique(r)) == set(range(10))
@@ -507,22 +507,22 @@ def test_randint_range_per_algorithm(alg):
 
 @pytest.mark.parametrize("alg", ["splitmix64", "threefry2x32", "philox4x32_10"])
 def test_permutation_is_valid_shuffle_per_algorithm(alg):
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.permutation(key, 9)
+        return evoxc.random.permutation(key, 9)
 
-    perm = run_numpy(f, etl.random.key(1, alg))
+    perm = run_numpy(f, evoxc.random.key(1, alg))
     assert perm.shape == (9,)
     assert np.array_equal(np.sort(perm), np.arange(9))
 
 
 @pytest.mark.parametrize("alg", ["splitmix64", "threefry2x32", "philox4x32_10"])
 def test_normal_finite_per_algorithm(alg):
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.normal(key, (10000,))
+        return evoxc.random.normal(key, (10000,))
 
-    z = run_numpy(f, etl.random.key(1, alg))
+    z = run_numpy(f, evoxc.random.key(1, alg))
     assert np.isfinite(z).all()
     assert abs(z.mean()) < 0.05
     assert abs(z.std() - 1.0) < 0.1
@@ -532,12 +532,12 @@ def test_same_seed_draws_differ_across_algorithms():
     """The three algorithms draw decorrelated streams: same seed + same op
     → different values for each algorithm."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        return etl.random.uniform(key, (8,))
+        return evoxc.random.uniform(key, (8,))
 
     draws = [
-        run_numpy(f, etl.random.key(9, alg)) for alg in etl.random.ALGORITHMS
+        run_numpy(f, evoxc.random.key(9, alg)) for alg in evoxc.random.ALGORITHMS
     ]
     assert len({tuple(d) for d in draws}) == 3
 
@@ -550,25 +550,25 @@ def test_multinomial_algorithm_stream(alg):
     """multinomial with a counter-based key: unchanged semantics — in-range
     indices, (num_samples,) shape, int32 dtype, deterministic."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key, p):
-        return etl.random.multinomial(key, p, 1000)
+        return evoxc.random.multinomial(key, p, 1000)
 
     p = np.array([0.1, 0.2, 0.7], dtype=np.float32)
-    idx = run_numpy(f, etl.random.key(1, alg), p)
+    idx = run_numpy(f, evoxc.random.key(1, alg), p)
     assert idx.dtype == np.int32 and idx.shape == (1000,)
     assert set(np.unique(idx)) <= {0, 1, 2}
     assert (idx == 2).mean() > 0.6  # the 0.7 mass dominates empirically
-    assert np.array_equal(idx, run_numpy(f, etl.random.key(1, alg), p))
+    assert np.array_equal(idx, run_numpy(f, evoxc.random.key(1, alg), p))
 
 
 def test_multinomial_zero_samples_with_counter_key():
     for alg in ("threefry2x32", "philox4x32_10"):
-        @etl.defn
+        @evoxc.defn
         def f(key, p):
-            return etl.random.multinomial(key, p, 0)
+            return evoxc.random.multinomial(key, p, 0)
 
-        idx = run_numpy(f, etl.random.key(1, alg), np.array([0.5, 0.5], np.float32))
+        idx = run_numpy(f, evoxc.random.key(1, alg), np.array([0.5, 0.5], np.float32))
         assert idx.shape == (0,)
 
 
@@ -585,12 +585,12 @@ def test_multinomial_input_validation_with_counter_key(probs, match):
     """The same explicit runtime validation applies with an algorithm-aware
     key (threefry2x32) — errors, never silent fallback."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key, p):
-        return etl.random.multinomial(key, p, 10)
+        return evoxc.random.multinomial(key, p, 10)
 
     with pytest.raises(ValueError, match=match):
-        etl.evaluate(f, etl.random.key(1, "threefry2x32"), probs)
+        evoxc.evaluate(f, evoxc.random.key(1, "threefry2x32"), probs)
 
 
 # --- 9. Graph save/load preserves the algorithm attribute --------------------
@@ -599,8 +599,8 @@ def test_multinomial_input_validation_with_counter_key(probs, match):
 @pytest.mark.parametrize(
     ("alg", "spec"),
     [
-        ("threefry2x32", etl.TensorSpec((2,), etl.int32)),
-        ("philox4x32_10", etl.TensorSpec((4,), etl.int32)),
+        ("threefry2x32", evoxc.TensorSpec((2,), evoxc.int32)),
+        ("philox4x32_10", evoxc.TensorSpec((4,), evoxc.int32)),
     ],
     ids=["threefry2x32", "philox4x32_10"],
 )
@@ -609,15 +609,15 @@ def test_graph_save_load_preserves_algorithm(tmp_path, alg, spec):
     save/load with the ``algorithm`` attribute preserved, and the loaded
     graph runs bit-identical to the original."""
 
-    @etl.defn
+    @evoxc.defn
     def f(key):
-        a, b = etl.random.split(key)
-        return a, b, etl.random.uniform(key, (3,))
+        a, b = evoxc.random.split(key)
+        return a, b, evoxc.random.uniform(key, (3,))
 
-    graph = etl.trace(f, spec)
-    path = tmp_path / f"random_{alg}.etlgraph"
+    graph = evoxc.trace(f, spec)
+    path = tmp_path / f"random_{alg}.evoxcgraph"
     graph.save(path)
-    loaded = etl.Graph.load(path)
+    loaded = evoxc.Graph.load(path)
 
     # every random op in the loaded graph carries the algorithm attribute
     random_ops = [
@@ -630,8 +630,8 @@ def test_graph_save_load_preserves_algorithm(tmp_path, alg, spec):
         assert op.attributes["algorithm"] == alg
 
     # the loaded graph runs bit-identical to the original
-    exe0 = etl.load(etl.compile(etl.lower(graph)))
-    exe1 = etl.load(etl.compile(etl.lower(loaded)))
-    key = etl.random.key(11, alg)
-    for a, b in zip(etl.run(exe0, key), etl.run(exe1, key)):
+    exe0 = evoxc.load(evoxc.compile(evoxc.lower(graph)))
+    exe1 = evoxc.load(evoxc.compile(evoxc.lower(loaded)))
+    key = evoxc.random.key(11, alg)
+    for a, b in zip(evoxc.run(exe0, key), evoxc.run(exe1, key)):
         assert np.array_equal(a.numpy(), b.numpy())

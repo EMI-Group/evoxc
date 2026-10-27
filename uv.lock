@@ -175,7 +175,7 @@ nvtx = [
 ]
 
 [[package]]
-name = "etl"
+name = "evoxc"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

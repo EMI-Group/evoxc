@@ -1,8 +1,8 @@
 """Graph-construction tests for the six dist collectives + rank/world_size.
 
-Asserts the IR contract of ``etl/dist`` (sibling package, read-only — the
-contract lives in ``etl/dist/CONTEXT.md``, the canonical op defs in
-``etl/ir/op_defs/collective.py``):
+Asserts the IR contract of ``evoxc/dist`` (sibling package, read-only — the
+contract lives in ``evoxc/dist/CONTEXT.md``, the canonical op defs in
+``evoxc/ir/op_defs/collective.py``):
 
 - each collective builds exactly ONE op with effect kind ``collective``,
   1 operand / 1 result, attrs ``group`` + ``group_size`` plus per-op params;
@@ -21,24 +21,24 @@ These tests are graph-construction only: no execution, CPU only, small shapes.
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl.dist.collectives import REDUCTIONS
+import evoxc
+from evoxc import core
+from evoxc.dist.collectives import REDUCTIONS
 
 # --- fixtures / helpers -----------------------------------------------------
 
 #: Explicit 4-rank group used throughout (group="data", size 4).
-G4 = etl.dist.group("data", (0, 1, 2, 3))
+G4 = evoxc.dist.group("data", (0, 1, 2, 3))
 
 #: Default local input shape: rank 2, dims divisible by the group size.
 SHAPE = (4, 8)
 
 
 def _collective_defn(fn_name, **kwargs):
-    """Build a defn calling ``getattr(etl.dist, fn_name)(x, **kwargs)``."""
-    collective = getattr(etl.dist, fn_name)
+    """Build a defn calling ``getattr(evoxc.dist, fn_name)(x, **kwargs)``."""
+    collective = getattr(evoxc.dist, fn_name)
 
-    @etl.defn
+    @evoxc.defn
     def fn(x):
         return collective(x, **kwargs)
 
@@ -46,7 +46,7 @@ def _collective_defn(fn_name, **kwargs):
 
 
 def _trace(fn, shape=SHAPE, dtype=core.float32):
-    return etl.trace(fn, core.TensorSpec(shape, dtype))
+    return evoxc.trace(fn, core.TensorSpec(shape, dtype))
 
 
 def _single_op(fn, op_name, shape=SHAPE, dtype=core.float32):
@@ -179,9 +179,9 @@ def test_unknown_reduction_op_raises_value_error(fn_name, op):
 @pytest.mark.parametrize("fn_name", ["rank", "world_size"])
 def test_execution_context_scalar_op(fn_name):
     """rank/world_size: 0-operand read-effect scalar int64 ops, group="world"."""
-    scalar_fn = getattr(etl.dist, fn_name)
+    scalar_fn = getattr(evoxc.dist, fn_name)
 
-    @etl.defn
+    @evoxc.defn
     def fn(x):
         return scalar_fn()
 
@@ -198,10 +198,10 @@ def test_rank_world_size_return_symbolic_tensors():
     """rank()/world_size() are SymbolicTensor graph values, not Python ints."""
     captured = []
 
-    @etl.defn
+    @evoxc.defn
     def fn(x):
-        r = etl.dist.rank()
-        w = etl.dist.world_size()
+        r = evoxc.dist.rank()
+        w = evoxc.dist.world_size()
         captured.extend((r, w))
         return r, w
 
@@ -218,9 +218,9 @@ def test_rank_world_size_return_symbolic_tensors():
 
 def test_rank_world_size_outside_trace_raise_trace_error():
     with pytest.raises(core.TraceError, match="No active trace"):
-        etl.dist.rank()
+        evoxc.dist.rank()
     with pytest.raises(core.TraceError, match="No active trace"):
-        etl.dist.world_size()
+        evoxc.dist.world_size()
 
 
 # --- 4. error matrix --------------------------------------------------------
@@ -242,7 +242,7 @@ VALID_KWARGS = [
 def test_concrete_tensor_operand_raises_trace_error(fn_name, kwargs):
     """No eager mode: a concrete Tensor operand fails with a clear TraceError."""
     tensor = core.zeros((2, 2), core.float32)
-    collective = getattr(etl.dist, fn_name)
+    collective = getattr(evoxc.dist, fn_name)
     with pytest.raises(core.TraceError, match="no eager mode"):
         collective(tensor, group=G4, **kwargs)
 
@@ -256,7 +256,7 @@ def test_concrete_tensor_operand_raises_trace_error(fn_name, kwargs):
 ])
 def test_non_tensor_operand_raises_type_error(bad):
     with pytest.raises(TypeError, match="SymbolicTensor"):
-        etl.dist.all_reduce(bad, "sum", G4)
+        evoxc.dist.all_reduce(bad, "sum", G4)
 
 
 @pytest.mark.parametrize("fn_name,kwargs", VALID_KWARGS)
@@ -264,15 +264,15 @@ def test_collective_outside_trace_raises_trace_error(fn_name, kwargs):
     """A SymbolicTensor captured during a trace is rejected after the trace."""
     captured = []
 
-    @etl.defn
+    @evoxc.defn
     def fn(x):
-        y = etl.dist.all_reduce(x, "sum", G4)
+        y = evoxc.dist.all_reduce(x, "sum", G4)
         captured.append(y)
         return y
 
     _trace(fn)
     y = captured[0]
-    collective = getattr(etl.dist, fn_name)
+    collective = getattr(evoxc.dist, fn_name)
     with pytest.raises(core.TraceError, match="No active trace"):
         collective(y, group=G4, **kwargs)
 

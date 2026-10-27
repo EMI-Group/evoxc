@@ -1,18 +1,18 @@
-"""Computation-op tests for ``etl.sparse``: graph evaluation vs pure-numpy
+"""Computation-op tests for ``evoxc.sparse``: graph evaluation vs pure-numpy
 references of the DENSE matrices, mixed-format auto-conversion, from_dense /
 to_dense roundtrips, empty-nnz edge cases, trace-time static error checks, and
 IR-contract spot checks (exact emitted op names).
 
-Contract under test: ``../etl/sparse/CONTEXT.md`` (sibling, read-only). Every
+Contract under test: ``../evoxc/sparse/CONTEXT.md`` (sibling, read-only). Every
 computation op is evaluated through the explicit pipeline
-(``etl.evaluate`` — concrete sparse args derive ``SparseTensorSpec``s
+(``evoxc.evaluate`` — concrete sparse args derive ``SparseTensorSpec``s
 automatically) and compared against the dense reference with a tight
 tolerance. Static violations are asserted at TRACE time with the exact
-wording from ``../etl/sparse/ops.py``.
+wording from ``../evoxc/sparse/ops.py``.
 
 NOTE on the conftest helpers: ``tests.sparse.conftest.csr_spec`` /
 ``csc_spec`` currently omit the ``format=`` keyword (so they raise
-``ShapeError`` — a test-helper bug, not an etl bug). This file therefore
+``ShapeError`` — a test-helper bug, not an evoxc bug). This file therefore
 defines corrected ``csr_spec`` / ``csc_spec`` helpers at module level;
 ``coo_spec`` and the concrete examples from conftest are used as-is.
 """
@@ -20,9 +20,9 @@ defines corrected ``csr_spec`` / ``csc_spec`` helpers at module level;
 import numpy as np
 import pytest
 
-import etl
-from etl import sparse
-from etl import core
+import evoxc
+from evoxc import sparse
+from evoxc import core
 
 from tests.sparse.conftest import (
     csc_example,
@@ -39,23 +39,23 @@ from tests.sparse.conftest import (
 # ---------------------------------------------------------------------------
 
 
-def csr_spec(dtype=etl.float32):
+def csr_spec(dtype=evoxc.float32):
     """The SparseTensorSpec matching `csr_example()` (indptr static (4,))."""
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((4,), etl.int64),
-        etl.TensorSpec((None,), etl.int64),
-        etl.TensorSpec((None,), dtype),
+        evoxc.TensorSpec((4,), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.int64),
+        evoxc.TensorSpec((None,), dtype),
         dense_shape=(3, 4),
         format="csr",
     )
 
 
-def csc_spec(dtype=etl.float32):
+def csc_spec(dtype=evoxc.float32):
     """The SparseTensorSpec matching `csc_example()` (indptr static (5,))."""
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((5,), etl.int64),
-        etl.TensorSpec((None,), etl.int64),
-        etl.TensorSpec((None,), dtype),
+        evoxc.TensorSpec((5,), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.int64),
+        evoxc.TensorSpec((None,), dtype),
         dense_shape=(3, 4),
         format="csc",
     )
@@ -112,7 +112,7 @@ def test_add_overlapping_entries_are_summed():
 
 
 def test_add_result_is_coo():
-    result = etl.evaluate(lambda a, b: sparse.add(a, b), coo_example(), csr_example())
+    result = evoxc.evaluate(lambda a, b: sparse.add(a, b), coo_example(), csr_example())
     assert sparse.is_sparse(result)
     assert result.format == "coo"
 
@@ -142,7 +142,7 @@ def test_multiply_disjoint_supports_is_empty():
         np.array([7.0, 8.0], dtype=np.float32),
         (3, 4),
     )
-    result = etl.evaluate(lambda a, b: sparse.multiply(a, b), coo_example(), disjoint)
+    result = evoxc.evaluate(lambda a, b: sparse.multiply(a, b), coo_example(), disjoint)
     assert sparse.is_sparse(result)
     assert result.indices.shape[0] == 0  # nnz-0 result
     np.testing.assert_allclose(
@@ -151,7 +151,7 @@ def test_multiply_disjoint_supports_is_empty():
 
 
 def test_multiply_result_is_coo():
-    result = etl.evaluate(
+    result = evoxc.evaluate(
         lambda a, b: sparse.multiply(a, b), coo_example(), csr_example()
     )
     assert sparse.is_sparse(result)
@@ -171,10 +171,10 @@ def test_multiply_dense_scales_values_at_sparse_positions():
 
 
 def test_multiply_dense_traces_with_dense_tensor_spec():
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, x: sparse.multiply_dense(a, x),
         coo_spec(),
-        etl.TensorSpec((3, 4), etl.float32),
+        evoxc.TensorSpec((3, 4), evoxc.float32),
     )
     assert "sparse_multiply_dense" in _ops_of(graph)
 
@@ -192,7 +192,7 @@ def test_negate():
 
 def test_negate_keeps_sparsity_structure():
     d = dense_example()
-    result = etl.evaluate(lambda x: sparse.negate(x), coo_example())
+    result = evoxc.evaluate(lambda x: sparse.negate(x), coo_example())
     assert sparse.is_sparse(result)
     assert result.format == "coo"
     assert result.indices.shape[0] == 4  # same nnz as the input
@@ -205,8 +205,8 @@ def test_negate_keeps_sparsity_structure():
 
 
 def test_sum_result_is_dense():
-    result = etl.evaluate(lambda x: sparse.sum(x), coo_example())
-    assert isinstance(result, etl.Tensor)
+    result = evoxc.evaluate(lambda x: sparse.sum(x), coo_example())
+    assert isinstance(result, evoxc.Tensor)
 
 
 @pytest.mark.parametrize(
@@ -253,7 +253,7 @@ def test_sum_bigger_shape():
 
 def test_transpose_default_reverses_axes():
     d = dense_example()
-    result = etl.evaluate(lambda x: sparse.transpose(x), coo_example())
+    result = evoxc.evaluate(lambda x: sparse.transpose(x), coo_example())
     assert sparse.is_sparse(result)
     assert result.format == "coo"
     assert result.dense_shape == (4, 3)
@@ -274,7 +274,7 @@ def test_transpose_explicit_perm():
 @pytest.mark.parametrize("new_shape", [(12,), (2, 6), (6, 2)])
 def test_reshape_element_count_equal(new_shape):
     d = dense_example()
-    result = etl.evaluate(lambda x: sparse.reshape(x, new_shape), coo_example())
+    result = evoxc.evaluate(lambda x: sparse.reshape(x, new_shape), coo_example())
     assert sparse.is_sparse(result)
     assert result.format == "coo"
     assert result.dense_shape == tuple(new_shape)
@@ -304,7 +304,7 @@ def test_concatenate_axis_and_operand_count(axis, n_operands):
 def test_concatenate_operand_extents_and_result_shape():
     # Two (3, 4) operands along axis 0: result dense_shape (6, 4) with
     # per-operand extents (3, 3).
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, b: sparse.concatenate([a, b], axis=0), coo_spec(), csr_spec()
     )
     op = next(
@@ -314,7 +314,7 @@ def test_concatenate_operand_extents_and_result_shape():
     assert op.attributes["operand_extents"] == (3, 3)
     assert op.attributes["axis"] == 0
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, b: sparse.concatenate([a, b], axis=1), coo_spec(), csr_spec()
     )
     op = next(
@@ -326,7 +326,7 @@ def test_concatenate_operand_extents_and_result_shape():
 
 def test_concatenate_result_dense_shape_is_extent_sum():
     # Three (3, 4) COOs along axis 0.
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, b, c: sparse.concatenate([a, b, c], axis=0),
         coo_spec(),
         coo_spec(),
@@ -347,24 +347,24 @@ def test_concatenate_result_dense_shape_is_extent_sum():
 def test_matmul_sparse_dot_dense():
     d = dense_example()
     dense = np.arange(4 * 5, dtype=np.float32).reshape(4, 5)
-    result = etl.evaluate(lambda x, y: sparse.matmul(x, y), coo_example(), dense)
-    assert isinstance(result, etl.Tensor)  # DENSE result
+    result = evoxc.evaluate(lambda x, y: sparse.matmul(x, y), coo_example(), dense)
+    assert isinstance(result, evoxc.Tensor)  # DENSE result
     np.testing.assert_allclose(result.numpy(), d @ dense, rtol=1e-6, atol=1e-6)
 
 
 def test_matmul_dense_dot_sparse():
     d = dense_example()
     dense = np.arange(5 * 3, dtype=np.float32).reshape(5, 3)
-    result = etl.evaluate(lambda x, y: sparse.matmul(x, y), dense, coo_example())
-    assert isinstance(result, etl.Tensor)  # DENSE result
+    result = evoxc.evaluate(lambda x, y: sparse.matmul(x, y), dense, coo_example())
+    assert isinstance(result, evoxc.Tensor)  # DENSE result
     np.testing.assert_allclose(result.numpy(), dense @ d, rtol=1e-6, atol=1e-6)
 
 
-def test_matmul_dense_dot_dense_routes_to_etl_ops_dot():
-    graph = etl.trace(
+def test_matmul_dense_dot_dense_routes_to_evoxc_ops_dot():
+    graph = evoxc.trace(
         lambda a, b: sparse.matmul(a, b),
-        etl.TensorSpec((3, 4), etl.float32),
-        etl.TensorSpec((4, 5), etl.float32),
+        evoxc.TensorSpec((3, 4), evoxc.float32),
+        evoxc.TensorSpec((4, 5), evoxc.float32),
     )
     ops = _ops_of(graph)
     assert "dot" in ops
@@ -385,10 +385,10 @@ def test_matmul_batched_dense_traces_with_static_tolerance():
     # contract (the dense batch must come from the sparse operand's batch
     # dims) and fails with an explicit ShapeError at run time — not exercised
     # here.
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda x, y: sparse.matmul(x, y),
         coo_spec(),
-        etl.TensorSpec((2, 4, 5), etl.float32),
+        evoxc.TensorSpec((2, 4, 5), evoxc.float32),
     )
     assert "sparse_dot_dense" in _ops_of(graph)
 
@@ -399,77 +399,77 @@ def test_matmul_batched_dense_traces_with_static_tolerance():
 
 
 def test_computation_ops_auto_convert_csr_csc_inputs():
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, b: sparse.add(a, b), csr_spec(), csc_spec()
     )
     ops = _ops_of(graph)
     assert ops == ["sparse_csr_to_coo", "sparse_csc_to_coo", "sparse_add"]
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         lambda a, b: sparse.multiply(a, b), csr_spec(), csr_spec()
     )
     ops = _ops_of(graph)
     assert ops == ["sparse_csr_to_coo", "sparse_csr_to_coo", "sparse_multiply"]
 
-    graph = etl.trace(
-        lambda x, y: sparse.matmul(x, y), csr_spec(), etl.TensorSpec((4, 5), etl.float32)
+    graph = evoxc.trace(
+        lambda x, y: sparse.matmul(x, y), csr_spec(), evoxc.TensorSpec((4, 5), evoxc.float32)
     )
     assert _ops_of(graph) == ["sparse_csr_to_coo", "sparse_dot_dense"]
 
 
 def test_to_dense_auto_converts_csr_csc_but_not_coo():
-    assert _ops_of(etl.trace(lambda x: sparse.to_dense(x), csr_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_dense(x), csr_spec())) == [
         "sparse_csr_to_coo",
         "sparse_to_dense",
     ]
-    assert _ops_of(etl.trace(lambda x: sparse.to_dense(x), csc_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_dense(x), csc_spec())) == [
         "sparse_csc_to_coo",
         "sparse_to_dense",
     ]
-    assert _ops_of(etl.trace(lambda x: sparse.to_dense(x), coo_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_dense(x), coo_spec())) == [
         "sparse_to_dense"
     ]
 
 
 def test_to_csr_to_csc_emit_coo_conversions():
-    assert _ops_of(etl.trace(lambda x: sparse.to_csr(x), coo_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_csr(x), coo_spec())) == [
         "sparse_coo_to_csr"
     ]
-    assert _ops_of(etl.trace(lambda x: sparse.to_csc(x), coo_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_csc(x), coo_spec())) == [
         "sparse_coo_to_csc"
     ]
 
 
 def test_to_csr_on_csr_is_identity():
-    assert _ops_of(etl.trace(lambda x: sparse.to_csr(x), csr_spec())) == []
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_csr(x), csr_spec())) == []
 
 
 def test_to_coo_identity_on_coo():
-    assert _ops_of(etl.trace(lambda x: sparse.to_coo(x), coo_spec())) == []
+    assert _ops_of(evoxc.trace(lambda x: sparse.to_coo(x), coo_spec())) == []
 
 
 def test_csr_csc_inputs_auto_convert_in_negate_sum_transpose_reshape():
-    assert _ops_of(etl.trace(lambda x: sparse.negate(x), csc_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.negate(x), csc_spec())) == [
         "sparse_csc_to_coo",
         "sparse_negate",
     ]
-    assert _ops_of(etl.trace(lambda x: sparse.sum(x, axes=0), csr_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.sum(x, axes=0), csr_spec())) == [
         "sparse_csr_to_coo",
         "sparse_reduce_sum",
     ]
-    assert _ops_of(etl.trace(lambda x: sparse.transpose(x), csr_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.transpose(x), csr_spec())) == [
         "sparse_csr_to_coo",
         "sparse_transpose",
     ]
-    assert _ops_of(etl.trace(lambda x: sparse.reshape(x, (12,)), csc_spec())) == [
+    assert _ops_of(evoxc.trace(lambda x: sparse.reshape(x, (12,)), csc_spec())) == [
         "sparse_csc_to_coo",
         "sparse_reshape",
     ]
     assert _ops_of(
-        etl.trace(
+        evoxc.trace(
             lambda a, x: sparse.multiply_dense(a, x),
             csr_spec(),
-            etl.TensorSpec((3, 4), etl.float32),
+            evoxc.TensorSpec((3, 4), evoxc.float32),
         )
     ) == ["sparse_csr_to_coo", "sparse_multiply_dense"]
 
@@ -492,11 +492,11 @@ def test_rank2_requirement_for_conversion_to_dense():
         return sparse.to_dense(x)
 
     with pytest.raises(core.ShapeError, match="requires a rank-2 sparse tensor"):
-        etl.trace(
+        evoxc.trace(
             f,
-            etl.TensorSpec((7,), etl.int64),
-            etl.TensorSpec((None,), etl.int64),
-            etl.TensorSpec((None,), etl.float32),
+            evoxc.TensorSpec((7,), evoxc.int64),
+            evoxc.TensorSpec((None,), evoxc.int64),
+            evoxc.TensorSpec((None,), evoxc.float32),
         )
 
 
@@ -525,8 +525,8 @@ def test_from_dense_symbolic_roundtrip():
     # In-graph creator: sparse_from_dense op emitted; evaluated result equals
     # the input dense.
     d = np.arange(3 * 4, dtype=np.float32).reshape(3, 4)
-    graph = etl.trace(
-        lambda x: sparse.to_dense(sparse.from_dense(x)), etl.TensorSpec((3, 4), etl.float32)
+    graph = evoxc.trace(
+        lambda x: sparse.to_dense(sparse.from_dense(x)), evoxc.TensorSpec((3, 4), evoxc.float32)
     )
     assert _ops_of(graph) == ["sparse_from_dense", "sparse_to_dense"]
     got = eval_dense(lambda x: sparse.to_dense(sparse.from_dense(x)), d)
@@ -570,7 +570,7 @@ def test_empty_nnz_through_computation_ops():
 
 def test_empty_intersection_multiply_is_nnz_zero():
     e = empty_coo()
-    result = etl.evaluate(lambda a, b: sparse.multiply(a, b), e, coo_example())
+    result = evoxc.evaluate(lambda a, b: sparse.multiply(a, b), e, coo_example())
     assert sparse.is_sparse(result)
     assert result.indices.shape[0] == 0
     np.testing.assert_allclose(
@@ -597,7 +597,7 @@ def test_concatenate_with_empty_operand():
 
 def test_all_empty_concatenate():
     e = empty_coo()
-    result = etl.evaluate(lambda a, b: sparse.concatenate([a, b], axis=0), e, e)
+    result = evoxc.evaluate(lambda a, b: sparse.concatenate([a, b], axis=0), e, e)
     assert sparse.is_sparse(result)
     assert result.indices.shape[0] == 0
     assert result.dense_shape == (6, 4)
@@ -607,22 +607,22 @@ def test_all_empty_concatenate():
 
 
 # ---------------------------------------------------------------------------
-# 13. Static error checks (trace time, exact wording from etl/sparse/ops.py)
+# 13. Static error checks (trace time, exact wording from evoxc/sparse/ops.py)
 # ---------------------------------------------------------------------------
 
 
 def _spec_mismatched_shape():
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(2, 4),
     )
 
 
 def _spec_mismatched_dtype():
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float64),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float64),
         dense_shape=(3, 4),
     )
 
@@ -631,24 +631,24 @@ def _spec_mismatch_nonconcat_axis():
     # (3, 5): differs from coo_spec's (3, 4) at axis 1 — a NON-concat-axis
     # mismatch for axis=0 concatenation.
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(3, 5),
     )
 
 
 def _spec_rank1():
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 1), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 1), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(4,),
     )
 
 
 def _spec_rank3():
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 3), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 3), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(2, 3, 4),
     )
 
@@ -796,25 +796,25 @@ def _spec_rank3():
         # matmul
         (
             lambda a, b: sparse.matmul(a, b),
-            (_spec_rank3(), etl.TensorSpec((3, 4, 5), etl.float32)),
+            (_spec_rank3(), evoxc.TensorSpec((3, 4, 5), evoxc.float32)),
             core.ShapeError,
             "sparse operand must be rank-2",
         ),
         (
             lambda a, b: sparse.matmul(a, b),
-            (coo_spec(), etl.TensorSpec((4,), etl.float32)),
+            (coo_spec(), evoxc.TensorSpec((4,), evoxc.float32)),
             core.ShapeError,
             "dense operand must have rank >= 2",
         ),
         (
             lambda a, b: sparse.matmul(a, b),
-            (coo_spec(), etl.TensorSpec((3, 5), etl.float32)),
+            (coo_spec(), evoxc.TensorSpec((3, 5), evoxc.float32)),
             core.ShapeError,
             "inner dims must match",
         ),
         (
             lambda a, b: sparse.matmul(a, b),
-            (etl.TensorSpec((5, 2), etl.float32), coo_spec()),
+            (evoxc.TensorSpec((5, 2), evoxc.float32), coo_spec()),
             core.ShapeError,
             "inner dims must match",
         ),
@@ -827,7 +827,7 @@ def _spec_rank3():
         # multiply_dense
         (
             lambda a, x: sparse.multiply_dense(a, x),
-            (coo_spec(), etl.TensorSpec((2, 4), etl.float32)),
+            (coo_spec(), evoxc.TensorSpec((2, 4), evoxc.float32)),
             core.ShapeError,
             "must equal the sparse dense_shape",
         ),
@@ -835,7 +835,7 @@ def _spec_rank3():
 )
 def test_static_errors_at_trace_time(build, specs, exc, match):
     with pytest.raises(exc, match=match):
-        etl.trace(build, *specs)
+        evoxc.trace(build, *specs)
 
 
 def test_reshape_with_dim_in_dense_shape_is_rejected():
@@ -846,21 +846,21 @@ def test_reshape_with_dim_in_dense_shape_is_rejected():
         return sparse.reshape(x, (8,))
 
     with pytest.raises(core.ShapeError, match="static shapes only in v1"):
-        etl.trace(
+        evoxc.trace(
             f,
-            etl.TensorSpec((None, 2), etl.int64),
-            etl.TensorSpec((None,), etl.float32),
+            evoxc.TensorSpec((None, 2), evoxc.int64),
+            evoxc.TensorSpec((None,), evoxc.float32),
         )
 
 
 def test_ops_on_concrete_values_inside_trace_raise_no_eager_mode():
     # Representative checks: the full matrix lives in test_errors.py.
     with pytest.raises(core.TraceError, match="There is no eager mode"):
-        etl.trace(lambda: sparse.add(coo_example(), csr_example()))
+        evoxc.trace(lambda: sparse.add(coo_example(), csr_example()))
     with pytest.raises(core.TraceError, match="There is no eager mode"):
-        etl.trace(lambda: sparse.negate(coo_example()))
+        evoxc.trace(lambda: sparse.negate(coo_example()))
     with pytest.raises(core.TraceError, match="There is no eager mode"):
-        etl.trace(
+        evoxc.trace(
             lambda a: sparse.multiply_dense(a, np.ones((3, 4), dtype=np.float32)),
             coo_spec(),
         )
@@ -883,7 +883,7 @@ def test_ops_outside_trace_raise():
     [
         (
             lambda d: sparse.from_dense(d),
-            (etl.TensorSpec((3, 4), etl.float32),),
+            (evoxc.TensorSpec((3, 4), evoxc.float32),),
             ["sparse_from_dense"],
         ),
         (lambda x: sparse.to_dense(x), (coo_spec(),), ["sparse_to_dense"]),
@@ -904,7 +904,7 @@ def test_ops_outside_trace_raise():
         ),
         (
             lambda a, x: sparse.multiply_dense(a, x),
-            (coo_spec(), etl.TensorSpec((3, 4), etl.float32)),
+            (coo_spec(), evoxc.TensorSpec((3, 4), evoxc.float32)),
             ["sparse_multiply_dense"],
         ),
         (
@@ -921,16 +921,16 @@ def test_ops_outside_trace_raise():
         ),
         (
             lambda x, d: sparse.matmul(x, d),
-            (coo_spec(), etl.TensorSpec((4, 5), etl.float32)),
+            (coo_spec(), evoxc.TensorSpec((4, 5), evoxc.float32)),
             ["sparse_dot_dense"],
         ),
         (
             lambda d, x: sparse.matmul(d, x),
-            (etl.TensorSpec((5, 3), etl.float32), coo_spec()),
+            (evoxc.TensorSpec((5, 3), evoxc.float32), coo_spec()),
             ["dense_dot_sparse"],
         ),
     ],
 )
 def test_exact_ir_op_names(build, specs, expected):
-    graph = etl.trace(build, *specs)
+    graph = evoxc.trace(build, *specs)
     assert _ops_of(graph) == expected

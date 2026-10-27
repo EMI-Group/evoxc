@@ -1,4 +1,4 @@
-"""pytest suite for etl sorting ops — ``sort``/``argsort`` numpy parity plus
+"""pytest suite for evoxc sorting ops — ``sort``/``argsort`` numpy parity plus
 ``topk`` regression coverage.
 
 ``sort``/``argsort``: exact parity with ``np.sort``/``np.argsort`` (the numpy
@@ -23,12 +23,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 from tests.ops.conftest import run_numpy
 
 
 def _topk(x, k, axis=-1, largest=True):
-    return etl.topk(x, k, axis=axis, largest=largest)
+    return evoxc.topk(x, k, axis=axis, largest=largest)
 
 
 def test_topk_largest_basic():
@@ -79,32 +79,32 @@ def test_topk_k_equals_extent_and_zero():
 
 
 def test_topk_k_exceeds_static_extent_raises_shape_error():
-    with pytest.raises(etl.ShapeError, match="k=5 exceeds"):
+    with pytest.raises(evoxc.ShapeError, match="k=5 exceeds"):
         run_numpy(lambda t: _topk(t, 5), np.array([3.0, 1.0, 2.0]))
 
 
 @pytest.mark.parametrize("axis", [2, -3])
 def test_topk_bad_axis_raises_shape_error(axis):
-    with pytest.raises(etl.ShapeError, match="topk"):
+    with pytest.raises(evoxc.ShapeError, match="topk"):
         run_numpy(lambda t: _topk(t, 2, axis=axis), np.array([3.0, 1.0, 2.0]))
 
 
 def test_sort_bad_axis_message_unchanged():
     """The sort call site keeps its unprefixed error text (regression guard
     for the ``_sort_axis`` signature extension)."""
-    with pytest.raises(etl.ShapeError) as excinfo:
-        run_numpy(lambda t: etl.sort(t, axis=2), np.array([3.0, 1.0, 2.0]))
+    with pytest.raises(evoxc.ShapeError) as excinfo:
+        run_numpy(lambda t: evoxc.sort(t, axis=2), np.array([3.0, 1.0, 2.0]))
     assert "sort" not in str(excinfo.value)
 
 
 def test_topk_symbolic_extent_traces_and_runs():
     """A symbolic (Dim) axis extent must trace without crashing and defer the
     k-vs-extent check to run time."""
-    exe = etl.build(
+    exe = evoxc.build(
         lambda t: _topk(t, 2)[0],
-        etl.TensorSpec((etl.dim("n"),), etl.float32),
+        evoxc.TensorSpec((evoxc.dim("n"),), evoxc.float32),
     )
-    out = etl.run(exe, np.array([3.0, 1.0, 2.0], dtype=np.float32))
+    out = evoxc.run(exe, np.array([3.0, 1.0, 2.0], dtype=np.float32))
     assert np.array_equal(out.numpy(), [3.0, 2.0])
 
 
@@ -121,12 +121,12 @@ def test_topk_preserves_dtype_indices_int64():
 def test_topk_errors():
     with pytest.raises(TypeError, match="k must be a Python int"):
         run_numpy(lambda t: _topk(t, 2.0), np.array([3.0, 1.0, 2.0]))
-    with pytest.raises(etl.ShapeError, match="rank >= 1"):
+    with pytest.raises(evoxc.ShapeError, match="rank >= 1"):
         run_numpy(lambda t: _topk(t, 1), np.array(3.0))
 
 
 def test_topk_negative_k_raises_shape_error():
-    with pytest.raises(etl.ShapeError, match="k must be >= 0"):
+    with pytest.raises(evoxc.ShapeError, match="k must be >= 0"):
         run_numpy(lambda t: _topk(t, -1), np.array([3.0, 1.0, 2.0]))
 
 
@@ -230,7 +230,7 @@ def test_topk_k1_int_and_bool_dtypes():
 def test_topk_k1_graph_has_no_sort_op():
     """The k == 1 graph carries argmax/argmin + gather and NO sort/argsort
     op (the fast path is backend-agnostic)."""
-    graph = etl.trace(lambda t: _topk(t, 1), etl.TensorSpec((4,), etl.float32))
+    graph = evoxc.trace(lambda t: _topk(t, 1), evoxc.TensorSpec((4,), evoxc.float32))
     names = [
         op.name
         for fn in graph.module.functions
@@ -239,8 +239,8 @@ def test_topk_k1_graph_has_no_sort_op():
     ]
     assert "argmax" in names
     assert "sort" not in names and "argsort" not in names
-    graph = etl.trace(
-        lambda t: _topk(t, 1, largest=False), etl.TensorSpec((4,), etl.float32)
+    graph = evoxc.trace(
+        lambda t: _topk(t, 1, largest=False), evoxc.TensorSpec((4,), evoxc.float32)
     )
     names = [
         op.name
@@ -258,7 +258,7 @@ def test_topk_k1_graph_has_no_sort_op():
 
 def test_sort_1d_default_axis():
     x = np.array([3.0, 1.0, 2.0])
-    out = run_numpy(lambda t: etl.sort(t), x)
+    out = run_numpy(lambda t: evoxc.sort(t), x)
     assert np.array_equal(out, np.sort(x))
     assert out.shape == x.shape
 
@@ -266,14 +266,14 @@ def test_sort_1d_default_axis():
 @pytest.mark.parametrize("axis", [0, 1, -1, -2])
 def test_sort_2d_along_axis(axis):
     x = np.array([[3.0, 1.0, 4.0], [1.0, 5.0, 9.0], [2.0, 6.0, 5.0]])
-    out = run_numpy(lambda t: etl.sort(t, axis=axis), x)
+    out = run_numpy(lambda t: evoxc.sort(t, axis=axis), x)
     assert np.array_equal(out, np.sort(x, axis=axis))
 
 
 def test_sort_axis_none_flattens():
     """axis=None sorts the flattened tensor (numpy semantics) — 1-D result."""
     x = np.array([[3.0, 1.0], [2.0, 4.0]])
-    out = run_numpy(lambda t: etl.sort(t, axis=None), x)
+    out = run_numpy(lambda t: evoxc.sort(t, axis=None), x)
     assert out.shape == (4,)
     assert np.array_equal(out, np.sort(x, axis=None))
 
@@ -281,13 +281,13 @@ def test_sort_axis_none_flattens():
 @pytest.mark.parametrize("axis", [0, 1, -1])
 def test_sort_descending_matches_flip_of_ascending(axis):
     x = np.array([[3.0, 1.0, 4.0], [1.0, 5.0, 9.0], [2.0, 6.0, 5.0]])
-    out = run_numpy(lambda t: etl.sort(t, axis=axis, descending=True), x)
+    out = run_numpy(lambda t: evoxc.sort(t, axis=axis, descending=True), x)
     assert np.array_equal(out, np.flip(np.sort(x, axis=axis), axis=axis))
 
 
 def test_sort_stable_matches_numpy_stable():
     x = np.array([2.0, 1.0, 1.0, 3.0])
-    out = run_numpy(lambda t: etl.sort(t, stable=True), x)
+    out = run_numpy(lambda t: evoxc.sort(t, stable=True), x)
     assert np.array_equal(out, np.sort(x, kind="stable"))
 
 
@@ -295,7 +295,7 @@ def test_sort_default_kind_matches_numpy_default():
     """stable=False passes numpy's default kind (quicksort) — the kernel calls
     np.sort directly, so the results are bit-identical to np.sort(x)."""
     x = np.array([3.0, 1.0, 2.0])
-    out = run_numpy(lambda t: etl.sort(t, stable=False), x)
+    out = run_numpy(lambda t: evoxc.sort(t, stable=False), x)
     assert np.array_equal(out, np.sort(x))
 
 
@@ -305,7 +305,7 @@ def test_sort_default_kind_matches_numpy_default():
 )
 def test_sort_preserves_dtype_exactly(dtype):
     x = np.array([3, 1, 2], dtype=dtype)
-    out = run_numpy(lambda t: etl.sort(t), x)
+    out = run_numpy(lambda t: evoxc.sort(t), x)
     assert out.dtype == x.dtype
     assert np.array_equal(out, np.sort(x))
 
@@ -316,7 +316,7 @@ def test_sort_preserves_dtype_exactly(dtype):
 
 def test_argsort_1d_default_axis():
     x = np.array([3.0, 1.0, 2.0])
-    indices = run_numpy(lambda t: etl.argsort(t), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t), x)
     assert np.array_equal(indices, np.argsort(x))
     assert indices.dtype == np.int64
     # indices index the ORIGINAL tensor and recover the sorted values.
@@ -326,14 +326,14 @@ def test_argsort_1d_default_axis():
 @pytest.mark.parametrize("axis", [0, 1, -1, -2])
 def test_argsort_2d_along_axis(axis):
     x = np.array([[3.0, 1.0, 4.0], [1.0, 5.0, 9.0], [2.0, 6.0, 5.0]])
-    indices = run_numpy(lambda t: etl.argsort(t, axis=axis), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t, axis=axis), x)
     assert np.array_equal(indices, np.argsort(x, axis=axis))
     assert indices.dtype == np.int64
 
 
 def test_argsort_axis_none_flattens():
     x = np.array([[3.0, 1.0], [2.0, 4.0]])
-    indices = run_numpy(lambda t: etl.argsort(t, axis=None), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t, axis=None), x)
     assert indices.shape == (4,)
     assert np.array_equal(indices, np.argsort(x, axis=None))
 
@@ -341,7 +341,7 @@ def test_argsort_axis_none_flattens():
 @pytest.mark.parametrize("axis", [0, 1, -1])
 def test_argsort_descending_matches_flip_of_ascending(axis):
     x = np.array([[3.0, 1.0, 4.0], [1.0, 5.0, 9.0], [2.0, 6.0, 5.0]])
-    indices = run_numpy(lambda t: etl.argsort(t, axis=axis, descending=True), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t, axis=axis, descending=True), x)
     assert np.array_equal(indices, np.flip(np.argsort(x, axis=axis), axis=axis))
 
 
@@ -350,20 +350,20 @@ def test_argsort_stable_keeps_equal_elements_in_original_order():
     verified explicitly (indices [1, 2, 0, 3]) and against numpy's stable
     kind."""
     x = np.array([2.0, 1.0, 1.0, 3.0])
-    indices = run_numpy(lambda t: etl.argsort(t, stable=True), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t, stable=True), x)
     assert np.array_equal(indices, [1, 2, 0, 3])
     assert np.array_equal(indices, np.argsort(x, kind="stable"))
 
 
 def test_argsort_default_kind_matches_numpy_default():
     x = np.array([3.0, 1.0, 2.0])
-    indices = run_numpy(lambda t: etl.argsort(t, stable=False), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t, stable=False), x)
     assert np.array_equal(indices, np.argsort(x))
 
 
 def test_argsort_indices_int64_for_int_input():
     x = np.array([3, 1, 2], dtype=np.int32)
-    indices = run_numpy(lambda t: etl.argsort(t), x)
+    indices = run_numpy(lambda t: evoxc.argsort(t), x)
     assert indices.dtype == np.int64
     assert np.array_equal(indices, np.argsort(x))
 
@@ -374,54 +374,54 @@ def test_argsort_indices_int64_for_int_input():
 
 @pytest.mark.parametrize("op_name", ["sort", "argsort"])
 def test_sort_argsort_outside_trace_raises_directing_trace_error(op_name):
-    with pytest.raises(etl.TraceError) as exc:
-        getattr(etl, op_name)(np.array([3.0, 1.0, 2.0]))
+    with pytest.raises(evoxc.TraceError) as exc:
+        getattr(evoxc, op_name)(np.array([3.0, 1.0, 2.0]))
     message = str(exc.value)
     assert message.startswith(
         "No active trace: tensor ops can only be called while tracing"
     )
-    assert "etl.trace" in message
-    assert "etl.evaluate" in message
+    assert "evoxc.trace" in message
+    assert "evoxc.evaluate" in message
 
 
 @pytest.mark.parametrize("op_name", ["sort", "argsort"])
 def test_sort_argsort_reject_concrete_tensor_operand_in_trace(op_name):
-    tensor = etl.tensor(np.array([3.0, 1.0, 2.0], dtype=np.float32))
+    tensor = evoxc.tensor(np.array([3.0, 1.0, 2.0], dtype=np.float32))
 
     def fn(x):
-        return getattr(etl, op_name)(tensor)
+        return getattr(evoxc, op_name)(tensor)
 
-    with pytest.raises(etl.TraceError) as exc:
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+    with pytest.raises(evoxc.TraceError) as exc:
+        evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
     message = str(exc.value)
     assert message.startswith(
         "Concrete Tensor operands are not allowed in graph ops "
-        "(etl has no eager mode)"
+        "(evoxc has no eager mode)"
     )
     assert "explicit input" in message
-    assert "etl.constant" in message
-    assert "etl.evaluate" in message
+    assert "evoxc.constant" in message
+    assert "evoxc.evaluate" in message
 
 
 @pytest.mark.parametrize("op_name", ["sort", "argsort"])
 @pytest.mark.parametrize("axis", [1.5, "0"], ids=["float", "str"])
 def test_sort_argsort_bad_axis_type_raises_type_error(op_name, axis):
     with pytest.raises(TypeError, match="axis must be an int or None"):
-        run_numpy(lambda t: getattr(etl, op_name)(t, axis=axis), np.array([3.0, 1.0, 2.0]))
+        run_numpy(lambda t: getattr(evoxc, op_name)(t, axis=axis), np.array([3.0, 1.0, 2.0]))
 
 
 @pytest.mark.parametrize("op_name", ["sort", "argsort"])
 @pytest.mark.parametrize("axis", [2, -3], ids=["too-large", "too-negative"])
 def test_sort_argsort_axis_out_of_range_raises_shape_error(op_name, axis):
-    with pytest.raises(etl.ShapeError, match="out of range for rank"):
-        run_numpy(lambda t: getattr(etl, op_name)(t, axis=axis), np.array([3.0, 1.0, 2.0]))
+    with pytest.raises(evoxc.ShapeError, match="out of range for rank"):
+        run_numpy(lambda t: getattr(evoxc, op_name)(t, axis=axis), np.array([3.0, 1.0, 2.0]))
 
 
 @pytest.mark.parametrize("op_name", ["sort", "argsort"])
 def test_sort_argsort_bad_descending_raises_type_error(op_name):
     with pytest.raises(TypeError, match="descending must be a bool"):
         run_numpy(
-            lambda t: getattr(etl, op_name)(t, descending="yes"),
+            lambda t: getattr(evoxc, op_name)(t, descending="yes"),
             np.array([3.0, 1.0, 2.0]),
         )
 
@@ -430,7 +430,7 @@ def test_sort_argsort_bad_descending_raises_type_error(op_name):
 def test_sort_argsort_bad_stable_raises_type_error(op_name):
     with pytest.raises(TypeError, match="stable must be a bool"):
         run_numpy(
-            lambda t: getattr(etl, op_name)(t, stable=1),
+            lambda t: getattr(evoxc, op_name)(t, stable=1),
             np.array([3.0, 1.0, 2.0]),
         )
 
@@ -438,5 +438,5 @@ def test_sort_argsort_bad_stable_raises_type_error(op_name):
 @pytest.mark.parametrize("op_name", ["sort", "argsort"])
 def test_sort_argsort_scalar_operand_raises_shape_error(op_name):
     """Rank-0 operand: axis normalization fails like numpy's AxisError."""
-    with pytest.raises(etl.ShapeError, match="out of range for rank 0"):
-        run_numpy(lambda t: getattr(etl, op_name)(t), np.array(3.0))
+    with pytest.raises(evoxc.ShapeError, match="out of range for rank 0"):
+        run_numpy(lambda t: getattr(evoxc, op_name)(t), np.array(3.0))

@@ -1,10 +1,10 @@
 """Sparse tensors through the traced control-flow ops: `cond`, `while_loop`,
 and `scan`.
 
-Contract under test: ``../etl/sparse/CONTEXT.md`` ("Known issues / v1
+Contract under test: ``../evoxc/sparse/CONTEXT.md`` ("Known issues / v1
 deferrals": sparse loop CARRIES through scan/cond/while_loop work — trace-level
 support is generic registered-pytree handling; scan over sparse `xs` and sparse
-`y`-stacking are explicit TraceError deferrals) and ``../etl/trace/CONTEXT.md``
+`y`-stacking are explicit TraceError deferrals) and ``../evoxc/trace/CONTEXT.md``
 (control-flow region conventions, static-leaf snapshotting). All numerics are
 checked against pure-numpy dense references with tight tolerances.
 
@@ -14,20 +14,20 @@ Pinned behaviors (verified against the current implementation):
   dense_shape/dtype/format static leaves snapshot as static values (3, 4,
   float32, "coo") and stay out of the carried tensor leaves.
 * `scan` over sparse `xs` defers at trace time:
-  "etl.scan: xs leaf 2 must be a core.SymbolicTensor, got int" (the static
+  "evoxc.scan: xs leaf 2 must be a core.SymbolicTensor, got int" (the static
   dense_shape leaf of the flattened sparse is rejected — the flattened xs
   contains non-tensor leaves).
 * `scan` whose body returns a SPARSE y (the value to stack) defers at trace
-  time: "etl.scan: f's y outputs must be SymbolicTensors (at least one) — a
+  time: "evoxc.scan: f's y outputs must be SymbolicTensors (at least one) — a
   scan with no stacked tensor outputs cannot be traced".
 """
 
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl import sparse
+import evoxc
+from evoxc import core
+from evoxc import sparse
 
 from tests.sparse.conftest import (
     coo_example,
@@ -40,7 +40,7 @@ from tests.sparse.conftest import (
 
 def _const(value, dtype):
     """Embed a static value as a constant op (valid only inside a trace)."""
-    return etl.constant(etl.tensor(value, dtype=dtype))
+    return evoxc.constant(evoxc.tensor(value, dtype=dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +53,14 @@ def test_cond_sparse_returning_branches():
     result is a concrete sparse; True/False match the dense references."""
 
     def f(p, x):
-        return etl.cond(
+        return evoxc.cond(
             p,
             lambda v: sparse.negate(v),
             lambda v: sparse.add(v, v),
             x,
         )
 
-    graph = etl.trace(f, etl.TensorSpec((), etl.bool_), coo_spec())
+    graph = evoxc.trace(f, evoxc.TensorSpec((), evoxc.bool_), coo_spec())
     d = dense_example()
 
     got_true = run_graph(graph, np.array(True), coo_example())
@@ -75,14 +75,14 @@ def test_cond_dense_returning_branches():
     the same way and yields a dense tensor."""
 
     def f(p, x):
-        return etl.cond(
+        return evoxc.cond(
             p,
             lambda v: sparse.to_dense(sparse.negate(v)),
             lambda v: sparse.to_dense(sparse.add(v, v)),
             x,
         )
 
-    graph = etl.trace(f, etl.TensorSpec((), etl.bool_), coo_spec())
+    graph = evoxc.trace(f, evoxc.TensorSpec((), evoxc.bool_), coo_spec())
     d = dense_example()
 
     got_true = materialize(run_graph(graph, np.array(True), coo_example()))
@@ -104,14 +104,14 @@ def test_while_loop_sparse_carry_doubling():
 
     def f(c):
         def cond_fn(carry):
-            return etl.sparse.sum(carry) < _const(100.0, etl.float32)
+            return evoxc.sparse.sum(carry) < _const(100.0, evoxc.float32)
 
         def body_fn(carry):
             return sparse.add(carry, carry)
 
-        return etl.while_loop(cond_fn, body_fn, c)
+        return evoxc.while_loop(cond_fn, body_fn, c)
 
-    graph = etl.trace(f, coo_spec())
+    graph = evoxc.trace(f, coo_spec())
     out = run_graph(graph, coo_example())
 
     d = dense_example()
@@ -126,15 +126,15 @@ def test_while_loop_sparse_dense_tuple_carry():
     def f(c, w):
         def cond_fn(state):
             carry, _ = state
-            return etl.sparse.sum(carry) < _const(100.0, etl.float32)
+            return evoxc.sparse.sum(carry) < _const(100.0, evoxc.float32)
 
         def body_fn(state):
             carry, dense = state
-            return (sparse.add(carry, carry), etl.add(dense, dense))
+            return (sparse.add(carry, carry), evoxc.add(dense, dense))
 
-        return etl.while_loop(cond_fn, body_fn, (c, w))
+        return evoxc.while_loop(cond_fn, body_fn, (c, w))
 
-    graph = etl.trace(f, coo_spec(), etl.TensorSpec((3, 4), etl.float32))
+    graph = evoxc.trace(f, coo_spec(), evoxc.TensorSpec((3, 4), evoxc.float32))
     carry, dense = run_graph(graph, coo_example(), dense_example())
 
     d = dense_example()
@@ -155,14 +155,14 @@ def test_scan_sparse_carry_dense_xs():
     def f(c, xs):
         def body(carry, x):
             scaled = sparse.multiply_dense(carry, x)
-            return (sparse.add(carry, scaled), etl.sum(x))
+            return (sparse.add(carry, scaled), evoxc.sum(x))
 
-        return etl.scan(body, c, xs)
+        return evoxc.scan(body, c, xs)
 
     xs = np.array([0.5, 1.0, 2.0], dtype=np.float32).reshape(3, 1, 1) * np.ones(
         (1, 3, 4), dtype=np.float32
     )
-    graph = etl.trace(f, coo_spec(), etl.TensorSpec((3, 3, 4), etl.float32))
+    graph = evoxc.trace(f, coo_spec(), evoxc.TensorSpec((3, 3, 4), evoxc.float32))
     final_carry, stacked = run_graph(graph, coo_example(), xs)
 
     ref = dense_example().copy()
@@ -185,14 +185,14 @@ def test_scan_sparse_carry_init_is_traced_input():
         acc = sparse.multiply_dense(c, w)
 
         def body(carry, x):
-            return (sparse.add(carry, carry), etl.sum(x))
+            return (sparse.add(carry, carry), evoxc.sum(x))
 
-        return etl.scan(body, acc, xs)
+        return evoxc.scan(body, acc, xs)
 
     w = np.full((3, 4), 2.0, dtype=np.float32)
     xs = np.array([1.0, 2.0], dtype=np.float32)
-    graph = etl.trace(
-        f, coo_spec(), etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((2,), etl.float32)
+    graph = evoxc.trace(
+        f, coo_spec(), evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((2,), evoxc.float32)
     )
     final_carry, stacked = run_graph(graph, coo_example(), w, xs)
 
@@ -211,12 +211,12 @@ def test_scan_over_sparse_xs_raises():
     static dense_shape leaves, so the leaf check rejects them explicitly (the
     pinned message names the leaf kind)."""
     with pytest.raises(core.TraceError, match="must be a core.SymbolicTensor") as exc:
-        etl.trace(
-            lambda c, xs: etl.scan(lambda carry, x: (carry, x), c, xs),
+        evoxc.trace(
+            lambda c, xs: evoxc.scan(lambda carry, x: (carry, x), c, xs),
             coo_spec(),
             coo_spec(),
         )
-    assert "etl.scan: xs leaf 2" in str(exc.value)
+    assert "evoxc.scan: xs leaf 2" in str(exc.value)
     assert "got int" in str(exc.value)
 
 
@@ -230,14 +230,14 @@ def test_scan_sparse_y_stacking_raises():
     time: the flattened y contains static leaves, which are not stackable
     tensor outputs — an explicit TraceError (never a silent wrong stack)."""
     with pytest.raises(core.TraceError, match="y outputs must be SymbolicTensors") as exc:
-        etl.trace(
-            lambda c, xs: etl.scan(
+        evoxc.trace(
+            lambda c, xs: evoxc.scan(
                 lambda carry, x: (sparse.add(carry, carry), sparse.negate(carry)),
                 c,
                 xs,
             ),
             coo_spec(),
-            etl.TensorSpec((3,), etl.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
         )
     assert "no stacked tensor outputs" in str(exc.value)
 
@@ -254,14 +254,14 @@ def test_sparse_static_leaves_snapshot_through_while_loop():
 
     def f(c):
         def cond_fn(carry):
-            return etl.sparse.sum(carry) < _const(100.0, etl.float32)
+            return evoxc.sparse.sum(carry) < _const(100.0, evoxc.float32)
 
         def body_fn(carry):
             return sparse.add(carry, carry)
 
-        return etl.while_loop(cond_fn, body_fn, c)
+        return evoxc.while_loop(cond_fn, body_fn, c)
 
-    graph = etl.trace(f, coo_spec())
+    graph = evoxc.trace(f, coo_spec())
     statics = [record.value for record in graph.static_values]
     assert 3 in statics and 4 in statics
     assert np.dtype("float32") in statics

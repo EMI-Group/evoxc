@@ -1,19 +1,19 @@
 """Compiler-backend fallback for external kernels without host-dispatch.
 
-Pins the v1 fallback semantics documented in ``etl/backends/CONTEXT.md``
+Pins the v1 fallback semantics documented in ``evoxc/backends/CONTEXT.md``
 ("External kernels on compiler backends") and implemented by the shared
-``CompilerBackend.lower`` + ``etl.backends.inline.inline_portables``
+``CompilerBackend.lower`` + ``evoxc.backends.inline.inline_portables``
 (``inline_external_portables=True``): a backend WITHOUT host-dispatch (v1:
 xla/tvm — ``Capabilities.external_calls=False``) cannot execute
 ``external_call`` ops, so an op whose kernel name has a registered portable
-decomposition (``etl.external.get_portable``) is INLINED at ``lower()``
+decomposition (``evoxc.external.get_portable``) is INLINED at ``lower()``
 through the shared portable-splicing machinery — with a ``UserWarning`` —
 instead of raising.
 
 Pinned here (tvm is the in-env backend without host-dispatch; the fallback
 is backend-neutral shared code):
 
-* portable registered => ``etl.lower(..., backend="tvm")`` succeeds, the
+* portable registered => ``evoxc.lower(..., backend="tvm")`` succeeds, the
   payload is the ordinary StableHLO contract with the portable's body
   inlined (``stablehlo.multiply`` present, no ``external_call`` text), and a
   ``UserWarning`` naming the kernel fires.
@@ -49,20 +49,20 @@ pytest.importorskip("tvm")
 # never imported). Skip cleanly when tvm is present but jaxlib is not.
 pytest.importorskip("jaxlib")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
-# kernels + portables (plain numpy stand-ins; the portables are @etl.defn
+# kernels + portables (plain numpy stand-ins; the portables are @evoxc.defn
 # graph decompositions matching the kernels' outputs)
 # ---------------------------------------------------------------------------
 
 
-@etl.defn
+@evoxc.defn
 def _portable_double(x):
     return x * 2.0
 
 
-@etl.defn
+@evoxc.defn
 def _portable_inc(x):
     return x + 1.0
 
@@ -85,14 +85,14 @@ PORTABLES = {
 @pytest.fixture(scope="module", autouse=True)
 def _register_kernels():
     for name, kernel in KERNELS.items():
-        etl.register_external_kernel(name, kernel)
+        evoxc.register_external_kernel(name, kernel)
     for name, portable in PORTABLES.items():
-        etl.register_portable(name, portable)
+        evoxc.register_portable(name, portable)
     try:
         yield
     finally:
         for name in KERNELS:
-            etl.unregister_external_kernel(name)
+            evoxc.unregister_external_kernel(name)
 
 
 # ---------------------------------------------------------------------------
@@ -100,35 +100,35 @@ def _register_kernels():
 # ---------------------------------------------------------------------------
 
 X = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-SPEC = etl.TensorSpec((3,), etl.float32)
+SPEC = evoxc.TensorSpec((3,), evoxc.float32)
 
 
 def _single_call(x):
-    return etl.external_call("p_kernel_double", x, result=SPEC)
+    return evoxc.external_call("p_kernel_double", x, result=SPEC)
 
 
 def _two_calls_same_name(x):
-    y = etl.external_call("p_kernel_double", x, result=SPEC)
-    return etl.external_call("p_kernel_double", y, result=SPEC)
+    y = evoxc.external_call("p_kernel_double", x, result=SPEC)
+    return evoxc.external_call("p_kernel_double", y, result=SPEC)
 
 
 def _no_portable_call(x):
-    return etl.external_call("p_kernel_no_portable", x, result=SPEC)
+    return evoxc.external_call("p_kernel_no_portable", x, result=SPEC)
 
 
 def _wrong_count_call(x):
-    return etl.external_call("p_kernel_double", x, result=[SPEC, SPEC])
+    return evoxc.external_call("p_kernel_double", x, result=[SPEC, SPEC])
 
 
 def _wrong_dtype_call(x):
-    return etl.external_call(
-        "p_kernel_double", x, result=etl.TensorSpec((3,), etl.float64)
+    return evoxc.external_call(
+        "p_kernel_double", x, result=evoxc.TensorSpec((3,), evoxc.float64)
     )
 
 
 def _wrong_shape_call(x):
-    return etl.external_call(
-        "p_kernel_double", x, result=etl.TensorSpec((4,), etl.float32)
+    return evoxc.external_call(
+        "p_kernel_double", x, result=evoxc.TensorSpec((4,), evoxc.float32)
     )
 
 
@@ -141,9 +141,9 @@ def test_tvm_lower_inlines_portable_with_warning():
     """lower() succeeds for a portable-backed external_call: the portable's
     body is inlined into the exported StableHLO and a UserWarning naming the
     kernel explains the fallback (no host-dispatch on the tvm backend)."""
-    graph = etl.trace(_single_call, SPEC)
+    graph = evoxc.trace(_single_call, SPEC)
     with pytest.warns(UserWarning, match="p_kernel_double"):
-        lowered = etl.lower(graph, backend="tvm")
+        lowered = evoxc.lower(graph, backend="tvm")
     assert lowered.backend == "tvm"
     assert lowered.payload["format"] == "stablehlo"
     mlir = lowered.payload["mlir_text"]
@@ -154,9 +154,9 @@ def test_tvm_lower_inlines_portable_with_warning():
 def test_tvm_run_parity_with_numpy():
     """The inlined portable compiles + runs on tvm with numpy parity (the
     numpy reference dispatches the registered default-slot kernel)."""
-    exe = etl.build(_single_call, SPEC, backend="tvm")
-    got = etl.run(exe, etl.Tensor(X))
-    ref = etl.evaluate(_single_call, X)  # numpy backend: kernel dispatch
+    exe = evoxc.build(_single_call, SPEC, backend="tvm")
+    got = evoxc.run(exe, evoxc.Tensor(X))
+    ref = evoxc.evaluate(_single_call, X)  # numpy backend: kernel dispatch
     np.testing.assert_allclose(
         got.numpy(), ref.numpy(), rtol=1e-5, atol=1e-5
     )
@@ -175,11 +175,11 @@ def test_warning_once_for_two_identical_name_ops():
     once per op — the dedupe is the default filter, never per-op silence —
     and every record carries the SAME canonical message."""
     with pytest.warns(UserWarning, match="p_kernel_double"):
-        etl.lower(etl.trace(_two_calls_same_name, SPEC), backend="tvm")
+        evoxc.lower(evoxc.trace(_two_calls_same_name, SPEC), backend="tvm")
 
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("always")
-        etl.lower(etl.trace(_two_calls_same_name, SPEC), backend="tvm")
+        evoxc.lower(evoxc.trace(_two_calls_same_name, SPEC), backend="tvm")
     matching = [
         r for r in records
         if r.category is UserWarning and "p_kernel_double" in str(r.message)
@@ -189,7 +189,7 @@ def test_warning_once_for_two_identical_name_ops():
 
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("default")  # Python's default per-location dedupe
-        etl.lower(etl.trace(_two_calls_same_name, SPEC), backend="tvm")
+        evoxc.lower(evoxc.trace(_two_calls_same_name, SPEC), backend="tvm")
     matching = [
         r for r in records
         if r.category is UserWarning and "p_kernel_double" in str(r.message)
@@ -204,7 +204,7 @@ def test_warning_deduped_across_repeated_lower_calls():
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("default")
         for _ in range(2):
-            etl.lower(etl.trace(_single_call, SPEC), backend="tvm")
+            evoxc.lower(evoxc.trace(_single_call, SPEC), backend="tvm")
     matching = [
         r for r in records
         if r.category is UserWarning and "p_kernel_double" in str(r.message)
@@ -221,9 +221,9 @@ def test_tvm_rejects_without_portable():
     """An external_call WITHOUT a registered portable raises the upgraded
     BackendError naming the op, host-dispatch, the backend and the portable
     option — never a silent fallback."""
-    graph = etl.trace(_no_portable_call, SPEC)
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.lower(graph, backend="tvm")
+    graph = evoxc.trace(_no_portable_call, SPEC)
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.lower(graph, backend="tvm")
     msg = str(excinfo.value)
     assert "external_call" in msg
     assert "host-dispatch" in msg
@@ -247,9 +247,9 @@ def test_tvm_wrong_result_spec_validated(builder, needles):
     """A portable whose outputs disagree with the op's declared result specs
     (count/dtype/shape) is rejected at lower() by the shared output
     validation — never a silently accepted mismatch."""
-    graph = etl.trace(builder, SPEC)
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.lower(graph, backend="tvm")
+    graph = evoxc.trace(builder, SPEC)
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.lower(graph, backend="tvm")
     msg = str(excinfo.value)
     for needle in needles:
         assert needle in msg
@@ -265,7 +265,7 @@ def test_numpy_backend_dispatch_unchanged():
     no portable inlining, no fallback warning."""
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("always")
-        out = etl.evaluate(_single_call, X)
+        out = evoxc.evaluate(_single_call, X)
     assert np.array_equal(out.numpy(), X * 2.0)
     assert not [
         r for r in records

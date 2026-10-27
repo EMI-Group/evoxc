@@ -1,7 +1,7 @@
-"""Local-shape semantics of the six `etl.dist` collectives.
+"""Local-shape semantics of the six `evoxc.dist` collectives.
 
-Contract under test: `etl/dist/CONTEXT.md`, section "Local-shape semantics
-(worked examples)" + the shape rules in `etl/ir/inference.py`
+Contract under test: `evoxc/dist/CONTEXT.md`, section "Local-shape semantics
+(worked examples)" + the shape rules in `evoxc/ir/inference.py`
 (``infer_all_gather``, ``infer_reduce_scatter``, ``infer_all_to_all``,
 ``infer_identity``).
 
@@ -24,9 +24,9 @@ Both the IR result type (read off the built op's ``ValueType``) and the
 
 import pytest
 
-import etl
-import etl.dist as dist
-from etl import core
+import evoxc
+import evoxc.dist as dist
+from evoxc import core
 
 #: Collective frontend functions, keyed by contract name.
 _COLLECTIVES = {
@@ -60,13 +60,13 @@ def _trace_collective(fn, in_shape):
     """
     seen = []
 
-    @etl.defn
+    @evoxc.defn
     def traced(x):
         y = fn(x)
         seen.append(y)
         return y
 
-    graph = etl.trace(traced, core.TensorSpec(in_shape, core.float32))
+    graph = evoxc.trace(traced, core.TensorSpec(in_shape, core.float32))
     fn_ir = graph.module.functions[0]
     ops = fn_ir.entry_block.ops  # entry_block is a property → Block
     assert ops[-1].name == "return"

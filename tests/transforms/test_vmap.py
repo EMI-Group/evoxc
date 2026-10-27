@@ -1,6 +1,6 @@
-"""Tests for `etl.vmap` — transparent function-side sugar over `vectorize`.
+"""Tests for `evoxc.vmap` — transparent function-side sugar over `vectorize`.
 
-Contract under test (binding): `etl/transforms/CONTEXT.md` "The vmap ⇔
+Contract under test (binding): `evoxc/transforms/CONTEXT.md` "The vmap ⇔
 vectorize equivalence contract" and "out_axes semantics (v1)". `vmap` uses
 exactly the same batching machinery as `vectorize`: with `out_axes=0` both
 produce identical IR; given a callable/`Defn` it returns a `TransformCallable`
@@ -12,10 +12,10 @@ explicit staging only.
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl import ir
-from etl.transforms import TransformCallable
+import evoxc
+from evoxc import core
+from evoxc import ir
+from evoxc.transforms import TransformCallable
 
 
 # ---------------------------------------------------------------------------
@@ -25,11 +25,11 @@ from etl.transforms import TransformCallable
 
 def run_graph(graph, *args):
     """Explicit staging pipeline: lower → compile → load → run."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *args)
 
 
 def to_np(out):
-    """Unwrap `etl.run` structured outputs (bare Tensor or tuple) to numpy."""
+    """Unwrap `evoxc.run` structured outputs (bare Tensor or tuple) to numpy."""
     if isinstance(out, core.Tensor):
         return out.numpy()
     if isinstance(out, (tuple, list)):
@@ -60,9 +60,9 @@ def serialize(graph):
 
 
 def stacked_reference(fn, *rows):
-    """Run the UNVECTORIZED fn on each row via `etl.evaluate` and stack."""
+    """Run the UNVECTORIZED fn on each row via `evoxc.evaluate` and stack."""
     return np.stack(
-        [np.asarray(to_np(etl.evaluate(fn, *row))) for row in rows]
+        [np.asarray(to_np(evoxc.evaluate(fn, *row))) for row in rows]
     )
 
 
@@ -70,27 +70,27 @@ def stacked_reference(fn, *rows):
 
 
 def _add1(x):
-    return etl.add(x, 1.0)
+    return evoxc.add(x, 1.0)
 
 
 def _add2(x, y):
-    return etl.add(x, y)
+    return evoxc.add(x, y)
 
 
 def _mul2(x, y):
-    return etl.multiply(x, y)
+    return evoxc.multiply(x, y)
 
 
 def _row_sum(x):
-    return etl.sum(x, axes=(1,))
+    return evoxc.sum(x, axes=(1,))
 
 
 def _mixed(x, y):
-    return etl.multiply(etl.add(x, y), 2.0)
+    return evoxc.multiply(evoxc.add(x, y), 2.0)
 
 
 def _two_outputs(x):
-    return (etl.add(x, 1.0), etl.multiply(x, 2.0))
+    return (evoxc.add(x, 1.0), evoxc.multiply(x, 2.0))
 
 
 # ---------------------------------------------------------------------------
@@ -99,38 +99,38 @@ def _two_outputs(x):
 
 
 def test_vmap_fn_returns_transformcallable_building_graph():
-    tf = etl.vmap(_add1)
+    tf = evoxc.vmap(_add1)
     assert isinstance(tf, TransformCallable)
     assert tf.kind == "vmap"
     assert callable(tf)
 
-    graph = tf(etl.TensorSpec((4, 3), etl.float32))
-    assert isinstance(graph, etl.Graph)  # transforms never execute
+    graph = tf(evoxc.TensorSpec((4, 3), evoxc.float32))
+    assert isinstance(graph, evoxc.Graph)  # transforms never execute
     graph.verify()
 
 
 def test_vmap_defn_returns_transformcallable():
-    @etl.defn
+    @evoxc.defn
     def d(x):
-        return etl.add(x, 1.0)
+        return evoxc.add(x, 1.0)
 
-    tf = etl.vmap(d)
+    tf = evoxc.vmap(d)
     assert tf.kind == "vmap"
-    graph = tf(etl.TensorSpec((4, 3), etl.float32))
-    assert isinstance(graph, etl.Graph)
+    graph = tf(evoxc.TensorSpec((4, 3), evoxc.float32))
+    assert isinstance(graph, evoxc.Graph)
     graph.verify()
 
 
 def test_vmap_graph_returns_graph_directly():
-    graph = etl.trace(_add1, etl.TensorSpec((3,), etl.float32))
-    result = etl.vmap(graph, 0)
-    assert isinstance(result, etl.Graph)
+    graph = evoxc.trace(_add1, evoxc.TensorSpec((3,), evoxc.float32))
+    result = evoxc.vmap(graph, 0)
+    assert isinstance(result, evoxc.Graph)
 
 
 def test_vmap_rejects_concrete_tensors():
-    tf = etl.vmap(_add1)
+    tf = evoxc.vmap(_add1)
     with pytest.raises(core.TraceError, match="never execute"):
-        tf(etl.zeros((4, 3)))
+        tf(evoxc.zeros((4, 3)))
 
 
 # ---------------------------------------------------------------------------
@@ -143,27 +143,27 @@ def test_vmap_rejects_concrete_tensors():
     [
         (
             _add1,
-            (etl.TensorSpec((3,), etl.float32),),
-            (etl.TensorSpec((4, 3), etl.float32),),
+            (evoxc.TensorSpec((3,), evoxc.float32),),
+            (evoxc.TensorSpec((4, 3), evoxc.float32),),
             0,
         ),
         (
             _add2,
-            (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
-            (etl.TensorSpec((4, 3, 4), etl.float32), etl.TensorSpec((4, 3, 4), etl.float32)),
+            (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
+            (evoxc.TensorSpec((4, 3, 4), evoxc.float32), evoxc.TensorSpec((4, 3, 4), evoxc.float32)),
             (0, 0),
         ),
         (
             _mixed,
-            (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
-            (etl.TensorSpec((4, 3, 4), etl.float32), etl.TensorSpec((4, 3, 4), etl.float32)),
+            (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
+            (evoxc.TensorSpec((4, 3, 4), evoxc.float32), evoxc.TensorSpec((4, 3, 4), evoxc.float32)),
             (0, 0),
         ),
         (
             # one mapped + one unmapped argument
             _add2,
-            (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
-            (etl.TensorSpec((4, 3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
+            (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
+            (evoxc.TensorSpec((4, 3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
             (0, None),
         ),
     ],
@@ -174,8 +174,8 @@ def test_vmap_fn_equiv_vectorize_trace(fn, specs, batched_specs, in_axes):
     The stripped specs drop the leading mapped dim (dtype/name preserved);
     same machinery ⇒ identical IR, compared via module serialization.
     """
-    g_vmap = etl.vmap(fn, in_axes=in_axes)(*batched_specs)
-    g_vec = etl.vectorize(etl.trace(fn, *specs), in_axes)
+    g_vmap = evoxc.vmap(fn, in_axes=in_axes)(*batched_specs)
+    g_vec = evoxc.vectorize(evoxc.trace(fn, *specs), in_axes)
     assert serialize(g_vmap) == serialize(g_vec)
     assert ir.pretty_print(g_vmap.module) == ir.pretty_print(g_vec.module)
 
@@ -183,24 +183,24 @@ def test_vmap_fn_equiv_vectorize_trace(fn, specs, batched_specs, in_axes):
 @pytest.mark.parametrize(
     "fn, specs, in_axes",
     [
-        (_add1, (etl.TensorSpec((3, 4), etl.float32),), 0),
+        (_add1, (evoxc.TensorSpec((3, 4), evoxc.float32),), 0),
         (
             _add2,
-            (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
+            (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
             (0, 0),
         ),
         (
             _row_sum,
-            (etl.TensorSpec((3, 4), etl.float32),),
+            (evoxc.TensorSpec((3, 4), evoxc.float32),),
             0,
         ),
     ],
 )
 def test_vmap_graph_equiv_vectorize_graph(fn, specs, in_axes):
     """vmap(graph, in_axes, out_axes=0) ≡ vectorize(graph, in_axes)."""
-    graph = etl.trace(fn, *specs)
-    g_vmap = etl.vmap(graph, in_axes, 0)
-    g_vec = etl.vectorize(etl.trace(fn, *specs), in_axes)
+    graph = evoxc.trace(fn, *specs)
+    g_vmap = evoxc.vmap(graph, in_axes, 0)
+    g_vec = evoxc.vectorize(evoxc.trace(fn, *specs), in_axes)
     assert serialize(g_vmap) == serialize(g_vec)
     assert ir.pretty_print(g_vmap.module) == ir.pretty_print(g_vec.module)
     # out_axes=0 adds no extra op at all.
@@ -215,15 +215,15 @@ def test_vmap_graph_equiv_vectorize_graph(fn, specs, in_axes):
 @pytest.mark.parametrize(
     "fn, specs, batched_specs, in_axes, tol",
     [
-        (_add1, (etl.TensorSpec((3,), etl.float32),), (etl.TensorSpec((5, 3), etl.float32),), 0, 1e-5),
-        (_add1, (etl.TensorSpec((3,), etl.float64),), (etl.TensorSpec((5, 3), etl.float64),), 0, 1e-7),
-        (_row_sum, (etl.TensorSpec((3, 4), etl.float32),), (etl.TensorSpec((5, 3, 4), etl.float32),), 0, 1e-5),
-        (_mul2, (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
-         (etl.TensorSpec((5, 3, 4), etl.float32), etl.TensorSpec((5, 3, 4), etl.float32)), (0, 0), 1e-5),
+        (_add1, (evoxc.TensorSpec((3,), evoxc.float32),), (evoxc.TensorSpec((5, 3), evoxc.float32),), 0, 1e-5),
+        (_add1, (evoxc.TensorSpec((3,), evoxc.float64),), (evoxc.TensorSpec((5, 3), evoxc.float64),), 0, 1e-7),
+        (_row_sum, (evoxc.TensorSpec((3, 4), evoxc.float32),), (evoxc.TensorSpec((5, 3, 4), evoxc.float32),), 0, 1e-5),
+        (_mul2, (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
+         (evoxc.TensorSpec((5, 3, 4), evoxc.float32), evoxc.TensorSpec((5, 3, 4), evoxc.float32)), (0, 0), 1e-5),
     ],
 )
 def test_vmap_numerics(fn, specs, batched_specs, in_axes, tol):
-    graph = etl.vmap(fn, in_axes=in_axes)(*batched_specs)
+    graph = evoxc.vmap(fn, in_axes=in_axes)(*batched_specs)
     rng = np.random.default_rng(0)
     arrays = [
         rng.standard_normal(spec.shape).astype(spec.dtype) for spec in batched_specs
@@ -235,7 +235,7 @@ def test_vmap_numerics(fn, specs, batched_specs, in_axes, tol):
 
 def test_vmap_default_in_axes_and_unmapped_arg_broadcast():
     # default in_axes=0 applies to the single tensor arg.
-    graph = etl.vmap(_add1)(etl.TensorSpec((4, 3), etl.float32))
+    graph = evoxc.vmap(_add1)(evoxc.TensorSpec((4, 3), evoxc.float32))
     x = np.random.default_rng(1).standard_normal((4, 3)).astype(np.float32)
     out = np.asarray(to_np(run_graph(graph, x)))
     ref = stacked_reference(_add1, *zip(x))
@@ -243,13 +243,13 @@ def test_vmap_default_in_axes_and_unmapped_arg_broadcast():
 
     # in_axes=None leaves an argument unbatched: it keeps its shape and is
     # broadcast against the mapped rows.
-    graph = etl.vmap(_mul2, in_axes=(0, None))(
-        etl.TensorSpec((4, 3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)
+    graph = evoxc.vmap(_mul2, in_axes=(0, None))(
+        evoxc.TensorSpec((4, 3, 4), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)
     )
     xb = np.random.default_rng(2).standard_normal((4, 3, 4)).astype(np.float32)
     y = np.random.default_rng(3).standard_normal((3, 4)).astype(np.float32)
     out = np.asarray(to_np(run_graph(graph, xb, y)))
-    ref = np.stack([to_np(etl.evaluate(_mul2, xb[i], y)) for i in range(4)])
+    ref = np.stack([to_np(evoxc.evaluate(_mul2, xb[i], y)) for i in range(4)])
     np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
 
 
@@ -263,13 +263,13 @@ def test_vmap_traces_fn_exactly_once_per_call():
 
     def counted(x):
         count["n"] += 1
-        return etl.add(x, 1.0)
+        return evoxc.add(x, 1.0)
 
-    tf = etl.vmap(counted)
-    g_first = tf(etl.TensorSpec((4, 3), etl.float32))
+    tf = evoxc.vmap(counted)
+    g_first = tf(evoxc.TensorSpec((4, 3), evoxc.float32))
     assert count["n"] == 1
 
-    g_second = tf(etl.TensorSpec((4, 3), etl.float32))
+    g_second = tf(evoxc.TensorSpec((4, 3), evoxc.float32))
     assert count["n"] == 2
     assert g_second is not g_first  # fresh graph per call
     assert serialize(g_first) == serialize(g_second)
@@ -283,17 +283,17 @@ def test_vmap_traces_fn_exactly_once_per_call():
 def test_out_axes_none_requires_unmapped_output():
     # `_add1`'s output is mapped → out_axes=None must fail (a batch axis is
     # never silently dropped).
-    tf = etl.vmap(_add1, out_axes=None)
+    tf = evoxc.vmap(_add1, out_axes=None)
     with pytest.raises(core.TransformError, match="never silently dropped"):
-        tf(etl.TensorSpec((4, 3), etl.float32))
+        tf(evoxc.TensorSpec((4, 3), evoxc.float32))
 
 
 def test_out_axes_none_with_unmapped_output():
     def depends_only_on_unmapped(x, y):
-        return etl.add(y, 1.0)
+        return evoxc.add(y, 1.0)
 
-    tf = etl.vmap(depends_only_on_unmapped, in_axes=(0, None), out_axes=None)
-    graph = tf(etl.TensorSpec((4, 3), etl.float32), etl.TensorSpec((3,), etl.float32))
+    tf = evoxc.vmap(depends_only_on_unmapped, in_axes=(0, None), out_axes=None)
+    graph = tf(evoxc.TensorSpec((4, 3), evoxc.float32), evoxc.TensorSpec((3,), evoxc.float32))
 
     x = np.random.default_rng(3).standard_normal((4, 3)).astype(np.float32)
     y = np.random.default_rng(4).standard_normal((3,)).astype(np.float32)
@@ -304,10 +304,10 @@ def test_out_axes_none_with_unmapped_output():
 
 def test_out_axes_zero_with_unmapped_output_inserts_size_one_axis():
     def depends_only_on_unmapped(x, y):
-        return etl.add(y, 1.0)
+        return evoxc.add(y, 1.0)
 
-    graph = etl.vmap(depends_only_on_unmapped, in_axes=(0, None))(
-        etl.TensorSpec((4, 3), etl.float32), etl.TensorSpec((3,), etl.float32)
+    graph = evoxc.vmap(depends_only_on_unmapped, in_axes=(0, None))(
+        evoxc.TensorSpec((4, 3), evoxc.float32), evoxc.TensorSpec((3,), evoxc.float32)
     )
     # out_axes=0 on an unmapped output: an explicitly requested size-one axis
     # is inserted at 0 via an ordinary reshape op.
@@ -325,9 +325,9 @@ def test_out_axes_zero_with_mapped_scalar_rows_keeps_batch():
     # Per-row scalar (keepdims=True → row shape (1,)) stays mapped: the
     # batch axis is kept leading, no rearrangement op is added.
     def sum_keepdims(x):
-        return etl.sum(x, keepdims=True)
+        return evoxc.sum(x, keepdims=True)
 
-    graph = etl.vmap(sum_keepdims)(etl.TensorSpec((4, 3), etl.float32))
+    graph = evoxc.vmap(sum_keepdims)(evoxc.TensorSpec((4, 3), evoxc.float32))
     assert "reshape" not in all_op_names(graph)
 
     x = np.random.default_rng(7).standard_normal((4, 3)).astype(np.float32)
@@ -337,21 +337,21 @@ def test_out_axes_zero_with_mapped_scalar_rows_keeps_batch():
 
 
 def test_out_axes_structure_mismatch():
-    graph = etl.trace(_two_outputs, etl.TensorSpec((3,), etl.float32))
+    graph = evoxc.trace(_two_outputs, evoxc.TensorSpec((3,), evoxc.float32))
     with pytest.raises(core.TransformError, match="does not match"):
-        etl.vmap(graph, 0, (0,))
+        evoxc.vmap(graph, 0, (0,))
 
 
 def test_bare_out_axes_with_multiple_tensor_outputs():
-    graph = etl.trace(_two_outputs, etl.TensorSpec((3,), etl.float32))
+    graph = evoxc.trace(_two_outputs, evoxc.TensorSpec((3,), evoxc.float32))
     with pytest.raises(core.TransformError, match="at most ONE tensor output"):
-        etl.vmap(graph, 0, 0)
+        evoxc.vmap(graph, 0, 0)
 
 
 def test_out_axes_non_zero_is_deferred():
-    tf = etl.vmap(_add1, out_axes=1)
+    tf = evoxc.vmap(_add1, out_axes=1)
     with pytest.raises(core.TransformError, match="leading axis"):
-        tf(etl.TensorSpec((4, 3), etl.float32))
+        tf(evoxc.TensorSpec((4, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -360,21 +360,21 @@ def test_out_axes_non_zero_is_deferred():
 
 
 def test_in_axes_non_zero_is_deferred():
-    tf = etl.vmap(_add1, in_axes=1)
+    tf = evoxc.vmap(_add1, in_axes=1)
     with pytest.raises(core.TransformError, match="leading axis"):
-        tf(etl.TensorSpec((4, 3), etl.float32))
+        tf(evoxc.TensorSpec((4, 3), evoxc.float32))
 
 
 def test_bare_in_axes_with_multiple_tensor_specs():
-    tf = etl.vmap(_add2)  # default in_axes=0 is bare → ambiguous with 2 args
+    tf = evoxc.vmap(_add2)  # default in_axes=0 is bare → ambiguous with 2 args
     with pytest.raises(core.TransformError, match="exactly ONE tensor spec"):
-        tf(etl.TensorSpec((4, 3), etl.float32), etl.TensorSpec((4, 3), etl.float32))
+        tf(evoxc.TensorSpec((4, 3), evoxc.float32), evoxc.TensorSpec((4, 3), evoxc.float32))
 
 
 def test_in_axes_structure_mismatch():
-    tf = etl.vmap(_add2, in_axes=(0,))
+    tf = evoxc.vmap(_add2, in_axes=(0,))
     with pytest.raises(core.TransformError, match="does not match"):
-        tf(etl.TensorSpec((4, 3), etl.float32), etl.TensorSpec((4, 3), etl.float32))
+        tf(evoxc.TensorSpec((4, 3), evoxc.float32), evoxc.TensorSpec((4, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -384,15 +384,15 @@ def test_in_axes_structure_mismatch():
 
 def test_vmap_of_cond_raises_transformerror():
     def cond_fn(x):
-        pred = etl.sum(x) > 0.0
-        return etl.cond(pred, lambda: x, lambda: -x)
+        pred = evoxc.sum(x) > 0.0
+        return evoxc.cond(pred, lambda: x, lambda: -x)
 
-    tf = etl.vmap(cond_fn)
+    tf = evoxc.vmap(cond_fn)
     with pytest.raises(
         core.TransformError,
         match=r"cannot batch op 'if'.*region-bearing control-flow",
     ):
-        tf(etl.TensorSpec((4, 3), etl.float32))
+        tf(evoxc.TensorSpec((4, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -401,15 +401,15 @@ def test_vmap_of_cond_raises_transformerror():
 #
 # `external_call` ops resolve batching rules under the namespaced
 # `external:<name>` key (mirroring `block:<name>` for block calls), registered
-# through the handle returned by `etl.register_external_kernel`. Without an
+# through the handle returned by `evoxc.register_external_kernel`. Without an
 # explicit rule, a registered portable decomposition (`@handle.portable`) is
 # the fallback: vmap/vectorize re-trace it over the batched operands. Names
 # are `tx_`-prefixed to stay unique in the process-wide registries.
 
 
 def _sym(value):
-    """Wrap an ir.Value as a SymbolicTensor so etl.ops can build on it."""
-    return etl.SymbolicTensor(
+    """Wrap an ir.Value as a SymbolicTensor so evoxc.ops can build on it."""
+    return evoxc.SymbolicTensor(
         value=value, dtype=value.type.dtype, shape=value.type.shape
     )
 
@@ -423,20 +423,20 @@ def _ext_double(x):
     return 2 * x
 
 
-ext_double = etl.register_external_kernel("tx_ext_double", _ext_double)
+ext_double = evoxc.register_external_kernel("tx_ext_double", _ext_double)
 
 
 @ext_double.batching_rule
 def _ext_double_batch(op, operands, axes):
     """Explicit batching rule: batched rows of 2x."""
-    y = etl.multiply(_sym(operands[0]), 2)
+    y = evoxc.multiply(_sym(operands[0]), 2)
     return (y.value,), (axes[0],)
 
 
-@etl.defn
+@evoxc.defn
 def _ext_double_fn(x):
-    return etl.external_call(
-        "tx_ext_double", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.external_call(
+        "tx_ext_double", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
@@ -449,7 +449,7 @@ def _batched_ext_rows():
 def test_vmap_external_call_explicit_batching_rule():
     """vmap over a graph containing external_call with an explicit rule
     (external:<name> key) == 2x on every row; the rule replaces the op."""
-    graph = etl.vmap(_ext_double_fn)(etl.TensorSpec((EXT_BATCH, EXT_DIM), etl.float32))
+    graph = evoxc.vmap(_ext_double_fn)(evoxc.TensorSpec((EXT_BATCH, EXT_DIM), evoxc.float32))
     graph.verify()
     x = _batched_ext_rows()
     out = np.asarray(to_np(run_graph(graph, x)))
@@ -460,8 +460,8 @@ def test_vmap_external_call_explicit_batching_rule():
 def test_vectorize_external_call_graph_form_explicit_rule():
     """vectorize on the traced graph (not the callable) uses the same
     external:<name> rule channel."""
-    graph = etl.trace(_ext_double_fn, etl.TensorSpec((EXT_DIM,), etl.float32))
-    vec = etl.vectorize(graph, 0)
+    graph = evoxc.trace(_ext_double_fn, evoxc.TensorSpec((EXT_DIM,), evoxc.float32))
+    vec = evoxc.vectorize(graph, 0)
     x = _batched_ext_rows()
     out = np.asarray(to_np(run_graph(vec, x)))
     np.testing.assert_allclose(out, 2 * x, rtol=1e-6)
@@ -473,28 +473,28 @@ def _ext_swish(x):
     return s * x
 
 
-ext_swish = etl.register_external_kernel("tx_ext_swish", _ext_swish)
+ext_swish = evoxc.register_external_kernel("tx_ext_swish", _ext_swish)
 
 
 @ext_swish.portable
-@etl.defn
+@evoxc.defn
 def _ext_swish_portable(
-    x: etl.TensorSpec((EXT_DIM,), etl.float32),
-) -> etl.TensorSpec((EXT_DIM,), etl.float32):
-    return etl.sigmoid(x) * x
+    x: evoxc.TensorSpec((EXT_DIM,), evoxc.float32),
+) -> evoxc.TensorSpec((EXT_DIM,), evoxc.float32):
+    return evoxc.sigmoid(x) * x
 
 
-@etl.defn
+@evoxc.defn
 def _ext_swish_fn(x):
-    return etl.external_call(
-        "tx_ext_swish", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.external_call(
+        "tx_ext_swish", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
 def test_vmap_external_call_portable_fallback():
     """No explicit rule: vmap falls back to inlining the registered portable
     decomposition over the batched operands — equals the per-row kernel."""
-    graph = etl.vmap(_ext_swish_fn)(etl.TensorSpec((EXT_BATCH, EXT_DIM), etl.float32))
+    graph = evoxc.vmap(_ext_swish_fn)(evoxc.TensorSpec((EXT_BATCH, EXT_DIM), evoxc.float32))
     graph.verify()
     x = _batched_ext_rows()
     out = np.asarray(to_np(run_graph(graph, x)))
@@ -508,28 +508,28 @@ def _ext_win(x):
     return x
 
 
-ext_win = etl.register_external_kernel("tx_ext_win", _ext_win)
+ext_win = evoxc.register_external_kernel("tx_ext_win", _ext_win)
 
 
 @ext_win.portable
-@etl.defn
+@evoxc.defn
 def _ext_win_portable(
-    x: etl.TensorSpec((EXT_DIM,), etl.float32),
-) -> etl.TensorSpec((EXT_DIM,), etl.float32):
-    return etl.multiply(x, 2)
+    x: evoxc.TensorSpec((EXT_DIM,), evoxc.float32),
+) -> evoxc.TensorSpec((EXT_DIM,), evoxc.float32):
+    return evoxc.multiply(x, 2)
 
 
 @ext_win.batching_rule
 def _ext_win_batch(op, operands, axes):
     """Registered AFTER the portable: must overwrite the fallback (3x)."""
-    y = etl.multiply(_sym(operands[0]), 3)
+    y = evoxc.multiply(_sym(operands[0]), 3)
     return (y.value,), (axes[0],)
 
 
-@etl.defn
+@evoxc.defn
 def _ext_win_fn(x):
-    return etl.external_call(
-        "tx_ext_win", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    return evoxc.external_call(
+        "tx_ext_win", x, result=evoxc.TensorSpec((EXT_DIM,), evoxc.float32)
     )
 
 
@@ -537,17 +537,17 @@ def test_external_explicit_batching_rule_wins_over_portable():
     """A rule registered AFTER the portable decomposition overwrites the
     fallback: the registry lookup returns the explicit rule and vmap uses it
     (3x) instead of the portable's 2x."""
-    from etl import transforms
+    from evoxc import transforms
 
     assert transforms.batching_rules["external:tx_ext_win"] is _ext_win_batch
     # The portable itself computes 2x (the fallback semantics it replaced).
     x4 = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     port_out = run_graph(
-        etl.trace(_ext_win_portable, etl.TensorSpec((EXT_DIM,), etl.float32)), x4
+        evoxc.trace(_ext_win_portable, evoxc.TensorSpec((EXT_DIM,), evoxc.float32)), x4
     )
     np.testing.assert_allclose(to_np(port_out), 2 * x4, rtol=1e-6)
 
     x = _batched_ext_rows()
-    graph = etl.vmap(_ext_win_fn)(etl.TensorSpec((EXT_BATCH, EXT_DIM), etl.float32))
+    graph = evoxc.vmap(_ext_win_fn)(evoxc.TensorSpec((EXT_BATCH, EXT_DIM), evoxc.float32))
     out = np.asarray(to_np(run_graph(graph, x)))
     np.testing.assert_allclose(out, 3 * x, rtol=1e-6)

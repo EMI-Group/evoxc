@@ -2,9 +2,9 @@
 evox-style iterative stateful workloads (DE/PSO), validated at DE scale
 (state f32 (4096, 50), ~8 iree dispatches per step).
 
-Pattern (explicit-placement model — see etl/core/tensor.py ``Tensor.to`` /
-``.numpy`` and the run-boundary contract in etl/pipeline.py; measured
-numbers in etl/backends/adapters/CONTEXT.md "Iterative stateful
+Pattern (explicit-placement model — see evoxc/core/tensor.py ``Tensor.to`` /
+``.numpy`` and the run-boundary contract in evoxc/pipeline.py; measured
+numbers in evoxc/backends/adapters/CONTEXT.md "Iterative stateful
 workloads"): build the step graph ONCE (target_backends=["cuda"],
 opt_level="O3"), place the INITIAL host state + key on the device ONCE via
 the explicit transfer API (``Tensor.to(cuda_device)`` — the iree
@@ -48,34 +48,34 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # DE-shaped step graph (synthetic: random parents + mutation + crossover)
 # ---------------------------------------------------------------------------
 N, D = 4096, 50
 SPECS = (
-    etl.TensorSpec((), etl.int64),          # key (rank-0 i64, splitmix64)
-    etl.TensorSpec((N, D), etl.float32),    # state
+    evoxc.TensorSpec((), evoxc.int64),          # key (rank-0 i64, splitmix64)
+    evoxc.TensorSpec((N, D), evoxc.float32),    # state
 )
 
 
-@etl.defn
+@evoxc.defn
 def de_step(key, state):
     # Three split chains: parents / noise / crossover + next-step key.
-    k_a, k_b = etl.random.split(key)
-    k_p, k_noise = etl.random.split(k_a)
-    k_u, k_next = etl.random.split(k_b)
-    i1 = etl.random.randint(k_p, (N,), 0, N)
-    i2 = etl.random.randint(k_p, (N,), 0, N)
-    i3 = etl.random.randint(k_p, (N,), 0, N)
-    p1 = etl.gather(state, i1, axis=0)
-    p2 = etl.gather(state, i2, axis=0)
-    p3 = etl.gather(state, i3, axis=0)
-    noise = etl.random.normal(k_noise, (N, D), mean=0.0, std=0.5)
-    mutant = etl.clamp(p1 + 0.5 * (p2 - p3) + noise, -1e3, 1e3)
-    cr = etl.random.uniform(k_u, (N, D), low=0.0, high=1.0)
-    trial = etl.select(cr < 0.9, mutant, state)  # ~10% greedy crossover
+    k_a, k_b = evoxc.random.split(key)
+    k_p, k_noise = evoxc.random.split(k_a)
+    k_u, k_next = evoxc.random.split(k_b)
+    i1 = evoxc.random.randint(k_p, (N,), 0, N)
+    i2 = evoxc.random.randint(k_p, (N,), 0, N)
+    i3 = evoxc.random.randint(k_p, (N,), 0, N)
+    p1 = evoxc.gather(state, i1, axis=0)
+    p2 = evoxc.gather(state, i2, axis=0)
+    p3 = evoxc.gather(state, i3, axis=0)
+    noise = evoxc.random.normal(k_noise, (N, D), mean=0.0, std=0.5)
+    mutant = evoxc.clamp(p1 + 0.5 * (p2 - p3) + noise, -1e3, 1e3)
+    cr = evoxc.random.uniform(k_u, (N, D), low=0.0, high=1.0)
+    trial = evoxc.select(cr < 0.9, mutant, state)  # ~10% greedy crossover
     return trial, k_next
 
 
@@ -125,12 +125,12 @@ def cuda_device():
         rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
-    return etl.core.Device("cuda", idx)
+    return evoxc.core.Device("cuda", idx)
 
 
 @pytest.fixture(scope="module")
 def exe(cuda_device):
-    return etl.build(de_step, *SPECS, backend="iree", device=cuda_device,
+    return evoxc.build(de_step, *SPECS, backend="iree", device=cuda_device,
                      target_backends=["cuda"], opt_level="O3")
 
 
@@ -141,8 +141,8 @@ def _np(v):
     # on llvm-cpu too: .to() is a same-device no-op returning self and
     # .numpy() stays lazy (nothing else in this file runs llvm-cpu).
     # Plain np.asarray on a Tensor would yield an object scalar.
-    if isinstance(v, etl.Tensor):
-        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
+    if isinstance(v, evoxc.Tensor):
+        return np.asarray(v.to(evoxc.core.Device("cpu", 0)).numpy())
     return np.asarray(v)
 
 
@@ -152,7 +152,7 @@ def _device_loop(exe, steps, key, state):
     times = []
     for _ in range(steps):
         t0 = time.perf_counter()
-        state, key = etl.run(exe, key, state)
+        state, key = evoxc.run(exe, key, state)
         times.append((time.perf_counter() - t0) * 1e3)
     return times, key, state
 
@@ -163,22 +163,22 @@ def _device_loop(exe, steps, key, state):
 def test_loop_bit_deterministic_and_device_resident(exe, cuda_device):
     # The run boundary never transfers: initial host values are placed on
     # the device ONCE (explicit .to() upload) before each loop starts.
-    key_a = etl.core.Tensor(_new_key(7)).to(cuda_device)
-    state_a = etl.core.Tensor(_new_state(0)).to(cuda_device)
-    key_b = etl.core.Tensor(_new_key(7)).to(cuda_device)
-    state_b = etl.core.Tensor(_new_state(0)).to(cuda_device)
+    key_a = evoxc.core.Tensor(_new_key(7)).to(cuda_device)
+    state_a = evoxc.core.Tensor(_new_state(0)).to(cuda_device)
+    key_b = evoxc.core.Tensor(_new_key(7)).to(cuda_device)
+    state_b = evoxc.core.Tensor(_new_state(0)).to(cuda_device)
     seq_a = []
     for _ in range(12):
-        state_a, key_a = etl.run(exe, key_a, state_a)
+        state_a, key_a = evoxc.run(exe, key_a, state_a)
         seq_a.append((_np(state_a), _np(key_a)))
         # every step's outputs are payload-backed device tensors on the exe
-        assert isinstance(state_a, etl.Tensor)
+        assert isinstance(state_a, evoxc.Tensor)
         assert not isinstance(state_a.data, np.ndarray)
         assert state_a.device == cuda_device
         assert state_a.shape == (N, D) and state_a.dtype == np.dtype("float32")
         assert key_a.shape == () and key_a.dtype == np.dtype("int64")
     for _ in range(12):
-        state_b, key_b = etl.run(exe, key_b, state_b)
+        state_b, key_b = evoxc.run(exe, key_b, state_b)
         s_a, k_a = seq_a.pop(0)
         assert np.array_equal(_np(state_b), s_a)  # bit-deterministic
         assert np.array_equal(_np(key_b), k_a)
@@ -192,14 +192,14 @@ def test_first_step_matches_numpy_backend_reference(exe, cuda_device):
     # placed on the device via the explicit .to() upload; the numpy
     # reference takes the plain host arrays.
     key, state = _new_key(7), _new_state(0)
-    cuda_out = etl.run(
+    cuda_out = evoxc.run(
         exe,
-        etl.core.Tensor(key).to(cuda_device),
-        etl.core.Tensor(state).to(cuda_device),
+        evoxc.core.Tensor(key).to(cuda_device),
+        evoxc.core.Tensor(state).to(cuda_device),
     )
-    np_out = etl.evaluate(de_step, key, state, backend="numpy")
-    for c, n in zip(etl.tree_leaves(etl.tree_map(_np, cuda_out)),
-                    etl.tree_leaves(etl.tree_map(_np, np_out))):
+    np_out = evoxc.evaluate(de_step, key, state, backend="numpy")
+    for c, n in zip(evoxc.tree_leaves(evoxc.tree_map(_np, cuda_out)),
+                    evoxc.tree_leaves(evoxc.tree_map(_np, np_out))):
         assert c.shape == n.shape
         assert np.allclose(c, n, rtol=1e-4, atol=1e-4), f"{c} vs {n}"
 
@@ -213,8 +213,8 @@ def test_zero_asdevicearray_from_first_call(exe, cuda_device, monkeypatch):
     # Place the initial host values BEFORE the counting wrapper goes up
     # (placement is an explicit one-shot upload, not a run step); every
     # run call below is then a pure same-device pass-through.
-    key = etl.core.Tensor(_new_key(7)).to(cuda_device)
-    state = etl.core.Tensor(_new_state(1)).to(cuda_device)
+    key = evoxc.core.Tensor(_new_key(7)).to(cuda_device)
+    state = evoxc.core.Tensor(_new_state(1)).to(cuda_device)
 
     calls = []
 
@@ -225,7 +225,7 @@ def test_zero_asdevicearray_from_first_call(exe, cuda_device, monkeypatch):
     real = rt.asdevicearray
     monkeypatch.setattr(rt, "asdevicearray", _counting)
     for _ in range(21):  # steps 1..21: pure pass-through, first included
-        state, key = etl.run(exe, key, state)
+        state, key = evoxc.run(exe, key, state)
     assert len(calls) == 0  # ZERO asdevicearray on EVERY step incl. the first
 
 
@@ -242,12 +242,12 @@ def test_same_device_loop_beats_host_restaging_and_stays_flat(exe, cuda_device):
     # the run. Only state is re-uploaded: the key was placed once up front
     # and passes through device-resident (mirrors the old loop's shape).
     fresh_states = [_new_state(2) for _ in range(24)]
-    key_h = etl.core.Tensor(_new_key(7)).to(cuda_device)
+    key_h = evoxc.core.Tensor(_new_key(7)).to(cuda_device)
     h_times = []
     for i in range(24):
         t0 = time.perf_counter()
-        state_h, key_h = etl.run(
-            exe, key_h, etl.core.Tensor(fresh_states[i]).to(cuda_device)
+        state_h, key_h = evoxc.run(
+            exe, key_h, evoxc.core.Tensor(fresh_states[i]).to(cuda_device)
         )
         h_times.append((time.perf_counter() - t0) * 1e3)
     h_med = _med(h_times)
@@ -255,8 +255,8 @@ def test_same_device_loop_beats_host_restaging_and_stays_flat(exe, cuda_device):
     # Same-device loop: initial values placed once up front, then 200
     # steps feeding device outputs back (pure pass-through — the FIRST run
     # included, since the initial .to() placement already happened above).
-    key_d = etl.core.Tensor(_new_key(7)).to(cuda_device)
-    state_d = etl.core.Tensor(_new_state(3)).to(cuda_device)
+    key_d = evoxc.core.Tensor(_new_key(7)).to(cuda_device)
+    state_d = evoxc.core.Tensor(_new_state(3)).to(cuda_device)
     d_times, _, _ = _device_loop(exe, 200, key_d, state_d)
     d_med, d_p90 = _med(d_times), float(np.percentile(d_times, 90))
     drift = _med(d_times[150:]) / max(_med(d_times[:50]), 1e-6)

@@ -1,8 +1,8 @@
-# tests/numpy — `etl.numpy` (enp) test suite
+# tests/numpy — `evoxc.numpy` (enp) test suite
 
 ## Intent
 
-pytest suite validating the `etl.numpy` (alias `enp`) sugar namespace against its contract in `../../etl/numpy/CONTEXT.md` (sibling — read-only from here; escalate any enp/ops fix to root). The defining property under test: **every enp function builds exactly the same IR as the mapped `etl.ops` calls** (same op kinds, operands, attrs, result types).
+pytest suite validating the `evoxc.numpy` (alias `enp`) sugar namespace against its contract in `../../evoxc/numpy/CONTEXT.md` (sibling — read-only from here; escalate any enp/ops fix to root). The defining property under test: **every enp function builds exactly the same IR as the mapped `evoxc.ops` calls** (same op kinds, operands, attrs, result types).
 
 ## Structure
 
@@ -18,14 +18,14 @@ pytest suite validating the `etl.numpy` (alias `enp`) sugar namespace against it
 
 ## Test strategy
 
-- **Equivalence method**: trace an enp-based defn and an ops-composition defn from identical `TensorSpec`s/static values; `graph.verify()` both; assert normalized `etl.ir.pretty_print` texts are character-identical (pytest shows the diff on failure). Python scalar args become `etl.constant` ops with `ndarray<dtype[shape]>` attr summaries, so identical args print identically.
-- Numeric checks go through `etl.evaluate` (all args must be tensors/ndarrays — a Python scalar arg raises TypeError; pass runtime bounds as 0-d arrays or capture them as static closure values) and compare against numpy references.
+- **Equivalence method**: trace an enp-based defn and an ops-composition defn from identical `TensorSpec`s/static values; `graph.verify()` both; assert normalized `evoxc.ir.pretty_print` texts are character-identical (pytest shows the diff on failure). Python scalar args become `evoxc.constant` ops with `ndarray<dtype[shape]>` attr summaries, so identical args print identically.
+- Numeric checks go through `evoxc.evaluate` (all args must be tensors/ndarrays — a Python scalar arg raises TypeError; pass runtime bounds as 0-d arrays or capture them as static closure values) and compare against numpy references.
 - Constraints: small shapes (≤ ~16 elements), CPU only, <2s per file, parametrize with ids, `pytest.raises(..., match=...)`.
 
 ## Notes for agents
 
 - `from tests.numpy._ir_utils import normalize_ir` — test dirs are packages (have `__init__.py`), so helper imports must be package-qualified.
-- `normalize_ir` strips per-op ` loc("file":line:col)` tokens: enp callsites live in `etl/numpy/*.py` while ops-composed defns live in the test file, so raw printed IR never matches without this normalization. The entry function is always named `main`.
+- `normalize_ir` strips per-op ` loc("file":line:col)` tokens: enp callsites live in `evoxc/numpy/*.py` while ops-composed defns live in the test file, so raw printed IR never matches without this normalization. The entry function is always named `main`.
 - `ops.dot` requires rank ≥ 2 (batched matmul) — 1-D `enp.dot`/`enp.matmul` raise ShapeError; that is the documented v1 deviation, not a bug.
-- Creation ops emit large-constant warnings by design (`ETL_LARGE_CONSTANT_BYTES`, default 1 MiB) — tests use small shapes and treat warnings as expected, not bugs.
-- When a name seems missing from enp, check the deferral list in `../../etl/numpy/CONTEXT.md` before writing an AttributeError test.
+- Creation ops emit large-constant warnings by design (`EVOXC_LARGE_CONSTANT_BYTES`, default 1 MiB) — tests use small shapes and treat warnings as expected, not bugs.
+- When a name seems missing from enp, check the deferral list in `../../evoxc/numpy/CONTEXT.md` before writing an AttributeError test.

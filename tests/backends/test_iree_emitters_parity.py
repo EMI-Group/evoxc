@@ -1,6 +1,6 @@
 """iree parity for the v1 StableHLO emitters added in the GPU-export line.
 
-Covered here (all newly v1 — see ``etl/backends/stablehlo/ops.py``):
+Covered here (all newly v1 — see ``evoxc/backends/stablehlo/ops.py``):
 
 * gather / sort / argsort / argmax / argmin / tile / scatter,
 * the SplitMix64 random family (``random_key_mix`` / ``random_uniform`` /
@@ -11,11 +11,11 @@ Covered here (all newly v1 — see ``etl/backends/stablehlo/ops.py``):
   runs, asserted below) but ~1e-6 vs the numpy f64 math, so the parity
   checks are tolerance-based for normal and the split_n chain),
 * the shift primitives (``bitwise_left_shift`` / ``bitwise_right_shift``),
-* ``etl.scan`` (desugars at trace time into while + gather + scatter — all
+* ``evoxc.scan`` (desugars at trace time into while + gather + scatter — all
   v1, so scan graphs compile and run on iree-llvm-cpu).
 
-Every graph is built with ``etl.build(..., backend="iree")`` (llvm-cpu),
-run, and compared against ``etl.evaluate`` (the numpy reference backend) —
+Every graph is built with ``evoxc.build(..., backend="iree")`` (llvm-cpu),
+run, and compared against ``evoxc.evaluate`` (the numpy reference backend) —
 EXACT (``np.array_equal``) for integer / data-movement ops, plus explicit
 ``np.*`` references where the semantics are unambiguous (sort, argsort
 stable/descending, argmax/argmin, tile, scatter, gather). Test data mirrors
@@ -26,12 +26,12 @@ The iree-cuda smoke set (device 5, ``target_backends=["cuda"]``) skips when
 the IREE cuda HAL driver or the GPU is unavailable. The smokes follow the
 explicit device-placement model: each run input is moved to
 ``Device("cuda", 5)`` via the explicit ``core.Tensor(...).to(...)``
-transfer before ``etl.run`` (no implicit host→device staging happens at
+transfer before ``evoxc.run`` (no implicit host→device staging happens at
 the run boundary — a cuda executable rejects host inputs), and the cuda
 outputs are read back through the explicit ``.to(core.Device("cpu", 0))``
 transfer (a non-cpu payload's ``.numpy()`` raises ``DeviceError``).
 While-loop graphs are deliberately excluded from cuda (upstream iree cuda
-HAL crashes on while — documented in ``etl/bench`` Known Issues; ``scan``
+HAL crashes on while — documented in ``evoxc/bench`` Known Issues; ``scan``
 is therefore cpu-only here).
 """
 
@@ -41,8 +41,8 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
-import etl.numpy as enp
+import evoxc
+import evoxc.numpy as enp
 
 # ---------------------------------------------------------------------------
 # data (fixed seed — same draws as probe_new_emitters.py)
@@ -97,15 +97,15 @@ def _np(v):
     numpy backend and iree-llvm-cpu) keep the plain ``.numpy()`` path —
     byte-identical to the pre-placement model.
     """
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         if v.device.kind != "cpu":
-            v = v.to(etl.core.Device("cpu", 0))
+            v = v.to(evoxc.core.Device("cpu", 0))
         return np.asarray(v.numpy())
     return np.asarray(v)
 
 
 def _place_inputs(args, device):
-    """Explicitly place host inputs on ``device`` before ``etl.run``.
+    """Explicitly place host inputs on ``device`` before ``evoxc.run``.
 
     Run-boundary device contract (``core.Tensor.to`` / pipeline ``run``):
     no implicit host→device transfer happens at the run boundary, so a
@@ -120,35 +120,35 @@ def _place_inputs(args, device):
         return args
     placed = []
     for value in args:
-        if isinstance(value, etl.Tensor):
+        if isinstance(value, evoxc.Tensor):
             placed.append(value.to(device))
         elif isinstance(value, np.ndarray):
-            placed.append(etl.core.Tensor(value).to(device))
+            placed.append(evoxc.core.Tensor(value).to(device))
         else:
             raise TypeError(
                 "cannot place a cuda run input of type "
                 f"{type(value).__qualname__}: expected a numpy ndarray or "
-                "an etl.Tensor"
+                "an evoxc.Tensor"
             )
     return tuple(placed)
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
 
 def _assert_close(got, want, rtol=1e-5, atol=1e-5):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.allclose(gp, wp, rtol=rtol, atol=atol), f"{gp} != {wp}"
 
 
 def _parity(fn, *specs, args, exact=True, ref=None, **iree_kwargs):
-    """Build on iree, run, and compare vs ``etl.evaluate`` (numpy reference).
+    """Build on iree, run, and compare vs ``evoxc.evaluate`` (numpy reference).
 
     ``ref``: optional explicit numpy reference (an ndarray) asserted against
     BOTH sides; ``None`` means the numpy backend output is the reference.
@@ -162,11 +162,11 @@ def _parity(fn, *specs, args, exact=True, ref=None, **iree_kwargs):
     ``DeviceError``). Cpu devices (``device`` absent — the llvm-cpu runs)
     feed the host arrays as-is: byte-identical to the pre-placement model.
     """
-    want = etl.evaluate(fn, *args)
+    want = evoxc.evaluate(fn, *args)
     if ref is not None:
         _assert_exact(want, ref)
-    exe = etl.build(fn, *specs, backend="iree", **iree_kwargs)
-    got = etl.run(exe, *_place_inputs(args, iree_kwargs.get("device")))
+    exe = evoxc.build(fn, *specs, backend="iree", **iree_kwargs)
+    got = evoxc.run(exe, *_place_inputs(args, iree_kwargs.get("device")))
     if exact:
         _assert_exact(got, want)
     else:
@@ -178,7 +178,7 @@ def _require_cuda():
     import iree.runtime as rt
 
     try:
-        # etl Device("cuda", 5) maps to iree device_id 6 (1-based ids).
+        # evoxc Device("cuda", 5) maps to iree device_id 6 (1-based ids).
         rt.get_driver("cuda").create_device(device_id=6)
     except Exception as exc:  # noqa: BLE001 — any driver/device failure skips
         pytest.skip(f"IREE cuda HAL driver or GPU 5 unavailable: {exc}")
@@ -190,41 +190,41 @@ def _require_cuda():
 
 
 def _g_axis0(x, i):
-    return etl.gather(x, i, axis=0)
+    return evoxc.gather(x, i, axis=0)
 
 
 def _g_axis1(x, i):
-    return etl.gather(x, i, axis=1)
+    return evoxc.gather(x, i, axis=1)
 
 
 def _g_axis0_static(x):
-    idx = etl.constant(etl.core.Tensor(IDX0.copy()))
-    return etl.gather(x, idx, axis=0)
+    idx = evoxc.constant(evoxc.core.Tensor(IDX0.copy()))
+    return evoxc.gather(x, idx, axis=0)
 
 
 def _g_axis1_static(x):
-    idx = etl.constant(etl.core.Tensor(IDX1.copy()))
-    return etl.gather(x, idx, axis=1)
+    idx = evoxc.constant(evoxc.core.Tensor(IDX1.copy()))
+    return evoxc.gather(x, idx, axis=1)
 
 
 GATHER_CASES = [
     ("gather_axis0_rt", _g_axis0,
-     (etl.TensorSpec((_P, _D), etl.float32), etl.TensorSpec((_K,), etl.int64)),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32), evoxc.TensorSpec((_K,), evoxc.int64)),
      (POP, IDX0), np.take(POP, IDX0, axis=0)),
     ("gather_axis0_static", _g_axis0_static,
-     (etl.TensorSpec((_P, _D), etl.float32),), (POP,),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32),), (POP,),
      np.take(POP, IDX0, axis=0)),
     ("gather_axis1_rt", _g_axis1,
-     (etl.TensorSpec((_P, _D), etl.float32), etl.TensorSpec((3,), etl.int64)),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32), evoxc.TensorSpec((3,), evoxc.int64)),
      (POP, IDX1), np.take(POP, IDX1, axis=1)),
     ("gather_axis1_static", _g_axis1_static,
-     (etl.TensorSpec((_P, _D), etl.float32),), (POP,),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32),), (POP,),
      np.take(POP, IDX1, axis=1)),
     ("gather_negative_indices", _g_axis0,
-     (etl.TensorSpec((_P, _D), etl.float32), etl.TensorSpec((2,), etl.int64)),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32), evoxc.TensorSpec((2,), evoxc.int64)),
      (POP, NEG), np.take(POP, NEG, axis=0)),
     ("gather_0d_index", _g_axis0,
-     (etl.TensorSpec((_P, _D), etl.float32), etl.TensorSpec((), etl.int64)),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32), evoxc.TensorSpec((), evoxc.int64)),
      (POP, np.array(3, dtype=np.int64)), np.take(POP, np.array(3), axis=0)),
 ]
 
@@ -244,75 +244,75 @@ def test_gather_iree_parity(fn, specs, args, ref):
 
 
 def _sort1(x):
-    return etl.sort(x, axis=0)
+    return evoxc.sort(x, axis=0)
 
 
 def _sort1d_desc(x):
-    return etl.sort(x, axis=0, descending=True)
+    return evoxc.sort(x, axis=0, descending=True)
 
 
 def _sort2(x):
-    return etl.sort(x, axis=1)
+    return evoxc.sort(x, axis=1)
 
 
 def _argsort1(x):
-    return etl.argsort(x, axis=0)
+    return evoxc.argsort(x, axis=0)
 
 
 def _argsort1d_desc(x):
-    return etl.argsort(x, axis=0, descending=True)
+    return evoxc.argsort(x, axis=0, descending=True)
 
 
 def _argsort2(x):
-    return etl.argsort(x, axis=1)
+    return evoxc.argsort(x, axis=1)
 
 
 def _argsort_bool(x):
-    return etl.argsort(x, axis=0)
+    return evoxc.argsort(x, axis=0)
 
 
 def _argmax1(x):
-    return etl.argmax(x, axis=0)
+    return evoxc.argmax(x, axis=0)
 
 
 def _argmin1(x):
-    return etl.argmin(x, axis=0)
+    return evoxc.argmin(x, axis=0)
 
 
 def _argmax_kd(x):
-    return etl.argmax(x, axis=1, keepdims=True)
+    return evoxc.argmax(x, axis=1, keepdims=True)
 
 
 def _argmax_flat(x):
-    return etl.argmax(x)
+    return evoxc.argmax(x)
 
 
 SORT_ARGSORT_ARGMINMAX_CASES = [
-    ("sort_1d", _sort1, (etl.TensorSpec((5,), etl.float32),), (X1,),
+    ("sort_1d", _sort1, (evoxc.TensorSpec((5,), evoxc.float32),), (X1,),
      np.sort(X1)),
-    ("sort_1d_descending", _sort1d_desc, (etl.TensorSpec((5,), etl.float32),),
+    ("sort_1d_descending", _sort1d_desc, (evoxc.TensorSpec((5,), evoxc.float32),),
      (X1,), np.sort(X1)[::-1]),
-    ("sort_2d_axis1", _sort2, (etl.TensorSpec((3, 6), etl.float32),), (X2,),
+    ("sort_2d_axis1", _sort2, (evoxc.TensorSpec((3, 6), evoxc.float32),), (X2,),
      np.sort(X2, axis=1)),
-    ("argsort_1d_stable_ties", _argsort1, (etl.TensorSpec((5,), etl.float32),),
+    ("argsort_1d_stable_ties", _argsort1, (evoxc.TensorSpec((5,), evoxc.float32),),
      (X1,), np.argsort(X1, kind="stable")),
     # descending ties break in REVERSED index order — matches the numpy
     # backend's np.argsort(x)[::-1] convention (probe-validated exact)
     ("argsort_1d_descending", _argsort1d_desc,
-     (etl.TensorSpec((5,), etl.float32),), (X1,), np.argsort(X1)[::-1]),
-    ("argsort_2d_axis1", _argsort2, (etl.TensorSpec((3, 6), etl.float32),),
+     (evoxc.TensorSpec((5,), evoxc.float32),), (X1,), np.argsort(X1)[::-1]),
+    ("argsort_2d_axis1", _argsort2, (evoxc.TensorSpec((3, 6), evoxc.float32),),
      (X2,), np.argsort(X2, axis=1, kind="stable")),
-    ("argsort_bool", _argsort_bool, (etl.TensorSpec((4,), np.bool_),), (X1B,),
+    ("argsort_bool", _argsort_bool, (evoxc.TensorSpec((4,), np.bool_),), (X1B,),
      np.argsort(X1B, kind="stable")),
-    ("argmax_1d", _argmax1, (etl.TensorSpec((4,), etl.float32),), (AM,),
+    ("argmax_1d", _argmax1, (evoxc.TensorSpec((4,), evoxc.float32),), (AM,),
      np.argmax(AM)),
-    ("argmin_1d", _argmin1, (etl.TensorSpec((4,), etl.float32),), (AM,),
+    ("argmin_1d", _argmin1, (evoxc.TensorSpec((4,), evoxc.float32),), (AM,),
      np.argmin(AM)),
     ("argmax_2d_axis1_keepdims", _argmax_kd,
-     (etl.TensorSpec((3, 7), etl.float32),), (A2D,),
+     (evoxc.TensorSpec((3, 7), evoxc.float32),), (A2D,),
      np.argmax(A2D, axis=1, keepdims=True)),
     ("argmax_axis_none_flat", _argmax_flat,
-     (etl.TensorSpec((3, 7), etl.float32),), (A2D,), np.argmax(A2D)),
+     (evoxc.TensorSpec((3, 7), evoxc.float32),), (A2D,), np.argmax(A2D)),
 ]
 
 
@@ -333,35 +333,35 @@ def test_sort_argsort_argminmax_iree_parity(fn, specs, args, ref):
 
 
 def _tile1(x):
-    return etl.tile(x, (2,))
+    return evoxc.tile(x, (2,))
 
 
 def _tile2(x):
-    return etl.tile(x, (2, 2))
+    return evoxc.tile(x, (2, 2))
 
 
 def _tile3(x):
-    return etl.tile(x, (2, 1))
+    return evoxc.tile(x, (2, 1))
 
 
 def _tile4(x):
-    return etl.tile(x, (2, 2, 1))
+    return evoxc.tile(x, (2, 2, 1))
 
 
 def _scatter1(x, i, u):
-    return etl.scatter(x, i, u, axis=0)
+    return evoxc.scatter(x, i, u, axis=0)
 
 
 def _scatter_row_0d(x, i, u):
-    return etl.scatter(x, i, u, axis=0)
+    return evoxc.scatter(x, i, u, axis=0)
 
 
 def _scatter_row_multi(x, i, u):
-    return etl.scatter(x, i, u, axis=0)
+    return evoxc.scatter(x, i, u, axis=0)
 
 
 def _scatter_axis1(x, i, u):
-    return etl.scatter(x, i, u, axis=1)
+    return evoxc.scatter(x, i, u, axis=1)
 
 
 def _scatter_1d_ref():
@@ -389,29 +389,29 @@ def _scatter_axis1_ref():
 
 
 TILE_SCATTER_CASES = [
-    ("tile_rightalign", _tile1, (etl.TensorSpec((2, 3), etl.float32),), (T,),
+    ("tile_rightalign", _tile1, (evoxc.TensorSpec((2, 3), evoxc.float32),), (T,),
      np.tile(T, (2,))),
-    ("tile_2x2", _tile2, (etl.TensorSpec((2, 3), etl.float32),), (T,),
+    ("tile_2x2", _tile2, (evoxc.TensorSpec((2, 3), evoxc.float32),), (T,),
      np.tile(T, (2, 2))),
-    ("tile_2x1", _tile3, (etl.TensorSpec((2, 3), etl.float32),), (T,),
+    ("tile_2x1", _tile3, (evoxc.TensorSpec((2, 3), evoxc.float32),), (T,),
      np.tile(T, (2, 1))),
-    ("tile_rank_promote", _tile4, (etl.TensorSpec((2, 3), etl.float32),),
+    ("tile_rank_promote", _tile4, (evoxc.TensorSpec((2, 3), evoxc.float32),),
      (T,), np.tile(T, (2, 2, 1))),
     ("scatter_1d", _scatter1,
-     (etl.TensorSpec((5,), etl.float32), etl.TensorSpec((3,), etl.int64),
-      etl.TensorSpec((3,), etl.float32)),
+     (evoxc.TensorSpec((5,), evoxc.float32), evoxc.TensorSpec((3,), evoxc.int64),
+      evoxc.TensorSpec((3,), evoxc.float32)),
      (SC, SI, SU), _scatter_1d_ref()),
     ("scatter_row_0d_index", _scatter_row_0d,
-     (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((), etl.int64),
-      etl.TensorSpec((4,), etl.float32)),
+     (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((), evoxc.int64),
+      evoxc.TensorSpec((4,), evoxc.float32)),
      (MAT, np.array(1, dtype=np.int64), MUPD), _scatter_row_0d_ref()),
     ("scatter_row_multi", _scatter_row_multi,
-     (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((2,), etl.int64),
-      etl.TensorSpec((2, 4), etl.float32)),
+     (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((2,), evoxc.int64),
+      evoxc.TensorSpec((2, 4), evoxc.float32)),
      (MAT, IDX2, UPD2), _scatter_row_multi_ref()),
     ("scatter_axis1", _scatter_axis1,
-     (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((2,), etl.int64),
-      etl.TensorSpec((3, 2), etl.float32)),
+     (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((2,), evoxc.int64),
+      evoxc.TensorSpec((3, 2), evoxc.float32)),
      (MAT, ICOL, UCOL), _scatter_axis1_ref()),
 ]
 
@@ -433,9 +433,9 @@ def test_tile_scatter_iree_parity(fn, specs, args, ref):
 
 def _fn_scan(x):
     def step(carry, elem):
-        return etl.add(carry, elem), etl.multiply(carry, elem)
+        return evoxc.add(carry, elem), evoxc.multiply(carry, elem)
 
-    return etl.scan(step, 0.0, x)[1]
+    return evoxc.scan(step, 0.0, x)[1]
 
 
 def _scan_ref(x):
@@ -448,33 +448,33 @@ def _scan_ref(x):
 
 
 def _shift_left(x, s):
-    return etl.bitwise_left_shift(x, s)
+    return evoxc.bitwise_left_shift(x, s)
 
 
 def _shift_right(x, s):
-    return etl.bitwise_right_shift(x, s)
+    return evoxc.bitwise_right_shift(x, s)
 
 
 def _shift_right_u64(x, s):
     # Logical shift on u64 via the mask trick (probe-validated bit-exact vs
     # np.right_shift on the raw u64 view).
-    one = etl.constant(etl.core.Tensor(np.array([1], dtype=np.int64)))
-    mask = etl.subtract(etl.bitwise_left_shift(one, etl.subtract(64, s)), 1)
-    return etl.bitwise_and(etl.bitwise_right_shift(x, s), mask)
+    one = evoxc.constant(evoxc.core.Tensor(np.array([1], dtype=np.int64)))
+    mask = evoxc.subtract(evoxc.bitwise_left_shift(one, evoxc.subtract(64, s)), 1)
+    return evoxc.bitwise_and(evoxc.bitwise_right_shift(x, s), mask)
 
 
 SCAN_SHIFT_CASES = [
     ("scan_desugared_while_gather_scatter", _fn_scan,
-     (etl.TensorSpec((4,), etl.float32),),
+     (evoxc.TensorSpec((4,), evoxc.float32),),
      (np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),), None),
     ("shift_left_i64", _shift_left,
-     (etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64)),
+     (evoxc.TensorSpec((3,), evoxc.int64), evoxc.TensorSpec((), evoxc.int64)),
      (A64, np.array(3, dtype=np.int64)), np.left_shift(A64, 3)),
     ("shift_right_i64_arithmetic", _shift_right,
-     (etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64)),
+     (evoxc.TensorSpec((3,), evoxc.int64), evoxc.TensorSpec((), evoxc.int64)),
      (A64, np.array(3, dtype=np.int64)), np.right_shift(A64, 3)),
     ("shift_right_u64_logical_mask", _shift_right_u64,
-     (etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64)),
+     (evoxc.TensorSpec((3,), evoxc.int64), evoxc.TensorSpec((), evoxc.int64)),
      (U64.view(np.int64), np.array(3, dtype=np.int64)),
      np.right_shift(U64, 3).view(np.int64)),
 ]
@@ -497,46 +497,46 @@ def test_scan_and_shifts_iree_parity(fn, specs, args, ref):
 
 
 def _rkey():
-    k = etl.random.key(42)
-    return etl.random.split(k)
+    k = evoxc.random.key(42)
+    return evoxc.random.split(k)
 
 
 def _runiform(k):
-    return etl.random.uniform(k, (4, 5), low=-1.0, high=3.0)
+    return evoxc.random.uniform(k, (4, 5), low=-1.0, high=3.0)
 
 
 def _rnormal(k):
-    return etl.random.normal(k, (4, 5), mean=2.0, std=0.5)
+    return evoxc.random.normal(k, (4, 5), mean=2.0, std=0.5)
 
 
 def _rrandint(k):
-    return etl.random.randint(k, (4, 5), low=-10, high=10)
+    return evoxc.random.randint(k, (4, 5), low=-10, high=10)
 
 
 def _rperm(k):
-    return etl.random.permutation(k, 12)
+    return evoxc.random.permutation(k, 12)
 
 
 def _rperm64(k):
-    return etl.random.permutation(k, 12, dtype=etl.int64)
+    return evoxc.random.permutation(k, 12, dtype=evoxc.int64)
 
 
 def _rchain(k):
-    ks = etl.random.split_n(k, 3)
+    ks = evoxc.random.split_n(k, 3)
     return (
-        etl.random.uniform(ks[0], (4, 3))
-        + etl.random.normal(ks[1], (4, 3))
-        + etl.random.randint(ks[2], (4, 3), low=0, high=5)
+        evoxc.random.uniform(ks[0], (4, 3))
+        + evoxc.random.normal(ks[1], (4, 3))
+        + evoxc.random.randint(ks[2], (4, 3), low=0, high=5)
     )
 
 
 SEED = np.array(42, dtype=np.int64)
-KEY_SPEC = etl.TensorSpec((), etl.int64)
+KEY_SPEC = evoxc.TensorSpec((), evoxc.int64)
 
 # (id, fn, specs, args, exact) — the numpy kernel IS the reference for
 # uniform/randint/permutation/key_mix (the emitter must reproduce them
 # bit-for-bit); normal is the documented f32 fast-path deviation (see
-# etl/backends/stablehlo/random_export.py) → explicit tolerance, and its
+# evoxc/backends/stablehlo/random_export.py) → explicit tolerance, and its
 # determinism (same key ⇒ bit-identical draws) is asserted in
 # test_random_iree_determinism.
 RANDOM_CASES = [
@@ -560,15 +560,15 @@ RANDOM_NORMAL_TOL = dict(rtol=1e-4, atol=1e-5)
     ids=[c[0] for c in RANDOM_CASES],
 )
 def test_random_iree_parity(case_id, fn, specs, args, exact):
-    want = etl.evaluate(fn, *args)
-    exe = etl.build(fn, *specs, backend="iree")
-    got = etl.run(exe, *args)
+    want = evoxc.evaluate(fn, *args)
+    exe = evoxc.build(fn, *specs, backend="iree")
+    got = evoxc.run(exe, *args)
     if exact:
         _assert_exact(got, want)
     else:
         _assert_close(got, want, **RANDOM_NORMAL_TOL)
     if "permutation" in case_id:
-        got = _np(etl.evaluate(fn, *args))
+        got = _np(evoxc.evaluate(fn, *args))
         assert sorted(got.tolist()) == list(range(12))  # a real permutation
 
 
@@ -578,13 +578,13 @@ def test_random_iree_parity(case_id, fn, specs, args, exact):
     ids=[c[0] for c in RANDOM_CASES],
 )
 def test_random_iree_determinism(case_id, fn, specs, args):
-    """The hard etl.random contract on compiler backends: same key +
+    """The hard evoxc.random contract on compiler backends: same key +
     operands ⇒ BIT-IDENTICAL draws across runs (the values may deviate from
     the numpy reference for the f32 normal fast path, but never across
     iree runs)."""
-    exe = etl.build(fn, *specs, backend="iree")
-    g1 = etl.run(exe, *args)
-    g2 = etl.run(exe, *args)
+    exe = evoxc.build(fn, *specs, backend="iree")
+    g1 = evoxc.run(exe, *args)
+    g2 = evoxc.run(exe, *args)
     _assert_exact(g1, g2)
 
 
@@ -592,7 +592,7 @@ def test_random_iree_determinism(case_id, fn, specs, args):
 # 6. iree-cuda smoke set (device 5; while-loop graphs deliberately excluded
 # — upstream iree cuda HAL crashes on while). Explicit device placement:
 # _parity moves every host input to Device("cuda", 5) via
-# core.Tensor(...).to(...) before etl.run (the run boundary never
+# core.Tensor(...).to(...) before evoxc.run (the run boundary never
 # transfers implicitly — host inputs to a cuda executable raise
 # DeviceError) and reads the cuda outputs back through the explicit
 # .to(core.Device("cpu", 0)) host transfer in _np.
@@ -600,16 +600,16 @@ def test_random_iree_determinism(case_id, fn, specs, args):
 
 CUDA_CASES = [
     ("cuda_gather_axis1", _g_axis1,
-     (etl.TensorSpec((_P, _D), etl.float32), etl.TensorSpec((3,), etl.int64)),
+     (evoxc.TensorSpec((_P, _D), evoxc.float32), evoxc.TensorSpec((3,), evoxc.int64)),
      (POP, IDX1), np.take(POP, IDX1, axis=1)),
-    ("cuda_sort_2d_axis1", _sort2, (etl.TensorSpec((3, 6), etl.float32),),
+    ("cuda_sort_2d_axis1", _sort2, (evoxc.TensorSpec((3, 6), evoxc.float32),),
      (X2,), np.sort(X2, axis=1)),
     ("cuda_random_uniform", _runiform, (KEY_SPEC,), (SEED,), None),
-    ("cuda_tile_2x1", _tile3, (etl.TensorSpec((2, 3), etl.float32),), (T,),
+    ("cuda_tile_2x1", _tile3, (evoxc.TensorSpec((2, 3), evoxc.float32),), (T,),
      np.tile(T, (2, 1))),
     ("cuda_scatter_row_0d", _scatter_row_0d,
-     (etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((), etl.int64),
-      etl.TensorSpec((4,), etl.float32)),
+     (evoxc.TensorSpec((3, 4), evoxc.float32), evoxc.TensorSpec((), evoxc.int64),
+      evoxc.TensorSpec((4,), evoxc.float32)),
      (MAT, np.array(1, dtype=np.int64), MUPD), _scatter_row_0d_ref()),
 ]
 
@@ -623,7 +623,7 @@ def test_iree_cuda_smoke(fn, specs, args, ref):
     _require_cuda()
     _parity(
         fn, *specs, args=args, exact=True, ref=ref,
-        device=etl.core.Device("cuda", 5), target_backends=["cuda"],
+        device=evoxc.core.Device("cuda", 5), target_backends=["cuda"],
     )
 
 
@@ -631,12 +631,12 @@ def test_iree_cuda_smoke(fn, specs, args, ref):
 # 7. sort inside a nested region — the `gather(v, argsort(v))` permutation
 # composition (llvm-cpu only)
 #
-# An `etl.argsort` is emitted as a 2-operand pair sort (keys + iota). That
+# An `evoxc.argsort` is emitted as a 2-operand pair sort (keys + iota). That
 # form is unreliable inside an `if`/`while` region whose index operand is
 # hoisted out of the region: the index column can return as the UNSORTED
 # iota, so the following `gather` silently yields the unsorted data. The
 # exporter therefore emits the COUNT composition (no `stablehlo.sort` at
-# all — `_count_argsort_active` in `etl/backends/stablehlo/writer.py`) for
+# all — `_count_argsort_active` in `evoxc/backends/stablehlo/writer.py`) for
 # every sort emitted inside a region, whatever `sort_emission` says. The two
 # cases below pin that emission numerically, BIT-EXACT:
 #
@@ -659,8 +659,8 @@ SV = _RNG.standard_normal(SORT_N).astype(np.float32)
 SW = _RNG.standard_normal(SORT_N).astype(np.float32)
 
 SORT_PERM_SPECS = (
-    etl.TensorSpec((SORT_N,), etl.float32),
-    etl.TensorSpec((SORT_N,), etl.float32),
+    evoxc.TensorSpec((SORT_N,), evoxc.float32),
+    evoxc.TensorSpec((SORT_N,), evoxc.float32),
 )
 
 
@@ -672,8 +672,8 @@ def _sort_perm_step(v, w):
     the step is NOT idempotent and every loop iteration really re-orders the
     carried values.
     """
-    idx = etl.argsort(v)
-    return etl.multiply(etl.gather(v, idx), etl.gather(w, idx))
+    idx = evoxc.argsort(v)
+    return evoxc.multiply(evoxc.gather(v, idx), evoxc.gather(w, idx))
 
 
 def _sort_perm_body(carry):
@@ -686,8 +686,8 @@ def _sort_perm_in_while(v, w):
     def cond_fn(carry):
         return carry[2] < SORT_ITERS
 
-    out, _, _ = etl.while_loop(
-        cond_fn, _sort_perm_body, (v, w, enp.zeros((), etl.int64))
+    out, _, _ = evoxc.while_loop(
+        cond_fn, _sort_perm_body, (v, w, enp.zeros((), evoxc.int64))
     )
     return out
 

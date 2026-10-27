@@ -1,5 +1,5 @@
 """``SymbolicTensor.__getitem__`` — the registered operator handler kind
-``getitem`` (``etl/ops/indexing.py::getitem``).
+``getitem`` (``evoxc/ops/indexing.py::getitem``).
 
 Strictly STATIC indexing: an ``int`` key becomes a ``gather`` op with a 0-d
 index constant (dropping the axis); a contiguous ``builtins.slice`` becomes a
@@ -13,8 +13,8 @@ index values) raises ``TraceError``; static out-of-bounds int indices raise
 import numpy as np
 import pytest
 
-import etl
-from etl import ShapeError, TraceError
+import evoxc
+from evoxc import ShapeError, TraceError
 
 from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
@@ -40,7 +40,7 @@ class TestIntIndex:
         def f(x):
             return x[key]
 
-        g = trace_fn(f, etl.TensorSpec((3, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((3, 4), evoxc.float32))
         gathers = ops_of(g, "gather")
         assert len(gathers) == 1
         assert gathers[0].attributes["axes"] == (0,)
@@ -56,7 +56,7 @@ class TestIntIndex:
         def f(x):
             return x[-1]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         const = ops_of(g, "constant")[0]
         assert const.attributes["value"].item() == 4  # 5 + (-1)
         assert ops_of(g, "gather")[0].attributes["axes"] == (0,)
@@ -64,27 +64,27 @@ class TestIntIndex:
         np.testing.assert_array_equal(run_numpy(f, ARR), ARR[-1])
 
     def test_negative_int_index_over_symbolic_dim(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[-1]
 
         with pytest.raises(ShapeError, match="negative index -1 over symbolic"):
-            trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
 
     def test_out_of_bounds_int_index(self):
         def f(x):
             return x[10]
 
         with pytest.raises(ShapeError, match="out of range for dim 5"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_out_of_bounds_negative_int_index(self):
         def f(x):
             return x[-6]
 
         with pytest.raises(ShapeError, match="index -6 out of range for dim 5"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ class TestSliceIndex:
         def f(x):
             return x[1:3]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         slices = ops_of(g, "slice")
         assert len(slices) == 1
         s = slices[0]
@@ -110,7 +110,7 @@ class TestSliceIndex:
         def f(x):
             return x[:2]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         s = ops_of(g, "slice")[0]
         assert s.attributes["start_indices"] == (0, 0)
         assert s.attributes["limit_indices"] == (2, 4)
@@ -120,7 +120,7 @@ class TestSliceIndex:
         def f(x):
             return x[1:]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         s = ops_of(g, "slice")[0]
         assert s.attributes["start_indices"] == (1, 0)
         assert s.attributes["limit_indices"] == (5, 4)
@@ -131,7 +131,7 @@ class TestSliceIndex:
         def f(x):
             return x[1:10]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         s = ops_of(g, "slice")[0]
         assert s.attributes["start_indices"] == (1, 0)
         assert s.attributes["limit_indices"] == (5, 4)  # numpy clamps
@@ -142,7 +142,7 @@ class TestSliceIndex:
         def f(x):
             return x[-2:]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         s = ops_of(g, "slice")[0]
         assert s.attributes["start_indices"] == (3, 0)
         assert s.attributes["limit_indices"] == (5, 4)
@@ -153,7 +153,7 @@ class TestSliceIndex:
         def f(x):
             return x[1:-1]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         s = ops_of(g, "slice")[0]
         assert s.attributes["start_indices"] == (1, 0)
         assert s.attributes["limit_indices"] == (4, 4)
@@ -164,7 +164,7 @@ class TestSliceIndex:
         def f(x):
             return x[2:1]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         assert last_result(g).type.shape == (0, 4)
         np.testing.assert_array_equal(run_numpy(f, ARR), ARR[2:1])
 
@@ -172,7 +172,7 @@ class TestSliceIndex:
         def f(x):
             return x[:]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         # no data op at all: the function returns the input unchanged
         assert [op.name for op in ops_of(g)] == ["return"]
         ret = ops_of(g)[0]
@@ -183,7 +183,7 @@ class TestSliceIndex:
         def f(x):
             return x[::2]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         const = ops_of(g, "constant")[0]
         np.testing.assert_array_equal(const.attributes["value"], [0, 2, 4])
         assert ops_of(g, "gather")[0].attributes["axes"] == (0,)
@@ -194,7 +194,7 @@ class TestSliceIndex:
         def f(x):
             return x[::-1]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         const = ops_of(g, "constant")[0]
         np.testing.assert_array_equal(const.attributes["value"], [4, 3, 2, 1, 0])
         assert last_result(g).type.shape == (5, 4)
@@ -205,7 +205,7 @@ class TestSliceIndex:
             return x[::0]
 
         with pytest.raises(TypeError):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ class TestTupleIndex:
         def f(x):
             return x[:, 2]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         gathers = ops_of(g, "gather")
         assert len(gathers) == 1
         assert gathers[0].attributes["axes"] == (1,)
@@ -228,7 +228,7 @@ class TestTupleIndex:
         def f(x):
             return x[1, 2:4]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         gathers = ops_of(g, "gather")
         assert len(gathers) == 1 and gathers[0].attributes["axes"] == (0,)
         s = ops_of(g, "slice")[0]
@@ -241,7 +241,7 @@ class TestTupleIndex:
         def f(x):
             return x[0, 0]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         assert len(ops_of(g, "gather")) == 2
         assert last_result(g).type.shape == ()
         np.testing.assert_array_equal(run_numpy(f, ARR), ARR[0, 0])
@@ -250,7 +250,7 @@ class TestTupleIndex:
         def f(x):
             return x[::2, 1]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         assert last_result(g).type.shape == (3,)
         np.testing.assert_array_equal(run_numpy(f, ARR), ARR[::2, 1])
 
@@ -258,7 +258,7 @@ class TestTupleIndex:
         def f(x):
             return x[1:3, ::2]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
         const = ops_of(g, "constant")[0]
         np.testing.assert_array_equal(const.attributes["value"], [0, 2])
         assert last_result(g).type.shape == (2, 2)
@@ -269,7 +269,7 @@ class TestTupleIndex:
             return x[0, 0, 0]
 
         with pytest.raises(ShapeError, match="too many indices \\(3\\) for rank 2"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -278,31 +278,31 @@ class TestTupleIndex:
 
 class TestSymbolicDims:
     def test_int_index_result_shape(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[1]
 
-        g = trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
         assert last_result(g).type.shape == (5,)
 
     def test_slice_result_shape_keeps_symbolic_dims(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[1:3]
 
-        g = trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+        g = trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
         assert last_result(g).type.shape == (2, 5)
 
         def g1(x):
             return x[2:3]
 
-        gr = trace_fn(g1, etl.TensorSpec((n, 5), etl.float32))
+        gr = trace_fn(g1, evoxc.TensorSpec((n, 5), evoxc.float32))
         assert last_result(gr).type.shape == (1, 5)
 
     def test_full_axis_slice_over_symbolic_dim_not_expressible(self):
-        n, m = etl.dim("n"), etl.dim("m")
+        n, m = evoxc.dim("n"), evoxc.dim("m")
 
         def f(x):
             return x[2:3]
@@ -310,45 +310,45 @@ class TestSymbolicDims:
         with pytest.raises(
             TraceError, match="full-axis slice over symbolic dim"
         ):
-            trace_fn(f, etl.TensorSpec((n, m), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, m), evoxc.float32))
 
     def test_negative_slice_bound_over_symbolic_dim(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[-2:]
 
         with pytest.raises(TraceError, match="negative slice bound"):
-            trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
 
     def test_strided_slice_over_symbolic_dim(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[::2]
 
         with pytest.raises(TraceError, match="strided slice over symbolic dim"):
-            trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
 
     def test_dim_slice_bound_is_not_static(self):
-        # etl.dim objects are NOT static slice bounds: the contract requires
+        # evoxc.dim objects are NOT static slice bounds: the contract requires
         # plain ints (or None); a Dim bound raises TraceError.
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[1:n]
 
         with pytest.raises(TraceError, match="slice bounds must be static ints"):
-            trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
 
     def test_dim_stop_is_not_static(self):
-        n = etl.dim("n")
+        n = evoxc.dim("n")
 
         def f(x):
             return x[:n]
 
         with pytest.raises(TraceError, match="slice bounds must be static ints"):
-            trace_fn(f, etl.TensorSpec((n, 5), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((n, 5), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -361,49 +361,49 @@ class TestUnsupportedKeys:
             return x[None]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_ellipsis_unsupported(self):
         def f(x):
             return x[..., 1]
 
         with pytest.raises(TraceError, match="not supported"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_boolean_mask_symbolic_tensor_unsupported(self):
         def f(x):
-            return x[etl.greater(x, 1.0)]
+            return x[evoxc.greater(x, 1.0)]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_ndarray_key_unsupported(self):
         def f(x):
             return x[np.array([True, False, True, False, True])]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_float_index_unsupported(self):
         def f(x):
             return x[1.0]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_bool_index_unsupported(self):
         def f(x):
             return x[True]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_dim_index_unsupported(self):
         def f(x):
-            return x[etl.dim("k")]
+            return x[evoxc.dim("k")]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))
 
     def test_symbolic_tensor_index_unsupported(self):
         def f(x, i):
@@ -412,19 +412,19 @@ class TestUnsupportedKeys:
         with pytest.raises(TraceError, match=r"symbolic \(runtime\) indices"):
             trace_fn(
                 f,
-                etl.TensorSpec((5, 4), etl.float32),
-                etl.TensorSpec((), etl.int64),
+                evoxc.TensorSpec((5, 4), evoxc.float32),
+                evoxc.TensorSpec((), evoxc.int64),
             )
 
     def test_ndarray_static_arg_accepted_and_preserved(self):
         # numpy ndarrays ARE static Python values (see
-        # etl/trace/_tree.py::_is_static_value) — an ndarray argument is
+        # evoxc/trace/_tree.py::_is_static_value) — an ndarray argument is
         # accepted as a static (graph-specializing) leaf and PRESERVED in
         # the graph's static records (used here to compute the index key).
         def f(x, arr):
             return x[int(arr[0])]
 
-        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32), np.array([1]))
+        g = trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32), np.array([1]))
         (record,) = g.static_values
         assert record.kind == "ndarray"
         np.testing.assert_array_equal(record.value, np.array([1]))
@@ -432,8 +432,8 @@ class TestUnsupportedKeys:
 
         # end-to-end: the static ndarray passes run-time validation
         # (array-equality) and the baked index selects row 1
-        exe = etl.build(f, etl.TensorSpec((5, 4), etl.float32), np.array([1]))
-        out = etl.run(exe, ARR, np.array([1]))
+        exe = evoxc.build(f, evoxc.TensorSpec((5, 4), evoxc.float32), np.array([1]))
+        out = evoxc.run(exe, ARR, np.array([1]))
         np.testing.assert_array_equal(out.numpy(), ARR[1])
 
     def test_numpy_scalar_key_unsupported_v1(self):
@@ -444,4 +444,4 @@ class TestUnsupportedKeys:
             return x[np.int64(1)]
 
         with pytest.raises(TraceError, match="unsupported index key"):
-            trace_fn(f, etl.TensorSpec((5, 4), etl.float32))
+            trace_fn(f, evoxc.TensorSpec((5, 4), evoxc.float32))

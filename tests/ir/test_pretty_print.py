@@ -1,8 +1,8 @@
-"""Golden-output tests for the EvoXIR IR pretty printer (`etl.ir.pretty_print`).
+"""Golden-output tests for the EvoXIR IR pretty printer (`evoxc.ir.pretty_print`).
 
 Every expected string here was produced by running `pretty_print` on the
 corresponding hand-built module and eyeballed against the documented format
-rules in `etl/ir/printer.py`:
+rules in `evoxc/ir/printer.py`:
 
 * functions/ops/block-args print in program order; attribute keys print
   sorted; op results are renumbered ``%0, %1, ...`` per function and only ops
@@ -21,8 +21,8 @@ rules in `etl/ir/printer.py`:
 import numpy as np
 import pytest
 
-from etl import ir
-from etl.core import Dim, DimExpr
+from evoxc import ir
+from evoxc.core import Dim, DimExpr
 
 F32 = np.dtype("float32")
 
@@ -52,10 +52,10 @@ def test_traced_style_module_full_output():
 module @"main" version 1 {
   func @main(%arg0: tensor<Bx4xf32>,
              %arg1: tensor<4xf32>) -> tensor<Bx4xf32> {
-    %0 = etl.add(%arg0, %arg1) : tensor<Bx4xf32>
-    %1 = etl.constant() attributes {value = ndarray<f32[]>} : tensor<f32>
-    %2 = etl.multiply(%0, %1) : tensor<Bx4xf32>
-    etl.return(%2)
+    %0 = evoxc.add(%arg0, %arg1) : tensor<Bx4xf32>
+    %1 = evoxc.constant() attributes {value = ndarray<f32[]>} : tensor<f32>
+    %2 = evoxc.multiply(%0, %1) : tensor<Bx4xf32>
+    evoxc.return(%2)
   }
 }
 """
@@ -86,11 +86,11 @@ def test_attribute_rendering():
     expected = """\
 module @"main" version 1 {
   func @main(%arg0: tensor<Bx4xf32>) -> tensor<Bx4xf64> {
-    %0 = etl.reduce_sum(%arg0) attributes {axes = [1], keepdims = False, reduce_op = "sum"} : tensor<Bxf32>
-    %1 = etl.transpose(%arg0) attributes {permutation = ?} : tensor<4xBxf32>
-    %2 = etl.slice(%arg0) attributes {limit_indices = [8, 4], start_indices = [0, 1], strides = [1, 2]} : tensor<8x2xf32>
-    %3 = etl.cast(%arg0) attributes {dtype = "float64"} : tensor<Bx4xf64>
-    etl.return(%3)
+    %0 = evoxc.reduce_sum(%arg0) attributes {axes = [1], keepdims = False, reduce_op = "sum"} : tensor<Bxf32>
+    %1 = evoxc.transpose(%arg0) attributes {permutation = ?} : tensor<4xBxf32>
+    %2 = evoxc.slice(%arg0) attributes {limit_indices = [8, 4], start_indices = [0, 1], strides = [1, 2]} : tensor<8x2xf32>
+    %3 = evoxc.cast(%arg0) attributes {dtype = "float64"} : tensor<Bx4xf64>
+    evoxc.return(%3)
   }
 }
 """
@@ -110,9 +110,9 @@ def test_location_rendering():
     expected = """\
 module @"main" version 1 {
   func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
-    %0 = etl.add(%arg0, %arg0) : tensor<2xf32> loc("model.py":12:8)
-    %1 = etl.negate(%0) : tensor<2xf32> loc("model.py":13)
-    etl.return(%1)
+    %0 = evoxc.add(%arg0, %arg0) : tensor<2xf32> loc("model.py":12:8)
+    %1 = evoxc.negate(%0) : tensor<2xf32> loc("model.py":13)
+    evoxc.return(%1)
   }
 }
 """
@@ -134,9 +134,9 @@ module @"main" version 1 {
   func @main(%arg0: tensor<2x3xf32>,
              %arg1: tensor<3xf32>,
              %arg2: tensor<3xf32>) -> tensor<2x3xf32> {
-    %0 = etl.add(%arg0, %arg1) : tensor<2x3xf32>
-    %1 = etl.multiply(%0, %arg2) : tensor<2x3xf32>
-    etl.return(%1)
+    %0 = evoxc.add(%arg0, %arg1) : tensor<2x3xf32>
+    %1 = evoxc.multiply(%0, %arg2) : tensor<2x3xf32>
+    evoxc.return(%1)
   }
 }
 """
@@ -144,7 +144,7 @@ module @"main" version 1 {
 
 
 def test_zero_output_function():
-    """No result types in the header; a bare ``etl.return()`` terminator."""
+    """No result types in the header; a bare ``evoxc.return()`` terminator."""
     b = ir.Builder()
     module = b.build_module("main")
     f = b.build_function("main", (_vt((2,)),))
@@ -155,8 +155,8 @@ def test_zero_output_function():
     expected = """\
 module @"main" version 1 {
   func @main(%arg0: tensor<2xf32>) {
-    %0 = etl.negate(%arg0) : tensor<2xf32>
-    etl.return()
+    %0 = evoxc.negate(%arg0) : tensor<2xf32>
+    evoxc.return()
   }
 }
 """
@@ -183,14 +183,14 @@ def test_nested_regions_if_op():
 module @"main" version 1 {
   func @main(%arg0: tensor<i1>,
              %arg1: tensor<2xf32>) -> tensor<2xf32> {
-    %0 = etl.if(%arg0, %arg1) : tensor<2xf32> {
+    %0 = evoxc.if(%arg0, %arg1) : tensor<2xf32> {
       ^bb0(%arg0: tensor<2xf32>):
-        etl.return(%arg0)
+        evoxc.return(%arg0)
     } {
       ^bb1(%arg0: tensor<2xf32>):
-        etl.return(%arg0)
+        evoxc.return(%arg0)
     }
-    etl.return(%0)
+    evoxc.return(%0)
   }
 }
 """
@@ -213,10 +213,10 @@ def test_op_order_and_zero_result_ops_consume_no_number():
 module @"main" version 1 {
   func @main(%arg0: tensor<2xf32>,
              %arg1: tensor<2xf32>) -> tensor<2xf32> {
-    %0 = etl.negate(%arg0) : tensor<2xf32>
-    %1 = etl.add(%arg0, %arg1) : tensor<2xf32>
-    %2 = etl.multiply(%0, %1) : tensor<2xf32>
-    etl.return(%2)
+    %0 = evoxc.negate(%arg0) : tensor<2xf32>
+    %1 = evoxc.add(%arg0, %arg1) : tensor<2xf32>
+    %2 = evoxc.multiply(%0, %1) : tensor<2xf32>
+    evoxc.return(%2)
   }
 }
 """
@@ -249,8 +249,8 @@ def test_symbolic_dim_spellings():
     expected = f"""\
 module @"main" version 1 {{
   func @main(%arg0: {tensor}) -> {tensor} {{
-    %0 = etl.stop_gradient(%arg0) : {tensor}
-    etl.return(%0)
+    %0 = evoxc.stop_gradient(%arg0) : {tensor}
+    evoxc.return(%0)
   }}
 }}
 """

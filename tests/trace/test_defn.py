@@ -1,16 +1,16 @@
-"""Tests for `@etl.defn` — the graph-definition marker decorator.
+"""Tests for `@evoxc.defn` — the graph-definition marker decorator.
 
-Contract under test (`etl/trace/defn.py` + `etl/trace/CONTEXT.md`):
-- `@etl.defn` (bare or with options) returns an `etl.Defn` that stores the
+Contract under test (`evoxc/trace/defn.py` + `evoxc/trace/CONTEXT.md`):
+- `@evoxc.defn` (bare or with options) returns an `evoxc.Defn` that stores the
   ORIGINAL function object — it does NOT wrap, so metadata is naturally
   preserved.
-- A `Defn` is NEVER callable: direct calls always raise `etl.TraceError`
-  directing to `etl.trace(defn, *specs)` / `etl.evaluate(defn, *args)`.
-- Idempotent: `etl.defn(existing_defn)` returns the same object.
-- `etl.trace` accepts a Defn and produces the same Graph as tracing the
+- A `Defn` is NEVER callable: direct calls always raise `evoxc.TraceError`
+  directing to `evoxc.trace(defn, *specs)` / `evoxc.evaluate(defn, *args)`.
+- Idempotent: `evoxc.defn(existing_defn)` returns the same object.
+- `evoxc.trace` accepts a Defn and produces the same Graph as tracing the
   plain function.
 
-Constants inside traced functions MUST be `etl.constant(etl.tensor(v,
+Constants inside traced functions MUST be `evoxc.constant(evoxc.tensor(v,
 dtype=d))` — never captured concrete Tensors (see spec-compliance tests).
 """
 
@@ -19,41 +19,41 @@ import inspect
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 
 # --- decorator forms --------------------------------------------------------
 
 
 def test_bare_decorator_returns_defn_marking_both():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    assert isinstance(f, etl.Defn)
-    assert f.__etl_defn__
-    assert f.fn.__etl_defn__
+    assert isinstance(f, evoxc.Defn)
+    assert f.__evoxc_defn__
+    assert f.fn.__evoxc_defn__
 
 
 def test_defn_stores_the_original_function_object():
     def f(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    d = etl.defn(f)
+    d = evoxc.defn(f)
 
     assert d.fn is f
 
 
 def test_options_form_stores_options_and_bare_defaults_to_empty():
     def f(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    bare = etl.defn(f)
+    bare = evoxc.defn(f)
     assert bare.options == {}
 
-    @etl.defn(compiler_hint="iree")
+    @evoxc.defn(compiler_hint="iree")
     def g(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
     assert g.options == {"compiler_hint": "iree"}
 
@@ -63,25 +63,25 @@ def test_options_form_stores_options_and_bare_defaults_to_empty():
 
 def test_defn_of_defn_is_idempotent():
     def f(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    d = etl.defn(f)
-    again = etl.defn(d)
+    d = evoxc.defn(f)
+    again = evoxc.defn(d)
 
     assert again is d
 
 
 def test_defn_fn_is_always_the_unwrapped_plain_function():
     def f(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    d = etl.defn(f)
-    again = etl.defn(d)  # unwraps — never nests Defns
+    d = evoxc.defn(f)
+    again = evoxc.defn(d)  # unwraps — never nests Defns
 
     assert d.fn is f
     assert again.fn is f
-    assert not isinstance(d.fn, etl.Defn)
-    assert not isinstance(again.fn, etl.Defn)
+    assert not isinstance(d.fn, evoxc.Defn)
+    assert not isinstance(again.fn, evoxc.Defn)
 
 
 # --- metadata preservation (defn does NOT wrap) -----------------------------
@@ -90,9 +90,9 @@ def test_defn_fn_is_always_the_unwrapped_plain_function():
 def test_defn_preserves_function_metadata():
     def f(x):
         """Add one to every element."""
-        return etl.add(x, etl.constant(etl.tensor(1.0, dtype=etl.float32)))
+        return evoxc.add(x, evoxc.constant(evoxc.tensor(1.0, dtype=evoxc.float32)))
 
-    d = etl.defn(f)
+    d = evoxc.defn(f)
 
     assert d.fn.__name__ == f.__name__
     assert d.fn.__doc__ == f.__doc__
@@ -100,9 +100,9 @@ def test_defn_preserves_function_metadata():
 
 
 def test_defn_repr_contains_function_name():
-    @etl.defn
+    @evoxc.defn
     def add_one(x):
-        return etl.add(x, etl.constant(etl.tensor(1.0, dtype=etl.float32)))
+        return evoxc.add(x, evoxc.constant(evoxc.tensor(1.0, dtype=evoxc.float32)))
 
     assert "add_one" in repr(add_one)
 
@@ -111,7 +111,7 @@ def test_defn_repr_contains_function_name():
 
 _CALL_CASES = [
     pytest.param((), id="no-args"),
-    pytest.param((etl.TensorSpec((3,), etl.float32),), id="tensor-spec"),
+    pytest.param((evoxc.TensorSpec((3,), evoxc.float32),), id="tensor-spec"),
     pytest.param(
         (np.array([1.0, 2.0, 3.0], dtype=np.float32),), id="concrete-ndarray"
     ),
@@ -119,13 +119,13 @@ _CALL_CASES = [
 
 
 @pytest.mark.parametrize("args", _CALL_CASES)
-@pytest.mark.parametrize("needle", ["etl.trace", "etl.evaluate"])
+@pytest.mark.parametrize("needle", ["evoxc.trace", "evoxc.evaluate"])
 def test_calling_defn_always_raises_traceerror_directing_to_staging(args, needle):
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    with pytest.raises(etl.TraceError, match=needle):
+    with pytest.raises(evoxc.TraceError, match=needle):
         f(*args)
 
 
@@ -133,14 +133,14 @@ def test_calling_defn_always_raises_traceerror_directing_to_staging(args, needle
 
 
 def test_trace_defn_matches_trace_plain_fn():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.add(x, etl.constant(etl.tensor(1.0, dtype=etl.float32)))
+        return evoxc.add(x, evoxc.constant(evoxc.tensor(1.0, dtype=evoxc.float32)))
 
-    spec = etl.TensorSpec((3,), etl.float32)
-    graph_from_defn = etl.trace(f, spec)
-    graph_from_fn = etl.trace(f.fn, spec)
+    spec = evoxc.TensorSpec((3,), evoxc.float32)
+    graph_from_defn = evoxc.trace(f, spec)
+    graph_from_fn = evoxc.trace(f.fn, spec)
 
-    assert etl.ir.serialize_module(graph_from_defn.module) == etl.ir.serialize_module(
+    assert evoxc.ir.serialize_module(graph_from_defn.module) == evoxc.ir.serialize_module(
         graph_from_fn.module
     )

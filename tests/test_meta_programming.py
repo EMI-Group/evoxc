@@ -1,12 +1,12 @@
 """tests/test_meta_programming.py — genetic-programming end-to-end coverage
 for the ``build_cached`` / ``CompileCache`` memoized-build sugar
-(``etl.build_cache``, Workstream C).
+(``evoxc.build_cache``, Workstream C).
 
 A miniature genetic-programming harness: an outer loop generates random
 arithmetic expression programs ENCODED AS TENSORS — integer program tensors
-produced by a small ``@etl.defn`` over ``etl.random.randint`` (one key
-``etl.random.key(base + i * gap)`` per outer iteration, materialized via
-``etl.evaluate``), prefix-decoded Python-side into static int-only tuple
+produced by a small ``@evoxc.defn`` over ``evoxc.random.randint`` (one key
+``evoxc.random.key(base + i * gap)`` per outer iteration, materialized via
+``evoxc.evaluate``), prefix-decoded Python-side into static int-only tuple
 trees. Each distinct program is built once through ``build_cached`` (keyed
 on the tree's static content BEFORE tracing) and its executable is reused
 across an inner evaluation loop over several inputs.
@@ -24,7 +24,7 @@ decode as the x leaf), so expression trees stay small. Tree node form:
 tuples. Only streams whose first token is an op (a binary-root tree that
 uses x) are accepted as programs; op nodes whose children both fold to
 Python ints are folded at trace time (an all-static subexpression must not
-reach an etl op — ops need at least one SymbolicTensor operand).
+reach an evoxc op — ops need at least one SymbolicTensor operand).
 
 Asserted end to end: ``cache.misses`` equals the number of DISTINCT trees
 over the whole outer loop; a repeated program is a hit returning the SAME
@@ -35,18 +35,18 @@ tree evaluator on multiple inputs (rtol/atol 1e-5). Two legs: the numpy
 backend (default) and iree-llvm-cpu (function-local ``importorskip``; the
 leg compiles at most two programs and re-runs the cached executable).
 
-Determinism: ``etl.random`` is key-based and stateless, so the whole outer
+Determinism: ``evoxc.random`` is key-based and stateless, so the whole outer
 loop is reproducible run to run (same seed -> same program tensors).
 """
 
 import numpy as np
 import pytest
 
-import etl
-from etl.build_cache import CompileCache, build_cached
+import evoxc
+from evoxc.build_cache import CompileCache, build_cached
 
-SPEC = etl.TensorSpec((4,), etl.float32)
-SPEC2 = etl.TensorSpec((2,), etl.float32)  # different-spec leg
+SPEC = evoxc.TensorSpec((4,), evoxc.float32)
+SPEC2 = evoxc.TensorSpec((2,), evoxc.float32)  # different-spec leg
 
 # -- outer-loop sizing (small: 10 numpy programs, 2 iree compiles) ---------
 NUM_PROGRAMS = 10
@@ -72,17 +72,17 @@ EVAL_INPUTS = np.array(
 
 _FOLD = {1: lambda a, b: a + b, 2: lambda a, b: a - b,
          3: lambda a, b: a * b, 4: max}
-_ETL_OPS = {1: etl.add, 2: etl.subtract, 3: etl.multiply, 4: etl.maximum}
+_EVOXC_OPS = {1: evoxc.add, 2: evoxc.subtract, 3: evoxc.multiply, 4: evoxc.maximum}
 
 
-# -- trace-time composition: static tree -> etl op expression ---------------
+# -- trace-time composition: static tree -> evoxc op expression ---------------
 def _compose(tree, x):
-    """Decode a static tree into an etl op expression over ``x``.
+    """Decode a static tree into an evoxc op expression over ``x``.
 
     Runs as plain Python at trace time. Int-only subtrees fold to Python
-    ints; an etl op is only emitted when at least one side is symbolic
+    ints; an evoxc op is only emitted when at least one side is symbolic
     (tree programs always contain the x leaf, so the root never folds to a
-    bare int). Constant leaves reach etl ops as Python scalars.
+    bare int). Constant leaves reach evoxc ops as Python scalars.
     """
     if not isinstance(tree, tuple):
         return x if tree == 0 else tree
@@ -91,10 +91,10 @@ def _compose(tree, x):
     b = _compose(right, x)
     if isinstance(a, int) and isinstance(b, int):
         return _FOLD[op](a, b)
-    return _ETL_OPS[op](a, b)
+    return _EVOXC_OPS[op](a, b)
 
 
-@etl.defn
+@evoxc.defn
 def _step(x, tree):
     """Apply the static tree program to x.
 
@@ -105,17 +105,17 @@ def _step(x, tree):
 
 
 # -- program generation: random trees encoded as tensors --------------------
-@etl.defn
+@evoxc.defn
 def _gen(k):
     """One random program tensor: TOKENS_PER_PROGRAM int32 tokens."""
-    return etl.random.randint(
-        k, shape=(TOKENS_PER_PROGRAM,), low=-5, high=5, dtype=etl.int32
+    return evoxc.random.randint(
+        k, shape=(TOKENS_PER_PROGRAM,), low=-5, high=5, dtype=evoxc.int32
     )
 
 
 def _materialize(seed):
     """Run the generator for ``seed`` -> token list (deterministic)."""
-    return etl.evaluate(_gen, etl.random.key(seed)).numpy().tolist()
+    return evoxc.evaluate(_gen, evoxc.random.key(seed)).numpy().tolist()
 
 
 def _decode(tokens, depth=0):
@@ -167,8 +167,8 @@ def _np_eval(tree, x):
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """No ETL_* defaults leak into per-call backend/device resolution."""
-    for var in ("ETL_BACKEND", "ETL_DEVICE", "ETL_TARGET_BACKENDS"):
+    """No EVOXC_* defaults leak into per-call backend/device resolution."""
+    for var in ("EVOXC_BACKEND", "EVOXC_DEVICE", "EVOXC_TARGET_BACKENDS"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -196,7 +196,7 @@ class TestMetaLoopNumpy:
 
             # Inner evaluation loop over several inputs with numpy parity.
             for x in EVAL_INPUTS:
-                got = etl.run(exe, x, tree).numpy().astype(np.float64)
+                got = evoxc.run(exe, x, tree).numpy().astype(np.float64)
                 ref = _np_eval(tree, x.astype(np.float64))
                 assert np.allclose(got, ref, rtol=1e-5, atol=1e-5), (tree, x)
 
@@ -242,7 +242,7 @@ class TestMetaLoopNumpy:
 
         # And the cached executable still runs fine on fresh inputs.
         for x in EVAL_INPUTS:
-            got = etl.run(exe_regen, x, last_tree).numpy().astype(np.float64)
+            got = evoxc.run(exe_regen, x, last_tree).numpy().astype(np.float64)
             assert np.allclose(
                 got, _np_eval(last_tree, x.astype(np.float64)),
                 rtol=1e-5, atol=1e-5,
@@ -262,7 +262,7 @@ class TestMetaLoopNumpy:
         assert cache.hits == 1 and cache.misses == 2
 
         x2 = np.array([1.0, -3.0], dtype=np.float32)
-        got = etl.run(exe_small, x2, tree).numpy().astype(np.float64)
+        got = evoxc.run(exe_small, x2, tree).numpy().astype(np.float64)
         assert np.allclose(got, _np_eval(tree, x2.astype(np.float64)),
                            rtol=1e-5, atol=1e-5)
 
@@ -280,14 +280,14 @@ class TestMetaLoopNumpy:
 
         wrong = next((t for t in trees if t != trees[-1]), None)
         assert wrong is not None  # several distinct programs were generated
-        with pytest.raises(etl.TraceError):
-            etl.run(exes[trees[-1]], EVAL_INPUTS[0], wrong)
+        with pytest.raises(evoxc.TraceError):
+            evoxc.run(exes[trees[-1]], EVAL_INPUTS[0], wrong)
 
         # A structurally different static program is rejected as well.
-        with pytest.raises(etl.TraceError):
-            etl.run(exes[trees[-1]], EVAL_INPUTS[0], (2, 0))
+        with pytest.raises(evoxc.TraceError):
+            evoxc.run(exes[trees[-1]], EVAL_INPUTS[0], (2, 0))
         # And the right program still runs — nothing was corrupted.
-        got = etl.run(exes[trees[-1]], EVAL_INPUTS[0], trees[-1]).numpy()
+        got = evoxc.run(exes[trees[-1]], EVAL_INPUTS[0], trees[-1]).numpy()
         assert got.shape == (4,)
 
 
@@ -303,7 +303,7 @@ class TestMetaLoopIree:
         pytest.importorskip("iree.compiler")
         pytest.importorskip("iree.runtime")
 
-        device = etl.Device("cpu", 0)
+        device = evoxc.Device("cpu", 0)
         cache = CompileCache()
         exes = {}
         seen = set()
@@ -323,7 +323,7 @@ class TestMetaLoopIree:
             # One inner evaluation loop over several inputs on the cached
             # (device-resident-agnostic llvm-cpu) executable.
             for x in EVAL_INPUTS:
-                got = etl.run(exe, x, tree).numpy().astype(np.float64)
+                got = evoxc.run(exe, x, tree).numpy().astype(np.float64)
                 ref = _np_eval(tree, x.astype(np.float64))
                 assert np.allclose(got, ref, rtol=1e-5, atol=1e-5), (tree, x)
 
@@ -340,7 +340,7 @@ class TestMetaLoopIree:
 
         # The cached iree executable keeps running on fresh inputs.
         for x in EVAL_INPUTS:
-            got = etl.run(again, x, last_tree).numpy().astype(np.float64)
+            got = evoxc.run(again, x, last_tree).numpy().astype(np.float64)
             assert np.allclose(
                 got, _np_eval(last_tree, x.astype(np.float64)),
                 rtol=1e-5, atol=1e-5,

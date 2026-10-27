@@ -1,8 +1,8 @@
 """PJRT ctypes layer tests driven by a FAKE PJRT plugin (built at test time).
 
-The xla adapter (``etl/backends/adapters/xla.py``) drives a USER-PROVIDED
+The xla adapter (``evoxc/backends/adapters/xla.py``) drives a USER-PROVIDED
 PJRT C API plugin (``.so`` exporting ``GetPjRtApi``) through pure-stdlib
-ctypes (``etl/backends/adapters/_pjrt_c_api.py`` + ``xla_util.py``). A real
+ctypes (``evoxc/backends/adapters/_pjrt_c_api.py`` + ``xla_util.py``). A real
 XLA plugin is not pip-installable and is absent from CI, so this file builds
 a small FAKE plugin (``_fake_pjrt_plugin.c``, gcc) that satisfies the same
 ABI contract and exercises the whole ctypes driver + backend plumbing for
@@ -10,7 +10,7 @@ real:
 
 * ABI/version gate: ``verify_api`` accepts the fake (struct_size == 1144,
   API major 0) and rejects deliberately broken builds (wrong struct_size,
-  wrong major version) with ``etl.BackendError``.
+  wrong major version) with ``evoxc.BackendError``.
 * Full driver plumbing through the real backend: ``XlaBackend``
   lower/compile/load/run against the fake, plus artifact save/load
   round-trips. The fake parses the entry function's result types from the
@@ -18,7 +18,7 @@ real:
   shapes/dtypes — so shape/dtype/plumbing are asserted, numerical parity is
   intentionally out of scope (the fake performs no computation).
 * Error reporting: an env-var-injected plugin failure raises
-  ``etl.BackendError`` carrying the plugin's message text.
+  ``evoxc.BackendError`` carrying the plugin's message text.
 
 The fake is built at collection-adjacent runtime: when no C compiler is
 available (or the build fails) the module skips with ``pytest.skip`` —
@@ -33,10 +33,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import etl
-from etl.backends.adapters import _pjrt_c_api as pjrt
-from etl.backends.adapters import xla
-from etl.backends.adapters import xla_util
+import evoxc
+from evoxc.backends.adapters import _pjrt_c_api as pjrt
+from evoxc.backends.adapters import xla
+from evoxc.backends.adapters import xla_util
 
 from tests.backends import _adapter_utils as u
 
@@ -77,7 +77,7 @@ def wrong_size_plugin(tmp_path_factory):
     return _build_plugin(
         tmp_path_factory.mktemp("fake_pjrt_plugin_wrong_size"),
         "fake_pjrt_plugin_wrong_size.so",
-        defines=("ETL_FAKE_PJRT_STRUCT_SIZE=600",),
+        defines=("EVOXC_FAKE_PJRT_STRUCT_SIZE=600",),
     )
 
 
@@ -87,7 +87,7 @@ def wrong_major_plugin(tmp_path_factory):
     return _build_plugin(
         tmp_path_factory.mktemp("fake_pjrt_plugin_wrong_major"),
         "fake_pjrt_plugin_wrong_major.so",
-        defines=("ETL_FAKE_PJRT_MAJOR_VERSION=1",),
+        defines=("EVOXC_FAKE_PJRT_MAJOR_VERSION=1",),
     )
 
 
@@ -117,13 +117,13 @@ def test_version_gate_passes_against_fake(fake_plugin):
 
 def test_version_gate_rejects_wrong_struct_size(wrong_size_plugin):
     """A too-small PJRT_Api struct is rejected naming struct_size."""
-    with pytest.raises(etl.BackendError, match="struct_size is 600"):
+    with pytest.raises(evoxc.BackendError, match="struct_size is 600"):
         xla_util._load_plugin({"plugin_path": str(wrong_size_plugin)})
 
 
 def test_version_gate_rejects_wrong_major(wrong_major_plugin):
     """A plugin compiled against another ABI family is rejected explicitly."""
-    with pytest.raises(etl.BackendError, match="ABI mismatch"):
+    with pytest.raises(evoxc.BackendError, match="ABI mismatch"):
         xla_util._load_plugin({"plugin_path": str(wrong_major_plugin)})
 
 
@@ -160,12 +160,12 @@ def test_close_one_executable_keeps_shared_client(tmp_path, monkeypatch):
     """Loaded executables share the client; closing one executable keeps
     the client alive for the others and destroys it only at the last close."""
     plug = _build_plugin(tmp_path, "fake_shared_client_2.so")
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(plug))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(plug))
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, plug)
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)
-    backend = etl.backends.get(NAME)
+    expected = evoxc.evaluate(fn, a, b)
+    backend = evoxc.backends.get(NAME)
     exe1 = backend.load(artifact)
     exe2 = backend.load(artifact)
     assert exe1._client is exe2._client  # one shared client per plugin path
@@ -173,7 +173,7 @@ def test_close_one_executable_keeps_shared_client(tmp_path, monkeypatch):
     exe1.close()
     assert exe1._client is None
     # exe2 still holds the remaining reference — it must still run.
-    (out,) = exe2.run([etl.tensor(a), etl.tensor(b)])
+    (out,) = exe2.run([evoxc.tensor(a), evoxc.tensor(b)])
     np.testing.assert_array_equal(out.numpy(), np.zeros_like(expected.numpy()))
     exe2.close()
     assert shared.closed  # the last close destroyed the shared client
@@ -186,16 +186,16 @@ def test_close_one_executable_keeps_shared_client(tmp_path, monkeypatch):
 
 def _compile_fake(fn, specs, fake_plugin):
     """trace -> lower(backend="xla") -> compile with plugin_path=..."""
-    graph = etl.trace(fn, *specs)
-    lowered = etl.lower(graph, backend=NAME)
-    return etl.compile(lowered, plugin_path=str(fake_plugin))
+    graph = evoxc.trace(fn, *specs)
+    lowered = evoxc.lower(graph, backend=NAME)
+    return evoxc.compile(lowered, plugin_path=str(fake_plugin))
 
 
 def test_compile_load_run_and_save_load_roundtrip(fake_plugin, tmp_path, monkeypatch):
     """XlaBackend compile/load/run + artifact save/load against the fake."""
-    # Load-path plugin discovery goes through the ETL_PJRT_PLUGIN env var
+    # Load-path plugin discovery goes through the EVOXC_PJRT_PLUGIN env var
     # (compile above uses the explicit plugin_path option).
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_plugin))
 
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, fake_plugin)
@@ -205,37 +205,37 @@ def test_compile_load_run_and_save_load_roundtrip(fake_plugin, tmp_path, monkeyp
     assert isinstance(payload["executable_base64"], str)
 
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)  # numpy reference (shape/dtype only)
+    expected = evoxc.evaluate(fn, a, b)  # numpy reference (shape/dtype only)
 
     # Save / load round-trip at pipeline level (deserialize path).
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
-    loaded_artifact = etl.backends.CompiledArtifact.load(path)
-    exe = etl.load(loaded_artifact)
+    loaded_artifact = evoxc.backends.CompiledArtifact.load(path)
+    exe = evoxc.load(loaded_artifact)
     assert "main" in exe.functions
-    out = etl.run(exe, a, b)
-    assert isinstance(out, etl.Tensor)
+    out = evoxc.run(exe, a, b)
+    assert isinstance(out, evoxc.Tensor)
     assert out.dtype == expected.dtype
     assert out.shape == expected.shape
     # The fake performs no computation: outputs are zero-filled.
     np.testing.assert_array_equal(out.numpy(), np.zeros_like(expected.numpy()))
 
-    # Backend-level raw reload + run over flat etl.Tensor inputs.
-    backend = etl.backends.get(NAME)
+    # Backend-level raw reload + run over flat evoxc.Tensor inputs.
+    backend = evoxc.backends.get(NAME)
     raw = backend.load(artifact)
-    (raw_out,) = raw.run([etl.tensor(a), etl.tensor(b)])
+    (raw_out,) = raw.run([evoxc.tensor(a), evoxc.tensor(b)])
     np.testing.assert_array_equal(raw_out.numpy(), np.zeros_like(expected.numpy()))
 
 
 def test_multi_dim_output_against_fake(fake_plugin, monkeypatch):
     """A 4-D output exercises the MLIR result-type parse beyond scalars."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_plugin))
     fn, specs = u.reshape_broadcast_transpose()
     x = u.standard_normal((4, 8))
     artifact = _compile_fake(fn, specs, fake_plugin)
-    exe = etl.load(artifact)
-    expected = etl.evaluate(fn, x)
-    out = etl.run(exe, x)
+    exe = evoxc.load(artifact)
+    expected = evoxc.evaluate(fn, x)
+    out = evoxc.run(exe, x)
     assert out.dtype == expected.dtype
     assert out.shape == expected.shape
     np.testing.assert_array_equal(out.numpy(), np.zeros_like(expected.numpy()))
@@ -243,17 +243,17 @@ def test_multi_dim_output_against_fake(fake_plugin, monkeypatch):
 
 def test_multi_output_graph_against_fake(fake_plugin, monkeypatch):
     """A tuple-returning graph exercises the parenthesized result list."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_plugin))
 
     def fn(x):
-        return etl.add(x, x), etl.multiply(x, 2.0)
+        return evoxc.add(x, x), evoxc.multiply(x, 2.0)
 
-    specs = (etl.TensorSpec((2, 3), etl.float32),)
+    specs = (evoxc.TensorSpec((2, 3), evoxc.float32),)
     artifact = _compile_fake(fn, specs, fake_plugin)
-    exe = etl.load(artifact)
+    exe = evoxc.load(artifact)
     x = u.standard_normal((2, 3))
-    expected = etl.evaluate(fn, x)
-    outs = etl.run(exe, x)
+    expected = evoxc.evaluate(fn, x)
+    outs = evoxc.run(exe, x)
     assert isinstance(outs, tuple) and len(outs) == 2
     for got, want in zip(outs, expected):
         assert got.dtype == want.dtype
@@ -268,22 +268,22 @@ def test_multi_output_graph_against_fake(fake_plugin, monkeypatch):
 
 def test_injected_compile_error_raises_backend_error(fake_plugin, monkeypatch):
     """A failing PJRT_Client_Compile surfaces as BackendError with the message."""
-    monkeypatch.setenv("ETL_FAKE_PJRT_FAIL_STEP", "PJRT_Client_Compile")
-    monkeypatch.setenv("ETL_FAKE_PJRT_FAIL_MESSAGE", "fake compile failure")
+    monkeypatch.setenv("EVOXC_FAKE_PJRT_FAIL_STEP", "PJRT_Client_Compile")
+    monkeypatch.setenv("EVOXC_FAKE_PJRT_FAIL_MESSAGE", "fake compile failure")
     fn, specs = u.matmul_relu_sum()
-    lowered = etl.lower(etl.trace(fn, *specs), backend=NAME)
-    with pytest.raises(etl.BackendError, match="fake compile failure"):
-        etl.compile(lowered, plugin_path=str(fake_plugin))
+    lowered = evoxc.lower(evoxc.trace(fn, *specs), backend=NAME)
+    with pytest.raises(evoxc.BackendError, match="fake compile failure"):
+        evoxc.compile(lowered, plugin_path=str(fake_plugin))
 
 
 def test_injected_execute_error_raises_backend_error(fake_plugin, monkeypatch):
     """A failing PJRT_LoadedExecutable_Execute surfaces at run time."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_plugin))
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, fake_plugin)
-    exe = etl.load(artifact)
-    monkeypatch.setenv("ETL_FAKE_PJRT_FAIL_STEP", "PJRT_LoadedExecutable_Execute")
-    monkeypatch.setenv("ETL_FAKE_PJRT_FAIL_MESSAGE", "fake execute failure")
+    exe = evoxc.load(artifact)
+    monkeypatch.setenv("EVOXC_FAKE_PJRT_FAIL_STEP", "PJRT_LoadedExecutable_Execute")
+    monkeypatch.setenv("EVOXC_FAKE_PJRT_FAIL_MESSAGE", "fake execute failure")
     a, b = u.matmul_relu_sum_args()
-    with pytest.raises(etl.BackendError, match="fake execute failure"):
-        etl.run(exe, a, b)
+    with pytest.raises(evoxc.BackendError, match="fake execute failure"):
+        evoxc.run(exe, a, b)

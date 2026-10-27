@@ -20,13 +20,13 @@ helper gives the ROCm counterpart of that guard, WITHOUT ``nvidia-smi``:
   ROCm userspace tool (``rocminfo`` / ``rocm-smi`` / ``amdgpu-arch`` /
   ``rocm_agent_enumerator``) is on ``PATH``. It never decides availability
   on its own (``amdgpu-arch`` in particular is frequently absent).
-* etl ``Device("rocm", idx)`` maps to IREE's 1-based ``hip`` driver
+* evoxc ``Device("rocm", idx)`` maps to IREE's 1-based ``hip`` driver
   ``device_id = idx + 1`` (the same convention as the cuda guard), and
-  ``"hip"`` is an accepted etl alias for the ``"rocm"`` kind that resolves
+  ``"hip"`` is an accepted evoxc alias for the ``"rocm"`` kind that resolves
   to the very same execution path while PRESERVING the ``"hip"`` label.
 
 The module is importable with or without ``iree`` installed: all IREE (and
-``etl``) imports are lazy, inside the functions.
+``evoxc``) imports are lazy, inside the functions.
 """
 
 from __future__ import annotations
@@ -83,9 +83,9 @@ def rocm_device_count() -> int:
 
 
 def available_rocm_indices() -> list:
-    """etl device indices (IREE ``device_id`` - 1) of the usable ROCm devices.
+    """evoxc device indices (IREE ``device_id`` - 1) of the usable ROCm devices.
 
-    IREE's ``hip`` driver reports 1-based ``device_id`` s; etl
+    IREE's ``hip`` driver reports 1-based ``device_id`` s; evoxc
     ``Device("rocm", idx)`` therefore corresponds to ``device_id = idx + 1``.
     Malformed entries are skipped rather than crashing the guard.
     """
@@ -126,18 +126,18 @@ def unavailable_reason() -> str:
 
 
 def rocm_device(index: int = 0, kind: str = "rocm"):
-    """The etl ``Device`` for ROCm index ``index``.
+    """The evoxc ``Device`` for ROCm index ``index``.
 
     ``kind`` defaults to the canonical ``"rocm"``; ``"hip"`` is the accepted
     alias (same execution path, label preserved).
     """
-    import etl
+    import evoxc
 
-    return etl.core.Device(kind, index)
+    return evoxc.core.Device(kind, index)
 
 
 def pick_rocm_device_index() -> int:
-    """etl index of the first usable ROCm device; ``pytest.skip`` otherwise."""
+    """evoxc index of the first usable ROCm device; ``pytest.skip`` otherwise."""
     require_rocm()
     return available_rocm_indices()[0]
 
@@ -148,7 +148,7 @@ def pick_rocm_device_index() -> int:
 
 
 def require_rocm(index: int = 0, kind: str = "rocm"):
-    """``pytest.skip`` unless a ROCm device is usable; return the etl device.
+    """``pytest.skip`` unless a ROCm device is usable; return the evoxc device.
 
     Gating a test on the return value keeps the guard and the device it
     guards in lock-step::

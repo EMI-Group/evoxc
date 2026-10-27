@@ -1,10 +1,10 @@
 """Contract tests for the numeric / creation ops batch.
 
-Covers ``etl.ops.structural.isnan``, ``nan_to_num``, ``eye``, ``linspace`` and
-``etl.ops.linalg.cumprod`` (the 15-op batch; ``clamp`` lives in
-``test_structural.py``). The etl package (repo-root sibling) is fully
+Covers ``evoxc.ops.structural.isnan``, ``nan_to_num``, ``eye``, ``linspace`` and
+``evoxc.ops.linalg.cumprod`` (the 15-op batch; ``clamp`` lives in
+``test_structural.py``). The evoxc package (repo-root sibling) is fully
 implemented; these tests assert the per-op contracts documented in the
-``etl/ops/structural.py`` / ``etl/ops/linalg.py`` docstrings:
+``evoxc/ops/structural.py`` / ``evoxc/ops/linalg.py`` docstrings:
 
 - ``isnan``: composition over ``not_equal(x, x)`` → bool tensor (no dedicated
   IR op); complex is NaN when the real OR imaginary part is NaN; integer
@@ -17,10 +17,10 @@ implemented; these tests assert the per-op contracts documented in the
   (mirrors ``cumsum``); bool → int64 (explicit frontend pre-cast); other
   dtypes preserved; accumulates in the operand dtype (numpy-2-proof).
 - ``eye``: GRAPH creation op (Constant composition, the ``enp`` pattern) —
-  NOT a concrete creator like ``etl.zeros``; default dtype float32 (the etl
+  NOT a concrete creator like ``evoxc.zeros``; default dtype float32 (the evoxc
   creation convention).
 - ``linspace``: GRAPH creation op (Constant composition); default dtype
-  float64 — a DELIBERATE deviation from the etl float32 creation convention
+  float64 — a DELIBERATE deviation from the evoxc float32 creation convention
   for numpy exactness (documented in the op docstring); symbolic
   ``Dim``/``DimExpr`` bounds raise ``TraceError`` (deferred to v2, like
   ``enp.arange``); a SymbolicTensor bound falls through to the number check
@@ -31,7 +31,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 
@@ -53,23 +53,23 @@ def _trace_capturing(fn, *specs):
         captured["out"] = out
         return out
 
-    graph = etl.trace(wrapped, *specs)
+    graph = evoxc.trace(wrapped, *specs)
     return graph, captured["out"]
 
 
 def _concrete_tensor_operand(op_call):
     """Assert the mandated three-option TraceError for a concrete Tensor
     operand passed INSIDE a trace."""
-    with pytest.raises(etl.TraceError) as exc:
-        trace_fn(lambda: op_call(etl.tensor(np.ones((2, 3), np.float32))))
+    with pytest.raises(evoxc.TraceError) as exc:
+        trace_fn(lambda: op_call(evoxc.tensor(np.ones((2, 3), np.float32))))
     message = str(exc.value)
     assert message.startswith(
         "Concrete Tensor operands are not allowed in graph ops "
-        "(etl has no eager mode)"
+        "(evoxc has no eager mode)"
     )
     assert "explicit input" in message
-    assert "etl.constant" in message
-    assert "etl.evaluate" in message
+    assert "evoxc.constant" in message
+    assert "evoxc.evaluate" in message
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def _concrete_tensor_operand(op_call):
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_isnan_numerics_vs_numpy(dtype):
     def f(x):
-        return etl.isnan(x)
+        return evoxc.isnan(x)
 
     x = np.array([1.0, np.nan, np.inf, -np.inf, 2.5], dtype=dtype)
     got = run_numpy(f, x)
@@ -91,7 +91,7 @@ def test_isnan_numerics_vs_numpy(dtype):
 def test_isnan_int_input_is_all_false(dtype):
     """Integer tensors cannot hold NaN — every entry is False (bool dtype)."""
     def f(x):
-        return etl.isnan(x)
+        return evoxc.isnan(x)
 
     x = np.array([1, -2, 3, 0], dtype=dtype)
     got = run_numpy(f, x)
@@ -103,7 +103,7 @@ def test_isnan_int_input_is_all_false(dtype):
 def test_isnan_complex_nan_in_either_part_is_true():
     """Complex semantics: NaN in the real OR imaginary part → True."""
     def f(x):
-        return etl.isnan(x)
+        return evoxc.isnan(x)
 
     x = np.array([
         1 + 2j,             # finite
@@ -119,10 +119,10 @@ def test_isnan_complex_nan_in_either_part_is_true():
 
 def test_isnan_2d_output_shape_and_dtype():
     def f(x):
-        return etl.isnan(x)
+        return evoxc.isnan(x)
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec((2, 3), etl.float64))
+        f, evoxc.TensorSpec((2, 3), evoxc.float64))
     assert [op.name for op in ops_of(graph)] == ["not_equal", "return"]
     assert out.dtype == np.bool_
     assert out.shape == (2, 3)
@@ -132,12 +132,12 @@ def test_isnan_2d_output_shape_and_dtype():
 
 
 def test_isnan_outside_trace_raises_traceerror():
-    with pytest.raises(etl.TraceError):
-        etl.isnan(np.array([1.0, np.nan], dtype=np.float32))
+    with pytest.raises(evoxc.TraceError):
+        evoxc.isnan(np.array([1.0, np.nan], dtype=np.float32))
 
 
 def test_isnan_concrete_tensor_operand_raises_traceerror():
-    _concrete_tensor_operand(etl.isnan)
+    _concrete_tensor_operand(evoxc.isnan)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def test_nan_to_num_defaults_vs_numpy(dtype):
     """Default replacements: nan→0.0, +inf→dtype max finite, -inf→dtype min
     finite (``None`` = the numpy defaults)."""
     def f(x):
-        return etl.nan_to_num(x)
+        return evoxc.nan_to_num(x)
 
     x = np.array([1.5, np.nan, np.inf, -np.inf], dtype=dtype)
     got = run_numpy(f, x)
@@ -163,7 +163,7 @@ def test_nan_to_num_defaults_vs_numpy(dtype):
 
 def test_nan_to_num_explicit_nan_replacement():
     def f(x):
-        return etl.nan_to_num(x, nan=1.5)
+        return evoxc.nan_to_num(x, nan=1.5)
 
     x = np.array([1.0, np.nan, np.inf, -np.inf], dtype=np.float32)
     np.testing.assert_array_equal(run_numpy(f, x), np.nan_to_num(x, nan=1.5))
@@ -173,7 +173,7 @@ def test_nan_to_num_posinf_given_leaves_neginf_alone():
     """Only the corresponding infinity is replaced: ``posinf=1`` must leave
     -inf untouched (the numpy per-argument semantics)."""
     def f(x):
-        return etl.nan_to_num(x, nan=0.0, posinf=1.0)
+        return evoxc.nan_to_num(x, nan=0.0, posinf=1.0)
 
     x = np.array([1.0, np.nan, np.inf, -np.inf], dtype=np.float32)
     got = run_numpy(f, x)
@@ -184,7 +184,7 @@ def test_nan_to_num_posinf_given_leaves_neginf_alone():
 
 def test_nan_to_num_neginf_given_leaves_posinf_alone():
     def f(x):
-        return etl.nan_to_num(x, nan=0.0, neginf=-1.0)
+        return evoxc.nan_to_num(x, nan=0.0, neginf=-1.0)
 
     x = np.array([1.0, np.nan, np.inf, -np.inf], dtype=np.float32)
     got = run_numpy(f, x)
@@ -195,7 +195,7 @@ def test_nan_to_num_neginf_given_leaves_posinf_alone():
 
 def test_nan_to_num_both_infinity_replacements():
     def f(x):
-        return etl.nan_to_num(x, nan=5.0, posinf=7.0, neginf=-7.0)
+        return evoxc.nan_to_num(x, nan=5.0, posinf=7.0, neginf=-7.0)
 
     x = np.array([1.0, np.nan, np.inf, -np.inf], dtype=np.float32)
     np.testing.assert_array_equal(
@@ -205,7 +205,7 @@ def test_nan_to_num_both_infinity_replacements():
 def test_nan_to_num_int_input_passthrough():
     """Integer input has no NaN/inf values — passes through unchanged."""
     def f(x):
-        return etl.nan_to_num(x)
+        return evoxc.nan_to_num(x)
 
     x = np.array([[1, -2, 3], [4, 5, -6]], dtype=np.int32)
     got = run_numpy(f, x)
@@ -215,9 +215,9 @@ def test_nan_to_num_int_input_passthrough():
 
 def test_nan_to_num_2d_dtype_and_shape_preserved():
     def f(x):
-        return etl.nan_to_num(x)
+        return evoxc.nan_to_num(x)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3), etl.float32))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3), evoxc.float32))
     assert [op.name for op in ops_of(graph)] == ["nan_to_num", "return"]
     assert out.dtype == np.float32
     assert out.shape == (2, 3)
@@ -235,17 +235,17 @@ def test_nan_to_num_2d_dtype_and_shape_preserved():
 def test_nan_to_num_invalid_replacement_type(kwargs):
     with pytest.raises(TypeError, match=r"nan_to_num: (nan|posinf|neginf) "
                                         r"must be an int/float"):
-        trace_fn(lambda x: etl.nan_to_num(x, **kwargs),
-                 etl.TensorSpec((3,), etl.float32))
+        trace_fn(lambda x: evoxc.nan_to_num(x, **kwargs),
+                 evoxc.TensorSpec((3,), evoxc.float32))
 
 
 def test_nan_to_num_outside_trace_raises_traceerror():
-    with pytest.raises(etl.TraceError):
-        etl.nan_to_num(np.array([1.0, np.nan], dtype=np.float32))
+    with pytest.raises(evoxc.TraceError):
+        evoxc.nan_to_num(np.array([1.0, np.nan], dtype=np.float32))
 
 
 def test_nan_to_num_concrete_tensor_operand_raises_traceerror():
-    _concrete_tensor_operand(etl.nan_to_num)
+    _concrete_tensor_operand(evoxc.nan_to_num)
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +253,14 @@ def test_nan_to_num_concrete_tensor_operand_raises_traceerror():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
-@pytest.mark.parametrize("dtype", [etl.float64, etl.float32, etl.int32])
+@pytest.mark.parametrize("dtype", [evoxc.float64, evoxc.float32, evoxc.int32])
 def test_cumprod_numerics_vs_numpy(axis, dtype):
     def f(x):
-        return etl.cumprod(x, axis=axis)
+        return evoxc.cumprod(x, axis=axis)
 
     x = np.arange(1, 13).reshape(3, 4).astype(dtype)
     got = run_numpy(f, x)
-    # dtype is preserved exactly (numpy >= 2 upcasts int32 cumprod — the etl
+    # dtype is preserved exactly (numpy >= 2 upcasts int32 cumprod — the evoxc
     # contract explicitly accumulates in the operand dtype).
     assert got.dtype == np.dtype(dtype)
     np.testing.assert_array_equal(got, np.cumprod(x, axis=axis, dtype=x.dtype))
@@ -270,7 +270,7 @@ def test_cumprod_int8_dtype_preserved():
     """int8 accumulation stays in int8 — small values keep results in range
     (the kernel calls np.cumprod with dtype=arr.dtype)."""
     def f(x):
-        return etl.cumprod(x, axis=1)
+        return evoxc.cumprod(x, axis=1)
 
     x = np.array([[1, 1, 2], [2, 2, 3]], dtype=np.int8)
     got = run_numpy(f, x)
@@ -282,9 +282,9 @@ def test_cumprod_bool_promotes_to_int64():
     """Documented rule: bool → int64, implemented as an explicit pre-cast
     (mirror of cumsum)."""
     def f(x):
-        return etl.cumprod(x, axis=1)
+        return evoxc.cumprod(x, axis=1)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3), etl.bool_))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3), evoxc.bool_))
     names = [op.name for op in ops_of(graph)]
     assert names == ["cast", "cumprod", "return"]
     assert out.dtype == np.int64
@@ -299,7 +299,7 @@ def test_cumprod_reverse_scans_from_the_end(axis):
     """``reverse=True`` is documented as "scan from the end toward the start",
     i.e. out[i] = prod(x[i:]) — equivalently flip(cumprod(flip(x)))."""
     def f(x):
-        return etl.cumprod(x, axis=axis, reverse=True)
+        return evoxc.cumprod(x, axis=axis, reverse=True)
 
     x = np.array([[1.5, 2.0, 0.5], [3.0, -2.0, 4.0]], dtype=np.float64)
     expected = np.flip(np.cumprod(np.flip(x, axis=axis), axis=axis), axis=axis)
@@ -308,7 +308,7 @@ def test_cumprod_reverse_scans_from_the_end(axis):
 
 def test_cumprod_reverse_1d():
     def f(x):
-        return etl.cumprod(x, axis=0, reverse=True)
+        return evoxc.cumprod(x, axis=0, reverse=True)
 
     x = np.array([2.0, 3.0, 4.0], dtype=np.float64)
     expected = np.flip(np.cumprod(np.flip(x, axis=0), axis=0), axis=0)
@@ -318,7 +318,7 @@ def test_cumprod_reverse_1d():
 
 def test_cumprod_scalar_is_identity():
     def f(x):
-        return etl.cumprod(x, axis=0)
+        return evoxc.cumprod(x, axis=0)
 
     got = run_numpy(f, np.array(3.5, dtype=np.float32))
     assert got.shape == ()
@@ -327,25 +327,25 @@ def test_cumprod_scalar_is_identity():
 
 
 def test_cumprod_errors():
-    with pytest.raises(etl.ShapeError, match="axis 3 out of range for rank 2"):
-        etl.trace(lambda x: etl.cumprod(x, axis=3),
-                  etl.TensorSpec((2, 3), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="axis 3 out of range for rank 2"):
+        evoxc.trace(lambda x: evoxc.cumprod(x, axis=3),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError,
                        match="axes must be None, an int, or a tuple of ints"):
-        etl.trace(lambda x: etl.cumprod(x, axis=1.5),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: evoxc.cumprod(x, axis=1.5),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError, match="cumprod: reverse must be a bool"):
-        etl.trace(lambda x: etl.cumprod(x, axis=0, reverse="yes"),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: evoxc.cumprod(x, axis=0, reverse="yes"),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 def test_cumprod_outside_trace_raises_traceerror():
-    with pytest.raises(etl.TraceError):
-        etl.cumprod(np.ones((2, 3), dtype=np.float32))
+    with pytest.raises(evoxc.TraceError):
+        evoxc.cumprod(np.ones((2, 3), dtype=np.float32))
 
 
 def test_cumprod_concrete_tensor_operand_raises_traceerror():
-    _concrete_tensor_operand(etl.cumprod)
+    _concrete_tensor_operand(evoxc.cumprod)
 
 
 # ---------------------------------------------------------------------------
@@ -355,10 +355,10 @@ def test_cumprod_concrete_tensor_operand_raises_traceerror():
 def test_eye_default_dtype_is_float32():
     """Creation-op convention: default dtype float32 (PINNED)."""
     def f():
-        return etl.eye(3)
+        return evoxc.eye(3)
 
     graph, out = _trace_capturing(f)
-    assert isinstance(out, etl.SymbolicTensor)
+    assert isinstance(out, evoxc.SymbolicTensor)
     assert out.dtype == np.float32
     assert out.shape == (3, 3)
     assert [op.name for op in ops_of(graph)] == ["constant", "return"]
@@ -372,7 +372,7 @@ def test_eye_default_dtype_is_float32():
                                    np.float64, np.float32])
 def test_eye_explicit_dtypes_vs_numpy(dtype):
     def f():
-        return etl.eye(4, dtype=dtype)
+        return evoxc.eye(4, dtype=dtype)
 
     got = run_numpy(f)
     assert got.dtype == np.dtype(dtype)
@@ -382,7 +382,7 @@ def test_eye_explicit_dtypes_vs_numpy(dtype):
 @pytest.mark.parametrize("n, m", [(2, 4), (4, 2)])
 def test_eye_rectangular(n, m):
     def f():
-        return etl.eye(n, m)
+        return evoxc.eye(n, m)
 
     got = run_numpy(f)
     assert got.shape == (n, m)
@@ -392,7 +392,7 @@ def test_eye_rectangular(n, m):
 @pytest.mark.parametrize("n, m", [(0, None), (0, 3), (3, 0)])
 def test_eye_zero_size(n, m):
     def f():
-        return etl.eye(n) if m is None else etl.eye(n, m)
+        return evoxc.eye(n) if m is None else evoxc.eye(n, m)
 
     got = run_numpy(f)
     expected = np.eye(n) if m is None else np.eye(n, m)
@@ -401,17 +401,17 @@ def test_eye_zero_size(n, m):
 
 
 def test_eye_diagonal_ones_offdiagonal_zero():
-    got = run_numpy(lambda: etl.eye(4, 6, dtype=np.float64))
+    got = run_numpy(lambda: evoxc.eye(4, 6, dtype=np.float64))
     np.testing.assert_array_equal(np.diag(got), np.ones(4))
     mask = ~np.eye(4, 6, dtype=bool)
     np.testing.assert_array_equal(got[mask], np.zeros(mask.sum()))
 
 
 def test_eye_is_graph_op_not_concrete_creator():
-    """eye is NOT a concrete creator like etl.zeros — it is graph composition
+    """eye is NOT a concrete creator like evoxc.zeros — it is graph composition
     (Constant embedding) and requires an active trace."""
-    with pytest.raises(etl.TraceError):
-        etl.eye(3)
+    with pytest.raises(evoxc.TraceError):
+        evoxc.eye(3)
 
 
 def test_eye_bad_static_args():
@@ -419,15 +419,15 @@ def test_eye_bad_static_args():
     # even outside a trace); bools are rejected as "not a plain int".
     with pytest.raises(TypeError, match=r"eye: n must be a Python int, "
                                         r"got 2\.5"):
-        etl.eye(2.5)
+        evoxc.eye(2.5)
     with pytest.raises(TypeError, match=r"eye: n must be a Python int, "
                                         r"got True"):
-        etl.eye(True)
+        evoxc.eye(True)
     with pytest.raises(TypeError, match=r"eye: m must be a Python int"):
-        trace_fn(lambda: etl.eye(3, m=2.5))
+        trace_fn(lambda: evoxc.eye(3, m=2.5))
     # Negative dimensions → ValueError (numpy parity, raised by numpy).
     with pytest.raises(ValueError, match="negative dimensions are not allowed"):
-        etl.eye(-1)
+        evoxc.eye(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -435,14 +435,14 @@ def test_eye_bad_static_args():
 # ---------------------------------------------------------------------------
 
 def test_linspace_default_dtype_is_float64():
-    """PINNED: default dtype float64 — a DELIBERATE deviation from the etl
+    """PINNED: default dtype float64 — a DELIBERATE deviation from the evoxc
     float32 creation convention, for numpy exactness (documented in the op
     docstring)."""
     def f():
-        return etl.linspace(0, 1, 5)
+        return evoxc.linspace(0, 1, 5)
 
     graph, out = _trace_capturing(f)
-    assert isinstance(out, etl.SymbolicTensor)
+    assert isinstance(out, evoxc.SymbolicTensor)
     assert out.dtype == np.float64
     assert out.shape == (5,)
     assert [op.name for op in ops_of(graph)] == ["constant", "return"]
@@ -464,7 +464,7 @@ def test_linspace_default_dtype_is_float64():
 ])
 def test_linspace_numerics_vs_numpy(start, stop, num):
     def f():
-        return etl.linspace(start, stop, num)
+        return evoxc.linspace(start, stop, num)
 
     got = run_numpy(f)
     expected = np.linspace(start, stop, num)
@@ -475,7 +475,7 @@ def test_linspace_numerics_vs_numpy(start, stop, num):
 
 def test_linspace_explicit_float32_dtype():
     def f():
-        return etl.linspace(0, 1, 5, dtype=np.float32)
+        return evoxc.linspace(0, 1, 5, dtype=np.float32)
 
     got = run_numpy(f)
     assert got.dtype == np.float32
@@ -486,34 +486,34 @@ def test_linspace_bounds_must_be_static_python_numbers():
     """Symbolic Dim/DimExpr bounds → TraceError (v2 deferral, mirrors
     ``enp.arange``); a SymbolicTensor bound falls through to the number check
     → TypeError (pinned real behavior)."""
-    with pytest.raises(etl.TraceError,
+    with pytest.raises(evoxc.TraceError,
                        match=r"linspace: symbolic start=Dim\('n'\) is not "
                              r"supported"):
-        etl.trace(lambda: etl.linspace(etl.Dim("n"), 1.0, 3))
+        evoxc.trace(lambda: evoxc.linspace(evoxc.Dim("n"), 1.0, 3))
     with pytest.raises(
-        etl.TraceError,
+        evoxc.TraceError,
         match=r"linspace: symbolic start=DimExpr\('add', left=Dim\('n'\), "
               r"right=1\) is not supported",
     ):
-        etl.trace(lambda: etl.linspace(etl.Dim("n") + 1, 1.0, 3))
-    with pytest.raises(etl.TraceError,
+        evoxc.trace(lambda: evoxc.linspace(evoxc.Dim("n") + 1, 1.0, 3))
+    with pytest.raises(evoxc.TraceError,
                        match=r"linspace: symbolic stop=Dim\('n'\) is not "
                              r"supported"):
-        etl.trace(lambda: etl.linspace(0.0, etl.Dim("n"), 3))
+        evoxc.trace(lambda: evoxc.linspace(0.0, evoxc.Dim("n"), 3))
     with pytest.raises(TypeError,
                        match=r"linspace: start must be a Python int or "
                              r"float"):
-        etl.trace(lambda x: etl.linspace(x, 1.0, 3),
-                  etl.TensorSpec((), etl.float32))
+        evoxc.trace(lambda x: evoxc.linspace(x, 1.0, 3),
+                  evoxc.TensorSpec((), evoxc.float32))
     with pytest.raises(TypeError,
                        match=r"linspace: start must be a Python int or "
                              r"float, got True"):
-        etl.trace(lambda: etl.linspace(True, 1.0, 3))
+        evoxc.trace(lambda: evoxc.linspace(True, 1.0, 3))
 
 
 def test_linspace_outside_trace_raises_traceerror():
-    with pytest.raises(etl.TraceError):
-        etl.linspace(0, 1, 3)
+    with pytest.raises(evoxc.TraceError):
+        evoxc.linspace(0, 1, 3)
 
 
 @pytest.mark.parametrize("num, exc, match", [
@@ -523,4 +523,4 @@ def test_linspace_outside_trace_raises_traceerror():
 ])
 def test_linspace_bad_num(num, exc, match):
     with pytest.raises(exc, match=match):
-        etl.trace(lambda: etl.linspace(0, 1, num))
+        evoxc.trace(lambda: evoxc.linspace(0, 1, num))

@@ -1,4 +1,4 @@
-"""Tests for etl.persist.container — the on-disk save/load container.
+"""Tests for evoxc.persist.container — the on-disk save/load container.
 
 Covers: round-trips through the codec, the exact byte layout, integrity
 (tamper/truncate/garbage detection), format versioning, payload_type
@@ -16,15 +16,15 @@ import struct
 import numpy as np
 import pytest
 
-from etl.core import Device, Dim, PersistenceError, TensorSpec
-from etl.persist import (
-    ETL_FORMAT_VERSION,
+from evoxc.core import Device, Dim, PersistenceError, TensorSpec
+from evoxc.persist import (
+    EVOXC_FORMAT_VERSION,
     LoadedObject,
     load_object,
     save_object,
 )
 
-MAGIC = b"ETLPERS"
+MAGIC = b"EVOXCPERS"
 DIGEST_LEN = 64  # 32 bytes of SHA-256 as lowercase ASCII hex
 
 
@@ -100,11 +100,11 @@ def _save_sample(path, payload_type="widgets", payload=None, backend_info=None,
 
 def _parse_layout(data: bytes):
     """Parse the container byte layout; return (header, header_bytes, payload_bytes)."""
-    header_len = struct.unpack(">I", data[11:15])[0]
-    header_bytes = data[15 : 15 + header_len]
+    header_len = struct.unpack(">I", data[13:17])[0]
+    header_bytes = data[17 : 17 + header_len]
     header = json.loads(header_bytes)
-    payload_len = struct.unpack(">Q", data[15 + header_len : 23 + header_len])[0]
-    payload_start = 23 + header_len
+    payload_len = struct.unpack(">Q", data[17 + header_len : 25 + header_len])[0]
+    payload_start = 25 + header_len
     payload_bytes = data[payload_start : payload_start + payload_len]
     return header, header_bytes, payload_bytes
 
@@ -124,7 +124,7 @@ def _patch(data: bytes, start: int, replacement: bytes) -> bytes:
 
 
 def test_round_trip_rich_payload(tmp_path):
-    path = tmp_path / "round_trip.etlpers"
+    path = tmp_path / "round_trip.evoxcpers"
     payload = _rich_payload()
     save_object(path, "test.payload", payload)
 
@@ -132,8 +132,8 @@ def test_round_trip_rich_payload(tmp_path):
     assert isinstance(loaded, LoadedObject)
     assert isinstance(loaded, dict)
     assert loaded.payload_type == "test.payload"
-    assert loaded.format_version == ETL_FORMAT_VERSION
-    assert loaded["format_version"] == ETL_FORMAT_VERSION
+    assert loaded.format_version == EVOXC_FORMAT_VERSION
+    assert loaded["format_version"] == EVOXC_FORMAT_VERSION
     assert loaded.backend_info is None
     assert loaded.signature_info is None
     assert set(loaded.keys()) == {
@@ -153,7 +153,7 @@ def test_round_trip_rich_payload(tmp_path):
 
 
 def test_file_layout(tmp_path):
-    path = tmp_path / "layout.etlpers"
+    path = tmp_path / "layout.evoxcpers"
     backend_info = {"name": "numpy", "version": "0.1"}
     signature_info = {"inputs": [{"dtype": "float32", "shape": [2, 3]}]}
     data = _save_sample(
@@ -164,12 +164,12 @@ def test_file_layout(tmp_path):
     )
 
     # Magic + version + header length fields.
-    assert data[:7] == MAGIC
-    assert struct.unpack(">I", data[7:11])[0] == ETL_FORMAT_VERSION
-    header_len = struct.unpack(">I", data[11:15])[0]
+    assert data[:len(MAGIC)] == MAGIC
+    assert struct.unpack(">I", data[9:13])[0] == EVOXC_FORMAT_VERSION
+    header_len = struct.unpack(">I", data[13:17])[0]
 
     # Header JSON: parse, exact key set, exact values.
-    header_bytes = data[15 : 15 + header_len]
+    header_bytes = data[17 : 17 + header_len]
     header = json.loads(header_bytes)
     assert set(header.keys()) == {
         "format_version",
@@ -178,25 +178,25 @@ def test_file_layout(tmp_path):
         "signature_info",
         "hash_algorithm",
     }
-    assert header["format_version"] == ETL_FORMAT_VERSION
+    assert header["format_version"] == EVOXC_FORMAT_VERSION
     assert header["payload_type"] == "widgets"
     assert header["backend_info"] == backend_info
     assert header["signature_info"] == signature_info
     assert header["hash_algorithm"] == "sha256"
 
     # Payload length + payload bytes.
-    payload_len = struct.unpack(">Q", data[15 + header_len : 23 + header_len])[0]
-    payload_bytes = data[23 + header_len : 23 + header_len + payload_len]
+    payload_len = struct.unpack(">Q", data[17 + header_len : 25 + header_len])[0]
+    payload_bytes = data[25 + header_len : 25 + header_len + payload_len]
     assert isinstance(json.loads(payload_bytes), dict)
 
     # Trailing digest: 64 lowercase ASCII hex chars, SHA-256 of payload ONLY.
-    digest_bytes = data[23 + header_len + payload_len :]
+    digest_bytes = data[25 + header_len + payload_len :]
     assert len(digest_bytes) == DIGEST_LEN
     assert digest_bytes.isascii() and digest_bytes == digest_bytes.lower()
     assert digest_bytes == hashlib.sha256(payload_bytes).hexdigest().encode("ascii")
 
-    # Total length: 15 + H + 8 + P + 64.
-    assert len(data) == 15 + header_len + 8 + payload_len + DIGEST_LEN
+    # Total length: 17 + H + 8 + P + 64.
+    assert len(data) == 17 + header_len + 8 + payload_len + DIGEST_LEN
 
 
 # 3. Integrity: tampering, truncation, garbage
@@ -208,7 +208,7 @@ def test_file_layout(tmp_path):
     ids=["first", "second", "fifth", "middle", "last"],
 )
 def test_tampered_payload_byte_detected(tmp_path, offset):
-    path = tmp_path / "tamper_payload.etlpers"
+    path = tmp_path / "tamper_payload.evoxcpers"
     data = _save_sample(path)
     _, _, payload_bytes = _parse_layout(data)
     payload_start = len(data) - DIGEST_LEN - len(payload_bytes)
@@ -224,10 +224,10 @@ def test_tampered_payload_byte_detected(tmp_path, offset):
 
 
 def test_tampered_header_json_detected(tmp_path):
-    path = tmp_path / "tamper_header.etlpers"
+    path = tmp_path / "tamper_header.evoxcpers"
     data = _save_sample(path)
-    header_len = struct.unpack(">I", data[11:15])[0]
-    header_start = 15
+    header_len = struct.unpack(">I", data[13:17])[0]
+    header_start = 17
 
     # Flip the leading '{' of the header JSON -> invalid JSON -> "corrupt".
     path.write_bytes(_flip(data, header_start))
@@ -244,7 +244,7 @@ def test_tampered_header_json_detected(tmp_path):
 
 
 def test_tampered_magic_detected(tmp_path):
-    path = tmp_path / "tamper_magic.etlpers"
+    path = tmp_path / "tamper_magic.evoxcpers"
     data = _save_sample(path)
     path.write_bytes(b"X" + data[1:])
     with pytest.raises(PersistenceError, match="bad magic header"):
@@ -252,14 +252,14 @@ def test_tampered_magic_detected(tmp_path):
 
 
 def test_truncated_file_detected(tmp_path):
-    path = tmp_path / "truncated.etlpers"
+    path = tmp_path / "truncated.evoxcpers"
     data = _save_sample(path)
-    header_len = struct.unpack(">I", data[11:15])[0]
+    header_len = struct.unpack(">I", data[13:17])[0]
     _, _, payload_bytes = _parse_layout(data)
     payload_start = len(data) - DIGEST_LEN - len(payload_bytes)
     cut_points = {
-        "header-cut": 15 + header_len - 1,
-        "mid-payload-length": 15 + header_len + 4,
+        "header-cut": 17 + header_len - 1,
+        "mid-payload-length": 17 + header_len + 4,
         "mid-payload": payload_start + len(payload_bytes) // 2,
         "payload-complete-no-digest": len(data) - DIGEST_LEN,
         "one-byte-short": len(data) - 1,
@@ -271,7 +271,7 @@ def test_truncated_file_detected(tmp_path):
 
 
 def test_appended_garbage_detected(tmp_path):
-    path = tmp_path / "appended.etlpers"
+    path = tmp_path / "appended.evoxcpers"
     data = _save_sample(path)
     path.write_bytes(data + b"GARBAGE")
     with pytest.raises(PersistenceError, match="payload length does not match"):
@@ -279,14 +279,14 @@ def test_appended_garbage_detected(tmp_path):
 
 
 def test_garbage_file_detected(tmp_path):
-    path = tmp_path / "garbage.etlpers"
+    path = tmp_path / "garbage.evoxcpers"
     path.write_bytes(os.urandom(256))
     with pytest.raises(PersistenceError):
         load_object(path)
 
 
 def test_empty_file_detected(tmp_path):
-    path = tmp_path / "empty.etlpers"
+    path = tmp_path / "empty.evoxcpers"
     path.write_bytes(b"")
     with pytest.raises(PersistenceError, match="corrupt"):
         load_object(path)
@@ -296,17 +296,17 @@ def test_empty_file_detected(tmp_path):
 
 
 def test_newer_format_version_detected(tmp_path):
-    path = tmp_path / "newer.etlpers"
+    path = tmp_path / "newer.evoxcpers"
     data = _save_sample(path)
-    path.write_bytes(_patch(data, 7, struct.pack(">I", ETL_FORMAT_VERSION + 1)))
+    path.write_bytes(_patch(data, 9, struct.pack(">I", EVOXC_FORMAT_VERSION + 1)))
     with pytest.raises(PersistenceError, match="newer format"):
         load_object(path)
 
 
 def test_zero_format_version_detected(tmp_path):
-    path = tmp_path / "old.etlpers"
+    path = tmp_path / "old.evoxcpers"
     data = _save_sample(path)
-    path.write_bytes(_patch(data, 7, struct.pack(">I", 0)))
+    path.write_bytes(_patch(data, 9, struct.pack(">I", 0)))
     with pytest.raises(PersistenceError, match="corrupt"):
         load_object(path)
 
@@ -315,7 +315,7 @@ def test_zero_format_version_detected(tmp_path):
 
 
 def test_expected_payload_type_match(tmp_path):
-    path = tmp_path / "widgets.etlpers"
+    path = tmp_path / "widgets.evoxcpers"
     _save_sample(path, payload_type="widgets")
     loaded = load_object(path, expected_payload_type="widgets")
     assert loaded.payload_type == "widgets"
@@ -323,14 +323,14 @@ def test_expected_payload_type_match(tmp_path):
 
 
 def test_expected_payload_type_mismatch(tmp_path):
-    path = tmp_path / "widgets.etlpers"
+    path = tmp_path / "widgets.evoxcpers"
     _save_sample(path, payload_type="widgets")
     with pytest.raises(PersistenceError, match="payload_type mismatch"):
         load_object(path, expected_payload_type="gadgets")
 
 
 def test_expected_payload_type_none_accepts_any(tmp_path):
-    path = tmp_path / "widgets.etlpers"
+    path = tmp_path / "widgets.evoxcpers"
     _save_sample(path, payload_type="widgets")
     assert load_object(path).payload_type == "widgets"
     assert load_object(path, expected_payload_type=None).payload_type == "widgets"
@@ -340,7 +340,7 @@ def test_expected_payload_type_none_accepts_any(tmp_path):
 
 
 def test_backend_and_signature_info_round_trip(tmp_path):
-    path = tmp_path / "meta.etlpers"
+    path = tmp_path / "meta.evoxcpers"
     backend_info = {
         "name": "numpy",
         "version": "0.1.0",
@@ -369,13 +369,13 @@ def test_backend_and_signature_info_round_trip(tmp_path):
     ids=["int", "empty", "none", "bytes", "float"],
 )
 def test_save_rejects_invalid_payload_type(tmp_path, bad_type):
-    path = tmp_path / "bad_type.etlpers"
+    path = tmp_path / "bad_type.evoxcpers"
     with pytest.raises(PersistenceError, match="payload_type must be a non-empty string"):
         save_object(path, bad_type, {"value": 1})
 
 
 def test_save_rejects_non_json_serializable_metadata(tmp_path):
-    path = tmp_path / "bad_meta.etlpers"
+    path = tmp_path / "bad_meta.evoxcpers"
     with pytest.raises(PersistenceError, match="JSON-serializable"):
         save_object(path, "widgets", {"value": 1}, backend_info={"tags": {"a", "b"}})
     with pytest.raises(PersistenceError, match="JSON-serializable"):
@@ -385,7 +385,7 @@ def test_save_rejects_non_json_serializable_metadata(tmp_path):
 
 
 def test_save_rejects_non_encodable_payload(tmp_path):
-    path = tmp_path / "bad_payload.etlpers"
+    path = tmp_path / "bad_payload.evoxcpers"
     with pytest.raises(PersistenceError):
         save_object(path, "widgets", {"opaque": object()})
 
@@ -394,7 +394,7 @@ def test_save_rejects_non_encodable_payload(tmp_path):
 
 
 def test_non_dict_payload_fails_on_load(tmp_path):
-    path = tmp_path / "list_payload.etlpers"
+    path = tmp_path / "list_payload.evoxcpers"
     # Saving a non-dict payload succeeds (it encodes fine) ...
     save_object(path, "t", [1, 2, 3])
     # ... but loading it must fail: artifacts always hold payload dicts.
@@ -406,7 +406,7 @@ def test_non_dict_payload_fails_on_load(tmp_path):
 
 
 def test_failed_save_leaves_no_partial_file_or_temp(tmp_path):
-    path = tmp_path / "never_written.etlpers"
+    path = tmp_path / "never_written.evoxcpers"
     with pytest.raises(PersistenceError):
         save_object(path, "", {"value": 1})
     assert not path.exists()
@@ -427,7 +427,7 @@ def test_failed_replace_cleans_up_temp_file(tmp_path):
 
 
 def test_save_creates_parent_directories(tmp_path):
-    path = tmp_path / "a" / "b" / "f.etlpers"
+    path = tmp_path / "a" / "b" / "f.evoxcpers"
     payload = {"deep": [1, 2, 3]}
     save_object(path, "nested", payload)
     assert path.exists()

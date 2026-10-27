@@ -1,9 +1,9 @@
-"""SSA data-model tests for EvoXIR (``etl.ir``).
+"""SSA data-model tests for EvoXIR (``evoxc.ir``).
 
 Pins down the structural contracts of the IR building blocks —
 ``ValueType``, ``Location``, effect kinds, ``Module``/``Function``/
 ``Region``/``Block``/``Op``/``Value``/``Use`` — as documented in
-``etl/ir``. The ``Builder`` is exercised here only for structure sanity
+``evoxc/ir``. The ``Builder`` is exercised here only for structure sanity
 (parent wiring, id assignment, use bookkeeping); exhaustive Builder
 coverage (insertion points, attribute validation, result inference)
 belongs to ``test_builder.py``.
@@ -14,8 +14,8 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from etl import ir
-from etl.core import Dim, DimExpr
+from evoxc import ir
+from evoxc.core import Dim, DimExpr
 
 
 def _f32_4() -> ir.ValueType:

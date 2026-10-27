@@ -1,11 +1,11 @@
-"""Operand-phase errors + run-time canonical validation for ``etl.sparse``.
+"""Operand-phase errors + run-time canonical validation for ``evoxc.sparse``.
 
-Pins the contract in ``etl/sparse/CONTEXT.md`` + ``etl/sparse/ops.py`` +
-``etl/backends/numpy/kernels/sparse.py`` (all read-only):
+Pins the contract in ``evoxc/sparse/CONTEXT.md`` + ``evoxc/sparse/ops.py`` +
+``evoxc/backends/numpy/kernels/sparse.py`` (all read-only):
 
 - the mandated three-option ``core.TraceError`` for concrete operands inside
-  a trace ("There is no eager mode" + "explicit input" / "etl.constant" /
-  "etl.evaluate"), and the no-active-builder ``TraceError`` outside a trace;
+  a trace ("There is no eager mode" + "explicit input" / "evoxc.constant" /
+  "evoxc.evaluate"), and the no-active-builder ``TraceError`` outside a trace;
 - spec-phase ``TypeError``s (TensorSpec creator components, mixed
   concrete/symbolic components, converters on a spec, converters on
   non-sparse operands);
@@ -15,7 +15,7 @@ Pins the contract in ``etl/sparse/CONTEXT.md`` + ``etl/sparse/ops.py`` +
   naming the op; the values-aware stored-zero tolerance passes);
 - the trace-time rank-2 requirement for CSR/CSC -> COO conversion.
 
-Cross-cutting v1 deferrals owned by ``test_deferrals.py`` (etl.constant on
+Cross-cutting v1 deferrals owned by ``test_deferrals.py`` (evoxc.constant on
 sparse, whole-sparse bind, vjp TransformErrors, compiler-backend
 BackendErrors) are NOT duplicated here.
 """
@@ -23,8 +23,8 @@ BackendErrors) are NOT duplicated here.
 import numpy as np
 import pytest
 
-import etl
-from etl import core, sparse
+import evoxc
+from evoxc import core, sparse
 
 from tests.sparse.conftest import (
     coo_example,
@@ -39,14 +39,14 @@ from tests.sparse.conftest import (
 # ---------------------------------------------------------------------------
 
 
-def _csr_spec(dtype=etl.float32):
+def _csr_spec(dtype=evoxc.float32):
     """Local CSR spec. (The conftest `csr_spec` helper omits
     ``format="csr"``, so calling it raises ShapeError "COO requires 2 leaf
     specs, got 3" — conftest is shared and not edited; see the suite report.)"""
     return sparse.SparseTensorSpec(
-        etl.TensorSpec((4,), etl.int64),
-        etl.TensorSpec((None,), etl.int64),
-        etl.TensorSpec((None,), dtype),
+        evoxc.TensorSpec((4,), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.int64),
+        evoxc.TensorSpec((None,), dtype),
         dense_shape=(3, 4),
         format="csr",
     )
@@ -60,7 +60,7 @@ def _symbolic_sparse_arg():
         captured["x"] = x
         return x
 
-    etl.trace(f, coo_spec())
+    evoxc.trace(f, coo_spec())
     return captured["x"]
 
 
@@ -73,7 +73,7 @@ def _coo_from_parts(indices, values, dense_shape=(3, 4)):
 
 def _run_coo_todense_graph(bad):
     """Trace a coo_spec() -> to_dense graph and run it with `bad`."""
-    graph = etl.trace(lambda a: sparse.to_dense(a), coo_spec())
+    graph = evoxc.trace(lambda a: sparse.to_dense(a), coo_spec())
     return run_graph(graph, bad)
 
 
@@ -90,7 +90,7 @@ def _run_csr_todense_graph(bad):
     Symbolic CSR inputs to `to_dense` first emit `sparse_csr_to_coo`, so the
     indptr/segment violations surface from the ``sparse_csr_to_coo`` kernel.
     """
-    graph = etl.trace(lambda a: sparse.to_dense(a), _csr_spec())
+    graph = evoxc.trace(lambda a: sparse.to_dense(a), _csr_spec())
     return run_graph(graph, bad)
 
 
@@ -98,12 +98,12 @@ def _run_csr_todense_graph(bad):
 # 1. Three-option TraceError on concrete operands inside a trace.
 # ---------------------------------------------------------------------------
 
-_THREE_OPTIONS = ("There is no eager mode", "explicit input", "etl.constant", "etl.evaluate")
+_THREE_OPTIONS = ("There is no eager mode", "explicit input", "evoxc.constant", "evoxc.evaluate")
 
 
 def _assert_three_option_traceerror(fn, *specs):
     with pytest.raises(core.TraceError) as exc_info:
-        etl.trace(fn, *specs)
+        evoxc.trace(fn, *specs)
     msg = str(exc_info.value)
     for fragment in _THREE_OPTIONS:
         assert fragment in msg, f"missing {fragment!r} in: {msg}"
@@ -143,7 +143,7 @@ def test_three_option_traceerror_concrete_sparse_inside_trace(op_call):
     _assert_three_option_traceerror(f, coo_spec())
 
 
-@etl.defn
+@evoxc.defn
 def _defn_negate_concrete(x):
     return sparse.negate(coo_example())
 
@@ -218,7 +218,7 @@ def test_converters_concrete_inside_trace_static_outputs(converter_call):
     def f(a):
         return converter_call()
 
-    graph = etl.trace(f, coo_spec())
+    graph = evoxc.trace(f, coo_spec())
     # no tensor outputs: the whole result is preserved as static output values
     assert graph.module.main.output_types == ()
     assert graph.output_static_values
@@ -255,14 +255,14 @@ def test_no_active_builder_outside_trace(op_call):
 
 
 def test_creator_tensorspec_components():
-    idx_spec = etl.TensorSpec((None, 2), etl.int64)
-    val_spec = etl.TensorSpec((None,), etl.float32)
+    idx_spec = evoxc.TensorSpec((None, 2), evoxc.int64)
+    val_spec = evoxc.TensorSpec((None,), evoxc.float32)
     with pytest.raises(TypeError, match="for trace inputs use a SparseTensorSpec"):
         sparse.coo(idx_spec, val_spec, (3, 4))
     with pytest.raises(TypeError, match="for trace inputs use a SparseTensorSpec"):
-        sparse.csr(etl.TensorSpec((4,), etl.int64), idx_spec, val_spec, (3, 4))
+        sparse.csr(evoxc.TensorSpec((4,), evoxc.int64), idx_spec, val_spec, (3, 4))
     with pytest.raises(TypeError, match="for trace inputs use a SparseTensorSpec"):
-        sparse.csc(etl.TensorSpec((5,), etl.int64), idx_spec, val_spec, (3, 4))
+        sparse.csc(evoxc.TensorSpec((5,), evoxc.int64), idx_spec, val_spec, (3, 4))
 
 
 def test_creator_mixed_concrete_symbolic_components():
@@ -299,7 +299,7 @@ def test_sparse_in_dense_operand_position_typeerror():
         return sparse.multiply_dense(a, coo_example())
 
     with pytest.raises(TypeError, match="dense operands must be SymbolicTensor"):
-        etl.trace(f, coo_spec())
+        evoxc.trace(f, coo_spec())
 
 
 @pytest.mark.parametrize(
@@ -322,7 +322,7 @@ def test_sparse_sparse_matmul_v1_deferral():
         return sparse.matmul(a, b)
 
     with pytest.raises(core.TraceError) as exc_info:
-        etl.trace(f, coo_spec(), coo_spec())
+        evoxc.trace(f, coo_spec(), coo_spec())
     msg = str(exc_info.value)
     assert "v1 deferral" in msg
     assert "to_dense" in msg
@@ -484,7 +484,7 @@ def test_symbolic_rank3_csr_to_dense_shape_error():
         return sparse.to_dense(sym)
 
     with pytest.raises(core.ShapeError, match="requires a rank-2 sparse tensor"):
-        etl.trace(f, coo_spec())
+        evoxc.trace(f, coo_spec())
 
 
 def test_symbolic_rank3_csc_to_dense_shape_error():
@@ -495,4 +495,4 @@ def test_symbolic_rank3_csc_to_dense_shape_error():
         return sparse.to_dense(sym)
 
     with pytest.raises(core.ShapeError, match="requires a rank-2 sparse tensor"):
-        etl.trace(f, coo_spec())
+        evoxc.trace(f, coo_spec())

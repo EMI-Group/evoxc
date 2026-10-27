@@ -1,12 +1,12 @@
 """Cross-adapter mixed-dtype compile+run regression tests (fix 6aec043).
 
-etl IR allows mixed-dtype operands on binary elementwise ops / compare /
+evoxc IR allows mixed-dtype operands on binary elementwise ops / compare /
 select (the result dtype follows numpy promotion — e.g. a Python scalar
 like ``3`` becomes a scalar i64 weak constant at trace time); the StableHLO
 writer equalizes operand dtypes by inserting ``stablehlo.convert`` after
 shape equalization (MLIR goldens pinned in ``tests/backends/
 test_stablehlo.py`` section 14). Before the fix these graphs lowered into
-invalid StableHLO that compilers rejected at ``etl.compile`` with "use of
+invalid StableHLO that compilers rejected at ``evoxc.compile`` with "use of
 value ... expects different type than prior uses". Pinned here: each
 blast-radius graph must build and run on every available compiler adapter —
 ``iree``, ``tvm`` and ``xla`` (CPU) — with results identical to the default
@@ -23,7 +23,7 @@ absence never affects the others:
 * ``xla``: requires a USER-PROVIDED PJRT C API plugin (a ``.so`` exporting
   ``GetPjRtApi``; there is no pip-installable dependency). The gate is a
   ``xla.register()`` probe that skips with an actionable message when no
-  plugin is configured — set ``ETL_PJRT_PLUGIN=/path/to/
+  plugin is configured — set ``EVOXC_PJRT_PLUGIN=/path/to/
   pjrt_c_api_cpu_plugin.so`` or pass ``plugin_path=...`` to the compile
   options — and runs for real when a plugin is available (same contract as
   ``test_adapter_xla.py``, but per-test instead of module-level).
@@ -36,7 +36,7 @@ per backend, 18 worst case; 12 in this environment where xla skips).
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 BACKENDS = ("iree", "tvm", "xla")
 
@@ -58,15 +58,15 @@ def _require_backend(backend):
         pytest.importorskip("tvm")
         pytest.importorskip("jaxlib")
     elif backend == "xla":
-        from etl.backends.adapters import xla
+        from evoxc.backends.adapters import xla
 
         try:
             xla.register()
-        except etl.BackendError as exc:
+        except evoxc.BackendError as exc:
             pytest.skip(
                 "the xla adapter requires a user-provided PJRT C API plugin "
                 "(.so exporting GetPjRtApi); set "
-                "ETL_PJRT_PLUGIN=/path/to/pjrt_c_api_cpu_plugin.so or pass "
+                "EVOXC_PJRT_PLUGIN=/path/to/pjrt_c_api_cpu_plugin.so or pass "
                 f"plugin_path=... to the compile options. Details: {exc}"
             )
     else:
@@ -76,12 +76,12 @@ def _require_backend(backend):
 def _run_backend_and_numpy(fn, specs, args, backend):
     """Build+run ``fn`` on ``backend`` (CPU) and evaluate the numpy reference.
 
-    Returns ``(actual, expected)`` as ``etl.Tensor``s; the device defaults
+    Returns ``(actual, expected)`` as ``evoxc.Tensor``s; the device defaults
     to CPU for both backends. Callers run the parity assertions.
     """
-    expected = etl.evaluate(fn, *args)  # default numpy reference
-    exe = etl.build(fn, *specs, backend=backend)
-    actual = etl.run(exe, *args)
+    expected = evoxc.evaluate(fn, *args)  # default numpy reference
+    exe = evoxc.build(fn, *specs, backend=backend)
+    actual = evoxc.run(exe, *args)
     return actual, expected
 
 
@@ -90,24 +90,24 @@ def _run_backend_and_numpy(fn, specs, args, backend):
 CASES = [
     (
         "add_i32_python_scalar",
-        lambda x: etl.add(x, 3),
-        (etl.TensorSpec(_SHAPE, etl.int32),),
+        lambda x: evoxc.add(x, 3),
+        (evoxc.TensorSpec(_SHAPE, evoxc.int32),),
         (np.arange(_N, dtype=np.int32).reshape(_SHAPE),),
         False,
     ),
     (
         "equal_i32_python_scalar",
-        lambda x: etl.equal(x, 3),
-        (etl.TensorSpec(_SHAPE, etl.int32),),
+        lambda x: evoxc.equal(x, 3),
+        (evoxc.TensorSpec(_SHAPE, evoxc.int32),),
         (np.arange(_N, dtype=np.int32).reshape(_SHAPE),),
         False,
     ),
     (
         "select_bool_i32_i64",
-        lambda p, a, b: etl.select(p, a, b),
-        (etl.TensorSpec(_SHAPE, etl.bool_),
-         etl.TensorSpec(_SHAPE, etl.int32),
-         etl.TensorSpec(_SHAPE, etl.int64)),
+        lambda p, a, b: evoxc.select(p, a, b),
+        (evoxc.TensorSpec(_SHAPE, evoxc.bool_),
+         evoxc.TensorSpec(_SHAPE, evoxc.int32),
+         evoxc.TensorSpec(_SHAPE, evoxc.int64)),
         ((np.arange(_N) % 2).astype(bool).reshape(_SHAPE),
          np.arange(_N).astype(np.int32).reshape(_SHAPE),
          np.arange(_N).astype(np.int64).reshape(_SHAPE)),
@@ -115,27 +115,27 @@ CASES = [
     ),
     (
         "bitwise_and_i32_i64",
-        lambda a, b: etl.bitwise_and(a, b),
-        (etl.TensorSpec(_SHAPE, etl.int32),
-         etl.TensorSpec(_SHAPE, etl.int64)),
+        lambda a, b: evoxc.bitwise_and(a, b),
+        (evoxc.TensorSpec(_SHAPE, evoxc.int32),
+         evoxc.TensorSpec(_SHAPE, evoxc.int64)),
         (np.arange(_N).astype(np.int32).reshape(_SHAPE),
          np.arange(_N).astype(np.int64).reshape(_SHAPE)),
         False,
     ),
     (
         "add_i8_i16",
-        lambda a, b: etl.add(a, b),
-        (etl.TensorSpec(_SHAPE, etl.int8),
-         etl.TensorSpec(_SHAPE, etl.int16)),
+        lambda a, b: evoxc.add(a, b),
+        (evoxc.TensorSpec(_SHAPE, evoxc.int8),
+         evoxc.TensorSpec(_SHAPE, evoxc.int16)),
         ((np.arange(_N) % 100).astype(np.int8).reshape(_SHAPE),
          (np.arange(_N) % 100).astype(np.int16).reshape(_SHAPE)),
         False,
     ),
     (
         "add_f32_f64",
-        lambda a, b: etl.add(a, b),
-        (etl.TensorSpec(_SHAPE, etl.float32),
-         etl.TensorSpec(_SHAPE, etl.float64)),
+        lambda a, b: evoxc.add(a, b),
+        (evoxc.TensorSpec(_SHAPE, evoxc.float32),
+         evoxc.TensorSpec(_SHAPE, evoxc.float64)),
         ((np.arange(_N) % 7).astype(np.float32).reshape(_SHAPE),
          (np.arange(_N) % 7).astype(np.float64).reshape(_SHAPE)),
         True,
@@ -152,7 +152,7 @@ CASES = [
 def test_mixed_dtype_compile_run_parity(backend, fn, specs, args, is_float):
     _require_backend(backend)
     actual, expected = _run_backend_and_numpy(fn, specs, args, backend)
-    assert isinstance(actual, etl.Tensor)
+    assert isinstance(actual, evoxc.Tensor)
     assert actual.dtype == expected.dtype
     if is_float:
         np.testing.assert_allclose(

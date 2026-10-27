@@ -1,13 +1,13 @@
-"""Contract tests for static-value snapshotting in `etl.trace`.
+"""Contract tests for static-value snapshotting in `evoxc.trace`.
 
 Static Python values (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/
-`slice`/`ndarray` — the `_is_static_value` predicate in `etl/trace/_tree.py`)
+`slice`/`ndarray` — the `_is_static_value` predicate in `evoxc/trace/_tree.py`)
 specialize the graph at TRACE time and are validated at RUN time
 (`Graph.flatten_inputs`; ndarray leaves compare with `np.array_equal`
 semantics). A fully-static dataclass config object is also
 legitimate static specialization: the tracer descends into dataclass pytree
 containers, so every static field becomes a specializing leaf. Non-static
-leaf values are still rejected. etl value types (`Device`/`Dim`/`TensorSpec`/
+leaf values are still rejected. evoxc value types (`Device`/`Dim`/`TensorSpec`/
 `TreeSpec`) are also static inputs, but as SINGLE leaves — no descent into
 their fields, unlike user dataclasses. These tests pin specialization,
 run-time validation, trace-time snapshotting, and rejection of non-static
@@ -20,7 +20,7 @@ import enum
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 
 class Mode(enum.Enum):
@@ -64,25 +64,25 @@ class TwoFieldConfig:
 
 
 def cast_to(x, dt):
-    return etl.cast(x, dt)
+    return evoxc.cast(x, dt)
 
 
 def mode_fn(x, mode):
     if mode is Mode.A:
-        return etl.multiply(x, x)
-    return etl.negate(x)
+        return evoxc.multiply(x, x)
+    return evoxc.negate(x)
 
 
 def slice_fn(x, s):
-    # etl.slice takes Nx-style (start, lengths): a Python slice(start, stop)
+    # evoxc.slice takes Nx-style (start, lengths): a Python slice(start, stop)
     # maps to start = s.start, lengths = s.stop - s.start.
-    return etl.slice(x, s.start, s.stop - s.start)
+    return evoxc.slice(x, s.start, s.stop - s.start)
 
 
 def flag_fn(x, flag):
     if flag:
-        return etl.add(x, x)
-    return etl.negate(x)
+        return evoxc.add(x, x)
+    return evoxc.negate(x)
 
 
 def identity_fn(x, cfg):
@@ -94,15 +94,15 @@ def identity_fn(x, cfg):
 
 def test_dtype_static_arg_specializes_graph(run_graph, as_numpy):
     x = np.array([1, 2, 3], dtype=np.int32)
-    g32 = etl.trace(cast_to, etl.TensorSpec((3,), etl.int32), etl.float32)
-    g64 = etl.trace(cast_to, etl.TensorSpec((3,), etl.int32), etl.float64)
+    g32 = evoxc.trace(cast_to, evoxc.TensorSpec((3,), evoxc.int32), evoxc.float32)
+    g64 = evoxc.trace(cast_to, evoxc.TensorSpec((3,), evoxc.int32), evoxc.float64)
 
     # the two traces are different programs
     assert g32.module.main.output_types[0].dtype != g64.module.main.output_types[0].dtype
-    assert etl.ir.serialize_module(g32.module)["ops"] != etl.ir.serialize_module(g64.module)["ops"]
+    assert evoxc.ir.serialize_module(g32.module)["ops"] != evoxc.ir.serialize_module(g64.module)["ops"]
 
-    out32 = as_numpy(run_graph(g32, x, etl.float32))
-    out64 = as_numpy(run_graph(g64, x, etl.float64))
+    out32 = as_numpy(run_graph(g32, x, evoxc.float32))
+    out64 = as_numpy(run_graph(g64, x, evoxc.float64))
     assert out32.dtype == np.float32 and out64.dtype == np.float64
     np.testing.assert_array_equal(out32, x.astype(np.float32))
     np.testing.assert_array_equal(out64, x.astype(np.float64))
@@ -113,8 +113,8 @@ def test_dtype_static_arg_specializes_graph(run_graph, as_numpy):
 
 def test_enum_static_arg_specializes_graph(run_graph, as_numpy):
     x = np.array([2.0, 3.0, 4.0], dtype=np.float32)
-    g_a = etl.trace(mode_fn, etl.TensorSpec((3,), etl.float32), Mode.A)
-    g_b = etl.trace(mode_fn, etl.TensorSpec((3,), etl.float32), Mode.B)
+    g_a = evoxc.trace(mode_fn, evoxc.TensorSpec((3,), evoxc.float32), Mode.A)
+    g_b = evoxc.trace(mode_fn, evoxc.TensorSpec((3,), evoxc.float32), Mode.B)
 
     # Python `if` over the enum ran at trace time: different op sets
     ops_a = [op.name for op in g_a.module.main.entry_block.ops]
@@ -131,8 +131,8 @@ def test_enum_static_arg_specializes_graph(run_graph, as_numpy):
 
 def test_slice_static_arg_specializes_graph(run_graph, as_numpy):
     x = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
-    g02 = etl.trace(slice_fn, etl.TensorSpec((4,), etl.float32), slice(0, 2))
-    g13 = etl.trace(slice_fn, etl.TensorSpec((4,), etl.float32), slice(1, 3))
+    g02 = evoxc.trace(slice_fn, evoxc.TensorSpec((4,), evoxc.float32), slice(0, 2))
+    g13 = evoxc.trace(slice_fn, evoxc.TensorSpec((4,), evoxc.float32), slice(1, 3))
 
     attrs02 = g02.module.main.entry_block.ops[0].attributes
     attrs13 = g13.module.main.entry_block.ops[0].attributes
@@ -153,7 +153,7 @@ def test_slice_static_arg_specializes_graph(run_graph, as_numpy):
     ids=["True", "False", "1", "0"],
 )
 def test_static_bool_int_specializes_graph(flag, expected_op):
-    graph = etl.trace(flag_fn, etl.TensorSpec((3,), etl.float32), flag)
+    graph = evoxc.trace(flag_fn, evoxc.TensorSpec((3,), evoxc.float32), flag)
     names = [op.name for op in graph.module.main.entry_block.ops]
     assert expected_op in names
     assert ("negate" if expected_op == "add" else "add") not in names
@@ -161,16 +161,16 @@ def test_static_bool_int_specializes_graph(flag, expected_op):
 
 def test_static_flag_validated_at_run_time(run_graph, as_numpy):
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    graph = etl.trace(flag_fn, etl.TensorSpec((3,), etl.float32), True)
+    graph = evoxc.trace(flag_fn, evoxc.TensorSpec((3,), evoxc.float32), True)
 
     np.testing.assert_array_equal(as_numpy(run_graph(graph, x, True)), x + x)
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
         run_graph(graph, x, False)
 
 
 def test_flatten_inputs_rejects_changed_static_value():
-    graph = etl.trace(flag_fn, etl.TensorSpec((3,), etl.float32), True)
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+    graph = evoxc.trace(flag_fn, evoxc.TensorSpec((3,), evoxc.float32), True)
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
         graph.flatten_inputs((np.ones(3, dtype=np.float32), False))
 
 
@@ -192,17 +192,17 @@ def test_non_static_specs_are_rejected(bad):
     # static values — ndarrays are the accepted array class (see
     # test_ndarray_static_arg_accepted_and_preserved).
     with pytest.raises(
-        etl.TraceError, match="is neither a core.TensorSpec nor a static"
+        evoxc.TraceError, match="is neither a core.TensorSpec nor a static"
     ):
-        etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), bad)
+        evoxc.trace(identity_fn, evoxc.TensorSpec((2,), evoxc.float32), bad)
 
 
 # --- ndarray static leaves (accepted in v1) -----------------------------------
 
 
 def _scale_fn_ndarray(x, w):
-    return etl.multiply(
-        x, etl.constant(etl.tensor(float(w[0]), dtype=etl.float32))
+    return evoxc.multiply(
+        x, evoxc.constant(evoxc.tensor(float(w[0]), dtype=evoxc.float32))
     )
 
 
@@ -211,7 +211,7 @@ def test_ndarray_static_arg_accepted_and_preserved(run_graph, as_numpy):
     into a StaticValue record, and validated with array-equality semantics at
     run time (plain `==` on arrays would be ambiguous)."""
     arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    graph = etl.trace(_scale_fn_ndarray, etl.TensorSpec((3,), etl.float32), arr)
+    graph = evoxc.trace(_scale_fn_ndarray, evoxc.TensorSpec((3,), evoxc.float32), arr)
 
     # the ndarray is preserved as ONE static leaf, not a tensor input
     (record,) = graph.static_values
@@ -219,7 +219,7 @@ def test_ndarray_static_arg_accepted_and_preserved(run_graph, as_numpy):
     assert record.path == (1,)
     assert record.kind == "ndarray"
     assert record.value is arr
-    assert graph.tensor_specs == (etl.TensorSpec((3,), etl.float32),)
+    assert graph.tensor_specs == (evoxc.TensorSpec((3,), evoxc.float32),)
 
     x = np.ones(3, dtype=np.float32)
     # a matching ndarray passes run-time validation (array-equality)
@@ -227,10 +227,10 @@ def test_ndarray_static_arg_accepted_and_preserved(run_graph, as_numpy):
         as_numpy(run_graph(graph, x, arr)), float(arr[0]) * x
     )
     # an elementwise-different ndarray is rejected like any static mismatch
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
         run_graph(graph, x, np.array([2.0, 2.0, 3.0], dtype=np.float32))
     # and so is an ndarray of a different shape
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
         run_graph(graph, x, np.array([1.0, 2.0], dtype=np.float32))
 
 
@@ -238,11 +238,11 @@ def test_ndarray_static_arg_specializes_graph(run_graph, as_numpy):
     """Two traces over different ndarray statics produce different programs
     (the static value is baked in at trace time, like any other static)."""
     x = np.ones(3, dtype=np.float32)
-    g_small = etl.trace(
-        _scale_fn_ndarray, etl.TensorSpec((3,), etl.float32), np.array([0.5])
+    g_small = evoxc.trace(
+        _scale_fn_ndarray, evoxc.TensorSpec((3,), evoxc.float32), np.array([0.5])
     )
-    g_large = etl.trace(
-        _scale_fn_ndarray, etl.TensorSpec((3,), etl.float32), np.array([2.0])
+    g_large = evoxc.trace(
+        _scale_fn_ndarray, evoxc.TensorSpec((3,), evoxc.float32), np.array([2.0])
     )
 
     assert g_small.static_values[0].kind == "ndarray"
@@ -259,10 +259,10 @@ def test_ndarray_static_output_preserved(run_graph, as_numpy):
     snapshotted and re-inserted verbatim (never a graph result)."""
 
     def f(x):
-        return etl.negate(x), np.array([1, 2, 3], dtype=np.int32)
+        return evoxc.negate(x), np.array([1, 2, 3], dtype=np.int32)
 
     out_arr = np.array([1, 2, 3], dtype=np.int32)
-    graph = etl.trace(f, etl.TensorSpec((3,), etl.float32))
+    graph = evoxc.trace(f, evoxc.TensorSpec((3,), evoxc.float32))
     assert graph.output_static_values[0].kind == "ndarray"
     assert len(graph.module.main.output_types) == 1  # only the tensor leaf
 
@@ -275,18 +275,18 @@ def test_ndarray_static_output_preserved(run_graph, as_numpy):
 
 
 def _scale_fn(x, cfg):
-    return etl.multiply(
-        x, etl.constant(etl.tensor(float(cfg.lr), dtype=etl.float32))
+    return evoxc.multiply(
+        x, evoxc.constant(evoxc.tensor(float(cfg.lr), dtype=evoxc.float32))
     )
 
 
 def test_dataclass_config_spec_specializes(run_graph, as_numpy):
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    spec = etl.TensorSpec((3,), etl.float32)
+    spec = evoxc.TensorSpec((3,), evoxc.float32)
 
     # both traces succeed — a fully-static dataclass is a valid trace spec
-    g_small = etl.trace(_scale_fn, spec, Config(0.5))
-    g_large = etl.trace(_scale_fn, spec, Config(2.0))
+    g_small = evoxc.trace(_scale_fn, spec, Config(0.5))
+    g_large = evoxc.trace(_scale_fn, spec, Config(2.0))
 
     # each static field of the dataclass becomes a recorded specializing leaf
     assert len(g_small.static_values) == 1
@@ -309,16 +309,16 @@ def test_dataclass_config_spec_specializes(run_graph, as_numpy):
     )
 
     # a mismatched config is rejected at run time, like any other static value
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
         run_graph(g_small, x, Config(0.25))
 
 
-# --- etl value types are single leaves ---------------------------------------
+# --- evoxc value types are single leaves ---------------------------------------
 
 
 def test_device_static_arg_is_single_leaf(run_graph, as_numpy):
-    dev = etl.Device("cpu", 0)
-    graph = etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), dev)
+    dev = evoxc.Device("cpu", 0)
+    graph = evoxc.trace(identity_fn, evoxc.TensorSpec((2,), evoxc.float32), dev)
 
     # ONE static leaf — the tracer never descends into the Device's
     # (kind, index) fields.
@@ -331,13 +331,13 @@ def test_device_static_arg_is_single_leaf(run_graph, as_numpy):
     # run-time validation treats the Device as one static value
     x = np.array([1.0, 2.0], dtype=np.float32)
     np.testing.assert_array_equal(as_numpy(run_graph(graph, x, dev)), x)
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
-        run_graph(graph, x, etl.Device("cuda", 0))
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
+        run_graph(graph, x, evoxc.Device("cuda", 0))
 
 
 def test_dim_static_arg_is_single_leaf():
-    dim = etl.Dim("B")
-    graph = etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), dim)
+    dim = evoxc.Dim("B")
+    graph = evoxc.trace(identity_fn, evoxc.TensorSpec((2,), evoxc.float32), dim)
 
     # ONE static leaf — no descent into the Dim's (name, size) fields.
     (record,) = graph.static_values
@@ -348,18 +348,18 @@ def test_dim_static_arg_is_single_leaf():
 
     # flatten_inputs validates the Dim as a single static value (Dim
     # equality is by name+size).
-    flat = graph.flatten_inputs((np.ones(2, dtype=np.float32), etl.Dim("B")))
+    flat = graph.flatten_inputs((np.ones(2, dtype=np.float32), evoxc.Dim("B")))
     assert len(flat) == 1
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
-        graph.flatten_inputs((np.ones(2, dtype=np.float32), etl.Dim("C")))
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
+        graph.flatten_inputs((np.ones(2, dtype=np.float32), evoxc.Dim("C")))
 
 
 def test_user_dataclass_still_descends_field_by_field():
-    graph = etl.trace(
-        identity_fn, etl.TensorSpec((2,), etl.float32), TwoFieldConfig(0.5, 3)
+    graph = evoxc.trace(
+        identity_fn, evoxc.TensorSpec((2,), evoxc.float32), TwoFieldConfig(0.5, 3)
     )
 
-    # contrast with the single-leaf etl value types: a user dataclass is a
+    # contrast with the single-leaf evoxc value types: a user dataclass is a
     # pytree container, so every static field becomes a recorded leaf
     assert len(graph.static_values) == 2
     lr_rec, steps_rec = graph.static_values
@@ -386,8 +386,8 @@ def test_flatten_inputs_rejects_static_mismatch(traced, passed):
     def fn(x, s):
         return x
 
-    graph = etl.trace(fn, etl.TensorSpec((2,), etl.float32), traced)
-    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+    graph = evoxc.trace(fn, evoxc.TensorSpec((2,), evoxc.float32), traced)
+    with pytest.raises(evoxc.TraceError, match="graph was specialized on"):
         graph.flatten_inputs((np.ones(2, dtype=np.float32), passed))
 
 
@@ -395,7 +395,7 @@ def test_flatten_inputs_accepts_matching_static_value():
     def fn(x, s):
         return x
 
-    graph = etl.trace(fn, etl.TensorSpec((2,), etl.float32), 5)
+    graph = evoxc.trace(fn, evoxc.TensorSpec((2,), evoxc.float32), 5)
     flat = graph.flatten_inputs((np.ones(2, dtype=np.float32), 5))
     assert len(flat) == 1
     assert flat[0].dtype == np.dtype("float32")
@@ -409,9 +409,9 @@ def test_closure_static_value_is_snapshotted_at_trace_time(run_graph, as_numpy):
         k = 2
 
         def f(x):
-            return etl.multiply(x, etl.constant(etl.tensor(float(k), dtype=etl.float32)))
+            return evoxc.multiply(x, evoxc.constant(evoxc.tensor(float(k), dtype=evoxc.float32)))
 
-        graph = etl.trace(f, etl.TensorSpec((3,), etl.float32))
+        graph = evoxc.trace(f, evoxc.TensorSpec((3,), evoxc.float32))
         k = 10  # mutated AFTER tracing — the graph must keep the baked 2
         return graph
 
@@ -423,11 +423,11 @@ def test_closure_static_value_is_snapshotted_at_trace_time(run_graph, as_numpy):
 # --- dtype equality ------------------------------------------------------------
 
 
-def test_np_dtype_static_arg_validates_against_etl_dtype(run_graph, as_numpy):
+def test_np_dtype_static_arg_validates_against_evoxc_dtype(run_graph, as_numpy):
     x = np.array([1, 2, 3], dtype=np.int32)
-    assert etl.float32 == np.dtype("float32")
+    assert evoxc.float32 == np.dtype("float32")
 
-    graph = etl.trace(cast_to, etl.TensorSpec((3,), etl.int32), etl.float32)
+    graph = evoxc.trace(cast_to, evoxc.TensorSpec((3,), evoxc.int32), evoxc.float32)
     flat = graph.flatten_inputs((x, np.dtype("float32")))
     assert len(flat) == 1 and flat[0].dtype == np.dtype("int32")
 

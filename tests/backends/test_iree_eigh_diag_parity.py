@@ -2,13 +2,13 @@
 
 Both are multi-op compositions — no mnemonic StableHLO op exists (StableHLO
 1.0 removed ``eigh``/``qr``/``svd``, and there is no diag op), see
-``etl/backends/stablehlo/ops.py``:
+``evoxc/backends/stablehlo/ops.py``:
 
 * ``eigh`` — TWO cyclic-Jacobi symmetric-eigensolver compositions selected by
   the exporter option ``eigh_algorithm`` (``"jacobi_batched"`` = the DEFAULT,
   ``"jacobi"`` = the sequential predecessor):
 
-  - **batched (default,** ``etl/backends/stablehlo/eigh_batched.py`` **)** —
+  - **batched (default,** ``evoxc/backends/stablehlo/eigh_batched.py`` **)** —
     ONE ``stablehlo.while`` carrying ``(a, v, k)`` applies ALL ``m`` mutually
     DISJOINT rotations of one odd-even round-robin round per iteration (``L``
     rounds per sweep, ``total = sweeps·L``), so a sweep costs ``L`` iterations
@@ -60,8 +60,8 @@ grows O(n⁴) in the rotation count). CPU only (llvm-cpu — well-shaped carries
 no iree-cuda while fragility); ONE extra ROCm-guarded case proves the batched
 composition also runs on the AMD GPU (the sequential one SIGSEGVs there).
 
-eigh INSIDE A NESTED ``stablehlo`` REGION — an ``etl.cond`` branch, an
-``etl.while_loop`` body, cond-inside-cond — is supported and pinned on
+eigh INSIDE A NESTED ``stablehlo`` REGION — an ``evoxc.cond`` branch, an
+``evoxc.while_loop`` body, cond-inside-cond — is supported and pinned on
 iree-llvm-cpu. Three emission rules make a nested composition behave exactly
 like a bare one:
 
@@ -78,7 +78,7 @@ like a bare one:
   regions, sidestepping the region-crossing operand desync.
 
 The region pins are ``test_eigh_inside_cond_contract[n3|n10|n25]`` (eigh in an
-``etl.cond`` branch, run in both branch directions),
+``evoxc.cond`` branch, run in both branch directions),
 ``test_eigh_inside_cond_runtime_predicate`` (the predicate is an i1 GRAPH
 INPUT, so the runtime polarity drives the emitted select/branch path),
 ``test_eigh_inside_cond_nested`` (cond inside cond, eigh in the inner
@@ -94,8 +94,8 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
-import etl.numpy as enp
+import evoxc
+import evoxc.numpy as enp
 
 from tests.backends import _rocm_guard as guard
 
@@ -105,10 +105,10 @@ from tests.backends import _rocm_guard as guard
 
 _RNG = np.random.default_rng(7)
 
-#: etl dtype per numpy dtype (specs are spelled with the etl names below).
-_ETL_DTYPE = {
-    np.dtype(np.float32): etl.float32,
-    np.dtype(np.float64): etl.float64,
+#: evoxc dtype per numpy dtype (specs are spelled with the evoxc names below).
+_EVOXC_DTYPE = {
+    np.dtype(np.float32): evoxc.float32,
+    np.dtype(np.float64): evoxc.float64,
 }
 
 
@@ -134,7 +134,7 @@ def _sym(n, scale=0.0, dtype=np.float32, seed=None):
 
 def _np(v):
     """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays."""
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
@@ -201,11 +201,11 @@ def _check_eigh_scaled(A, w, v, w_ref, rec_rel, orth, w_rel):
 
 
 def _run_eigh(fn, A, spec, **options):
-    """Build on iree-llvm-cpu (``options`` → ``etl.build``), run, and return
+    """Build on iree-llvm-cpu (``options`` → ``evoxc.build``), run, and return
     the (w, v) ndarrays plus the numpy-backend reference for ``w``."""
-    want = etl.evaluate(fn, A)
-    exe = etl.build(fn, spec, backend="iree", **options)
-    got = etl.run(exe, A)
+    want = evoxc.evaluate(fn, A)
+    exe = evoxc.build(fn, spec, backend="iree", **options)
+    got = evoxc.run(exe, A)
     return _np(got[0]), _np(got[1]), _np(want[0]), _np(want[1])
 
 
@@ -215,15 +215,15 @@ def _run_eigh(fn, A, spec, **options):
 
 
 def _diag(x):
-    return etl.diag(x)
+    return evoxc.diag(x)
 
 
 DIAG_CASES = [
-    ("diag_rank1", _diag, etl.TensorSpec((5,), etl.float32),
+    ("diag_rank1", _diag, evoxc.TensorSpec((5,), evoxc.float32),
      _RNG.standard_normal(5).astype(np.float32)),
-    ("diag_rank2_square", _diag, etl.TensorSpec((3, 3), etl.float32),
+    ("diag_rank2_square", _diag, evoxc.TensorSpec((3, 3), evoxc.float32),
      _RNG.standard_normal((3, 3)).astype(np.float32)),
-    ("diag_rank2_rect", _diag, etl.TensorSpec((4, 6), etl.float32),
+    ("diag_rank2_rect", _diag, evoxc.TensorSpec((4, 6), evoxc.float32),
      _RNG.standard_normal((4, 6)).astype(np.float32)),
 ]
 
@@ -234,8 +234,8 @@ DIAG_CASES = [
     ids=[case_id for case_id, _, _, _ in DIAG_CASES],
 )
 def test_diag_iree_exact(fn, spec, arg):
-    want = etl.evaluate(fn, arg)
-    got = etl.run(etl.build(fn, spec, backend="iree"), arg)
+    want = evoxc.evaluate(fn, arg)
+    got = evoxc.run(evoxc.build(fn, spec, backend="iree"), arg)
     g, w = _np(got), _np(want)
     assert g.shape == w.shape
     assert np.array_equal(g, w), f"{g} != {w}"
@@ -248,13 +248,13 @@ def test_diag_iree_exact(fn, spec, arg):
 
 
 def _eigh(x):
-    w, v = etl.eigh(x)
+    w, v = evoxc.eigh(x)
     return w, v
 
 
 def test_eigh_3x3_f32_contract():
     A = _sym(3)
-    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((3, 3), etl.float32))
+    gw, gv, ww, _ = _run_eigh(_eigh, A, evoxc.TensorSpec((3, 3), evoxc.float32))
     _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
     assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3), f"w vs numpy: {gw} != {ww}"
 
@@ -262,7 +262,7 @@ def test_eigh_3x3_f32_contract():
 def test_eigh_10x10_f32_contract():
     # CMAES population-covariance size; well-conditioned (diagonal +10).
     A = _sym(10, scale=10.0)
-    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((10, 10), etl.float32))
+    gw, gv, ww, _ = _run_eigh(_eigh, A, evoxc.TensorSpec((10, 10), evoxc.float32))
     _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
     assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3), (
         f"w vs numpy: max abs diff {np.max(np.abs(gw - ww))}"
@@ -271,7 +271,7 @@ def test_eigh_10x10_f32_contract():
 
 def test_eigh_batched_2x3x3_f32_contract():
     A = np.stack([_sym(3), _sym(3)])
-    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((2, 3, 3), etl.float32))
+    gw, gv, ww, _ = _run_eigh(_eigh, A, evoxc.TensorSpec((2, 3, 3), evoxc.float32))
     _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
     assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3), (
         f"w vs numpy: max abs diff {np.max(np.abs(gw - ww))}"
@@ -282,7 +282,7 @@ def test_eigh_f64_3x3_contract():
     # f64 passes through — the Jacobi composition is near-exact (LAPACK-level
     # agreement measured at 2.7e-15).
     A = _sym(3, dtype=np.float64)
-    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((3, 3), etl.float64))
+    gw, gv, ww, _ = _run_eigh(_eigh, A, evoxc.TensorSpec((3, 3), evoxc.float64))
     _check_eigh_contract(A, gw, gv, rtol=1e-12, atol=1e-12)
     assert np.allclose(gw, ww, rtol=1e-12, atol=1e-12), (
         f"w vs numpy: max abs diff {np.max(np.abs(gw - ww))}"
@@ -293,9 +293,9 @@ def test_eigh_int32_upcast_f64_contract():
     # int → float64 upcast (numpy linalg rule): the composition runs in f64,
     # so the integer spectrum is recovered exactly.
     A = np.array([[4, 1, 0], [1, 3, 1], [0, 1, 2]], dtype=np.int32)
-    want = etl.evaluate(_eigh, A)
-    exe = etl.build(_eigh, etl.TensorSpec((3, 3), etl.int32), backend="iree")
-    got = etl.run(exe, A)
+    want = evoxc.evaluate(_eigh, A)
+    exe = evoxc.build(_eigh, evoxc.TensorSpec((3, 3), evoxc.int32), backend="iree")
+    got = evoxc.run(exe, A)
     gw, gv = _np(got[0]), _np(got[1])
     assert gw.dtype == np.float64 and gv.dtype == np.float64
     _check_eigh_contract(A.astype(np.float64), gw, gv, rtol=1e-12, atol=1e-12)
@@ -337,7 +337,7 @@ EIGH_BATCHED_MATRIX = [
 )
 def test_eigh_batched_default_matrix(n, dtype, seed, rec_rel, orth, w_rel):
     A = _sym(n, scale=10.0, dtype=dtype, seed=seed)
-    spec = etl.TensorSpec((n, n), _ETL_DTYPE[np.dtype(dtype)])
+    spec = evoxc.TensorSpec((n, n), _EVOXC_DTYPE[np.dtype(dtype)])
     gw, gv, ww, _ = _run_eigh(_eigh, A, spec)
     _check_eigh_scaled(A, gw, gv, ww, rec_rel, orth, w_rel)
 
@@ -352,7 +352,7 @@ def test_eigh_batched_default_matrix(n, dtype, seed, rec_rel, orth, w_rel):
 def test_eigh_jacobi_10x10_f32_option_contract():
     A = _sym(10, scale=10.0, seed=31)
     gw, gv, ww, _ = _run_eigh(
-        _eigh, A, etl.TensorSpec((10, 10), etl.float32),
+        _eigh, A, evoxc.TensorSpec((10, 10), evoxc.float32),
         eigh_algorithm="jacobi",
     )
     _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
@@ -388,27 +388,27 @@ def _run_eigh_variant(A, spec, early_exit):
     # Splice the directly-exported text into the payload (the adapters do
     # not forward eigh_early_exit; both modes are explicit here since the
     # option defaults to False). The iree LoweredProgram payload carries
-    # the MLIR text under "mlir_text" (etl.backends.compiler).
-    graph = etl.trace(_eigh, spec)
-    lowered = etl.lower(graph, backend="iree")
-    text = etl.backends.stablehlo.export(
+    # the MLIR text under "mlir_text" (evoxc.backends.compiler).
+    graph = evoxc.trace(_eigh, spec)
+    lowered = evoxc.lower(graph, backend="iree")
+    text = evoxc.backends.stablehlo.export(
         graph, options={"eigh_early_exit": early_exit})
-    lowered = etl.LoweredProgram(backend="iree", signature=lowered.signature,
+    lowered = evoxc.LoweredProgram(backend="iree", signature=lowered.signature,
                                  payload={**lowered.payload, "mlir_text": text})
-    got = etl.run(etl.load(etl.compile(lowered, backend="iree"), backend="iree"), A)
+    got = evoxc.run(evoxc.load(evoxc.compile(lowered, backend="iree"), backend="iree"), A)
     return _np(got[0]), _np(got[1])
 
 
 def test_eigh_dim45_f32_early_exit_contract():
     A = _cov_like(45, seed=0)
-    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((45, 45), etl.float32))
+    gw, gv, ww, _ = _run_eigh(_eigh, A, evoxc.TensorSpec((45, 45), evoxc.float32))
     _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
     assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3)
 
 
 def test_eigh_dim45_early_exit_off_matches_on():
     A = _cov_like(45, seed=0)
-    spec = etl.TensorSpec((45, 45), etl.float32)
+    spec = evoxc.TensorSpec((45, 45), evoxc.float32)
     gw_on, gv_on = _run_eigh_variant(A, spec, early_exit=True)
     gw_off, gv_off = _run_eigh_variant(A, spec, early_exit=False)
     _check_eigh_contract(A, gw_on, gv_on, rtol=1e-3, atol=1e-3)
@@ -417,7 +417,7 @@ def test_eigh_dim45_early_exit_off_matches_on():
 
 
 # ---------------------------------------------------------------------------
-# 4. eigh INSIDE etl.cond — the while-bearing-cond select fallback
+# 4. eigh INSIDE evoxc.cond — the while-bearing-cond select fallback
 #
 # Each branch computes its own eigh and the predicate (sign of the matrix sum)
 # selects. Because a branch region of this cond contains a while-emitting op
@@ -445,7 +445,7 @@ EIGH_COND_CASES = [
 
 
 def _eigh_cond(x):
-    return etl.cond(etl.sum(x) > 0.0, _eigh, lambda t: _eigh(-t), x)
+    return evoxc.cond(evoxc.sum(x) > 0.0, _eigh, lambda t: _eigh(-t), x)
 
 
 @pytest.mark.parametrize(
@@ -455,11 +455,11 @@ def _eigh_cond(x):
 )
 def test_eigh_inside_cond_contract(n, seed, rec_rel):
     A = _sym(n, scale=10.0, seed=seed)
-    spec = etl.TensorSpec((n, n), etl.float32)
-    w_ref = _np(etl.evaluate(_eigh, A)[0])
-    exe = etl.build(_eigh_cond, spec, backend="iree")
+    spec = evoxc.TensorSpec((n, n), evoxc.float32)
+    w_ref = _np(evoxc.evaluate(_eigh, A)[0])
+    exe = evoxc.build(_eigh_cond, spec, backend="iree")
     for arg in (A, -A):
-        got = etl.run(exe, arg)
+        got = evoxc.run(exe, arg)
         gw, gv = _np(got[0]), _np(got[1])
         _check_eigh_contract(A, gw, gv, rtol=1e-4, atol=1e-4)
         _check_eigh_scaled(A, gw, gv, w_ref, rec_rel, 1.0e-5, 2.0e-5)
@@ -480,8 +480,8 @@ def test_eigh_inside_cond_contract(n, seed, rec_rel):
 
 def _i64(v):
     """A static int64 scalar constant (the verified ``while_loop`` counter
-    pattern — embedded explicitly through ``etl.constant``)."""
-    return etl.constant(etl.tensor(np.array(v, dtype=np.int64)))
+    pattern — embedded explicitly through ``evoxc.constant``)."""
+    return evoxc.constant(evoxc.tensor(np.array(v, dtype=np.int64)))
 
 
 # --- 4b(i) eigh inside a while_loop BODY ------------------------------------
@@ -504,24 +504,24 @@ def _eigh_while(x):
 
     def body_fn(state):
         a, _w, _v, i = state
-        w, v = etl.eigh(a)
-        m = etl.dot(etl.dot(v, etl.diag(w)), etl.transpose(v))
+        w, v = evoxc.eigh(a)
+        m = evoxc.dot(evoxc.dot(v, evoxc.diag(w)), evoxc.transpose(v))
         return (m, w, v, i + 1)
 
     init = (
         x,
-        enp.zeros((n,), etl.float32),      # overwritten by iteration 1
-        enp.zeros((n, n), etl.float32),    # overwritten by iteration 1
+        enp.zeros((n,), evoxc.float32),      # overwritten by iteration 1
+        enp.zeros((n, n), evoxc.float32),    # overwritten by iteration 1
         _i64(0),
     )
-    return etl.while_loop(cond_fn, body_fn, init)
+    return evoxc.while_loop(cond_fn, body_fn, init)
 
 
 def test_eigh_inside_while_body_contract():
     A = _sym(WHILE_BODY_N, scale=10.0, seed=67)
-    spec = etl.TensorSpec((WHILE_BODY_N, WHILE_BODY_N), etl.float32)
-    w_ref = _np(etl.evaluate(_eigh, A)[0])
-    got = etl.run(etl.build(_eigh_while, spec, backend="iree"), A)
+    spec = evoxc.TensorSpec((WHILE_BODY_N, WHILE_BODY_N), evoxc.float32)
+    w_ref = _np(evoxc.evaluate(_eigh, A)[0])
+    got = evoxc.run(evoxc.build(_eigh_while, spec, backend="iree"), A)
     a_out, gw, gv = _np(got[0]), _np(got[1]), _np(got[2])
     # The loop is matrix-preserving: measured drift of the carried matrix
     # 4.9e-6 of max|A| after 3 eigh/re-form round trips (bound 2.0e-5).
@@ -544,20 +544,20 @@ def test_eigh_inside_while_body_contract():
 
 
 def _eigh_cond_runtime_pred(x, pred):
-    return etl.cond(pred, _eigh, lambda t: _eigh(-t), x)
+    return evoxc.cond(pred, _eigh, lambda t: _eigh(-t), x)
 
 
 def test_eigh_inside_cond_runtime_predicate():
     n = 10
     A = _sym(n, scale=10.0, seed=73)
     specs = (
-        etl.TensorSpec((n, n), etl.float32),
-        etl.TensorSpec((), etl.bool_),
+        evoxc.TensorSpec((n, n), evoxc.float32),
+        evoxc.TensorSpec((), evoxc.bool_),
     )
-    exe = etl.build(_eigh_cond_runtime_pred, *specs, backend="iree")
+    exe = evoxc.build(_eigh_cond_runtime_pred, *specs, backend="iree")
     spectra = {}
     for pred, M in ((True, A), (False, -A)):
-        got = etl.run(exe, A, np.array(pred))
+        got = evoxc.run(exe, A, np.array(pred))
         gw, gv = _np(got[0]), _np(got[1])
         spectra[pred] = gw
         _check_eigh_contract(M, gw, gv, rtol=1e-4, atol=1e-4)
@@ -565,7 +565,7 @@ def test_eigh_inside_cond_runtime_predicate():
         # eigh(-A) is the mirrored spectrum at the same accuracy): rec 2.4e-6 /
         # orth 1.1e-6 / eigenvalues 1.4e-6 — bounds at 3-5x margin.
         _check_eigh_scaled(
-            M, gw, gv, _np(etl.evaluate(_eigh, M)[0]), 1.0e-5, 5.0e-6, 5.0e-6,
+            M, gw, gv, _np(evoxc.evaluate(_eigh, M)[0]), 1.0e-5, 5.0e-6, 5.0e-6,
         )
     # The polarity really reaches the select: the two runs hold mirror-image
     # spectra (ascending eigenvalues of A vs of -A), never the same branch.
@@ -582,23 +582,23 @@ def test_eigh_inside_cond_runtime_predicate():
 
 def _eigh_cond_nested(x):
     def inner(t):
-        return etl.cond(etl.sum(t) > 0.0, _eigh, lambda u: _eigh(-u), t)
+        return evoxc.cond(evoxc.sum(t) > 0.0, _eigh, lambda u: _eigh(-u), t)
 
-    return etl.cond(etl.sum(x) > 0.0, inner, inner, x)
+    return evoxc.cond(evoxc.sum(x) > 0.0, inner, inner, x)
 
 
 def test_eigh_inside_cond_nested():
     n = 3
     A = _sym(n, scale=10.0, seed=79)
-    spec = etl.TensorSpec((n, n), etl.float32)
-    w_ref = _np(etl.evaluate(_eigh, A)[0])
-    exe = etl.build(_eigh_cond_nested, spec, backend="iree")
+    spec = evoxc.TensorSpec((n, n), evoxc.float32)
+    w_ref = _np(evoxc.evaluate(_eigh, A)[0])
+    exe = evoxc.build(_eigh_cond_nested, spec, backend="iree")
     # Both outer branches hold the same while-bearing inner cond, so either
     # outer polarity runs an inner cond whose two branches each compute their
     # own eigh — and ``sum`` of a symmetrized X Xᵀ + 10·I is positive, so the
     # selected inner result is ``eigh(A)`` for the matrix AND for its negation.
     for arg in (A, -A):
-        got = etl.run(exe, arg)
+        got = evoxc.run(exe, arg)
         gw, gv = _np(got[0]), _np(got[1])
         _check_eigh_contract(A, gw, gv, rtol=1e-4, atol=1e-4)
         # Measured (n=3, seed 79): rec 3.4e-7 / orth 2.4e-7 / eigenvalues
@@ -617,24 +617,24 @@ def test_eigh_inside_cond_nested():
 
 @pytest.fixture(scope="module")
 def rocm_device():
-    """The ROCm etl device; ``pytest.skip`` when no HIP device is usable."""
+    """The ROCm evoxc device; ``pytest.skip`` when no HIP device is usable."""
     return guard.require_rocm()
 
 
 def test_eigh_batched_rocm_n10_f32_contract(rocm_device):
     A = _sym(10, scale=10.0, seed=53)
-    exe = etl.build(
-        _eigh, etl.TensorSpec((10, 10), etl.float32), backend="iree",
+    exe = evoxc.build(
+        _eigh, evoxc.TensorSpec((10, 10), evoxc.float32), backend="iree",
         device=rocm_device, target_backends=["rocm"],
     )
-    got = etl.run(exe, etl.core.Tensor(A).to(rocm_device))
+    got = evoxc.run(exe, evoxc.core.Tensor(A).to(rocm_device))
     # Device-resident run-outs; host access goes through the explicit D2H hop
     # (a bare .numpy() on a rocm payload raises core.DeviceError).
     for out in got:
         assert out.device == rocm_device
-    gw = np.asarray(got[0].to(etl.core.Device("cpu", 0)).numpy())
-    gv = np.asarray(got[1].to(etl.core.Device("cpu", 0)).numpy())
-    w_ref = _np(etl.evaluate(_eigh, A)[0])
+    gw = np.asarray(got[0].to(evoxc.core.Device("cpu", 0)).numpy())
+    gv = np.asarray(got[1].to(evoxc.core.Device("cpu", 0)).numpy())
+    w_ref = _np(evoxc.evaluate(_eigh, A)[0])
     # Measured on the MI300X (gfx942): rec 1.31e-6 / orth 8.3e-7 (normalized
     # as above) — the same band as llvm-cpu; bounds at ~8x margin.
     _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)

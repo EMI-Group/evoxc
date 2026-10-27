@@ -1,4 +1,4 @@
-"""Shared IR-normalization helper for the enp (etl.numpy) test files."""
+"""Shared IR-normalization helper for the enp (evoxc.numpy) test files."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ def normalize_ir(text: str) -> str:
 
     The regex ``\s+loc\(.*?\)\s*$`` is applied to each line, before removing
     leading/trailing whitespace, because loc tokens differ between enp
-    callsites (etl/numpy/*.py) and ops-composed defns (the test files).
+    callsites (evoxc/numpy/*.py) and ops-composed defns (the test files).
     Everything else in the IR must match character-for-character.
     """
     return "\n".join(_LOC_RE.sub("", line) for line in text.splitlines()).strip()

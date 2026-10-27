@@ -3,14 +3,14 @@
 The Vulkan counterpart of ``test_iree_rocm_device_resident.py`` (explicit
 placement contract: host-input rejection / pass-through / the same-device
 iteration pattern) for the FOURTH first-class device kind, ``"vulkan"``
-(``etl/backends/adapters/iree.py`` + ``core.Tensor.to``/``.numpy`` + the
-pipeline run-boundary device check in ``etl/pipeline.py``):
+(``evoxc/backends/adapters/iree.py`` + ``core.Tensor.to``/``.numpy`` + the
+pipeline run-boundary device check in ``evoxc/pipeline.py``):
 
 * ``Device("vulkan", N)`` selects the N-th entry of IREE's enumerated vulkan
   device list — the ids are QUERIED PER-PROCESS HASHES, not the cuda/rocm
   1-based ordinals (``_acquire_vulkan_device``);
 * a ``vulkan`` device infers the ``"vulkan-spirv"`` compile target
-  (``etl.pipeline`` / ``etl.bench._util``), so ``etl.build(..., backend=
+  (``evoxc.pipeline`` / ``evoxc.bench._util``), so ``evoxc.build(..., backend=
   "iree", device=Device("vulkan", 0))`` produces a ``target == "vulkan"``
   artifact that ``load()`` accepts on that device;
 * run outputs are payload-backed ``core.Tensor``\\ s on the executable's
@@ -41,7 +41,7 @@ loader away from a wedged vendor ICD: with it unset, this host's loader
 dlopens a broken amdgpu ICD and ``get_driver("vulkan")`` HANGS instead of
 failing. A hang is neither a skip nor a failure, so the guard enumerates in a
 CHILD process under a timeout (``_probe_vulkan_devices``, following Known
-Issue 16b in ``etl/backends/adapters/CONTEXT.md``: "wrap any Vulkan/DRM probe
+Issue 16b in ``evoxc/backends/adapters/CONTEXT.md``: "wrap any Vulkan/DRM probe
 in ``timeout``") and skips with that reason when it fires.
 
 Deliberately NO timing / benchmarking here: only short correctness checks on
@@ -59,7 +59,7 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 # ---------------------------------------------------------------------------
 # data (deterministic; small shapes — the software device stays cheap)
@@ -72,18 +72,18 @@ XR = np.random.default_rng(7).standard_normal((4, 6)).astype(np.float32)
 XW = np.random.default_rng(11).standard_normal((6, 5)).astype(np.float32)
 
 ADD_SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((4, 6), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
 )
 MLP_SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((6, 5), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((6, 5), evoxc.float32),
 )
 STEP_SPECS = MLP_SPECS
 
 
 def _add(x, y):
-    return etl.add(x, y)
+    return evoxc.add(x, y)
 
 
 def _mlp_sum(x, w):
@@ -93,19 +93,19 @@ def _mlp_sum(x, w):
     ~5e-07 (well inside the fp32 budget), never bit-exact — accumulation
     order is the compiler's.
     """
-    return etl.sum(etl.relu(etl.dot(x, w)), axes=(1,))
+    return evoxc.sum(evoxc.relu(evoxc.dot(x, w)), axes=(1,))
 
 
 def _step(x, w):
     """One loop step: a matmul/relu branch + a carried state branch."""
-    return etl.relu(etl.dot(x, w)), x + 1.0
+    return evoxc.relu(evoxc.dot(x, w)), x + 1.0
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
-_CPU = etl.core.Device("cpu", 0)
+_CPU = evoxc.core.Device("cpu", 0)
 
 
 def _np(v):
@@ -116,31 +116,31 @@ def _np(v):
     no-op for cpu-kind payloads, and the D2H hop for vulkan payloads whose
     bare ``.numpy()`` raises ``DeviceError``.
     """
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.to(_CPU).numpy())
     return np.asarray(v)
 
 
 def _place(host, device):
     """Place host numpy data on ``device`` via the explicit transfer API."""
-    return etl.core.Tensor(host).to(device)
+    return evoxc.core.Tensor(host).to(device)
 
 
 def _numpy_ref(fn, *args):
     """The numpy interpreter's result as plain ndarrays (the reference)."""
-    return etl.tree_map(_np, etl.evaluate(fn, *args, backend="numpy"))
+    return evoxc.tree_map(_np, evoxc.evaluate(fn, *args, backend="numpy"))
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
 
 def _assert_close(got, want, rtol=1e-5, atol=1e-5):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.allclose(gp, wp, rtol=rtol, atol=atol), f"{gp} != {wp}"
 
@@ -151,7 +151,7 @@ def _assert_device_resident(out, device):
     Duck-typed payload assertions only (the payload class is private): not an
     ndarray, knows its shape/dtype/device, and exposes the ``to_host`` path.
     """
-    assert isinstance(out, etl.Tensor)
+    assert isinstance(out, evoxc.Tensor)
     assert not isinstance(out.data, np.ndarray)  # NOT a numpy-backed tensor
     assert out.device == device  # the executable's core.Device label
     assert hasattr(out.data, "to_host")  # duck-typed payload protocol
@@ -181,7 +181,7 @@ def _build_exe(fn, specs, device, target_backends=None):
         kwargs = {"backend": "iree", "device": device}
         if target_backends is not None:
             kwargs["target_backends"] = list(target_backends)
-        exe = etl.build(fn, *specs, **kwargs)
+        exe = evoxc.build(fn, *specs, **kwargs)
         _EXECUTABLES[key] = exe
     return exe
 
@@ -192,7 +192,7 @@ def _build_exe(fn, specs, device, target_backends=None):
 
 #: Why the suite skips. Names BOTH the IREE 3.11 ``llvmpipe`` device-name
 #: denylist AND the ``VK_ICD_FILENAMES`` remedy (the ``_acquire_vulkan_device``
-#: contract in ``etl/backends/adapters/iree.py``).
+#: contract in ``evoxc/backends/adapters/iree.py``).
 NO_VULKAN_DEVICE = (
     "no usable Vulkan device for IREE: iree.runtime.get_driver('vulkan') "
     "enumerated no devices (or could not even create a driver instance). "
@@ -210,7 +210,7 @@ NO_VULKAN_DEVICE = (
 def _enumerated_vulkan_devices():
     """IREE's enumerated vulkan device-info dicts (the adapter's own source).
 
-    ``etl`` maps ``Device("vulkan", N)`` to the N-th ENUMERATED entry, so this
+    ``evoxc`` maps ``Device("vulkan", N)`` to the N-th ENUMERATED entry, so this
     is both the ground truth the error messages must name and the source the
     adapter's ``_acquire_vulkan_device`` reads. IN-PROCESS ONLY AFTER THE
     GUARD PASSED — see ``_probe_vulkan_devices`` for why the guard itself must
@@ -249,7 +249,7 @@ def _probe_vulkan_devices():
     IN-PROCESS IS NOT SAFE ON EVERY HOST: with ``VK_ICD_FILENAMES`` unset, a
     host whose vendor ICD is wedged makes the Vulkan loader dlopen that ICD
     and ``query_available_devices()`` HANG — it neither returns nor raises
-    (Known Issue 16b in ``etl/backends/adapters/CONTEXT.md``: "wrap any
+    (Known Issue 16b in ``evoxc/backends/adapters/CONTEXT.md``: "wrap any
     Vulkan/DRM probe in ``timeout``"). A hung probe is neither a skip nor a
     failure, so the guard runs it in a subprocess and skips when the timeout
     fires. Once the probe HAS succeeded the loader is proven healthy and the
@@ -300,7 +300,7 @@ def _probe_vulkan_devices():
 
 @pytest.fixture(scope="module")
 def vulkan():
-    """The etl vulkan device; ``pytest.skip`` when no device is usable."""
+    """The evoxc vulkan device; ``pytest.skip`` when no device is usable."""
     infos, reason = _probe_vulkan_devices()
     if not infos:
         pytest.skip(f"{NO_VULKAN_DEVICE} ({reason})" if reason else NO_VULKAN_DEVICE)
@@ -308,8 +308,8 @@ def vulkan():
     # fills the per-backend AND the flat-DEFAULT vulkan device-transfer slots
     # (the iree adapter is the only backend that serves a vulkan device), which
     # is what makes ``Tensor.to(Device("vulkan", N))`` resolve.
-    etl.backends.get("iree")
-    return etl.core.Device("vulkan", 0)
+    evoxc.backends.get("iree")
+    return evoxc.core.Device("vulkan", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +325,7 @@ def test_vulkan_runout_device_resident_and_numpy_parity(vulkan):
     # The inference is real, not a default llvm-cpu artifact that happened to
     # load: load()'s artifact↔device gate accepts only a "vulkan-spirv" target.
     assert exe.backend_executable.artifact.target == "vulkan"
-    out = etl.run(exe, _place(XR, vulkan), _place(XW, vulkan))
+    out = evoxc.run(exe, _place(XR, vulkan), _place(XW, vulkan))
     # Payload-backed (never ndarray-backed), labelled with the executable's
     # vulkan device, declaring the graph's output shape/dtype.
     _assert_device_resident(out, vulkan)
@@ -346,16 +346,16 @@ def test_vulkan_runout_device_resident_and_numpy_parity(vulkan):
 def test_vulkan_explicit_pipeline_and_readback(vulkan):
     # Trace -> lower -> compile -> load -> run, with the vulkan target passed
     # EXPLICITLY (the sugar-free spelling of the same compile).
-    graph = etl.trace(_add, *ADD_SPECS)
-    lowered = etl.lower(graph, backend="iree", target_backends=["vulkan-spirv"])
-    artifact = etl.compile(lowered, target_backends=["vulkan-spirv"])
+    graph = evoxc.trace(_add, *ADD_SPECS)
+    lowered = evoxc.lower(graph, backend="iree", target_backends=["vulkan-spirv"])
+    artifact = evoxc.compile(lowered, target_backends=["vulkan-spirv"])
     assert artifact.target == "vulkan"
-    exe = etl.load(artifact, backend="iree", device=vulkan)
+    exe = evoxc.load(artifact, backend="iree", device=vulkan)
     assert exe.device == vulkan
-    out = etl.run(exe, _place(XA, vulkan), _place(XB, vulkan))
+    out = evoxc.run(exe, _place(XA, vulkan), _place(XB, vulkan))
     _assert_device_resident(out, vulkan)
     # No implicit device-to-host transfer, ever.
-    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+    with pytest.raises(evoxc.core.DeviceError, match="no implicit device-to-host"):
         out.numpy()
     # The explicit D2H hop is the only host path — and it is BIT-EXACT here:
     # the elementwise add of exactly-representable fp32 values.
@@ -371,9 +371,9 @@ def test_vulkan_explicit_pipeline_and_readback(vulkan):
 
 
 def test_zeros_to_vulkan_and_explicit_round_trip(vulkan):
-    # etl.zeros is a concrete creator (cpu:0 host memory); .to(vulkan) is the
+    # evoxc.zeros is a concrete creator (cpu:0 host memory); .to(vulkan) is the
     # explicit upload and yields a vulkan-resident tensor with the REAL label.
-    z = etl.zeros((4, 6), etl.float32).to(vulkan)
+    z = evoxc.zeros((4, 6), evoxc.float32).to(vulkan)
     _assert_device_resident(z, vulkan)
     assert z.shape == (4, 6)
     assert z.dtype == np.dtype("float32")
@@ -382,7 +382,7 @@ def test_zeros_to_vulkan_and_explicit_round_trip(vulkan):
     _assert_device_resident(placed, vulkan)
     assert placed.shape == XA.shape
     # No implicit device-to-host transfer, ever.
-    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+    with pytest.raises(evoxc.core.DeviceError, match="no implicit device-to-host"):
         z.numpy()
     # The explicit download is correct in both directions.
     host = z.to(_CPU)
@@ -403,8 +403,8 @@ def test_host_inputs_rejected_at_run_boundary(vulkan):
     exe = _build_exe(_add, ADD_SPECS, vulkan)
     # (a) A vulkan executable never stages host inputs: feeding host cpu:0
     # tensors raises DeviceError naming the input path + the remedy.
-    with pytest.raises(etl.core.DeviceError) as excinfo:
-        etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    with pytest.raises(evoxc.core.DeviceError) as excinfo:
+        evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     msg = str(excinfo.value)
     assert "input at path [0]" in msg  # the offending input tree path
     assert (
@@ -414,13 +414,13 @@ def test_host_inputs_rejected_at_run_boundary(vulkan):
     assert "t.to(" in msg  # the explicit placement remedy
     # (b) Raw numpy arrays auto-wrap as cpu:0 host tensors — same error.
     with pytest.raises(
-        etl.core.DeviceError,
+        evoxc.core.DeviceError,
         match="no implicit device-to-host or host-to-device transfer happens "
         "at the run boundary",
     ):
-        etl.run(exe, XA, XB)
+        evoxc.run(exe, XA, XB)
     # (c) Inputs explicitly placed on the device run bit-exact.
-    out = etl.run(exe, _place(XA, vulkan), _place(XB, vulkan))
+    out = evoxc.run(exe, _place(XA, vulkan), _place(XB, vulkan))
     _assert_device_resident(out, vulkan)
     _assert_exact(out, _numpy_ref(_add, XA, XB))
 
@@ -452,7 +452,7 @@ def test_same_device_loop_zero_asdevicearray_calls(vulkan, monkeypatch):
     monkeypatch.setattr(rt, "asdevicearray", _forbid)
     first = None
     for i in range(5):  # steps 1..5: pure pass-through, first included
-        branch, x = etl.run(exe, x, w)
+        branch, x = evoxc.run(exe, x, w)
         _assert_device_resident(branch, vulkan)
         _assert_device_resident(x, vulkan)
         assert branch.shape == (4, 5) and branch.dtype == np.dtype("float32")
@@ -483,7 +483,7 @@ def test_out_of_range_vulkan_index_names_enumeration(vulkan):
 
     # The requested index must not exist for this pin to mean anything.
     bad_index = count + 3
-    bad_device = etl.core.Device("vulkan", bad_index)
+    bad_device = evoxc.core.Device("vulkan", bad_index)
 
     # The (cached) vulkan artifact of a previous test — the load-time gate is
     # reached before any device work, so the failure is purely the index.
@@ -492,8 +492,8 @@ def test_out_of_range_vulkan_index_names_enumeration(vulkan):
     # (a) load() on the out-of-range device: an explicit BackendError naming
     # the enumerated COUNT, the enumerated device NAMES and the requested
     # index — and stating that vulkan ids are queried hashes, not ordinals.
-    with pytest.raises(etl.core.BackendError) as excinfo:
-        etl.load(artifact, backend="iree", device=bad_device)
+    with pytest.raises(evoxc.core.BackendError) as excinfo:
+        evoxc.load(artifact, backend="iree", device=bad_device)
     msg = str(excinfo.value)
     assert f"enumerated {count} device(s)" in msg
     for name in names:
@@ -504,7 +504,7 @@ def test_out_of_range_vulkan_index_names_enumeration(vulkan):
 
     # (b) The placement provider resolves the SAME device path, so an upload to
     # the out-of-range device raises the same contract-bearing BackendError.
-    with pytest.raises(etl.core.BackendError) as excinfo2:
+    with pytest.raises(evoxc.core.BackendError) as excinfo2:
         _place(XA, bad_device)
     msg2 = str(excinfo2.value)
     assert f"enumerated {count} device(s)" in msg2

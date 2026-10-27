@@ -1,13 +1,13 @@
-"""`etl.numpy` (alias `enp`) namespace surface tests.
+"""`evoxc.numpy` (alias `enp`) namespace surface tests.
 
-Validates the documented public surface of `etl.numpy` — the `enp` alias,
+Validates the documented public surface of `evoxc.numpy` — the `enp` alias,
 the three documented import styles, the exact `__all__` name set (all
 callable except the `linalg` submodule), and the intentional v1 deferrals
 (absent names raise `AttributeError` — never silently exist).
 
-The IR-equivalence of every function (enp.f ≡ mapped etl.ops composition)
+The IR-equivalence of every function (enp.f ≡ mapped evoxc.ops composition)
 is covered in `test_equivalence.py` — the defining property of the
-namespace (see `etl/numpy/CONTEXT.md`).
+namespace (see `evoxc/numpy/CONTEXT.md`).
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ import types
 
 import pytest
 
-import etl
-import etl.numpy as enp
+import evoxc
+import evoxc.numpy as enp
 
 # --- The documented v1 surface ----------------------------------------------
-# etl/numpy/CONTEXT.md "API surface" + etl/numpy/__init__.py __all__:
+# evoxc/numpy/CONTEXT.md "API surface" + evoxc/numpy/__init__.py __all__:
 # 55 callables + the `linalg` submodule = 56 names.
 EXPECTED_SURFACE = frozenset(
     {
@@ -46,24 +46,24 @@ EXPECTED_SURFACE = frozenset(
 
 CALLABLE_NAMES = sorted(EXPECTED_SURFACE - {"linalg"})
 
-# Documented v1 deferrals (etl/numpy/CONTEXT.md "Deferrals (v1)").
+# Documented v1 deferrals (evoxc/numpy/CONTEXT.md "Deferrals (v1)").
 DEFERRED_NAMES = ["linspace", "absolute", "var", "std", "einsum"]
 
 
 def test_enp_is_numpy_alias():
-    """`enp` is the documented alias of `etl.numpy` (registered at the
-    package level in etl/__init__.py)."""
-    assert etl.enp is etl.numpy
+    """`enp` is the documented alias of `evoxc.numpy` (registered at the
+    package level in evoxc/__init__.py)."""
+    assert evoxc.enp is evoxc.numpy
 
 
 def test_import_styles():
     """All documented import forms resolve to the same module object."""
-    # import etl.numpy as enp
-    assert importlib.import_module("etl.numpy") is etl.numpy
-    # from etl import numpy as enp
-    assert importlib.import_module("etl").numpy is etl.numpy
-    # the etl-level alias
-    assert importlib.import_module("etl").enp is etl.numpy
+    # import evoxc.numpy as enp
+    assert importlib.import_module("evoxc.numpy") is evoxc.numpy
+    # from evoxc import numpy as enp
+    assert importlib.import_module("evoxc").numpy is evoxc.numpy
+    # the evoxc-level alias
+    assert importlib.import_module("evoxc").enp is evoxc.numpy
 
 
 def test_surface_exact():

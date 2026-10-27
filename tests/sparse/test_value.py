@@ -1,6 +1,6 @@
-"""Value-model tests for ``etl.sparse`` — the three-phase sparse tensor.
+"""Value-model tests for ``evoxc.sparse`` — the three-phase sparse tensor.
 
-Pins the contract in ``etl/sparse/CONTEXT.md`` + ``etl/sparse/value.py``
+Pins the contract in ``evoxc/sparse/CONTEXT.md`` + ``evoxc/sparse/value.py``
 (read-only): concrete constructors and their canonical validation, integer
 index-dtype normalization, ``from_dense`` extraction, ``SparseTensorSpec``
 (``from_concrete`` + constructor validation), the ONE pytree registration
@@ -13,8 +13,8 @@ Small shapes only; CPU only.
 import numpy as np
 import pytest
 
-import etl
-from etl import core, sparse
+import evoxc
+from evoxc import core, sparse
 
 from tests.sparse.conftest import (
     batched_coo_example,
@@ -38,7 +38,7 @@ def _symbolic_coo():
         captured["x"] = x
         return x
 
-    etl.trace(f, coo_spec())
+    evoxc.trace(f, coo_spec())
     return captured["x"]
 
 
@@ -527,9 +527,9 @@ def test_stored_zero_duplicate_row_constructs():
     [
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((None, 2), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
-                etl.TensorSpec((None,), etl.int64),
+                evoxc.TensorSpec((None, 2), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
+                evoxc.TensorSpec((None,), evoxc.int64),
                 dense_shape=(3, 4),
             ),
             "COO requires 2 leaf specs",
@@ -537,8 +537,8 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4,), etl.int64),
-                etl.TensorSpec((None,), etl.int64),
+                evoxc.TensorSpec((4,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.int64),
                 dense_shape=(3, 4),
                 format="csr",
             ),
@@ -548,7 +548,7 @@ def test_stored_zero_duplicate_row_constructs():
         pytest.param(
             lambda: sparse.SparseTensorSpec(
                 5,
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
             ),
             "indices leaf spec must be a core.TensorSpec",
@@ -556,8 +556,8 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4, 2), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((4, 2), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
             ),
             "COO indices spec must have shape",
@@ -565,8 +565,8 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((None, 2), etl.int64),
-                etl.TensorSpec((4,), etl.float32),
+                evoxc.TensorSpec((None, 2), evoxc.int64),
+                evoxc.TensorSpec((4,), evoxc.float32),
                 dense_shape=(3, 4),
             ),
             "COO values spec must have shape",
@@ -574,8 +574,8 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((None, 2), etl.float32),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((None, 2), evoxc.float32),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
             ),
             "indices spec dtype must be int64",
@@ -583,9 +583,9 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4,), etl.int64),
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(2, 3, 4),
                 format="csr",
             ),
@@ -594,9 +594,9 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
                 format="csr",
             ),
@@ -605,9 +605,9 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4,), etl.float32),
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.float32),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
                 format="csr",
             ),
@@ -616,9 +616,9 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
                 format="csr",
             ),
@@ -627,9 +627,9 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4,), etl.int64),
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
                 format="csc",
             ),
@@ -638,9 +638,9 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((4,), etl.int64),
-                etl.TensorSpec((None,), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((4,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(core.Dim(name="b"), 4),
                 format="csr",
             ),
@@ -649,8 +649,8 @@ def test_stored_zero_duplicate_row_constructs():
         ),
         pytest.param(
             lambda: sparse.SparseTensorSpec(
-                etl.TensorSpec((None, 2), etl.int64),
-                etl.TensorSpec((None,), etl.float32),
+                evoxc.TensorSpec((None, 2), evoxc.int64),
+                evoxc.TensorSpec((None,), evoxc.float32),
                 dense_shape=(3, 4),
                 format="dia",
             ),
@@ -666,8 +666,8 @@ def test_spec_constructor_validation(build, match):
 
 def test_spec_dim_at_position_zero_allowed_for_coo():
     spec = sparse.SparseTensorSpec(
-        etl.TensorSpec((None, 2), etl.int64),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None, 2), evoxc.int64),
+        evoxc.TensorSpec((None,), evoxc.float32),
         dense_shape=(core.Dim(name="b"), 4),
     )
     assert isinstance(spec.dense_shape[0], core.Dim)
@@ -852,7 +852,7 @@ def test_batched_concrete_input_side_pytree_layout():
     # test_batched_to_dense_dim_at_position_zero); these values exist to be
     # run() inputs of vectorized graphs.
     b = batched_coo_example()
-    children, tree = etl.core.flatten(b)
+    children, tree = evoxc.core.flatten(b)
     assert tree.type is sparse.SparseTensor
     assert children[0].shape == (2, 4, 2)  # indices (B, nnz, ndim)
     assert children[1].shape == (2, 4)  # values (B, nnz)

@@ -1,11 +1,11 @@
-"""Portable-decomposition inlining tests for ``etl.block`` (decorator form).
+"""Portable-decomposition inlining tests for ``evoxc.block`` (decorator form).
 
-Covers the binding contract from ``etl/block/CONTEXT.md``:
+Covers the binding contract from ``evoxc/block/CONTEXT.md``:
 
-* ``@etl.block @etl.defn`` registers a portable implementation (name = function
+* ``@evoxc.block @evoxc.defn`` registers a portable implementation (name = function
   name; ``has_portable`` True; resolved batching policy ``batching_rule``;
   the decomposition fallbacks land in the transforms registries).
-* The numpy backend INLINES the portable decomposition at ``etl.lower`` time
+* The numpy backend INLINES the portable decomposition at ``evoxc.lower`` time
   (graph->graph splice), so the interpreter never sees the ``block_call`` and
   numerical results equal the decomposition's computation.
 * Errors: non-defn portables fail at declaration (``BlockError``); a portable
@@ -17,13 +17,13 @@ Covers the binding contract from ``etl/block/CONTEXT.md``:
   structured-return blocks declare ``outputs=`` explicitly. Direct
   evaluate/lowering works for both shapes; vmap works through the
   namedtuple return, and through the dataclass return once the parallel
-  ``etl/block`` implementation lands — at base the dataclass-through-vmap
-  case fails with ``BlockError`` from ``etl/block/rules.py::_flatten_outputs``
-  (see the ``BUG(etl)`` marker on ``test_vmap_through_dataclass_portable``).
+  ``evoxc/block`` implementation lands — at base the dataclass-through-vmap
+  case fails with ``BlockError`` from ``evoxc/block/rules.py::_flatten_outputs``
+  (see the ``BUG(evoxc)`` marker on ``test_vmap_through_dataclass_portable``).
 
 Notes:
 
-* Block annotations are eagerly evaluated (``etl.defn``/``etl.block`` do not
+* Block annotations are eagerly evaluated (``evoxc.defn``/``evoxc.block`` do not
   evaluate string annotations), so this module deliberately has NO
   ``from __future__ import annotations`` and multi-output return annotations
   are spelled as literal tuples of ``TensorSpec``.
@@ -41,8 +41,8 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-import etl
-from etl.block.errors import BlockError
+import evoxc
+from evoxc.block.errors import BlockError
 
 BATCH = 8
 DIM = 4
@@ -78,7 +78,7 @@ def _sigmoid_np(x):
 
 def _run(graph, *args):
     """Explicit pipeline: lower -> compile -> load -> run (returns structure)."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *args)
 
 
 def _batched_rows():
@@ -91,26 +91,26 @@ def _batched_rows():
 # ---------------------------------------------------------------------------
 
 
-@etl.block
-@etl.defn
-def port_swish(x: etl.TensorSpec((None,), etl.float32)) -> etl.TensorSpec((None,), etl.float32):
-    return etl.sigmoid(x) * x
+@evoxc.block
+@evoxc.defn
+def port_swish(x: evoxc.TensorSpec((None,), evoxc.float32)) -> evoxc.TensorSpec((None,), evoxc.float32):
+    return evoxc.sigmoid(x) * x
 
 
-@etl.defn
+@evoxc.defn
 def port_swish_fn(x):
     return port_swish(x)
 
 
-@etl.block
-@etl.defn
+@evoxc.block
+@evoxc.defn
 def port_pair(
-    x: etl.TensorSpec((None,), etl.float32),
-) -> (etl.TensorSpec((None,), etl.float32), etl.TensorSpec((None,), etl.float32)):
-    return etl.sigmoid(x) * x, etl.tanh(x)
+    x: evoxc.TensorSpec((None,), evoxc.float32),
+) -> (evoxc.TensorSpec((None,), evoxc.float32), evoxc.TensorSpec((None,), evoxc.float32)):
+    return evoxc.sigmoid(x) * x, evoxc.tanh(x)
 
 
-@etl.defn
+@evoxc.defn
 def port_pair_fn(x):
     return port_pair(x)
 
@@ -118,26 +118,26 @@ def port_pair_fn(x):
 # Portable returning a non-tensor: the return annotation is omitted and the
 # output spec is declared explicitly, so the declaration succeeds and the
 # failure surfaces at LOWER time (where the decomposition is inlined).
-@etl.block(outputs=[etl.TensorSpec((), etl.float32)])
-@etl.defn
-def port_badtensor(x: etl.TensorSpec((), etl.float32)):
+@evoxc.block(outputs=[evoxc.TensorSpec((), evoxc.float32)])
+@evoxc.defn
+def port_badtensor(x: evoxc.TensorSpec((), evoxc.float32)):
     return 2.0
 
 
-@etl.defn
+@evoxc.defn
 def port_badtensor_fn(x):
     return port_badtensor(x)
 
 
 # Declared output is a scalar, the portable returns rank 1 (a rank-vs-dim
 # variant of the declared-vs-portable mismatch).
-@etl.block(outputs=[etl.TensorSpec((), etl.float32)])
-@etl.defn
-def port_shape_mismatch(x: etl.TensorSpec((2,), etl.float32)):
-    return etl.reshape(x, (2,))
+@evoxc.block(outputs=[evoxc.TensorSpec((), evoxc.float32)])
+@evoxc.defn
+def port_shape_mismatch(x: evoxc.TensorSpec((2,), evoxc.float32)):
+    return evoxc.reshape(x, (2,))
 
 
-@etl.defn
+@evoxc.defn
 def port_shape_mismatch_fn(x):
     return port_shape_mismatch(x)
 
@@ -152,18 +152,18 @@ def port_shape_mismatch_fn(x):
 _PortNT = namedtuple("_PortNT", "a b")
 
 
-@etl.block(
+@evoxc.block(
     outputs=[
-        etl.TensorSpec((None,), etl.float32),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
     ]
 )
-@etl.defn
-def port_nt(x: etl.TensorSpec((None,), etl.float32)):
-    return _PortNT(etl.sigmoid(x) * x, etl.tanh(x))
+@evoxc.defn
+def port_nt(x: evoxc.TensorSpec((None,), evoxc.float32)):
+    return _PortNT(evoxc.sigmoid(x) * x, evoxc.tanh(x))
 
 
-@etl.defn
+@evoxc.defn
 def port_nt_fn(x):
     return port_nt(x)
 
@@ -174,18 +174,18 @@ class _PortDC:
     b: object
 
 
-@etl.block(
+@evoxc.block(
     outputs=[
-        etl.TensorSpec((None,), etl.float32),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
     ]
 )
-@etl.defn
-def port_dc(x: etl.TensorSpec((None,), etl.float32)):
-    return _PortDC(etl.sigmoid(x) * x, etl.tanh(x))
+@evoxc.defn
+def port_dc(x: evoxc.TensorSpec((None,), evoxc.float32)):
+    return _PortDC(evoxc.sigmoid(x) * x, evoxc.tanh(x))
 
 
-@etl.defn
+@evoxc.defn
 def port_dc_fn(x):
     return port_dc(x)
 
@@ -194,19 +194,19 @@ def port_dc_fn(x):
 _PortHeadTail = namedtuple("_PortHeadTail", "head tail")
 
 
-@etl.block(
+@evoxc.block(
     outputs=[
-        etl.TensorSpec((None,), etl.float32),
-        etl.TensorSpec((None,), etl.float32),
-        etl.TensorSpec((None,), etl.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
+        evoxc.TensorSpec((None,), evoxc.float32),
     ]
 )
-@etl.defn
-def port_nt_nested(x: etl.TensorSpec((None,), etl.float32)):
-    return _PortHeadTail(etl.sigmoid(x) * x, (etl.tanh(x), etl.sigmoid(x)))
+@evoxc.defn
+def port_nt_nested(x: evoxc.TensorSpec((None,), evoxc.float32)):
+    return _PortHeadTail(evoxc.sigmoid(x) * x, (evoxc.tanh(x), evoxc.sigmoid(x)))
 
 
-@etl.defn
+@evoxc.defn
 def port_nt_nested_fn(x):
     return port_nt_nested(x)
 
@@ -219,8 +219,8 @@ def port_nt_nested_fn(x):
 def test_decorator_block_inlined_with_correct_numerics():
     """The portable decomposition replaces the block_call and computes it."""
     x = np.linspace(-2, 2, 32, dtype=np.float32)
-    y = etl.evaluate(port_swish_fn, x)
-    assert isinstance(y, etl.Tensor)
+    y = evoxc.evaluate(port_swish_fn, x)
+    assert isinstance(y, evoxc.Tensor)
     assert np.allclose(y.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
 
 
@@ -234,25 +234,25 @@ def test_decorator_block_attributes():
 def test_output_specs_derived_from_return_annotation():
     """No declared outputs: output_specs derive from the TensorSpec annotation."""
     (spec,) = port_swish.output_specs
-    assert isinstance(spec, etl.TensorSpec)
+    assert isinstance(spec, evoxc.TensorSpec)
     assert spec.shape == (None,)
     assert spec.dtype == np.dtype(np.float32)
 
 
 def test_lowering_inlines_the_block_call():
     """After lower() the serialized payload contains no block_call ops."""
-    graph = etl.trace(port_swish_fn, etl.TensorSpec((None,), etl.float32))
+    graph = evoxc.trace(port_swish_fn, evoxc.TensorSpec((None,), evoxc.float32))
     assert _count_block_calls(graph.module) == 1  # the traced graph has it
 
-    lowered = etl.lower(graph)
-    module = etl.ir.deserialize_module(lowered.payload)
+    lowered = evoxc.lower(graph)
+    module = evoxc.ir.deserialize_module(lowered.payload)
     assert _count_block_calls(module) == 0
 
 
 def test_multi_output_portable():
     """A tuple-returning portable inlines into two numerically-correct results."""
     x = np.linspace(-2, 2, 32, dtype=np.float32)
-    out = etl.evaluate(port_pair_fn, x)
+    out = evoxc.evaluate(port_pair_fn, x)
     assert isinstance(out, tuple) and len(out) == 2
     a, b = out
     assert np.allclose(a.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
@@ -267,7 +267,7 @@ def test_multi_output_portable():
 def test_namedtuple_portable_runs_with_correct_fields():
     """A namedtuple-returning portable runs with both fields correct."""
     x = np.linspace(-2, 2, 32, dtype=np.float32)
-    out = etl.evaluate(port_nt_fn, x)
+    out = evoxc.evaluate(port_nt_fn, x)
     assert isinstance(out, tuple) and len(out) == 2
     a, b = out
     assert np.allclose(a.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
@@ -277,7 +277,7 @@ def test_namedtuple_portable_runs_with_correct_fields():
 def test_dataclass_portable_runs_with_correct_fields():
     """A dataclass-returning portable runs with both fields correct."""
     x = np.linspace(-2, 2, 32, dtype=np.float32)
-    out = etl.evaluate(port_dc_fn, x)
+    out = evoxc.evaluate(port_dc_fn, x)
     assert isinstance(out, tuple) and len(out) == 2
     a, b = out
     assert np.allclose(a.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
@@ -286,18 +286,18 @@ def test_dataclass_portable_runs_with_correct_fields():
 
 def test_namedtuple_portable_lowering_inlines_the_block_call():
     """lower() inlines a namedtuple-returning portable like any other."""
-    graph = etl.trace(port_nt_fn, etl.TensorSpec((None,), etl.float32))
+    graph = evoxc.trace(port_nt_fn, evoxc.TensorSpec((None,), evoxc.float32))
     assert _count_block_calls(graph.module) == 1  # the traced graph has it
 
-    lowered = etl.lower(graph)
-    module = etl.ir.deserialize_module(lowered.payload)
+    lowered = evoxc.lower(graph)
+    module = evoxc.ir.deserialize_module(lowered.payload)
     assert _count_block_calls(module) == 0
 
 
 def test_nested_namedtuple_portable_mixed_return():
     """A namedtuple field holding a plain tuple flattens to 3 outputs."""
     x = np.linspace(-2, 2, 32, dtype=np.float32)
-    out = etl.evaluate(port_nt_nested_fn, x)
+    out = evoxc.evaluate(port_nt_nested_fn, x)
     assert isinstance(out, tuple) and len(out) == 3
     head, tail1, tail2 = out
     assert np.allclose(head.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
@@ -307,40 +307,40 @@ def test_nested_namedtuple_portable_mixed_return():
 
 def test_vmap_through_namedtuple_portable():
     """vmap through a namedtuple-returning portable == per-row reference."""
-    tf = etl.vmap(port_nt_fn, out_axes=(0, 0))
-    graph = tf(etl.TensorSpec((BATCH, DIM), etl.float32))
+    tf = evoxc.vmap(port_nt_fn, out_axes=(0, 0))
+    graph = tf(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
     x = _batched_rows()
     out = _run(graph, x)
     assert isinstance(out, tuple) and len(out) == 2
 
     # Reference: the unvectorized computation, row by row (build once, run
-    # per row — the documented explicit form of etl.evaluate).
-    exe = etl.build(port_nt_fn, etl.TensorSpec((DIM,), etl.float32))
-    ref_a = np.stack([etl.run(exe, row)[0].numpy() for row in x])
-    ref_b = np.stack([etl.run(exe, row)[1].numpy() for row in x])
+    # per row — the documented explicit form of evoxc.evaluate).
+    exe = evoxc.build(port_nt_fn, evoxc.TensorSpec((DIM,), evoxc.float32))
+    ref_a = np.stack([evoxc.run(exe, row)[0].numpy() for row in x])
+    ref_b = np.stack([evoxc.run(exe, row)[1].numpy() for row in x])
     a, b = out
     assert np.allclose(a.numpy(), ref_a, rtol=1e-6)
     assert np.allclose(b.numpy(), ref_b, rtol=1e-6)
 
 
-# BUG(etl): dataclass portable returns are rejected by the portable batching
-# fallback in etl/block/rules.py::_flatten_outputs — it only accepts
+# BUG(evoxc): dataclass portable returns are rejected by the portable batching
+# fallback in evoxc/block/rules.py::_flatten_outputs — it only accepts
 # SymbolicTensor / tuple / list / dict, so a dataclass raises BlockError at
 # vmap time. The pinned contract requires dataclass returns to work through
-# vmap; this test passes once the parallel etl implementation lands. Do NOT
+# vmap; this test passes once the parallel evoxc implementation lands. Do NOT
 # skip/xfail/weaken it.
 def test_vmap_through_dataclass_portable():
     """vmap through a dataclass-returning portable == per-row reference."""
-    tf = etl.vmap(port_dc_fn, out_axes=(0, 0))
-    graph = tf(etl.TensorSpec((BATCH, DIM), etl.float32))
+    tf = evoxc.vmap(port_dc_fn, out_axes=(0, 0))
+    graph = tf(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
     x = _batched_rows()
     out = _run(graph, x)
     assert isinstance(out, tuple) and len(out) == 2
 
     # Reference: the unvectorized computation, row by row.
-    exe = etl.build(port_dc_fn, etl.TensorSpec((DIM,), etl.float32))
-    ref_a = np.stack([etl.run(exe, row)[0].numpy() for row in x])
-    ref_b = np.stack([etl.run(exe, row)[1].numpy() for row in x])
+    exe = evoxc.build(port_dc_fn, evoxc.TensorSpec((DIM,), evoxc.float32))
+    ref_a = np.stack([evoxc.run(exe, row)[0].numpy() for row in x])
+    ref_b = np.stack([evoxc.run(exe, row)[1].numpy() for row in x])
     a, b = out
     assert np.allclose(a.numpy(), ref_a, rtol=1e-6)
     assert np.allclose(b.numpy(), ref_b, rtol=1e-6)
@@ -353,21 +353,21 @@ def test_vmap_through_dataclass_portable():
 
 def test_factory_portable_must_be_a_defn():
     """A non-defn portable (lambda) fails the declaration with BlockError."""
-    with pytest.raises(BlockError, match="must be an etl.defn"):
-        etl.block(
+    with pytest.raises(BlockError, match="must be an evoxc.defn"):
+        evoxc.block(
             "port_factory_bad",
-            inputs=[etl.TensorSpec((), etl.float32)],
-            outputs=[etl.TensorSpec((), etl.float32)],
+            inputs=[evoxc.TensorSpec((), evoxc.float32)],
+            outputs=[evoxc.TensorSpec((), evoxc.float32)],
             portable=lambda v: v,
         )
 
 
 def test_decorator_over_non_defn_raises():
-    """Decorating a plain (non-defn) function with @etl.block raises."""
-    with pytest.raises(BlockError, match="must be an etl.defn"):
+    """Decorating a plain (non-defn) function with @evoxc.block raises."""
+    with pytest.raises(BlockError, match="must be an evoxc.defn"):
 
-        @etl.block
-        def port_decorator_bad(x: etl.TensorSpec((), etl.float32)) -> etl.TensorSpec((), etl.float32):
+        @evoxc.block
+        def port_decorator_bad(x: evoxc.TensorSpec((), evoxc.float32)) -> evoxc.TensorSpec((), evoxc.float32):
             return x
 
 
@@ -379,13 +379,13 @@ def test_portable_returning_non_tensor_fails_at_lower():
     (the objective's "must return symbolic" BlockError is the transforms-side
     message; the lower-time contract is "produces 0 result(s)").
     """
-    graph = etl.trace(port_badtensor_fn, etl.TensorSpec((), etl.float32))
-    with pytest.raises(etl.BackendError, match="produces 0 result"):
-        etl.lower(graph)
+    graph = evoxc.trace(port_badtensor_fn, evoxc.TensorSpec((), evoxc.float32))
+    with pytest.raises(evoxc.BackendError, match="produces 0 result"):
+        evoxc.lower(graph)
 
 
 def test_declared_vs_portable_shape_mismatch():
     """Declared scalar output vs rank-1 portable output -> BackendError."""
-    graph = etl.trace(port_shape_mismatch_fn, etl.TensorSpec((2,), etl.float32))
-    with pytest.raises(etl.BackendError, match="but the block_call declares"):
-        etl.lower(graph)
+    graph = evoxc.trace(port_shape_mismatch_fn, evoxc.TensorSpec((2,), evoxc.float32))
+    with pytest.raises(evoxc.BackendError, match="but the block_call declares"):
+        evoxc.lower(graph)

@@ -1,21 +1,21 @@
 """Save/load round-trips and failure modes for ``LoweredProgram``,
 ``CompiledArtifact``, and the numpy ``Executable``.
 
-The persistence contract under test (see ``etl/persist/container.py``): every
+The persistence contract under test (see ``evoxc/persist/container.py``): every
 file is a self-describing container — magic header + format version + JSON
 metadata (payload type, backend info, signature info) + JSON payload + a
 SHA-256 integrity hash. Loading validates everything and fails with
-``etl.PersistenceError`` on any corruption or environment mismatch — an
+``evoxc.PersistenceError`` on any corruption or environment mismatch — an
 artifact is never silently re-lowered/re-compiled (spec §10).
 
 Key facts tested here:
 
 * ``LoweredProgram.save/load`` and ``CompiledArtifact.save/load`` use the
-  etl.persist container; the numpy payload is a serialized ``ir.Module`` dict.
+  evoxc.persist container; the numpy payload is a serialized ``ir.Module`` dict.
 * Load validates the recorded backend name against the registry and (for
   artifacts) ``required_custom_ops`` / ``runtime_dependencies`` against the
   environment.
-* ``etl.load(artifact, backend=..., device=...)`` wraps the backend
+* ``evoxc.load(artifact, backend=..., device=...)`` wraps the backend
   executable; the numpy backend validates the device (v1 CPU only) and never
   re-compiles.
 * The numpy executable saves the underlying CompiledArtifact; the executable
@@ -26,8 +26,8 @@ Key facts tested here:
 import numpy as np
 import pytest
 
-import etl
-from etl import backends
+import evoxc
+from evoxc import backends
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +37,13 @@ from etl import backends
 
 def _make_fn():
     def fn(x):
-        return etl.multiply(x, etl.add(x, 2.0))
+        return evoxc.multiply(x, evoxc.add(x, 2.0))
 
     return fn
 
 
 def _spec():
-    return etl.TensorSpec(shape=(2, 3), dtype=etl.float32)
+    return evoxc.TensorSpec(shape=(2, 3), dtype=evoxc.float32)
 
 
 def _x():
@@ -52,11 +52,11 @@ def _x():
 
 
 def _lowered():
-    return etl.lower(etl.trace(_make_fn(), _spec()))
+    return evoxc.lower(evoxc.trace(_make_fn(), _spec()))
 
 
 def _artifact():
-    return etl.compile(_lowered())
+    return evoxc.compile(_lowered())
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ def _artifact():
 
 def test_lowered_program_roundtrip(tmp_path):
     lowered = _lowered()
-    path = tmp_path / "lowered.etl"
+    path = tmp_path / "lowered.evoxc"
     lowered.save(path)
 
     loaded = backends.LoweredProgram.load(path)
@@ -96,7 +96,7 @@ def test_lowered_program_roundtrip(tmp_path):
 
 def test_compiled_artifact_roundtrip_and_run(tmp_path):
     artifact = _artifact()
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
 
     loaded = backends.CompiledArtifact.load(path)
@@ -111,10 +111,10 @@ def test_compiled_artifact_roundtrip_and_run(tmp_path):
 
     # A loaded artifact produces a runnable executable whose numerical
     # result matches a fresh build.
-    exe = etl.load(loaded)
-    fresh = etl.build(_make_fn(), _spec())
-    out = etl.run(exe, _x())
-    np.testing.assert_allclose(out.numpy(), etl.run(fresh, _x()).numpy())
+    exe = evoxc.load(loaded)
+    fresh = evoxc.build(_make_fn(), _spec())
+    out = evoxc.run(exe, _x())
+    np.testing.assert_allclose(out.numpy(), evoxc.run(fresh, _x()).numpy())
     np.testing.assert_allclose(out.numpy(), 15.0)
 
 
@@ -127,23 +127,23 @@ def test_executable_save_load_roundtrip(tmp_path):
     # The numpy executable's save() writes the underlying CompiledArtifact;
     # the executable is reconstructed EXPLICITLY at load — device handles and
     # live interpreter state are never serialized.
-    exe = etl.build(_make_fn(), _spec())
-    path = tmp_path / "executable.etl"
+    exe = evoxc.build(_make_fn(), _spec())
+    path = tmp_path / "executable.evoxc"
     exe.save(path)
 
-    # Pipeline round-trip: etl.Executable.load re-wraps the backend
+    # Pipeline round-trip: evoxc.Executable.load re-wraps the backend
     # executable with the decoded structured signature.
-    reloaded = etl.Executable.load(path)
+    reloaded = evoxc.Executable.load(path)
     assert isinstance(reloaded.backend_executable, backends.NumpyExecutable)
     np.testing.assert_allclose(
-        etl.run(reloaded, _x()).numpy(), etl.run(exe, _x()).numpy()
+        evoxc.run(reloaded, _x()).numpy(), evoxc.run(exe, _x()).numpy()
     )
-    np.testing.assert_allclose(etl.run(reloaded, _x()).numpy(), 15.0)
+    np.testing.assert_allclose(evoxc.run(reloaded, _x()).numpy(), 15.0)
 
     # Raw backend-executable round-trip: NumpyExecutable.load speaks flat
     # tensor lists.
     raw = backends.NumpyExecutable.load(path)
-    flat = raw.run([etl.tensor(_x())])
+    flat = raw.run([evoxc.tensor(_x())])
     np.testing.assert_allclose(flat[0].numpy(), 15.0)
 
 
@@ -153,22 +153,22 @@ def test_executable_save_load_roundtrip(tmp_path):
 
 
 def test_corrupt_garbage_file(tmp_path):
-    path = tmp_path / "garbage.etl"
-    path.write_bytes(b"this is definitely not an etl persistence container")
-    with pytest.raises(etl.PersistenceError, match="corrupt"):
+    path = tmp_path / "garbage.evoxc"
+    path.write_bytes(b"this is definitely not an evoxc persistence container")
+    with pytest.raises(evoxc.PersistenceError, match="corrupt"):
         backends.LoweredProgram.load(path)
-    with pytest.raises(etl.PersistenceError, match="corrupt"):
+    with pytest.raises(evoxc.PersistenceError, match="corrupt"):
         backends.CompiledArtifact.load(path)
 
 
 def test_corrupt_truncated_file(tmp_path):
     artifact = _artifact()
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
     data = path.read_bytes()
     # Cut the valid container in half: the integrity/length checks must fail.
     path.write_bytes(data[: len(data) // 2])
-    with pytest.raises(etl.PersistenceError, match="corrupt"):
+    with pytest.raises(evoxc.PersistenceError, match="corrupt"):
         backends.CompiledArtifact.load(path)
 
 
@@ -176,14 +176,14 @@ def test_payload_type_mismatch(tmp_path):
     # A valid-format file carrying the wrong payload type tag is rejected —
     # never a silent reinterpretation of a file written for another stage.
     lowered = _lowered()
-    path = tmp_path / "lowered.etl"
+    path = tmp_path / "lowered.evoxc"
     lowered.save(path)
-    with pytest.raises(etl.PersistenceError, match="payload_type mismatch"):
+    with pytest.raises(evoxc.PersistenceError, match="payload_type mismatch"):
         backends.CompiledArtifact.load(path)
     # The pipeline Executable requires a compiled artifact, not a lowered
     # program (which must be compiled first).
-    with pytest.raises(etl.PersistenceError, match="not an executable artifact"):
-        etl.Executable.load(path)
+    with pytest.raises(evoxc.PersistenceError, match="not an executable artifact"):
+        evoxc.Executable.load(path)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +200,9 @@ def test_unregistered_backend(tmp_path):
         signature=lowered.signature,
         payload={"version": 1, "module": {"name": "main"}},
     )
-    path = tmp_path / "fake_backend.etl"
+    path = tmp_path / "fake_backend.evoxc"
     fake.save(path)
-    with pytest.raises(etl.PersistenceError, match="unknown backend"):
+    with pytest.raises(evoxc.PersistenceError, match="unknown backend"):
         backends.LoweredProgram.load(path)
 
     fake_artifact = backends.CompiledArtifact(
@@ -211,9 +211,9 @@ def test_unregistered_backend(tmp_path):
         target="cpu",
         payload={"version": 1, "module": {"name": "main"}},
     )
-    artifact_path = tmp_path / "fake_backend_artifact.etl"
+    artifact_path = tmp_path / "fake_backend_artifact.evoxc"
     fake_artifact.save(artifact_path)
-    with pytest.raises(etl.PersistenceError, match="unknown backend"):
+    with pytest.raises(evoxc.PersistenceError, match="unknown backend"):
         backends.CompiledArtifact.load(artifact_path)
 
 
@@ -221,15 +221,15 @@ def test_explicit_backend_name_mismatch(tmp_path):
     # Passing an explicit backend whose name differs from the recorded one
     # fails — never a silent recompile (pipeline.load semantics).
     artifact = _artifact()
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
     loaded = backends.CompiledArtifact.load(path)
 
-    with pytest.raises(etl.PersistenceError, match="never silently recompile"):
-        etl.load(loaded, backend="stablehlo")
+    with pytest.raises(evoxc.PersistenceError, match="never silently recompile"):
+        evoxc.load(loaded, backend="stablehlo")
     # The matching name is accepted.
-    exe = etl.load(loaded, backend="numpy")
-    np.testing.assert_allclose(etl.run(exe, _x()).numpy(), 15.0)
+    exe = evoxc.load(loaded, backend="numpy")
+    np.testing.assert_allclose(evoxc.run(exe, _x()).numpy(), 15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -239,25 +239,25 @@ def test_explicit_backend_name_mismatch(tmp_path):
 
 def test_device_mismatch_on_load(tmp_path):
     artifact = _artifact()
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
     loaded = backends.CompiledArtifact.load(path)
 
     # The numpy backend is CPU-only in v1: a GPU device fails explicitly.
-    with pytest.raises(etl.BackendError, match="CPU devices only"):
-        etl.load(loaded, device=etl.Device("gpu", 0))
-    with pytest.raises(etl.BackendError, match="CPU devices only"):
-        backends.NumpyExecutable.load(path, device=etl.Device("gpu", 0))
+    with pytest.raises(evoxc.BackendError, match="CPU devices only"):
+        evoxc.load(loaded, device=evoxc.Device("gpu", 0))
+    with pytest.raises(evoxc.BackendError, match="CPU devices only"):
+        backends.NumpyExecutable.load(path, device=evoxc.Device("gpu", 0))
     # Non-Device objects fail device normalization before reaching a backend.
-    with pytest.raises(etl.DeviceError):
-        etl.load(loaded, device=object())
+    with pytest.raises(evoxc.DeviceError):
+        evoxc.load(loaded, device=object())
 
     # None (the default) and explicit CPU devices work.
-    assert etl.load(loaded).device == etl.Device("cpu", 0)
-    exe_cpu = etl.load(loaded, device=etl.Device("cpu", 0))
-    np.testing.assert_allclose(etl.run(exe_cpu, _x()).numpy(), 15.0)
-    exe_str = etl.load(loaded, device="cpu")
-    np.testing.assert_allclose(etl.run(exe_str, _x()).numpy(), 15.0)
+    assert evoxc.load(loaded).device == evoxc.Device("cpu", 0)
+    exe_cpu = evoxc.load(loaded, device=evoxc.Device("cpu", 0))
+    np.testing.assert_allclose(evoxc.run(exe_cpu, _x()).numpy(), 15.0)
+    exe_str = evoxc.load(loaded, device="cpu")
+    np.testing.assert_allclose(evoxc.run(exe_str, _x()).numpy(), 15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def test_runtime_dependencies_tamper(tmp_path):
     # fail at load — the artifact is never silently recompiled. The tampered
     # copy is a separate dataclass; the original is untouched.
     artifact = _artifact()
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
     loaded = backends.CompiledArtifact.load(path)
 
@@ -282,9 +282,9 @@ def test_runtime_dependencies_tamper(tmp_path):
         required_custom_ops=loaded.required_custom_ops,
         runtime_dependencies={"numpy": "0.0.0"},
     )
-    tampered_path = tmp_path / "tampered.etl"
+    tampered_path = tmp_path / "tampered.evoxc"
     tampered.save(tampered_path)
-    with pytest.raises(etl.PersistenceError, match="never silently recompile"):
+    with pytest.raises(evoxc.PersistenceError, match="never silently recompile"):
         backends.CompiledArtifact.load(tampered_path)
 
     # The original on-disk artifact still loads.
@@ -301,14 +301,14 @@ def test_resave_idempotence(tmp_path):
     # Self-description: a loaded artifact exposes backend name + target as
     # attributes, and re-saving a loaded artifact round-trips again.
     artifact = _artifact()
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     artifact.save(path)
 
     first = backends.CompiledArtifact.load(path)
     assert first.backend == "numpy"
     assert first.target == "cpu"
 
-    second_path = tmp_path / "artifact_resaved.etl"
+    second_path = tmp_path / "artifact_resaved.evoxc"
     first.save(second_path)
     second = backends.CompiledArtifact.load(second_path)
     assert second.backend == first.backend

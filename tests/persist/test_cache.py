@@ -1,12 +1,12 @@
 """Tests for the explicit cache: ``Cache`` ABC, ``FileCache``, ``compute_key``.
 
-Contract under test (etl/persist/cache.py):
+Contract under test (evoxc/persist/cache.py):
   * No global cache — caches are explicit, user-created objects.
   * ``compute_key`` is a deterministic 64-char lowercase sha256 hex digest,
     insensitive to dict key insertion order (canonical JSON), sensitive to
     every component change.
   * ``FileCache`` stores one ``save_object`` container per key at
-    ``<dir>/<key[:2]>/<key>.etlcache`` with ``payload_type="FileCacheEntry"``.
+    ``<dir>/<key[:2]>/<key>.evoxccache`` with ``payload_type="FileCacheEntry"``.
   * ``get``: hit -> value; miss/corrupt + compute_fn -> recompute+store;
     miss/corrupt without compute_fn -> None; corrupt-entry errors never
     propagate.
@@ -17,8 +17,8 @@ import glob
 import numpy as np
 import pytest
 
-import etl
-from etl.persist import Cache, FileCache, compute_key, load_object
+import evoxc
+from evoxc.persist import Cache, FileCache, compute_key, load_object
 
 
 def counting_fn(value):
@@ -38,8 +38,8 @@ def counting_fn(value):
 
 
 def test_cache_exports_and_abc():
-    assert etl.Cache is Cache
-    assert etl.FileCache is FileCache
+    assert evoxc.Cache is Cache
+    assert evoxc.FileCache is FileCache
     with pytest.raises(TypeError):
         Cache()  # abstract: get/put/contains/clear
 
@@ -60,7 +60,7 @@ def test_get_miss_with_compute_fn_stores_entry(tmp_path):
     assert counter["calls"] == 1  # computed exactly once
     # Entry lives at the sharded path for the derived key.
     key = compute_key(key_components)
-    entry_path = tmp_path / "cache" / key[:2] / (key + ".etlcache")
+    entry_path = tmp_path / "cache" / key[:2] / (key + ".evoxccache")
     assert entry_path.is_file()
     # It is a save_object container with payload_type "FileCacheEntry".
     loaded = load_object(str(entry_path))
@@ -115,7 +115,7 @@ def test_distinct_keys_distinct_entries(tmp_path):
         assert counter["calls"] == 0
     for components in variants:
         key = compute_key(components)
-        assert (tmp_path / "cache" / key[:2] / (key + ".etlcache")).is_file()
+        assert (tmp_path / "cache" / key[:2] / (key + ".evoxccache")).is_file()
 
 
 def test_dict_component_insertion_order_same_key(tmp_path):
@@ -212,7 +212,7 @@ def test_corrupt_entry_treated_as_miss(tmp_path):
     cache = FileCache(directory)
     cache.put(("k",), "stored")
 
-    entries = glob.glob(str(directory / "**" / "*.etlcache"), recursive=True)
+    entries = glob.glob(str(directory / "**" / "*.evoxccache"), recursive=True)
     assert len(entries) == 1
     entry_path = entries[0]
     with open(entry_path, "wb") as f:

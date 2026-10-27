@@ -8,9 +8,9 @@ Covers the core value-model contract:
 - Operator dunders dispatch through the handler registry
   (``register_operator_handlers``), including reflected dunders.
 - Missing handlers raise a clear TraceError naming the kind.
-- Integration: real etl.ops handlers build IR ops inside a trace.
+- Integration: real evoxc.ops handlers build IR ops inside a trace.
 
-NOTE: importing ``etl`` (this module does) auto-imports ``etl.ops``, which
+NOTE: importing ``evoxc`` (this module does) auto-imports ``evoxc.ops``, which
 registers all operator handlers and the constant builder. Tests for missing
 handlers must therefore temporarily clear the registries via fixtures.
 """
@@ -20,9 +20,9 @@ import dataclasses
 import numpy as np
 import pytest
 
-import etl
-from etl.core import symbolic as symbolic_mod
-from etl.core.symbolic import _OPERATOR_HANDLERS
+import evoxc
+from evoxc.core import symbolic as symbolic_mod
+from evoxc.core.symbolic import _OPERATOR_HANDLERS
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -36,7 +36,7 @@ class _FakeValue:
 
 
 def make_st(dtype="float32", shape=(2, 2), location=None):
-    return etl.SymbolicTensor(_FakeValue(), dtype, shape, location=location)
+    return evoxc.SymbolicTensor(_FakeValue(), dtype, shape, location=location)
 
 
 # ---------------------------------------------------------------------------
@@ -105,21 +105,21 @@ def test_purity_no_concrete_accessors(name):
     # A symbolic tensor must never be confused with concrete data — neither
     # on the instance nor on the class.
     assert not hasattr(st, name)
-    assert not hasattr(etl.SymbolicTensor, name)
+    assert not hasattr(evoxc.SymbolicTensor, name)
 
 
 def test_bool_raises_with_control_flow_hint():
     st = make_st()
-    with pytest.raises(etl.TraceError, match="etl.cond") as excinfo:
+    with pytest.raises(evoxc.TraceError, match="evoxc.cond") as excinfo:
         bool(st)
     message = str(excinfo.value)
-    assert "etl.while_loop" in message
-    assert "etl.scan" in message
+    assert "evoxc.while_loop" in message
+    assert "evoxc.scan" in message
 
 
 def test_bool_message_includes_location():
     st = make_st(location="model.py:83")
-    with pytest.raises(etl.TraceError) as excinfo:
+    with pytest.raises(evoxc.TraceError) as excinfo:
         bool(st)
     assert "model.py:83" in str(excinfo.value)
 
@@ -128,7 +128,7 @@ def test_unhashable():
     st = make_st()
     with pytest.raises(TypeError, match="unhashable"):
         hash(st)
-    assert etl.SymbolicTensor.__hash__ is None
+    assert evoxc.SymbolicTensor.__hash__ is None
 
 
 # ---------------------------------------------------------------------------
@@ -137,34 +137,34 @@ def test_unhashable():
 
 
 def test_dtype_is_normalized():
-    st = etl.SymbolicTensor(_FakeValue(), "float32", (2, 3))
+    st = evoxc.SymbolicTensor(_FakeValue(), "float32", (2, 3))
     assert isinstance(st.dtype, np.dtype)
     assert st.dtype == np.dtype("float32")
 
 
 def test_shape_is_tupleified_and_entries_accepted():
-    st = etl.SymbolicTensor(
+    st = evoxc.SymbolicTensor(
         _FakeValue(),
-        etl.float32,
-        [etl.Dim("n"), etl.Dim("k") + etl.Dim("m"), 2, None],
+        evoxc.float32,
+        [evoxc.Dim("n"), evoxc.Dim("k") + evoxc.Dim("m"), 2, None],
     )
     assert isinstance(st.shape, tuple)
-    assert st.shape == (etl.Dim("n"), etl.Dim("k") + etl.Dim("m"), 2, None)
+    assert st.shape == (evoxc.Dim("n"), evoxc.Dim("k") + evoxc.Dim("m"), 2, None)
 
 
 @pytest.mark.parametrize("bad_entry", [1.5, "two", (2, 2)])
 def test_invalid_shape_entry_raises(bad_entry):
     with pytest.raises(TypeError, match="shape"):
-        etl.SymbolicTensor(_FakeValue(), etl.float32, (bad_entry,))
+        evoxc.SymbolicTensor(_FakeValue(), evoxc.float32, (bad_entry,))
 
 
 def test_value_must_expose_id():
     with pytest.raises(TypeError, match="'id'"):
-        etl.SymbolicTensor(object(), etl.float32, ())
+        evoxc.SymbolicTensor(object(), evoxc.float32, ())
 
 
 def test_id_property_and_location_default():
-    st = etl.SymbolicTensor(_FakeValue(), etl.float32, ())
+    st = evoxc.SymbolicTensor(_FakeValue(), evoxc.float32, ())
     assert st.id == "fake_id"
     assert st.location is None
 
@@ -172,7 +172,7 @@ def test_id_property_and_location_default():
 def test_frozen():
     st = make_st()
     with pytest.raises(dataclasses.FrozenInstanceError):
-        st.dtype = etl.float64  # type: ignore[misc]
+        st.dtype = evoxc.float64  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ def test_binary_dispatch_routes_to_kind(fake_handlers, kind, op):
     result = op(st1, st2)
     # Results are fresh SymbolicTensors (compared by identity — `==` would
     # dispatch back through the eq handler).
-    assert isinstance(result, etl.SymbolicTensor)
+    assert isinstance(result, evoxc.SymbolicTensor)
     assert len(records[kind]) == 1
     left, right = records[kind][0]
     assert left is st1
@@ -213,7 +213,7 @@ def test_getitem_passes_scalar_key(fake_handlers):
     records = fake_handlers
     st = make_st()
     result = st[0]
-    assert isinstance(result, etl.SymbolicTensor)
+    assert isinstance(result, evoxc.SymbolicTensor)
     args = records["getitem"][0]
     assert args[0] is st
     assert args[1] == 0
@@ -223,7 +223,7 @@ def test_neg_dispatches_single_operand(fake_handlers):
     records = fake_handlers
     st = make_st()
     result = -st
-    assert isinstance(result, etl.SymbolicTensor)
+    assert isinstance(result, evoxc.SymbolicTensor)
     (operand,) = records["neg"][0]
     assert operand is st
 
@@ -245,7 +245,7 @@ def test_reflected_dispatch_swaps_operands(fake_handlers, kind, op):
     records = fake_handlers
     st = make_st()
     result = op(st)
-    assert isinstance(result, etl.SymbolicTensor)
+    assert isinstance(result, evoxc.SymbolicTensor)
     left, right = records[kind][0]
     assert left == 2
     assert right is st
@@ -258,7 +258,7 @@ def test_register_replaces_existing_handler(fake_handlers):
         records.setdefault("add2", []).append((left, right))
         return make_st()
 
-    etl.core.register_operator_handlers("add", fake2)
+    evoxc.core.register_operator_handlers("add", fake2)
     st1, st2 = make_st(), make_st()
     st1 + st2
     # (identity checks only: tuple/list `==` would dispatch through the eq
@@ -270,7 +270,7 @@ def test_register_replaces_existing_handler(fake_handlers):
 
 def test_register_non_callable_raises():
     with pytest.raises(TypeError, match="callable"):
-        etl.core.register_operator_handlers("add", 42)
+        evoxc.core.register_operator_handlers("add", 42)
 
 
 # ---------------------------------------------------------------------------
@@ -280,15 +280,15 @@ def test_register_non_callable_raises():
 
 def test_missing_handler_raises_naming_kind(cleared_handlers):
     st1, st2 = make_st(), make_st()
-    with pytest.raises(etl.TraceError, match="kind 'add'") as excinfo:
+    with pytest.raises(evoxc.TraceError, match="kind 'add'") as excinfo:
         st1 + st2
-    assert "etl.ops" in str(excinfo.value)
+    assert "evoxc.ops" in str(excinfo.value)
 
 
 def test_constant_without_builder_raises(cleared_constant_builder):
-    t = etl.tensor([1.0, 2.0])
-    with pytest.raises(etl.TraceError, match="etl.ops"):
-        etl.core.constant(t)
+    t = evoxc.tensor([1.0, 2.0])
+    with pytest.raises(evoxc.TraceError, match="evoxc.ops"):
+        evoxc.core.constant(t)
 
 
 # ---------------------------------------------------------------------------
@@ -315,20 +315,20 @@ def test_operators_build_symbolic_results_inside_trace():
         seen.append(a[0])
         return a + b
 
-    spec = etl.TensorSpec((2, 2), etl.float32)
-    graph = etl.trace(fn, spec, spec)
+    spec = evoxc.TensorSpec((2, 2), evoxc.float32)
+    graph = evoxc.trace(fn, spec, spec)
 
     # 7 arithmetic ops (float32), 5 comparisons (bool), getitem (float32).
-    expected_dtypes = [etl.float32] * 7 + [etl.bool_] * 5 + [etl.float32]
+    expected_dtypes = [evoxc.float32] * 7 + [evoxc.bool_] * 5 + [evoxc.float32]
     assert len(seen) == len(expected_dtypes)
     for result, expected in zip(seen, expected_dtypes):
-        assert isinstance(result, etl.SymbolicTensor)
+        assert isinstance(result, evoxc.SymbolicTensor)
         assert result.dtype == expected
     # getitem sliced the leading axis: (2, 2) -> (2,)
     assert seen[-1].shape == (2,)
     # every SSA value has a distinct identity
     assert len({r.id for r in seen}) == len(seen)
-    assert isinstance(graph, etl.Graph)
+    assert isinstance(graph, evoxc.Graph)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +337,6 @@ def test_operators_build_symbolic_results_inside_trace():
 
 
 def test_constant_registered_but_no_trace_raises():
-    t = etl.tensor([1.0, 2.0])
-    with pytest.raises(etl.TraceError):
-        etl.core.constant(t)
+    t = evoxc.tensor([1.0, 2.0])
+    with pytest.raises(evoxc.TraceError):
+        evoxc.core.constant(t)

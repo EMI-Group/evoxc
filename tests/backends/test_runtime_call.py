@@ -1,9 +1,9 @@
 """Tests for the ``runtime_call`` op executed by the numpy interpreter.
 
-Contract under test (see ``etl/ops/constant.py`` and
-``etl/backends/numpy/kernels/custom.py``):
+Contract under test (see ``evoxc/ops/constant.py`` and
+``evoxc/backends/numpy/kernels/custom.py``):
 
-- ``etl.runtime_call(callback, *operands, result=...)`` builds a
+- ``evoxc.runtime_call(callback, *operands, result=...)`` builds a
   ``runtime_call`` IR op carrying the callback as a STRING registry id. The
   numpy interpreter executes the callback synchronously at the op's position
   (a documented sync point — the op's block position is the effect ordering),
@@ -21,7 +21,7 @@ Contract under test (see ``etl/ops/constant.py`` and
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 
 def test_simple_callback_doubles_input():
@@ -32,20 +32,20 @@ def test_simple_callback_doubles_input():
         return x * 2
 
     def fn(x):
-        return etl.runtime_call(
-            double, x, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.runtime_call(
+            double, x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    out = etl.evaluate(fn, x)
-    assert isinstance(out, etl.Tensor)
+    out = evoxc.evaluate(fn, x)
+    assert isinstance(out, evoxc.Tensor)
     assert out.dtype == np.float32
     assert out.shape == (3,)
     np.testing.assert_array_equal(out.numpy(), x * 2)
 
     # The callback executes synchronously at the op's position, once per run.
     assert invocations == [1]
-    etl.evaluate(fn, x)
+    evoxc.evaluate(fn, x)
     assert len(invocations) == 2
 
 
@@ -57,12 +57,12 @@ def test_callback_receives_numpy_arrays():
         return x
 
     def fn(x):
-        return etl.runtime_call(
-            record, x, result=etl.TensorSpec((2, 2), etl.float32)
+        return evoxc.runtime_call(
+            record, x, result=evoxc.TensorSpec((2, 2), evoxc.float32)
         )
 
     x = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    out = etl.evaluate(fn, x)
+    out = evoxc.evaluate(fn, x)
     assert len(seen) == 1
     kind, dtype, shape, value = seen[0]
     assert kind is np.ndarray
@@ -80,12 +80,12 @@ def test_multi_operand_with_python_scalar():
         return (x + s).astype(np.float32)
 
     def fn(x):
-        return etl.runtime_call(
-            add_scalar, x, 3.0, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.runtime_call(
+            add_scalar, x, 3.0, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    out = etl.evaluate(fn, x)
+    out = evoxc.evaluate(fn, x)
     # Python scalar operands are promoted to 0-d Constant ops at trace time
     # and reach the callback as 0-d numpy arrays with the natural scalar
     # dtype (float -> float64).
@@ -99,18 +99,18 @@ def test_multi_output_tuple():
         return x * 2, total
 
     def fn(x):
-        a, b = etl.runtime_call(
+        a, b = evoxc.runtime_call(
             split,
             x,
             result=(
-                etl.TensorSpec((3,), etl.float32),
-                etl.TensorSpec((1,), etl.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
+                evoxc.TensorSpec((1,), evoxc.float32),
             ),
         )
         return a, b
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    a, b = etl.evaluate(fn, x)
+    a, b = evoxc.evaluate(fn, x)
     np.testing.assert_array_equal(a.numpy(), x * 2)
     np.testing.assert_array_equal(b.numpy(), np.array([6.0], dtype=np.float32))
 
@@ -120,13 +120,13 @@ def test_result_dtype_mismatch_raises_backend_error():
         return x.astype(np.float64) * 2.0  # float64, declared result is f32
 
     def fn(x):
-        return etl.runtime_call(
-            bad, x, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.runtime_call(
+            bad, x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    with pytest.raises(etl.BackendError, match="dtype"):
-        etl.evaluate(fn, x)
+    with pytest.raises(evoxc.BackendError, match="dtype"):
+        evoxc.evaluate(fn, x)
 
 
 def test_result_shape_mismatch_raises_shape_error():
@@ -134,13 +134,13 @@ def test_result_shape_mismatch_raises_shape_error():
         return np.zeros(4, dtype=np.float32)  # (4,), declared result is (3,)
 
     def fn(x):
-        return etl.runtime_call(
-            bad, x, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.runtime_call(
+            bad, x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    with pytest.raises(etl.ShapeError, match="shape"):
-        etl.evaluate(fn, x)
+    with pytest.raises(evoxc.ShapeError, match="shape"):
+        evoxc.evaluate(fn, x)
 
 
 def test_wrong_output_count_raises_backend_error():
@@ -148,18 +148,18 @@ def test_wrong_output_count_raises_backend_error():
         return x  # 1 output, 2 declared
 
     def fn(x):
-        return etl.runtime_call(
+        return evoxc.runtime_call(
             one,
             x,
             result=(
-                etl.TensorSpec((3,), etl.float32),
-                etl.TensorSpec((3,), etl.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
+                evoxc.TensorSpec((3,), evoxc.float32),
             ),
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    with pytest.raises(etl.BackendError, match="output"):
-        etl.evaluate(fn, x)
+    with pytest.raises(evoxc.BackendError, match="output"):
+        evoxc.evaluate(fn, x)
 
 
 def test_non_array_return_raises_backend_error():
@@ -167,13 +167,13 @@ def test_non_array_return_raises_backend_error():
         return "not a tensor"
 
     def fn(x):
-        return etl.runtime_call(
-            bad, x, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.runtime_call(
+            bad, x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    with pytest.raises(etl.BackendError):
-        etl.evaluate(fn, x)
+    with pytest.raises(evoxc.BackendError):
+        evoxc.evaluate(fn, x)
 
 
 def test_runtime_call_in_a_larger_graph():
@@ -185,23 +185,23 @@ def test_runtime_call_in_a_larger_graph():
 
     # The callback's result feeds into further computation ...
     def fn(x):
-        y = etl.runtime_call(
-            double, x, result=etl.TensorSpec((3,), etl.float32)
+        y = evoxc.runtime_call(
+            double, x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
-        return etl.add(y, x)
+        return evoxc.add(y, x)
 
     # ... and the callback can consume operands computed by other ops.
     def fn2(x):
-        y = etl.multiply(x, x)
-        return etl.runtime_call(
-            double, y, result=etl.TensorSpec((3,), etl.float32)
+        y = evoxc.multiply(x, x)
+        return evoxc.runtime_call(
+            double, y, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    out = etl.evaluate(fn, x)
+    out = evoxc.evaluate(fn, x)
     np.testing.assert_array_equal(out.numpy(), x * 3)
 
-    out2 = etl.evaluate(fn2, x)
+    out2 = evoxc.evaluate(fn2, x)
     np.testing.assert_array_equal(out2.numpy(), x * x * 2)
 
     assert len(seen) == 2
@@ -214,11 +214,11 @@ def test_missing_callback_registration_raises_backend_error():
         return x
 
     def fn(x):
-        return etl.runtime_call(
-            cb, x, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.runtime_call(
+            cb, x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
-    graph = etl.trace(fn, etl.TensorSpec((3,), etl.float32))
+    graph = evoxc.trace(fn, evoxc.TensorSpec((3,), evoxc.float32))
     call_op = next(
         op
         for op in graph.module.get_function("main").entry_block.ops
@@ -229,9 +229,9 @@ def test_missing_callback_registration_raises_backend_error():
     # where the callback was never registered.
     call_op.attributes["callback"] = "callback_registered_nowhere"
 
-    lowered = etl.lower(graph)
-    artifact = etl.compile(lowered)
-    executable = etl.load(artifact)
-    x = etl.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
-    with pytest.raises(etl.BackendError, match="callback_registered_nowhere"):
-        etl.run(executable, x)
+    lowered = evoxc.lower(graph)
+    artifact = evoxc.compile(lowered)
+    executable = evoxc.load(artifact)
+    x = evoxc.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    with pytest.raises(evoxc.BackendError, match="callback_registered_nowhere"):
+        evoxc.run(executable, x)

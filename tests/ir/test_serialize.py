@@ -1,6 +1,6 @@
 """Serialization round-trip and integrity tests for EvoXIR.
 
-Covers the self-describing payload of ``etl.ir.serialize`` (see its module
+Covers the self-describing payload of ``evoxc.ir.serialize`` (see its module
 docstring for the binding schema and encoding notes):
 
 * payload structure and canonical sha256 integrity;
@@ -24,8 +24,8 @@ import re
 import numpy as np
 import pytest
 
-from etl import ir
-from etl.core import Dim, DimExpr, PersistenceError, VerificationError
+from evoxc import ir
+from evoxc.core import Dim, DimExpr, PersistenceError, VerificationError
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ def test_payload_structure() -> None:
     assert set(payload) == {
         "format", "version", "module", "functions", "ops", "constants", "sha256",
     }
-    assert payload["format"] == "etl-ir"
+    assert payload["format"] == "evoxc-ir"
     assert payload["version"] == 1 == ir.IR_FORMAT_VERSION
     assert payload["module"]["name"] == "simple"
     assert re.fullmatch(r"[0-9a-f]{64}", payload["sha256"])
@@ -538,7 +538,7 @@ def test_missing_functions_key_rejected(multi_payload) -> None:
 
 def test_non_dict_payload_rejected() -> None:
     with pytest.raises(PersistenceError, match=r"dict"):
-        ir.deserialize_module(["etl-ir", 1])
+        ir.deserialize_module(["evoxc-ir", 1])
 
 
 # ---------------------------------------------------------------------------

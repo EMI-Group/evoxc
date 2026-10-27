@@ -2,7 +2,7 @@
 
 Pins the ORDER-INDEPENDENT per-backend transfer-provider design: optional
 compiler adapters (iree/xla) register their providers under per-backend
-slots keyed by ``(kind, backend)``, ``etl.backends.registry.get(name)``
+slots keyed by ``(kind, backend)``, ``evoxc.backends.registry.get(name)``
 records the PREFERRED transfer backend per device kind, and ``Tensor.to``
 resolves the preferred backend's slot → the flat DEFAULT slot → explicit
 ``DeviceError``. No backend's activation can clobber another backend's
@@ -11,12 +11,12 @@ transfer provider depends only on the last explicit backend resolution —
 never on module import/activation order.
 
 Pure core-level simulation: sentinel providers under a made-up device kind
-(never ``"cuda"`` — the flat ``"cuda"`` slot holds ``etl.backends``' lazy
+(never ``"cuda"`` — the flat ``"cuda"`` slot holds ``evoxc.backends``' lazy
 iree thunk, which must not be invoked in CPU-only tests), no real adapters,
 no GPU, no iree import. The preference hook is exercised through the same
-internal function ``etl.backends.registry.get`` calls
+internal function ``evoxc.backends.registry.get`` calls
 (``_note_backend_transfer_preference``); one test pins that the real
-``etl.backends.get("numpy")`` never disturbs preferences (numpy serves no
+``evoxc.backends.get("numpy")`` never disturbs preferences (numpy serves no
 transfer kinds).
 """
 
@@ -25,9 +25,9 @@ import itertools
 import numpy as np
 import pytest
 
-import etl
-from etl.core import Device, Tensor
-from etl.core.tensor import (
+import evoxc
+from evoxc.core import Device, Tensor
+from evoxc.core.tensor import (
     _BACKEND_DEVICE_TRANSFER_PROVIDERS,
     _DEVICE_TRANSFER_PROVIDERS,
     _PREFERRED_TRANSFER_BACKENDS,
@@ -144,7 +144,7 @@ def test_to_resolves_preferred_backend_slot():
     register_device_transfer_provider(KIND, _make_provider("flat", flat_calls))
     register_backend_device_transfer_provider(KIND, ALPHA, _make_provider(ALPHA, alpha_calls))
     register_backend_device_transfer_provider(KIND, BETA, _make_provider(BETA, beta_calls))
-    _note_backend_transfer_preference(ALPHA)  # what etl.backends.get(ALPHA) does
+    _note_backend_transfer_preference(ALPHA)  # what evoxc.backends.get(ALPHA) does
     assert _get_preferred_transfer_backend(KIND) == ALPHA
     out = _host_tensor().to(DEV)
     assert out == f"placed-by-{ALPHA}"
@@ -195,7 +195,7 @@ def test_to_preference_without_slot_falls_back_to_flat():
 
 
 def test_to_with_no_provider_anywhere_raises():
-    with pytest.raises(etl.DeviceError, match="no device-transfer provider"):
+    with pytest.raises(evoxc.DeviceError, match="no device-transfer provider"):
         _host_tensor().to(DEV)
 
 
@@ -211,7 +211,7 @@ def test_to_with_no_provider_anywhere_raises():
 )
 def test_activation_order_permutations_transfer_via_last_activated(order):
     # Simulates mixed-backend processes under EVERY import/activation order
-    # (adapters registering per-backend slots, etl.backends.get(name)
+    # (adapters registering per-backend slots, evoxc.backends.get(name)
     # recording the preference): Tensor.to must always route through the
     # LAST resolved backend's own provider — never a clobbered/wrong one —
     # and every backend's provider must stay registered throughout.
@@ -231,8 +231,8 @@ def test_activation_order_permutations_transfer_via_last_activated(order):
 
 
 def test_registry_get_numpy_disturbs_no_preference():
-    # The real etl.backends.get("numpy") fast path runs the preference hook
+    # The real evoxc.backends.get("numpy") fast path runs the preference hook
     # but numpy registers no per-backend slots — preferences are untouched
     # (a no-op), and no error is raised.
-    etl.backends.get("numpy")
+    evoxc.backends.get("numpy")
     assert _PREFERRED_TRANSFER_BACKENDS.get(KIND) is None

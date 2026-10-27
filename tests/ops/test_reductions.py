@@ -1,11 +1,11 @@
-"""Contract tests for etl.ops.reductions.
+"""Contract tests for evoxc.ops.reductions.
 
 Covers the ``reduce_*`` family (``reduce_sum`` / ``reduce_max`` /
 ``reduce_min`` / ``reduce_mean`` / ``reduce_prod``) and the user-facing sugar
 (``sum`` / ``max`` / ``min`` / ``mean`` / ``prod`` — documented shorthand
-that expands EXACTLY onto the corresponding ``reduce_*`` op). The etl package
+that expands EXACTLY onto the corresponding ``reduce_*`` op). The evoxc package
 (repo-root sibling) is fully implemented; these tests assert the contracts in
-``etl/ops/reductions.py`` and ``etl/ops/CONTEXT.md``:
+``evoxc/ops/reductions.py`` and ``evoxc/ops/CONTEXT.md``:
 
 - ``axes`` is STATIC: None (all axes), int, or tuple of ints; negatives are
   shifted, duplicates deduped, result sorted.
@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 
@@ -54,7 +54,7 @@ def _trace_capturing(fn, *specs):
         captured["out"] = out
         return out
 
-    graph = etl.trace(wrapped, *specs)
+    graph = evoxc.trace(wrapped, *specs)
     return graph, captured["out"]
 
 
@@ -80,22 +80,22 @@ REDUCE_SHAPE_CASES = [
 @pytest.mark.parametrize("op_name", REDUCE_NAMES)
 @pytest.mark.parametrize("axes,keepdims,out_shape", REDUCE_SHAPE_CASES)
 def test_reduce_shape_inference(op_name, axes, keepdims, out_shape):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axes=axes, keepdims=keepdims)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3, 4), etl.float32))
-    assert isinstance(out, etl.SymbolicTensor)
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
+    assert isinstance(out, evoxc.SymbolicTensor)
     assert tuple(out.shape) == out_shape
     assert _op(graph, op_name).results[0].type.shape == out_shape
 
 
 def test_reduce_full_reduction_without_keepdims_is_scalar():
     def f(x):
-        return etl.reduce_sum(x)
+        return evoxc.reduce_sum(x)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3), etl.float32))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3), evoxc.float32))
     assert tuple(out.shape) == ()
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
     got = run_numpy(f, x)
@@ -105,13 +105,13 @@ def test_reduce_full_reduction_without_keepdims_is_scalar():
 
 @pytest.mark.parametrize("op_name", REDUCE_NAMES)
 def test_reduce_preserves_symbolic_dims(op_name):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axes=(0, 2), keepdims=True)
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec((etl.dim("n"), 3, etl.dim("m")), etl.float32)
+        f, evoxc.TensorSpec((evoxc.dim("n"), 3, evoxc.dim("m")), evoxc.float32)
     )
     assert tuple(out.shape) == (1, 3, 1)
     assert _op(graph, op_name).results[0].type.shape == (1, 3, 1)
@@ -120,22 +120,22 @@ def test_reduce_preserves_symbolic_dims(op_name):
 def test_reduce_symbolic_axis_removed():
     """Reducing over a symbolic dim consumes it; unreduced symbolic dims stay."""
     def f(x):
-        return etl.reduce_sum(x, axes=1)
+        return evoxc.reduce_sum(x, axes=1)
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec((etl.dim("n"), 3, etl.dim("m")), etl.float32)
+        f, evoxc.TensorSpec((evoxc.dim("n"), 3, evoxc.dim("m")), evoxc.float32)
     )
     shape = out.shape
     assert len(shape) == 2
-    assert isinstance(shape[0], etl.Dim) and isinstance(shape[1], etl.Dim)
-    assert shape[0] == etl.dim("n") and shape[1] == etl.dim("m")
+    assert isinstance(shape[0], evoxc.Dim) and isinstance(shape[1], evoxc.Dim)
+    assert shape[0] == evoxc.dim("n") and shape[1] == evoxc.dim("m")
 
 
 def test_reduce_normalized_attrs_are_sorted_and_deduped():
     def f(x):
-        return etl.reduce_sum(x, axes=(2, -1, 0, 2))
+        return evoxc.reduce_sum(x, axes=(2, -1, 0, 2))
 
-    graph = trace_fn(f, etl.TensorSpec((2, 3, 4), etl.float32))
+    graph = trace_fn(f, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
     op = _op(graph, "reduce_sum")
     assert op.attributes["axes"] == (0, 2)
     assert op.attributes["keepdims"] is False
@@ -147,37 +147,37 @@ def test_reduce_normalized_attrs_are_sorted_and_deduped():
 # ---------------------------------------------------------------------------
 
 REDUCE_DTYPE_CASES = [
-    ("reduce_sum", etl.int8, np.int64),
-    ("reduce_sum", etl.uint8, np.uint64),
-    ("reduce_sum", etl.bool_, np.int64),
-    ("reduce_sum", etl.float32, np.float32),
-    ("reduce_sum", etl.float16, np.float16),
-    ("reduce_sum", etl.complex64, np.complex64),
-    ("reduce_prod", etl.int32, np.int64),
-    ("reduce_prod", etl.uint16, np.uint64),
-    ("reduce_prod", etl.bool_, np.int64),
-    ("reduce_prod", etl.float32, np.float32),
-    ("reduce_mean", etl.int32, np.float64),
-    ("reduce_mean", etl.uint8, np.float64),
-    ("reduce_mean", etl.bool_, np.float64),
-    ("reduce_mean", etl.float32, np.float32),
-    ("reduce_mean", etl.float64, np.float64),
-    ("reduce_max", etl.int32, np.int32),
-    ("reduce_max", etl.bool_, np.bool_),
-    ("reduce_max", etl.float32, np.float32),
-    ("reduce_min", etl.int16, np.int16),
-    ("reduce_min", etl.float64, np.float64),
+    ("reduce_sum", evoxc.int8, np.int64),
+    ("reduce_sum", evoxc.uint8, np.uint64),
+    ("reduce_sum", evoxc.bool_, np.int64),
+    ("reduce_sum", evoxc.float32, np.float32),
+    ("reduce_sum", evoxc.float16, np.float16),
+    ("reduce_sum", evoxc.complex64, np.complex64),
+    ("reduce_prod", evoxc.int32, np.int64),
+    ("reduce_prod", evoxc.uint16, np.uint64),
+    ("reduce_prod", evoxc.bool_, np.int64),
+    ("reduce_prod", evoxc.float32, np.float32),
+    ("reduce_mean", evoxc.int32, np.float64),
+    ("reduce_mean", evoxc.uint8, np.float64),
+    ("reduce_mean", evoxc.bool_, np.float64),
+    ("reduce_mean", evoxc.float32, np.float32),
+    ("reduce_mean", evoxc.float64, np.float64),
+    ("reduce_max", evoxc.int32, np.int32),
+    ("reduce_max", evoxc.bool_, np.bool_),
+    ("reduce_max", evoxc.float32, np.float32),
+    ("reduce_min", evoxc.int16, np.int16),
+    ("reduce_min", evoxc.float64, np.float64),
 ]
 
 
 @pytest.mark.parametrize("op_name,in_dtype,out_dtype", REDUCE_DTYPE_CASES)
 def test_reduce_dtype_rules(op_name, in_dtype, out_dtype):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axes=0)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3), in_dtype))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3), in_dtype))
     assert out.dtype == np.dtype(out_dtype)
     assert _op(graph, op_name).results[0].type.dtype == np.dtype(out_dtype)
 
@@ -193,7 +193,7 @@ def test_reduce_dtype_rules_match_numpy_promotion():
         (np.float32, "reduce_max", np.max),
     ]:
         x = np.ones((2, 3), dtype=in_dtype)
-        got = run_numpy(lambda x: getattr(etl, op_name)(x), x)
+        got = run_numpy(lambda x: getattr(evoxc, op_name)(x), x)
         assert got.dtype == np_reducer(x).dtype
 
 
@@ -217,7 +217,7 @@ def test_reduce_dtype_rules_match_numpy_promotion():
     (1, True),
 ])
 def test_reduce_numerics_vs_numpy_float(op_name, np_reducer, axes, keepdims):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axes=axes, keepdims=keepdims)
@@ -238,7 +238,7 @@ def test_reduce_numerics_vs_numpy_float(op_name, np_reducer, axes, keepdims):
     ("reduce_prod", np.prod),
 ])
 def test_reduce_numerics_vs_numpy_int(op_name, np_reducer):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axes=(0, 2), keepdims=True)
@@ -253,7 +253,7 @@ def test_reduce_numerics_vs_numpy_int(op_name, np_reducer):
 
 def test_reduce_numerics_negative_axes_match_numpy():
     def f(x):
-        return etl.reduce_sum(x, axes=-2)
+        return evoxc.reduce_sum(x, axes=-2)
 
     x = np.arange(12, dtype=np.float64).reshape(3, 4)
     np.testing.assert_array_equal(run_numpy(f, x), np.sum(x, axis=-2))
@@ -264,24 +264,24 @@ def test_reduce_numerics_negative_axes_match_numpy():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("op_name,in_dtype,out_dtype", [
-    ("reduce_sum", etl.bool_, np.int64),
-    ("reduce_sum", etl.float32, np.float32),
-    ("reduce_mean", etl.int32, np.float64),
-    ("reduce_max", etl.int32, np.int32),
-    ("reduce_prod", etl.bool_, np.int64),
+    ("reduce_sum", evoxc.bool_, np.int64),
+    ("reduce_sum", evoxc.float32, np.float32),
+    ("reduce_mean", evoxc.int32, np.float64),
+    ("reduce_max", evoxc.int32, np.int32),
+    ("reduce_prod", evoxc.bool_, np.int64),
 ])
 def test_reduce_rank0_applies_dtype_rule(op_name, in_dtype, out_dtype):
     """A scalar reduction applies the op's dtype rule and keeps shape ()
     (there are no axes to remove)."""
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axes=(), keepdims=True)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((), in_dtype))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((), in_dtype))
     assert tuple(out.shape) == ()
     assert out.dtype == np.dtype(out_dtype)
-    got = run_numpy(f, np.asarray(True if in_dtype == etl.bool_ else 3, dtype=np.dtype(in_dtype)))
+    got = run_numpy(f, np.asarray(True if in_dtype == evoxc.bool_ else 3, dtype=np.dtype(in_dtype)))
     assert got.shape == ()
     assert got.dtype == np.dtype(out_dtype)
 
@@ -294,8 +294,8 @@ def test_reduce_rank0_applies_dtype_rule(op_name, in_dtype, out_dtype):
 def test_sugar_produces_identical_ir(sugar, reduce):
     """sum/max/min/mean/prod expand EXACTLY onto reduce_* (same op name,
     attributes, result type) — no hidden semantics."""
-    sugar_fn = getattr(etl, sugar)
-    reduce_fn = getattr(etl, reduce)
+    sugar_fn = getattr(evoxc, sugar)
+    reduce_fn = getattr(evoxc, reduce)
 
     def f_sugar(x):
         return sugar_fn(x, axes=(0, 2), keepdims=True)
@@ -303,8 +303,8 @@ def test_sugar_produces_identical_ir(sugar, reduce):
     def f_reduce(x):
         return reduce_fn(x, axes=(0, 2), keepdims=True)
 
-    g_sugar = trace_fn(f_sugar, etl.TensorSpec((2, 3, 4), etl.float32))
-    g_reduce = trace_fn(f_reduce, etl.TensorSpec((2, 3, 4), etl.float32))
+    g_sugar = trace_fn(f_sugar, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
+    g_reduce = trace_fn(f_reduce, evoxc.TensorSpec((2, 3, 4), evoxc.float32))
     ops_sugar = [op for op in ops_of(g_sugar) if op.name != "return"]
     ops_reduce = [op for op in ops_of(g_reduce) if op.name != "return"]
     assert [op.name for op in ops_sugar] == [reduce]
@@ -317,8 +317,8 @@ def test_sugar_produces_identical_ir(sugar, reduce):
 
 @pytest.mark.parametrize("sugar,reduce", SUGAR_PAIRS)
 def test_sugar_and_reduce_agree_numerically(sugar, reduce):
-    sugar_fn = getattr(etl, sugar)
-    reduce_fn = getattr(etl, reduce)
+    sugar_fn = getattr(evoxc, sugar)
+    reduce_fn = getattr(evoxc, reduce)
     x = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
     got_sugar = run_numpy(lambda t: sugar_fn(t, axes=1), x)
     got_reduce = run_numpy(lambda t: reduce_fn(t, axes=1), x)
@@ -331,25 +331,25 @@ def test_sugar_and_reduce_agree_numerically(sugar, reduce):
 
 @pytest.mark.parametrize("op_name", REDUCE_NAMES)
 def test_reduce_axes_out_of_range(op_name):
-    op = getattr(etl, op_name)
-    with pytest.raises(etl.ShapeError, match="axis 3 out of range for rank 2"):
-        etl.trace(lambda x: op(x, axes=3), etl.TensorSpec((2, 3), etl.float32))
-    with pytest.raises(etl.ShapeError, match="axis -3 out of range for rank 2"):
-        etl.trace(lambda x: op(x, axes=-3), etl.TensorSpec((2, 3), etl.float32))
-    with pytest.raises(etl.ShapeError, match="axis 2 out of range for rank 2"):
-        etl.trace(lambda x: op(x, axes=(0, 2)),
-                  etl.TensorSpec((2, 3), etl.float32))
+    op = getattr(evoxc, op_name)
+    with pytest.raises(evoxc.ShapeError, match="axis 3 out of range for rank 2"):
+        evoxc.trace(lambda x: op(x, axes=3), evoxc.TensorSpec((2, 3), evoxc.float32))
+    with pytest.raises(evoxc.ShapeError, match="axis -3 out of range for rank 2"):
+        evoxc.trace(lambda x: op(x, axes=-3), evoxc.TensorSpec((2, 3), evoxc.float32))
+    with pytest.raises(evoxc.ShapeError, match="axis 2 out of range for rank 2"):
+        evoxc.trace(lambda x: op(x, axes=(0, 2)),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 def test_reduce_empty_axes_rejected_on_rank1_plus():
     """axes=() would silently mean "all axes" at the IR level — the frontend
     rejects it explicitly on rank >= 1 tensors."""
-    with pytest.raises(etl.ShapeError, match="reducing no axes"):
-        etl.trace(lambda x: etl.reduce_sum(x, axes=()),
-                  etl.TensorSpec((2, 3), etl.float32))
-    with pytest.raises(etl.ShapeError, match="reducing no axes"):
-        etl.trace(lambda x: etl.reduce_mean(x, axes=()),
-                  etl.TensorSpec((2, 3), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="reducing no axes"):
+        evoxc.trace(lambda x: evoxc.reduce_sum(x, axes=()),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
+    with pytest.raises(evoxc.ShapeError, match="reducing no axes"):
+        evoxc.trace(lambda x: evoxc.reduce_mean(x, axes=()),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 @pytest.mark.parametrize("bad_axes,msg", [
@@ -361,24 +361,24 @@ def test_reduce_empty_axes_rejected_on_rank1_plus():
 ])
 def test_reduce_malformed_axes_raise_type_error(bad_axes, msg):
     with pytest.raises(TypeError, match=msg):
-        etl.trace(lambda x: etl.reduce_sum(x, axes=bad_axes),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: evoxc.reduce_sum(x, axes=bad_axes),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 @pytest.mark.parametrize("op_name", REDUCE_NAMES)
 def test_reduce_keepdims_must_be_bool(op_name):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
     with pytest.raises(TypeError,
                        match=f"{op_name}: keepdims must be a bool, got 1"):
-        etl.trace(lambda x: op(x, axes=0, keepdims=1),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: op(x, axes=0, keepdims=1),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 @pytest.mark.parametrize("sugar", ["sum", "max", "min", "mean", "prod"])
 def test_sugar_errors_match_reduce_errors(sugar):
-    sugar_fn = getattr(etl, sugar)
-    with pytest.raises(etl.ShapeError, match="axis 5 out of range for rank 2"):
-        etl.trace(lambda x: sugar_fn(x, axes=5), etl.TensorSpec((2, 3), etl.float32))
+    sugar_fn = getattr(evoxc, sugar)
+    with pytest.raises(evoxc.ShapeError, match="axis 5 out of range for rank 2"):
+        evoxc.trace(lambda x: sugar_fn(x, axes=5), evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError, match="keepdims must be a bool"):
-        etl.trace(lambda x: sugar_fn(x, axes=None, keepdims=0),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: sugar_fn(x, axes=None, keepdims=0),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))

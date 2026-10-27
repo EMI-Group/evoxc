@@ -1,7 +1,7 @@
 """iree adapter host-dispatch for external kernels (round 2) — end-to-end suite.
 
-Pins the round-2 semantics documented in ``etl/CONTEXT.md`` ("External
-kernels") and ``etl/backends/adapters/CONTEXT.md``:
+Pins the round-2 semantics documented in ``evoxc/CONTEXT.md`` ("External
+kernels") and ``evoxc/backends/adapters/CONTEXT.md``:
 
 * ``lower()`` SPLITS an external-call graph into segment modules + a
   kernel-call plan (payload ``stablehlo-segments``); ``compile()`` produces
@@ -26,7 +26,7 @@ kernels") and ``etl/backends/adapters/CONTEXT.md``:
 Stand-in kernels are plain Python/numpy functions — NO triton anywhere.
 
 Round 3 (per-backend dispatch + staging warning): the run path resolves
-kernels through ``etl.external.get_external_kernel(name, "iree")`` — the
+kernels through ``evoxc.external.get_external_kernel(name, "iree")`` — the
 exact ``"iree"`` slot wins over the default slot (pinned by differentiated
 outputs), and the host-dispatch staging ``UserWarning`` fires at the FIRST
 external-call boundary of an executable and never again for that executable
@@ -35,7 +35,7 @@ external-call boundary of an executable and never again for that executable
 Round 4 (device-resident kernels): a kernel registered under the exact
 ``"iree"`` slot with ``device_resident=True`` receives the boundary
 operands DIRECTLY — ``core.Tensor`` s whose ``.data`` is the public
-``etl.backends.adapters.iree.IreeDevicePayload`` (never host-staged numpy)
+``evoxc.backends.adapters.iree.IreeDevicePayload`` (never host-staged numpy)
 — and may return device tensors / duck-typed payloads / raw
 ``DeviceArray`` s / numpy arrays / tuple-list mixes; results are validated
 METADATA-ONLY (never a forced host copy), a device kernel may compile +
@@ -71,8 +71,8 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
-from etl.backends.adapters.iree import IreeDevicePayload
+import evoxc
+from evoxc.backends.adapters.iree import IreeDevicePayload
 
 # ---------------------------------------------------------------------------
 # kernels (plain numpy stand-ins; deterministic + exactly representable fp32)
@@ -95,12 +95,12 @@ KERNELS = {
 @pytest.fixture(scope="module", autouse=True)
 def _register_kernels():
     for name, kernel in KERNELS.items():
-        etl.register_external_kernel(name, kernel)
+        evoxc.register_external_kernel(name, kernel)
     try:
         yield
     finally:
         for name in KERNELS:
-            etl.unregister_external_kernel(name)
+            evoxc.unregister_external_kernel(name)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ def _register_kernels():
 
 X = np.array([1.0, 2.0, 3.0], dtype=np.float32)
 X2 = np.array([0.5, 1.5, 2.5], dtype=np.float32)
-SPEC = etl.TensorSpec((3,), etl.float32)
+SPEC = evoxc.TensorSpec((3,), evoxc.float32)
 
 
 def _specs(*specs):
@@ -122,14 +122,14 @@ def _specs(*specs):
 
 
 def _np(v):
-    if isinstance(v, etl.Tensor):
+    if isinstance(v, evoxc.Tensor):
         return np.asarray(v.numpy())
     return np.asarray(v)
 
 
 def _assert_bit_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
@@ -150,14 +150,14 @@ def _build_exe(builder, specs, device=None, target_backends=None):
         kwargs = {"backend": "iree", "device": device}
         if target_backends is not None:
             kwargs["target_backends"] = target_backends
-        exe = etl.build(builder, *specs, **kwargs)
+        exe = evoxc.build(builder, *specs, **kwargs)
         _EXECUTABLES[key] = exe
     return exe
 
 
 def _run_numpy(builder, *arrays):
     """The pure-graph numpy run (reference for the iree results)."""
-    return etl.evaluate(builder, *arrays)
+    return evoxc.evaluate(builder, *arrays)
 
 
 @contextmanager
@@ -167,20 +167,20 @@ def _device_kernel(name, host_fn, device_fn):
     numpy backend resolves the default slot only, so device mode is
     consumed by iree alone); unregister everything on exit."""
     if host_fn is not None:
-        etl.register_external_kernel(name, host_fn)
-    etl.register_external_kernel(
+        evoxc.register_external_kernel(name, host_fn)
+    evoxc.register_external_kernel(
         name, device_fn, backend="iree", device_resident=True
     )
     try:
         yield
     finally:
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
 
 
 def _assert_device_operand(x, device):
     """The device-mode operand contract: a ``core.Tensor`` wrapping the
     public ``IreeDevicePayload`` (never a host ndarray), on ``device``."""
-    assert isinstance(x, etl.Tensor), type(x)
+    assert isinstance(x, evoxc.Tensor), type(x)
     assert isinstance(x.data, IreeDevicePayload), type(x.data)
     assert not isinstance(x, np.ndarray)
     assert x.data.shape == (3,)
@@ -194,62 +194,62 @@ def _assert_device_operand(x, device):
 
 
 def _mid_graph(x):
-    y = etl.external_call(
-        "t_kernel_double", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_kernel_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y + 1.0
 
 
 def _sequential(x):
-    y1 = etl.external_call(
-        "t_kernel_double", x, result=etl.TensorSpec((3,), etl.float32)
+    y1 = evoxc.external_call(
+        "t_kernel_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
-    y2 = etl.external_call(
-        "t_kernel_inc", y1, result=etl.TensorSpec((3,), etl.float32)
+    y2 = evoxc.external_call(
+        "t_kernel_inc", y1, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y2 * 2.0
 
 
 def _kernel_at_start(x):
-    y = etl.external_call(
-        "t_kernel_triple", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_kernel_triple", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y + 1.0
 
 
 def _kernel_at_end(x):
-    return etl.external_call(
-        "t_kernel_triple", x, result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_kernel_triple", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
 def _multi_output(x):
-    a, b = etl.external_call(
+    a, b = evoxc.external_call(
         "t_kernel_multi",
         x,
         result=[
-            etl.TensorSpec((3,), etl.float32),
-            etl.TensorSpec((3,), etl.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
         ],
     )
     return a + b
 
 
 def _multi_output_with_carry(x):
-    a, b = etl.external_call(
+    a, b = evoxc.external_call(
         "t_kernel_multi",
         x,
         result=[
-            etl.TensorSpec((3,), etl.float32),
-            etl.TensorSpec((3,), etl.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
         ],
     )
-    return etl.sum(a) + b
+    return evoxc.sum(a) + b
 
 
 def _two_inputs(x, w):
-    y = etl.external_call(
-        "t_kernel_add", x, w, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_kernel_add", x, w, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y * 2.0
 
@@ -257,8 +257,8 @@ def _two_inputs(x, w):
 def _slot_graph(x):
     """Single call to a kernel registered per-backend (round 3): the run
     path must prefer the exact "iree" slot over the default slot."""
-    return etl.external_call(
-        "t_slot_kernel", x, result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_slot_kernel", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
@@ -266,8 +266,8 @@ def _staging_warn_graph(x):
     """One-call graph used ONLY by the staging-warning test (fresh
     executable — the once-per-executable warning must not be consumed by
     another test's run of the same builder)."""
-    y = etl.external_call(
-        "t_kernel_double", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_kernel_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y + 1.0
 
@@ -279,59 +279,59 @@ def _plain_graph(x):
 
 
 def _ghost(x):
-    return etl.external_call(
-        "t_ghost_kernel", x, result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_ghost_kernel", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
 def _while_body(c, i):
     def cond(state):
-        return etl.less(
-            state[1], etl.constant(etl.tensor(3, dtype=etl.int32))
+        return evoxc.less(
+            state[1], evoxc.constant(evoxc.tensor(3, dtype=evoxc.int32))
         )
 
     def body(state):
-        y = etl.external_call(
-            "t_kernel_double", state[0], result=etl.TensorSpec((3,), etl.float32)
+        y = evoxc.external_call(
+            "t_kernel_double", state[0], result=evoxc.TensorSpec((3,), evoxc.float32)
         )
         return (
             y,
-            etl.add(state[1], etl.constant(etl.tensor(1, dtype=etl.int32))),
+            evoxc.add(state[1], evoxc.constant(evoxc.tensor(1, dtype=evoxc.int32))),
         )
 
-    return etl.while_loop(cond, body, (c, i))[0]
+    return evoxc.while_loop(cond, body, (c, i))[0]
 
 
 def _cond_body(x):
     def true_fn(x):
-        return etl.external_call(
-            "t_kernel_double", x, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.external_call(
+            "t_kernel_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
-    return etl.cond(
-        etl.constant(etl.tensor(True)), true_fn, lambda x: x, x
+    return evoxc.cond(
+        evoxc.constant(evoxc.tensor(True)), true_fn, lambda x: x, x
     )
 
 
 def _symbolic_result(x):
     n = x.shape[0]
-    return etl.external_call(
-        "t_kernel_double", x, result=etl.TensorSpec((n, 2), etl.float32)
+    return evoxc.external_call(
+        "t_kernel_double", x, result=evoxc.TensorSpec((n, 2), evoxc.float32)
     )
 
 
 def _none_result_dim(x):
-    n = etl.Dim("n")  # pragma: no cover — never traced
+    n = evoxc.Dim("n")  # pragma: no cover — never traced
     del n
-    return etl.external_call(
-        "t_kernel_double", x, result=etl.TensorSpec((None,), etl.float32)
+    return evoxc.external_call(
+        "t_kernel_double", x, result=evoxc.TensorSpec((None,), evoxc.float32)
     )
 
 
 def _zero_operand(x):
     del x
-    return etl.external_call(
-        "t_zero_kernel", result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_zero_kernel", result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
@@ -341,8 +341,8 @@ def _zero_operand(x):
 
 
 def test_lower_produces_segments_payload_and_segments_artifact():
-    graph = etl.trace(_mid_graph, SPEC)
-    lowered = etl.lower(graph, backend="iree")
+    graph = evoxc.trace(_mid_graph, SPEC)
+    lowered = evoxc.lower(graph, backend="iree")
     assert lowered.backend == "iree"
     assert lowered.payload["format"] == "stablehlo-segments"
     segments = lowered.payload["segments"]
@@ -359,18 +359,18 @@ def test_lower_produces_segments_payload_and_segments_artifact():
         assert isinstance(segment["mlir_text"], str)
         assert segment["entry_functions"] == ["main"]
 
-    artifact = etl.compile(lowered)
+    artifact = evoxc.compile(lowered)
     assert artifact.backend == "iree"
     assert artifact.payload["format"] == "iree-vmfb-segments"
     assert len(artifact.payload["segments"]) == 2
-    exe = etl.load(artifact)
-    out = etl.run(exe, etl.Tensor(X))
+    exe = evoxc.load(artifact)
+    out = evoxc.run(exe, evoxc.Tensor(X))
     _assert_bit_exact(out, _run_numpy(_mid_graph, X))
 
 
 def test_llvm_cpu_mid_graph_call_bit_exact():
     exe = _build_exe(_mid_graph, _specs(SPEC))
-    _assert_bit_exact(etl.run(exe, etl.Tensor(X)), _run_numpy(_mid_graph, X))
+    _assert_bit_exact(evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_mid_graph, X))
 
 
 def test_llvm_cpu_sequential_calls():
@@ -379,14 +379,14 @@ def test_llvm_cpu_sequential_calls():
     dropped ``result_outputs`` -> ``KeyError`` at the first boundary."""
     exe = _build_exe(_sequential, _specs(SPEC))
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_sequential, X)
+        evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_sequential, X)
     )
 
 
 def test_llvm_cpu_kernel_at_start():
     exe = _build_exe(_kernel_at_start, _specs(SPEC))
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_kernel_at_start, X)
+        evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_kernel_at_start, X)
     )
 
 
@@ -395,35 +395,35 @@ def test_llvm_cpu_kernel_at_end():
     call's operand-staging segment with no trailing plain ops."""
     exe = _build_exe(_kernel_at_end, _specs(SPEC))
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_kernel_at_end, X)
+        evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_kernel_at_end, X)
     )
 
 
 def test_llvm_cpu_kernel_at_start_and_end():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        y = etl.external_call(
-            "t_kernel_inc", x, result=etl.TensorSpec((3,), etl.float32)
+        y = evoxc.external_call(
+            "t_kernel_inc", x, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
-        return etl.external_call(
-            "t_kernel_double", y, result=etl.TensorSpec((3,), etl.float32)
+        return evoxc.external_call(
+            "t_kernel_double", y, result=evoxc.TensorSpec((3,), evoxc.float32)
         )
 
     exe = _build_exe(f, _specs(SPEC))
-    _assert_bit_exact(etl.run(exe, etl.Tensor(X)), _run_numpy(f, X))
+    _assert_bit_exact(evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(f, X))
 
 
 def test_llvm_cpu_multi_output_kernel():
     exe = _build_exe(_multi_output, _specs(SPEC))
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_multi_output, X)
+        evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_multi_output, X)
     )
 
 
 def test_llvm_cpu_multi_output_kernel_with_carry():
     exe = _build_exe(_multi_output_with_carry, _specs(SPEC))
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_multi_output_with_carry, X)
+        evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_multi_output_with_carry, X)
     )
 
 
@@ -432,7 +432,7 @@ def test_llvm_cpu_two_graph_inputs_one_operand_each():
     plumbing across the staging boundary)."""
     exe = _build_exe(_two_inputs, _specs(SPEC, SPEC))
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X), etl.Tensor(X2)),
+        evoxc.run(exe, evoxc.Tensor(X), evoxc.Tensor(X2)),
         _run_numpy(_two_inputs, X, X2),
     )
 
@@ -441,22 +441,22 @@ def test_llvm_cpu_repeat_run_deterministic():
     """Same inputs + same registered kernels -> identical results across
     runs (purity contract)."""
     exe = _build_exe(_sequential, _specs(SPEC))
-    first = etl.run(exe, etl.Tensor(X))
-    second = etl.run(exe, etl.Tensor(X))
+    first = evoxc.run(exe, evoxc.Tensor(X))
+    second = evoxc.run(exe, evoxc.Tensor(X))
     _assert_bit_exact(first, second)
     _assert_bit_exact(first, _run_numpy(_sequential, X))
 
 
 def test_split_artifact_save_load_roundtrip(tmp_path):
     """The segments artifact (vmfbs + JSON-safe plan) persists and re-runs."""
-    graph = etl.trace(_sequential, SPEC)
-    artifact = etl.compile(etl.lower(graph, backend="iree"))
-    path = tmp_path / "ext_seq.etl"
+    graph = evoxc.trace(_sequential, SPEC)
+    artifact = evoxc.compile(evoxc.lower(graph, backend="iree"))
+    path = tmp_path / "ext_seq.evoxc"
     artifact.save(str(path))
-    restored = etl.backends.CompiledArtifact.load(str(path))
+    restored = evoxc.backends.CompiledArtifact.load(str(path))
     assert restored.payload["format"] == "iree-vmfb-segments"
-    exe = etl.load(restored)
-    _assert_bit_exact(etl.run(exe, etl.Tensor(X)), _run_numpy(_sequential, X))
+    exe = evoxc.load(restored)
+    _assert_bit_exact(evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_sequential, X))
 
 
 # ---------------------------------------------------------------------------
@@ -466,45 +466,45 @@ def test_split_artifact_save_load_roundtrip(tmp_path):
 
 def test_run_unregistered_kernel_raises_naming_registry():
     exe = _build_exe(_ghost, _specs(SPEC))
-    with pytest.raises(etl.BackendError, match="t_ghost_kernel"):
-        etl.run(exe, etl.Tensor(X))
+    with pytest.raises(evoxc.BackendError, match="t_ghost_kernel"):
+        evoxc.run(exe, evoxc.Tensor(X))
     # the message points at the registration API
     try:
-        etl.run(exe, etl.Tensor(X))
-    except etl.BackendError as exc:
+        evoxc.run(exe, evoxc.Tensor(X))
+    except evoxc.BackendError as exc:
         assert "register_external_kernel" in str(exc)
 
 
 def test_lower_rejects_call_inside_while_body():
-    graph = etl.trace(
-        _while_body, SPEC, etl.TensorSpec((), etl.int32)
+    graph = evoxc.trace(
+        _while_body, SPEC, evoxc.TensorSpec((), evoxc.int32)
     )
-    with pytest.raises(etl.BackendError, match="not splittable"):
-        etl.lower(graph, backend="iree")
+    with pytest.raises(evoxc.BackendError, match="not splittable"):
+        evoxc.lower(graph, backend="iree")
 
 
 def test_lower_rejects_call_inside_cond_body():
-    graph = etl.trace(_cond_body, SPEC)
-    with pytest.raises(etl.BackendError, match="not splittable"):
-        etl.lower(graph, backend="iree")
+    graph = evoxc.trace(_cond_body, SPEC)
+    with pytest.raises(evoxc.BackendError, match="not splittable"):
+        evoxc.lower(graph, backend="iree")
 
 
 def test_lower_rejects_symbolic_result_dims():
-    graph = etl.trace(_symbolic_result, etl.TensorSpec((etl.Dim("n"),), etl.float32))
-    with pytest.raises(etl.BackendError, match="STATIC"):
-        etl.lower(graph, backend="iree")
+    graph = evoxc.trace(_symbolic_result, evoxc.TensorSpec((evoxc.Dim("n"),), evoxc.float32))
+    with pytest.raises(evoxc.BackendError, match="STATIC"):
+        evoxc.lower(graph, backend="iree")
 
 
 def test_lower_rejects_none_result_dim():
-    graph = etl.trace(_none_result_dim, SPEC)
-    with pytest.raises(etl.BackendError, match="STATIC"):
-        etl.lower(graph, backend="iree")
+    graph = evoxc.trace(_none_result_dim, SPEC)
+    with pytest.raises(evoxc.BackendError, match="STATIC"):
+        evoxc.lower(graph, backend="iree")
 
 
 def test_lower_rejects_zero_operand_call():
-    graph = etl.trace(_zero_operand, SPEC)
-    with pytest.raises(etl.BackendError, match="at least one tensor operand"):
-        etl.lower(graph, backend="iree")
+    graph = evoxc.trace(_zero_operand, SPEC)
+    with pytest.raises(evoxc.BackendError, match="at least one tensor operand"):
+        evoxc.lower(graph, backend="iree")
 
 
 @pytest.mark.parametrize("backend", ["xla", "tvm"])
@@ -513,9 +513,9 @@ def test_xla_tvm_still_reject_with_round1_message(backend):
     reject external-call graphs at lower() with the round-1 message
     (adapter host-dispatch not yet wired). Env-dependent adapter-missing
     errors skip, mirroring the round-1 test pattern."""
-    graph = etl.trace(_mid_graph, SPEC)
-    with pytest.raises(etl.BackendError) as exc:
-        etl.lower(graph, backend=backend)
+    graph = evoxc.trace(_mid_graph, SPEC)
+    with pytest.raises(evoxc.BackendError) as exc:
+        evoxc.lower(graph, backend=backend)
     message = str(exc.value)
     if "external_call" not in message:
         pytest.skip(f"{backend} adapter not available in this env: {message}")
@@ -532,13 +532,13 @@ def test_run_prefers_exact_iree_slot_over_default():
     """Per-backend resolution: a kernel registered under backend="iree" wins
     over the default slot at iree run time (differentiated by output)."""
     name = "t_slot_kernel"
-    etl.register_external_kernel(name, lambda x: x * 2.0)  # default slot
-    etl.register_external_kernel(name, lambda x: x * 5.0, backend="iree")
+    evoxc.register_external_kernel(name, lambda x: x * 2.0)  # default slot
+    evoxc.register_external_kernel(name, lambda x: x * 5.0, backend="iree")
     try:
         exe = _build_exe(_slot_graph, _specs(SPEC))
-        _assert_bit_exact(etl.run(exe, etl.Tensor(X)), X * 5.0)
+        _assert_bit_exact(evoxc.run(exe, evoxc.Tensor(X)), X * 5.0)
     finally:
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
 
 
 def test_run_default_slot_only_kernel_still_works():
@@ -546,12 +546,12 @@ def test_run_default_slot_only_kernel_still_works():
     shared executable resolves kernels at run time, so the cached build
     serves both tests)."""
     name = "t_slot_kernel"
-    etl.register_external_kernel(name, lambda x: x * 2.0)  # default slot only
+    evoxc.register_external_kernel(name, lambda x: x * 2.0)  # default slot only
     try:
         exe = _build_exe(_slot_graph, _specs(SPEC))
-        _assert_bit_exact(etl.run(exe, etl.Tensor(X)), X * 2.0)
+        _assert_bit_exact(evoxc.run(exe, evoxc.Tensor(X)), X * 2.0)
     finally:
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
 
 
 def test_staging_warning_once_per_executable():
@@ -560,10 +560,10 @@ def test_staging_warning_once_per_executable():
     executable (record count across a second run is zero)."""
     exe = _build_exe(_staging_warn_graph, _specs(SPEC))
     with pytest.warns(UserWarning, match="host-dispatch"):
-        first = etl.run(exe, etl.Tensor(X))
+        first = evoxc.run(exe, evoxc.Tensor(X))
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("always")
-        second = etl.run(exe, etl.Tensor(X))
+        second = evoxc.run(exe, evoxc.Tensor(X))
     assert not [
         r for r in records
         if r.category is UserWarning and "host-dispatch" in str(r.message)
@@ -578,7 +578,7 @@ def test_no_staging_warning_without_external_calls():
     exe = _build_exe(_plain_graph, _specs(SPEC))
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("always")
-        out = etl.run(exe, etl.Tensor(X))
+        out = evoxc.run(exe, evoxc.Tensor(X))
     assert not [
         r for r in records
         if r.category is UserWarning and "host-dispatch" in str(r.message)
@@ -632,27 +632,27 @@ def _run_second_vmfb(payload):
 def _t_dev_second_vmfb(x):
     """Device kernel: run a SECOND vmfb on the operand's HAL device and
     return its raw DeviceArray (x + 2)."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return _run_second_vmfb(x.data)
 
 
 def _t_dev_numpy(x):
     """Device kernel returning a HOST numpy array (explicit to_host inside
     the kernel; the boundary stages it back — the adapter never forces)."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return x.data.to_host() * 2.0
 
 
 def _t_dev_mixed(x):
     """Device kernel returning a (device_array, host_array) mix."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return (_run_second_vmfb(x.data), x.data.to_host() + 1.0)
 
 
 def _t_dev_core_tensor(x):
     """Device kernel returning a ``core.Tensor`` wrapping a device payload."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
-    return etl.core.Tensor(
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
+    return evoxc.core.Tensor(
         IreeDevicePayload(_run_second_vmfb(x.data), x.data.device)
     )
 
@@ -660,13 +660,13 @@ def _t_dev_core_tensor(x):
 def _t_dev_duck_payload(x):
     """Device kernel returning a duck-typed payload (a raw
     ``IreeDevicePayload`` — shape + dtype) the adapter wraps itself."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return IreeDevicePayload(_run_second_vmfb(x.data), x.data.device)
 
 
 def _t_dev_double(x):
     """Device kernel for the placement tests (x + 2 via the second vmfb)."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return _run_second_vmfb(x.data)
 
 
@@ -676,7 +676,7 @@ def _t_dev_inc(x):
     DeviceArray via asdevicearray (x + 1)."""
     import iree.runtime as rt
 
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return rt.asdevicearray(
         x.data.device_array._device, x.data.to_host() + 1.0
     )
@@ -684,7 +684,7 @@ def _t_dev_inc(x):
 
 def _t_dev_multi(x):
     """Device kernel with two device outputs (both via the second vmfb)."""
-    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    _assert_device_operand(x, evoxc.core.Device("cpu", 0))
     return (_run_second_vmfb(x.data), _run_second_vmfb(x.data))
 
 
@@ -720,73 +720,73 @@ def _t_dev_garbage(x):
 
 
 def _dev_second_vmfb_graph(x):
-    y = etl.external_call(
-        "t_dev_second_vmfb", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_dev_second_vmfb", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y + 1.0
 
 
 def _dev_numpy_warn_graph(x):
-    y = etl.external_call(
-        "t_dev_numpy", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_dev_numpy", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y * 2.0
 
 
 def _dev_mixed_graph(x):
-    a, b = etl.external_call(
+    a, b = evoxc.external_call(
         "t_dev_mixed",
         x,
         result=[
-            etl.TensorSpec((3,), etl.float32),
-            etl.TensorSpec((3,), etl.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
         ],
     )
     return a + b
 
 
 def _dev_tensor_duck_graph(x):
-    a = etl.external_call(
-        "t_dev_core_tensor", x, result=etl.TensorSpec((3,), etl.float32)
+    a = evoxc.external_call(
+        "t_dev_core_tensor", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
-    b = etl.external_call(
-        "t_dev_duck_payload", a, result=etl.TensorSpec((3,), etl.float32)
+    b = evoxc.external_call(
+        "t_dev_duck_payload", a, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return b + 1.0
 
 
 def _dev_multi_graph(x):
-    a, b = etl.external_call(
+    a, b = evoxc.external_call(
         "t_dev_multi",
         x,
         result=[
-            etl.TensorSpec((3,), etl.float32),
-            etl.TensorSpec((3,), etl.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
+            evoxc.TensorSpec((3,), evoxc.float32),
         ],
     )
     return a + b
 
 
 def _dev_sequential_graph(x):
-    a = etl.external_call(
-        "t_dev_double", x, result=etl.TensorSpec((3,), etl.float32)
+    a = evoxc.external_call(
+        "t_dev_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
-    b = etl.external_call(
-        "t_dev_inc", a, result=etl.TensorSpec((3,), etl.float32)
+    b = evoxc.external_call(
+        "t_dev_inc", a, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return b + 1.0
 
 
 def _dev_start_graph(x):
-    y = etl.external_call(
-        "t_dev_double", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_dev_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y + 1.0
 
 
 def _dev_end_graph(x):
-    return etl.external_call(
-        "t_dev_double", x, result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_dev_double", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
@@ -794,27 +794,27 @@ def _dev_no_warn_graph(x):
     """One-call graph used ONLY by the fully-device-resident no-warning
     test (fresh executable — the once-per-executable warning state must
     not be consumed by another test's run of the same builder)."""
-    y = etl.external_call(
-        "t_dev_no_warn", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_dev_no_warn", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y * 2.0
 
 
 def _dev_garbage_graph(x):
-    return etl.external_call(
-        "t_dev_garbage", x, result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_dev_garbage", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
 def _dev_unregistered_graph(x):
-    return etl.external_call(
-        "t_dev_unregistered", x, result=etl.TensorSpec((3,), etl.float32)
+    return evoxc.external_call(
+        "t_dev_unregistered", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
 
 
 def _dev_cuda_graph(x):
-    y = etl.external_call(
-        "t_dev_cuda_relay", x, result=etl.TensorSpec((3,), etl.float32)
+    y = evoxc.external_call(
+        "t_dev_cuda_relay", x, result=evoxc.TensorSpec((3,), evoxc.float32)
     )
     return y + 1.0
 
@@ -829,7 +829,7 @@ def test_llvm_cpu_device_kernel_receives_device_payload_and_runs_second_vmfb():
     ):
         exe = _build_exe(_dev_second_vmfb_graph, _specs(SPEC))
         _assert_bit_exact(
-            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_second_vmfb_graph, X)
+            evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_dev_second_vmfb_graph, X)
         )
 
 
@@ -842,7 +842,7 @@ def test_llvm_cpu_device_kernel_returning_numpy_and_mixed():
         exe = _build_exe(_dev_numpy_warn_graph, _specs(SPEC))
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            first = etl.run(exe, etl.Tensor(X))
+            first = evoxc.run(exe, evoxc.Tensor(X))
         staged = [
             r for r in records
             if r.category is UserWarning and "host-dispatch" in str(r.message)
@@ -850,7 +850,7 @@ def test_llvm_cpu_device_kernel_returning_numpy_and_mixed():
         assert len(staged) == 1
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            second = etl.run(exe, etl.Tensor(X))
+            second = evoxc.run(exe, evoxc.Tensor(X))
         assert not [
             r for r in records
             if r.category is UserWarning and "host-dispatch" in str(r.message)
@@ -864,7 +864,7 @@ def test_llvm_cpu_device_kernel_returning_numpy_and_mixed():
         exe = _build_exe(_dev_mixed_graph, _specs(SPEC))
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out = etl.run(exe, etl.Tensor(X))
+            out = evoxc.run(exe, evoxc.Tensor(X))
         staged = [
             r for r in records
             if r.category is UserWarning and "host-dispatch" in str(r.message)
@@ -886,7 +886,7 @@ def test_llvm_cpu_device_kernel_returning_core_tensor_and_duck_payload():
         ):
             exe = _build_exe(_dev_tensor_duck_graph, _specs(SPEC))
             _assert_bit_exact(
-                etl.run(exe, etl.Tensor(X)),
+                evoxc.run(exe, evoxc.Tensor(X)),
                 _run_numpy(_dev_tensor_duck_graph, X),
             )
 
@@ -899,7 +899,7 @@ def test_llvm_cpu_device_multi_output_kernel():
     ):
         exe = _build_exe(_dev_multi_graph, _specs(SPEC))
         _assert_bit_exact(
-            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_multi_graph, X)
+            evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_dev_multi_graph, X)
         )
 
 
@@ -910,7 +910,7 @@ def test_llvm_cpu_device_sequential_calls():
         with _device_kernel("t_dev_inc", lambda x: x + 1.0, _t_dev_inc):
             exe = _build_exe(_dev_sequential_graph, _specs(SPEC))
             _assert_bit_exact(
-                etl.run(exe, etl.Tensor(X)),
+                evoxc.run(exe, evoxc.Tensor(X)),
                 _run_numpy(_dev_sequential_graph, X),
             )
 
@@ -920,7 +920,7 @@ def test_llvm_cpu_device_kernel_at_start():
     with _device_kernel("t_dev_double", lambda x: x + 2.0, _t_dev_double):
         exe = _build_exe(_dev_start_graph, _specs(SPEC))
         _assert_bit_exact(
-            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_start_graph, X)
+            evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_dev_start_graph, X)
         )
 
 
@@ -931,7 +931,7 @@ def test_llvm_cpu_device_kernel_at_end():
     with _device_kernel("t_dev_double", lambda x: x + 2.0, _t_dev_double):
         exe = _build_exe(_dev_end_graph, _specs(SPEC))
         _assert_bit_exact(
-            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_end_graph, X)
+            evoxc.run(exe, evoxc.Tensor(X)), _run_numpy(_dev_end_graph, X)
         )
 
 
@@ -942,7 +942,7 @@ def test_no_staging_warning_for_fully_device_resident_boundary():
         exe = _build_exe(_dev_no_warn_graph, _specs(SPEC))
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
-            out = etl.run(exe, etl.Tensor(X))
+            out = evoxc.run(exe, evoxc.Tensor(X))
         assert not [
             r for r in records
             if r.category is UserWarning and "host-dispatch" in str(r.message)
@@ -955,8 +955,8 @@ def test_device_wrong_shape_result_raises_shape_error():
     shape (2,) when (3,) is declared -> ShapeError."""
     with _device_kernel("t_dev_garbage", None, _t_dev_wrong_shape):
         exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
-        with pytest.raises(etl.ShapeError, match="callback returned shape"):
-            etl.run(exe, etl.Tensor(X))
+        with pytest.raises(evoxc.ShapeError, match="callback returned shape"):
+            evoxc.run(exe, evoxc.Tensor(X))
 
 
 def test_device_wrong_dtype_result_raises_backend_error():
@@ -964,8 +964,8 @@ def test_device_wrong_dtype_result_raises_backend_error():
     when f32 is declared -> BackendError (never silent coercion)."""
     with _device_kernel("t_dev_garbage", None, _t_dev_wrong_dtype):
         exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
-        with pytest.raises(etl.BackendError, match="no silent dtype coercion"):
-            etl.run(exe, etl.Tensor(X))
+        with pytest.raises(evoxc.BackendError, match="no silent dtype coercion"):
+            evoxc.run(exe, evoxc.Tensor(X))
 
 
 def test_device_wrong_count_result_raises_backend_error():
@@ -974,9 +974,9 @@ def test_device_wrong_count_result_raises_backend_error():
     with _device_kernel("t_dev_garbage", None, _t_dev_wrong_count):
         exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
         with pytest.raises(
-            etl.BackendError, match=r"produced 2 output\(s\), expected 1"
+            evoxc.BackendError, match=r"produced 2 output\(s\), expected 1"
         ):
-            etl.run(exe, etl.Tensor(X))
+            evoxc.run(exe, evoxc.Tensor(X))
 
 
 def test_device_garbage_return_raises_backend_error():
@@ -984,8 +984,8 @@ def test_device_garbage_return_raises_backend_error():
     call — the dispatch path never guesses."""
     with _device_kernel("t_dev_garbage", None, _t_dev_garbage):
         exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
-        with pytest.raises(etl.BackendError, match="callback returned str"):
-            etl.run(exe, etl.Tensor(X))
+        with pytest.raises(evoxc.BackendError, match="callback returned str"):
+            evoxc.run(exe, evoxc.Tensor(X))
 
 
 def test_device_unregistered_kernel_raises_naming_registry():
@@ -993,16 +993,16 @@ def test_device_unregistered_kernel_raises_naming_registry():
     registered (device kernel) and then unregistered raises BackendError
     naming the kernel + register_external_kernel."""
     name = "t_dev_unregistered"
-    etl.register_external_kernel(
+    evoxc.register_external_kernel(
         name, _t_dev_double, backend="iree", device_resident=True
     )
-    etl.unregister_external_kernel(name)
+    evoxc.unregister_external_kernel(name)
     exe = _build_exe(_dev_unregistered_graph, _specs(SPEC))
-    with pytest.raises(etl.BackendError, match="t_dev_unregistered"):
-        etl.run(exe, etl.Tensor(X))
+    with pytest.raises(evoxc.BackendError, match="t_dev_unregistered"):
+        evoxc.run(exe, evoxc.Tensor(X))
     try:
-        etl.run(exe, etl.Tensor(X))
-    except etl.BackendError as exc:
+        evoxc.run(exe, evoxc.Tensor(X))
+    except evoxc.BackendError as exc:
         assert "register_external_kernel" in str(exc)
 
 
@@ -1054,11 +1054,11 @@ def cuda_device():
     import iree.runtime as rt
 
     try:
-        # etl Device("cuda", idx) maps to iree device_id idx + 1 (1-based ids).
+        # evoxc Device("cuda", idx) maps to iree device_id idx + 1 (1-based ids).
         rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001 — any driver/device failure skips
         pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
-    return etl.core.Device("cuda", idx)
+    return evoxc.core.Device("cuda", idx)
 
 
 def test_cuda_mid_graph_call_bit_exact(cuda_device):
@@ -1072,12 +1072,12 @@ def test_cuda_mid_graph_call_bit_exact(cuda_device):
     exe = _build_exe(
         _mid_graph, _specs(SPEC), device=cuda_device, target_backends=["cuda"]
     )
-    x_in = etl.core.Tensor(X).to(cuda_device)
-    out = etl.run(exe, x_in)
-    with pytest.raises(etl.core.DeviceError):
+    x_in = evoxc.core.Tensor(X).to(cuda_device)
+    out = evoxc.run(exe, x_in)
+    with pytest.raises(evoxc.core.DeviceError):
         out.numpy()
     _assert_bit_exact(
-        out.to(etl.core.Device("cpu", 0)), _run_numpy(_mid_graph, X)
+        out.to(evoxc.core.Device("cpu", 0)), _run_numpy(_mid_graph, X)
     )
 
 
@@ -1090,12 +1090,12 @@ def test_cuda_sequential_calls_bit_exact(cuda_device):
     exe = _build_exe(
         _sequential, _specs(SPEC), device=cuda_device, target_backends=["cuda"]
     )
-    x_in = etl.core.Tensor(X).to(cuda_device)
-    out = etl.run(exe, x_in)
-    with pytest.raises(etl.core.DeviceError):
+    x_in = evoxc.core.Tensor(X).to(cuda_device)
+    out = evoxc.run(exe, x_in)
+    with pytest.raises(evoxc.core.DeviceError):
         out.numpy()
     _assert_bit_exact(
-        out.to(etl.core.Device("cpu", 0)), _run_numpy(_sequential, X)
+        out.to(evoxc.core.Device("cpu", 0)), _run_numpy(_sequential, X)
     )
 
 
@@ -1136,13 +1136,13 @@ def test_cuda_device_kernel_bit_exact_and_operands_device_resident(cuda_device):
             device=cuda_device,
             target_backends=["cuda"],
         )
-        x_in = etl.core.Tensor(X).to(cuda_device)
-        out = etl.run(exe, x_in)
-        assert isinstance(out, etl.Tensor)
+        x_in = evoxc.core.Tensor(X).to(cuda_device)
+        out = evoxc.run(exe, x_in)
+        assert isinstance(out, evoxc.Tensor)
         assert out.data.device == cuda_device
-        with pytest.raises(etl.core.DeviceError):
+        with pytest.raises(evoxc.core.DeviceError):
             out.numpy()
         _assert_bit_exact(
-            out.to(etl.core.Device("cpu", 0)),
+            out.to(evoxc.core.Device("cpu", 0)),
             _run_numpy(_dev_cuda_graph, X),
         )

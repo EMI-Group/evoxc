@@ -1,7 +1,7 @@
 """LoweredProgram + Signature contract tests (numpy backend).
 
-Covers the staging objects owned by ``etl.backends`` (see
-``etl/backends/program.py`` and ``etl/backends/CONTEXT.md``):
+Covers the staging objects owned by ``evoxc.backends`` (see
+``evoxc/backends/program.py`` and ``evoxc/backends/CONTEXT.md``):
 
 * ``Signature``: frozen, field layout matching ``Graph.signature_info()``.
 * numpy ``LoweredProgram``: backend name, self-describing serialized-IR
@@ -20,9 +20,9 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-import etl
-from etl import persist
-from etl.backends import LoweredProgram, Signature
+import evoxc
+from evoxc import persist
+from evoxc.backends import LoweredProgram, Signature
 
 #: Keys of ``Graph.signature_info()`` == ``Signature`` field names.
 _SIGNATURE_KEYS = (
@@ -37,11 +37,11 @@ _SIGNATURE_KEYS = (
 
 def _double(x):
     """x -> x * 2 (the canonical tiny program for these tests)."""
-    return etl.multiply(x, 2)
+    return evoxc.multiply(x, 2)
 
 
 def _simple_graph():
-    return etl.trace(_double, etl.TensorSpec((3,), etl.float32))
+    return evoxc.trace(_double, evoxc.TensorSpec((3,), evoxc.float32))
 
 
 def _decoded_info(graph):
@@ -58,7 +58,7 @@ def _decoded_info(graph):
 
 def test_lower_simple_program_numpy_backend():
     graph = _simple_graph()
-    lowered = etl.lower(graph, backend=etl.numpy_backend)
+    lowered = evoxc.lower(graph, backend=evoxc.numpy_backend)
 
     assert isinstance(lowered, LoweredProgram)
     assert lowered.backend == "numpy"
@@ -76,7 +76,7 @@ def test_lower_simple_program_numpy_backend():
 
 def test_lower_with_backend_name_string():
     graph = _simple_graph()
-    lowered = etl.lower(graph, backend="numpy")
+    lowered = evoxc.lower(graph, backend="numpy")
     assert lowered.backend == "numpy"
     assert lowered.text()
 
@@ -87,26 +87,26 @@ def test_lower_with_backend_name_string():
 
 
 def test_signature_tree_and_spec_structure():
-    lowered = etl.lower(_simple_graph())
+    lowered = evoxc.lower(_simple_graph())
     sig = lowered.signature
 
-    assert isinstance(sig.input_tree, etl.core.TreeSpec)
-    assert isinstance(sig.output_tree, etl.core.TreeSpec)
+    assert isinstance(sig.input_tree, evoxc.core.TreeSpec)
+    assert isinstance(sig.output_tree, evoxc.core.TreeSpec)
     # Leaf counts are coherent across the signature.
     assert sig.input_tree.num_leaves == len(sig.input_specs)
     assert sig.output_tree.num_leaves == len(sig.output_specs)
     # Each input leaf carries the traced shape/dtype.
     assert len(sig.input_specs) == 1
     in_spec = sig.input_specs[0]
-    assert isinstance(in_spec, etl.core.TensorSpec)
+    assert isinstance(in_spec, evoxc.core.TensorSpec)
     assert in_spec.shape == (3,)
-    assert in_spec.dtype == etl.float32
+    assert in_spec.dtype == evoxc.float32
     # The output spec mirrors the traced result type.
     assert len(sig.output_specs) == 1
     out_spec = sig.output_specs[0]
-    assert isinstance(out_spec, etl.core.TensorSpec)
+    assert isinstance(out_spec, evoxc.core.TensorSpec)
     assert out_spec.shape == (3,)
-    assert out_spec.dtype == etl.float32
+    assert out_spec.dtype == evoxc.float32
 
 
 def test_signature_is_a_frozen_dataclass():
@@ -126,16 +126,16 @@ def test_signature_is_a_frozen_dataclass():
 
 def test_dict_input_and_output_structure():
     def fn(xs):
-        return {"sum": etl.add(xs["a"], xs["b"])}
+        return {"sum": evoxc.add(xs["a"], xs["b"])}
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         fn,
         {
-            "a": etl.TensorSpec((2,), etl.float32),
-            "b": etl.TensorSpec((2,), etl.float32),
+            "a": evoxc.TensorSpec((2,), evoxc.float32),
+            "b": evoxc.TensorSpec((2,), evoxc.float32),
         },
     )
-    lowered = etl.lower(graph)
+    lowered = evoxc.lower(graph)
     sig = lowered.signature
 
     # Input tree = args tuple -> the single dict argument: dict node with
@@ -156,12 +156,12 @@ def test_dict_input_and_output_structure():
     assert out_tree.num_leaves == 1
     assert len(sig.output_specs) == 1
 
-    exe = etl.load(etl.compile(lowered))
-    out = etl.run(
+    exe = evoxc.load(evoxc.compile(lowered))
+    out = evoxc.run(
         exe,
         {
-            "a": etl.tensor(np.array([1.0, 2.0], dtype=np.float32)),
-            "b": etl.tensor(np.array([3.0, 4.0], dtype=np.float32)),
+            "a": evoxc.tensor(np.array([1.0, 2.0], dtype=np.float32)),
+            "b": evoxc.tensor(np.array([3.0, 4.0], dtype=np.float32)),
         },
     )
     assert isinstance(out, dict)
@@ -179,11 +179,11 @@ class Pair:
 
 def test_dataclass_input_and_output_structure():
     def fn(xs):
-        return Pair(etl.add(xs.left, xs.right), etl.multiply(xs.left, xs.right))
+        return Pair(evoxc.add(xs.left, xs.right), evoxc.multiply(xs.left, xs.right))
 
-    exe = etl.build(
+    exe = evoxc.build(
         fn,
-        Pair(etl.TensorSpec((2,), etl.float32), etl.TensorSpec((2,), etl.float32)),
+        Pair(evoxc.TensorSpec((2,), evoxc.float32), evoxc.TensorSpec((2,), evoxc.float32)),
     )
     sig = exe.signature
 
@@ -201,11 +201,11 @@ def test_dataclass_input_and_output_structure():
     assert out_tree.num_leaves == 2
     assert len(sig.output_specs) == 2
 
-    out = etl.run(
+    out = evoxc.run(
         exe,
         Pair(
-            etl.tensor(np.array([1.0, 2.0], dtype=np.float32)),
-            etl.tensor(np.array([3.0, 4.0], dtype=np.float32)),
+            evoxc.tensor(np.array([1.0, 2.0], dtype=np.float32)),
+            evoxc.tensor(np.array([3.0, 4.0], dtype=np.float32)),
         ),
     )
     assert isinstance(out, Pair)
@@ -215,10 +215,10 @@ def test_dataclass_input_and_output_structure():
 
 def test_static_input_values_recorded_pre_order():
     def fn(x, scale):
-        return etl.multiply(x, scale)
+        return evoxc.multiply(x, scale)
 
-    graph = etl.trace(fn, etl.TensorSpec((3,), etl.float32), 2.5)
-    lowered = etl.lower(graph)
+    graph = evoxc.trace(fn, evoxc.TensorSpec((3,), evoxc.float32), 2.5)
+    lowered = evoxc.lower(graph)
     sig = lowered.signature
 
     assert sig.static_values == (2.5,)
@@ -228,25 +228,25 @@ def test_static_input_values_recorded_pre_order():
     assert sig.input_tree.num_leaves == 2  # one tensor leaf + one static leaf
 
     # The static value travels with the run-time arguments and specializes.
-    exe = etl.load(etl.compile(lowered))
-    out = etl.run(exe, etl.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32)), 2.5)
+    exe = evoxc.load(evoxc.compile(lowered))
+    out = evoxc.run(exe, evoxc.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32)), 2.5)
     np.testing.assert_allclose(out.numpy(), [2.5, 5.0, 7.5])
 
 
 def test_static_output_values_recorded_pre_order():
     def fn(x):
-        return (etl.multiply(x, 2), "done")
+        return (evoxc.multiply(x, 2), "done")
 
-    graph = etl.trace(fn, etl.TensorSpec((3,), etl.float32))
-    lowered = etl.lower(graph)
+    graph = evoxc.trace(fn, evoxc.TensorSpec((3,), evoxc.float32))
+    lowered = evoxc.lower(graph)
     sig = lowered.signature
 
     assert sig.output_static_values == ("done",)
     assert sig.output_tree.num_leaves == 2
     assert len(sig.output_specs) == 1
 
-    exe = etl.load(etl.compile(lowered))
-    out = etl.run(exe, etl.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32)))
+    exe = evoxc.load(evoxc.compile(lowered))
+    out = evoxc.run(exe, evoxc.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32)))
     assert isinstance(out, tuple) and len(out) == 2
     assert out[1] == "done"
     np.testing.assert_allclose(out[0].numpy(), [2.0, 4.0, 6.0])
@@ -259,7 +259,7 @@ def test_static_output_values_recorded_pre_order():
 
 def test_lowered_signature_matches_graph_signature_info():
     graph = _simple_graph()
-    lowered = etl.lower(graph)
+    lowered = evoxc.lower(graph)
     info = _decoded_info(graph)
 
     assert lowered.signature.input_tree == info["input_tree"]
@@ -273,14 +273,14 @@ def test_lowered_signature_matches_graph_signature_info():
 @pytest.mark.parametrize("structured", [False, True])
 def test_artifact_signature_matches_lowered_signature(structured):
     if structured:
-        graph = etl.trace(
-            lambda xs: {"d": etl.multiply(xs["a"], 2)},
-            {"a": etl.TensorSpec((3,), etl.float32)},
+        graph = evoxc.trace(
+            lambda xs: {"d": evoxc.multiply(xs["a"], 2)},
+            {"a": evoxc.TensorSpec((3,), evoxc.float32)},
         )
     else:
         graph = _simple_graph()
-    lowered = etl.lower(graph)
-    artifact = etl.compile(lowered)
+    lowered = evoxc.lower(graph)
+    artifact = evoxc.compile(lowered)
     assert isinstance(artifact.signature, Signature)
     for field in _SIGNATURE_KEYS:
         assert getattr(artifact.signature, field) == getattr(lowered.signature, field)
@@ -294,8 +294,8 @@ def test_artifact_signature_matches_lowered_signature(structured):
 
 
 def test_lowered_program_save_load_roundtrip(tmp_path):
-    lowered = etl.lower(_simple_graph())
-    path = tmp_path / "lowered_program.etlbin"
+    lowered = evoxc.lower(_simple_graph())
+    path = tmp_path / "lowered_program.evoxcbin"
 
     lowered.save(path)
     assert path.exists()
@@ -316,12 +316,12 @@ def test_lowered_program_save_load_roundtrip(tmp_path):
 
 def test_lowered_program_roundtrip_static_values(tmp_path):
     def fn(x, scale):
-        return etl.multiply(x, scale)
+        return evoxc.multiply(x, scale)
 
-    lowered = etl.lower(
-        etl.trace(fn, etl.TensorSpec((3,), etl.float32), 2.5)
+    lowered = evoxc.lower(
+        evoxc.trace(fn, evoxc.TensorSpec((3,), evoxc.float32), 2.5)
     )
-    path = tmp_path / "lowered_static.etlbin"
+    path = tmp_path / "lowered_static.evoxcbin"
     lowered.save(path)
     loaded = LoweredProgram.load(path)
     assert loaded.signature.static_values == (2.5,)

@@ -1,0 +1,183 @@
+"""evoxc.backends.stablehlo — StableHLO MLIR export utility (v1: export-only).
+
+Produces StableHLO MLIR text from verified EvoXIR so external compilers can
+take over compilation, e.g. `iree-compile model.mlir -o model.vmfb`. This
+module is NOT a `Backend`: it is not registered with the backend registry
+and it never lowers, compiles, or runs anything. The compiler adapters that
+CONSUME this export (`"iree"`, `"xla"`, `"tvm"`) are implemented in
+`../adapters/`.
+
+See `../../CONTEXT.md` (backends contract; "StableHLO exporter — v1 scope"
+is binding) and `../../../CONTEXT.md` (root design principles).
+"""
+
+from __future__ import annotations
+
+from evoxc.ir import Module, verify  # allowed: top-level imports are core/ir only
+
+__all__ = ["export"]
+
+
+def export(graph_or_module, options: dict | None = None) -> str:
+    """Export a graph or module as StableHLO MLIR text.
+
+    Args:
+        graph_or_module: a `trace.Graph` (duck-typed — its `.module`
+            attribute is used; no `evoxc.trace` import is needed here) or an
+            `evoxc.ir.Module` directly.
+        options: optional dict of exporter options. ``rng_bit_generator``
+            accepts a bool (backward compat: ``True`` → both ciphers,
+            ``False``/absent → none) or a collection of random algorithm
+            names — the native ``stablehlo.rng_bit_generator`` emission is
+            used per-algorithm iff the name is in the set (canonical names:
+            ``"threefry2x32"``, ``"philox4x32_10"``; splitmix64 has no
+            native form — always the inline expansion). Algorithms outside
+            the set are expanded as bit-exact inline i32/ui32 elementwise
+            subgraphs, so bare exports always work. The compiler adapters
+            pass their ``Capabilities.rng_bit_generator`` set through here
+            from ``lower()`` (overridable per call via the reserved
+            ``rng_bit_generator`` lower option). ``sort_emission`` selects
+            the argsort emission: ``"pair"`` (default; the two-operand
+            (key, iota) ``stablehlo.sort``), ``"count"`` (the count-based
+            O(n^2) composition with NO sort op — bit-exact vs numpy, used
+            on iree cuda where multi-operand sorts at sorted-axis extent
+            >= 32 cannot be bufferized), or ``"auto"`` (per argsort: count
+            when the sorted-axis extent >= 32, else pair). The iree
+            adapter defaults to ``"auto"`` (see
+            ``CompilerBackend.default_sort_emission``). ``while_init_rewrite``
+            (bool, default True) rewrites all-zero rank>=1 constant while
+            INIT operands into computed zeros (the iree 3.11.0
+            AffinityAnalysis SEGV workaround — see the Writer).
+            ``eigh_algorithm`` selects the ``eigh`` cyclic-Jacobi
+            composition: ``"jacobi"`` (one (p, q) rotation per
+            ``stablehlo.while`` iteration) or ``"jacobi_batched"`` (the
+            default — every mutually disjoint rotation of an odd-even
+            round-robin round per iteration, so a sweep costs ``L`` rounds
+            instead of ``n(n-1)/2`` rotations and the loop is ONE 3-carry
+            while; same accuracy class, measured 4.0x / 29.2x / 74.4x
+            faster at n = 10 / 50 / 100 on iree-llvm-cpu). Values are
+            case-insensitive and whitespace-stripped, ``None``/absent
+            means the default, ``n < 2`` keeps the sequential composition,
+            and any other value raises `core.BackendError` naming the
+            option, the offending value and the accepted forms.
+            ``eigh_early_exit`` (bool, default False) opts INTO the
+            ``eigh`` compositions' convergence-based early
+            exit: the loop additionally carries an i1 ``done`` flag and, at
+            every sweep boundary (inside a nested ``stablehlo.if``), checks
+            the scale-aware relative off-diagonal energy of the current A
+            against a calibrated dtype tolerance (f32 tol 3e-5 — commit
+            09e145d, fires sweep ~4 of 7 on dim-45/50 sample-covariance-
+            like matrices; f64 tol 1e-13 — calibration home
+            ``tests/backends/test_iree_eigh_diag_parity.py``), exiting
+            once converged so converged matrices skip their remaining
+            scheduled sweeps (see the Writer's ``_emit_eigh`` /
+            ``_emit_eigh_sweep_check``). Both ``eigh`` compositions support
+            it; ``False`` (the default) emits the plain composition text
+            with no early-exit machinery. The convergence exit is validated
+            on llvm-cpu ONLY and, for the sequential composition, is
+            known-broken on iree-cuda at invoke (deterministic dealloca
+            ``INVALID_ARGUMENT`` at n=10, SIGSEGV at n=50, under BOTH
+            allocators) — hence the default is OFF; option-on remains
+            available as an llvm-cpu opt-in (the batched composition is
+            unvalidated on cuda). ``dot_precision`` selects the
+            precision hint emitted on every ``stablehlo.dot_general`` op:
+            ``"DEFAULT"`` (also used when the key is absent or ``None``;
+            case-insensitive) emits NO ``precision_config`` attribute —
+            byte-identical to the pre-option output — while ``"HIGH"`` /
+            ``"HIGHEST"`` emit ``precision_config = [#stablehlo<precision
+            <CFG>>, #stablehlo<precision <CFG>>]`` (one entry per operand)
+            on EVERY dot shape (batched / non-batched / broadcast /
+            size-1-squeezed). ``"HIGHEST"`` is the value that disables
+            TF32-class reduced-precision fp32 matmul on XLA (measured on a
+            real ROCm PJRT plugin: max-abs error vs fp64 0.1228 ->
+            0.000203 at n=1024); ``"HIGH"`` does NOT help there. Any other
+            value raises `core.BackendError` naming the option, the
+            offending value, and the accepted forms. ``split_reduction``
+            (bool, default True) selects the TWO-STAGE ("split") reduction
+            emission for reductions whose IREE lowering degrades to one
+            single-threaded workgroup: the reduced extent ``N`` is reshaped
+            into ``(R, C)``, the inner axis is reduced first (a rank >= 1
+            intermediate — ``R`` partials — which IREE parallelizes) and
+            the partials are reduced in a second, tiny stage. Reshaping to
+            keepdims ``(N, 1)`` does NOT help — the intermediate result has
+            to be genuinely small. Measured on an AMD MI300X (iree-base
+            3.11.0, real evox DE step): the rank-0 ``min``/``argmin``/i1
+            guard reduces over 10001 cost 1765 us of a 1858 us step while
+            all of the 10000x100 data-parallel work cost 61 us; the split
+            measures ``min`` 0.7608 -> 0.0957 ms (7.9x, exact 73x137
+            factorization) / 0.1067 ms (7.1x, generic padded path) and
+            ``argmin`` 0.9386 -> 0.1162 ms (8.1x), and ~9x on
+            iree/llvm-cpu too. A reduction is split when ALL of: the option
+            is True; the operand shape is fully STATIC (any
+            ``Dim``/``DimExpr``/``None`` keeps today's emission, no error);
+            the reduced dims are non-empty; the product of the reduced
+            extents is >= ``split_reduction_threshold``; the result has
+            <= 1024 elements (rank-0 or otherwise tiny); and the
+            reduction's exactness class allows it (below). Everything else
+            emits the single-stage ``stablehlo.reduce`` text. ONE MLIR
+            comment line (``// evoxc split reduction: pivot axis {pivot}, {N}
+            -> {R} x {C}``) precedes the stage-1 reduce so export goldens
+            can assert the split unambiguously. **Exactness classes:** the
+            i1 ``any``/``all`` guard shapes included, ``min``/``max`` split
+            BY DEFAULT; ``argmin``/``argmax`` split BY DEFAULT (both stages
+            carry the composite ``(value, index)`` reduce with the SAME
+            comparator region and an index operand ``iota(pivot)*C +
+            iota(pivot+1)`` — the ORIGINAL flat index for real elements,
+            and ``>= N`` for padded slots, so the first-occurrence
+            ``idx LT`` tie-break stays exact vs ``np.argmin``/``np.argmax``);
+            ``sum``/``prod`` over INTEGER/bool dtypes split BY DEFAULT
+            (wraparound integer arithmetic is associative — exact);
+            ``sum``/``prod`` over FLOAT dtypes — and therefore the
+            ``reduce_mean`` sum and ``var`` (a composition over the mean) —
+            do NOT split by default, because splitting reassociates the
+            floating-point accumulation and is therefore not bit-exact vs
+            the single-stage text; they split only when
+            ``split_reduction_non_exact`` is True. ``split_reduction=False``
+            emits the single-stage text BYTE-FOR-BYTE (hard
+            backward-compat requirement). ``split_reduction_threshold``
+            (int >= 2, default 1024) is the ``total_reduced`` gate — it also
+            lets callers force or suppress splitting on small shapes.
+            ``split_reduction_non_exact`` (bool, default False) opts INTO
+            splitting float ``sum``/``prod`` (and hence ``reduce_mean``).
+            A non-bool / non-int / out-of-range value for any of the three
+            raises `core.BackendError` naming the option, the offending
+            value and the accepted forms.
+
+    Returns:
+        The StableHLO MLIR text (a ``str``) — compiler input for external
+        tools, e.g. ``iree-compile model.mlir -o model.vmfb``.
+
+    Behavior (binding):
+        1. Unwrap: if the argument has a ``.module`` attribute
+           (`trace.Graph`), use it; accept `evoxc.ir.Module` directly;
+           otherwise raise ``TypeError``.
+        2. Verify FIRST: call ``module.verify()`` — verification failures
+           surface as `core.VerificationError`; never emit MLIR from
+           invalid IR.
+        3. Emit via ``writer.Writer``: functions in declaration order, ops
+           in block order, symbolic dims as ``?``, constants as
+           ``stablehlo.constant`` dense elements (see ``./writer.py``).
+        4. Unsupported or deferred op ⇒ `core.BackendError` NAMING THE OP,
+           with a message suggesting decomposition or a future adapter.
+           Never silently skip an op.
+        5. Export-only: this module is NOT registered as a Backend — it is
+           intentionally absent from the backend registry and performs no
+           lower/compile/load/run.
+
+    Raises:
+        TypeError: if ``graph_or_module`` is neither Graph-like nor an
+            `evoxc.ir.Module`.
+        core.VerificationError: if the IR fails verification.
+        core.BackendError: if any op is unsupported/deferred in v1 (names
+            the op).
+    """
+    module = getattr(graph_or_module, "module", graph_or_module)
+    if not isinstance(module, Module):
+        raise TypeError(
+            "evoxc.backends.stablehlo.export: expected a trace.Graph or an "
+            f"evoxc.ir.Module, got {type(graph_or_module).__name__}"
+        )
+    verify(module)
+    from .writer import Writer
+
+    return Writer(module, options=options).write()

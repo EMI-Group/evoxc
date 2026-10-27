@@ -1,7 +1,7 @@
-"""TVM adapter contract tests (``etl/backends/adapters/tvm.py``).
+"""TVM adapter contract tests (``evoxc/backends/adapters/tvm.py``).
 
 Contract under test: the shared ``CompilerBackend`` framework
-(``etl/backends/compiler.py``) plus the TVM adapter's REAL
+(``evoxc/backends/compiler.py``) plus the TVM adapter's REAL
 lower/compile/load/run through apache-tvm. One contract, three
 dependencies: this file, ``test_adapter_iree.py`` and
 ``test_adapter_xla.py`` are structurally identical and share the graph
@@ -11,19 +11,19 @@ Pinned here:
 
 * registration + lazy name resolution: ``tvm.register()`` installs the
   singleton ``tvm_backend`` (name ``"tvm"``) and every pipeline entry point
-  accepting a backend name string (``etl.lower`` / ``etl.build`` /
-  ``etl.evaluate``, resolved through ``etl.backends.get``) reaches the same
+  accepting a backend name string (``evoxc.lower`` / ``evoxc.build`` /
+  ``evoxc.evaluate``, resolved through ``evoxc.backends.get``) reaches the same
   instance.
 * numerical parity vs the default numpy backend (matmul+relu+sum and
   reshape/broadcast/transpose) at the cross-compiler fp32 tolerance.
 * symbolic dims iff ``capabilities.dynamic_shapes`` — otherwise an explicit
-  ``etl.BackendError`` NAMING the feature (never a silent fallback).
-* artifact save/load round-trips at pipeline level (``etl.load``) and raw
+  ``evoxc.BackendError`` NAMING the feature (never a silent fallback).
+* artifact save/load round-trips at pipeline level (``evoxc.load``) and raw
   backend level (``backend.load(...).run([flat tensors])``); load-time
-  backend-name mismatch raises ``etl.PersistenceError`` — never silently
+  backend-name mismatch raises ``evoxc.PersistenceError`` — never silently
   recompile.
 * capability rejections (``runtime_call`` / collectives when undeclared)
-  raise ``etl.BackendError`` NAMING the feature.
+  raise ``evoxc.BackendError`` NAMING the feature.
 * the lowered payload is the shared StableHLO contract: ``format ==
   "stablehlo"``, ``format_version == 1``, MLIR text, entry functions.
 
@@ -41,8 +41,8 @@ pytest.importorskip("tvm")
 # never imported). Skip cleanly when tvm is present but jaxlib is not.
 pytest.importorskip("jaxlib")
 
-import etl
-from etl.backends.adapters import tvm
+import evoxc
+from evoxc.backends.adapters import tvm
 
 from tests.backends import _adapter_utils as u
 
@@ -58,7 +58,7 @@ NAME = "tvm"
 def adapter_backend():
     """The registered singleton backend (``tvm_backend``)."""
     tvm.register()
-    backend = etl.backends.get(NAME)
+    backend = evoxc.backends.get(NAME)
     assert backend.name == NAME
     return backend
 
@@ -80,8 +80,8 @@ def adapter_artifact(adapter_backend):
 
 def test_registered_singleton(adapter_backend):
     assert adapter_backend is tvm.tvm_backend
-    assert etl.backends.get(NAME) is tvm.tvm_backend
-    assert isinstance(adapter_backend.capabilities, etl.backends.Capabilities)
+    assert evoxc.backends.get(NAME) is tvm.tvm_backend
+    assert isinstance(adapter_backend.capabilities, evoxc.backends.Capabilities)
 
 
 # ---------------------------------------------------------------------------
@@ -92,23 +92,23 @@ def test_registered_singleton(adapter_backend):
 def test_matmul_relu_sum_parity(adapter_artifact):
     fn, specs = u.matmul_relu_sum()
     a, b = u.matmul_relu_sum_args()
-    exe = etl.load(adapter_artifact)
+    exe = evoxc.load(adapter_artifact)
     u.assert_parity(fn, (a, b), exe)
 
 
 def test_reshape_broadcast_transpose_parity_via_build_name(adapter_backend):
     fn, specs = u.reshape_broadcast_transpose()
     x = u.standard_normal((4, 8))
-    exe = etl.build(fn, *specs, backend=NAME)
+    exe = evoxc.build(fn, *specs, backend=NAME)
     u.assert_parity(fn, (x,), exe)
 
 
 def test_evaluate_with_backend_name(adapter_backend):
     fn, specs = u.matmul_relu_sum()
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)  # default numpy reference
-    actual = etl.evaluate(fn, a, b, backend=NAME)
-    assert isinstance(actual, etl.Tensor)
+    expected = evoxc.evaluate(fn, a, b)  # default numpy reference
+    actual = evoxc.evaluate(fn, a, b, backend=NAME)
+    assert isinstance(actual, evoxc.Tensor)
     assert actual.dtype == expected.dtype
     np.testing.assert_allclose(
         actual.numpy(), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
@@ -122,23 +122,23 @@ def test_evaluate_with_backend_name(adapter_backend):
 
 def test_symbolic_dims(adapter_backend):
     fn, specs = u.symbolic_scale()
-    graph = etl.trace(fn, *specs)
+    graph = evoxc.trace(fn, *specs)
     graph.verify()
     if adapter_backend.capabilities.dynamic_shapes is False:
         # Capability rejection must name the feature — no silent fallback.
-        with pytest.raises(etl.BackendError) as excinfo:
-            etl.lower(graph, backend=NAME)
+        with pytest.raises(evoxc.BackendError) as excinfo:
+            evoxc.lower(graph, backend=NAME)
         assert "dynamic" in str(excinfo.value).lower()
         return
 
-    numpy_exe = etl.build(fn, *specs)  # default numpy reference
-    adapter_exe = etl.build(fn, *specs, backend=NAME)
+    numpy_exe = evoxc.build(fn, *specs)  # default numpy reference
+    adapter_exe = evoxc.build(fn, *specs, backend=NAME)
     for x in (
         np.array([1.0, 2.0, 3.0], dtype=np.float32),
         np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32),
     ):
-        expected = etl.run(numpy_exe, x)
-        actual = etl.run(adapter_exe, x)
+        expected = evoxc.run(numpy_exe, x)
+        actual = evoxc.run(adapter_exe, x)
         assert actual.dtype == expected.dtype
         np.testing.assert_allclose(
             actual.numpy(), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
@@ -148,13 +148,13 @@ def test_symbolic_dims(adapter_backend):
 def test_symbolic_dynamic_reshape_rejected_at_lower(adapter_backend):
     # Same writer regression as the iree file: a softmax-style graph over a
     # symbolic batch contains a dynamic keepdims reshape ((B,) -> (B, 1)).
-    # etl.lower must raise etl's OWN BackendError — never invalid MLIR that
+    # evoxc.lower must raise evoxc's OWN BackendError — never invalid MLIR that
     # dies later with a compiler parse error.
     fn, specs = u.symbolic_softmax()
-    graph = etl.trace(fn, *specs)
+    graph = evoxc.trace(fn, *specs)
     graph.verify()  # negative control: valid IR — rejection is export-time
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.lower(graph, backend=NAME)
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.lower(graph, backend=NAME)
     msg = str(excinfo.value)
     assert "op 'reshape'" in msg
     assert "dynamic" in msg
@@ -166,13 +166,13 @@ def test_symbolic_dynamic_reshape_rejected_at_lower(adapter_backend):
 def test_dynamic_slice_pad_rejected_at_lower(builder, adapter_backend):
     # Writer._reject_dynamic_dims also covers slice/pad (iree 3.11.0 parses
     # dynamic slice/pad MLIR but the runtime ABORTS on it) — the rejection
-    # must surface through the tvm adapter's lower path as etl's own error,
+    # must surface through the tvm adapter's lower path as evoxc's own error,
     # never as a tvm MLIR parse failure.
     fn, specs = builder()
-    graph = etl.trace(fn, *specs)
+    graph = evoxc.trace(fn, *specs)
     graph.verify()  # negative control: valid IR — rejection is export-time
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.lower(graph, backend=NAME)
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.lower(graph, backend=NAME)
     msg = str(excinfo.value)
     assert "op '" in msg
     assert "dynamic" in msg
@@ -185,9 +185,9 @@ def test_dynamic_slice_pad_rejected_at_lower(builder, adapter_backend):
 
 def test_lower_name_resolution_and_payload_contract(adapter_backend):
     fn, specs = u.matmul_relu_sum()
-    graph = etl.trace(fn, *specs)
+    graph = evoxc.trace(fn, *specs)
     graph.verify()
-    lowered = etl.lower(graph, backend=NAME)
+    lowered = evoxc.lower(graph, backend=NAME)
     assert lowered.backend == NAME
     payload = lowered.payload
     assert payload["format"] == "stablehlo"
@@ -210,23 +210,23 @@ def test_lower_name_resolution_and_payload_contract(adapter_backend):
 
 
 def test_artifact_save_load_roundtrip(tmp_path, adapter_backend, adapter_artifact):
-    path = tmp_path / "artifact.etl"
+    path = tmp_path / "artifact.evoxc"
     adapter_artifact.save(path)
-    loaded = etl.backends.CompiledArtifact.load(path)
+    loaded = evoxc.backends.CompiledArtifact.load(path)
     assert loaded.backend == NAME
 
-    # Backend-level reload: raw run over flat etl.Tensor inputs.
+    # Backend-level reload: raw run over flat evoxc.Tensor inputs.
     raw = adapter_backend.load(loaded)
     fn, specs = u.matmul_relu_sum()
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)
-    (out,) = raw.run([etl.tensor(a), etl.tensor(b)])
+    expected = evoxc.evaluate(fn, a, b)
+    (out,) = raw.run([evoxc.tensor(a), evoxc.tensor(b)])
     np.testing.assert_allclose(
         out.numpy(), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
     )
 
     # Pipeline-level reload runs through the structured signature.
-    exe = etl.load(loaded)
+    exe = evoxc.load(loaded)
     u.assert_parity(fn, (a, b), exe)
 
 
@@ -234,19 +234,19 @@ def test_backend_name_mismatch_on_load(adapter_backend, adapter_artifact):
     # An adapter artifact can never be loaded by another backend: "numpy"
     # stands in for any mismatching registered backend (always present,
     # order-independent).
-    with pytest.raises(etl.PersistenceError, match="never silently recompile"):
-        etl.load(adapter_artifact, backend="numpy")
+    with pytest.raises(evoxc.PersistenceError, match="never silently recompile"):
+        evoxc.load(adapter_artifact, backend="numpy")
 
     # The reverse direction: an adapter never loads another backend's
     # artifact.
 
     def fn(x):
-        return etl.add(x, x)
+        return evoxc.add(x, x)
 
-    numpy_artifact = etl.compile(
-        etl.lower(etl.trace(fn, etl.TensorSpec((2, 3), etl.float32)))
+    numpy_artifact = evoxc.compile(
+        evoxc.lower(evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32)))
     )
-    with pytest.raises(etl.PersistenceError):
+    with pytest.raises(evoxc.PersistenceError):
         adapter_backend.load(numpy_artifact)
 
 
@@ -256,10 +256,10 @@ def test_backend_name_mismatch_on_load(adapter_backend, adapter_artifact):
 
 
 def test_executable_attributes(adapter_artifact):
-    exe = etl.load(adapter_artifact)
+    exe = evoxc.load(adapter_artifact)
     assert isinstance(exe.functions, tuple)
     assert "main" in exe.functions
-    assert exe.device is None or exe.device == etl.Device("cpu", 0)
+    assert exe.device is None or exe.device == evoxc.Device("cpu", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +278,6 @@ def test_unsupported_features_rejected_naming_feature(adapter_backend):
 
     for feature, graph in cases:
         graph.verify()  # negative control: valid IR — rejection is capability-only
-        with pytest.raises(etl.BackendError) as excinfo:
+        with pytest.raises(evoxc.BackendError) as excinfo:
             adapter_backend.lower(graph)
         assert feature in str(excinfo.value).lower()

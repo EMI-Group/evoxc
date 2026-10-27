@@ -1,9 +1,9 @@
-"""StableHLO export tests (`etl.backends.stablehlo` — an export-only utility).
+"""StableHLO export tests (`evoxc.backends.stablehlo` — an export-only utility).
 
 The exporter is NOT a registered Backend: it maps verified EvoXIR to
 StableHLO MLIR text for external compilers (e.g. `iree-compile model.mlir`).
-These tests pin the v1 mapping tables (`etl/backends/stablehlo/ops.py`) and
-the emission conventions (`etl/backends/stablehlo/writer.py`): golden
+These tests pin the v1 mapping tables (`evoxc/backends/stablehlo/ops.py`) and
+the emission conventions (`evoxc/backends/stablehlo/writer.py`): golden
 mnemonics, MLIR type formatting, comparison attributes, decompositions,
 program-order emission, determinism, symbolic dims, deferred-op rejection,
 and input-shape validation (Graph vs ir.Module vs TypeError).
@@ -15,11 +15,11 @@ skipped and never partial output.
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 # --- shared fixtures -------------------------------------------------------
 
-SPEC_2X3 = etl.TensorSpec((2, 3), etl.float32)
+SPEC_2X3 = evoxc.TensorSpec((2, 3), evoxc.float32)
 
 #: Structural substrings every export must contain (module shell, entry
 #: function, return terminator).
@@ -28,65 +28,65 @@ SHELL_SUBSTRINGS = ("module {", "func.func @main", "func.return")
 
 def _export(fn, *specs, options=None):
     """Trace ``fn`` over ``specs`` and export the graph as StableHLO MLIR text."""
-    return etl.backends.stablehlo.export(etl.trace(fn, *specs), options=options)
+    return evoxc.backends.stablehlo.export(evoxc.trace(fn, *specs), options=options)
 
 
 def _export_error(fn, *specs):
     """Trace ``fn`` and expect a BackendError from export; return its message."""
-    graph = etl.trace(fn, *specs)
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.backends.stablehlo.export(graph)
+    graph = evoxc.trace(fn, *specs)
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.backends.stablehlo.export(graph)
     return str(excinfo.value)
 
 
 # --- 1. golden mnemonics: one graph per op group ---------------------------
 
 def _fn_add(x):
-    return etl.add(x, x)
+    return evoxc.add(x, x)
 
 
 def _fn_dot(a, b):
-    return etl.dot(a, b)
+    return evoxc.dot(a, b)
 
 
 def _fn_sum(x):
-    return etl.sum(x)
+    return evoxc.sum(x)
 
 
 def _fn_reshape(x):
-    return etl.reshape(x, (3, 2))
+    return evoxc.reshape(x, (3, 2))
 
 
 def _fn_transpose(x):
-    return etl.transpose(x, (1, 0))
+    return evoxc.transpose(x, (1, 0))
 
 
 def _fn_concatenate(a, b):
-    return etl.concatenate([a, b], axis=0)
+    return evoxc.concatenate([a, b], axis=0)
 
 
 def _fn_broadcast(x):
-    return etl.broadcast(x, (5, 2, 3))
+    return evoxc.broadcast(x, (5, 2, 3))
 
 
 def _fn_constant(x):
-    w = etl.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
-    return etl.add(x, etl.constant(w))
+    w = evoxc.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    return evoxc.add(x, evoxc.constant(w))
 
 
 GOLDEN_CASES = [
     ("add", _fn_add, (SPEC_2X3,), "stablehlo.add"),
     ("dot", _fn_dot,
-     (etl.TensorSpec((2, 3), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
+     (evoxc.TensorSpec((2, 3), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)),
      "stablehlo.dot_general"),
     ("reduce", _fn_sum, (SPEC_2X3,), "stablehlo.reduce"),
     ("reshape", _fn_reshape, (SPEC_2X3,), "stablehlo.reshape"),
     ("transpose", _fn_transpose, (SPEC_2X3,), "stablehlo.transpose"),
     ("concatenate", _fn_concatenate,
-     (etl.TensorSpec((2, 3), etl.float32), etl.TensorSpec((1, 3), etl.float32)),
+     (evoxc.TensorSpec((2, 3), evoxc.float32), evoxc.TensorSpec((1, 3), evoxc.float32)),
      "stablehlo.concatenate"),
     ("broadcast", _fn_broadcast, (SPEC_2X3,), "stablehlo.broadcast_in_dim"),
-    ("constant", _fn_constant, (etl.TensorSpec((3,), etl.float32),),
+    ("constant", _fn_constant, (evoxc.TensorSpec((3,), evoxc.float32),),
      "stablehlo.constant"),
 ]
 
@@ -111,13 +111,13 @@ def test_f32_input_renders_as_tensor_2x3xf32():
 
 
 def test_i64_input_renders_as_tensor_2x3xi64():
-    mlir = _export(_fn_add, etl.TensorSpec((2, 3), etl.int64))
+    mlir = _export(_fn_add, evoxc.TensorSpec((2, 3), evoxc.int64))
     assert "tensor<2x3xi64>" in mlir
 
 
 def test_bool_comparison_result_renders_as_i1():
     def f(a, b):
-        return etl.less(a, b)
+        return evoxc.less(a, b)
 
     mlir = _export(f, SPEC_2X3, SPEC_2X3)
     assert "-> tensor<2x3xi1>" in mlir
@@ -126,12 +126,12 @@ def test_bool_comparison_result_renders_as_i1():
 # --- 3. comparison_direction attribute rendering ----------------------------
 
 _COMPARISONS = {
-    "equal": (etl.equal, "EQ"),
-    "not_equal": (etl.not_equal, "NE"),
-    "less": (etl.less, "LT"),
-    "less_equal": (etl.less_equal, "LE"),
-    "greater": (etl.greater, "GT"),
-    "greater_equal": (etl.greater_equal, "GE"),
+    "equal": (evoxc.equal, "EQ"),
+    "not_equal": (evoxc.not_equal, "NE"),
+    "less": (evoxc.less, "LT"),
+    "less_equal": (evoxc.less_equal, "LE"),
+    "greater": (evoxc.greater, "GT"),
+    "greater_equal": (evoxc.greater_equal, "GE"),
 }
 
 
@@ -158,9 +158,9 @@ def test_comparison_direction_attribute(op, direction):
 
 def test_multiop_graph_emits_ops_in_program_order():
     def f(x):
-        a = etl.add(x, x)
-        b = etl.multiply(a, x)
-        return etl.sum(b)
+        a = evoxc.add(x, x)
+        b = evoxc.multiply(a, x)
+        return evoxc.sum(b)
 
     mlir = _export(f, SPEC_2X3)
     i_add = mlir.index("stablehlo.add")
@@ -174,43 +174,43 @@ def test_multiop_graph_emits_ops_in_program_order():
 
 def test_export_is_deterministic():
     def f(x):
-        a = etl.add(x, x)
-        return etl.multiply(a, x)
+        a = evoxc.add(x, x)
+        return evoxc.multiply(a, x)
 
-    graph = etl.trace(f, SPEC_2X3)
+    graph = evoxc.trace(f, SPEC_2X3)
     assert (
-        etl.backends.stablehlo.export(graph)
-        == etl.backends.stablehlo.export(graph)
+        evoxc.backends.stablehlo.export(graph)
+        == evoxc.backends.stablehlo.export(graph)
     )
     # A fresh trace of the same fn over the same specs emits identical text
     # (no caching, no nondeterministic naming/location leakage).
-    fresh = etl.trace(f, SPEC_2X3)
-    assert etl.backends.stablehlo.export(graph) == etl.backends.stablehlo.export(fresh)
+    fresh = evoxc.trace(f, SPEC_2X3)
+    assert evoxc.backends.stablehlo.export(graph) == evoxc.backends.stablehlo.export(fresh)
 
 
 # --- 6. symbolic dims ---------------------------------------------------------
 
 def test_symbolic_dim_renders_as_unknown():
-    mlir = _export(_fn_add, etl.TensorSpec((etl.dim("B"), 3), etl.float32))
+    mlir = _export(_fn_add, evoxc.TensorSpec((evoxc.dim("B"), 3), evoxc.float32))
     assert "tensor<?x3xf32>" in mlir
 
 
 def test_none_dim_renders_as_unknown():
-    mlir = _export(_fn_add, etl.TensorSpec((None, 3), etl.float32))
+    mlir = _export(_fn_add, evoxc.TensorSpec((None, 3), evoxc.float32))
     assert "tensor<?x3xf32>" in mlir
 
 
 # --- 7. deferred ops → BackendError naming the op -----------------------------
 
 def _fn_runtime_call(x):
-    return etl.runtime_call(np.add, x, x, result=etl.TensorSpec((2,), etl.float32))
+    return evoxc.runtime_call(np.add, x, x, result=evoxc.TensorSpec((2,), evoxc.float32))
 
 
 # A bare block: declared, but with NO numpy impl and NO portable decomposition.
-_BARE_BLOCK = etl.block(
+_BARE_BLOCK = evoxc.block(
     "stablehlo_export_bare_block",
-    inputs=[etl.TensorSpec((2,), etl.float32)],
-    outputs=[etl.TensorSpec((2,), etl.float32)],
+    inputs=[evoxc.TensorSpec((2,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((2,), evoxc.float32)],
 )
 
 
@@ -219,52 +219,52 @@ def _fn_block_call(x):
 
 
 def _fn_rank(x):
-    return etl.dist.rank()
+    return evoxc.dist.rank()
 
 
 def _fn_world_size(x):
-    return etl.dist.world_size()
+    return evoxc.dist.world_size()
 
 
 def _fn_erf(x):
-    return etl.erf(x)
+    return evoxc.erf(x)
 
 
 def _fn_gelu(x):
-    return etl.gelu(x)
+    return evoxc.gelu(x)
 
 
 def _fn_tril(x):
-    return etl.tril(x)
+    return evoxc.tril(x)
 
 
 def _fn_triu(x):
-    return etl.triu(x)
+    return evoxc.triu(x)
 
 
 def _fn_cumsum(x):
-    return etl.cumsum(x)
+    return evoxc.cumsum(x)
 
 
 def _fn_solve(a, b):
-    return etl.solve(a, b)
+    return evoxc.solve(a, b)
 
 
 DEFERRED_CASES = [
-    ("runtime_call", _fn_runtime_call, (etl.TensorSpec((2,), etl.float32),),
+    ("runtime_call", _fn_runtime_call, (evoxc.TensorSpec((2,), evoxc.float32),),
      "runtime_call"),
-    ("block_call", _fn_block_call, (etl.TensorSpec((2,), etl.float32),),
+    ("block_call", _fn_block_call, (evoxc.TensorSpec((2,), evoxc.float32),),
      "block_call"),
-    ("rank", _fn_rank, (etl.TensorSpec((2,), etl.float32),), "rank"),
-    ("world_size", _fn_world_size, (etl.TensorSpec((2,), etl.float32),),
+    ("rank", _fn_rank, (evoxc.TensorSpec((2,), evoxc.float32),), "rank"),
+    ("world_size", _fn_world_size, (evoxc.TensorSpec((2,), evoxc.float32),),
      "world_size"),
     ("erf", _fn_erf, (SPEC_2X3,), "erf"),
     ("gelu", _fn_gelu, (SPEC_2X3,), "gelu"),
-    ("tril", _fn_tril, (etl.TensorSpec((3, 3), etl.float32),), "tril"),
-    ("triu", _fn_triu, (etl.TensorSpec((3, 3), etl.float32),), "triu"),
+    ("tril", _fn_tril, (evoxc.TensorSpec((3, 3), evoxc.float32),), "tril"),
+    ("triu", _fn_triu, (evoxc.TensorSpec((3, 3), evoxc.float32),), "triu"),
     ("cumsum", _fn_cumsum, (SPEC_2X3,), "cumsum"),
     ("solve", _fn_solve,
-     (etl.TensorSpec((2, 2), etl.float32), etl.TensorSpec((2, 1), etl.float32)),
+     (evoxc.TensorSpec((2, 2), evoxc.float32), evoxc.TensorSpec((2, 1), evoxc.float32)),
      "solve"),
 ]
 
@@ -282,8 +282,8 @@ def test_deferred_ops_raise_backend_error_naming_the_op(fn, specs, expected_op):
 
 def test_complex_reduction_is_deferred():
     # Complex-number computation beyond cast is deferred; the writer enforces
-    # it on the reduce path (etl/backends/stablehlo/writer.py _emit_reduce).
-    msg = _export_error(_fn_sum, etl.TensorSpec((2, 3), etl.complex64))
+    # it on the reduce path (evoxc/backends/stablehlo/writer.py _emit_reduce).
+    msg = _export_error(_fn_sum, evoxc.TensorSpec((2, 3), evoxc.complex64))
     assert "op 'reduce_sum'" in msg
     assert "complex" in msg
 
@@ -297,7 +297,7 @@ def test_complex_reduction_is_deferred():
 )
 def test_export_rejects_non_graph_inputs(bad_input):
     with pytest.raises(TypeError):
-        etl.backends.stablehlo.export(bad_input)
+        evoxc.backends.stablehlo.export(bad_input)
 
 
 # --- 9. control flow -----------------------------------------------------------
@@ -305,14 +305,14 @@ def test_export_rejects_non_graph_inputs(bad_input):
 def test_cond_exports_stablehlo_if():
     def f(x):
         def true_fn(y):
-            return etl.add(y, 1.0)
+            return evoxc.add(y, 1.0)
 
         def false_fn(y):
-            return etl.subtract(y, 1.0)
+            return evoxc.subtract(y, 1.0)
 
-        return etl.cond(etl.less(x, 0.5), true_fn, false_fn, x)
+        return evoxc.cond(evoxc.less(x, 0.5), true_fn, false_fn, x)
 
-    mlir = _export(f, etl.TensorSpec((), etl.float32))
+    mlir = _export(f, evoxc.TensorSpec((), evoxc.float32))
     assert "stablehlo.if" in mlir
     assert "func.return" in mlir
 
@@ -320,14 +320,14 @@ def test_cond_exports_stablehlo_if():
 def test_while_loop_exports_stablehlo_while():
     def f(x):
         def cond_fn(state):
-            return etl.less(state, 10.0)
+            return evoxc.less(state, 10.0)
 
         def body_fn(state):
-            return etl.add(state, 1.0)
+            return evoxc.add(state, 1.0)
 
-        return etl.while_loop(cond_fn, body_fn, x)
+        return evoxc.while_loop(cond_fn, body_fn, x)
 
-    mlir = _export(f, etl.TensorSpec((), etl.float32))
+    mlir = _export(f, evoxc.TensorSpec((), evoxc.float32))
     assert "stablehlo.while" in mlir
     assert "func.return" in mlir
 
@@ -335,34 +335,34 @@ def test_while_loop_exports_stablehlo_while():
 # --- 10. constants and decompositions -------------------------------------------
 
 def test_constant_embeds_dense_elements():
-    mlir = _export(_fn_constant, etl.TensorSpec((3,), etl.float32))
+    mlir = _export(_fn_constant, evoxc.TensorSpec((3,), evoxc.float32))
     assert "stablehlo.constant" in mlir
     assert "dense<[1.0, 2.0, 3.0]>" in mlir
 
 
 def test_square_decomposes_to_multiply():
     def f(x):
-        return etl.square(x)
+        return evoxc.square(x)
 
-    mlir = _export(f, etl.TensorSpec((2,), etl.float32))
+    mlir = _export(f, evoxc.TensorSpec((2,), evoxc.float32))
     assert "stablehlo.multiply" in mlir
     assert "stablehlo.square" not in mlir
 
 
 def test_relu_decomposes_to_maximum():
     def f(x):
-        return etl.relu(x)
+        return evoxc.relu(x)
 
-    mlir = _export(f, etl.TensorSpec((2,), etl.float32))
+    mlir = _export(f, evoxc.TensorSpec((2,), evoxc.float32))
     assert "stablehlo.maximum" in mlir
     assert "stablehlo.relu" not in mlir
 
 
 def test_stop_gradient_passes_operand_through():
     def f(x):
-        return etl.stop_gradient(x)
+        return evoxc.stop_gradient(x)
 
-    mlir = _export(f, etl.TensorSpec((2,), etl.float32))
+    mlir = _export(f, evoxc.TensorSpec((2,), evoxc.float32))
     assert "stablehlo.stop" not in mlir
     # The function body is just the passthrough return — no op is emitted.
     assert "func.return %arg0" in mlir
@@ -370,7 +370,7 @@ def test_stop_gradient_passes_operand_through():
 
 def test_reduce_mean_decomposes_to_reduce_then_divide():
     def f(x):
-        return etl.mean(x)
+        return evoxc.mean(x)
 
     mlir = _export(f, SPEC_2X3)
     assert "stablehlo.reduce" in mlir
@@ -381,31 +381,31 @@ def test_reduce_mean_decomposes_to_reduce_then_divide():
 
 def test_export_accepts_module_directly():
     def f(x):
-        a = etl.add(x, x)
-        return etl.multiply(a, x)
+        a = evoxc.add(x, x)
+        return evoxc.multiply(a, x)
 
-    graph = etl.trace(f, SPEC_2X3)
+    graph = evoxc.trace(f, SPEC_2X3)
     assert (
-        etl.backends.stablehlo.export(graph.module)
-        == etl.backends.stablehlo.export(graph)
+        evoxc.backends.stablehlo.export(graph.module)
+        == evoxc.backends.stablehlo.export(graph)
     )
 
 
 # --- collectives (direct 1:1 mnemonics) -------------------------------------------
 
 COLLECTIVE_CASES = [
-    ("all_reduce", lambda x: etl.dist.all_reduce(x, op="sum"),
+    ("all_reduce", lambda x: evoxc.dist.all_reduce(x, op="sum"),
      "stablehlo.all_reduce"),
-    ("all_gather", lambda x: etl.dist.all_gather(x, axis=0),
+    ("all_gather", lambda x: evoxc.dist.all_gather(x, axis=0),
      "stablehlo.all_gather"),
-    ("reduce_scatter", lambda x: etl.dist.reduce_scatter(x, op="sum", axis=0),
+    ("reduce_scatter", lambda x: evoxc.dist.reduce_scatter(x, op="sum", axis=0),
      "stablehlo.reduce_scatter"),
-    ("all_to_all", lambda x: etl.dist.all_to_all(x, split_axis=0, concat_axis=0),
+    ("all_to_all", lambda x: evoxc.dist.all_to_all(x, split_axis=0, concat_axis=0),
      "stablehlo.all_to_all"),
-    ("dist_broadcast", lambda x: etl.dist.broadcast(x, src_rank=0),
+    ("dist_broadcast", lambda x: evoxc.dist.broadcast(x, src_rank=0),
      "stablehlo.collective_broadcast"),
     ("collective_permute",
-     lambda x: etl.dist.collective_permute(x, source_target_pairs=((0, 1),)),
+     lambda x: evoxc.dist.collective_permute(x, source_target_pairs=((0, 1),)),
      "stablehlo.collective_permute"),
 ]
 
@@ -416,13 +416,13 @@ COLLECTIVE_CASES = [
     ids=[case_id for case_id, _, _ in COLLECTIVE_CASES],
 )
 def test_collectives_export_direct_mnemonics(fn, mnemonic):
-    mlir = _export(fn, etl.TensorSpec((2,), etl.float32))
+    mlir = _export(fn, evoxc.TensorSpec((2,), evoxc.float32))
     assert mnemonic in mlir
 
 
 # --- 12. dynamic dims → BackendError at export time ----------------------------
 
-# `Writer._reject_dynamic_dims` (etl/backends/stablehlo/writer.py) keeps
+# `Writer._reject_dynamic_dims` (evoxc/backends/stablehlo/writer.py) keeps
 # invalid MLIR away from the compilers: reshape/conv/slice/pad with any
 # symbolic dim, the keepdims reshapes inside the reduce emitters, and
 # reduce_mean over a dynamic REDUCED dim all fail at export/lower time with a
@@ -431,37 +431,37 @@ def test_collectives_export_direct_mnemonics(fn, mnemonic):
 # EMPIRICALLY verified through iree 3.11.0 to parse but ABORT at runtime:
 # "hal.fence.await" failure).
 
-_DYN = etl.dim("B")
+_DYN = evoxc.dim("B")
 
 DYNAMIC_DIM_REJECT_CASES = [
     ("reshape_operand",
-     lambda x: etl.reshape(x, (3, 2)),
-     (etl.TensorSpec((_DYN, 6), etl.float32),),
+     lambda x: evoxc.reshape(x, (3, 2)),
+     (evoxc.TensorSpec((_DYN, 6), evoxc.float32),),
      "reshape", "operand shape has dynamic dims"),
     ("reshape_result",
-     lambda x: etl.reshape(x, (_DYN, 3, 2)),
-     (etl.TensorSpec((4, 6), etl.float32),),
+     lambda x: evoxc.reshape(x, (_DYN, 3, 2)),
+     (evoxc.TensorSpec((4, 6), evoxc.float32),),
      "reshape", "result shape has dynamic dims"),
     ("conv",
-     lambda x, w: etl.conv(x, w),
-     (etl.TensorSpec((_DYN, 3, 8, 8), etl.float32),
-      etl.TensorSpec((4, 3, 3, 3), etl.float32)),
+     lambda x, w: evoxc.conv(x, w),
+     (evoxc.TensorSpec((_DYN, 3, 8, 8), evoxc.float32),
+      evoxc.TensorSpec((4, 3, 3, 3), evoxc.float32)),
      "conv", "operand shape has dynamic dims"),
     ("slice",
-     lambda x: etl.slice(x, (0, 0), (2, 4)),
-     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     lambda x: evoxc.slice(x, (0, 0), (2, 4)),
+     (evoxc.TensorSpec((_DYN, 4), evoxc.float32),),
      "slice", "operand shape has dynamic dims"),
     ("pad",
-     lambda x: etl.pad(x, [[0, 0], [1, 1]]),
-     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     lambda x: evoxc.pad(x, [[0, 0], [1, 1]]),
+     (evoxc.TensorSpec((_DYN, 4), evoxc.float32),),
      "pad", "operand shape has dynamic dims"),
     ("reduce_mean_dynamic_reduced_dim",
-     lambda x: etl.mean(x, axes=0),
-     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     lambda x: evoxc.mean(x, axes=0),
+     (evoxc.TensorSpec((_DYN, 4), evoxc.float32),),
      "reduce_mean", "reduces over dynamic dims"),
     ("keepdims_reduce_reshape",
-     lambda x: etl.sum(x, axes=1, keepdims=True),
-     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     lambda x: evoxc.sum(x, axes=1, keepdims=True),
+     (evoxc.TensorSpec((_DYN, 4), evoxc.float32),),
      "reshape", "keepdims reshape operand has dynamic dims"),
 ]
 
@@ -484,8 +484,8 @@ def test_dynamic_dims_rejection_message_format():
     # between the op name and the shape description, so only the trailing
     # part (which follows the location) is pinned verbatim.
     msg = _export_error(
-        lambda x: etl.reshape(x, (3, 2)),
-        etl.TensorSpec((_DYN, 6), etl.float32),
+        lambda x: evoxc.reshape(x, (3, 2)),
+        evoxc.TensorSpec((_DYN, 6), evoxc.float32),
     )
     assert msg.endswith(
         "operand shape has dynamic dims (Dim('B'), 6) "
@@ -499,8 +499,8 @@ def test_reduce_mean_dynamic_reduced_dim_message_format():
     # reduce_mean's rejection is its own message: dynamic REDUCED dims make
     # the element count uncomputable statically.
     msg = _export_error(
-        lambda x: etl.mean(x, axes=0),
-        etl.TensorSpec((_DYN, 4), etl.float32),
+        lambda x: evoxc.mean(x, axes=0),
+        evoxc.TensorSpec((_DYN, 4), evoxc.float32),
     )
     assert msg.endswith(
         "reduces over dynamic dims (Dim('B'),) of shape (Dim('B'), 4) — "
@@ -515,8 +515,8 @@ def test_reduce_mean_dynamic_non_reduced_dim_still_exports():
     # working — the divide's scalar count broadcasts to the dynamic reduced
     # shape via dynamic_broadcast_in_dim + get_dimension_size.
     mlir = _export(
-        lambda x: etl.mean(x, axes=1),
-        etl.TensorSpec((_DYN, 4), etl.float32),
+        lambda x: evoxc.mean(x, axes=1),
+        evoxc.TensorSpec((_DYN, 4), evoxc.float32),
     )
     assert "-> tensor<?xf32>" in mlir
     assert "stablehlo.reduce" in mlir
@@ -536,7 +536,7 @@ def test_reduce_mean_dynamic_non_reduced_dim_still_exports():
 
 
 def _fn_dot_batched(a, b):
-    return etl.dot(a, b)
+    return evoxc.dot(a, b)
 
 
 def test_dot_rank3_rank2_non_batched():
@@ -544,8 +544,8 @@ def test_dot_rank3_rank2_non_batched():
     # a's batch dims — no broadcast materialization.
     mlir = _export(
         _fn_dot_batched,
-        etl.TensorSpec((4, 512, 768), etl.float32),
-        etl.TensorSpec((768, 2304), etl.float32),
+        evoxc.TensorSpec((4, 512, 768), evoxc.float32),
+        evoxc.TensorSpec((768, 2304), evoxc.float32),
     )
     assert "-> tensor<4x512x2304xf32>" in mlir
     assert (
@@ -562,8 +562,8 @@ def test_dot_rhs_higher_rank_lhs_broadcast():
     # (4,512,768), then a matched batched dot_general runs.
     mlir = _export(
         _fn_dot_batched,
-        etl.TensorSpec((512, 768), etl.float32),
-        etl.TensorSpec((4, 768, 2304), etl.float32),
+        evoxc.TensorSpec((512, 768), evoxc.float32),
+        evoxc.TensorSpec((4, 768, 2304), evoxc.float32),
     )
     assert "-> tensor<4x512x2304xf32>" in mlir
     assert "stablehlo.broadcast_in_dim" in mlir
@@ -579,8 +579,8 @@ def test_dot_size1_rhs_batch_squeezed():
     # non-batched dot_general, no broadcast materialized.
     mlir = _export(
         _fn_dot_batched,
-        etl.TensorSpec((4, 512, 768), etl.float32),
-        etl.TensorSpec((1, 768, 2304), etl.float32),
+        evoxc.TensorSpec((4, 512, 768), evoxc.float32),
+        evoxc.TensorSpec((1, 768, 2304), evoxc.float32),
     )
     assert "-> tensor<4x512x2304xf32>" in mlir
     assert "stablehlo.reshape" in mlir
@@ -602,8 +602,8 @@ def test_dot_size1_rhs_batch_dynamic_squeeze_skipped():
     # ("failed to legalize operation 'stablehlo.dynamic_reshape'").
     mlir = _export(
         _fn_dot_batched,
-        etl.TensorSpec((_DYN, 16, 8), etl.float32),
-        etl.TensorSpec((1, 8, 4), etl.float32),
+        evoxc.TensorSpec((_DYN, 16, 8), evoxc.float32),
+        evoxc.TensorSpec((1, 8, 4), evoxc.float32),
     )
     assert "-> tensor<?x16x4xf32>" in mlir
     assert "stablehlo.dynamic_broadcast_in_dim" in mlir
@@ -624,8 +624,8 @@ def test_dot_matched_multi_batch_direct():
     # for already-correct cases.
     mlir = _export(
         _fn_dot_batched,
-        etl.TensorSpec((4, 8, 512, 768), etl.float32),
-        etl.TensorSpec((4, 8, 768, 2304), etl.float32),
+        evoxc.TensorSpec((4, 8, 512, 768), evoxc.float32),
+        evoxc.TensorSpec((4, 8, 768, 2304), evoxc.float32),
     )
     assert "-> tensor<4x8x512x2304xf32>" in mlir
     assert (
@@ -644,8 +644,8 @@ def test_dot_symbolic_batch_dynamic_broadcast():
     # concrete B.
     mlir = _export(
         _fn_dot_batched,
-        etl.TensorSpec((_DYN, 512, 768), etl.float32),
-        etl.TensorSpec((768, 2304), etl.float32),
+        evoxc.TensorSpec((_DYN, 512, 768), evoxc.float32),
+        evoxc.TensorSpec((768, 2304), evoxc.float32),
     )
     assert "-> tensor<?x512x2304xf32>" in mlir
     assert "stablehlo.get_dimension_size" in mlir
@@ -663,8 +663,8 @@ def test_dot_unprovable_symbolic_merge_rejected():
     # the op and "dynamic", never invalid MLIR.
     msg = _export_error(
         _fn_dot_batched,
-        etl.TensorSpec((4, 512, 768), etl.float32),
-        etl.TensorSpec((_DYN, 768, 2304), etl.float32),
+        evoxc.TensorSpec((4, 512, 768), evoxc.float32),
+        evoxc.TensorSpec((_DYN, 768, 2304), evoxc.float32),
     )
     assert "op 'dot'" in msg
     assert "dynamic batch broadcast" in msg
@@ -674,7 +674,7 @@ def test_dot_unprovable_symbolic_merge_rejected():
 
 # --- 14. mixed-dtype operand equalization (regression for 6aec043) ----------
 
-# etl IR allows mixed-dtype operands on binary elementwise ops / compare /
+# evoxc IR allows mixed-dtype operands on binary elementwise ops / compare /
 # select (the result dtype follows numpy promotion — e.g. a Python scalar
 # like ``3`` becomes a scalar i64 weak constant at trace time). StableHLO
 # requires every non-predicate operand AND the result to share one element
@@ -698,9 +698,9 @@ def test_elementwise_mixed_dtype_operand_converted_to_result_dtype():
     # i64 constant, so the equalization convert is i32 -> i64 — the
     # promoted result dtype, distinct from the cast's convert.
     def f(x):
-        return etl.bitwise_and(etl.cast(x, etl.int32), 3)
+        return evoxc.bitwise_and(evoxc.cast(x, evoxc.int32), 3)
 
-    mlir = _export(f, etl.TensorSpec((8, 16), etl.float32))
+    mlir = _export(f, evoxc.TensorSpec((8, 16), evoxc.float32))
     assert "(tensor<8x16xf32>) -> tensor<8x16xi32>" in mlir  # the cast
     assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir  # equalization
     and_line = _line_containing(mlir, "stablehlo.and")
@@ -713,9 +713,9 @@ def test_elementwise_mixed_dtype_only_mismatched_operand_converted():
     # dtype. Pre-fix this graph emitted mixed-dtype stablehlo.add operands
     # that iree rejected at compile.
     def f(x):
-        return etl.add(x, 3)
+        return evoxc.add(x, 3)
 
-    mlir = _export(f, etl.TensorSpec((8, 16), etl.int32))
+    mlir = _export(f, evoxc.TensorSpec((8, 16), evoxc.int32))
     assert mlir.count("stablehlo.convert") == 1
     assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir
     add_line = _line_containing(mlir, "stablehlo.add")
@@ -727,9 +727,9 @@ def test_compare_mixed_dtype_operands_promoted_numeric_dtype():
     # NUMERIC dtype i64 (np.result_type(i32, i64)) — never to the i1
     # result type — so both operand slots render as tensor<8x16xi64>.
     def f(x):
-        return etl.equal(x, 3)
+        return evoxc.equal(x, 3)
 
-    mlir = _export(f, etl.TensorSpec((8, 16), etl.int32))
+    mlir = _export(f, evoxc.TensorSpec((8, 16), evoxc.int32))
     assert "(tensor<8x16xi64>, tensor<8x16xi64>) -> tensor<8x16xi1>" in mlir
     assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir
 
@@ -738,13 +738,13 @@ def test_select_mixed_dtype_branches_converted_pred_stays_i1():
     # select(p, a, b) over bool/i32/i64: on_true is converted to the
     # promoted result dtype i64 while the predicate keeps its i1 type.
     def f(p, a, b):
-        return etl.select(p, a, b)
+        return evoxc.select(p, a, b)
 
     mlir = _export(
         f,
-        etl.TensorSpec((8, 16), etl.bool_),
-        etl.TensorSpec((8, 16), etl.int32),
-        etl.TensorSpec((8, 16), etl.int64),
+        evoxc.TensorSpec((8, 16), evoxc.bool_),
+        evoxc.TensorSpec((8, 16), evoxc.int32),
+        evoxc.TensorSpec((8, 16), evoxc.int64),
     )
     assert (
         "(tensor<8x16xi1>, tensor<8x16xi64>, tensor<8x16xi64>) -> tensor<8x16xi64>"
@@ -754,14 +754,14 @@ def test_select_mixed_dtype_branches_converted_pred_stays_i1():
 
 
 NO_CONVERT_CASES = [
-    ("add_f32", lambda x: etl.add(x, x),
-     (etl.TensorSpec((8, 16), etl.float32),)),
-    ("equal_i64_i64", lambda a, b: etl.equal(a, b),
-     (etl.TensorSpec((8, 16), etl.int64), etl.TensorSpec((8, 16), etl.int64))),
-    ("select_bool_i32_i32", lambda p, a, b: etl.select(p, a, b),
-     (etl.TensorSpec((8, 16), etl.bool_),
-      etl.TensorSpec((8, 16), etl.int32),
-      etl.TensorSpec((8, 16), etl.int32))),
+    ("add_f32", lambda x: evoxc.add(x, x),
+     (evoxc.TensorSpec((8, 16), evoxc.float32),)),
+    ("equal_i64_i64", lambda a, b: evoxc.equal(a, b),
+     (evoxc.TensorSpec((8, 16), evoxc.int64), evoxc.TensorSpec((8, 16), evoxc.int64))),
+    ("select_bool_i32_i32", lambda p, a, b: evoxc.select(p, a, b),
+     (evoxc.TensorSpec((8, 16), evoxc.bool_),
+      evoxc.TensorSpec((8, 16), evoxc.int32),
+      evoxc.TensorSpec((8, 16), evoxc.int32))),
 ]
 
 
@@ -812,18 +812,18 @@ def test_matching_dtype_graphs_emit_no_convert(fn, specs):
 
 
 def _fn_eigh(x):
-    w, v = etl.eigh(x)
+    w, v = evoxc.eigh(x)
     return w, v
 
 
-def _eigh_mlir(n, dtype=etl.float32, **options):
+def _eigh_mlir(n, dtype=evoxc.float32, **options):
     """Export ``eigh`` of an ``(n, n)`` tensor; kwargs are exporter options."""
-    return _export(_fn_eigh, etl.TensorSpec((n, n), dtype),
+    return _export(_fn_eigh, evoxc.TensorSpec((n, n), dtype),
                    options=options or None)
 
 
 def test_eigh_exports_jacobi_composition():
-    mlir = _export(_fn_eigh, etl.TensorSpec((3, 3), etl.float32))
+    mlir = _export(_fn_eigh, evoxc.TensorSpec((3, 3), evoxc.float32))
     # The sweeps run inside ONE while loop (carrying (a, v, p, q, k)) with
     # dynamic (p, q) indexing via gathers; the ascending-order reorder is a
     # stable pair-sort of the final diagonal and the V column reorder is a
@@ -841,7 +841,7 @@ def test_eigh_exports_jacobi_composition():
 def test_eigh_int_input_upcasts_to_f64():
     # numpy linalg upcast rule: int/bool → float64 (mirrors the numpy
     # kernel). The convert is emitted up front; the composition runs in f64.
-    mlir = _export(_fn_eigh, etl.TensorSpec((3, 3), etl.int32))
+    mlir = _export(_fn_eigh, evoxc.TensorSpec((3, 3), evoxc.int32))
     assert "stablehlo.convert" in mlir
     assert "-> (tensor<3xf64>, tensor<3x3xf64>)" in mlir
 
@@ -849,8 +849,8 @@ def test_eigh_int_input_upcasts_to_f64():
 @pytest.mark.parametrize(
     "spec,fragment",
     [
-        (etl.TensorSpec((3, 3), etl.float16), "float16"),
-        (etl.TensorSpec((3, 3), etl.complex64), "complex"),
+        (evoxc.TensorSpec((3, 3), evoxc.float16), "float16"),
+        (evoxc.TensorSpec((3, 3), evoxc.complex64), "complex"),
     ],
     ids=["f16", "complex"],
 )
@@ -862,7 +862,7 @@ def test_eigh_unsupported_dtype_deferred_naming_op(spec, fragment):
 
 
 def test_eigh_dynamic_dims_deferred_naming_op():
-    msg = _export_error(_fn_eigh, etl.TensorSpec((_DYN, 3, 3), etl.float32))
+    msg = _export_error(_fn_eigh, evoxc.TensorSpec((_DYN, 3, 3), evoxc.float32))
     assert "op 'eigh'" in msg
     assert "dynamic" in msg
     assert "not supported" in msg
@@ -880,7 +880,7 @@ def test_eigh_early_exit_option_emits_sweep_check():
     # on purpose: the five-carry signature below is composition-specific
     # (the default "jacobi_batched" carries (a, v, k) — ONE, see
     # `test_eigh_batched_early_exit_golden`).
-    mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32),
+    mlir = _export(_fn_eigh, evoxc.TensorSpec((10, 10), evoxc.float32),
                    options={"eigh_early_exit": True,
                             "eigh_algorithm": "jacobi"})
     assert "dense<[[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]," in mlir
@@ -901,7 +901,7 @@ def test_eigh_early_exit_default_emits_pre_option_text():
     # composition explicitly (the DEFAULT "jacobi_batched" is pinned by
     # `test_eigh_batched_default_composition_golden`), so the loop total is
     # the sequential `sweeps * n(n-1)/2` = 5 x 45 = 225.
-    mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32),
+    mlir = _export(_fn_eigh, evoxc.TensorSpec((10, 10), evoxc.float32),
                    options={"eigh_algorithm": "jacobi"})
     assert "stablehlo.if" not in mlir
     assert "stablehlo.remainder" not in mlir
@@ -1040,16 +1040,16 @@ def test_eigh_algorithm_option_default_and_spelling():
 def test_eigh_algorithm_option_invalid_value_rejected():
     # An unknown spelling fails loudly at export with the canonical message
     # (never a silent fallback to a default composition).
-    graph = etl.trace(_fn_eigh, etl.TensorSpec((10, 10), etl.float32))
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.backends.stablehlo.export(graph, options={"eigh_algorithm": "nope"})
+    graph = evoxc.trace(_fn_eigh, evoxc.TensorSpec((10, 10), evoxc.float32))
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.backends.stablehlo.export(graph, options={"eigh_algorithm": "nope"})
     assert str(excinfo.value) == (
         "stablehlo export: invalid eigh_algorithm option 'nope' "
         "(expected one of jacobi, jacobi_batched)"
     )
     # Non-string values are rejected by the same normalizer.
-    with pytest.raises(etl.BackendError, match="invalid eigh_algorithm option"):
-        etl.backends.stablehlo.export(graph, options={"eigh_algorithm": 3})
+    with pytest.raises(evoxc.BackendError, match="invalid eigh_algorithm option"):
+        evoxc.backends.stablehlo.export(graph, options={"eigh_algorithm": 3})
 
 
 def test_eigh_algorithm_option_invalid_value_rejected_at_lower():
@@ -1059,9 +1059,9 @@ def test_eigh_algorithm_option_invalid_value_rejected_at_lower():
     # adapter (gated; the export-path pins above always run).
     pytest.importorskip("iree.compiler")
     pytest.importorskip("iree.runtime")
-    graph = etl.trace(_fn_eigh, etl.TensorSpec((10, 10), etl.float32))
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.lower(graph, backend="iree", eigh_algorithm="nope")
+    graph = evoxc.trace(_fn_eigh, evoxc.TensorSpec((10, 10), evoxc.float32))
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.lower(graph, backend="iree", eigh_algorithm="nope")
     assert str(excinfo.value) == (
         "stablehlo export: invalid eigh_algorithm option 'nope' "
         "(expected one of jacobi, jacobi_batched)"
@@ -1107,7 +1107,7 @@ EIGH_BATCHED_SCHEDULE_CASES = [
     ids=[f"n={case[0]}" for case in EIGH_BATCHED_SCHEDULE_CASES],
 )
 def test_eigh_batched_schedule_table(n, rounds, slots, fixed):
-    from etl.backends.stablehlo.eigh_batched import eigh_batched_schedule
+    from evoxc.backends.stablehlo.eigh_batched import eigh_batched_schedule
 
     assert eigh_batched_schedule(n) == (rounds, slots, fixed)
     # Parity rules: even n rotates n-1 rounds around the fixed vertex n-1
@@ -1135,17 +1135,17 @@ def test_eigh_batched_schedule_table(n, rounds, slots, fixed):
 
 
 def test_eigh_batched_schedule_rejects_n_lt_2():
-    from etl.backends.stablehlo.eigh_batched import eigh_batched_schedule
+    from evoxc.backends.stablehlo.eigh_batched import eigh_batched_schedule
 
     for n in (1, 0, -3):
-        with pytest.raises(etl.BackendError, match="n >= 2"):
+        with pytest.raises(evoxc.BackendError, match="n >= 2"):
             eigh_batched_schedule(n)
 
 
 def test_diag_rank1_exports_iota_select_composition():
     # rank-1 (n,) → the (n, n) diagonal matrix: iota-EQ mask + select over
     # a broadcast of the input — no gather.
-    mlir = _export(lambda x: etl.diag(x), etl.TensorSpec((3,), etl.float32))
+    mlir = _export(lambda x: evoxc.diag(x), evoxc.TensorSpec((3,), evoxc.float32))
     assert "stablehlo.select" in mlir
     assert "stablehlo.iota" in mlir
     assert "stablehlo.gather" not in mlir
@@ -1155,7 +1155,7 @@ def test_diag_rank1_exports_iota_select_composition():
 def test_diag_rank2_exports_gather_composition():
     # rank-2 (m, n) → the main diagonal (min(m, n),): flatten reshape +
     # constant-index gather — no select.
-    mlir = _export(lambda x: etl.diag(x), etl.TensorSpec((2, 3), etl.float32))
+    mlir = _export(lambda x: evoxc.diag(x), evoxc.TensorSpec((2, 3), evoxc.float32))
     assert "stablehlo.gather" in mlir
     assert "stablehlo.reshape" in mlir
     assert "stablehlo.select" not in mlir
@@ -1165,14 +1165,14 @@ def test_diag_rank2_exports_gather_composition():
 def test_diag_complex_dtype_preserved():
     # diag preserves the input dtype incl. complex in both directions (the
     # mask compares iotas, never data) — no convert is inserted.
-    mlir = _export(lambda x: etl.diag(x), etl.TensorSpec((3,), etl.complex64))
+    mlir = _export(lambda x: evoxc.diag(x), evoxc.TensorSpec((3,), evoxc.complex64))
     assert "stablehlo.select" in mlir
     assert "stablehlo.convert" not in mlir
     assert "-> tensor<3x3xcomplex<f32>>" in mlir
 
 
 def test_diag_dynamic_dims_deferred_naming_op():
-    msg = _export_error(lambda x: etl.diag(x), etl.TensorSpec((_DYN,), etl.float32))
+    msg = _export_error(lambda x: evoxc.diag(x), evoxc.TensorSpec((_DYN,), evoxc.float32))
     assert "op 'diag'" in msg
     assert "dynamic" in msg
     assert "not supported" in msg
@@ -1198,23 +1198,23 @@ def test_diag_dynamic_dims_deferred_naming_op():
 # native PHILOX emission is export-only — iree's legalization of PHILOX
 # fails, so that graph is never run on a compiler backend.
 
-from etl.backends.stablehlo import random_export as _random_export
+from evoxc.backends.stablehlo import random_export as _random_export
 
-_THREEFRY_KEY_SPEC = etl.TensorSpec((2,), etl.int32)
-_PHILOX_KEY_SPEC = etl.TensorSpec((4,), etl.int32)
-_SPLITMIX_KEY_SPEC = etl.TensorSpec((), etl.int64)
+_THREEFRY_KEY_SPEC = evoxc.TensorSpec((2,), evoxc.int32)
+_PHILOX_KEY_SPEC = evoxc.TensorSpec((4,), evoxc.int32)
+_SPLITMIX_KEY_SPEC = evoxc.TensorSpec((), evoxc.int64)
 
 
 def _fn_uniform_threefry(k):
-    return etl.random.uniform(k, (4,))
+    return evoxc.random.uniform(k, (4,))
 
 
 def _fn_uniform_philox(k):
-    return etl.random.uniform(k, (4,))
+    return evoxc.random.uniform(k, (4,))
 
 
 def _fn_uniform_splitmix(k):
-    return etl.random.uniform(k, (4,))
+    return evoxc.random.uniform(k, (4,))
 
 
 def _signed_i32(word):
@@ -1293,8 +1293,8 @@ def test_philox_native_rng_bit_generator_golden():
 
 def _fn_uniform_mixed(tk, pk):
     """Threefry + philox uniform in ONE graph (two key inputs)."""
-    a = etl.random.uniform(tk, (4,))
-    b = etl.random.uniform(pk, (4,))
+    a = evoxc.random.uniform(tk, (4,))
+    b = evoxc.random.uniform(pk, (4,))
     return a, b
 
 
@@ -1372,10 +1372,10 @@ def test_inline_random_exports_are_deterministic():
         (_fn_uniform_threefry, _THREEFRY_KEY_SPEC),
         (_fn_uniform_philox, _PHILOX_KEY_SPEC),
     ]:
-        graph = etl.trace(fn, spec)
+        graph = evoxc.trace(fn, spec)
         assert (
-            etl.backends.stablehlo.export(graph)
-            == etl.backends.stablehlo.export(graph)
+            evoxc.backends.stablehlo.export(graph)
+            == evoxc.backends.stablehlo.export(graph)
         )
 
 
@@ -1442,14 +1442,14 @@ def test_random_multinomial_deferred_for_all_algorithms(key_spec, options):
     # tests/ops/test_random.py; this covers the new key layouts AND the
     # native-emission option, which must not silently enable it).
     def f(key):
-        probs = etl.constant(
-            etl.tensor(np.array([0.25, 0.25, 0.5], dtype=np.float32))
+        probs = evoxc.constant(
+            evoxc.tensor(np.array([0.25, 0.25, 0.5], dtype=np.float32))
         )
-        return etl.random.multinomial(key, probs, 5)
+        return evoxc.random.multinomial(key, probs, 5)
 
-    graph = etl.trace(f, key_spec)
-    with pytest.raises(etl.BackendError) as excinfo:
-        etl.backends.stablehlo.export(graph, options=options)
+    graph = evoxc.trace(f, key_spec)
+    with pytest.raises(evoxc.BackendError) as excinfo:
+        evoxc.backends.stablehlo.export(graph, options=options)
     msg = str(excinfo.value)
     assert "op 'random_multinomial'" in msg
     assert "not supported in v1" in msg

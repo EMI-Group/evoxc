@@ -11,7 +11,7 @@ compiler-free mechanism as ``tests/backends/test_options_override.py::
 _install_fake_iree_runtime`` — so the gate arithmetic is pinned deterministically
 with or without IREE installed.
 
-Covered (see ``etl/backends/adapters/iree.py``):
+Covered (see ``evoxc/backends/adapters/iree.py``):
 
 1. ``_resolve_iree_compile_args`` — the derivation matrix for
    ``vulkan_target``: UNSET emits no ``--iree-vulkan-target`` flag at all
@@ -49,13 +49,13 @@ import types
 
 import pytest
 
-import etl
-from etl.core import BackendError, Device
-from etl.backends import CompiledArtifact, external_split
-from etl.backends import registry as backends_registry
-from etl.backends.adapters import iree as iree_adapt
-from etl.backends.options import validate_options
-from etl.pipeline_options import ENV_OPTION_TABLE, apply_env_options
+import evoxc
+from evoxc.core import BackendError, Device
+from evoxc.backends import CompiledArtifact, external_split
+from evoxc.backends import registry as backends_registry
+from evoxc.backends.adapters import iree as iree_adapt
+from evoxc.backends.options import validate_options
+from evoxc.pipeline_options import ENV_OPTION_TABLE, apply_env_options
 
 # ---------------------------------------------------------------------------
 # Shared constants + the tiny graph used by the public-path tests
@@ -64,34 +64,34 @@ from etl.pipeline_options import ENV_OPTION_TABLE, apply_env_options
 _OPTION = "vulkan_target"
 _TARGET = "vulkan-spirv"
 _FLAG_NAME = "--iree-vulkan-target"
-_ENV_VAR = "ETL_IREE_VULKAN_TARGET"
+_ENV_VAR = "EVOXC_IREE_VULKAN_TARGET"
 
-_TINY_SPEC = etl.TensorSpec((2, 2), etl.float32)
+_TINY_SPEC = evoxc.TensorSpec((2, 2), evoxc.float32)
 
 #: Every env var that could leak into an option dict during these tests (the
-#: per-stage env half of ``etl.pipeline_options`` + the staging-level vars).
+#: per-stage env half of ``evoxc.pipeline_options`` + the staging-level vars).
 _ENV_VARS = (
     _ENV_VAR,
-    "ETL_IREE_COMPILE_ARGS",
-    "ETL_IREE_RUNTIME_ARGS",
-    "ETL_OPT_LEVEL",
-    "ETL_EIGH_ALGORITHM",
-    "ETL_SPLIT_REDUCTION",
-    "ETL_BACKEND",
-    "ETL_DEVICE",
-    "ETL_TARGET_BACKENDS",
+    "EVOXC_IREE_COMPILE_ARGS",
+    "EVOXC_IREE_RUNTIME_ARGS",
+    "EVOXC_OPT_LEVEL",
+    "EVOXC_EIGH_ALGORITHM",
+    "EVOXC_SPLIT_REDUCTION",
+    "EVOXC_BACKEND",
+    "EVOXC_DEVICE",
+    "EVOXC_TARGET_BACKENDS",
 )
 
 
 @pytest.fixture(autouse=True)
 def _clean_option_env(monkeypatch):
-    """No ambient ``ETL_*`` option/environment leaks into these assertions."""
+    """No ambient ``EVOXC_*`` option/environment leaks into these assertions."""
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
 
 def _tiny_fn(x):
-    return etl.add(etl.multiply(x, x), 1.0)
+    return evoxc.add(evoxc.multiply(x, x), 1.0)
 
 
 def _vulkan_flags(flags):
@@ -125,7 +125,7 @@ def test_resolve_compile_args_vulkan_derived_flag_exactly_once():
         (_TARGET,), None, vulkan_target_args=(_derived("rdna3"),)
     )
     assert _vulkan_flags(out) == [_derived("rdna3")]
-    # The other etl defaults are untouched by the derived flag.
+    # The other evoxc defaults are untouched by the derived flag.
     for default in iree_adapt._IREE_DEFAULT_COMPILE_ARGS:
         assert default in out
 
@@ -354,7 +354,7 @@ def test_known_options_unknown_key_still_rejected(stage, unknown):
 
 
 # ---------------------------------------------------------------------------
-# 4. The public path — etl.lower / etl.compile / etl.build option validation
+# 4. The public path — evoxc.lower / evoxc.compile / evoxc.build option validation
 # ---------------------------------------------------------------------------
 
 
@@ -362,7 +362,7 @@ def test_known_options_unknown_key_still_rejected(stage, unknown):
 def iree_registered():
     """Register the REAL iree adapter singleton in the backend registry.
 
-    ``etl.lower``/``etl.compile`` resolve backends through the registry; the
+    ``evoxc.lower``/``evoxc.compile`` resolve backends through the registry; the
     normal ``registry.get("iree")`` activation path calls
     ``check_available()`` (which needs the IREE packages). These tests target
     the PIPELINE's option plumbing — ``lower`` never touches IREE (it only
@@ -400,7 +400,7 @@ class _FakeDriver:
         self.create_device_calls = []
 
     def query_available_devices(self):
-        return [{"name": "etl-fake-vulkan", "device_id": 4242, "path": "/fake/0"}]
+        return [{"name": "evoxc-fake-vulkan", "device_id": 4242, "path": "/fake/0"}]
 
     def create_device(self, info):
         self.create_device_calls.append(dict(info))
@@ -433,7 +433,7 @@ def _install_fake_iree(monkeypatch):
                 "extra_args": tuple(extra_args or ()),
             }
         )
-        return b"ETL-FAKE-VMFB"
+        return b"EVOXC-FAKE-VMFB"
 
     compiler = types.ModuleType("iree.compiler")
     compiler.compile_str = _compile_str
@@ -481,11 +481,11 @@ def _install_fake_iree(monkeypatch):
 
 
 def test_lower_accepts_vulkan_target_option(iree_registered):
-    """``etl.lower`` validates option KEYS only: the compile-stage
+    """``evoxc.lower`` validates option KEYS only: the compile-stage
     ``vulkan_target`` is accepted (and ignored) at the lower stage — lower
     never touches IREE, so this runs compiler-free."""
-    graph = etl.trace(_tiny_fn, _TINY_SPEC)
-    lowered = etl.lower(
+    graph = evoxc.trace(_tiny_fn, _TINY_SPEC)
+    lowered = evoxc.lower(
         graph,
         backend="iree",
         target_backends=[_TARGET],
@@ -497,9 +497,9 @@ def test_lower_accepts_vulkan_target_option(iree_registered):
 def test_lower_rejects_unknown_option_alongside_vulkan_target(iree_registered):
     """The asymmetric pin at the public entry point: a key valid at NO stage is
     still rejected, and the message lists ``vulkan_target`` as known."""
-    graph = etl.trace(_tiny_fn, _TINY_SPEC)
+    graph = evoxc.trace(_tiny_fn, _TINY_SPEC)
     with pytest.raises(BackendError) as excinfo:
-        etl.lower(
+        evoxc.lower(
             graph,
             backend="iree",
             target_backends=[_TARGET],
@@ -512,14 +512,14 @@ def test_lower_rejects_unknown_option_alongside_vulkan_target(iree_registered):
 
 
 def test_compile_derives_vulkan_target_flag(monkeypatch, iree_registered):
-    """``etl.compile`` forwards ``vulkan_target`` to iree-compile as the
+    """``evoxc.compile`` forwards ``vulkan_target`` to iree-compile as the
     derived flag AND records the ``"vulkan"`` target label on the artifact
     (the fake compiler stands in for iree-compile — no real compilation)."""
     recorder = _install_fake_iree(monkeypatch)
-    graph = etl.trace(_tiny_fn, _TINY_SPEC)
-    lowered = etl.lower(graph, backend="iree", target_backends=[_TARGET])
+    graph = evoxc.trace(_tiny_fn, _TINY_SPEC)
+    lowered = evoxc.lower(graph, backend="iree", target_backends=[_TARGET])
 
-    artifact = etl.compile(
+    artifact = evoxc.compile(
         lowered, target_backends=[_TARGET], vulkan_target="rdna3"
     )
 
@@ -538,11 +538,11 @@ def test_compile_vulkan_target_without_vulkan_spirv_is_loud(
     monkeypatch, iree_registered
 ):
     recorder = _install_fake_iree(monkeypatch)
-    graph = etl.trace(_tiny_fn, _TINY_SPEC)
-    lowered = etl.lower(graph, backend="iree", target_backends=["llvm-cpu"])
+    graph = evoxc.trace(_tiny_fn, _TINY_SPEC)
+    lowered = evoxc.lower(graph, backend="iree", target_backends=["llvm-cpu"])
 
     with pytest.raises(BackendError) as excinfo:
-        etl.compile(lowered, target_backends=["llvm-cpu"], vulkan_target="rdna3")
+        evoxc.compile(lowered, target_backends=["llvm-cpu"], vulkan_target="rdna3")
     message = str(excinfo.value)
     assert "'vulkan_target'" in message
     assert "only applies to vulkan-spirv compilation" in message
@@ -552,11 +552,11 @@ def test_compile_vulkan_target_without_vulkan_spirv_is_loud(
 
 def test_compile_vulkan_target_bad_value_is_loud(monkeypatch, iree_registered):
     recorder = _install_fake_iree(monkeypatch)
-    graph = etl.trace(_tiny_fn, _TINY_SPEC)
-    lowered = etl.lower(graph, backend="iree", target_backends=[_TARGET])
+    graph = evoxc.trace(_tiny_fn, _TINY_SPEC)
+    lowered = evoxc.lower(graph, backend="iree", target_backends=[_TARGET])
 
     with pytest.raises(BackendError) as excinfo:
-        etl.compile(lowered, target_backends=[_TARGET], vulkan_target=5)
+        evoxc.compile(lowered, target_backends=[_TARGET], vulkan_target=5)
     message = str(excinfo.value)
     assert "'vulkan_target'" in message
     assert "non-empty string" in message
@@ -565,11 +565,11 @@ def test_compile_vulkan_target_bad_value_is_loud(monkeypatch, iree_registered):
 
 
 def test_build_forwards_vulkan_target_to_compile(monkeypatch, iree_registered):
-    """``etl.build`` forwards the option to the compile stage (the loud
+    """``evoxc.build`` forwards the option to the compile stage (the loud
     wrong-target error fires at compile time, before any load)."""
     recorder = _install_fake_iree(monkeypatch)
     with pytest.raises(BackendError) as excinfo:
-        etl.build(
+        evoxc.build(
             _tiny_fn,
             _TINY_SPEC,
             backend="iree",
@@ -581,26 +581,26 @@ def test_build_forwards_vulkan_target_to_compile(monkeypatch, iree_registered):
 
 
 def test_compile_env_vulkan_target_reaches_compile(monkeypatch, iree_registered):
-    """The env half is part of the same contract: ``ETL_IREE_VULKAN_TARGET``
+    """The env half is part of the same contract: ``EVOXC_IREE_VULKAN_TARGET``
     reaches compile when not passed explicitly (explicit kwarg wins)."""
     recorder = _install_fake_iree(monkeypatch)
-    graph = etl.trace(_tiny_fn, _TINY_SPEC)
-    lowered = etl.lower(graph, backend="iree", target_backends=[_TARGET])
+    graph = evoxc.trace(_tiny_fn, _TINY_SPEC)
+    lowered = evoxc.lower(graph, backend="iree", target_backends=[_TARGET])
 
     monkeypatch.setenv(_ENV_VAR, "  rdna3  ")
-    etl.compile(lowered, target_backends=[_TARGET])
+    evoxc.compile(lowered, target_backends=[_TARGET])
     assert _vulkan_flags(recorder["compiled"][-1]["extra_args"]) == [
         _derived("rdna3")
     ]
 
-    etl.compile(lowered, target_backends=[_TARGET], vulkan_target="gfx1100")
+    evoxc.compile(lowered, target_backends=[_TARGET], vulkan_target="gfx1100")
     assert _vulkan_flags(recorder["compiled"][-1]["extra_args"]) == [
         _derived("gfx1100")
     ]
 
 
 # ---------------------------------------------------------------------------
-# 5. The env-option row (etl.pipeline_options.ETL_IREE_VULKAN_TARGET)
+# 5. The env-option row (evoxc.pipeline_options.EVOXC_IREE_VULKAN_TARGET)
 # ---------------------------------------------------------------------------
 
 
@@ -752,7 +752,7 @@ def _artifact(target_backends, entry_functions=("main",)):
             "format": "iree-vmfb",
             "format_version": 1,
             "mlir_text": "func.func @main() {}",
-            "vmfb_base64": base64.b64encode(b"ETL-FAKE-VMFB").decode("ascii"),
+            "vmfb_base64": base64.b64encode(b"EVOXC-FAKE-VMFB").decode("ascii"),
             "entry_functions": tuple(entry_functions),
             "target_backends": tuple(target_backends),
         },
@@ -769,7 +769,7 @@ def _segments_artifact(segment_targets, plan=None):
             "format_version": 1,
             "segments": [
                 {
-                    "vmfb_base64": base64.b64encode(b"ETL-FAKE-VMFB").decode(
+                    "vmfb_base64": base64.b64encode(b"EVOXC-FAKE-VMFB").decode(
                         "ascii"
                     ),
                     "entry_functions": ("main",),
@@ -830,7 +830,7 @@ def test_load_gate_vulkan_matching_target_passes_the_gate(
     # ... and it acquired the device through iree's "vulkan" driver.
     assert "vulkan" in recorder["drivers"]
     assert recorder["drivers"]["vulkan"].create_device_calls == [
-        {"name": "etl-fake-vulkan", "device_id": 4242, "path": "/fake/0"}
+        {"name": "evoxc-fake-vulkan", "device_id": 4242, "path": "/fake/0"}
     ]
 
 

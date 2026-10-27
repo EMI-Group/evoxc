@@ -1,12 +1,12 @@
 """Backend abstraction contract tests.
 
-Contract under test: ``../etl/backends/CONTEXT.md`` ("Backend contract") —
+Contract under test: ``../evoxc/backends/CONTEXT.md`` ("Backend contract") —
 ``Capabilities`` (frozen dataclass), the ``Backend`` ABC, the
 runtime-checkable ``Executable`` protocol, the backend registry
 (``register``/``get``), and the staged objects owned by backends
 (``Signature``, ``LoweredProgram``, ``CompiledArtifact``).
 
-CPU only; tiny shapes; everything imported from ``etl`` directly.
+CPU only; tiny shapes; everything imported from ``evoxc`` directly.
 """
 
 import dataclasses
@@ -14,8 +14,8 @@ import dataclasses
 import numpy as np
 import pytest
 
-import etl
-from etl import backends
+import evoxc
+from evoxc import backends
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -66,17 +66,17 @@ NUMPY_BACKEND_DTYPES = [
 ]
 
 
-@etl.defn
+@evoxc.defn
 def _add_self(x):
-    return etl.add(x, x)
+    return evoxc.add(x, x)
 
 
 @pytest.fixture(scope="module")
 def staged():
     """A tiny staged pair (LoweredProgram + CompiledArtifact) via the pipeline."""
-    graph = etl.trace(_add_self, etl.TensorSpec((2, 3), etl.float32))
-    lowered = etl.lower(graph)
-    artifact = etl.compile(lowered)
+    graph = evoxc.trace(_add_self, evoxc.TensorSpec((2, 3), evoxc.float32))
+    lowered = evoxc.lower(graph)
+    artifact = evoxc.compile(lowered)
     return lowered, artifact
 
 
@@ -245,19 +245,19 @@ class TestRegistry:
 
     def test_duplicate_name_different_instance_raises(self):
         backends.register(_make_backend_class("fake-reg-duplicate")())
-        with pytest.raises(etl.BackendError, match="already registered"):
+        with pytest.raises(evoxc.BackendError, match="already registered"):
             backends.register(_make_backend_class("fake-reg-duplicate")())
 
     def test_register_non_backend_raises(self):
-        with pytest.raises(etl.BackendError, match="Backend instance"):
+        with pytest.raises(evoxc.BackendError, match="Backend instance"):
             backends.register(object())
 
     def test_register_empty_name_raises(self):
-        with pytest.raises(etl.BackendError, match="non-empty"):
+        with pytest.raises(evoxc.BackendError, match="non-empty"):
             backends.register(_make_backend_class("")())
 
     def test_get_unknown_name_raises(self):
-        with pytest.raises(etl.BackendError, match="unknown backend") as excinfo:
+        with pytest.raises(evoxc.BackendError, match="unknown backend") as excinfo:
             backends.get("no-such-backend-xyz")
         assert "no-such-backend-xyz" in str(excinfo.value)
 
@@ -268,12 +268,12 @@ class TestRegistry:
 
 
 class TestStagedObjects:
-    def test_staged_types_re_exported_from_etl(self):
-        assert etl.LoweredProgram is backends.LoweredProgram
-        assert etl.CompiledArtifact is backends.CompiledArtifact
-        assert etl.Backend is backends.Backend
-        assert etl.Capabilities is backends.Capabilities
-        assert etl.numpy_backend is backends.numpy_backend
+    def test_staged_types_re_exported_from_evoxc(self):
+        assert evoxc.LoweredProgram is backends.LoweredProgram
+        assert evoxc.CompiledArtifact is backends.CompiledArtifact
+        assert evoxc.Backend is backends.Backend
+        assert evoxc.Capabilities is backends.Capabilities
+        assert evoxc.numpy_backend is backends.numpy_backend
 
     def test_lowered_program_attrs(self, staged):
         lowered, _ = staged
@@ -288,14 +288,14 @@ class TestStagedObjects:
     def test_signature_trees_and_specs(self, staged):
         lowered, _ = staged
         sig = lowered.signature
-        assert isinstance(sig.input_tree, etl.TreeSpec)
-        assert isinstance(sig.output_tree, etl.TreeSpec)
+        assert isinstance(sig.input_tree, evoxc.TreeSpec)
+        assert isinstance(sig.output_tree, evoxc.TreeSpec)
         assert len(sig.input_specs) == 1
-        assert isinstance(sig.input_specs[0], etl.TensorSpec)
+        assert isinstance(sig.input_specs[0], evoxc.TensorSpec)
         assert sig.input_specs[0].shape == (2, 3)
         assert sig.input_specs[0].dtype == np.dtype("float32")
         assert len(sig.output_specs) == 1
-        assert isinstance(sig.output_specs[0], etl.TensorSpec)
+        assert isinstance(sig.output_specs[0], evoxc.TensorSpec)
         assert sig.output_specs[0].shape == (2, 3)
         assert sig.output_specs[0].dtype == np.dtype("float32")
         assert sig.static_values == ()
@@ -324,7 +324,7 @@ class TestStagedObjects:
 
     def test_lowered_program_save_load_roundtrip(self, staged, tmp_path):
         lowered, _ = staged
-        path = tmp_path / "lowered.etl"
+        path = tmp_path / "lowered.evoxc"
         lowered.save(path)
         restored = backends.LoweredProgram.load(path)
         assert isinstance(restored, backends.LoweredProgram)
@@ -334,7 +334,7 @@ class TestStagedObjects:
 
     def test_compiled_artifact_save_load_roundtrip(self, staged, tmp_path):
         _, artifact = staged
-        path = tmp_path / "artifact.etl"
+        path = tmp_path / "artifact.evoxc"
         artifact.save(path)
         restored = backends.CompiledArtifact.load(path)
         assert isinstance(restored, backends.CompiledArtifact)
@@ -356,24 +356,24 @@ class TestStagedObjects:
     def test_backend_executable_run(self, staged):
         _, artifact = staged
         executable = backends.numpy_backend.load(artifact)
-        x = etl.tensor(np.ones((2, 3), dtype=np.float32))
+        x = evoxc.tensor(np.ones((2, 3), dtype=np.float32))
         (y,) = executable.run([x])
-        assert isinstance(y, etl.Tensor)
+        assert isinstance(y, evoxc.Tensor)
         np.testing.assert_allclose(y.numpy(), 2.0 * np.ones((2, 3), dtype=np.float32))
 
     def test_numpy_executable_save_load_roundtrip(self, staged, tmp_path):
         _, artifact = staged
         executable = backends.numpy_backend.load(artifact)
-        path = tmp_path / "executable.etl"
+        path = tmp_path / "executable.evoxc"
         executable.save(path)
         restored = backends.NumpyExecutable.load(path)
         assert isinstance(restored, backends.NumpyExecutable)
-        x = etl.tensor(np.ones((2, 3), dtype=np.float32))
+        x = evoxc.tensor(np.ones((2, 3), dtype=np.float32))
         (y,) = restored.run([x])
         np.testing.assert_allclose(y.numpy(), 2.0 * np.ones((2, 3), dtype=np.float32))
 
     def test_pipeline_load_run_smoke(self, staged):
         _, artifact = staged
-        executable = etl.load(artifact)
-        y = etl.run(executable, np.ones((2, 3), dtype=np.float32))
+        executable = evoxc.load(artifact)
+        y = evoxc.run(executable, np.ones((2, 3), dtype=np.float32))
         np.testing.assert_allclose(y.numpy(), 2.0 * np.ones((2, 3), dtype=np.float32))

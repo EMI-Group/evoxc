@@ -1,9 +1,9 @@
 """Tests for the device model and explicit multi-device data preparation.
 
-Covers ``etl.core.device``: ``Device``, ``devices()``, ``split_tensor`` and
-``replicate_tensor``.  The etl package is READ-ONLY from the tests' point of
+Covers ``evoxc.core.device``: ``Device``, ``devices()``, ``split_tensor`` and
+``replicate_tensor``.  The evoxc package is READ-ONLY from the tests' point of
 view: every assertion follows the implemented contract documented in
-``etl/core/CONTEXT.md`` and ``etl/core/device.py`` (e.g. ``split_tensor``
+``evoxc/core/CONTEXT.md`` and ``evoxc/core/device.py`` (e.g. ``split_tensor``
 returns *views* and ``replicate_tensor`` shares one buffer — both documented
 "no copies" v1 semantics).
 
@@ -38,8 +38,8 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from etl.core import Device, Tensor, devices, replicate_tensor, split_tensor, tensor
-from etl.core.errors import DeviceError, ShapeError
+from evoxc.core import Device, Tensor, devices, replicate_tensor, split_tensor, tensor
+from evoxc.core.errors import DeviceError, ShapeError
 
 # Stable fragments of the canonical v1 host-data-only DeviceError (see
 # device._host_only_error): the source and target variants both carry the
@@ -88,7 +88,7 @@ class _FakeIreeHIPDriver:
         self.name = name
 
     def query_available_devices(self):
-        # IREE HAL device ids are 1-based; etl only uses the list LENGTH.
+        # IREE HAL device ids are 1-based; evoxc only uses the list LENGTH.
         return [{"device_id": i + 1} for i in range(self.count)]
 
 
@@ -483,11 +483,11 @@ class TestVulkanDevices:
         ]
 
     def test_iree_is_imported_lazily_not_at_module_scope(self):
-        # `import etl` must never pull iree/torch in (optional extras): the
-        # module-level import graph of etl.core.device names neither.  A
+        # `import evoxc` must never pull iree/torch in (optional extras): the
+        # module-level import graph of evoxc.core.device names neither.  A
         # structural AST check is subprocess-free and order-independent —
         # another suite in this process may already have imported iree.
-        import etl.core.device as device_module
+        import evoxc.core.device as device_module
 
         source = inspect.getsource(device_module)
         tree = ast.parse(source)

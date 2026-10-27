@@ -1,18 +1,18 @@
 """Contract tests for the batched-variant sugar on external kernels
 (``ExternalKernel.batch_invariant`` / ``ExternalKernel.batch_variant``).
 
-Assertions on the declarative surface documented in ``etl/external.py`` and
-``etl/external_rules.py`` (the "External kernels" contract in
-``etl/CONTEXT.md``):
+Assertions on the declarative surface documented in ``evoxc/external.py`` and
+``evoxc/external_rules.py`` (the "External kernels" contract in
+``evoxc/CONTEXT.md``):
 
-- RESERVED derived-name suffix: ``_ETL_BATCH_SUFFIX == "__etl_batched"``.
-  User-facing registrations — ``etl.register_external_kernel`` AND
-  ``etl.register_portable`` — reject names containing it (``TypeError``
+- RESERVED derived-name suffix: ``_EVOXC_BATCH_SUFFIX == "__evoxc_batched"``.
+  User-facing registrations — ``evoxc.register_external_kernel`` AND
+  ``evoxc.register_portable`` — reject names containing it (``TypeError``
   naming the suffix); the internal derived registration path used by
   ``batch_variant`` is the only way into that namespace.
 - ``batch_variant(fn=None, *, backend=None, device_resident=False)``: direct /
   decorator / decorator-with-args forms. Registers ``fn`` under the DERIVED
-  name ``f"{name}__etl_batched"`` (same backend-slot + ``device_resident``
+  name ``f"{name}__evoxc_batched"`` (same backend-slot + ``device_resident``
   semantics as ``impl`` — ``device_resident=True`` without an explicit
   backend still raises ``TypeError``). Installs the shared pass-through
   batching rule under BOTH ``external:<name>`` AND ``external:<derived>``.
@@ -20,7 +20,7 @@ Assertions on the declarative surface documented in ``etl/external.py`` and
   under ``external:<name>`` ONLY, rebuilding mapped ``external_call`` ops with
   their name attribute UNCHANGED (the base kernel handles the batched stack
   in place). Creates no derived kernel slot/portable.
-- The shared rule (``etl.external_rules``) rebuilds mapped external_call ops
+- The shared rule (``evoxc.external_rules``) rebuilds mapped external_call ops
   WITHOUT operand alignment reshapes: mapped operands keep their batched
   shapes, unmapped operands arrive unbatched, and the kernel is called ONCE
   per run with the full batched operand stack as-is (invocation-count pins on
@@ -58,12 +58,12 @@ Assertions on the declarative surface documented in ``etl/external.py`` and
 import numpy as np
 import pytest
 
-import etl
-from etl import transforms
+import evoxc
+from evoxc import transforms
 
 from tests.ops.conftest import ops_of
 
-_BATCH_SUFFIX = "__etl_batched"
+_BATCH_SUFFIX = "__evoxc_batched"
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ _BATCH_SUFFIX = "__etl_batched"
 
 def _run(graph, *args):
     """Explicit pipeline: lower -> compile -> load -> run (returns structure)."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *args)
 
 
 def _derived(name):
@@ -103,7 +103,7 @@ def _cleanup(name):
     ``unregister_external_kernel`` by design — tests must clean them up so
     later tests start from a blank registry)."""
     try:
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
     except KeyError:
         pass  # the test may already have unregistered mid-test
     for key in _rule_keys(name):
@@ -119,17 +119,17 @@ def _cleanup(name):
 
 def test_register_external_kernel_rejects_reserved_suffix():
     """User-facing kernel registrations must not use names containing the
-    reserved derived-name suffix ``__etl_batched`` (that namespace belongs to
+    reserved derived-name suffix ``__evoxc_batched`` (that namespace belongs to
     kernels registered internally by ``batch_variant``)."""
-    for bad in ("eb_res_a__etl_batched", "eb_res_b__etl_batched_sub"):
+    for bad in ("eb_res_a__evoxc_batched", "eb_res_b__evoxc_batched_sub"):
         with pytest.raises(TypeError, match=_BATCH_SUFFIX) as exc:
-            etl.register_external_kernel(bad, lambda x: x)
+            evoxc.register_external_kernel(bad, lambda x: x)
         assert "register_external_kernel" in str(exc.value)
         # The rejection happens before any mutation.
-        assert etl.get_external_kernel(bad) is None
+        assert evoxc.get_external_kernel(bad) is None
 
     # The same name without the suffix is fine (positive control).
-    handle = etl.register_external_kernel("eb_res_ok", lambda x: x)
+    handle = evoxc.register_external_kernel("eb_res_ok", lambda x: x)
     try:
         assert handle.name == "eb_res_ok"
     finally:
@@ -137,22 +137,22 @@ def test_register_external_kernel_rejects_reserved_suffix():
 
 
 def test_register_portable_rejects_reserved_suffix():
-    @etl.defn
+    @evoxc.defn
     def port(x):
         return x + 1.0
 
-    bad = "eb_resp_a__etl_batched"
+    bad = "eb_resp_a__evoxc_batched"
     with pytest.raises(TypeError, match=_BATCH_SUFFIX) as exc:
-        etl.register_portable(bad, port)
+        evoxc.register_portable(bad, port)
     assert "register_portable" in str(exc.value)
     # The rejection happens before any mutation.
-    assert etl.get_portable(bad) is None
+    assert evoxc.get_portable(bad) is None
 
     # register_portable on a good base name still works (positive control).
-    handle = etl.register_external_kernel("eb_resp_ok", lambda x: x)
+    handle = evoxc.register_external_kernel("eb_resp_ok", lambda x: x)
     try:
-        etl.register_portable("eb_resp_ok", port)
-        assert etl.get_portable("eb_resp_ok") is port
+        evoxc.register_portable("eb_resp_ok", port)
+        assert evoxc.get_portable("eb_resp_ok") is port
     finally:
         _cleanup("eb_resp_ok")
 
@@ -174,24 +174,24 @@ def test_batch_variant_direct_form_registers_derived_slot_and_rules():
     def bv(x):
         return x * 2 + 1
 
-    handle = etl.register_external_kernel("eb_form_direct", k)
+    handle = evoxc.register_external_kernel("eb_form_direct", k)
     try:
         returned = handle.batch_variant(bv)
         assert returned is bv
 
         derived = _derived("eb_form_direct")
         # Derived slot registered with host-mode default-slot semantics.
-        assert etl.external.get_external_kernel_entry(derived) == (bv, False)
-        assert etl.get_external_kernel(derived) is bv
+        assert evoxc.external.get_external_kernel_entry(derived) == (bv, False)
+        assert evoxc.get_external_kernel(derived) is bv
         # The base slot is untouched.
-        assert etl.get_external_kernel("eb_form_direct") is k
+        assert evoxc.get_external_kernel("eb_form_direct") is k
         # Rules under BOTH keys.
         for key in _rule_keys("eb_form_direct"):
             assert key in transforms.batching_rules
     finally:
         _cleanup("eb_form_direct")
     # Cleanup removed the derived slot too.
-    assert etl.get_external_kernel(_derived("eb_form_direct")) is None
+    assert evoxc.get_external_kernel(_derived("eb_form_direct")) is None
 
 
 def test_batch_variant_decorator_and_args_forms():
@@ -202,7 +202,7 @@ def test_batch_variant_decorator_and_args_forms():
     def k(x):
         return x
 
-    handle = etl.register_external_kernel("eb_form_deco", k)
+    handle = evoxc.register_external_kernel("eb_form_deco", k)
     try:
         @handle.batch_variant
         def bv_plain(x):
@@ -214,18 +214,18 @@ def test_batch_variant_decorator_and_args_forms():
 
         derived = _derived("eb_form_deco")
         # Plain decorator -> default slot.
-        assert etl.external.get_external_kernel_entry(derived) == (bv_plain, False)
+        assert evoxc.external.get_external_kernel_entry(derived) == (bv_plain, False)
         # Args decorator -> the explicit iree device slot; the default slot
         # still holds the plain variant.
-        assert etl.external.get_external_kernel_entry(derived, "iree") == (
+        assert evoxc.external.get_external_kernel_entry(derived, "iree") == (
             bv_device,
             True,
         )
-        assert etl.get_external_kernel(derived) is bv_plain
+        assert evoxc.get_external_kernel(derived) is bv_plain
         # Rules under both keys; the base slot is untouched.
         for key in _rule_keys("eb_form_deco"):
             assert key in transforms.batching_rules
-        assert etl.get_external_kernel("eb_form_deco") is k
+        assert evoxc.get_external_kernel("eb_form_deco") is k
     finally:
         _cleanup("eb_form_deco")
 
@@ -234,7 +234,7 @@ def test_batch_variant_device_resident_requires_explicit_backend():
     """Mirrors the register_external_kernel rule: ``device_resident=True``
     without an explicit backend raises TypeError (a device kernel in the
     default slot would receive host numpy arrays from the numpy backend)."""
-    handle = etl.register_external_kernel("eb_form_dr", lambda x: x)
+    handle = evoxc.register_external_kernel("eb_form_dr", lambda x: x)
     try:
         with pytest.raises(TypeError, match="requires an explicit backend"):
             handle.batch_variant(lambda x: x, device_resident=True)
@@ -246,7 +246,7 @@ def test_batch_variant_device_resident_requires_explicit_backend():
                 return x
 
         # Nothing was registered by the failed attempts.
-        assert etl.get_external_kernel(_derived("eb_form_dr")) is None
+        assert evoxc.get_external_kernel(_derived("eb_form_dr")) is None
         for key in _rule_keys("eb_form_dr"):
             assert key not in transforms.batching_rules
     finally:
@@ -267,16 +267,16 @@ def test_batch_invariant_returns_self_and_installs_base_rule_only():
     def k(x):
         return x * 2 + 1
 
-    handle = etl.register_external_kernel("eb_bi", k)
+    handle = evoxc.register_external_kernel("eb_bi", k)
     try:
         assert handle.batch_invariant() is handle
         # Rule under the base key only.
         assert f"external:eb_bi" in transforms.batching_rules
         assert f"external:{_derived('eb_bi')}" not in transforms.batching_rules
         # No derived slot is auto-registered.
-        assert etl.get_external_kernel(_derived("eb_bi")) is None
-        assert etl.get_portable(_derived("eb_bi")) is None
-        assert etl.get_portable("eb_bi") is None
+        assert evoxc.get_external_kernel(_derived("eb_bi")) is None
+        assert evoxc.get_portable(_derived("eb_bi")) is None
+        assert evoxc.get_portable("eb_bi") is None
     finally:
         _cleanup("eb_bi")
 
@@ -293,32 +293,32 @@ def test_batch_invariant_end_to_end_vmap_and_vectorize():
         calls.append([np.shape(a) for a in arrays])
         return [a * 2 + 1 for a in arrays]
 
-    handle = etl.register_external_kernel(name, k)
+    handle = evoxc.register_external_kernel(name, k)
     handle.batch_invariant()
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2, 3), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2, 3), evoxc.int64))
 
     x = np.arange(24, dtype=np.int64).reshape(4, 2, 3)
     expected = x * 2 + 1
 
     try:
         # vmap (function-side sugar).
-        graph = etl.vmap(f)(etl.TensorSpec((4, 2, 3), etl.int64))
+        graph = evoxc.vmap(f)(evoxc.TensorSpec((4, 2, 3), evoxc.int64))
         assert _ext_names(graph) == [name]  # name UNCHANGED
         result_type = _single_result_type(graph)
         assert len(result_type.shape) == 3  # batch dims + declared (2, 3)
         assert tuple(result_type.shape[1:]) == (2, 3)
         calls.clear()
         out = _run(graph, x)
-        assert isinstance(out, etl.Tensor)
+        assert isinstance(out, evoxc.Tensor)
         np.testing.assert_array_equal(out.numpy(), expected)
         assert calls == [[(4, 2, 3)]]  # kernel ONCE, full batched stack
 
         # vectorize (the primitive graph-to-graph entry point).
-        plain = etl.vectorize(
-            etl.trace(f, etl.TensorSpec((2, 3), etl.int64)), 0
+        plain = evoxc.vectorize(
+            evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.int64)), 0
         )
         assert _ext_names(plain) == [name]
         calls.clear()
@@ -348,18 +348,18 @@ def test_batch_variant_end_to_end_vmap_and_vectorize():
         calls.append(np.shape(x))
         return x * 2 + 1
 
-    handle = etl.register_external_kernel(name, base_k)
+    handle = evoxc.register_external_kernel(name, base_k)
     handle.batch_variant(bv)
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2, 3), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2, 3), evoxc.int64))
 
     x = np.arange(24, dtype=np.int64).reshape(4, 2, 3)
     expected = x * 2 + 1
 
     try:
-        graph = etl.vmap(f)(etl.TensorSpec((4, 2, 3), etl.int64))
+        graph = evoxc.vmap(f)(evoxc.TensorSpec((4, 2, 3), evoxc.int64))
         derived = _derived(name)
         assert _ext_names(graph) == [derived]
         result_type = _single_result_type(graph)
@@ -372,8 +372,8 @@ def test_batch_variant_end_to_end_vmap_and_vectorize():
         assert calls == [(4, 2, 3)]  # ONCE, the full stack
 
         # vectorize path: identical semantics.
-        plain = etl.vectorize(
-            etl.trace(f, etl.TensorSpec((2, 3), etl.int64)), 0
+        plain = evoxc.vectorize(
+            evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.int64)), 0
         )
         assert _ext_names(plain) == [derived]
         calls.clear()
@@ -384,7 +384,7 @@ def test_batch_variant_end_to_end_vmap_and_vectorize():
         # Without vmap the BASE name still dispatches the BASE kernel (the
         # derived kernel never runs on the unbatched path).
         calls.clear()
-        out = _run(etl.trace(f, etl.TensorSpec((2, 3), etl.int64)), x[0])
+        out = _run(evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.int64)), x[0])
         np.testing.assert_array_equal(out.numpy(), expected[0])
         assert calls == []
     finally:
@@ -402,17 +402,17 @@ def test_batch_variant_multi_output_full_stack():
         calls.append(np.shape(a))
         return a + 1, a * 2
 
-    handle = etl.register_external_kernel(name, lambda a: (a + 1, a * 2))
+    handle = evoxc.register_external_kernel(name, lambda a: (a + 1, a * 2))
     handle.batch_variant(bv)
 
-    @etl.defn
+    @evoxc.defn
     def f(a):
-        b, c = etl.external_call(
+        b, c = evoxc.external_call(
             name,
             a,
             result=(
-                etl.TensorSpec((3,), etl.int64),
-                etl.TensorSpec((3,), etl.int64),
+                evoxc.TensorSpec((3,), evoxc.int64),
+                evoxc.TensorSpec((3,), evoxc.int64),
             ),
         )
         return b + c
@@ -420,7 +420,7 @@ def test_batch_variant_multi_output_full_stack():
     x = np.arange(12, dtype=np.int64).reshape(4, 3)
     expected = (x + 1) + (x * 2)
     try:
-        graph = etl.vmap(f)(etl.TensorSpec((4, 3), etl.int64))
+        graph = evoxc.vmap(f)(evoxc.TensorSpec((4, 3), evoxc.int64))
         assert _ext_names(graph) == [_derived(name)]
         for result in _ext_calls(graph)[0].results:
             assert len(result.type.shape) == 2
@@ -450,17 +450,17 @@ def test_nested_vmap_batch_variant():
         calls.append(np.shape(x))
         return x * 2 + 1
 
-    handle = etl.register_external_kernel(name, lambda x: x * 2 + 1)
+    handle = evoxc.register_external_kernel(name, lambda x: x * 2 + 1)
     handle.batch_variant(bv)
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2,), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2,), evoxc.int64))
 
     x = np.arange(24, dtype=np.int64).reshape(3, 4, 2)
     expected = x * 2 + 1
     try:
-        graph = etl.vmap(etl.vmap(f))(etl.TensorSpec((3, 4, 2), etl.int64))
+        graph = evoxc.vmap(evoxc.vmap(f))(evoxc.TensorSpec((3, 4, 2), evoxc.int64))
         calls_op = _ext_calls(graph)
         assert len(calls_op) == 1
         assert calls_op[0].attributes["name"] == _derived(name)
@@ -486,17 +486,17 @@ def test_nested_vmap_batch_invariant():
         calls.append([np.shape(a) for a in arrays])
         return [a * 2 + 1 for a in arrays]
 
-    handle = etl.register_external_kernel(name, k)
+    handle = evoxc.register_external_kernel(name, k)
     handle.batch_invariant()
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2,), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2,), evoxc.int64))
 
     x = np.arange(24, dtype=np.int64).reshape(3, 4, 2)
     expected = x * 2 + 1
     try:
-        graph = etl.vmap(etl.vmap(f))(etl.TensorSpec((3, 4, 2), etl.int64))
+        graph = evoxc.vmap(evoxc.vmap(f))(evoxc.TensorSpec((3, 4, 2), evoxc.int64))
         assert _ext_names(graph) == [name]
         calls.clear()
         out = _run(graph, x)
@@ -523,25 +523,25 @@ def test_batch_variant_mixed_mapped_counts():
         calls.append((np.shape(a), np.shape(b)))
         return a + b  # numpy broadcasts the (4, 2, 3) with the (3,)
 
-    handle = etl.register_external_kernel(name, bv)
+    handle = evoxc.register_external_kernel(name, bv)
     handle.batch_variant(bv)
 
-    @etl.defn
+    @evoxc.defn
     def f(a, b):
-        return etl.external_call(
-            name, a, b, result=etl.TensorSpec((2, 3), etl.int64)
+        return evoxc.external_call(
+            name, a, b, result=evoxc.TensorSpec((2, 3), evoxc.int64)
         )
 
-    graph = etl.trace(
+    graph = evoxc.trace(
         f,
-        etl.TensorSpec((2, 3), etl.int64),
-        etl.TensorSpec((3,), etl.int64),
+        evoxc.TensorSpec((2, 3), evoxc.int64),
+        evoxc.TensorSpec((3,), evoxc.int64),
     )
     x = np.arange(24, dtype=np.int64).reshape(4, 2, 3)
     w = np.array([1, 2, 3], dtype=np.int64)
     expected = x + w
     try:
-        batched = etl.vectorize(graph, (0, None))
+        batched = evoxc.vectorize(graph, (0, None))
         assert _ext_names(batched) == [_derived(name)]
         # Result shape = batch dims (from the mapped operand) + declared.
         result_type = _single_result_type(batched)
@@ -555,9 +555,9 @@ def test_batch_variant_mixed_mapped_counts():
 
         # Same via vmap's in_axes pytree form.
         calls.clear()
-        batched2 = etl.vmap(f, in_axes=(0, None))(
-            etl.TensorSpec((4, 2, 3), etl.int64),
-            etl.TensorSpec((3,), etl.int64),
+        batched2 = evoxc.vmap(f, in_axes=(0, None))(
+            evoxc.TensorSpec((4, 2, 3), evoxc.int64),
+            evoxc.TensorSpec((3,), evoxc.int64),
         )
         out = _run(batched2, x, w)
         np.testing.assert_array_equal(out.numpy(), expected)
@@ -579,23 +579,23 @@ def test_nothing_declared_raises_then_success_after_batch_variant():
     variant afterwards enables vmap of the SAME pre-traced graph."""
     name = "eb_nothing"
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2,), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2,), evoxc.int64))
 
-    graph = etl.trace(f, etl.TensorSpec((2,), etl.int64))
-    handle = etl.register_external_kernel(name, lambda x: x * 2 + 1)
+    graph = evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.int64))
+    handle = evoxc.register_external_kernel(name, lambda x: x * 2 + 1)
     try:
         assert f"external:{name}" not in transforms.batching_rules
-        with pytest.raises(etl.TransformError) as exc:
-            etl.vmap(graph, in_axes=0)
+        with pytest.raises(evoxc.TransformError) as exc:
+            evoxc.vmap(graph, in_axes=0)
         message = str(exc.value)
         assert "external_call" in message
         assert f"external:{name}" in message
         assert "Python-loop fallback" in message  # never a silent loop
 
         handle.batch_variant(lambda x: x * 2 + 1)
-        batched = etl.vmap(graph, in_axes=0)
+        batched = evoxc.vmap(graph, in_axes=0)
         x = np.arange(8, dtype=np.int64).reshape(4, 2)
         out = _run(batched, x)
         np.testing.assert_array_equal(out.numpy(), x * 2 + 1)
@@ -609,9 +609,9 @@ def test_nothing_declared_raises_then_success_after_batch_variant():
 
 
 def _decl_f(name):
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2,), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2,), evoxc.int64))
 
     return f
 
@@ -621,8 +621,8 @@ def _assert_batch_variant_rule_live(name, x, expected):
     evidenced by the derived-named external_call surviving in the IR (a
     portable fallback would inline the decomposition away, leaving NO
     external_call op) — with a bit-exact run."""
-    graph = etl.vmap(
-        etl.trace(_decl_f(name), etl.TensorSpec((2,), etl.int64)), 0
+    graph = evoxc.vmap(
+        evoxc.trace(_decl_f(name), evoxc.TensorSpec((2,), evoxc.int64)), 0
     )
     assert _ext_names(graph) == [_derived(name)]
     out = _run(graph, x)
@@ -636,11 +636,11 @@ def test_batch_variant_registered_before_portable_wins():
     (derived name in the IR, no inlined decomposition)."""
     name = "eb_ord_before"
 
-    @etl.defn
+    @evoxc.defn
     def port(x):
         return x + 1.0
 
-    handle = etl.register_external_kernel(name, lambda x: x * 2 + 1)
+    handle = evoxc.register_external_kernel(name, lambda x: x * 2 + 1)
     handle.batch_variant(lambda x: x * 2 + 1)
     pass_through = transforms.batching_rules.get(f"external:{name}")
     try:
@@ -660,11 +660,11 @@ def test_batch_variant_registered_after_portable_wins():
     it (last-wins ordinary registry assignment)."""
     name = "eb_ord_after"
 
-    @etl.defn
+    @evoxc.defn
     def port(x):
         return x + 1.0
 
-    handle = etl.register_external_kernel(name, lambda x: x * 2 + 1)
+    handle = evoxc.register_external_kernel(name, lambda x: x * 2 + 1)
     handle.portable(port)
     fallback = transforms.batching_rules.get(f"external:{name}")
     try:
@@ -689,22 +689,22 @@ def test_graph_save_load_roundtrip_with_derived_names(tmp_path):
     never serialized) the run fails with a BackendError NAMING the derived
     kernel."""
     name = "eb_persist"
-    handle = etl.register_external_kernel(name, lambda x: x * 2 + 1)
+    handle = evoxc.register_external_kernel(name, lambda x: x * 2 + 1)
     handle.batch_variant(lambda x: x * 2 + 1)
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2, 3), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2, 3), evoxc.int64))
 
     x = np.arange(24, dtype=np.int64).reshape(4, 2, 3)
     expected = x * 2 + 1
     loaded = None
     try:
-        graph = etl.vmap(f)(etl.TensorSpec((4, 2, 3), etl.int64))
+        graph = evoxc.vmap(f)(evoxc.TensorSpec((4, 2, 3), evoxc.int64))
         assert _ext_names(graph) == [_derived(name)]
-        path = tmp_path / "batched_ext.etl"
+        path = tmp_path / "batched_ext.evoxc"
         graph.save(str(path))
-        loaded = etl.Graph.load(str(path))
+        loaded = evoxc.Graph.load(str(path))
         assert _ext_names(loaded) == [_derived(name)]
         out = _run(loaded, x)
         np.testing.assert_array_equal(out.numpy(), expected)
@@ -714,7 +714,7 @@ def test_graph_save_load_roundtrip_with_derived_names(tmp_path):
     # Kernels unregistered -> the loaded graph fails loudly, naming the
     # derived name the op now carries.
     assert loaded is not None
-    with pytest.raises(etl.BackendError) as exc:
+    with pytest.raises(evoxc.BackendError) as exc:
         _run(loaded, x)
     assert _derived(name) in str(exc.value)
     assert "register_external_kernel" in str(exc.value)
@@ -736,11 +736,11 @@ def test_unregister_removes_derived_slots_and_portables_and_rules_survive():
     def k(x):
         return x
 
-    @etl.defn
+    @evoxc.defn
     def port(x):
         return x + 1.0
 
-    handle = etl.register_external_kernel(name, k)
+    handle = evoxc.register_external_kernel(name, k)
     handle.impl("iree", k, device_resident=True)
     handle.portable(port)
     handle.batch_variant(lambda x: x)
@@ -748,18 +748,18 @@ def test_unregister_removes_derived_slots_and_portables_and_rules_survive():
     derived_rule = transforms.batching_rules.get(derived_rule_key)
     try:
         assert base_rule is not None and derived_rule is not None
-        assert etl.get_external_kernel(name) is not None
-        assert etl.get_external_kernel(name, "iree") is not None
-        assert etl.get_external_kernel(_derived(name)) is not None
-        assert etl.get_portable(name) is port
+        assert evoxc.get_external_kernel(name) is not None
+        assert evoxc.get_external_kernel(name, "iree") is not None
+        assert evoxc.get_external_kernel(_derived(name)) is not None
+        assert evoxc.get_portable(name) is port
 
-        etl.unregister_external_kernel(name)
+        evoxc.unregister_external_kernel(name)
         # Base AND derived slots gone, portables gone (derived never had one).
-        assert etl.get_external_kernel(name) is None
-        assert etl.get_external_kernel(name, "iree") is None
-        assert etl.get_external_kernel(_derived(name)) is None
-        assert etl.get_portable(name) is None
-        assert etl.get_portable(_derived(name)) is None
+        assert evoxc.get_external_kernel(name) is None
+        assert evoxc.get_external_kernel(name, "iree") is None
+        assert evoxc.get_external_kernel(_derived(name)) is None
+        assert evoxc.get_portable(name) is None
+        assert evoxc.get_portable(_derived(name)) is None
         # Transform rules survive with their original identity.
         assert transforms.batching_rules.get(base_rule_key) is base_rule
         assert transforms.batching_rules.get(derived_rule_key) is derived_rule
@@ -775,21 +775,21 @@ def test_unregister_then_reregister_restores_vmap():
     def k(x):
         return x * 2 + 1
 
-    handle = etl.register_external_kernel(name, k)
+    handle = evoxc.register_external_kernel(name, k)
     handle.batch_variant(k)
-    etl.unregister_external_kernel(name)
-    assert etl.get_external_kernel(name) is None
+    evoxc.unregister_external_kernel(name)
+    assert evoxc.get_external_kernel(name) is None
 
-    handle2 = etl.register_external_kernel(name, k)
+    handle2 = evoxc.register_external_kernel(name, k)
     handle2.batch_variant(k)
     try:
-        @etl.defn
+        @evoxc.defn
         def f(x):
-            return etl.external_call(name, x, result=etl.TensorSpec((2,), etl.int64))
+            return evoxc.external_call(name, x, result=evoxc.TensorSpec((2,), evoxc.int64))
 
         x = np.arange(8, dtype=np.int64).reshape(4, 2)
-        graph = etl.vmap(
-            etl.trace(f, etl.TensorSpec((2,), etl.int64)), 0
+        graph = evoxc.vmap(
+            evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.int64)), 0
         )
         assert _ext_names(graph) == [_derived(name)]
         out = _run(graph, x)
@@ -802,7 +802,7 @@ def test_unregister_never_registered_raises_key_error():
     with pytest.raises(
         KeyError, match="no external kernel registered under 'eb_ghost'"
     ):
-        etl.unregister_external_kernel("eb_ghost")
+        evoxc.unregister_external_kernel("eb_ghost")
 
 
 # ---------------------------------------------------------------------------
@@ -823,20 +823,20 @@ def test_device_resident_numpy_batched_slot_raises_and_host_recovery():
     def k(x):
         return x * 2 + 1
 
-    handle = etl.register_external_kernel(name, k)
+    handle = evoxc.register_external_kernel(name, k)
     handle.batch_variant(k, backend="numpy", device_resident=True)
 
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.external_call(name, x, result=etl.TensorSpec((2,), etl.int64))
+        return evoxc.external_call(name, x, result=evoxc.TensorSpec((2,), evoxc.int64))
 
-    graph = etl.vmap(etl.trace(f, etl.TensorSpec((2,), etl.int64)), 0)
+    graph = evoxc.vmap(evoxc.trace(f, evoxc.TensorSpec((2,), evoxc.int64)), 0)
     x = np.arange(8, dtype=np.int64).reshape(4, 2)
     try:
-        assert etl.external.get_external_kernel_entry(
+        assert evoxc.external.get_external_kernel_entry(
             _derived(name), "numpy"
         ) == (k, True)
-        with pytest.raises(etl.BackendError) as exc:
+        with pytest.raises(evoxc.BackendError) as exc:
             _run(graph, x)
         message = str(exc.value)
         assert "device_resident" in message

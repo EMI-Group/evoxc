@@ -1,6 +1,6 @@
-"""Builder (op-construction API) tests for etl's EvoXIR IR layer.
+"""Builder (op-construction API) tests for evoxc's EvoXIR IR layer.
 
-Covers every documented Builder contract in ``etl/ir/builder.py``:
+Covers every documented Builder contract in ``evoxc/ir/builder.py``:
 
 * module/function/region construction wiring (parents, block args, ids,
   insertion point, metadata);
@@ -25,8 +25,8 @@ CPU only; no GPU/network. Fast: every test builds tiny modules.
 import numpy as np
 import pytest
 
-from etl import ir
-from etl.core import Dim, DimExpr, ShapeError, TensorSpec, VerificationError
+from evoxc import ir
+from evoxc.core import Dim, DimExpr, ShapeError, TensorSpec, VerificationError
 
 
 # ---------------------------------------------------------------------------

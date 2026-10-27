@@ -1,15 +1,15 @@
-"""Batching / jvp / vjp rule registration and fallbacks for ``etl.block``.
+"""Batching / jvp / vjp rule registration and fallbacks for ``evoxc.block``.
 
-Covers the rule-bridge contract from ``etl/block/CONTEXT.md`` and the frozen
-rule signatures from ``etl/transforms/CONTEXT.md``:
+Covers the rule-bridge contract from ``evoxc/block/CONTEXT.md`` and the frozen
+rule signatures from ``evoxc/transforms/CONTEXT.md``:
 
 * ``BlockOp.batching_rule / jvp_rule / vjp_rule(fn)`` register under the
-  ``block:<name>`` keys of the PUBLIC ``etl.transforms`` registries and return
+  ``block:<name>`` keys of the PUBLIC ``evoxc.transforms`` registries and return
   ``fn``; non-callable arguments raise ``BlockError`` (match "callable").
 * batching rule: ``rule(op, operands, axes) -> (new_values, new_axes)``;
   vjp rule: ``rule(op, cotangents, primals) -> input_cotangents``; jvp rule:
   ``rule(op, tangents) -> output_tangents``. Rules build replacement ops over
-  the values the machinery passes (wrapped as ``etl.SymbolicTensor``).
+  the values the machinery passes (wrapped as ``evoxc.SymbolicTensor``).
 * Without an explicit rule: the portable decomposition is the fallback for
   vmap/grad/jvp/vjp; with NO rule and NO portable the transforms raise
   ``TransformError`` naming the block (never a silent fallback). An explicit
@@ -31,25 +31,25 @@ Notes:
 import numpy as np
 import pytest
 
-import etl
-from etl import transforms
-from etl.block.errors import BlockError
-from etl.transforms.autodiff import ZeroTangent
+import evoxc
+from evoxc import transforms
+from evoxc.block.errors import BlockError
+from evoxc.transforms.autodiff import ZeroTangent
 
 BATCH = 8
 DIM = 4
 
 
 def _sym(value):
-    """Wrap an ir.Value as a SymbolicTensor so etl.ops can build on it."""
-    return etl.SymbolicTensor(
+    """Wrap an ir.Value as a SymbolicTensor so evoxc.ops can build on it."""
+    return evoxc.SymbolicTensor(
         value=value, dtype=value.type.dtype, shape=value.type.shape
     )
 
 
 def _run(graph, *args):
     """Explicit pipeline: lower -> compile -> load -> run (returns structure)."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *args)
 
 
 def _swish(x):
@@ -67,62 +67,62 @@ def _swish_deriv(x):
 # ---------------------------------------------------------------------------
 
 # 1. Portable-only block (decomposition fallback pre-registered at decl time).
-@etl.block
-@etl.defn
-def rule_swish(x: etl.TensorSpec((DIM,), etl.float32)) -> etl.TensorSpec((DIM,), etl.float32):
-    return etl.sigmoid(x) * x
+@evoxc.block
+@evoxc.defn
+def rule_swish(x: evoxc.TensorSpec((DIM,), evoxc.float32)) -> evoxc.TensorSpec((DIM,), evoxc.float32):
+    return evoxc.sigmoid(x) * x
 
 
-@etl.defn
+@evoxc.defn
 def rule_swish_fn(x):
     return rule_swish(x)
 
 
 # 2. Factory block, no portable -> policy "unsupported"; an EXPLICIT batching
 #    rule must still win (a registered rule always beats the policy).
-rule_explicit = etl.block(
+rule_explicit = evoxc.block(
     "rule_explicit",
-    inputs=[etl.TensorSpec((DIM,), etl.float32)],
-    outputs=[etl.TensorSpec((DIM,), etl.float32)],
+    inputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
 )
 
 
 @rule_explicit.batching_rule
 def rule_explicit_batch(op, operands, axes):
     x = operands[0]
-    y = etl.multiply(_sym(x), 2)
+    y = evoxc.multiply(_sym(x), 2)
     return (y.value,), (axes[0],)
 
 
-@etl.defn
+@evoxc.defn
 def rule_explicit_fn(x):
     return rule_explicit(x)
 
 
 # 3. Portable computes 2*x; an explicit rule computes 3*x and must win.
-@etl.block
-@etl.defn
-def rule_override(x: etl.TensorSpec((DIM,), etl.float32)) -> etl.TensorSpec((DIM,), etl.float32):
-    return etl.multiply(x, 2)
+@evoxc.block
+@evoxc.defn
+def rule_override(x: evoxc.TensorSpec((DIM,), evoxc.float32)) -> evoxc.TensorSpec((DIM,), evoxc.float32):
+    return evoxc.multiply(x, 2)
 
 
 @rule_override.batching_rule
 def rule_override_batch(op, operands, axes):
     x = operands[0]
-    y = etl.multiply(_sym(x), 3)
+    y = evoxc.multiply(_sym(x), 3)
     return (y.value,), (axes[0],)
 
 
-@etl.defn
+@evoxc.defn
 def rule_override_fn(x):
     return rule_override(x)
 
 
 # 4. "double" block: explicit jvp rule (+ numpy impl so the primal runs).
-rule_jvp = etl.block(
+rule_jvp = evoxc.block(
     "rule_jvp",
-    inputs=[etl.TensorSpec((DIM,), etl.float32)],
-    outputs=[etl.TensorSpec((DIM,), etl.float32)],
+    inputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
 )
 
 
@@ -136,19 +136,19 @@ def rule_jvp_forward(op, tangents):
     (t,) = tangents
     if t is None or isinstance(t, ZeroTangent):
         return (ZeroTangent(),)
-    return (etl.multiply(_sym(t), 2).value,)
+    return (evoxc.multiply(_sym(t), 2).value,)
 
 
-@etl.defn
+@evoxc.defn
 def rule_jvp_fn(x):
     return rule_jvp(x)
 
 
 # 5. "double" block: explicit vjp rule (+ numpy impl so the primal runs).
-rule_vjp = etl.block(
+rule_vjp = evoxc.block(
     "rule_vjp",
-    inputs=[etl.TensorSpec((DIM,), etl.float32)],
-    outputs=[etl.TensorSpec((DIM,), etl.float32)],
+    inputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
 )
 
 
@@ -162,49 +162,49 @@ def rule_vjp_backward(op, cotangents, primals):
     (ct,) = cotangents
     if ct is None or isinstance(ct, ZeroTangent):
         return (ZeroTangent(),)
-    return (etl.multiply(_sym(ct), 2).value,)
+    return (evoxc.multiply(_sym(ct), 2).value,)
 
 
-@etl.defn
+@evoxc.defn
 def rule_vjp_loss(x):
-    return etl.sum(rule_vjp(x))
+    return evoxc.sum(rule_vjp(x))
 
 
 # 6. Portable-only swish (diff fallback pre-registered; no explicit rules).
-@etl.block
-@etl.defn
-def rule_portgrad(x: etl.TensorSpec((DIM,), etl.float32)) -> etl.TensorSpec((DIM,), etl.float32):
-    return etl.sigmoid(x) * x
+@evoxc.block
+@evoxc.defn
+def rule_portgrad(x: evoxc.TensorSpec((DIM,), evoxc.float32)) -> evoxc.TensorSpec((DIM,), evoxc.float32):
+    return evoxc.sigmoid(x) * x
 
 
-@etl.defn
+@evoxc.defn
 def rule_portgrad_loss(x):
-    return etl.sum(rule_portgrad(x))
+    return evoxc.sum(rule_portgrad(x))
 
 
 # 7. No portable, no rules -> transforms must raise TransformError.
-rule_none = etl.block(
+rule_none = evoxc.block(
     "rule_none",
-    inputs=[etl.TensorSpec((DIM,), etl.float32)],
-    outputs=[etl.TensorSpec((DIM,), etl.float32)],
+    inputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
 )
 
 
-@etl.defn
+@evoxc.defn
 def rule_none_fn(x):
     return rule_none(x)
 
 
-@etl.defn
+@evoxc.defn
 def rule_none_loss(x):
-    return etl.sum(rule_none(x))
+    return evoxc.sum(rule_none(x))
 
 
 # 9. elementwise policy: batch dims pass through — safe WITHOUT a rule.
-rule_ew = etl.block(
+rule_ew = evoxc.block(
     "rule_ew",
-    inputs=[etl.TensorSpec((DIM,), etl.float32)],
-    outputs=[etl.TensorSpec((DIM,), etl.float32)],
+    inputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((DIM,), evoxc.float32)],
     batching="elementwise",
 )
 
@@ -214,7 +214,7 @@ def _np_rule_ew(x):
     return x
 
 
-@etl.defn
+@evoxc.defn
 def rule_ew_fn(x):
     return rule_ew(x)
 
@@ -230,14 +230,14 @@ def _batched_x():
 
 def test_vmap_via_portable_fallback():
     """vmap of a block with only a portable == per-row unvectorized run."""
-    tf = etl.vmap(rule_swish_fn)
-    graph = tf(etl.TensorSpec((BATCH, DIM), etl.float32))
+    tf = evoxc.vmap(rule_swish_fn)
+    graph = tf(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
     out = _run(graph, _batched_x())
 
     # Reference: the unvectorized computation, row by row (build once, run
-    # per row — the documented explicit form of etl.evaluate).
-    exe = etl.build(rule_swish_fn, etl.TensorSpec((DIM,), etl.float32))
-    reference = np.stack([etl.run(exe, row).numpy() for row in _batched_x()])
+    # per row — the documented explicit form of evoxc.evaluate).
+    exe = evoxc.build(rule_swish_fn, evoxc.TensorSpec((DIM,), evoxc.float32))
+    reference = np.stack([evoxc.run(exe, row).numpy() for row in _batched_x()])
     assert np.allclose(out.numpy(), reference, rtol=1e-6)
     assert np.allclose(out.numpy(), _swish(_batched_x()), rtol=1e-6)
 
@@ -248,7 +248,7 @@ def test_explicit_batching_rule_registers_and_wins_over_unsupported_policy():
     assert transforms.batching_rules["block:rule_explicit"] is rule_explicit_batch
 
     x = _batched_x()
-    graph = etl.vmap(rule_explicit_fn)(etl.TensorSpec((BATCH, DIM), etl.float32))
+    graph = evoxc.vmap(rule_explicit_fn)(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
     out = _run(graph, x)
     assert np.allclose(out.numpy(), 2 * x)
 
@@ -257,26 +257,26 @@ def test_explicit_rule_overrides_portable_decomposition():
     """A registered rule always wins over the portable fallback."""
     # The portable computes 2*x (verifiable through the normal lower path).
     x4 = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    assert np.allclose(etl.evaluate(rule_override_fn, x4).numpy(), 2 * x4)
+    assert np.allclose(evoxc.evaluate(rule_override_fn, x4).numpy(), 2 * x4)
 
     x = _batched_x()
-    graph = etl.vmap(rule_override_fn)(etl.TensorSpec((BATCH, DIM), etl.float32))
+    graph = evoxc.vmap(rule_override_fn)(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
     out = _run(graph, x)
     assert np.allclose(out.numpy(), 3 * x)
 
 
 def test_vmap_without_rule_raises_transform_error_naming_the_block():
     """No rule + no portable -> TransformError at the tf(spec) call."""
-    tf = etl.vmap(rule_none_fn)
+    tf = evoxc.vmap(rule_none_fn)
     # The rule lookup happens during vectorize, i.e. when calling tf(...).
-    with pytest.raises(etl.TransformError, match="rule_none"):
-        tf(etl.TensorSpec((BATCH, DIM), etl.float32))
+    with pytest.raises(evoxc.TransformError, match="rule_none"):
+        tf(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
 
 
 def test_elementwise_policy_passes_batch_dims_through():
     """elementwise policy: batch dims pass through safely without a rule."""
     x = _batched_x()
-    graph = etl.vmap(rule_ew_fn)(etl.TensorSpec((BATCH, DIM), etl.float32))
+    graph = evoxc.vmap(rule_ew_fn)(evoxc.TensorSpec((BATCH, DIM), evoxc.float32))
     out = _run(graph, x)
     assert np.allclose(out.numpy(), x)
 
@@ -291,8 +291,8 @@ def test_jvp_rule_forward_mode():
     x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     dx = np.array([0.5, -0.25, 1.0, 2.0], dtype=np.float32)
 
-    tf = etl.jvp(rule_jvp_fn, etl.TensorSpec((DIM,), etl.float32))
-    graph = tf(etl.TensorSpec((DIM,), etl.float32))
+    tf = evoxc.jvp(rule_jvp_fn, evoxc.TensorSpec((DIM,), evoxc.float32))
+    graph = tf(evoxc.TensorSpec((DIM,), evoxc.float32))
     # Result graph inputs: primal inputs followed by tangent inputs;
     # outputs: (primal_outputs, tangent_outputs).
     out = _run(graph, (x,), (dx,))
@@ -306,10 +306,10 @@ def test_vjp_rule_reverse_mode_grad():
     x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
 
     # The primal runs through the numpy impl: sum(2x) == 20.
-    assert np.allclose(etl.evaluate(rule_vjp_loss, x).numpy(), np.float32(20.0))
+    assert np.allclose(evoxc.evaluate(rule_vjp_loss, x).numpy(), np.float32(20.0))
 
-    tf = etl.grad(rule_vjp_loss)
-    graph = tf(etl.TensorSpec((DIM,), etl.float32))
+    tf = evoxc.grad(rule_vjp_loss)
+    graph = tf(evoxc.TensorSpec((DIM,), evoxc.float32))
     (grad_out,) = _run(graph, x)
     assert np.allclose(grad_out.numpy(), np.full(DIM, 2.0))
 
@@ -319,7 +319,7 @@ def test_grad_via_portable_decomposition():
     x = np.array([0.5, 1.0, 2.0, 3.0], dtype=np.float32)
     expected = _swish_deriv(x)
 
-    graph = etl.grad(rule_portgrad_loss)(etl.TensorSpec((DIM,), etl.float32))
+    graph = evoxc.grad(rule_portgrad_loss)(evoxc.TensorSpec((DIM,), evoxc.float32))
     (grad_out,) = _run(graph, x)
     assert np.allclose(grad_out.numpy(), expected, rtol=1e-5, atol=1e-5)
 
@@ -330,8 +330,8 @@ def test_jvp_derived_from_portable_vjp_fallback():
     dx = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     expected = _swish_deriv(x) * dx
 
-    tf = etl.jvp(rule_portgrad, etl.TensorSpec((DIM,), etl.float32))
-    graph = tf(etl.TensorSpec((DIM,), etl.float32))
+    tf = evoxc.jvp(rule_portgrad, evoxc.TensorSpec((DIM,), evoxc.float32))
+    graph = tf(evoxc.TensorSpec((DIM,), evoxc.float32))
     out = _run(graph, (x,), (dx,))
     primal, (tangent,) = out
     assert np.allclose(primal.numpy(), _swish(x), rtol=1e-6)
@@ -340,9 +340,9 @@ def test_jvp_derived_from_portable_vjp_fallback():
 
 def test_grad_without_rule_raises_transform_error_naming_the_block():
     """No rule + no portable -> grad raises TransformError at tf(spec)."""
-    tf = etl.grad(rule_none_loss)
-    with pytest.raises(etl.TransformError, match="rule_none"):
-        tf(etl.TensorSpec((DIM,), etl.float32))
+    tf = evoxc.grad(rule_none_loss)
+    with pytest.raises(evoxc.TransformError, match="rule_none"):
+        tf(evoxc.TensorSpec((DIM,), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------

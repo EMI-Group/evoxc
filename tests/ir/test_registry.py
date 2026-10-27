@@ -1,16 +1,16 @@
 """Op registry tests — the canonical v1 OpDef set and the registry API.
 
-The registry (``etl.ir.op_defs``) declares the contract of every EvoXIR op:
+The registry (``evoxc.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
 set (119 ops) so any accidental addition/removal/rename/effect change in the
-``etl`` package is caught here.
+``evoxc`` package is caught here.
 """
 
 import pytest
 
-from etl import ir
-from etl.ir import op_defs as _op_defs  # private: registry cleanup (see below)
+from evoxc import ir
+from evoxc.ir import op_defs as _op_defs  # private: registry cleanup (see below)
 
 # --- canonical op set ---------------------------------------------------------
 
@@ -469,7 +469,7 @@ def test_register_duplicate_name_raises_valueerror_before_mutation():
 def test_register_new_name_works_and_is_cleaned_up():
     # Registry is global: use a name no other test depends on and remove it
     # afterwards so the canonical 97-op set is never polluted.
-    name = "__etl_test_ephemeral_op__"
+    name = "__evoxc_test_ephemeral_op__"
     assert not ir.has_opdef(name)
     fresh = ir.OpDef(
         name=name,

@@ -1,10 +1,10 @@
 """Regression tests for the fixed block portable-decomposition VJP fallback.
 
-Context: commit 1a88219 fixed ``etl/block/rules.py::_portable_vjp_rule`` —
+Context: commit 1a88219 fixed ``evoxc/block/rules.py::_portable_vjp_rule`` —
 the fallback used to seed its local reverse sweep on the block_call's
 PRE-inline result ids (which are never inserted into the builder), so it
 returned all-``ZeroTangent`` whenever a real cotangent existed. The
-``_repair_portable_vjp`` workaround in ``etl/transforms/autodiff.py`` that
+``_repair_portable_vjp`` workaround in ``evoxc/transforms/autodiff.py`` that
 compensated was deleted. The fixed rule seeds on the POST-inline
 decomposition outputs and guards output-count mismatches with
 ``TransformError`` (never guessing).
@@ -13,14 +13,14 @@ These tests pin the fixed contract for blocks declared with ONLY a portable
 decomposition (decorator form, no explicit batching/jvp/vjp rules, default
 policy resolution ``batching_rule``):
 
-* correct NONZERO input cotangents through ``etl.grad`` / ``etl.vjp`` when a
+* correct NONZERO input cotangents through ``evoxc.grad`` / ``evoxc.vjp`` when a
   real cotangent flows, including non-scalar-output cases (elementwise
   ``y = x * w`` and a small matmul, grads wrt ALL inputs checked against a
   numpy reference) and a nested ordinary-op chain (``tanh(x^2) + sigmoid(x)``
   — no constants);
 * the all-``ZeroTangent`` short-circuit (a path that does not influence the
   loss → zeros) and the per-entry zero-skip for multi-output blocks;
-* ``etl.jvp`` derived from the fixed vjp fallback;
+* ``evoxc.jvp`` derived from the fixed vjp fallback;
 * the output-count guard (portable returning a different number of outputs
   than the declared results → ``TransformError``).
 
@@ -33,14 +33,14 @@ Notes:
 * All blocks are decorator-form portable-only declarations — the fallback
   rules registered at declaration time are exactly what the transforms
   resolve to (nothing explicit overrides them).
-* ``# BUG(etl)`` on ``test_grad_portable_containing_constant_op``: the
+* ``# BUG(evoxc)`` on ``test_grad_portable_containing_constant_op``: the
   fixed local sweep still does not skip ``constant`` ops (see the marker).
 """
 
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 
 DIM = 4
 
@@ -51,7 +51,7 @@ DIM = 4
 
 def _run(graph, *args):
     """Explicit pipeline: lower -> compile -> load -> run (returns structure)."""
-    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+    return evoxc.run(evoxc.load(evoxc.compile(evoxc.lower(graph))), *args)
 
 
 # ---------------------------------------------------------------------------
@@ -60,101 +60,101 @@ def _run(graph, *args):
 
 
 # Non-scalar (vector) output, two inputs: y = x * w.
-@etl.block
-@etl.defn
+@evoxc.block
+@evoxc.defn
 def reg_mul(
-    x: etl.TensorSpec((DIM,), etl.float64),
-    w: etl.TensorSpec((DIM,), etl.float64),
-) -> etl.TensorSpec((DIM,), etl.float64):
-    return etl.multiply(x, w)
+    x: evoxc.TensorSpec((DIM,), evoxc.float64),
+    w: evoxc.TensorSpec((DIM,), evoxc.float64),
+) -> evoxc.TensorSpec((DIM,), evoxc.float64):
+    return evoxc.multiply(x, w)
 
 
-@etl.defn
+@evoxc.defn
 def reg_mul_loss(x, w):
-    return etl.sum(reg_mul(x, w))
+    return evoxc.sum(reg_mul(x, w))
 
 
-@etl.defn
+@evoxc.defn
 def reg_mul_fn(x, w):
     return reg_mul(x, w)
 
 
 # Non-scalar (matrix) output, two inputs: y = a @ b.
-@etl.block
-@etl.defn
+@evoxc.block
+@evoxc.defn
 def reg_mm(
-    a: etl.TensorSpec((DIM, DIM), etl.float64),
-    b: etl.TensorSpec((DIM, DIM), etl.float64),
-) -> etl.TensorSpec((DIM, DIM), etl.float64):
-    return etl.dot(a, b)
+    a: evoxc.TensorSpec((DIM, DIM), evoxc.float64),
+    b: evoxc.TensorSpec((DIM, DIM), evoxc.float64),
+) -> evoxc.TensorSpec((DIM, DIM), evoxc.float64):
+    return evoxc.dot(a, b)
 
 
-@etl.defn
+@evoxc.defn
 def reg_mm_loss(a, b):
-    return etl.sum(reg_mm(a, b))
+    return evoxc.sum(reg_mm(a, b))
 
 
 # Nested ordinary-op chain, no constants: y = tanh(x^2) + sigmoid(x).
-@etl.block
-@etl.defn
-def reg_chain(x: etl.TensorSpec((DIM,), etl.float64)) -> etl.TensorSpec((DIM,), etl.float64):
-    return etl.tanh(etl.square(x)) + etl.sigmoid(x)
+@evoxc.block
+@evoxc.defn
+def reg_chain(x: evoxc.TensorSpec((DIM,), evoxc.float64)) -> evoxc.TensorSpec((DIM,), evoxc.float64):
+    return evoxc.tanh(evoxc.square(x)) + evoxc.sigmoid(x)
 
 
-@etl.defn
+@evoxc.defn
 def reg_chain_loss(x):
-    return etl.sum(reg_chain(x))
+    return evoxc.sum(reg_chain(x))
 
 
-@etl.defn
+@evoxc.defn
 def reg_chain_fn(x):
     return reg_chain(x)
 
 
 # Multi-output portable: grad through only the first output.
-@etl.block
-@etl.defn
+@evoxc.block
+@evoxc.defn
 def reg_pair(
-    x: etl.TensorSpec((DIM,), etl.float64),
-) -> (etl.TensorSpec((DIM,), etl.float64), etl.TensorSpec((DIM,), etl.float64)):
-    return etl.square(x), etl.tanh(x)
+    x: evoxc.TensorSpec((DIM,), evoxc.float64),
+) -> (evoxc.TensorSpec((DIM,), evoxc.float64), evoxc.TensorSpec((DIM,), evoxc.float64)):
+    return evoxc.square(x), evoxc.tanh(x)
 
 
-@etl.defn
+@evoxc.defn
 def reg_pair_loss(x):
-    return etl.sum(reg_pair(x)[0])
+    return evoxc.sum(reg_pair(x)[0])
 
 
 # A portable whose body contains a constant op (2.0 traces to `constant`).
-@etl.block
-@etl.defn
-def reg_const(x: etl.TensorSpec((DIM,), etl.float64)) -> etl.TensorSpec((DIM,), etl.float64):
-    return etl.multiply(x, 2.0)
+@evoxc.block
+@evoxc.defn
+def reg_const(x: evoxc.TensorSpec((DIM,), evoxc.float64)) -> evoxc.TensorSpec((DIM,), evoxc.float64):
+    return evoxc.multiply(x, 2.0)
 
 
-@etl.defn
+@evoxc.defn
 def reg_const_loss(x):
-    return etl.sum(reg_const(x))
+    return evoxc.sum(reg_const(x))
 
 
 # Portable returning MORE outputs than the declared results -> the fallback's
 # output-count guard must raise TransformError (never guess).
-@etl.defn
+@evoxc.defn
 def reg_two_out(x):
-    return x, etl.multiply(x, 2.0)
+    return x, evoxc.multiply(x, 2.0)
 
 
-reg_mismatch = etl.block(
+reg_mismatch = evoxc.block(
     "reg_mismatch",
-    inputs=[etl.TensorSpec((DIM,), etl.float64)],
-    outputs=[etl.TensorSpec((DIM,), etl.float64)],  # declares 1; portable returns 2
+    inputs=[evoxc.TensorSpec((DIM,), evoxc.float64)],
+    outputs=[evoxc.TensorSpec((DIM,), evoxc.float64)],  # declares 1; portable returns 2
     portable=reg_two_out,
 )
 
 
-@etl.defn
+@evoxc.defn
 def reg_mismatch_loss(x):
-    return etl.sum(reg_mismatch(x))
+    return evoxc.sum(reg_mismatch(x))
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +174,8 @@ def test_blocks_are_portable_only_declarations():
     assert reg_chain.has_portable is True
     assert reg_chain.batching_policy == "batching_rule"
     # The fallback vjp rule was registered at declaration time.
-    assert callable(etl.transforms.vjp_rules["block:reg_mul"])
-    assert callable(etl.transforms.vjp_rules["block:reg_chain"])
+    assert callable(evoxc.transforms.vjp_rules["block:reg_mul"])
+    assert callable(evoxc.transforms.vjp_rules["block:reg_chain"])
 
 
 def test_grad_nonzero_cotangents_two_input_portable():
@@ -183,9 +183,9 @@ def test_grad_nonzero_cotangents_two_input_portable():
     x = np.array([0.5, 1.0, 2.0, 3.0])
     w = np.array([2.0, -1.0, 0.5, 4.0])
 
-    tf = etl.grad(reg_mul_loss, argnums=(0, 1))
+    tf = evoxc.grad(reg_mul_loss, argnums=(0, 1))
     graph = tf(
-        etl.TensorSpec((DIM,), etl.float64), etl.TensorSpec((DIM,), etl.float64)
+        evoxc.TensorSpec((DIM,), evoxc.float64), evoxc.TensorSpec((DIM,), evoxc.float64)
     )
     grad_x, grad_w = _run(graph, x, w)
     assert np.any(grad_x.numpy() != 0.0) and np.any(grad_w.numpy() != 0.0)
@@ -199,9 +199,9 @@ def test_vjp_two_input_portable_nontrivial_cotangent():
     w = np.array([2.0, -1.0, 0.5, 4.0])
     ct = np.array([0.1, -0.2, 0.3, 0.4])
 
-    tf = etl.vjp(reg_mul_fn, etl.TensorSpec((DIM,), etl.float64))
+    tf = evoxc.vjp(reg_mul_fn, evoxc.TensorSpec((DIM,), evoxc.float64))
     graph = tf(
-        etl.TensorSpec((DIM,), etl.float64), etl.TensorSpec((DIM,), etl.float64)
+        evoxc.TensorSpec((DIM,), evoxc.float64), evoxc.TensorSpec((DIM,), evoxc.float64)
     )
     primal, (in_ct_x, in_ct_w) = _run(graph, (x, w), (ct,))
     np.testing.assert_allclose(primal.numpy(), x * w, rtol=1e-10, atol=1e-10)
@@ -216,10 +216,10 @@ def test_grad_matmul_portable_both_operands():
     a = rng.randn(DIM, DIM)
     b = rng.randn(DIM, DIM)
 
-    tf = etl.grad(reg_mm_loss, argnums=(0, 1))
+    tf = evoxc.grad(reg_mm_loss, argnums=(0, 1))
     graph = tf(
-        etl.TensorSpec((DIM, DIM), etl.float64),
-        etl.TensorSpec((DIM, DIM), etl.float64),
+        evoxc.TensorSpec((DIM, DIM), evoxc.float64),
+        evoxc.TensorSpec((DIM, DIM), evoxc.float64),
     )
     grad_a, grad_b = _run(graph, a, b)
     ones = np.ones((DIM, DIM))
@@ -232,7 +232,7 @@ def test_grad_nested_chain_portable():
     """d/dx sum(tanh(x^2) + sigmoid(x)) == 2x(1-tanh^2(x^2)) + s(1-s)."""
     x = np.array([0.5, 1.0, 2.0, 3.0])
 
-    graph = etl.grad(reg_chain_loss)(etl.TensorSpec((DIM,), etl.float64))
+    graph = evoxc.grad(reg_chain_loss)(evoxc.TensorSpec((DIM,), evoxc.float64))
     (grad_out,) = _run(graph, x)
     s = 1.0 / (1.0 + np.exp(-x))
     expected = 2.0 * x * (1.0 - np.tanh(x**2) ** 2) + s * (1.0 - s)
@@ -245,8 +245,8 @@ def test_vjp_nested_chain_portable_nontrivial_cotangent():
     x = np.array([0.5, 1.0, 2.0, 3.0])
     ct = np.array([0.1, -0.2, 0.3, 0.4])
 
-    tf = etl.vjp(reg_chain_fn, etl.TensorSpec((DIM,), etl.float64))
-    graph = tf(etl.TensorSpec((DIM,), etl.float64))
+    tf = evoxc.vjp(reg_chain_fn, evoxc.TensorSpec((DIM,), evoxc.float64))
+    graph = tf(evoxc.TensorSpec((DIM,), evoxc.float64))
     primal, (in_ct,) = _run(graph, (x,), (ct,))
     s = 1.0 / (1.0 + np.exp(-x))
     np.testing.assert_allclose(
@@ -267,13 +267,13 @@ def test_grad_zero_cotangent_path_short_circuits_to_zeros():
     x = np.array([0.5, 1.0, 2.0, 3.0])
     w = np.array([2.0, -1.0, 0.5, 4.0])
 
-    @etl.defn
+    @evoxc.defn
     def reg_zero_loss(x, w):
-        return etl.sum(etl.stop_gradient(reg_mul(x, w)))
+        return evoxc.sum(evoxc.stop_gradient(reg_mul(x, w)))
 
-    tf = etl.grad(reg_zero_loss, argnums=(0, 1))
+    tf = evoxc.grad(reg_zero_loss, argnums=(0, 1))
     graph = tf(
-        etl.TensorSpec((DIM,), etl.float64), etl.TensorSpec((DIM,), etl.float64)
+        evoxc.TensorSpec((DIM,), evoxc.float64), evoxc.TensorSpec((DIM,), evoxc.float64)
     )
     grad_x, grad_w = _run(graph, x, w)
     np.testing.assert_array_equal(grad_x.numpy(), np.zeros(DIM))
@@ -288,7 +288,7 @@ def test_grad_multi_output_portable_mixed_cotangents():
     """
     x = np.array([0.5, 1.0, 2.0, 3.0])
 
-    graph = etl.grad(reg_pair_loss)(etl.TensorSpec((DIM,), etl.float64))
+    graph = evoxc.grad(reg_pair_loss)(evoxc.TensorSpec((DIM,), evoxc.float64))
     (grad_out,) = _run(graph, x)
     assert np.any(grad_out.numpy() != 0.0)
     np.testing.assert_allclose(grad_out.numpy(), 2.0 * x, rtol=1e-10, atol=1e-10)
@@ -306,8 +306,8 @@ def test_jvp_derived_from_vjp_fallback_two_input_portable():
     dx = np.array([1.0, 1.0, 1.0, 1.0])
     dw = np.array([0.0, 1.0, 0.0, 1.0])
 
-    spec = etl.TensorSpec((DIM,), etl.float64)
-    tf = etl.jvp(reg_mul_fn, (spec, spec))
+    spec = evoxc.TensorSpec((DIM,), evoxc.float64)
+    tf = evoxc.jvp(reg_mul_fn, (spec, spec))
     graph = tf(spec, spec)
     primal, (tangent,) = _run(graph, (x, w), (dx, dw))
     np.testing.assert_allclose(primal.numpy(), x * w, rtol=1e-10, atol=1e-10)
@@ -324,11 +324,11 @@ def test_jvp_derived_from_vjp_fallback_two_input_portable():
 
 def test_portable_output_count_mismatch_raises_transform_error():
     """Portable returning 2 outputs for 1 declared result -> TransformError."""
-    tf = etl.grad(reg_mismatch_loss)
+    tf = evoxc.grad(reg_mismatch_loss)
     with pytest.raises(
-        etl.TransformError, match="returned 2 outputs for 1 declared results"
+        evoxc.TransformError, match="returned 2 outputs for 1 declared results"
     ):
-        tf(etl.TensorSpec((DIM,), etl.float64))
+        tf(evoxc.TensorSpec((DIM,), evoxc.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -336,24 +336,24 @@ def test_portable_output_count_mismatch_raises_transform_error():
 # ---------------------------------------------------------------------------
 
 
-# BUG(etl): a portable decomposition whose body contains a `constant` op (any
-# literal or etl.constant value feeding an inlined op) fails grad/vjp with
+# BUG(evoxc): a portable decomposition whose body contains a `constant` op (any
+# literal or evoxc.constant value feeding an inlined op) fails grad/vjp with
 # "grad/vjp: no VJP rule for op 'constant'": the local reverse sweep in
-# etl/block/rules.py::_portable_vjp_rule looks up a rule for EVERY inlined op
+# evoxc/block/rules.py::_portable_vjp_rule looks up a rule for EVERY inlined op
 # whose result carries a cotangent, but `constant` has NO registry entry by
-# design — the main sweep in etl/transforms/autodiff.py skips
+# design — the main sweep in evoxc/transforms/autodiff.py skips
 # `proxy.name == "constant"` (zero operands, nothing to propagate backward).
 # The decomposition is a graph of ordinary ops; constants in it must
 # differentiate fine (post-inline seeding), like the batching fallback's
 # "constant ops are unmapped" handling. Minimal repro: block with portable
-# `etl.multiply(x, 2.0)` — the 2.0 traces to a `constant` op — and
+# `evoxc.multiply(x, 2.0)` — the 2.0 traces to a `constant` op — and
 # `grad(sum(block(x)))` raises TransformError instead of returning 2.0.
 # Do NOT skip/xfail/weaken it.
 def test_grad_portable_containing_constant_op():
     """A constant in the portable must not break grad: d/dx sum(2x) == 2."""
     x = np.array([0.5, 1.0, 2.0, 3.0])
 
-    graph = etl.grad(reg_const_loss)(etl.TensorSpec((DIM,), etl.float64))
+    graph = evoxc.grad(reg_const_loss)(evoxc.TensorSpec((DIM,), evoxc.float64))
     (grad_out,) = _run(graph, x)
     assert np.any(grad_out.numpy() != 0.0)
     np.testing.assert_allclose(grad_out.numpy(), np.full(DIM, 2.0), rtol=1e-10, atol=1e-10)

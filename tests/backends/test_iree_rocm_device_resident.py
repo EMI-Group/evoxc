@@ -9,8 +9,8 @@ real ROCm/HIP device through IREE's ``hip`` HAL driver
 (``tests/backends/_rocm_guard.py``) and RUNS on the AMD box.
 
 Pins the explicit-placement execution contract on the ROCm target
-(``etl/backends/adapters/iree.py``: ``Device("rocm", idx)`` -> IREE ``hip``
-driver ``device_id = idx + 1``; ``"hip"`` is the accepted etl alias of the
+(``evoxc/backends/adapters/iree.py``: ``Device("rocm", idx)`` -> IREE ``hip``
+driver ``device_id = idx + 1``; ``"hip"`` is the accepted evoxc alias of the
 ``"rocm"`` kind, same path, label preserved):
 
 * a ``target_backends=["rocm"]`` executable runs the compiled graph on the
@@ -19,7 +19,7 @@ driver ``device_id = idx + 1``; ``"hip"`` is the accepted etl alias of the
   executable's ``core.Device``; ``.numpy()`` on them RAISES
   ``core.DeviceError`` (no implicit device-to-host transfer) — the explicit
   ``t.to(core.Device("cpu", 0)).numpy()`` hop is the only host path;
-* ``etl.zeros(...).to(Device("rocm", 0))`` stages host data onto the device
+* ``evoxc.zeros(...).to(Device("rocm", 0))`` stages host data onto the device
   and yields a rocm-resident tensor (the same explicit-readback rules apply);
 * run-boundary placement (R5): a rocm executable NEVER stages host inputs —
   a cpu:0 tensor (or a raw numpy array, auto-wrapped as cpu:0) raises
@@ -42,7 +42,7 @@ import pytest
 pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-import etl
+import evoxc
 
 from tests.backends import _rocm_guard as guard
 
@@ -57,28 +57,28 @@ XR = np.random.default_rng(7).standard_normal((4, 6)).astype(np.float32)
 XW = np.random.default_rng(11).standard_normal((6, 5)).astype(np.float32)
 
 ADD_SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((4, 6), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
 )
 MLP_SPECS = (
-    etl.TensorSpec((4, 6), etl.float32),
-    etl.TensorSpec((6, 5), etl.float32),
+    evoxc.TensorSpec((4, 6), evoxc.float32),
+    evoxc.TensorSpec((6, 5), evoxc.float32),
 )
 STEP_SPECS = MLP_SPECS
 
 
 def _add(x, y):
-    return etl.add(x, y)
+    return evoxc.add(x, y)
 
 
 def _mlp_sum(x, w):
     """matmul + relu + reduce — the fp32-accumulation-order case (1e-5)."""
-    return etl.sum(etl.relu(etl.dot(x, w)), axes=(1,))
+    return evoxc.sum(evoxc.relu(evoxc.dot(x, w)), axes=(1,))
 
 
 def _step(x, w):
     """One loop step: a matmul/relu branch + a carried state branch."""
-    return etl.relu(etl.dot(x, w)), x + 1.0
+    return evoxc.relu(evoxc.dot(x, w)), x + 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -94,26 +94,26 @@ def _np(v):
     no-op for cpu-kind payloads, and the D2H hop for rocm payloads whose
     bare ``.numpy()`` raises ``DeviceError``.
     """
-    if isinstance(v, etl.Tensor):
-        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
+    if isinstance(v, evoxc.Tensor):
+        return np.asarray(v.to(evoxc.core.Device("cpu", 0)).numpy())
     return np.asarray(v)
 
 
 def _place(host, device):
     """Place host numpy data on ``device`` via the explicit transfer API."""
-    return etl.core.Tensor(host).to(device)
+    return evoxc.core.Tensor(host).to(device)
 
 
 def _assert_exact(got, want):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.array_equal(gp, wp), f"{gp} != {wp}"
 
 
 def _assert_close(got, want, rtol=1e-5, atol=1e-5):
-    g, w = etl.tree_map(_np, got), etl.tree_map(_np, want)
-    for gp, wp in zip(etl.tree_leaves(g), etl.tree_leaves(w)):
+    g, w = evoxc.tree_map(_np, got), evoxc.tree_map(_np, want)
+    for gp, wp in zip(evoxc.tree_leaves(g), evoxc.tree_leaves(w)):
         assert gp.shape == wp.shape
         assert np.allclose(gp, wp, rtol=rtol, atol=atol), f"{gp} != {wp}"
 
@@ -124,7 +124,7 @@ def _assert_device_resident(out, device):
     Duck-typed payload assertions only (the payload class is private): not an
     ndarray, knows its shape/dtype/device, and exposes the ``to_host`` path.
     """
-    assert isinstance(out, etl.Tensor)
+    assert isinstance(out, evoxc.Tensor)
     assert not isinstance(out.data, np.ndarray)  # NOT a numpy-backed tensor
     assert out.device == device  # the executable's core.Device label
     assert hasattr(out.data, "to_host")  # duck-typed payload protocol
@@ -149,7 +149,7 @@ def _build_exe(fn, specs, device, target_backends=("rocm",)):
         kwargs = {"backend": "iree", "device": device}
         if target_backends is not None:
             kwargs["target_backends"] = list(target_backends)
-        exe = etl.build(fn, *specs, **kwargs)
+        exe = evoxc.build(fn, *specs, **kwargs)
         _EXECUTABLES[key] = exe
     return exe
 
@@ -161,7 +161,7 @@ def _build_exe(fn, specs, device, target_backends=("rocm",)):
 
 @pytest.fixture(scope="module")
 def rocm():
-    """The ROCm etl device; ``pytest.skip`` when no HIP device is usable."""
+    """The ROCm evoxc device; ``pytest.skip`` when no HIP device is usable."""
     return guard.require_rocm()
 
 
@@ -172,7 +172,7 @@ def rocm():
 
 def test_rocm_runout_device_resident_and_numpy_parity(rocm):
     exe = _build_exe(_mlp_sum, MLP_SPECS, rocm)
-    out = etl.run(exe, _place(XR, rocm), _place(XW, rocm))
+    out = evoxc.run(exe, _place(XR, rocm), _place(XW, rocm))
     # Payload-backed (never ndarray-backed), labelled with the executable's
     # rocm device, declaring the graph's output shape/dtype.
     _assert_device_resident(out, rocm)
@@ -181,25 +181,25 @@ def test_rocm_runout_device_resident_and_numpy_parity(rocm):
     # fp32 reduction accumulation-order noise: within the documented budget.
     # _np host-materializes through the explicit .to(cpu) hop.
     _assert_close(
-        out, etl.evaluate(_mlp_sum, XR, XW, backend="numpy"), rtol=1e-5, atol=1e-5
+        out, evoxc.evaluate(_mlp_sum, XR, XW, backend="numpy"), rtol=1e-5, atol=1e-5
     )
 
 
 def test_rocm_explicit_pipeline_and_readback(rocm):
     # Full explicit pipeline: trace -> lower -> compile -> load -> run, then
     # the explicit D2H readback (a bare .numpy() on a rocm payload RAISES).
-    graph = etl.trace(_add, *ADD_SPECS)
-    lowered = etl.lower(graph, backend="iree", target_backends=["rocm"])
-    artifact = etl.compile(lowered, target_backends=["rocm"])
-    exe = etl.load(artifact, backend="iree", device=rocm)
-    out = etl.run(exe, _place(XA, rocm), _place(XB, rocm))
+    graph = evoxc.trace(_add, *ADD_SPECS)
+    lowered = evoxc.lower(graph, backend="iree", target_backends=["rocm"])
+    artifact = evoxc.compile(lowered, target_backends=["rocm"])
+    exe = evoxc.load(artifact, backend="iree", device=rocm)
+    out = evoxc.run(exe, _place(XA, rocm), _place(XB, rocm))
     _assert_device_resident(out, rocm)
-    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+    with pytest.raises(evoxc.core.DeviceError, match="no implicit device-to-host"):
         out.numpy()
-    host = out.to(etl.core.Device("cpu", 0))
+    host = out.to(evoxc.core.Device("cpu", 0))
     assert isinstance(host.data, np.ndarray)  # explicit D2H -> host memory
-    assert host.device == etl.core.Device("cpu", 0)
-    _assert_exact(host, etl.evaluate(_add, XA, XB, backend="numpy"))
+    assert host.device == evoxc.core.Device("cpu", 0)
+    _assert_exact(host, evoxc.evaluate(_add, XA, XB, backend="numpy"))
 
 
 # ---------------------------------------------------------------------------
@@ -208,16 +208,16 @@ def test_rocm_explicit_pipeline_and_readback(rocm):
 
 
 def test_zeros_to_rocm_and_explicit_round_trip(rocm):
-    z = etl.zeros((4, 6), etl.float32).to(rocm)
+    z = evoxc.zeros((4, 6), evoxc.float32).to(rocm)
     _assert_device_resident(z, rocm)
     assert z.shape == (4, 6)
     assert z.dtype == np.dtype("float32")
     # No implicit device-to-host transfer, ever.
-    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+    with pytest.raises(evoxc.core.DeviceError, match="no implicit device-to-host"):
         z.numpy()
-    host = z.to(etl.core.Device("cpu", 0))
+    host = z.to(evoxc.core.Device("cpu", 0))
     assert isinstance(host.data, np.ndarray)
-    assert host.device == etl.core.Device("cpu", 0)
+    assert host.device == evoxc.core.Device("cpu", 0)
     np.testing.assert_array_equal(host.numpy(), np.zeros((4, 6), np.float32))
 
 
@@ -230,8 +230,8 @@ def test_host_inputs_rejected_at_run_boundary(rocm):
     exe = _build_exe(_add, ADD_SPECS, rocm)
     # (a) A rocm executable never stages host inputs: feeding host cpu:0
     # tensors raises DeviceError naming the input path + the remedy.
-    with pytest.raises(etl.core.DeviceError) as excinfo:
-        etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    with pytest.raises(evoxc.core.DeviceError) as excinfo:
+        evoxc.run(exe, evoxc.core.Tensor(XA), evoxc.core.Tensor(XB))
     msg = str(excinfo.value)
     assert "input at path [0]" in msg  # the offending input tree path
     assert (
@@ -241,15 +241,15 @@ def test_host_inputs_rejected_at_run_boundary(rocm):
     assert "t.to(" in msg  # the explicit placement remedy
     # (b) Raw numpy arrays auto-wrap as cpu:0 host tensors — same error.
     with pytest.raises(
-        etl.core.DeviceError,
+        evoxc.core.DeviceError,
         match="no implicit device-to-host or host-to-device transfer happens "
         "at the run boundary",
     ):
-        etl.run(exe, XA, XB)
+        evoxc.run(exe, XA, XB)
     # (c) Inputs explicitly placed on the device run bit-exact.
-    out = etl.run(exe, _place(XA, rocm), _place(XB, rocm))
+    out = evoxc.run(exe, _place(XA, rocm), _place(XB, rocm))
     _assert_device_resident(out, rocm)
-    _assert_exact(out, etl.evaluate(_add, XA, XB, backend="numpy"))
+    _assert_exact(out, evoxc.evaluate(_add, XA, XB, backend="numpy"))
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +280,7 @@ def test_same_device_loop_zero_asdevicearray_calls(rocm, monkeypatch):
     monkeypatch.setattr(rt, "asdevicearray", _forbid)
     first = None
     for i in range(5):  # steps 1..5: pure pass-through, first included
-        branch, x = etl.run(exe, x, w)
+        branch, x = evoxc.run(exe, x, w)
         _assert_device_resident(branch, rocm)
         _assert_device_resident(x, rocm)
         assert x.shape == (4, 6) and x.dtype == np.dtype("float32")
@@ -289,7 +289,7 @@ def test_same_device_loop_zero_asdevicearray_calls(rocm, monkeypatch):
     assert calls == []  # ZERO asdevicearray on EVERY step incl. the first
 
     # First-step parity vs the numpy interpreter (the reference).
-    ref_branch, ref_state = etl.evaluate(_step, XR, XW, backend="numpy")
+    ref_branch, ref_state = evoxc.evaluate(_step, XR, XW, backend="numpy")
     _assert_close(first[0], ref_branch, rtol=1e-5, atol=1e-5)
     _assert_close(first[1], ref_state, rtol=1e-5, atol=1e-5)
 
@@ -309,7 +309,7 @@ def test_guard_advertises_usable_rocm_device(rocm):
     indices = guard.available_rocm_indices()
     assert indices, "hip driver reported devices with unreadable device_ids"
     assert guard.pick_rocm_device_index() == indices[0]
-    assert 0 in indices  # iree device_id 1 -> etl Device("rocm", 0)
+    assert 0 in indices  # iree device_id 1 -> evoxc Device("rocm", 0)
     assert rocm == guard.rocm_device()
     assert rocm.kind == "rocm" and rocm.index == 0
     assert guard.skip_unless_rocm is guard.require_rocm  # documented alias
@@ -322,23 +322,23 @@ def test_guard_advertises_usable_rocm_device(rocm):
 def test_hip_kind_alias_same_execution_path(rocm):
     guard.require_rocm()  # the module gate (also covered by the fixture)
     hip = guard.rocm_device(kind="hip")
-    assert hip.kind == "hip" and etl.Device("rocm", 0).index == hip.index
+    assert hip.kind == "hip" and evoxc.Device("rocm", 0).index == hip.index
     exe = _build_exe(_mlp_sum, MLP_SPECS, hip)
-    out = etl.run(exe, _place(XR, hip), _place(XW, hip))
+    out = evoxc.run(exe, _place(XR, hip), _place(XW, hip))
     # The alias preserves its label end to end — the payload/executable are
     # on the hip-kind device, the same code path as "rocm".
     assert out.device == hip
     assert out.device.kind == "hip"
     _assert_device_resident(out, hip)
-    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+    with pytest.raises(evoxc.core.DeviceError, match="no implicit device-to-host"):
         out.numpy()
     _assert_close(
-        out, etl.evaluate(_mlp_sum, XR, XW, backend="numpy"), rtol=1e-5, atol=1e-5
+        out, evoxc.evaluate(_mlp_sum, XR, XW, backend="numpy"), rtol=1e-5, atol=1e-5
     )
     # The same placement contract applies on the alias spelling.
     with pytest.raises(
-        etl.core.DeviceError,
+        evoxc.core.DeviceError,
         match="no implicit device-to-host or host-to-device transfer happens "
         "at the run boundary",
     ):
-        etl.run(exe, XR, XW)
+        evoxc.run(exe, XR, XW)

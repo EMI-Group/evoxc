@@ -1,11 +1,11 @@
 """Contract tests for the linear-algebra / scan ops.
 
-Covers ``etl.ops.linalg`` (``dot``, ``conv``, ``tril``, ``triu``, ``cumsum``,
+Covers ``evoxc.ops.linalg`` (``dot``, ``conv``, ``tril``, ``triu``, ``cumsum``,
 ``solve``, ``eigh``, ``cholesky``, ``qr``, ``matrix_rank``, ``svd``,
-``matrix_exp``), ``etl.ops.reductions.argmax/argmin`` and
-``etl.ops.constant.stop_gradient``. The etl package (repo-root sibling) is
+``matrix_exp``), ``evoxc.ops.reductions.argmax/argmin`` and
+``evoxc.ops.constant.stop_gradient``. The evoxc package (repo-root sibling) is
 fully implemented; these tests assert the per-op contracts documented in the
-``etl/ops/linalg.py`` docstrings and ``etl/ops/CONTEXT.md``:
+``evoxc/ops/linalg.py`` docstrings and ``evoxc/ops/CONTEXT.md``:
 
 - ``dot``: batched matmul (numpy ``matmul`` shape rules); dtype =
   ``np.result_type``; static k-mismatch raises ``ShapeError`` at trace time;
@@ -31,7 +31,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import etl
+import evoxc
 from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 
@@ -60,7 +60,7 @@ def _trace_capturing(fn, *specs):
         captured["out"] = out
         return out
 
-    graph = etl.trace(wrapped, *specs)
+    graph = evoxc.trace(wrapped, *specs)
     return graph, captured["out"]
 
 
@@ -69,13 +69,13 @@ def _trace_capturing(fn, *specs):
 # ---------------------------------------------------------------------------
 
 DOT_TYPE_CASES = [
-    ((2, 3), (3, 4), etl.float32, etl.float32, (2, 4), np.float32),
-    ((3, 4), (4, 2), etl.float64, etl.float64, (3, 2), np.float64),
+    ((2, 3), (3, 4), evoxc.float32, evoxc.float32, (2, 4), np.float32),
+    ((3, 4), (4, 2), evoxc.float64, evoxc.float64, (3, 2), np.float64),
     # NEP-50-agnostic np.result_type promotion (int32 ⊕ float32 → float64)
-    ((2, 3), (3, 4), etl.int32, etl.float32, (2, 4), np.float64),
-    ((2, 4), (4, 3), etl.float16, etl.float16, (2, 3), np.float16),
-    ((1, 5), (5, 1), etl.float64, etl.float64, (1, 1), np.float64),
-    ((2, 3), (3, 4), etl.int64, etl.int64, (2, 4), np.int64),
+    ((2, 3), (3, 4), evoxc.int32, evoxc.float32, (2, 4), np.float64),
+    ((2, 4), (4, 3), evoxc.float16, evoxc.float16, (2, 3), np.float16),
+    ((1, 5), (5, 1), evoxc.float64, evoxc.float64, (1, 1), np.float64),
+    ((2, 3), (3, 4), evoxc.int64, evoxc.int64, (2, 4), np.int64),
 ]
 
 
@@ -86,15 +86,15 @@ def test_dot_shape_and_dtype_inference(
     a_shape, b_shape, a_dtype, b_dtype, out_shape, out_dtype
 ):
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
     graph, out = _trace_capturing(
         f,
-        etl.TensorSpec(a_shape, a_dtype),
-        etl.TensorSpec(b_shape, b_dtype),
+        evoxc.TensorSpec(a_shape, a_dtype),
+        evoxc.TensorSpec(b_shape, b_dtype),
     )
     # Frontend SymbolicTensor contract.
-    assert isinstance(out, etl.SymbolicTensor)
+    assert isinstance(out, evoxc.SymbolicTensor)
     assert tuple(out.shape) == out_shape
     assert out.dtype == np.dtype(out_dtype)
     # IR value type agrees (read back from the op, never computed twice).
@@ -109,7 +109,7 @@ def test_dot_2d_numerics_vs_numpy():
     rng = np.random.default_rng(0)
 
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
     x = rng.standard_normal((3, 5))
     w = rng.standard_normal((5, 4))
@@ -134,10 +134,10 @@ def test_dot_nd_batched_with_broadcast(a_shape, b_shape, out_shape):
     rng = np.random.default_rng(1)
 
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec(a_shape, etl.float64), etl.TensorSpec(b_shape, etl.float64)
+        f, evoxc.TensorSpec(a_shape, evoxc.float64), evoxc.TensorSpec(b_shape, evoxc.float64)
     )
     assert tuple(out.shape) == out_shape
     op = _op(graph, "dot")
@@ -150,16 +150,16 @@ def test_dot_nd_batched_with_broadcast(a_shape, b_shape, out_shape):
 
 def test_dot_symbolic_batch_broadcast():
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
     graph, _ = _trace_capturing(
         f,
-        etl.TensorSpec((etl.dim("b"), 3, 4), etl.float32),
-        etl.TensorSpec((2, 4, 5), etl.float32),
+        evoxc.TensorSpec((evoxc.dim("b"), 3, 4), evoxc.float32),
+        evoxc.TensorSpec((2, 4, 5), evoxc.float32),
     )
     shape = _op(graph, "dot").results[0].type.shape
     # Batch = broadcast((b,), (2,)) → the symbolic statement of numpy's rule.
-    assert isinstance(shape[0], etl.DimExpr)
+    assert isinstance(shape[0], evoxc.DimExpr)
     assert shape[0].evaluate({"b": 1}) == 2
     assert shape[0].evaluate({"b": 7}) == 7
     assert shape[1:] == (3, 5)
@@ -167,15 +167,15 @@ def test_dot_symbolic_batch_broadcast():
 
 def test_dot_k_mismatch_is_static_shape_error():
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
-    with pytest.raises(etl.ShapeError, match="contracting dims 3 and 4 do not match"):
-        etl.trace(f, etl.TensorSpec((2, 3), etl.float32),
-                  etl.TensorSpec((4, 5), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="contracting dims 3 and 4 do not match"):
+        evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.float32),
+                  evoxc.TensorSpec((4, 5), evoxc.float32))
     # Also static inside a batch.
-    with pytest.raises(etl.ShapeError, match="contracting dims 4 and 6 do not match"):
-        etl.trace(f, etl.TensorSpec((2, 3, 4), etl.float32),
-                  etl.TensorSpec((2, 6, 5), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="contracting dims 4 and 6 do not match"):
+        evoxc.trace(f, evoxc.TensorSpec((2, 3, 4), evoxc.float32),
+                  evoxc.TensorSpec((2, 6, 5), evoxc.float32))
 
 
 def test_dot_requires_rank_2_or_more():
@@ -183,14 +183,14 @@ def test_dot_requires_rank_2_or_more():
     (vector dot is an IR-level contract, not exposed by the frontend)."""
 
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
-    with pytest.raises(etl.ShapeError, match="operands must have rank >= 2"):
-        etl.trace(f, etl.TensorSpec((3,), etl.float32),
-                  etl.TensorSpec((3, 4), etl.float32))
-    with pytest.raises(etl.ShapeError, match="operands must have rank >= 2"):
-        etl.trace(f, etl.TensorSpec((2, 3), etl.float32),
-                  etl.TensorSpec((3,), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="operands must have rank >= 2"):
+        evoxc.trace(f, evoxc.TensorSpec((3,), evoxc.float32),
+                  evoxc.TensorSpec((3, 4), evoxc.float32))
+    with pytest.raises(evoxc.ShapeError, match="operands must have rank >= 2"):
+        evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.float32),
+                  evoxc.TensorSpec((3,), evoxc.float32))
 
 
 @pytest.mark.parametrize("side", ["a", "b"])
@@ -199,12 +199,12 @@ def test_dot_size1_k_broadcasts_via_explicit_broadcast_op(side):
     EXPLICIT ``broadcast`` op — sanctioned composition per the ops contract."""
 
     def f(x, w):
-        return etl.dot(x, w)
+        return evoxc.dot(x, w)
 
     a_shape = (2, 3, 1) if side == "a" else (2, 3)
     b_shape = (4, 5) if side == "a" else (1, 4)
-    graph = trace_fn(f, etl.TensorSpec(a_shape, etl.float32),
-                     etl.TensorSpec(b_shape, etl.float32))
+    graph = trace_fn(f, evoxc.TensorSpec(a_shape, evoxc.float32),
+                     evoxc.TensorSpec(b_shape, evoxc.float32))
     names = [op.name for op in ops_of(graph)]
     assert names == ["broadcast", "dot", "return"]
     bcast = ops_of(graph, "broadcast")[0]
@@ -235,7 +235,7 @@ def test_dot_matmul_operator_handler():
         return x @ w
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec((2, 3), etl.float32), etl.TensorSpec((3, 4), etl.float32)
+        f, evoxc.TensorSpec((2, 3), evoxc.float32), evoxc.TensorSpec((3, 4), evoxc.float32)
     )
     assert tuple(out.shape) == (2, 4)
     assert _op(graph, "dot").name == "dot"
@@ -245,8 +245,8 @@ def test_dot_matmul_operator_handler():
 
 
 def test_dot_scalar_scalar_is_trace_error():
-    with pytest.raises(etl.TraceError, match="both operands are Python scalars"):
-        etl.trace(lambda: etl.dot(2.0, 3.0))
+    with pytest.raises(evoxc.TraceError, match="both operands are Python scalars"):
+        evoxc.trace(lambda: evoxc.dot(2.0, 3.0))
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ def _dilate(arr, rates):
 
 def np_conv_ref(x, w, strides=1, padding="VALID", input_dilation=1,
                 kernel_dilation=1, feature_group_size=1, channels_last=False):
-    """Manual numpy cross-correlation implementing the documented etl conv
+    """Manual numpy cross-correlation implementing the documented evoxc conv
     semantics: dilate input and kernel, pad the dilated input, slide with
     strides (NCHW layout; VALID / SAME / int / per-spatial (lo, hi) pairs)."""
     if channels_last:
@@ -371,10 +371,10 @@ CONV_INFERENCE_CASES = [
 @pytest.mark.parametrize("x_shape,w_shape,kwargs,expected", CONV_INFERENCE_CASES)
 def test_conv_shape_inference_formula(x_shape, w_shape, kwargs, expected):
     def f(x, w):
-        return etl.conv(x, w, **kwargs)
+        return evoxc.conv(x, w, **kwargs)
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec(x_shape, etl.float32), etl.TensorSpec(w_shape, etl.float32)
+        f, evoxc.TensorSpec(x_shape, evoxc.float32), evoxc.TensorSpec(w_shape, evoxc.float32)
     )
     assert tuple(out.shape) == expected
     op = _op(graph, "conv")
@@ -393,26 +393,26 @@ def test_conv_symbolic_dims_produce_dimexpr():
     """Out dims are DimExpr formulas; bindings evaluate to the documented
     formula result."""
     def f(x, w):
-        return etl.conv(x, w, strides=2, padding="SAME", kernel_dilation=2)
+        return evoxc.conv(x, w, strides=2, padding="SAME", kernel_dilation=2)
 
     graph, _ = _trace_capturing(
         f,
-        etl.TensorSpec((2, 3, etl.dim("h"), etl.dim("w")), etl.float32),
-        etl.TensorSpec((4, 3, 3, 3), etl.float32),
+        evoxc.TensorSpec((2, 3, evoxc.dim("h"), evoxc.dim("w")), evoxc.float32),
+        evoxc.TensorSpec((4, 3, 3, 3), evoxc.float32),
     )
     shape = _op(graph, "conv").results[0].type.shape
-    assert isinstance(shape[2], etl.DimExpr) and isinstance(shape[3], etl.DimExpr)
+    assert isinstance(shape[2], evoxc.DimExpr) and isinstance(shape[3], evoxc.DimExpr)
     # SAME: out = ceil(d / stride) = (d + stride - 1) // stride.
     assert shape[2].evaluate({"h": 11, "w": 5}) == (11 + 2 - 1) // 2
     assert shape[3].evaluate({"h": 11, "w": 5}) == (5 + 2 - 1) // 2
     # VALID: out = (d - kdil*(k-1) - 1) // stride + 1.
     def g(x, w):
-        return etl.conv(x, w)
+        return evoxc.conv(x, w)
 
     graph2, _ = _trace_capturing(
         g,
-        etl.TensorSpec((2, 3, etl.dim("h"), etl.dim("w")), etl.float32),
-        etl.TensorSpec((4, 3, 3, 3), etl.float32),
+        evoxc.TensorSpec((2, 3, evoxc.dim("h"), evoxc.dim("w")), evoxc.float32),
+        evoxc.TensorSpec((4, 3, 3, 3), evoxc.float32),
     )
     shape2 = _op(graph2, "conv").results[0].type.shape
     assert shape2[2].evaluate({"h": 10, "w": 7}) == _conv_out_dim(10, 3, 1, 0, 0, 1)
@@ -437,7 +437,7 @@ CONV_NUMERIC_CASES = [
 @pytest.mark.parametrize("x_shape,w_shape,kwargs,_id", CONV_NUMERIC_CASES)
 def test_conv_numerics_vs_manual_reference(x_shape, w_shape, kwargs, _id):
     def f(x, w):
-        return etl.conv(x, w, **kwargs)
+        return evoxc.conv(x, w, **kwargs)
 
     rng = np.random.default_rng(3)
     x = rng.integers(0, 100, size=x_shape).astype(np.float32)
@@ -450,10 +450,10 @@ def test_conv_numerics_vs_manual_reference(x_shape, w_shape, kwargs, _id):
 
 def test_conv_mixed_dtype_promotes_result_type():
     def f(x, w):
-        return etl.conv(x, w)
+        return evoxc.conv(x, w)
 
     graph, _ = _trace_capturing(
-        f, etl.TensorSpec((1, 2, 4, 4), etl.int32), etl.TensorSpec((3, 2, 2, 2), etl.float32)
+        f, evoxc.TensorSpec((1, 2, 4, 4), evoxc.int32), evoxc.TensorSpec((3, 2, 2, 2), evoxc.float32)
     )
     assert _op(graph, "conv").results[0].type.dtype == np.result_type(
         np.int32, np.float32
@@ -468,15 +468,15 @@ def test_conv_mixed_dtype_promotes_result_type():
 
 def test_conv_channels_last_is_transpose_sugar():
     def f_nchw(x, w):
-        return etl.conv(x, w, strides=2, padding="SAME")
+        return evoxc.conv(x, w, strides=2, padding="SAME")
 
     def f_cl(x, w):
-        return etl.conv(x, w, strides=2, padding="SAME", channels_last=True)
+        return evoxc.conv(x, w, strides=2, padding="SAME", channels_last=True)
 
     graph, out = _trace_capturing(
         f_cl,
-        etl.TensorSpec((2, 6, 6, 3), etl.float32),
-        etl.TensorSpec((4, 3, 3, 3), etl.float32),
+        evoxc.TensorSpec((2, 6, 6, 3), evoxc.float32),
+        evoxc.TensorSpec((4, 3, 3, 3), evoxc.float32),
     )
     assert tuple(out.shape) == (2, 3, 3, 4)  # (N, *spatial, C_out)
     names = [op.name for op in ops_of(graph)]
@@ -492,27 +492,27 @@ def test_conv_channels_last_is_transpose_sugar():
 
 CONV_ERROR_CASES = [
     ((2, 3), (4, 3, 3), {},
-     etl.ShapeError, "conv: input rank must be >= 3"),
+     evoxc.ShapeError, "conv: input rank must be >= 3"),
     ((2, 3, 5, 5), (4, 3, 3), {},
-     etl.ShapeError, "conv: input and kernel ranks differ: 4 vs 3"),
+     evoxc.ShapeError, "conv: input and kernel ranks differ: 4 vs 3"),
     ((2, 3, 5, 5), (4, 2, 3, 3), {},
-     etl.ShapeError, "conv: kernel in-channels 2 != in_channels 3"),
+     evoxc.ShapeError, "conv: kernel in-channels 2 != in_channels 3"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"strides": 0},
-     etl.ShapeError, "strides entries must be positive ints, got 0"),
+     evoxc.ShapeError, "strides entries must be positive ints, got 0"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"input_dilation": (2, 0)},
-     etl.ShapeError, "input_dilation entries must be positive ints"),
+     evoxc.ShapeError, "input_dilation entries must be positive ints"),
     ((2, 4, 5, 5), (3, 2, 3, 3), {"feature_group_size": 2},
-     etl.ShapeError, "conv: out_channels 3 not divisible by feature_group_size 2"),
+     evoxc.ShapeError, "conv: out_channels 3 not divisible by feature_group_size 2"),
     ((2, 3, 5, 5), (4, 1, 3, 3), {"feature_group_size": 2},
-     etl.ShapeError, "conv: in_channels 3 not divisible by feature_group_count 2"),
+     evoxc.ShapeError, "conv: in_channels 3 not divisible by feature_group_count 2"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"padding": "FOO"},
-     etl.ShapeError, "conv: unknown padding mode 'FOO'"),
+     evoxc.ShapeError, "conv: unknown padding mode 'FOO'"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"padding": ((1, 1),)},
-     etl.ShapeError, "conv: expected 2 padding entries, got 1"),
+     evoxc.ShapeError, "conv: expected 2 padding entries, got 1"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"padding": ((1, -1), (0, 0))},
-     etl.ShapeError, "conv: negative padding"),
+     evoxc.ShapeError, "conv: negative padding"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"strides": (1, 2, 3)},
-     etl.ShapeError, "conv: strides must have 2 entries, got 3"),
+     evoxc.ShapeError, "conv: strides must have 2 entries, got 3"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"channels_last": 1},
      TypeError, "conv: channels_last must be a bool, got 1"),
     ((2, 3, 5, 5), (4, 3, 3, 3), {"strides": "x"},
@@ -528,11 +528,11 @@ CONV_ERROR_CASES = [
 )
 def test_conv_errors(x_shape, w_shape, kwargs, exc, msg):
     def f(x, w):
-        return etl.conv(x, w, **kwargs)
+        return evoxc.conv(x, w, **kwargs)
 
     with pytest.raises(exc, match=msg):
-        etl.trace(f, etl.TensorSpec(x_shape, etl.float32),
-                  etl.TensorSpec(w_shape, etl.float32))
+        evoxc.trace(f, evoxc.TensorSpec(x_shape, evoxc.float32),
+                  evoxc.TensorSpec(w_shape, evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -547,18 +547,18 @@ def _well_conditioned_a(n, rng):
 
 
 SOLVE_NUMERIC_CASES = [
-    (3, 1, etl.float64, False),   # single system, vector b
-    (3, 2, etl.float64, False),   # matrix b (k columns)
-    (2, 1, etl.float64, True),    # batched a (2,3,3), batched b (2,3)
-    (2, 2, etl.float64, True),    # batched a, batched b (2,3,2)
-    (3, 1, etl.float32, False),   # float32 stays float32
+    (3, 1, evoxc.float64, False),   # single system, vector b
+    (3, 2, evoxc.float64, False),   # matrix b (k columns)
+    (2, 1, evoxc.float64, True),    # batched a (2,3,3), batched b (2,3)
+    (2, 2, evoxc.float64, True),    # batched a, batched b (2,3,2)
+    (3, 1, evoxc.float32, False),   # float32 stays float32
 ]
 
 
 @pytest.mark.parametrize("n,k,dtype,batched", SOLVE_NUMERIC_CASES)
 def test_solve_numerics_vs_numpy(n, k, dtype, batched):
     def f(a, b):
-        return etl.solve(a, b)
+        return evoxc.solve(a, b)
 
     rng = np.random.default_rng(5)
     a = _well_conditioned_a(n, rng).astype(dtype)
@@ -577,10 +577,10 @@ def test_solve_numerics_vs_numpy(n, k, dtype, batched):
 
 def test_solve_int_input_promotes_to_float64():
     def f(a, b):
-        return etl.solve(a, b)
+        return evoxc.solve(a, b)
 
     graph, _ = _trace_capturing(
-        f, etl.TensorSpec((3, 3), etl.int32), etl.TensorSpec((3,), etl.int32)
+        f, evoxc.TensorSpec((3, 3), evoxc.int32), evoxc.TensorSpec((3,), evoxc.int32)
     )
     assert _op(graph, "solve").results[0].type.dtype == np.float64
     a = np.array([[4, 1, 0], [1, 4, 1], [0, 1, 4]], dtype=np.int32)
@@ -593,32 +593,32 @@ def test_solve_int_input_promotes_to_float64():
 def test_solve_mixed_int_float_promotes_to_float64():
     """Contract: ANY integer/bool operand → float64 (numpy linalg.solve rule)."""
     def f(a, b):
-        return etl.solve(a, b)
+        return evoxc.solve(a, b)
 
     graph, _ = _trace_capturing(
-        f, etl.TensorSpec((3, 3), etl.int32), etl.TensorSpec((3,), etl.float32)
+        f, evoxc.TensorSpec((3, 3), evoxc.int32), evoxc.TensorSpec((3,), evoxc.float32)
     )
     assert _op(graph, "solve").results[0].type.dtype == np.float64
 
 
 SOLVE_ERROR_CASES = [
-    ((3, 4), (3,), etl.ShapeError, "solve: 'a' must be square, got 3 vs 4"),
-    ((3, 3), (2,), etl.ShapeError, "solve: contracting dims 3 and 2 do not match"),
-    ((2, 3, 3), (5, 3, 3), etl.ShapeError,
+    ((3, 4), (3,), evoxc.ShapeError, "solve: 'a' must be square, got 3 vs 4"),
+    ((3, 3), (2,), evoxc.ShapeError, "solve: contracting dims 3 and 2 do not match"),
+    ((2, 3, 3), (5, 3, 3), evoxc.ShapeError,
      "cannot broadcast incompatible dims 2 and 5"),
-    ((3, 3), (), etl.ShapeError, "solve: 'b' must have rank >= 1"),
-    ((3,), (3,), etl.ShapeError, "solve: 'a' must have rank >= 2"),
+    ((3, 3), (), evoxc.ShapeError, "solve: 'b' must have rank >= 1"),
+    ((3,), (3,), evoxc.ShapeError, "solve: 'a' must have rank >= 2"),
 ]
 
 
 @pytest.mark.parametrize("a_shape,b_shape,exc,msg", SOLVE_ERROR_CASES)
 def test_solve_shape_errors(a_shape, b_shape, exc, msg):
     def f(a, b):
-        return etl.solve(a, b)
+        return evoxc.solve(a, b)
 
     with pytest.raises(exc, match=msg):
-        etl.trace(f, etl.TensorSpec(a_shape, etl.float64),
-                  etl.TensorSpec(b_shape, etl.float64))
+        evoxc.trace(f, evoxc.TensorSpec(a_shape, evoxc.float64),
+                  evoxc.TensorSpec(b_shape, evoxc.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +628,7 @@ def test_solve_shape_errors(a_shape, b_shape, exc, msg):
 @pytest.mark.parametrize("op_name", ["tril", "triu"])
 @pytest.mark.parametrize("k", [-2, -1, 0, 1, 2])
 def test_tril_triu_numerics_vs_numpy(op_name, k):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, k=k)
@@ -641,13 +641,13 @@ def test_tril_triu_numerics_vs_numpy(op_name, k):
 
 @pytest.mark.parametrize("op_name", ["tril", "triu"])
 def test_tril_triu_preserve_shape_and_dtype(op_name):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, k=-1)
 
     graph, out = _trace_capturing(
-        f, etl.TensorSpec((2, 3, 4), etl.float16)
+        f, evoxc.TensorSpec((2, 3, 4), evoxc.float16)
     )
     assert tuple(out.shape) == (2, 3, 4)
     assert out.dtype == np.float16
@@ -662,13 +662,13 @@ def test_tril_triu_preserve_shape_and_dtype(op_name):
 
 @pytest.mark.parametrize("op_name", ["tril", "triu"])
 def test_tril_triu_errors(op_name):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
-    with pytest.raises(etl.ShapeError,
+    with pytest.raises(evoxc.ShapeError,
                        match=f"{op_name}: input must have rank >= 2"):
-        etl.trace(lambda x: op(x), etl.TensorSpec((3,), etl.float32))
+        evoxc.trace(lambda x: op(x), evoxc.TensorSpec((3,), evoxc.float32))
     with pytest.raises(TypeError, match=f"{op_name}: k must be an int, got 0.5"):
-        etl.trace(lambda x: op(x, k=0.5), etl.TensorSpec((3, 3), etl.float32))
+        evoxc.trace(lambda x: op(x, k=0.5), evoxc.TensorSpec((3, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -676,14 +676,14 @@ def test_tril_triu_errors(op_name):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
-@pytest.mark.parametrize("dtype", [etl.float64, etl.float32, etl.int32])
+@pytest.mark.parametrize("dtype", [evoxc.float64, evoxc.float32, evoxc.int32])
 def test_cumsum_numerics_vs_numpy(axis, dtype):
     def f(x):
-        return etl.cumsum(x, axis=axis)
+        return evoxc.cumsum(x, axis=axis)
 
     x = np.arange(12).reshape(3, 4).astype(dtype)
     got = run_numpy(f, x)
-    # dtype is preserved exactly (numpy >= 2 upcasts int32 cumsum — the etl
+    # dtype is preserved exactly (numpy >= 2 upcasts int32 cumsum — the evoxc
     # contract explicitly accumulates in the operand dtype).
     assert got.dtype == np.dtype(dtype)
     np.testing.assert_array_equal(got, np.cumsum(x, axis=axis, dtype=x.dtype))
@@ -692,9 +692,9 @@ def test_cumsum_numerics_vs_numpy(axis, dtype):
 def test_cumsum_bool_promotes_to_int64():
     """Documented rule: bool → int64, implemented as an explicit pre-cast."""
     def f(x):
-        return etl.cumsum(x, axis=1)
+        return evoxc.cumsum(x, axis=1)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3), etl.bool_))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3), evoxc.bool_))
     names = [op.name for op in ops_of(graph)]
     assert names == ["cast", "cumsum", "return"]
     assert out.dtype == np.int64
@@ -709,7 +709,7 @@ def test_cumsum_reverse_scans_from_the_end():
     i.e. out[i] = sum(x[i:]) — equivalently flip(cumsum(flip(x))).
     """
     def f(x):
-        return etl.cumsum(x, axis=1, reverse=True)
+        return evoxc.cumsum(x, axis=1, reverse=True)
 
     x = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]], dtype=np.float64)
     expected = np.flip(np.cumsum(np.flip(x, axis=1), axis=1), axis=1)
@@ -718,7 +718,7 @@ def test_cumsum_reverse_scans_from_the_end():
 
 def test_cumsum_scalar_is_identity():
     def f(x):
-        return etl.cumsum(x, axis=0)
+        return evoxc.cumsum(x, axis=0)
 
     got = run_numpy(f, np.array(3.5, dtype=np.float32))
     assert got.shape == ()
@@ -727,16 +727,16 @@ def test_cumsum_scalar_is_identity():
 
 
 def test_cumsum_errors():
-    with pytest.raises(etl.ShapeError, match="axis 3 out of range for rank 2"):
-        etl.trace(lambda x: etl.cumsum(x, axis=3),
-                  etl.TensorSpec((2, 3), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="axis 3 out of range for rank 2"):
+        evoxc.trace(lambda x: evoxc.cumsum(x, axis=3),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError,
                        match="axes must be None, an int, or a tuple of ints"):
-        etl.trace(lambda x: etl.cumsum(x, axis=1.5),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: evoxc.cumsum(x, axis=1.5),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError, match="cumsum: reverse must be a bool"):
-        etl.trace(lambda x: etl.cumsum(x, axis=0, reverse="yes"),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: evoxc.cumsum(x, axis=0, reverse="yes"),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +747,7 @@ def test_cumsum_errors():
 @pytest.mark.parametrize("axis", [0, 1, -1, None])
 @pytest.mark.parametrize("keepdims", [False, True])
 def test_argmax_argmin_numerics_vs_numpy(op_name, axis, keepdims):
-    op = getattr(etl, op_name)
+    op = getattr(evoxc, op_name)
 
     def f(x):
         return op(x, axis=axis, keepdims=keepdims)
@@ -768,9 +768,9 @@ def test_argmax_argmin_numerics_vs_numpy(op_name, axis, keepdims):
 
 def test_argmax_argmin_result_dtype_is_int64_in_ir():
     def f(x):
-        return etl.argmax(x, axis=0), etl.argmin(x, axis=0)
+        return evoxc.argmax(x, axis=0), evoxc.argmin(x, axis=0)
 
-    graph = trace_fn(f, etl.TensorSpec((3, 4), etl.float32))
+    graph = trace_fn(f, evoxc.TensorSpec((3, 4), evoxc.float32))
     for name in ("argmax", "argmin"):
         op = _op(graph, name)
         assert op.results[0].type.dtype == np.int64
@@ -779,7 +779,7 @@ def test_argmax_argmin_result_dtype_is_int64_in_ir():
 
 def test_argmax_ties_pick_first_index():
     def f(x):
-        return etl.argmax(x, axis=0)
+        return evoxc.argmax(x, axis=0)
 
     x = np.array([[5.0, 1.0, 2.0], [5.0, 3.0, 4.0]])
     np.testing.assert_array_equal(run_numpy(f, x), np.argmax(x, axis=0))
@@ -787,17 +787,17 @@ def test_argmax_ties_pick_first_index():
 
 @pytest.mark.parametrize("op_name", ["argmax", "argmin"])
 def test_argmax_argmin_errors(op_name):
-    op = getattr(etl, op_name)
-    with pytest.raises(etl.ShapeError,
+    op = getattr(evoxc, op_name)
+    with pytest.raises(evoxc.ShapeError,
                        match=f"{op_name}: axis 3 out of range for rank 2"):
-        etl.trace(lambda x: op(x, axis=3), etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: op(x, axis=3), evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError,
                        match=f"{op_name}: axis must be None or an int, got 0.5"):
-        etl.trace(lambda x: op(x, axis=0.5), etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: op(x, axis=0.5), evoxc.TensorSpec((2, 3), evoxc.float32))
     with pytest.raises(TypeError,
                        match=f"{op_name}: keepdims must be a bool, got 1"):
-        etl.trace(lambda x: op(x, axis=0, keepdims=1),
-                  etl.TensorSpec((2, 3), etl.float32))
+        evoxc.trace(lambda x: op(x, axis=0, keepdims=1),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -806,9 +806,9 @@ def test_argmax_argmin_errors(op_name):
 
 def test_stop_gradient_identity_barrier():
     def f(x):
-        return etl.stop_gradient(x)
+        return evoxc.stop_gradient(x)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 3), etl.float32))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 3), evoxc.float32))
     assert tuple(out.shape) == (2, 3)
     assert out.dtype == np.float32
     op = _op(graph, "stop_gradient")
@@ -823,10 +823,10 @@ def test_stop_gradient_identity_barrier():
 
 def test_stop_gradient_passes_value_through():
     def f(x):
-        y = etl.multiply(x, x)
-        return etl.stop_gradient(y)
+        y = evoxc.multiply(x, x)
+        return evoxc.stop_gradient(y)
 
-    graph = trace_fn(f, etl.TensorSpec((2, 3), etl.float32))
+    graph = trace_fn(f, evoxc.TensorSpec((2, 3), evoxc.float32))
     assert [op.name for op in ops_of(graph)] == ["multiply", "stop_gradient", "return"]
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
     np.testing.assert_array_equal(run_numpy(f, x), x * x)
@@ -847,7 +847,7 @@ EIGH_CASES = [(2, np.float32), (3, np.float64), (2, np.int64), (2, np.complex64)
 @pytest.mark.parametrize("n,dtype", EIGH_CASES)
 def test_eigh_numerics_vs_numpy(n, dtype):
     def f(x):
-        return etl.eigh(x)
+        return evoxc.eigh(x)
 
     rng = np.random.default_rng(3)
     x = _symmetric(n, rng, dtype)
@@ -866,7 +866,7 @@ def test_eigh_numerics_vs_numpy(n, dtype):
 
 def test_eigh_dtype_rules():
     def f(x):
-        return etl.eigh(x)
+        return evoxc.eigh(x)
 
     w64, v64 = run_numpy(f, np.eye(2, dtype=np.float64))
     assert w64.dtype == np.float64 and v64.dtype == np.float64
@@ -880,7 +880,7 @@ def test_eigh_dtype_rules():
 
 def test_eigh_batched_vs_numpy():
     def f(x):
-        return etl.eigh(x)
+        return evoxc.eigh(x)
 
     rng = np.random.default_rng(7)
     batch = np.stack([_symmetric(2, rng, np.float64) for _ in range(3)])
@@ -894,9 +894,9 @@ def test_eigh_batched_vs_numpy():
 
 def test_eigh_ir_result_types():
     def f(x):
-        return etl.eigh(x)
+        return evoxc.eigh(x)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((2, 2), etl.float32))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((2, 2), evoxc.float32))
     assert isinstance(out, tuple) and len(out) == 2
     w, v = out
     assert tuple(w.shape) == (2,) and w.dtype == np.float32
@@ -908,20 +908,20 @@ def test_eigh_ir_result_types():
 
 
 def test_eigh_non_square_raises_shape_error():
-    with pytest.raises(etl.ShapeError, match="must be square"):
-        etl.trace(lambda x: etl.eigh(x), etl.TensorSpec((2, 3), etl.float32))
-    with pytest.raises(etl.ShapeError, match="rank >= 2"):
-        etl.trace(lambda x: etl.eigh(x), etl.TensorSpec((2,), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="must be square"):
+        evoxc.trace(lambda x: evoxc.eigh(x), evoxc.TensorSpec((2, 3), evoxc.float32))
+    with pytest.raises(evoxc.ShapeError, match="rank >= 2"):
+        evoxc.trace(lambda x: evoxc.eigh(x), evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_eigh_inside_defn_graph():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        w, v = etl.eigh(x)
-        return etl.solve(x, w)
+        w, v = evoxc.eigh(x)
+        return evoxc.solve(x, w)
 
     x = np.array([[4.0, 1.0], [1.0, 3.0]])
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     wn, _ = np.linalg.eigh(x)
     np.testing.assert_allclose(out.numpy(), np.linalg.solve(x, wn),
                                rtol=1e-12, atol=1e-12)
@@ -937,7 +937,7 @@ CHOLESKY_CASES = [(2, np.float32), (3, np.float64), (2, np.int64)]
 @pytest.mark.parametrize("n,dtype", CHOLESKY_CASES)
 def test_cholesky_numerics_vs_numpy(n, dtype):
     def f(x):
-        return etl.cholesky(x)
+        return evoxc.cholesky(x)
 
     rng = np.random.default_rng(11)
     a = rng.standard_normal((n, n))
@@ -950,7 +950,7 @@ def test_cholesky_numerics_vs_numpy(n, dtype):
 
 def test_cholesky_lower_triangular_reconstructs():
     def f(x):
-        return etl.cholesky(x)
+        return evoxc.cholesky(x)
 
     rng = np.random.default_rng(13)
     a = rng.standard_normal((3, 3))
@@ -962,7 +962,7 @@ def test_cholesky_lower_triangular_reconstructs():
 
 def test_cholesky_batched_vs_numpy():
     def f(x):
-        return etl.cholesky(x)
+        return evoxc.cholesky(x)
 
     rng = np.random.default_rng(17)
     batch = np.stack(
@@ -976,26 +976,26 @@ def test_cholesky_batched_vs_numpy():
 
 def test_cholesky_non_pd_raises_linalg_error():
     def f(x):
-        return etl.cholesky(x)
+        return evoxc.cholesky(x)
 
     with pytest.raises(np.linalg.LinAlgError):
         run_numpy(f, np.array([[1.0, 2.0], [2.0, 1.0]]))
 
 
 def test_cholesky_non_square_raises_shape_error():
-    with pytest.raises(etl.ShapeError, match="must be square"):
-        etl.trace(lambda x: etl.cholesky(x),
-                  etl.TensorSpec((2, 3), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="must be square"):
+        evoxc.trace(lambda x: evoxc.cholesky(x),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
 
 
 def test_cholesky_inside_defn_graph():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        c = etl.cholesky(x)
-        return etl.dot(c, etl.transpose(c))
+        c = evoxc.cholesky(x)
+        return evoxc.dot(c, evoxc.transpose(c))
 
     x = np.array([[4.0, 1.0], [1.0, 3.0]])
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     np.testing.assert_allclose(out.numpy(), x, rtol=1e-12, atol=1e-12)
 
 
@@ -1009,7 +1009,7 @@ QR_CASES = [((3, 2), np.float32), ((2, 3), np.float64), ((2, 2), np.int64)]
 @pytest.mark.parametrize("shape,dtype", QR_CASES)
 def test_qr_numerics_vs_numpy(shape, dtype):
     def f(x):
-        return etl.qr(x)
+        return evoxc.qr(x)
 
     rng = np.random.default_rng(19)
     x = rng.standard_normal(shape).astype(dtype)
@@ -1026,7 +1026,7 @@ def test_qr_numerics_vs_numpy(shape, dtype):
 
 def test_qr_reduced_mode_shapes():
     def f(x):
-        return etl.qr(x)
+        return evoxc.qr(x)
 
     q, r = run_numpy(f, np.ones((4, 2), dtype=np.float64))
     assert q.shape == (4, 2) and r.shape == (2, 2)
@@ -1036,7 +1036,7 @@ def test_qr_reduced_mode_shapes():
 
 def test_qr_batched_vs_numpy():
     def f(x):
-        return etl.qr(x)
+        return evoxc.qr(x)
 
     rng = np.random.default_rng(23)
     batch = rng.standard_normal((3, 2, 2))
@@ -1049,9 +1049,9 @@ def test_qr_batched_vs_numpy():
 
 def test_qr_ir_result_types():
     def f(x):
-        return etl.qr(x)
+        return evoxc.qr(x)
 
-    graph, out = _trace_capturing(f, etl.TensorSpec((3, 2), etl.float32))
+    graph, out = _trace_capturing(f, evoxc.TensorSpec((3, 2), evoxc.float32))
     q, r = out
     assert tuple(q.shape) == (3, 2) and tuple(r.shape) == (2, 2)
     op = _op(graph, "qr")
@@ -1059,13 +1059,13 @@ def test_qr_ir_result_types():
 
 
 def test_qr_inside_defn_graph():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        q, r = etl.qr(x)
-        return etl.dot(q, r)
+        q, r = evoxc.qr(x)
+        return evoxc.dot(q, r)
 
     x = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     np.testing.assert_allclose(out.numpy(), x, rtol=1e-12, atol=1e-12)
 
 
@@ -1075,7 +1075,7 @@ def test_qr_inside_defn_graph():
 
 def test_matrix_rank_known_values():
     def f(x):
-        return etl.matrix_rank(x)
+        return evoxc.matrix_rank(x)
 
     assert run_numpy(f, np.eye(3, dtype=np.float32)) == 3
     assert run_numpy(f, np.zeros((3, 3), dtype=np.float32)) == 0
@@ -1086,7 +1086,7 @@ def test_matrix_rank_known_values():
 
 def test_matrix_rank_dtype_is_int64():
     def f(x):
-        return etl.matrix_rank(x)
+        return evoxc.matrix_rank(x)
 
     out = run_numpy(f, np.eye(2, dtype=np.float32))
     assert out.dtype == np.int64
@@ -1095,7 +1095,7 @@ def test_matrix_rank_dtype_is_int64():
 
 def test_matrix_rank_batched():
     def f(x):
-        return etl.matrix_rank(x)
+        return evoxc.matrix_rank(x)
 
     x = np.stack([np.eye(2), np.zeros((2, 2)), np.ones((2, 2))])
     out = run_numpy(f, x)
@@ -1105,22 +1105,22 @@ def test_matrix_rank_batched():
 
 def test_matrix_rank_tol():
     def f(x):
-        return etl.matrix_rank(x, tol=0.9)
+        return evoxc.matrix_rank(x, tol=0.9)
 
     small = np.diag([1.0, 0.5])
     assert run_numpy(f, small) == 1  # singular value 0.5 < tol
     def g(x):
-        return etl.matrix_rank(x)
+        return evoxc.matrix_rank(x)
     assert run_numpy(g, small) == 2  # auto threshold keeps it
 
 
 def test_matrix_rank_inside_defn_graph():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.matrix_rank(x)
+        return evoxc.matrix_rank(x)
 
     x = np.eye(2, dtype=np.float32)
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     assert int(out.numpy()) == 2
 
 
@@ -1135,7 +1135,7 @@ SVD_CASES = [((3, 2), np.float32), ((2, 3), np.float64), ((2, 2), np.int64),
 @pytest.mark.parametrize("shape,dtype", SVD_CASES)
 def test_svd_numerics_vs_numpy(shape, dtype):
     def f(x):
-        return etl.svd(x)
+        return evoxc.svd(x)
 
     rng = np.random.default_rng(29)
     x = rng.standard_normal(shape).astype(dtype)
@@ -1152,7 +1152,7 @@ def test_svd_numerics_vs_numpy(shape, dtype):
 
 def test_svd_dtype_rules():
     def f(x):
-        return etl.svd(x)
+        return evoxc.svd(x)
 
     u32, s32, vh32 = run_numpy(f, np.eye(2, dtype=np.float32))
     assert u32.dtype == np.float32 and s32.dtype == np.float32
@@ -1164,7 +1164,7 @@ def test_svd_dtype_rules():
 
 def test_svd_batched_vs_numpy():
     def f(x):
-        return etl.svd(x)
+        return evoxc.svd(x)
 
     rng = np.random.default_rng(31)
     batch = rng.standard_normal((3, 2, 2))
@@ -1175,13 +1175,13 @@ def test_svd_batched_vs_numpy():
 
 
 def test_svd_inside_defn_graph():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        u, s, vh = etl.svd(x)
+        u, s, vh = evoxc.svd(x)
         return s
 
     x = np.array([[3.0, 0.0], [0.0, 1.0]])
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     np.testing.assert_allclose(out.numpy(), [3.0, 1.0], rtol=1e-12)
 
 
@@ -1210,7 +1210,7 @@ def _expm_series_ref(a, terms=60):
 
 def test_matrix_exp_known_values():
     def f(x):
-        return etl.matrix_exp(x)
+        return evoxc.matrix_exp(x)
 
     # exp([[0,1],[1,0]]) = [[cosh(1), sinh(1)], [sinh(1), cosh(1)]]
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
@@ -1235,7 +1235,7 @@ def test_matrix_exp_known_values():
 @pytest.mark.parametrize("dtype", [np.float32, np.float64, np.complex64])
 def test_matrix_exp_vs_series_reference(dtype):
     def f(x):
-        return etl.matrix_exp(x)
+        return evoxc.matrix_exp(x)
 
     rng = np.random.default_rng(37)
     x = rng.standard_normal((3, 3)).astype(dtype)
@@ -1249,7 +1249,7 @@ def test_matrix_exp_vs_series_reference(dtype):
 
 def test_matrix_exp_dtype_rule():
     def f(x):
-        return etl.matrix_exp(x)
+        return evoxc.matrix_exp(x)
 
     out = run_numpy(f, np.eye(2, dtype=np.int64))
     assert out.dtype == np.float64
@@ -1258,7 +1258,7 @@ def test_matrix_exp_dtype_rule():
 
 def test_matrix_exp_batched():
     def f(x):
-        return etl.matrix_exp(x)
+        return evoxc.matrix_exp(x)
 
     x = np.stack([np.array([[0.0, 1.0], [1.0, 0.0]]), np.eye(2) * 2.0])
     out = run_numpy(f, x)
@@ -1273,7 +1273,7 @@ def test_matrix_exp_symmetric_matches_eigh_composition():
     """Symmetric matrices: exp(A) = V diag(exp(w)) V^T — the composition
     consumers rely on (e.g. CMAES-style updates)."""
     def f(x):
-        return etl.matrix_exp(x)
+        return evoxc.matrix_exp(x)
 
     rng = np.random.default_rng(41)
     a = rng.standard_normal((3, 3))
@@ -1285,21 +1285,21 @@ def test_matrix_exp_symmetric_matches_eigh_composition():
 
 
 def test_matrix_exp_non_square_raises_shape_error():
-    with pytest.raises(etl.ShapeError, match="must be square"):
-        etl.trace(lambda x: etl.matrix_exp(x),
-                  etl.TensorSpec((2, 3), etl.float32))
-    with pytest.raises(etl.ShapeError, match="rank >= 2"):
-        etl.trace(lambda x: etl.matrix_exp(x),
-                  etl.TensorSpec((2,), etl.float32))
+    with pytest.raises(evoxc.ShapeError, match="must be square"):
+        evoxc.trace(lambda x: evoxc.matrix_exp(x),
+                  evoxc.TensorSpec((2, 3), evoxc.float32))
+    with pytest.raises(evoxc.ShapeError, match="rank >= 2"):
+        evoxc.trace(lambda x: evoxc.matrix_exp(x),
+                  evoxc.TensorSpec((2,), evoxc.float32))
 
 
 def test_matrix_exp_inside_defn_graph():
-    @etl.defn
+    @evoxc.defn
     def f(x):
-        return etl.matrix_exp(x)
+        return evoxc.matrix_exp(x)
 
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
-    out = etl.evaluate(f, x)
+    out = evoxc.evaluate(f, x)
     np.testing.assert_allclose(
         out.numpy(), [[np.cosh(1), np.sinh(1)], [np.sinh(1), np.cosh(1)]],
         rtol=1e-12, atol=1e-12)

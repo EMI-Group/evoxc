@@ -2,7 +2,7 @@
 
 ``test_adapter_iree.py``, ``test_adapter_xla.py`` and ``test_adapter_tvm.py``
 exercise ONE contract — the shared ``CompilerBackend`` framework
-(``etl/backends/compiler.py``) plus each adapter's real compile/load/run
+(``evoxc/backends/compiler.py``) plus each adapter's real compile/load/run
 through its compiler dependency — against three different dependencies. The
 three files differ only in which dependency they import and which backend
 name they use; the graphs, tolerances and parity checks live here so the
@@ -16,7 +16,7 @@ The underscore prefix keeps this module out of collection entirely
 
 import numpy as np
 
-import etl
+import evoxc
 
 # Cross-compiler float tolerance. IREE/XLA/TVM run the real StableHLO
 # lowering/fusion pipeline, so fp32 results may differ from the numpy
@@ -39,11 +39,11 @@ def matmul_relu_sum():
     """``fn(a, b) = sum(relu(dot(a, b)))`` over (4, 8) x (8, 4)."""
 
     def fn(a, b):
-        return etl.sum(etl.relu(etl.dot(a, b)))
+        return evoxc.sum(evoxc.relu(evoxc.dot(a, b)))
 
     return fn, (
-        etl.TensorSpec((4, 8), etl.float32),
-        etl.TensorSpec((8, 4), etl.float32),
+        evoxc.TensorSpec((4, 8), evoxc.float32),
+        evoxc.TensorSpec((8, 4), evoxc.float32),
     )
 
 
@@ -55,11 +55,11 @@ def reshape_broadcast_transpose():
     """``fn(x) = transpose(broadcast(reshape(x, (2, 4, 4)), (3, 2, 4, 4)), (0, 2, 1, 3))``."""
 
     def fn(x):
-        r = etl.reshape(x, (2, 4, 4))
-        b = etl.broadcast(r, (3, 2, 4, 4))
-        return etl.transpose(b, (0, 2, 1, 3))
+        r = evoxc.reshape(x, (2, 4, 4))
+        b = evoxc.broadcast(r, (3, 2, 4, 4))
+        return evoxc.transpose(b, (0, 2, 1, 3))
 
-    return fn, (etl.TensorSpec((4, 8), etl.float32),)
+    return fn, (evoxc.TensorSpec((4, 8), evoxc.float32),)
 
 
 def symbolic_scale():
@@ -68,23 +68,23 @@ def symbolic_scale():
     def fn(x):
         return x * 2.0 + 1.0
 
-    return fn, (etl.TensorSpec((etl.dim("B"),), etl.float32),)
+    return fn, (evoxc.TensorSpec((evoxc.dim("B"),), evoxc.float32),)
 
 
 def symbolic_softmax():
     """``fn(x) = softmax(x)`` over a symbolic ``(B, 16)`` batch.
 
     The keepdims reduces produce dynamic keepdims reshapes ((B,) -> (B, 1)),
-    which the StableHLO writer must reject at lower() time with etl's own
+    which the StableHLO writer must reject at lower() time with evoxc's own
     BackendError — never invalid MLIR that dies later with a compiler parse
     error or runtime abort (see ``Writer._reject_dynamic_dims``).
     """
 
     def fn(x):
-        e = etl.exp(x - etl.max(x, axes=1, keepdims=True))
-        return e / etl.sum(e, axes=1, keepdims=True)
+        e = evoxc.exp(x - evoxc.max(x, axes=1, keepdims=True))
+        return e / evoxc.sum(e, axes=1, keepdims=True)
 
-    return fn, (etl.TensorSpec((etl.dim("B"), 16), etl.float32),)
+    return fn, (evoxc.TensorSpec((evoxc.dim("B"), 16), evoxc.float32),)
 
 
 def symbolic_slice():
@@ -96,9 +96,9 @@ def symbolic_slice():
     """
 
     def fn(x):
-        return etl.slice(x, (0, 0), (2, 4))
+        return evoxc.slice(x, (0, 0), (2, 4))
 
-    return fn, (etl.TensorSpec((etl.dim("B"), 4), etl.float32),)
+    return fn, (evoxc.TensorSpec((evoxc.dim("B"), 4), evoxc.float32),)
 
 
 def symbolic_pad():
@@ -109,13 +109,13 @@ def symbolic_pad():
     """
 
     def fn(x):
-        return etl.pad(x, [[0, 0], [1, 1]])
+        return evoxc.pad(x, [[0, 0], [1, 1]])
 
-    return fn, (etl.TensorSpec((etl.dim("B"), 4), etl.float32),)
+    return fn, (evoxc.TensorSpec((evoxc.dim("B"), 4), evoxc.float32),)
 
 
 def _dot_fn(a, b):
-    return etl.dot(a, b)
+    return evoxc.dot(a, b)
 
 
 def batched_dot_cases():
@@ -127,20 +127,20 @@ def batched_dot_cases():
     return {
         "rank3_rank2": (
             _dot_fn,
-            (etl.TensorSpec((4, 512, 768), etl.float32),
-             etl.TensorSpec((768, 2304), etl.float32)),
+            (evoxc.TensorSpec((4, 512, 768), evoxc.float32),
+             evoxc.TensorSpec((768, 2304), evoxc.float32)),
             (standard_normal((4, 512, 768)), standard_normal((768, 2304))),
         ),
         "rhs_higher_rank": (
             _dot_fn,
-            (etl.TensorSpec((512, 768), etl.float32),
-             etl.TensorSpec((4, 768, 2304), etl.float32)),
+            (evoxc.TensorSpec((512, 768), evoxc.float32),
+             evoxc.TensorSpec((4, 768, 2304), evoxc.float32)),
             (standard_normal((512, 768)), standard_normal((4, 768, 2304))),
         ),
         "size1_rhs_batch": (
             _dot_fn,
-            (etl.TensorSpec((4, 512, 768), etl.float32),
-             etl.TensorSpec((1, 768, 2304), etl.float32)),
+            (evoxc.TensorSpec((4, 512, 768), evoxc.float32),
+             evoxc.TensorSpec((1, 768, 2304), evoxc.float32)),
             (standard_normal((4, 512, 768)), standard_normal((1, 768, 2304))),
         ),
     }
@@ -153,8 +153,8 @@ def batched_dot_symbolic():
     so one compiled executable serves every concrete batch size."""
 
     return _dot_fn, (
-        etl.TensorSpec((etl.dim("B"), 512, 768), etl.float32),
-        etl.TensorSpec((768, 2304), etl.float32),
+        evoxc.TensorSpec((evoxc.dim("B"), 512, 768), evoxc.float32),
+        evoxc.TensorSpec((768, 2304), evoxc.float32),
     )
 
 
@@ -166,36 +166,36 @@ def runtime_call_graph():
     """A verified graph carrying a ``runtime_call`` op (module-level callback)."""
 
     def fn(x):
-        return etl.runtime_call(
-            _double_callback, x, result=etl.TensorSpec((4,), etl.float32)
+        return evoxc.runtime_call(
+            _double_callback, x, result=evoxc.TensorSpec((4,), evoxc.float32)
         )
 
-    return etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 def collective_graph():
     """A verified graph carrying an explicit ``dist.all_reduce`` collective."""
 
     def fn(x):
-        return etl.dist.all_reduce(x)
+        return evoxc.dist.all_reduce(x)
 
-    return etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+    return evoxc.trace(fn, evoxc.TensorSpec((4,), evoxc.float32))
 
 
 def stage(backend_name, fn, specs):
     """Front half of the pipeline via backend-name resolution: trace → lower → compile."""
-    graph = etl.trace(fn, *specs)
-    lowered = etl.lower(graph, backend=backend_name)
-    artifact = etl.compile(lowered)
+    graph = evoxc.trace(fn, *specs)
+    lowered = evoxc.lower(graph, backend=backend_name)
+    artifact = evoxc.compile(lowered)
     return graph, lowered, artifact
 
 
 def assert_parity(fn, args, executable):
     """Run ``fn`` through ``executable`` and compare against the default
     numpy-backend evaluation at the cross-compiler fp tolerance."""
-    expected = etl.evaluate(fn, *args)  # default numpy reference
-    actual = etl.run(executable, *args)
-    assert isinstance(actual, etl.Tensor)
+    expected = evoxc.evaluate(fn, *args)  # default numpy reference
+    actual = evoxc.run(executable, *args)
+    assert isinstance(actual, evoxc.Tensor)
     assert actual.dtype == expected.dtype
     np.testing.assert_allclose(
         actual.numpy(), expected.numpy(), rtol=FP32_RTOL, atol=FP32_ATOL

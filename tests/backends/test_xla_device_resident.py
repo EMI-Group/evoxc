@@ -1,7 +1,7 @@
 """xla adapter device-resident staging semantics (regression suite).
 
 Pins the EXPLICIT device-placement execution contract for the xla adapter
-(``etl/backends/adapters/xla.py`` + ``xla_util.py``), exercised against the
+(``evoxc/backends/adapters/xla.py`` + ``xla_util.py``), exercised against the
 TEST-ONLY fake PJRT plugin built from C at test time (the same fake as
 ``test_pjrt_ctypes_plugin.py``; zero-filled outputs, ONE addressable
 device, no computation):
@@ -41,16 +41,16 @@ import gc
 import numpy as np
 import pytest
 
-import etl
-from etl.backends.adapters import xla
-from etl.backends.adapters import xla_util
+import evoxc
+from evoxc.backends.adapters import xla
+from evoxc.backends.adapters import xla_util
 
 from tests.backends import _adapter_utils as u
 from tests.backends.test_pjrt_ctypes_plugin import _build_plugin, _compile_fake
 
 NAME = "xla"
-CPU = etl.core.Device("cpu", 0)
-CUDA0 = etl.core.Device("cuda", 0)
+CPU = evoxc.core.Device("cpu", 0)
+CUDA0 = evoxc.core.Device("cuda", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -60,13 +60,13 @@ CUDA0 = etl.core.Device("cuda", 0)
 
 def _activate(fake_plugin, monkeypatch):
     """Point plugin discovery at the fake .so and (re)activate the adapter."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_plugin))
     xla.register()  # idempotent; also (re)installs the "cuda" placement provider
 
 
 def _load_raw(artifact, device=CUDA0):
     """Backend-level load on ``device`` (the raw ``XlaExecutable``)."""
-    return etl.backends.get(NAME).load(artifact, device=device)
+    return evoxc.backends.get(NAME).load(artifact, device=device)
 
 
 def _assert_device_resident(out, device):
@@ -76,7 +76,7 @@ def _assert_device_resident(out, device):
     ``IreeDevicePayload``): not an ndarray, knows shape/dtype/device, and
     exposes the explicit ``to_host`` path.
     """
-    assert isinstance(out, etl.Tensor)
+    assert isinstance(out, evoxc.Tensor)
     assert isinstance(out.data, xla.XlaDevicePayload)
     assert not isinstance(out.data, np.ndarray)  # NOT numpy-backed
     assert out.device == device
@@ -99,8 +99,8 @@ def test_cuda_runout_device_resident(tmp_path, monkeypatch):
     assert raw.device == CUDA0  # the load device is the executable's device
 
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)  # numpy reference (shape/dtype only)
-    xa, xb = etl.core.Tensor(a).to(CUDA0), etl.core.Tensor(b).to(CUDA0)
+    expected = evoxc.evaluate(fn, a, b)  # numpy reference (shape/dtype only)
+    xa, xb = evoxc.core.Tensor(a).to(CUDA0), evoxc.core.Tensor(b).to(CUDA0)
     (out,) = raw.run([xa, xb])
     _assert_device_resident(out, CUDA0)
     assert out.shape == expected.shape
@@ -109,7 +109,7 @@ def test_cuda_runout_device_resident(tmp_path, monkeypatch):
     # Semantic pin (explicit-placement model): a non-cpu run-out payload
     # NEVER transfers implicitly — .numpy() raises DeviceError; the
     # explicit .to(cpu) hop is the only host path.
-    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+    with pytest.raises(evoxc.core.DeviceError, match="no implicit device-to-host"):
         out.numpy()
     host = out.to(CPU)
     assert isinstance(host.data, np.ndarray)  # explicit D2H -> host memory
@@ -118,8 +118,8 @@ def test_cuda_runout_device_resident(tmp_path, monkeypatch):
     np.testing.assert_array_equal(host.numpy(), np.zeros_like(expected.numpy()))
 
     # The pipeline-level run reaches the same device-resident path.
-    exe = etl.load(artifact, device=CUDA0)
-    pipeline_out = etl.run(exe, xa, xb)
+    exe = evoxc.load(artifact, device=CUDA0)
+    pipeline_out = evoxc.run(exe, xa, xb)
     _assert_device_resident(pipeline_out, CUDA0)
     np.testing.assert_array_equal(
         pipeline_out.to(CPU).numpy(), np.zeros_like(expected.numpy())
@@ -144,7 +144,7 @@ def test_rank0_staging_scalar_shape(tmp_path, monkeypatch):
     plug = _build_plugin(tmp_path, "fake_devres_rank0.so")
     _activate(plug, monkeypatch)
     for value, dtype in ((42, np.int64), (7, np.int32), (2.5, np.float32)):
-        t = etl.core.Tensor(np.array(value, dtype=dtype)).to(CUDA0)
+        t = evoxc.core.Tensor(np.array(value, dtype=dtype)).to(CUDA0)
         _assert_device_resident(t, CUDA0)
         assert t.shape == (), f"rank-0 staged as {t.shape!r}, not ()"
         assert t.dtype == np.dtype(dtype)
@@ -162,10 +162,10 @@ def test_rank0_staging_scalar_shape(tmp_path, monkeypatch):
 def _step(x):
     """An iterative step graph: output shape == input shape, so each step's
     output feeds back as the next step's input (the evox loop pattern)."""
-    return etl.add(x, 1.0)
+    return evoxc.add(x, 1.0)
 
 
-STEP_SPECS = (etl.TensorSpec((4, 8), etl.float32),)
+STEP_SPECS = (evoxc.TensorSpec((4, 8), evoxc.float32),)
 
 
 def test_same_device_loop_zero_host_staging(tmp_path, monkeypatch):
@@ -195,8 +195,8 @@ def test_same_device_loop_zero_host_staging(tmp_path, monkeypatch):
     # Seed: the explicit one-time placement (the bootstrap host->device
     # upload) — the ONLY staging event of the whole workload.
     x0 = u.standard_normal((4, 8))
-    expected = etl.evaluate(_step, x0)
-    state = etl.core.Tensor(x0).to(CUDA0)
+    expected = evoxc.evaluate(_step, x0)
+    state = evoxc.core.Tensor(x0).to(CUDA0)
     assert len(stages) == 1  # one staged seed
     assert stages[0][1] == 0  # staged on cuda device 0
     stages.clear()
@@ -232,9 +232,9 @@ def test_host_inputs_require_explicit_placement(tmp_path, monkeypatch):
     # arrays, auto-wrapped as cpu:0) to a cuda executable raises
     # DeviceError naming the input path and the t.to(...) remedy, BEFORE
     # the backend is dispatched.
-    exe = etl.load(artifact, device=CUDA0)
-    with pytest.raises(etl.core.DeviceError) as excinfo:
-        etl.run(exe, etl.core.Tensor(a), etl.core.Tensor(b))
+    exe = evoxc.load(artifact, device=CUDA0)
+    with pytest.raises(evoxc.core.DeviceError) as excinfo:
+        evoxc.run(exe, evoxc.core.Tensor(a), evoxc.core.Tensor(b))
     msg = str(excinfo.value)
     assert "input at path [0]" in msg
     assert (
@@ -243,21 +243,21 @@ def test_host_inputs_require_explicit_placement(tmp_path, monkeypatch):
     )
     assert "t.to(" in msg
     with pytest.raises(
-        etl.core.DeviceError,
+        evoxc.core.DeviceError,
         match="no implicit device-to-host or host-to-device transfer happens "
         "at the run boundary",
     ):
-        etl.run(exe, a, b)
+        evoxc.run(exe, a, b)
 
     # (b) Backend-level defense: a direct raw.run([...]) call never stages
     # host inputs for a device-resident executable.
     raw = _load_raw(artifact)
-    with pytest.raises(etl.core.DeviceError, match="never stages host inputs"):
-        raw.run([etl.core.Tensor(a), etl.core.Tensor(b)])
+    with pytest.raises(evoxc.core.DeviceError, match="never stages host inputs"):
+        raw.run([evoxc.core.Tensor(a), evoxc.core.Tensor(b)])
 
     # (c) Inputs placed explicitly via .to(cuda) run fine.
     (out,) = raw.run(
-        [etl.core.Tensor(a).to(CUDA0), etl.core.Tensor(b).to(CUDA0)]
+        [evoxc.core.Tensor(a).to(CUDA0), evoxc.core.Tensor(b).to(CUDA0)]
     )
     _assert_device_resident(out, CUDA0)
 
@@ -272,11 +272,11 @@ def test_cross_device_input_rejected(tmp_path, monkeypatch):
     # A payload on the right device from a DIFFERENT client (different
     # plugin path) is never silently mixed into the execution.
     other_plug = _build_plugin(tmp_path, "fake_devres_other.so")
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(other_plug))
-    foreign = etl.core.Tensor(a).to(CUDA0)
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(plug))
-    with pytest.raises(etl.core.DeviceError, match="different PJRT client"):
-        raw.run([foreign, etl.core.Tensor(b).to(CUDA0)])
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(other_plug))
+    foreign = evoxc.core.Tensor(a).to(CUDA0)
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(plug))
+    with pytest.raises(evoxc.core.DeviceError, match="different PJRT client"):
+        raw.run([foreign, evoxc.core.Tensor(b).to(CUDA0)])
 
 
 # ---------------------------------------------------------------------------
@@ -289,29 +289,29 @@ def test_load_device_validation(tmp_path, monkeypatch):
     _activate(plug, monkeypatch)
     fn, specs = u.matmul_relu_sum()
     artifact = _compile_fake(fn, specs, plug)
-    backend = etl.backends.get(NAME)
+    backend = evoxc.backends.get(NAME)
 
     # Out-of-range cuda index -> BackendError naming the device count.
-    with pytest.raises(etl.BackendError, match="addressable device"):
-        backend.load(artifact, device=etl.core.Device("cuda", 999))
+    with pytest.raises(evoxc.BackendError, match="addressable device"):
+        backend.load(artifact, device=evoxc.core.Device("cuda", 999))
     # Unknown kind -> BackendError naming the supported set.
-    with pytest.raises(etl.BackendError, match="supports CPU"):
-        backend.load(artifact, device=etl.core.Device("gpu", 0))
+    with pytest.raises(evoxc.BackendError, match="supports CPU"):
+        backend.load(artifact, device=evoxc.core.Device("gpu", 0))
     # Non-zero cpu index -> DeviceError (only Device('cpu', 0) exists).
-    with pytest.raises(etl.core.DeviceError, match="only Device\\('cpu', 0\\)"):
-        backend.load(artifact, device=etl.core.Device("cpu", 1))
+    with pytest.raises(evoxc.core.DeviceError, match="only Device\\('cpu', 0\\)"):
+        backend.load(artifact, device=evoxc.core.Device("cpu", 1))
     # Non-Device -> DeviceError.
-    with pytest.raises(etl.core.DeviceError, match="core.Device"):
+    with pytest.raises(evoxc.core.DeviceError, match="core.Device"):
         backend.load(artifact, device="cuda")  # type: ignore[arg-type]
 
     # Default (None) and explicit cpu:0 loads stay on the historical CPU
     # staging path (host in -> host out).
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)
-    for dev in (None, etl.core.Device("cpu", 0)):
+    expected = evoxc.evaluate(fn, a, b)
+    for dev in (None, evoxc.core.Device("cpu", 0)):
         raw = backend.load(artifact, device=dev)
-        assert raw.device == etl.core.Device("cpu", 0)
-        (out,) = raw.run([etl.core.Tensor(a), etl.core.Tensor(b)])
+        assert raw.device == evoxc.core.Device("cpu", 0)
+        (out,) = raw.run([evoxc.core.Tensor(a), evoxc.core.Tensor(b)])
         assert isinstance(out.data, np.ndarray)  # cpu path copies back
         np.testing.assert_array_equal(out.numpy(), np.zeros_like(expected.numpy()))
 
@@ -328,8 +328,8 @@ def test_payload_keeps_client_alive_and_client_dies_at_last_payload(tmp_path, mo
     artifact = _compile_fake(fn, specs, plug)
     raw = _load_raw(artifact)
     a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)
-    xa, xb = etl.core.Tensor(a).to(CUDA0), etl.core.Tensor(b).to(CUDA0)
+    expected = evoxc.evaluate(fn, a, b)
+    xa, xb = evoxc.core.Tensor(a).to(CUDA0), evoxc.core.Tensor(b).to(CUDA0)
     (out,) = raw.run([xa, xb])
 
     # References: executable (1) + xa payload (1) + xb payload (1) + out
@@ -395,11 +395,11 @@ def test_placement_provider_contract(tmp_path, monkeypatch):
     a = u.standard_normal((4, 8))
 
     # The provider is the xla adapter's upload_tensor under the PER-BACKEND
-    # slot ("cuda", "xla") — the shared flat slot keeps etl.backends' lazy
+    # slot ("cuda", "xla") — the shared flat slot keeps evoxc.backends' lazy
     # thunk (no last-wins clobbering across backends) and _activate's
-    # etl.backends.get("xla") made xla the preferred cuda transfer backend.
-    from etl.backends import _cuda_transfer_thunk
-    from etl.core.tensor import (
+    # evoxc.backends.get("xla") made xla the preferred cuda transfer backend.
+    from evoxc.backends import _cuda_transfer_thunk
+    from evoxc.core.tensor import (
         _DEVICE_TRANSFER_PROVIDERS,
         _get_backend_device_transfer_provider,
         _get_preferred_transfer_backend,
@@ -410,17 +410,17 @@ def test_placement_provider_contract(tmp_path, monkeypatch):
     assert _DEVICE_TRANSFER_PROVIDERS["cuda"] is _cuda_transfer_thunk
 
     # Bootstrap placement: host cpu:0 -> cuda 0 via BufferFromHostBuffer.
-    xa = etl.core.Tensor(a).to(CUDA0)
+    xa = evoxc.core.Tensor(a).to(CUDA0)
     _assert_device_resident(xa, CUDA0)
     # Same-device .to() is a no-op (returns self, zero staging).
     assert xa.to(CUDA0) is xa
 
     # Out-of-range cuda index on a HOST source -> the provider raises
     # BackendError naming the device count.
-    with pytest.raises(etl.BackendError, match="addressable device"):
-        etl.core.Tensor(a).to(etl.core.Device("cuda", 5))
+    with pytest.raises(evoxc.BackendError, match="addressable device"):
+        evoxc.core.Tensor(a).to(evoxc.core.Device("cuda", 5))
     # A payload-backed source to a DIFFERENT non-cpu target raises the core
     # cross-device DeviceError BEFORE the provider is consulted (the
     # explicit two-hop .to(cpu).to(target) is the remedy).
-    with pytest.raises(etl.core.DeviceError, match="cross-device copies"):
-        xa.to(etl.core.Device("cuda", 1))
+    with pytest.raises(evoxc.core.DeviceError, match="cross-device copies"):
+        xa.to(evoxc.core.Device("cuda", 1))

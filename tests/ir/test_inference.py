@@ -1,8 +1,8 @@
-"""Shape-inference hook tests for EvoXIR (``etl.ir.inference``).
+"""Shape-inference hook tests for EvoXIR (``evoxc.ir.inference``).
 
-Encodes the exact semantics documented in ``etl/ir/inference.py`` for all 23
+Encodes the exact semantics documented in ``evoxc/ir/inference.py`` for all 23
 public hooks, plus the KNOWN current contracts recorded in
-``etl/ir/CONTEXT.md`` ("Known Issues"):
+``evoxc/ir/CONTEXT.md`` ("Known Issues"):
 
 * ``divide`` binds ``infer_elementwise_binary`` — int/int stays int;
 * unary math ops (``sqrt``, ``exp``, ...) bind ``infer_elementwise_unary`` —
@@ -34,8 +34,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from etl import ir
-from etl.core import Dim, DimExpr, ShapeError
+from evoxc import ir
+from evoxc.core import Dim, DimExpr, ShapeError
 
 INF = ir.inference
 VT = ir.ValueType
@@ -671,7 +671,7 @@ def test_infer_identity_empty():
 
 
 def test_known_issues_current_opdef_wiring():
-    # CURRENT contract (etl/ir/CONTEXT.md "Known Issues"): these ops bind the
+    # CURRENT contract (evoxc/ir/CONTEXT.md "Known Issues"): these ops bind the
     # generic hooks; the ../ops binding contract will later replace them with
     # dedicated hooks (true division, unary-math promotion, cumsum promotion).
     assert ir.opdef("divide").shape_fn is INF.infer_elementwise_binary

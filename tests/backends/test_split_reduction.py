@@ -1,13 +1,13 @@
 """Emission goldens for the two-stage ("split") reduction exporter option.
 
-``etl/backends/stablehlo/split_reduce.py`` emits an ELIGIBLE reduction as TWO
+``evoxc/backends/stablehlo/split_reduce.py`` emits an ELIGIBLE reduction as TWO
 ``stablehlo.reduce`` stages instead of one: the reduced extent ``N`` is
 reshaped into ``(R, C)`` (padded to ``R * C`` when no useful factorization
 exists, with the reduction IDENTITY as the pad value so slack can never win),
 the INNER axis is reduced first (an intermediate with ``R`` elements — a rank
 >= 1 result, which IREE parallelizes, unlike a rank-0 reduce that it lowers to
 one single-threaded workgroup) and the partials are reduced in a second, tiny
-stage. One MLIR comment line (``// etl split reduction: pivot axis P, N -> R x
+stage. One MLIR comment line (``// evoxc split reduction: pivot axis P, N -> R x
 C``) marks the stage-1 reduce so goldens can assert the split unambiguously.
 
 This suite pins the OPTION SURFACE and the EMITTED TEXT only — ``export()``
@@ -34,18 +34,18 @@ from typing import NamedTuple
 
 import pytest
 
-import etl
-from etl.core import BackendError
+import evoxc
+from evoxc.core import BackendError
 
-F32 = etl.float32
-I32 = etl.int32
+F32 = evoxc.float32
+I32 = evoxc.int32
 
 
 # --- helpers ---------------------------------------------------------------
 
 def _export(fn, *specs, options=None):
     """Trace ``fn`` over ``specs`` and export it as StableHLO MLIR text."""
-    return etl.backends.stablehlo.export(etl.trace(fn, *specs), options=options)
+    return evoxc.backends.stablehlo.export(evoxc.trace(fn, *specs), options=options)
 
 
 def _counts(mlir):
@@ -58,61 +58,61 @@ def _counts(mlir):
 
 
 #: The single marker line the split emission prepends to the stage-1 reduce.
-SPLIT_MARKER = "// etl split reduction:"
+SPLIT_MARKER = "// evoxc split reduction:"
 
 
 def _split_comment(pivot, n, r, c):
-    return f"// etl split reduction: pivot axis {pivot}, {n} -> {r} x {c}"
+    return f"// evoxc split reduction: pivot axis {pivot}, {n} -> {r} x {c}"
 
 
 # --- traced functions ------------------------------------------------------
 
 def _fn_min(x):
-    return etl.min(x)
+    return evoxc.min(x)
 
 
 def _fn_max(x):
-    return etl.max(x)
+    return evoxc.max(x)
 
 
 def _fn_argmin(x):
-    return etl.argmin(x)
+    return evoxc.argmin(x)
 
 
 def _fn_argmax(x):
-    return etl.argmax(x)
+    return evoxc.argmax(x)
 
 
 def _fn_min_axis0(x):
-    return etl.min(x, axes=(0,))
+    return evoxc.min(x, axes=(0,))
 
 
 def _fn_min_axis1(x):
-    return etl.min(x, axes=(1,))
+    return evoxc.min(x, axes=(1,))
 
 
 def _fn_max_of_less(a, b):
     """i1 ``any`` guard shape: a bool reduction emitted as i1 ``maximum``."""
-    return etl.max(etl.less(a, b))
+    return evoxc.max(evoxc.less(a, b))
 
 
 def _fn_sum(x):
-    return etl.sum(x)
+    return evoxc.sum(x)
 
 
 def _fn_prod(x):
-    return etl.prod(x)
+    return evoxc.prod(x)
 
 
 def _fn_mean(x):
-    return etl.mean(x)
+    return evoxc.mean(x)
 
 
 # --- 1. option defaults and validation -------------------------------------
 
 def test_normalizer_defaults():
     """Absent options resolve to (split ON, threshold 1024, non-exact OFF)."""
-    from etl.backends.stablehlo.split_reduce import (
+    from evoxc.backends.stablehlo.split_reduce import (
         normalize_split_reduction,
         normalize_split_reduction_non_exact,
         normalize_split_reduction_threshold,
@@ -125,23 +125,23 @@ def test_normalizer_defaults():
 
 def test_default_is_split_on_for_the_exact_class():
     """No options at all: an eligible ``min`` already emits two stages."""
-    mlir = _export(_fn_min, etl.TensorSpec((10001,), F32))
+    mlir = _export(_fn_min, evoxc.TensorSpec((10001,), F32))
     assert mlir.count('"stablehlo.reduce"') == 2
     assert mlir.count(SPLIT_MARKER) == 1
 
 
 EXACT_CLASS_CASES = [
     # id, fn, specs, expected reduce count with DEFAULT options
-    ("min_f32", _fn_min, (etl.TensorSpec((10001,), F32),), 2),
-    ("max_f32", _fn_max, (etl.TensorSpec((10001,), F32),), 2),
-    ("argmin_f32", _fn_argmin, (etl.TensorSpec((10001,), F32),), 2),
-    ("argmax_f32", _fn_argmax, (etl.TensorSpec((10001,), F32),), 2),
-    ("sum_i32", _fn_sum, (etl.TensorSpec((10001,), I32),), 2),
-    ("prod_i32", _fn_prod, (etl.TensorSpec((10001,), I32),), 2),
+    ("min_f32", _fn_min, (evoxc.TensorSpec((10001,), F32),), 2),
+    ("max_f32", _fn_max, (evoxc.TensorSpec((10001,), F32),), 2),
+    ("argmin_f32", _fn_argmin, (evoxc.TensorSpec((10001,), F32),), 2),
+    ("argmax_f32", _fn_argmax, (evoxc.TensorSpec((10001,), F32),), 2),
+    ("sum_i32", _fn_sum, (evoxc.TensorSpec((10001,), I32),), 2),
+    ("prod_i32", _fn_prod, (evoxc.TensorSpec((10001,), I32),), 2),
     (
         "i1_any_guard_max_less",
         _fn_max_of_less,
-        (etl.TensorSpec((10001,), F32), etl.TensorSpec((10001,), F32)),
+        (evoxc.TensorSpec((10001,), F32), evoxc.TensorSpec((10001,), F32)),
         2,
     ),
 ]
@@ -160,9 +160,9 @@ def test_exact_class_splits_by_default(fn, specs, reduces):
 
 
 NON_EXACT_CLASS_CASES = [
-    ("sum_f32", _fn_sum, (etl.TensorSpec((10001,), F32),), 1, 2),
-    ("prod_f32", _fn_prod, (etl.TensorSpec((10001,), F32),), 1, 2),
-    ("mean_f32", _fn_mean, (etl.TensorSpec((10001,), F32),), 1, 2),
+    ("sum_f32", _fn_sum, (evoxc.TensorSpec((10001,), F32),), 1, 2),
+    ("prod_f32", _fn_prod, (evoxc.TensorSpec((10001,), F32),), 1, 2),
+    ("mean_f32", _fn_mean, (evoxc.TensorSpec((10001,), F32),), 1, 2),
 ]
 
 
@@ -205,7 +205,7 @@ VALID_OPTION_CASES = [
 def test_valid_option_values_are_accepted(option, value, reduces):
     """Every valid value exports (and lands on the documented side of the gate)."""
     mlir = _export(
-        _fn_min, etl.TensorSpec((10001,), F32), options={option: value}
+        _fn_min, evoxc.TensorSpec((10001,), F32), options={option: value}
     )
     assert mlir.count('"stablehlo.reduce"') == reduces
 
@@ -299,9 +299,9 @@ INVALID_OPTION_CASES = [
 )
 def test_invalid_option_values_raise_backend_error(option, value, fragments):
     """Garbage is rejected explicitly, naming the option (never silently)."""
-    graph = etl.trace(_fn_min, etl.TensorSpec((10001,), F32))
+    graph = evoxc.trace(_fn_min, evoxc.TensorSpec((10001,), F32))
     with pytest.raises(BackendError) as excinfo:
-        etl.backends.stablehlo.export(graph, options={option: value})
+        evoxc.backends.stablehlo.export(graph, options={option: value})
     message = str(excinfo.value)
     for fragment in fragments:
         assert fragment in message
@@ -309,7 +309,7 @@ def test_invalid_option_values_raise_backend_error(option, value, fragments):
 
 def test_threshold_below_two_is_rejected_even_as_a_useful_gate():
     """``split_reduction_threshold`` < 2 is a validation error, not a gate."""
-    from etl.backends.stablehlo.split_reduce import (
+    from evoxc.backends.stablehlo.split_reduce import (
         normalize_split_reduction_threshold,
     )
 
@@ -327,17 +327,17 @@ DYNAMIC_SPEC_CASES = [
     (
         "symbolic_all_axes",
         _fn_min,
-        (etl.TensorSpec((etl.Dim("B"),), F32),),
+        (evoxc.TensorSpec((evoxc.Dim("B"),), F32),),
     ),
     (
         "symbolic_reduced_axis",
         _fn_min_axis0,
-        (etl.TensorSpec((etl.Dim("B"), 10000), F32),),
+        (evoxc.TensorSpec((evoxc.Dim("B"), 10000), F32),),
     ),
     (
         "symbolic_reduced_axis_transposed",
         _fn_min_axis0,
-        (etl.TensorSpec((10000, etl.Dim("B")), F32),),
+        (evoxc.TensorSpec((10000, evoxc.Dim("B")), F32),),
     ),
 ]
 
@@ -356,14 +356,14 @@ def test_dynamic_dims_keep_single_stage(fn, specs):
 
 def test_below_threshold_keeps_single_stage():
     """``total_reduced`` 1023 < the default 1024 threshold: no split."""
-    mlir = _export(_fn_min, etl.TensorSpec((1023,), F32))
+    mlir = _export(_fn_min, evoxc.TensorSpec((1023,), F32))
     assert _counts(mlir) == (1, 0, 11)
     assert SPLIT_MARKER not in mlir
 
 
 def test_threshold_gate_is_inclusive():
     """``total_reduced`` == threshold splits (``min`` over exactly ``(1024,)``)."""
-    mlir = _export(_fn_min, etl.TensorSpec((1024,), F32))
+    mlir = _export(_fn_min, evoxc.TensorSpec((1024,), F32))
     assert _counts(mlir) == (2, 0, 19)
     assert _split_comment(0, 1024, 32, 32) in mlir
 
@@ -381,14 +381,14 @@ LARGE_RESULT_CASES = [
 )
 def test_large_result_keeps_single_stage(shape):
     """``result_elems > 1024`` is not a rank-0/tiny result: no split."""
-    mlir = _export(_fn_min_axis0, etl.TensorSpec(shape, F32))
+    mlir = _export(_fn_min_axis0, evoxc.TensorSpec(shape, F32))
     assert _counts(mlir) == (1, 0, 11)
     assert SPLIT_MARKER not in mlir
 
 
 def test_result_at_the_1024_boundary_still_splits():
     """``result_elems == 1024`` is still ``<= 1024`` — the gate is inclusive."""
-    mlir = _export(_fn_min_axis0, etl.TensorSpec((2000, 1024), F32))
+    mlir = _export(_fn_min_axis0, evoxc.TensorSpec((2000, 1024), F32))
     assert mlir.count('"stablehlo.reduce"') == 2
     assert mlir.count(SPLIT_MARKER) == 1
 
@@ -397,7 +397,7 @@ def test_reduce_over_no_reduced_dims_keeps_single_stage():
     """A reduction keeping every dim (axes=() equivalent) is never split."""
     # ``min`` over a rank-2 tensor on a NON-reduced-only shape: axes=(1,) of a
     # (10000, 100) tensor reduces 100 (< threshold) and keeps 10000 as result.
-    mlir = _export(_fn_min_axis1, etl.TensorSpec((10000, 100), F32))
+    mlir = _export(_fn_min_axis1, evoxc.TensorSpec((10000, 100), F32))
     assert _counts(mlir) == (1, 0, 11)
     assert SPLIT_MARKER not in mlir
 
@@ -406,14 +406,14 @@ def test_reduce_over_no_reduced_dims_keeps_single_stage():
 
 def test_split_case_marker_set():
     """A split emits exactly TWO reduces and exactly ONE marker comment."""
-    mlir = _export(_fn_min, etl.TensorSpec((10001,), F32))
+    mlir = _export(_fn_min, evoxc.TensorSpec((10001,), F32))
     assert mlir.count('"stablehlo.reduce"') == 2
     assert mlir.count(SPLIT_MARKER) == 1
 
 
 def test_single_stage_case_marker_set():
     """A non-split case keeps ONE reduce and NO marker comment."""
-    mlir = _export(_fn_sum, etl.TensorSpec((10001,), F32))
+    mlir = _export(_fn_sum, evoxc.TensorSpec((10001,), F32))
     assert mlir.count('"stablehlo.reduce"') == 1
     assert mlir.count(SPLIT_MARKER) == 0
 
@@ -444,7 +444,7 @@ SHAPE_CASES = [
     Case(
         "min_10001_f32",
         _fn_min,
-        (etl.TensorSpec((10001,), F32),),
+        (evoxc.TensorSpec((10001,), F32),),
         True,
         (2, 0, 19),
         (1, 0, 11),
@@ -461,7 +461,7 @@ SHAPE_CASES = [
         # is 14 of the extra split lines and 7 of the extra single-stage ones.
         "argmin_10001_f32",
         _fn_argmin,
-        (etl.TensorSpec((10001,), F32),),
+        (evoxc.TensorSpec((10001,), F32),),
         True,
         (2, 0, 52),
         (1, 0, 27),
@@ -476,7 +476,7 @@ SHAPE_CASES = [
     Case(
         "min_10000x100_axes0_f32",
         _fn_min_axis0,
-        (etl.TensorSpec((10000, 100), F32),),
+        (evoxc.TensorSpec((10000, 100), F32),),
         True,
         (2, 0, 19),
         (1, 0, 11),
@@ -492,7 +492,7 @@ SHAPE_CASES = [
         # elements (> 1024) — ineligible on TWO gates.
         "min_10000x100_axes1_f32",
         _fn_min_axis1,
-        (etl.TensorSpec((10000, 100), F32),),
+        (evoxc.TensorSpec((10000, 100), F32),),
         False,
         (1, 0, 11),
         (1, 0, 11),
@@ -502,7 +502,7 @@ SHAPE_CASES = [
         # the i1 "any" guard shape: reduce_max over a comparison result
         "max_of_less_i1_10001",
         _fn_max_of_less,
-        (etl.TensorSpec((10001,), F32), etl.TensorSpec((10001,), F32)),
+        (evoxc.TensorSpec((10001,), F32), evoxc.TensorSpec((10001,), F32)),
         True,
         (2, 0, 20),
         (1, 0, 12),
@@ -519,7 +519,7 @@ SHAPE_CASES = [
         # 10007 is prime: no exact factorization -> pad 105 to 128 x 79
         "min_10007_f32_padded",
         _fn_min,
-        (etl.TensorSpec((10007,), F32),),
+        (evoxc.TensorSpec((10007,), F32),),
         True,
         (2, 1, 21),
         (1, 0, 11),
@@ -535,7 +535,7 @@ SHAPE_CASES = [
         # 64, so the rows are re-picked 128 -> 127 (79 stays clean), pad 26.
         "min_10007_i32_rocm_guard",
         _fn_min,
-        (etl.TensorSpec((10007,), I32),),
+        (evoxc.TensorSpec((10007,), I32),),
         True,
         (2, 1, 21),
         (1, 0, 11),
@@ -550,7 +550,7 @@ SHAPE_CASES = [
         # FLOAT sum: reassociated by a split -> single-stage by default
         "sum_10001_f32_default",
         _fn_sum,
-        (etl.TensorSpec((10001,), F32),),
+        (evoxc.TensorSpec((10001,), F32),),
         False,
         (1, 0, 11),
         (1, 0, 11),
@@ -560,7 +560,7 @@ SHAPE_CASES = [
         # threshold boundary: exactly 1024 reduced elements DO split
         "min_1024_threshold_boundary",
         _fn_min,
-        (etl.TensorSpec((1024,), F32),),
+        (evoxc.TensorSpec((1024,), F32),),
         True,
         (2, 0, 19),
         (1, 0, 11),
@@ -572,7 +572,7 @@ SHAPE_CASES = [
     Case(
         "min_1023_below_threshold",
         _fn_min,
-        (etl.TensorSpec((1023,), F32),),
+        (evoxc.TensorSpec((1023,), F32),),
         False,
         (1, 0, 11),
         (1, 0, 11),
@@ -597,7 +597,7 @@ def test_float_sum_splits_when_non_exact_is_opted_in():
     """``split_reduction_non_exact=True``: float ``sum`` gains the split text."""
     mlir = _export(
         _fn_sum,
-        etl.TensorSpec((10001,), F32),
+        evoxc.TensorSpec((10001,), F32),
         options={"split_reduction_non_exact": True},
     )
     assert _counts(mlir) == (2, 0, 19)
@@ -606,7 +606,7 @@ def test_float_sum_splits_when_non_exact_is_opted_in():
 
 def test_non_exact_option_does_not_change_the_exact_class_text():
     """Opting in is a no-op for reductions that already split by default."""
-    specs = (etl.TensorSpec((10001,), F32),)
+    specs = (evoxc.TensorSpec((10001,), F32),)
     assert _export(_fn_min, *specs, options={"split_reduction_non_exact": True}) \
         == _export(_fn_min, *specs)
 
@@ -636,7 +636,7 @@ def test_split_off_is_byte_identical_to_a_huge_threshold(case):
 
 def test_split_off_suppresses_the_non_exact_split_too():
     """``split_reduction=False`` wins over ``split_reduction_non_exact=True``."""
-    specs = (etl.TensorSpec((10001,), F32),)
+    specs = (evoxc.TensorSpec((10001,), F32),)
     mlir = _export(
         _fn_sum,
         *specs,

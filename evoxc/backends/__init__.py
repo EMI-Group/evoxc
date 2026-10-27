@@ -1,0 +1,133 @@
+"""evoxc.backends — backend abstraction, reference numpy CPU backend, StableHLO exporter.
+
+Public surface (full contract in this directory's CONTEXT.md and ../CONTEXT.md):
+
+- ``Capabilities``, ``Backend``, ``Executable`` (protocol)      — backend.py
+- ``Signature``, ``LoweredProgram``, ``CompiledArtifact``       — program.py (owned HERE, not by pipeline)
+- ``register``, ``get`` (auto-activates optional adapters)      — registry.py
+- ``CompilerBackend``, ``CompilerExecutable``                   — compiler.py (shared pluggable-compiler framework)
+- ``numpy_backend`` (default), ``NumpyBackend``, ``NumpyExecutable`` — numpy/
+- ``stablehlo`` submodule (``stablehlo.export``; export utility, NOT a backend) — stablehlo/
+- shared block-inlining machinery                              — inline.py
+- ``adapters`` subpackage (iree/xla/tvm adapter modules — a separate effort) — adapters/
+
+Import acyclicity: this package imports ``evoxc.core`` / ``evoxc.ir`` at top level;
+``evoxc.ops`` only inside function bodies; never ``evoxc.pipeline``. Optional
+compiler adapters are imported only on first registry use (``get("iree")``) —
+never at ``import evoxc`` / ``import evoxc.backends`` time (the device-transfer
+thunk below imports the iree adapter lazily, on first call).
+"""
+from evoxc.core import DeviceError, register_device_transfer_provider
+
+from .backend import Backend, Capabilities, Executable
+from .compiler import CompilerBackend, CompilerExecutable
+from .program import CompiledArtifact, LoweredProgram, Signature
+from .registry import get, register
+from . import numpy, stablehlo
+from .numpy import NumpyBackend, NumpyExecutable, numpy_backend
+
+__all__ = [
+    # backend contract
+    "Capabilities",
+    "Backend",
+    "Executable",
+    # staged objects owned by backends
+    "Signature",
+    "LoweredProgram",
+    "CompiledArtifact",
+    # registry
+    "register",
+    "get",
+    # shared pluggable-compiler framework (adapters/ subpackage)
+    "CompilerBackend",
+    "CompilerExecutable",
+    # numpy reference backend (default)
+    "numpy",
+    "NumpyBackend",
+    "NumpyExecutable",
+    "numpy_backend",
+    # stablehlo export utility
+    "stablehlo",
+]
+
+
+# --- device-transfer provider registration (explicit placement) --------------
+# ``Tensor.to(Device('cuda', N))`` / ``Tensor.to(Device('rocm', N))``
+# (kind ``"hip"`` is the alias kind for the same AMD/ROCm targets) dispatch
+# through the core registries (``core.register_device_transfer_provider`` /
+# the per-backend slots); core never imports backends. This package registers
+# the flat DEFAULT "cuda" / "rocm" / "hip" slots at import time as LAZY thunks
+# over the iree adapter: the adapter module is imported only on first transfer,
+# and the adapter's module-level ``upload_tensor(tensor, device)`` is looked up
+# by name at call time (implemented by the iree adapter). Optional adapters
+# (iree/xla) register their own DIRECT provider under PER-BACKEND slots
+# (``core.register_backend_device_transfer_provider``) when they activate —
+# they never overwrite these flat slots or each other, so activation/import
+# order cannot clobber any backend's provider. ``registry.get(name)``
+# records the preferred transfer backend per kind, and ``Tensor.to``
+# resolves the preferred backend's slot first, falling back to these thunks.
+# The ``"vulkan"`` kind has NO thunk here: the iree adapter is the only
+# backend that serves it, so its ``register()`` fills both its per-backend
+# slot AND the flat DEFAULT slot for vulkan.
+
+def _cuda_transfer_thunk(tensor, device):
+    """Lazy "cuda" placement provider: delegates to the iree adapter.
+
+    Imports ``evoxc.backends.adapters.iree`` on first call and delegates to
+    its module-level ``upload_tensor(tensor, device)``. Any import or
+    availability failure surfaces as a clean ``core.DeviceError`` with a
+    pip hint — never a raw ``ModuleNotFoundError`` or other exception.
+    """
+    try:
+        from evoxc.backends.adapters import iree as _iree_adapter
+    except Exception as exc:  # noqa: BLE001 — always a clean DeviceError
+        raise DeviceError(
+            f"Tensor.to cannot place data on {device!r}: the cuda "
+            "device-transfer provider requires the evoxc iree backend (the "
+            "iree-base-compiler + iree-base-runtime packages), which is "
+            f"unavailable: {exc}. Install it with `pip install evoxc[iree]`"
+        ) from exc
+    upload_tensor = getattr(_iree_adapter, "upload_tensor", None)
+    if not callable(upload_tensor):
+        raise DeviceError(
+            f"Tensor.to cannot place data on {device!r}: the iree adapter "
+            "does not expose upload_tensor(tensor, device), so the cuda "
+            "device-transfer provider is unavailable (the iree adapter "
+            "registers it when activated)"
+        )
+    return upload_tensor(tensor, device)
+
+
+def _rocm_transfer_thunk(tensor, device):
+    """Lazy "rocm" / "hip" placement provider: delegates to the iree adapter.
+
+    Imports ``evoxc.backends.adapters.iree`` on first call and delegates to
+    its module-level ``upload_tensor(tensor, device)``. Any import or
+    availability failure surfaces as a clean ``core.DeviceError`` with a
+    pip hint — never a raw ``ModuleNotFoundError`` or other exception.
+    Registered for both the canonical ``"rocm"`` kind and its ``"hip"``
+    alias.
+    """
+    try:
+        from evoxc.backends.adapters import iree as _iree_adapter
+    except Exception as exc:  # noqa: BLE001 — always a clean DeviceError
+        raise DeviceError(
+            f"Tensor.to cannot place data on {device!r}: the rocm "
+            "device-transfer provider requires the evoxc iree backend (the "
+            "iree-base-compiler + iree-base-runtime packages), which is "
+            f"unavailable: {exc}. Install it with `pip install evoxc[iree]`"
+        ) from exc
+    upload_tensor = getattr(_iree_adapter, "upload_tensor", None)
+    if not callable(upload_tensor):
+        raise DeviceError(
+            f"Tensor.to cannot place data on {device!r}: the iree adapter "
+            "does not expose upload_tensor(tensor, device), so the rocm "
+            "device-transfer provider is unavailable (the iree adapter "
+            "registers it when activated)"
+        )
+    return upload_tensor(tensor, device)
+
+
+register_device_transfer_provider("cuda", _cuda_transfer_thunk)
+register_device_transfer_provider("rocm", _rocm_transfer_thunk)
+register_device_transfer_provider("hip", _rocm_transfer_thunk)

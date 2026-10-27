@@ -2,7 +2,7 @@
  *
  * A minimal PJRT C API plugin (.so exporting GetPjRtApi()) used by
  * tests/backends/test_pjrt_ctypes_plugin.py to exercise the ctypes PJRT
- * driver (etl/backends/adapters/_pjrt_c_api.py + xla_util.py) WITHOUT a
+ * driver (evoxc/backends/adapters/_pjrt_c_api.py + xla_util.py) WITHOUT a
  * real XLA plugin. It accepts StableHLO MLIR text at compile time, records
  * the program text, and returns ZERO-FILLED output buffers of the shapes
  * declared in the entry function's result types — the adapter's plumbing
@@ -11,7 +11,7 @@
  * deliberately not meaningful.
  *
  * ABI fidelity (binding): the struct field ORDER below is EXACTLY the order
- * in etl/backends/adapters/_pjrt_c_api.py — both are derived from the
+ * in evoxc/backends/adapters/_pjrt_c_api.py — both are derived from the
  * canonical OpenXLA header xla/pjrt/c/pjrt_c_api.h at commit
  * 70fe66213b73c5953d92eb25d2606bd6004d47c3. The _Static_asserts pin
  * sizeof(PJRT_Api) == 1144 (3 metadata fields + 138 function pointers on
@@ -20,15 +20,15 @@
  *
  * Build (64-bit Linux):  gcc -shared -fPIC -std=c99 -O1 -o plugin.so this.c
  * Test-only knobs (via -D at build time, and env vars at run time):
- *   -DETL_FAKE_PJRT_STRUCT_SIZE=N   override PJRT_Api.struct_size (ABI gate)
- *   -DETL_FAKE_PJRT_MAJOR_VERSION=N override pjrt_api_version.major_version
- *   ETL_FAKE_PJRT_FAIL_STEP=<entry point name>  (env): make that call fail
- *   ETL_FAKE_PJRT_FAIL_MESSAGE=<text>           (env): the error message
- *   ETL_FAKE_PJRT_NO_DEVICE_EVENT=<any>         (env): leave the
+ *   -DEVOXC_FAKE_PJRT_STRUCT_SIZE=N   override PJRT_Api.struct_size (ABI gate)
+ *   -DEVOXC_FAKE_PJRT_MAJOR_VERSION=N override pjrt_api_version.major_version
+ *   EVOXC_FAKE_PJRT_FAIL_STEP=<entry point name>  (env): make that call fail
+ *   EVOXC_FAKE_PJRT_FAIL_MESSAGE=<text>           (env): the error message
+ *   EVOXC_FAKE_PJRT_NO_DEVICE_EVENT=<any>         (env): leave the
  *       device-complete-event slot NULL when the caller requests one
  *       (simulates a plugin violating the
  *       PJRT_LoadedExecutable_Execute_Args.device_complete_events contract)
- *   ETL_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT=<any> (env): write a real
+ *   EVOXC_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT=<any> (env): write a real
  *       device-complete event and THEN fail the execute (the driver's
  *       stray-handle cleanup path)
  */
@@ -349,13 +349,13 @@ static PJRT_Error* make_error(const char* msg) {
   return e;
 }
 
-/* Test-only error injection: when ETL_FAKE_PJRT_FAIL_STEP names the entry
- * point being called, return an error carrying ETL_FAKE_PJRT_FAIL_MESSAGE
+/* Test-only error injection: when EVOXC_FAKE_PJRT_FAIL_STEP names the entry
+ * point being called, return an error carrying EVOXC_FAKE_PJRT_FAIL_MESSAGE
  * (or a default). */
 static PJRT_Error* maybe_fail(const char* step) {
-  const char* want = getenv("ETL_FAKE_PJRT_FAIL_STEP");
+  const char* want = getenv("EVOXC_FAKE_PJRT_FAIL_STEP");
   if (want && strcmp(want, step) == 0) {
-    const char* msg = getenv("ETL_FAKE_PJRT_FAIL_MESSAGE");
+    const char* msg = getenv("EVOXC_FAKE_PJRT_FAIL_MESSAGE");
     return make_error(msg && *msg ? msg : "injected fake PJRT plugin failure");
   }
   return NULL;
@@ -580,7 +580,7 @@ static void free_fake_outputs(fake_output* outputs, size_t count) {
 }
 
 /* Parse the entry function's result types from StableHLO MLIR text: the
- * etl writer emits `func.func @main(...) -> tensor<...>` (or a
+ * evoxc writer emits `func.func @main(...) -> tensor<...>` (or a
  * parenthesized list) on one line — take the FIRST func.func. */
 static int parse_output_types(const char* text, fake_output** out,
                               size_t* out_count) {
@@ -759,7 +759,7 @@ static PJRT_Error* fake_PJRT_Client_BufferFromHostBuffer(
      shape-(1,) buffer). Re-probed on the real 0.10.2 plugin: BOTH NULL and
      non-NULL dims with num_dims == 0 report shape () — the historical (1,)
      symptom was an upstream np.ascontiguousarray ndmin=1 promotion staging
-     a genuinely-1-d array. The emulation is kept so the etl driver's
+     a genuinely-1-d array. The emulation is kept so the evoxc driver's
      dims == NULL rank-0 staging stays pinned
      (test_xla_device_resident.test_rank0_staging_scalar_shape). */
   static const int64_t fake_one[1] = {1};
@@ -863,12 +863,12 @@ static PJRT_Error* fake_PJRT_LoadedExecutable_Execute(
    * written BEFORE the output buffers, so the FAIL_AFTER knob below can
    * hand the driver a stray handle without leaking buffers. */
   if (args->device_complete_events) {
-    const char* no_event = getenv("ETL_FAKE_PJRT_NO_DEVICE_EVENT");
+    const char* no_event = getenv("EVOXC_FAKE_PJRT_NO_DEVICE_EVENT");
     if (!no_event || !*no_event) {
       args->device_complete_events[0] = make_event();
     }
     {
-      const char* fail_after = getenv("ETL_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT");
+      const char* fail_after = getenv("EVOXC_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT");
       if (fail_after && *fail_after)
         return make_error(
             "injected fake failure after writing a device-complete event");
@@ -1055,21 +1055,21 @@ _Static_assert(offsetof(struct PJRT_Api, pjrt_api_version) == 16,
 _Static_assert(offsetof(struct PJRT_Api, PJRT_Buffer_ToHostBuffer) == 600,
                "PJRT_Api layout drift: PJRT_Buffer_ToHostBuffer offset");
 
-#ifndef ETL_FAKE_PJRT_STRUCT_SIZE
-#define ETL_FAKE_PJRT_STRUCT_SIZE (sizeof(struct PJRT_Api))
+#ifndef EVOXC_FAKE_PJRT_STRUCT_SIZE
+#define EVOXC_FAKE_PJRT_STRUCT_SIZE (sizeof(struct PJRT_Api))
 #endif
-#ifndef ETL_FAKE_PJRT_MAJOR_VERSION
-#define ETL_FAKE_PJRT_MAJOR_VERSION 0
+#ifndef EVOXC_FAKE_PJRT_MAJOR_VERSION
+#define EVOXC_FAKE_PJRT_MAJOR_VERSION 0
 #endif
 
 static struct PJRT_Api g_api = {
-    .struct_size = ETL_FAKE_PJRT_STRUCT_SIZE,
+    .struct_size = EVOXC_FAKE_PJRT_STRUCT_SIZE,
     .extension_start = NULL,
     .pjrt_api_version =
         {
             .struct_size = sizeof(struct PJRT_Api_Version),
             .extension_start = NULL,
-            .major_version = ETL_FAKE_PJRT_MAJOR_VERSION,
+            .major_version = EVOXC_FAKE_PJRT_MAJOR_VERSION,
             .minor_version = 114, /* PJRT_API_MINOR at HEADER_COMMIT */
         },
     .PJRT_Error_Destroy = fake_PJRT_Error_Destroy,

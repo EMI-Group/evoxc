@@ -1,9 +1,9 @@
 """Backend options-override contract tests (the backend half).
 
 Pins the per-backend option machinery of the options-override contract:
-``etl/backends/options.py::validate_options`` (option NAMES validated against
+``evoxc/backends/options.py::validate_options`` (option NAMES validated against
 the UNION of the per-stage ``KNOWN_OPTIONS`` sets; option VALUES are never
-validated by etl — the compiler validates them), ``normalize_bool_option``
+validated by evoxc — the compiler validates them), ``normalize_bool_option``
 (the shared VALUE coercion for bool-typed options — ``split_reduction`` /
 ``while_init_rewrite`` — so an env-style string value like ``"0"`` can never
 fall into the ``bool("0") is True`` trap), the performance-option plumbing
@@ -19,10 +19,10 @@ loud parsing), the tvm ``tvm_target`` / ``tvm_pass_configs`` options
 ``xla_compile_options`` options (against the fake PJRT plugin — the
 ``test_pjrt_ctypes_plugin.py`` fixture), and the numpy documented-ignore.
 
-The env half (``etl.pipeline_options``, precedence explicit > env > default,
+The env half (``evoxc.pipeline_options``, precedence explicit > env > default,
 stub full-path) is pinned by ``tests/test_pipeline_options.py``. NOTE: the two
 performance lower options have NO env-var rows yet (``ENV_OPTION_TABLE`` has
-no ``ETL_EIGH_ALGORITHM`` / ``ETL_SPLIT_REDUCTION`` entry — indeed no
+no ``EVOXC_EIGH_ALGORITHM`` / ``EVOXC_SPLIT_REDUCTION`` entry — indeed no
 ``("iree", "lower")`` entry at all), so this file carries no env-override
 coverage for them; add it here once those rows exist.
 Adapter-test conventions (same as ``test_adapter_{iree,xla,tvm}.py``): real
@@ -40,14 +40,14 @@ import types
 import numpy as np
 import pytest
 
-import etl
-from etl import core
-from etl.backends import options as options_module
-from etl.backends.options import normalize_bool_option, validate_options
-from etl.backends.adapters import iree as iree_adapt
-from etl.backends.adapters import tvm as tvm_adapt
-from etl.backends.adapters import xla as xla_adapt
-from etl.backends.adapters import xla_util
+import evoxc
+from evoxc import core
+from evoxc.backends import options as options_module
+from evoxc.backends.options import normalize_bool_option, validate_options
+from evoxc.backends.adapters import iree as iree_adapt
+from evoxc.backends.adapters import tvm as tvm_adapt
+from evoxc.backends.adapters import xla as xla_adapt
+from evoxc.backends.adapters import xla_util
 
 from tests.backends.test_pjrt_ctypes_plugin import _build_plugin
 
@@ -58,48 +58,48 @@ from tests.backends.test_pjrt_ctypes_plugin import _build_plugin
 
 
 def _add_fn(x):
-    return etl.add(x, 1.0)
+    return evoxc.add(x, 1.0)
 
 
-_ADD_SPEC = etl.TensorSpec((4,), etl.float32)
+_ADD_SPEC = evoxc.TensorSpec((4,), evoxc.float32)
 _ADD_INPUT = np.ones(4, dtype="float32")
 _ADD_EXPECTED = np.full(4, 2.0, dtype="float32")
 
 
 def _argsort_fn(x):
-    return etl.argsort(x)
+    return evoxc.argsort(x)
 
 
-_ARGSORT_SPEC = etl.TensorSpec((8,), etl.float32)
+_ARGSORT_SPEC = evoxc.TensorSpec((8,), evoxc.float32)
 _ARGSORT_INPUT = np.array([3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 7.0, 6.0], "float32")
 
 
 def _while_fn(init):
-    return etl.while_loop(
-        lambda c: etl.less(c, 4.0), lambda c: etl.add(c, 1.0), init
+    return evoxc.while_loop(
+        lambda c: evoxc.less(c, 4.0), lambda c: evoxc.add(c, 1.0), init
     )
 
 
-_WHILE_SPEC = etl.TensorSpec((), etl.float32)
+_WHILE_SPEC = evoxc.TensorSpec((), evoxc.float32)
 
 
 # ``eigh`` exercises the ``eigh_algorithm`` exporter option (two different
 # cyclic-Jacobi compositions) — tiny 3x3 so the export stays cheap.
 def _eigh_fn(x):
-    return etl.eigh(x)[0]
+    return evoxc.eigh(x)[0]
 
 
-_EIGH_SPEC = etl.TensorSpec((3, 3), etl.float32)
+_EIGH_SPEC = evoxc.TensorSpec((3, 3), evoxc.float32)
 
 # ``min`` over 1024 elements exercises the ``split_reduction`` exporter option:
 # a rank-0-result INTEGER extrema reduce with a reduced extent >= the 1024
 # threshold splits into two stages by default, so the two option values emit
 # visibly different MLIR text.
 def _min_fn(x):
-    return etl.min(x)
+    return evoxc.min(x)
 
 
-_MIN_SPEC = etl.TensorSpec((1024,), etl.int32)
+_MIN_SPEC = evoxc.TensorSpec((1024,), evoxc.int32)
 _MIN_INPUT = np.arange(1024, 0, -1, dtype="int32")
 _MIN_EXPECTED = int(_MIN_INPUT.min())
 
@@ -248,7 +248,7 @@ def test_adapter_known_options_declarations():
 def test_iree_unknown_lower_option_rejected_without_compiler():
     """A lower-stage unknown key raises before any compiler work (the shared
     CompilerBackend validates before exporting) — no IREE needed."""
-    graph = etl.trace(_argsort_fn, _ARGSORT_SPEC)
+    graph = evoxc.trace(_argsort_fn, _ARGSORT_SPEC)
     backend = iree_adapt.IreeBackend()
     with pytest.raises(core.BackendError, match="does not recognize the lower option"):
         backend.lower(graph, {"bogus": 1})
@@ -270,7 +270,7 @@ def test_xla_unknown_load_option_rejected_without_plugin():
 
 def test_normalize_bool_option_is_public():
     """``normalize_bool_option`` is part of the module's public surface (it is
-    the reuse point for bool ``ETL_*`` env-var parsing)."""
+    the reuse point for bool ``EVOXC_*`` env-var parsing)."""
     assert "normalize_bool_option" in options_module.__all__
     assert callable(options_module.normalize_bool_option)
 
@@ -392,7 +392,7 @@ def test_eigh_algorithm_reaches_the_exporter():
     ``"jacobi_batched"`` composition, ``"jacobi"`` (case/whitespace tolerant)
     selects the OTHER cyclic-Jacobi composition — a different MLIR text — and
     both stay single-``while`` compositions."""
-    graph = etl.trace(_eigh_fn, _EIGH_SPEC)
+    graph = evoxc.trace(_eigh_fn, _EIGH_SPEC)
     batched = _iree_lower_text(graph)
     assert _iree_lower_text(graph, eigh_algorithm="jacobi_batched") == batched
     sequential = _iree_lower_text(graph, eigh_algorithm=" JACOBI ")
@@ -407,7 +407,7 @@ def test_eigh_algorithm_invalid_value_is_a_backend_error(bad_value):
     """An invalid ``eigh_algorithm`` VALUE surfaces as core.BackendError naming
     the option (the exporter's own validation — the framework only validates
     keys). Full value-domain goldens live in ``test_stablehlo.py``."""
-    graph = etl.trace(_eigh_fn, _EIGH_SPEC)
+    graph = evoxc.trace(_eigh_fn, _EIGH_SPEC)
     with pytest.raises(core.BackendError) as excinfo:
         _iree_lower_text(graph, eigh_algorithm=bad_value)
     message = str(excinfo.value)
@@ -420,7 +420,7 @@ def test_split_reduction_reaches_the_exporter():
     rank-0-result integer ``min`` over 1024 elements into two stages,
     ``False`` emits the byte-identical single-stage text, and the env-style
     strings are coerced ("1" == True, "0" == False)."""
-    graph = etl.trace(_min_fn, _MIN_SPEC)
+    graph = evoxc.trace(_min_fn, _MIN_SPEC)
     default = _iree_lower_text(graph)
     assert _iree_lower_text(graph, split_reduction=True) == default
     assert _iree_lower_text(graph, split_reduction="1") == default
@@ -436,7 +436,7 @@ def test_split_reduction_invalid_value_is_a_backend_error(bad_value):
     """An invalid ``split_reduction`` VALUE (``None`` included: bool options
     have no "unset" spelling — omit the key to get the default) raises
     core.BackendError naming the option and the value."""
-    graph = etl.trace(_min_fn, _MIN_SPEC)
+    graph = evoxc.trace(_min_fn, _MIN_SPEC)
     with pytest.raises(core.BackendError) as excinfo:
         _iree_lower_text(graph, split_reduction=bad_value)
     message = str(excinfo.value)
@@ -451,7 +451,7 @@ def test_unknown_lower_option_error_is_loud_naming_key(name, backend_cls):
     options per stage — while the DECLARED ``split_reduction`` family key
     itself is accepted at lower (no compiler needed: the shared
     ``CompilerBackend`` validates before exporting)."""
-    graph = etl.trace(_min_fn, _MIN_SPEC)
+    graph = evoxc.trace(_min_fn, _MIN_SPEC)
     with pytest.raises(core.BackendError) as excinfo:
         backend_cls().lower(graph, {"no_such_lower_option": 2048})
     message = str(excinfo.value)
@@ -474,30 +474,30 @@ _SPLIT_REDUCTION_SUB_OPTIONS = (
 
 
 def _sum_10001_fn(x):
-    return etl.sum(x)
+    return evoxc.sum(x)
 
 
 #: ``sum`` over 10001 f32 elements: a rank-0-result FLOAT reduction, so the
 #: default keeps ONE reduce and ``split_reduction_non_exact=True`` splits it.
-_SUM_10001_SPEC = etl.TensorSpec((10001,), etl.float32)
+_SUM_10001_SPEC = evoxc.TensorSpec((10001,), evoxc.float32)
 
 #: ``min`` over 10001 i32 elements: rank-0 result above the default 1024
 #: threshold, so the default splits and a threshold past the extent does not.
-_MIN_10001_SPEC = etl.TensorSpec((10001,), etl.int32)
+_MIN_10001_SPEC = evoxc.TensorSpec((10001,), evoxc.int32)
 
-# BUG(etl): `split_reduction_threshold` / `split_reduction_non_exact` are
+# BUG(evoxc): `split_reduction_threshold` / `split_reduction_non_exact` are
 # exporter-only — the StableHLO Writer accepts them
-# (`etl/backends/stablehlo/split_reduce.py::normalize_split_reduction_threshold`
+# (`evoxc/backends/stablehlo/split_reduce.py::normalize_split_reduction_threshold`
 # / `normalize_split_reduction_non_exact`) but NO adapter declares them in
 # `KNOWN_OPTIONS["lower"]` and `CompilerBackend._exporter_options` does not
 # forward them, so they are unreachable through the pipeline. Repro:
-#   etl.lower(etl.trace(lambda x: etl.min(x), etl.TensorSpec((10001,), np.float32)),
+#   evoxc.lower(evoxc.trace(lambda x: evoxc.min(x), evoxc.TensorSpec((10001,), np.float32)),
 #             backend="iree", split_reduction_threshold=2048)
 #   -> BackendError: the iree backend does not recognize the lower option
 #      'split_reduction_threshold' ...
 @pytest.mark.xfail(
     strict=True,
-    reason="BUG(etl): split_reduction_threshold / split_reduction_non_exact are "
+    reason="BUG(evoxc): split_reduction_threshold / split_reduction_non_exact are "
     "exporter-only — not declared in KNOWN_OPTIONS['lower'] nor forwarded by "
     "CompilerBackend._exporter_options, so they are unreachable through the "
     "pipeline",
@@ -522,7 +522,7 @@ def test_split_reduction_sub_options_forwarded_through_lower(name, backend_cls):
 
     backend = backend_cls()
 
-    sum_graph = etl.trace(_sum_10001_fn, _SUM_10001_SPEC)
+    sum_graph = evoxc.trace(_sum_10001_fn, _SUM_10001_SPEC)
     single_stage = backend.lower(sum_graph, {}).payload["mlir_text"]
     non_exact_split = backend.lower(
         sum_graph, {"split_reduction_non_exact": True}
@@ -530,7 +530,7 @@ def test_split_reduction_sub_options_forwarded_through_lower(name, backend_cls):
     assert single_stage.count('"stablehlo.reduce"') == 1
     assert non_exact_split.count('"stablehlo.reduce"') == 2
 
-    min_graph = etl.trace(_min_fn, _MIN_10001_SPEC)
+    min_graph = evoxc.trace(_min_fn, _MIN_10001_SPEC)
     default_split = backend.lower(min_graph, {}).payload["mlir_text"]
     above_threshold = backend.lower(
         min_graph, {"split_reduction_threshold": 10002}
@@ -545,7 +545,7 @@ def test_split_reduction_sub_options_forwarded_through_lower(name, backend_cls):
 
 
 def test_iree_resolve_compile_args_defaults_survive():
-    """With no user flags the final extra_args are exactly etl's minimal
+    """With no user flags the final extra_args are exactly evoxc's minimal
     defaults (f64 semantics + the two llvm-cpu portability flags)."""
     assert iree_adapt._resolve_iree_compile_args(("llvm-cpu",), None) == [
         "--iree-input-demote-f64-to-f32=false",
@@ -574,7 +574,7 @@ def test_iree_resolve_compile_args_user_flag_drops_default_by_name():
 
 def test_iree_resolve_compile_args_unknown_flag_passes_through():
     """An arbitrary unknown flag passes through unvalidated (the compiler
-    validates flag values; etl never guesses)."""
+    validates flag values; evoxc never guesses)."""
     args = iree_adapt._resolve_iree_compile_args(
         ("llvm-cpu",), ["--iree-llvmcpu-target-cpu=native", "--any-flag=whatever"]
     )
@@ -590,7 +590,7 @@ def test_iree_resolve_compile_args_unknown_flag_passes_through():
             "--iree-hal-target-backends=cuda",
             "use the 'target_backends' compile option instead",
         ),
-        ("--iree-input-type=stablehlo", "etl always feeds StableHLO"),
+        ("--iree-input-type=stablehlo", "evoxc always feeds StableHLO"),
         (
             "--iree-vm-bytecode-module-output-format=x",
             "would break artifact loading",
@@ -661,7 +661,7 @@ def _install_fake_iree_runtime(monkeypatch, parse_flags_impl):
 
 
 def test_iree_cuda_allocator_policy_parses_nothing(monkeypatch):
-    """etl forces NO process-global cuda allocator flag.
+    """evoxc forces NO process-global cuda allocator flag.
 
     The adapter default is iree's own ``--cuda_async_allocations=true``
     (stream-ordered allocations) — the fast, validated state on iree 3.11.0
@@ -738,23 +738,23 @@ def _require_iree():
 def iree_argsort_lowered():
     """One shared trace+lower of the argsort graph (no compile)."""
     _require_iree()
-    return etl.lower(etl.trace(_argsort_fn, _ARGSORT_SPEC), backend="iree")
+    return evoxc.lower(evoxc.trace(_argsort_fn, _ARGSORT_SPEC), backend="iree")
 
 
 @pytest.fixture(scope="module")
 def iree_argsort_exe(iree_argsort_lowered):
     """One shared compiled+loaded executable carrying USER compile and load
     options: iree_compile_args at compile, iree_runtime_args at load."""
-    artifact = etl.compile(
+    artifact = evoxc.compile(
         iree_argsort_lowered, iree_compile_args=["--iree-llvmcpu-target-cpu=generic"]
     )
-    return etl.load(artifact, iree_runtime_args=["--cuda_async_allocations=false"])
+    return evoxc.load(artifact, iree_runtime_args=["--cuda_async_allocations=false"])
 
 
 def test_iree_compile_and_load_options_end_to_end(iree_argsort_exe):
     """iree_compile_args (compile) + iree_runtime_args (load) on a real
     llvm-cpu build: parity with the numpy reference."""
-    out = etl.run(iree_argsort_exe, _ARGSORT_INPUT)
+    out = evoxc.run(iree_argsort_exe, _ARGSORT_INPUT)
     np.testing.assert_array_equal(out.numpy(), np.argsort(_ARGSORT_INPUT))
 
 
@@ -762,7 +762,7 @@ def test_iree_run_stage_unknown_option_rejected(iree_argsort_exe):
     """The iree run stage has NO known options in v1: a non-empty run options
     dict raises core.BackendError."""
     with pytest.raises(core.BackendError, match="does not recognize the run option"):
-        etl.run(iree_argsort_exe, _ARGSORT_INPUT, bogus=1)
+        evoxc.run(iree_argsort_exe, _ARGSORT_INPUT, bogus=1)
 
 
 def test_iree_real_runtime_garbage_flag_rejected(iree_argsort_exe):
@@ -770,29 +770,29 @@ def test_iree_real_runtime_garbage_flag_rejected(iree_argsort_exe):
     BackendError naming the option (loud, never swallowed)."""
     artifact = iree_argsort_exe.backend_executable.artifact
     with pytest.raises(core.BackendError) as excinfo:
-        etl.load(artifact, iree_runtime_args=["--definitely-not-a-real-iree-flag"])
+        evoxc.load(artifact, iree_runtime_args=["--definitely-not-a-real-iree-flag"])
     assert "iree_runtime_args" in str(excinfo.value)
     assert "--definitely-not-a-real-iree-flag" in str(excinfo.value)
 
 
 def test_iree_explicit_compile_kwarg_beats_env(monkeypatch, iree_argsort_lowered):
-    """End to end: ETL_IREE_COMPILE_ARGS carries a flag iree-compile rejects;
+    """End to end: EVOXC_IREE_COMPILE_ARGS carries a flag iree-compile rejects;
     the explicit iree_compile_args kwarg wins (explicit > env > default)."""
-    monkeypatch.setenv("ETL_IREE_COMPILE_ARGS", "--definitely-not-a-real-iree-flag")
-    artifact = etl.compile(
+    monkeypatch.setenv("EVOXC_IREE_COMPILE_ARGS", "--definitely-not-a-real-iree-flag")
+    artifact = evoxc.compile(
         iree_argsort_lowered, iree_compile_args=["--iree-llvmcpu-target-cpu=generic"]
     )
-    exe = etl.load(artifact)
-    out = etl.run(exe, _ARGSORT_INPUT)
+    exe = evoxc.load(artifact)
+    out = evoxc.run(exe, _ARGSORT_INPUT)
     np.testing.assert_array_equal(out.numpy(), np.argsort(_ARGSORT_INPUT))
 
 
 def test_iree_env_compile_args_alone_rejected(monkeypatch, iree_argsort_lowered):
     """Without an explicit kwarg, the env flag IS applied — and the compiler's
     rejection surfaces as BackendError (the env path is real, not inert)."""
-    monkeypatch.setenv("ETL_IREE_COMPILE_ARGS", "--definitely-not-a-real-iree-flag")
+    monkeypatch.setenv("EVOXC_IREE_COMPILE_ARGS", "--definitely-not-a-real-iree-flag")
     with pytest.raises(core.BackendError, match="iree-compile"):
-        etl.compile(iree_argsort_lowered)
+        evoxc.compile(iree_argsort_lowered)
 
 
 def test_iree_lower_reserved_option_sort_emission():
@@ -800,10 +800,10 @@ def test_iree_lower_reserved_option_sort_emission():
     KNOWN_OPTIONS: it passes validation and the pair emission compiles and
     runs on llvm-cpu."""
     _require_iree()
-    exe = etl.build(
+    exe = evoxc.build(
         _argsort_fn, _ARGSORT_SPEC, backend="iree", sort_emission="pair"
     )
-    out = etl.run(exe, _ARGSORT_INPUT)
+    out = evoxc.run(exe, _ARGSORT_INPUT)
     np.testing.assert_array_equal(out.numpy(), np.argsort(_ARGSORT_INPUT))
 
 
@@ -812,10 +812,10 @@ def test_iree_lower_reserved_option_while_init_rewrite():
     KNOWN_OPTIONS: it passes validation and a scalar-init while loop compiles
     and runs on llvm-cpu with the rewrite disabled."""
     _require_iree()
-    exe = etl.build(
+    exe = evoxc.build(
         _while_fn, _WHILE_SPEC, backend="iree", while_init_rewrite=False
     )
-    out = etl.run(exe, np.array(0.0, "float32"))
+    out = evoxc.run(exe, np.array(0.0, "float32"))
     assert out.numpy() == 4.0
 
 
@@ -826,14 +826,14 @@ def test_iree_performance_options_end_to_end():
     numpy reference (the split-reduction path disabled emits the plain
     ``stablehlo.reduce``)."""
     _require_iree()
-    exe = etl.build(
+    exe = evoxc.build(
         _min_fn,
         _MIN_SPEC,
         backend="iree",
         eigh_algorithm="jacobi",
         split_reduction=False,
     )
-    out = etl.run(exe, _MIN_INPUT)
+    out = evoxc.run(exe, _MIN_INPUT)
     assert out.dtype == np.dtype("int32")
     assert int(out.numpy()) == _MIN_EXPECTED
 
@@ -851,8 +851,8 @@ def test_tvm_target_accepted():
     """``tvm_target`` (default "llvm") is accepted and forwarded to the Relax
     VM build; the graph compiles and runs."""
     _require_tvm()
-    exe = etl.build(_add_fn, _ADD_SPEC, backend="tvm", tvm_target="llvm")
-    np.testing.assert_allclose(etl.run(exe, _ADD_INPUT).numpy(), _ADD_EXPECTED)
+    exe = evoxc.build(_add_fn, _ADD_SPEC, backend="tvm", tvm_target="llvm")
+    np.testing.assert_allclose(evoxc.run(exe, _ADD_INPUT).numpy(), _ADD_EXPECTED)
 
 
 def test_tvm_pass_configs_version_adaptive():
@@ -860,9 +860,9 @@ def test_tvm_pass_configs_version_adaptive():
     the parameter; otherwise a loud BackendError naming the option — never
     silently dropped."""
     _require_tvm()
-    lowered = etl.lower(etl.trace(_add_fn, _ADD_SPEC), backend="tvm")
+    lowered = evoxc.lower(evoxc.trace(_add_fn, _ADD_SPEC), backend="tvm")
     try:
-        artifact = etl.compile(
+        artifact = evoxc.compile(
             lowered, tvm_pass_configs={"tir.disable_assert": False}
         )
     except core.BackendError as exc:
@@ -870,15 +870,15 @@ def test_tvm_pass_configs_version_adaptive():
         assert "pass_configs" in str(exc)
         assert "tvm_pass_configs" in str(exc)
     else:
-        exe = etl.load(artifact)
-        np.testing.assert_allclose(etl.run(exe, _ADD_INPUT).numpy(), _ADD_EXPECTED)
+        exe = evoxc.load(artifact)
+        np.testing.assert_allclose(evoxc.run(exe, _ADD_INPUT).numpy(), _ADD_EXPECTED)
 
 
 def test_tvm_unknown_compile_option_rejected():
     _require_tvm()
-    lowered = etl.lower(etl.trace(_add_fn, _ADD_SPEC), backend="tvm")
+    lowered = evoxc.lower(evoxc.trace(_add_fn, _ADD_SPEC), backend="tvm")
     with pytest.raises(core.BackendError, match="does not recognize the compile option"):
-        etl.compile(lowered, bogus=1)
+        evoxc.compile(lowered, bogus=1)
 
 
 # ---------------------------------------------------------------------------
@@ -897,15 +897,15 @@ def fake_pjrt_plugin(tmp_path_factory):
 
 
 def _xla_lowered():
-    return etl.lower(etl.trace(_add_fn, _ADD_SPEC), backend="xla")
+    return evoxc.lower(evoxc.trace(_add_fn, _ADD_SPEC), backend="xla")
 
 
 def test_xla_plugin_discovery_requires_env_or_option(monkeypatch, fake_pjrt_plugin):
-    """No plugin configured -> BackendError naming ETL_PJRT_PLUGIN; the
+    """No plugin configured -> BackendError naming EVOXC_PJRT_PLUGIN; the
     ``plugin_path`` option is honored for discovery."""
-    monkeypatch.delenv("ETL_PJRT_PLUGIN", raising=False)
+    monkeypatch.delenv("EVOXC_PJRT_PLUGIN", raising=False)
     monkeypatch.setattr(xla_util, "_DEFAULT_PLUGIN_PATHS", ())
-    with pytest.raises(core.BackendError, match="ETL_PJRT_PLUGIN"):
+    with pytest.raises(core.BackendError, match="EVOXC_PJRT_PLUGIN"):
         xla_util._find_plugin_path(None)
     plugin = xla_util._load_plugin({"plugin_path": str(fake_pjrt_plugin)})
     assert plugin.api is not None
@@ -915,15 +915,15 @@ def test_xla_compile_load_options_end_to_end(monkeypatch, fake_pjrt_plugin):
     """plugin_path at compile AND load + xla_compile_options bytes: the full
     pipeline runs against the fake (zero-filled outputs — the declared
     shape/dtype plumbing is what the fake exercises)."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_pjrt_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_pjrt_plugin))
     lowered = _xla_lowered()
-    artifact = etl.compile(
+    artifact = evoxc.compile(
         lowered,
         plugin_path=str(fake_pjrt_plugin),
         xla_compile_options=b"\x1a\x04\x20\x01\x28\x01",  # a CompileOptionsProto
     )
-    exe = etl.load(artifact, plugin_path=str(fake_pjrt_plugin))
-    out = etl.run(exe, _ADD_INPUT)
+    exe = evoxc.load(artifact, plugin_path=str(fake_pjrt_plugin))
+    out = evoxc.run(exe, _ADD_INPUT)
     assert out.shape == (4,)
     assert out.dtype == np.dtype("float32")
     np.testing.assert_array_equal(out.numpy(), np.zeros(4, "float32"))
@@ -932,21 +932,21 @@ def test_xla_compile_load_options_end_to_end(monkeypatch, fake_pjrt_plugin):
 def test_xla_compile_options_non_bytes_rejected(monkeypatch, fake_pjrt_plugin):
     """``xla_compile_options`` must be bytes (a serialized
     CompileOptionsProto) — rejected before any plugin work."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_pjrt_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_pjrt_plugin))
     lowered = _xla_lowered()
     with pytest.raises(core.BackendError, match="xla_compile_options"):
-        etl.compile(lowered, xla_compile_options="not-bytes")
+        evoxc.compile(lowered, xla_compile_options="not-bytes")
 
 
 def test_xla_run_stage_unknown_option_rejected(monkeypatch, fake_pjrt_plugin):
     """The xla run stage has NO known options in v1: a non-empty run options
     dict raises core.BackendError."""
-    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(fake_pjrt_plugin))
+    monkeypatch.setenv("EVOXC_PJRT_PLUGIN", str(fake_pjrt_plugin))
     lowered = _xla_lowered()
-    artifact = etl.compile(lowered, plugin_path=str(fake_pjrt_plugin))
-    exe = etl.load(artifact, plugin_path=str(fake_pjrt_plugin))
+    artifact = evoxc.compile(lowered, plugin_path=str(fake_pjrt_plugin))
+    exe = evoxc.load(artifact, plugin_path=str(fake_pjrt_plugin))
     with pytest.raises(core.BackendError, match="does not recognize the run option"):
-        etl.run(exe, _ADD_INPUT, bogus=1)
+        evoxc.run(exe, _ADD_INPUT, bogus=1)
 
 
 # ---------------------------------------------------------------------------
@@ -957,12 +957,12 @@ def test_xla_run_stage_unknown_option_rejected(monkeypatch, fake_pjrt_plugin):
 def test_numpy_ignores_unknown_options():
     """The numpy reference backend DELIBERATELY declares no validation:
     cross-backend option dicts pass at every stage without error."""
-    exe = etl.build(
+    exe = evoxc.build(
         _add_fn, _ADD_SPEC, backend="numpy",
         target_backends=["llvm-cpu"], bogus_option=1,
     )
     np.testing.assert_allclose(
-        etl.run(exe, _ADD_INPUT, target_backends=["cuda"], another_bogus=2).numpy(),
+        evoxc.run(exe, _ADD_INPUT, target_backends=["cuda"], another_bogus=2).numpy(),
         _ADD_EXPECTED,
     )
 
@@ -970,8 +970,8 @@ def test_numpy_ignores_unknown_options():
 def test_numpy_rank_context_flows_through_run_options():
     """The documented numpy exception: ``rank_context`` inside run options
     still flows into the interpreter's execution context."""
-    exe = etl.build(_add_fn, _ADD_SPEC, backend="numpy")
+    exe = evoxc.build(_add_fn, _ADD_SPEC, backend="numpy")
     np.testing.assert_allclose(
-        etl.run(exe, _ADD_INPUT, rank_context=etl.dist.RankContext(0, 1)).numpy(),
+        evoxc.run(exe, _ADD_INPUT, rank_context=evoxc.dist.RankContext(0, 1)).numpy(),
         _ADD_EXPECTED,
     )

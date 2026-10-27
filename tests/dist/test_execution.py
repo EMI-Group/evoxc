@@ -1,10 +1,10 @@
-"""Single-rank execution tests for etl.dist collectives.
+"""Single-rank execution tests for evoxc.dist collectives.
 
 End-to-end behavior of the default collective executor (installed by the
 numpy backend): `SingleRankCollectiveExecutor` with rank 0 / world size 1,
 identity semantics — every collective returns its input tensor unchanged.
 
-These tests document the runtime contract (see `../../etl/dist/CONTEXT.md`):
+These tests document the runtime contract (see `../../evoxc/dist/CONTEXT.md`):
 
 - World-group collectives declare `None` (runtime-dynamic) dims on the
   collective axes, so the identity result passes result-type validation.
@@ -25,20 +25,20 @@ CPU only, no network, small shapes.
 import numpy as np
 import pytest
 
-import etl
-from etl import core
+import evoxc
+from evoxc import core
 
-G4 = etl.dist.group("data4", (0, 1, 2, 3))
+G4 = evoxc.dist.group("data4", (0, 1, 2, 3))
 
 # (collective frontend, extra kwargs for the 2-D input shape) — group=None
 # (the world group) in all cases.
 WORLD_CASES = [
-    (etl.dist.all_reduce, {}),
-    (etl.dist.all_gather, {}),
-    (etl.dist.reduce_scatter, {}),
-    (etl.dist.all_to_all, {"split_axis": 0, "concat_axis": 1}),
-    (etl.dist.broadcast, {}),
-    (etl.dist.collective_permute, {"source_target_pairs": ((0, 1), (1, 0))}),
+    (evoxc.dist.all_reduce, {}),
+    (evoxc.dist.all_gather, {}),
+    (evoxc.dist.reduce_scatter, {}),
+    (evoxc.dist.all_to_all, {"split_axis": 0, "concat_axis": 1}),
+    (evoxc.dist.broadcast, {}),
+    (evoxc.dist.collective_permute, {"source_target_pairs": ((0, 1), (1, 0))}),
 ]
 
 DTYPE_SHAPE_CASES = [
@@ -49,9 +49,9 @@ DTYPE_SHAPE_CASES = [
 
 
 def _collective_defn(collective, **kwargs):
-    """Wrap a collective frontend call in a one-argument `@etl.defn` graph."""
+    """Wrap a collective frontend call in a one-argument `@evoxc.defn` graph."""
 
-    @etl.defn
+    @evoxc.defn
     def f(t):
         return collective(t, **kwargs)
 
@@ -77,7 +77,7 @@ def test_world_group_identity_execution(collective, kwargs, dtype, shape):
     fn = _collective_defn(collective, **kwargs)
     x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
 
-    out = etl.evaluate(fn, x)
+    out = evoxc.evaluate(fn, x)
 
     assert isinstance(out, core.Tensor)
     assert out.dtype == core.dtype(dtype)
@@ -93,10 +93,10 @@ def test_world_group_identity_execution(collective, kwargs, dtype, shape):
 @pytest.mark.parametrize(
     "collective,kwargs",
     [
-        (etl.dist.all_reduce, {}),
-        (etl.dist.broadcast, {"src_rank": 0}),
+        (evoxc.dist.all_reduce, {}),
+        (evoxc.dist.broadcast, {"src_rank": 0}),
         (
-            etl.dist.collective_permute,
+            evoxc.dist.collective_permute,
             {"source_target_pairs": ((0, 1), (1, 2), (2, 3), (3, 0))},
         ),
     ],
@@ -107,7 +107,7 @@ def test_explicit_group_shape_preserving_identity(collective, kwargs):
     fn = _collective_defn(collective, group=G4, **kwargs)
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
 
-    out = etl.evaluate(fn, x)
+    out = evoxc.evaluate(fn, x)
 
     assert isinstance(out, core.Tensor)
     assert out.dtype == core.float32
@@ -122,11 +122,11 @@ def test_explicit_group_shape_preserving_identity(collective, kwargs):
 @pytest.mark.parametrize(
     "op_name,collective,kwargs,input_shape",
     [
-        ("all_gather", etl.dist.all_gather, {}, (2, 3)),
-        ("reduce_scatter", etl.dist.reduce_scatter, {}, (8, 3)),
+        ("all_gather", evoxc.dist.all_gather, {}, (2, 3)),
+        ("reduce_scatter", evoxc.dist.reduce_scatter, {}, (8, 3)),
         (
             "all_to_all",
-            etl.dist.all_to_all,
+            evoxc.dist.all_to_all,
             {"split_axis": 0, "concat_axis": 1},
             (4, 4),
         ),
@@ -148,7 +148,7 @@ def test_explicit_group_shape_changing_identity_raises(
     x = np.arange(np.prod(input_shape), dtype=np.float32).reshape(input_shape)
 
     with pytest.raises(core.ShapeError, match=f"kernel for op '{op_name}'"):
-        etl.evaluate(fn, x)
+        evoxc.evaluate(fn, x)
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +156,11 @@ def test_explicit_group_shape_changing_identity_raises(
 # ---------------------------------------------------------------------------
 
 def test_rank_and_world_size_single_rank():
-    @etl.defn
+    @evoxc.defn
     def f():
-        return (etl.dist.rank(), etl.dist.world_size())
+        return (evoxc.dist.rank(), evoxc.dist.world_size())
 
-    rank_t, world_t = etl.evaluate(f)
+    rank_t, world_t = evoxc.evaluate(f)
 
     assert isinstance(rank_t, core.Tensor)
     assert isinstance(world_t, core.Tensor)
