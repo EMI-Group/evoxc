@@ -101,6 +101,16 @@ class Executable(Protocol):
     of backend-specific RUN options (validated against the backend's
     ``KNOWN_OPTIONS["run"]`` set — unknown keys raise ``core.BackendError``;
     the numpy reference backend documents ignoring options instead).
+
+    Synchronization (OPTIONAL, deliberately NOT a protocol member so
+    structural ``isinstance`` keeps working for executables without it): a
+    backend whose ``run`` is asynchronous may expose
+    ``synchronize() -> None``, which blocks until device work submitted by
+    previous ``run`` calls has completed — output values are already valid
+    before the call, only their timing needs it. Backends whose ``run``
+    already blocks on the device queue (numpy, iree) omit it or provide a
+    documented no-op; ``etl.pipeline.Executable.synchronize`` dispatches via
+    ``getattr`` and is a no-op when the method is absent.
     """
 
     functions: tuple[str, ...]

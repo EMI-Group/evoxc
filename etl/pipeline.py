@@ -148,6 +148,26 @@ class Executable:
         executable)."""
         return self.backend_executable.device
 
+    def synchronize(self):
+        """Wait until all device work submitted by previous ``run()`` calls on
+        this executable has completed.
+
+        Binding semantics: the output Tensors' values are already valid before
+        the call (any read awaits), only their *timing* needs this — so
+        ``synchronize`` is an EXPLICIT caller-invoked primitive that lets a
+        caller overlap dispatch (the default) and join only when it must.
+        Nothing in etl calls it implicitly and ``etl.run`` is unchanged (no
+        per-call sync — dispatch overlap stays a feature).
+
+        Delegates to the backend executable's optional ``synchronize`` when it
+        has one; a backend whose ``run`` already blocks on the device queue
+        (numpy, iree) is a documented no-op here (numpy exposes no method at
+        all). Returns ``None``.
+        """
+        sync = getattr(self.backend_executable, "synchronize", None)
+        if callable(sync):
+            sync()
+
     def save(self, path):
         """Persist the executable if the backend supports it.
 
@@ -279,6 +299,15 @@ class BoundExecutable:
     def backend(self):
         """Backend name the wrapped executable runs on (delegates)."""
         return self.executable.backend
+
+    def synchronize(self):
+        """Wait for all device work submitted by previous ``run`` calls on the
+        wrapped executable (delegates to ``self.executable.synchronize()``).
+
+        Exists so an ``etl.bind(...)`` result exposes the exact same call
+        shape as the underlying ``Executable``. Returns ``None``.
+        """
+        self.executable.synchronize()
 
 
 # ---------------------------------------------------------------------------
