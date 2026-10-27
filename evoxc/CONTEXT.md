@@ -6,7 +6,7 @@ skill:
 
 ## Intent
 
-The `evoxc` package: an explicit, minimal tensor graph compiler and runtime.
+The `evoxc` package — **EvoX Compiler**: a minimal, explicit, compiler-neutral tensor graph compiler and runtime.
 See root `../CONTEXT.md` for the binding principles, the four-concept value-model table, the import-acyclicity contract, the error strategy, and the non-goals — all binding here.
 This file owns the **public API surface** (names that must exist) and the **cross-module contracts** every submodule must honor; per-feature implementation detail lives in the child nodes listed in the routing table.
 This file must stay under the ~64 KB per-file read limit — push new detail down to the owning child node instead of growing it.
