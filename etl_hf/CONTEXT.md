@@ -232,6 +232,8 @@ Rank-0 scalars get their own bucket and unpack through `reshape(slice(...), ())`
 Measured packed input counts: llama untied **5** / tied **4**, gpt2 untied **4** / tied **3**, real 124M `gpt2` **3** against 196 canonical keys; the packed element count equals the canonical total exactly (lossless and bit-identical). Counts are shape-driven, not role-driven — read them from `pack_plan(...).specs`, never assume a number.
 Families opt in with one line: `graph(cfg, seq_len, batch_size, *, pack_plan=None)` and, as the forward's **first** statement, `params = pack_plan.unpack(params)`.
 Pure graph→graph composition: **no new IR ops** (one `etl.slice` per canonical key) and never an `etl.constant` of weights. Explicit errors: symbolic/dynamic dims → `HFUnsupportedError`; missing/extra keys or shape/dtype mismatches → `HFWeightError` naming the key.
+Packing therefore costs the compiled program exactly **1× the weight bytes per call**: every bucket is an axis-0 concatenation of same-trailing-shape matrices (each canonical matrix keeps its canonical `(in, out)` orientation, so no transpose/gather/arbitrary reshape is needed to feed `etl.dot`) and every slice has exactly one consumer (traced qwen3_14b packed graph: 362 ≥1 MB slice operands consumed = 59.176 GB against 59.073 GB of weights, no multi-consumer weight slice).
+The one in-graph *materialization* of a weight is the tied-head transpose (see Known Issues).
 
 ### `etl_hf/errors.py` and `etl_hf/_validate.py`
 
