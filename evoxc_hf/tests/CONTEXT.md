@@ -2,7 +2,7 @@
 
 ## Intent
 
-Colocated tests for `evoxc_hf`: a source-only top-level package that ships in no wheel or sdist of `evoxc`, so its tests live here rather than under `./tests/`, which mirrors `evoxc` only (`pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]`, package list `include = ["evoxc", "evoxc.*"]` — these globs cannot match `evoxc_hf`/`evoxc_hf.*`, and `exclude = ["evoxc_hf.tests", "evoxc_hf.tests.*"]` keeps the suite out of publishing as belt-and-braces).
+Colocated tests for `evoxc_hf`: a source-only top-level package that ships in no wheel or sdist of `evoxc`, so its tests live here rather than under `../../tests/`, which mirrors `evoxc` only (`pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]`, package list `include = ["evoxc", "evoxc.*"]` — these globs cannot match `evoxc_hf`/`evoxc_hf.*`, and `exclude = ["evoxc_hf.tests", "evoxc_hf.tests.*"]` keeps the suite out of publishing as belt-and-braces).
 The suite pins the **external** contracts — config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, parity against an independent oracle — plus the **functional shape** of the API: `evoxc_hf.load` (checkpoint → config + params), `evoxc_hf.program` (memoised forward, specs, oracle), `evoxc_hf.pipeline` (build/run/predict/placement), joined only by ordinary values.
 Everything is offline and numpy-only by default (no torch, no compiler), so the contract verifies on a bare `uv run --with pytest` install; only the guarded checkpoint readers touch the network.
 
@@ -52,7 +52,7 @@ Skip groups (default env): torch/transformers absent (4), `iree` absent (22), `E
 `pytest` is not in the base uv env: `uv run --with pytest python -m pytest evoxc_hf/tests -q` (add `--extra iree` for the compiled path; `uv run --isolated --extra iree …` for GPU work — the base env has no iree, so `evoxc.devices()` shows only cpu).
 Take authoritative counts from `--junit-xml`: iree's nanobind teardown can abort at exit and swallow the `-q` summary; also export `PYTHONUNBUFFERED=1` on a GPU host so buffered diagnostics survive a redirect.
 Never assert timings (the GPU is shared): measured numbers live in module-level `MEASURED` dicts or assertion messages.
-Use `$TMPDIR` (never `/tmp`) for scratch files, and never write into `./bench_logs/` or `./evoxc/`.
+Use `$TMPDIR` (never `/tmp`) for scratch files, and never write into `../../bench_logs/` or `../../evoxc/`.
 
 ## Network and environment gates
 
@@ -65,7 +65,7 @@ No test requires torch: the compiled and conformance paths are numpy-only, and e
 
 ## Golden fixtures
 
-`../bench_logs/hf_goldens/` (resolved from the repo root, never the cwd) is the read-only contract with a separate torch-golden harness; it carries five fixtures (`tiny_random_llama`, `tiny_random_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`) and nothing here writes it.
+`../../bench_logs/hf_goldens/` (resolved from the repo root, never the cwd) is the read-only contract with a separate torch-golden harness; it carries five fixtures (`tiny_random_llama`, `tiny_random_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`) and nothing here writes it.
 Per model: `<slug>.npz` with `input_ids` (int32, `(batch, seq_len)`) and `logits` (float32, `(batch, seq_len, vocab)` or `(batch*seq_len, vocab)`), plus `<slug>.meta.json` with an HF repo id under `model` or `model_id` (`model` wins) and informational `revision`/`dtype`.
 Reading uses `allow_pickle=False`; the meta repo id wins over the slug mapping, and the stored logits must be float32.
 An absent directory skips the parity test with a contract restatement; a malformed fixture fails `test_golden_fixture_format`, an unmappable one fails `test_golden_slugs_resolve`.
@@ -82,7 +82,7 @@ CLI: `python evoxc_hf/tests/hf_download.py [--slugs a,b] [--root DIR] [--check]`
 ## Known Issues / quirks
 
 `sshleifer/tiny-gpt2` is an ordinary oracle case — its legacy `pytorch_model.bin` reads correctly (33 tensors matching `torch.load`, `max |logit| ≈ 0.1285`, 2.2e-8 vs HuggingFace); a shifted parse still yields well-shaped tensors that agree with evoxc_hf's own numpy reference, so only that external comparison (or `test_weights.py`'s exact-consumption check) catches it.
-The `~1e-44` "degenerate checkpoint" figure in `../bench_logs/hf_feasibility_findings.md` describes such a shifted parse, not the checkpoint.
+The `~1e-44` "degenerate checkpoint" figure in `../../bench_logs/hf_feasibility_findings.md` describes such a shifted parse, not the checkpoint.
 ROCm: `Device("rocm", 0)` maps to HAL `device_id = 1` (1-based; `create_device(0)` raises); fp32 `dot` is true fp32 on iree/ROCm; the first `.to(cpu)` readback and first `place_params` leaf each pay a one-time driver init never to be charged to a per-call loop.
 `tiny-random-Mistral` uses exact `erf`-GELU, a StableHLO v1 deferral, so it is numpy-backend-only.
 `test_public_api.py` enumerates the whole surface, so it is the first file to update when the public API changes — it fails loudly on drift instead of tolerating stale names.
@@ -107,4 +107,4 @@ ROCm: `Device("rocm", 0)` maps to HAL `device_id = 1` (1-based; `create_device(0
 | `./test_torch_oracle.py` | Optional torch/transformers oracle + golden-fixture contract. |
 | `./hf_download.py` | Guarded downloader/cache helper + slug tables + CLI (stdlib only). |
 | `../` | The package under test (`config`, `weights`, `ops`, `reference`, `families`, `load`, `program`, `pipeline`, `pack`). |
-| `../../evoxc/` | The tensor language it builds on (read-only from here). |
+| `../../evoxc/` | The EvoX Compiler package (`evoxc`) it builds on (read-only from here). |

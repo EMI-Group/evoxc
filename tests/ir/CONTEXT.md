@@ -3,7 +3,7 @@
 ## Intent
 
 pytest suite validating the `evoxc.ir` package (sibling — the contract lives in
-`../evoxc/ir/CONTEXT.md`, read it before touching these tests). These tests are
+`../../evoxc/ir/CONTEXT.md`, read it before touching these tests). These tests are
 the executable spec of the IR layer: the op registry (canonical 105-op v1 set),
 `verify()` invariants, serialization round-trips/integrity, `pretty_print`
 golden output, the `Builder`, shape-inference hooks, and the SSA data model.
@@ -24,7 +24,7 @@ golden output, the `Builder`, shape-inference hooks, and the SSA data model.
 ## Known evoxc bugs
 
 None found — every test passes against the current implementation; the documented
-contracts in `../evoxc/ir/CONTEXT.md` (including the Known Issues section) hold.
+contracts in `../../evoxc/ir/CONTEXT.md` (including the Known Issues section) hold.
 Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
 - `divide` uses `infer_elementwise_binary` (int/int stays int) and unary math ops
   are dtype-preserving — the ops-layer true-division/float64-promotion contract

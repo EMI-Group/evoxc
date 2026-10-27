@@ -291,11 +291,11 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 ## Constraints
 
 - **No new hard dependency**; `torch`/`transformers` appear only in tests behind availability guards as external golden oracles, `iree` only behind `skipif` guards, and no `safetensors`/`huggingface_hub` package is required.
-- **Never modify `./evoxc/`** (sibling node — read-only; escalate core gaps to the parent agent). Gaps are composed around here and documented: `rsqrt` → `1/sqrt`, `erf` → numpy-backend-only GELU.
+- **Never modify `../evoxc/`** (sibling node — read-only; escalate core gaps to the parent agent). Gaps are composed around here and documented: `rsqrt` → `1/sqrt`, `erf` → numpy-backend-only GELU.
 - **Explicit errors only**: everything derives from `evoxc.core.EVOXCError` via `HFError` (or `ValueError`/`TypeError` for pure host-side argument errors), messages name the file/field/tensor/key, and there is never a silent fallback, dtype swap or positional guess.
 - **Static-shape-first**: dynamic dims are not a goal; a mismatched `seq_len`/`batch_size` is an explicit `HFConfigError`/`evoxc.ShapeError`.
 - **Files stay small** (~1000 lines baseline, one concern per module); no duplicate family logic — shared attention/norm/MLP pieces live in `ops.py` / `models/_common.py`. `pipeline.py` sits at ~1110 lines: one concern (the verbatim option matrix plus `build`/`run`/`predict`/placement), each function documented in place.
-- **Tests are colocated** in `./evoxc_hf/tests/`; `pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]` and its package list excludes `evoxc_hf.tests`.
+- **Tests are colocated** in `./tests/`; `pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]` and its package list excludes `evoxc_hf.tests`.
 - **Status (measured)**: **725 collected — 695 passed / 30 skipped** in the base env (`uv run --with pytest python -m pytest evoxc_hf/tests`), zero failures; skips are host/dependency guards only (torch/transformers absent, `EVOXC_HF_BIG` unset, `iree` absent). The real `Qwen/Qwen3-0.6B` legs were run explicitly with `EVOXC_HF_BIG=1` + `EVOXC_HF_MODELS_DIR=…/evoxc_hf_models_qwen3`: `test_real_checkpoints.py -k qwen3` 1 passed (23 s) and `test_torch_oracle.py -k qwen3` 1 passed under the torch/transformers venv (30 s).
 - **Status (capability)**: both families trace, verify, export to StableHLO and run on the numpy interpreter, and the same graph compiles and runs on **every validated compiler adapter** — one IREE program on `llvm-cpu` and — packed where needed — device-resident on ROCm, plus device-resident **XLA/ROCm** via a user-provided PJRT plugin. Adapter coverage for the whole forward: `numpy` (host), `iree` (llvm-cpu + ROCm), `xla` (ROCm — the first `evoxc_hf` runs on XLA anywhere, measured by the benchmark harness, not a gated test); **`tvm` is UNVALIDATED for `evoxc_hf`** (no whole-model run has been recorded on the TVM adapter — its option handling is unit-tested only).
   Measured best-of-5 warm, llvm-cpu: `tiny_llama` `seq_len=32` build 1.5 s / 3.3 ms per call (1.0e-7 vs numpy), `tiny_gpt2` 1.1 s / 3.7 ms (2.2e-8), `distilgpt2` 1.9 s / 346 ms (2.1e-4) — against 6.0 / 1.9 / 12.1 ms for the numpy interpreter, whose OpenBLAS matmuls win on CPU.
@@ -330,22 +330,22 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 
 | Path / module | Area |
 |---|---|
-| `./evoxc_hf/load.py` | Loading half: `LoadedModel`, `load_config`, `load_params`, `load_hf`, `validate_params`. |
-| `./evoxc_hf/program.py` | Compute half: `forward_fn` (+ memoisation/specialisation stamp), `param_specs`, `reference_logits`, `resolve_seq_len`, `DEFAULT_SEQ_LEN`. |
-| `./evoxc_hf/pipeline.py` | Staging: `build`, `run`, `predict`, `place_params`, `place_ids`, `resolve_build_options`, the `DEFAULT_*` option constants and the default backend/option matrix. |
-| `./evoxc_hf/config.py` | HF `config.json` → `ModelConfig`, `digest`, `FAMILY_BY_MODEL_TYPE`. |
-| `./evoxc_hf/weights.py` | Checkpoint reading: safetensors, torch zip/legacy, sharded indices, dtype policy, restricted unpickler (no key mapping). |
-| `./evoxc_hf/ops.py` | Graph idioms (norms/activations/softmax/mask/RoPE/head layout) + `ACTIVATIONS`/`EXPORT_UNSAFE_ACTIVATIONS`. |
-| `./evoxc_hf/reference.py` | Independent pure-numpy oracle primitives (no `evoxc` import) — the thing graphs are validated against. |
-| `./evoxc_hf/families.py` | `FamilySpec`, the `FAMILIES` registry, `get_family`, `family_for_model_type`, `resolve_family`. |
-| `./evoxc_hf/models/` | Per-family graph builders (`llama.py` — llama/mistral/qwen2/qwen3, the Qwen3 case adding per-head QK-Norm — and `gpt2.py`) plus the shared block assembly `_common.py`; `models/__init__.py` re-exports nothing (import acyclicity). |
-| `./evoxc_hf/pack.py` | Opt-in packed weights: `PackPlan`/`PackEntry`/`pack_plan`/`pack_params`/`is_packed_tree` — bucket the canonical `param_specs` by `(dtype, rank, shape[1:])`, concatenate along axis 0 on the host, unpack inside the graph with static `evoxc.slice`; derived entries (`source`/`transposed`) store a pre-transposed copy so the graph never transposes a weight. |
-| `./evoxc_hf/_specs.py` | The packing-orientation rule: `transposed_aliases(specs)` → `{derived_key: source_key}` (a tied tree declares its pre-transposed head; nothing else does). |
-| `./evoxc_hf/errors.py` | The `HFError` hierarchy (rooted at `evoxc.core.EVOXCError`). |
-| `./evoxc_hf/_validate.py` | Internal argument guards shared by `load`/`program`/`pipeline`. |
-| `./evoxc_hf/tests/` | pytest suite (parity, export, iree/llvm-cpu + iree/ROCm device-resident gates, packed-weight pins, real-checkpoint gates, and the functional-API design pins in `test_public_api.py`); `tests/hf_download.py` is the guarded checkpoint downloader used by the network-dependent tests. |
+| `./load.py` | Loading half: `LoadedModel`, `load_config`, `load_params`, `load_hf`, `validate_params`. |
+| `./program.py` | Compute half: `forward_fn` (+ memoisation/specialisation stamp), `param_specs`, `reference_logits`, `resolve_seq_len`, `DEFAULT_SEQ_LEN`. |
+| `./pipeline.py` | Staging: `build`, `run`, `predict`, `place_params`, `place_ids`, `resolve_build_options`, the `DEFAULT_*` option constants and the default backend/option matrix. |
+| `./config.py` | HF `config.json` → `ModelConfig`, `digest`, `FAMILY_BY_MODEL_TYPE`. |
+| `./weights.py` | Checkpoint reading: safetensors, torch zip/legacy, sharded indices, dtype policy, restricted unpickler (no key mapping). |
+| `./ops.py` | Graph idioms (norms/activations/softmax/mask/RoPE/head layout) + `ACTIVATIONS`/`EXPORT_UNSAFE_ACTIVATIONS`. |
+| `./reference.py` | Independent pure-numpy oracle primitives (no `evoxc` import) — the thing graphs are validated against. |
+| `./families.py` | `FamilySpec`, the `FAMILIES` registry, `get_family`, `family_for_model_type`, `resolve_family`. |
+| `./models/` | Per-family graph builders (`llama.py` — llama/mistral/qwen2/qwen3, the Qwen3 case adding per-head QK-Norm — and `gpt2.py`) plus the shared block assembly `_common.py`; `models/__init__.py` re-exports nothing (import acyclicity). |
+| `./pack.py` | Opt-in packed weights: `PackPlan`/`PackEntry`/`pack_plan`/`pack_params`/`is_packed_tree` — bucket the canonical `param_specs` by `(dtype, rank, shape[1:])`, concatenate along axis 0 on the host, unpack inside the graph with static `evoxc.slice`; derived entries (`source`/`transposed`) store a pre-transposed copy so the graph never transposes a weight. |
+| `./_specs.py` | The packing-orientation rule: `transposed_aliases(specs)` → `{derived_key: source_key}` (a tied tree declares its pre-transposed head; nothing else does). |
+| `./errors.py` | The `HFError` hierarchy (rooted at `evoxc.core.EVOXCError`). |
+| `./_validate.py` | Internal argument guards shared by `load`/`program`/`pipeline`. |
+| `./tests/` | pytest suite (parity, export, iree/llvm-cpu + iree/ROCm device-resident gates, packed-weight pins, real-checkpoint gates, and the functional-API design pins in `test_public_api.py`); `tests/hf_download.py` is the guarded checkpoint downloader used by the network-dependent tests. |
 
-Cross-references (read-only): `../evoxc/` → the tensor language this package builds on (public API contract in `../evoxc/CONTEXT.md`); `../bench_logs/` → the HF feasibility spike, probe scripts and measured results — notably the current HF-vs-PyTorch benchmark harness `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `../bench_logs/hf_bench_data/`) and its report `../bench_logs/hf_bench_results.md`, the older `../bench_logs/hf_perf_results.md`, and `../bench_logs/hf_goldens/`, the torch-golden fixtures read by `tests/test_torch_oracle.py`.
+Cross-references (read-only): `../evoxc/` → the EvoX Compiler package (`evoxc`) this package builds on (public API contract in `../evoxc/CONTEXT.md`); `../bench_logs/` → the HF feasibility spike, probe scripts and measured results — notably the current HF-vs-PyTorch benchmark harness `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `../bench_logs/hf_bench_data/`) and its report `../bench_logs/hf_bench_results.md`, the older `../bench_logs/hf_perf_results.md`, and `../bench_logs/hf_goldens/`, the torch-golden fixtures read by `tests/test_torch_oracle.py`.
 
 ## Notes for Agents
 

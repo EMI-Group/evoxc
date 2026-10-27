@@ -2,7 +2,7 @@
 
 ## Intent
 
-pytest suite for the `evoxc.block` subsystem (sibling `../evoxc/block/` — read-only from here; read its CONTEXT.md for the contract being tested): block declaration (factory + decorator forms), call semantics (block_call IR construction, static specialization, operand errors), backend impl registration + execution, portable decomposition inlining, batching/derivative rule registration + fallbacks, and the BlockError hierarchy.
+pytest suite for the `evoxc.block` subsystem (sibling `../../evoxc/block/` — read-only from here; read its CONTEXT.md for the contract being tested): block declaration (factory + decorator forms), call semantics (block_call IR construction, static specialization, operand errors), backend impl registration + execution, portable decomposition inlining, batching/derivative rule registration + fallbacks, and the BlockError hierarchy.
 
 ## Structure
 
@@ -19,7 +19,7 @@ pytest suite for the `evoxc.block` subsystem (sibling `../evoxc/block/` — read
 ## Constraints
 
 - CPU only, small shapes (batch ≤ 16, dims ≤ 8), fast (<2s per file, whole dir ~0.8s).
-- Never modify `../evoxc/` — bugs found are kept as failing tests with a `# BUG(evoxc): ...` comment above the assertion; the parent (root) delegates fixes.
+- Never modify `../../evoxc/` — bugs found are kept as failing tests with a `# BUG(evoxc): ...` comment above the assertion; the parent (root) delegates fixes.
 - Run from repo root: `python3 -m pytest -q tests/block` (root conftest.py adds the repo to sys.path).
 
 ## Notes for agents

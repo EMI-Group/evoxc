@@ -128,7 +128,7 @@ satisfies it):
 
 ## Test strategy
 
-pytest under `../tests/dist/` (sibling — read-only from here; escalate test writes to root):
+pytest under `../../tests/dist/` (sibling — read-only from here; escalate test writes to root):
 
 - `test_group.py`: validation errors, equality/hash, world-group semantics, static-value-ness.
 - `test_collectives.py`: graph construction — op attrs (group name/ranks, params), effect kind `collective`, local shapes per the worked-examples table, `TraceError` on eager calls, world-group `None` dims.
@@ -136,7 +136,7 @@ pytest under `../tests/dist/` (sibling — read-only from here; escalate test wr
 - **Multi-rank simulation:** install a custom in-process executor; run the same executable once per simulated rank with distinct local inputs; the executor buffers contributions (keyed by op instance + group) until all ranks contributed, then computes numpy semantics. Assert all_gather concatenation, all_reduce sum/max/min/prod, reduce_scatter chunking, all_to_all transposition, broadcast, collective_permute routing, plus rank/world_size resolution per simulated rank.
 - Default numpy backend: identity semantics (rank 0 / world 1 → copy).
 - Serialization: graph save/load round-trips group name+ranks attrs; no Python objects in artifacts.
-- Spec-compliance (in `../tests/test_spec_compliance.py`): collectives are explicit `collective`-effect ops; no global tensor type anywhere; local shapes only; `rank()`/`world_size()` are graph values, not Python ints.
+- Spec-compliance (in `../../tests/test_spec_compliance.py`): collectives are explicit `collective`-effect ops; no global tensor type anywhere; local shapes only; `rank()`/`world_size()` are graph values, not Python ints.
 
 ## Routing table
 

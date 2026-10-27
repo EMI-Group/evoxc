@@ -67,7 +67,7 @@ concern):
 | `control_flow.py` | `cond`/`while_loop`/`scan`: region building via the `ir.Builder` (`_run_in_region`), operand classification (`_classify_operands`), registered-node rules. NEVER imports `evoxc.ops` (ops imports trace — the DAG stays acyclic). |
 | `__init__.py` | re-exports only + the shadowing note |
 
-Sibling: `../tests/` → test suite (read-only from here; escalate test
+Sibling: `../../tests/` → test suite (read-only from here; escalate test
 writes to the package root).
 
 Private cross-module imports that MUST keep working (do not rename/move
@@ -366,7 +366,7 @@ editing messages, keep the wording of existing paths intact.
   (`backends/stablehlo/writer.py::_emit_while`). Known consequence (iree
   3.9.0): a ≥4-carry `stablehlo.while` in a large module (NSGA3 tell
   graph) SIGSEGVs in AffinityAnalysis while 3-carry whiles (NSGA2) compile
-  — see `./evoxc/backends/stablehlo/CONTEXT.md` ("Loop-CARRIED-COUNT crash
+  — see `../backends/stablehlo/CONTEXT.md` ("Loop-CARRIED-COUNT crash
   observation"). Reducing carries today means USER-SIDE graph changes (e.g.
   recompute a derived carry such as `dominates = (count == 0)` locally in
   the cond/body instead of carrying it) — there is no CSE/DCE/region
@@ -397,7 +397,7 @@ editing messages, keep the wording of existing paths intact.
 
 ## Test strategy
 
-pytest; mirror under `../tests/test_trace/` (or per-module files):
+pytest; mirror under `../../tests/trace/` (or per-module files):
 - `defn`: calling a Defn raises `TraceError` with the staging-direction
   message; bare/options decorator forms; idempotence.
 - `trace`: static values specialize (python `if` over an int works at trace
@@ -413,7 +413,7 @@ pytest; mirror under `../tests/test_trace/` (or per-module files):
 - `Graph`: flatten/unflatten validation (ShapeError/DTypeError/DeviceError/
   static mismatch), save/load round-trip via persist (integrity,
   `PersistenceError` on mismatch).
-- Spec-compliance coverage lives in `../tests/test_spec_compliance.py`
+- Spec-compliance coverage lives in `../../tests/test_spec_compliance.py`
   (owned by the package root): staging explicitness, bind-as-sugar,
   vmap≡vectorize, etc.
 

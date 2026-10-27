@@ -92,11 +92,11 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 | `./kernels/custom.py` | `constant`, `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time), `block_call` (registered numpy impl dispatch) |
 | `./kernels/sparse.py` | the 16 sparse kernels: `sparse_from_dense`/`sparse_to_dense`, coo↔csr / coo↔csc conversions, `sparse_negate`/`add`/`multiply`/`multiply_dense`, `sparse_reduce_sum`, `sparse_transpose`, `sparse_reshape`, `sparse_concatenate`, `sparse_dot_dense`/`dense_dot_sparse` — batched via per-batch loops with lex-max stored-zero padding to a common nnz; shared values-aware canonical validation (see Notes for agents) |
 
-Sibling: `../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry (optional-adapter auto-activation), StableHLO exporter, shared `inline.py` block-inlining machinery, `compiler.py` (`CompilerBackend`/`CompilerExecutable`), `adapters/` (separate parallel effort).
+Sibling: `../../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry (optional-adapter auto-activation), StableHLO exporter, shared `inline.py` block-inlining machinery, `compiler.py` (`CompilerBackend`/`CompilerExecutable`), `adapters/` (separate parallel effort).
 
 ## Test strategy
 
-Planned tests live in `../../tests/backends/numpy/` (sibling — read-only from here; test-related writes escalate to root), CPU only, pytest, numpy-only deps:
+Planned tests live in `../../../tests/backends/` (sibling — read-only from here; test-related writes escalate to root), CPU only, pytest, numpy-only deps:
 - **Per-op coverage per kernel category** (elementwise/reductions/indexing/linalg) against the ops-level semantics.
 - **Symbolic dims**: runtime binding of `Dim`/`DimExpr` shapes; free symbolic dim ⇒ `ShapeError`.
 - **Dynamic control flow**: `cond`/`while_loop`/`scan` genuinely dynamic (per-iteration shapes, early exit).

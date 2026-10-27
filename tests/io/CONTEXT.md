@@ -3,7 +3,7 @@
 ## Intent
 
 Device-free unit suite pinning the committed public surface of `evoxc.io` (Workstream B,
-`../evoxc/io.py` — module imports `core` only): `prefetch(host_tensor, device)` /
+`../../evoxc/io.py` — module imports `core` only): `prefetch(host_tensor, device)` /
 `sink(device_tensor)` return `AsyncCopy` handles (`.device`, `.direction`
 `"host_to_device"`/`"device_to_host"`, `.done` non-blocking, `.wait(timeout=None)`
 idempotent re-raising the stored copy exception VERBATIM — never swallowed,

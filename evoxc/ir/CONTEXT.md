@@ -272,12 +272,12 @@ in `printer.py`.
 | `./serialize.py` | IR payload serialization: self-describing payload, sha256 integrity, round-trip rebuild with original ids (implemented) |
 | `./printer.py` | SSA text printing (implemented) |
 
-Sibling: `../tests/` → test suite (read-only from here; escalate test-related
+Sibling: `../../tests/` → test suite (read-only from here; escalate test-related
 writes to root).
 
 ## Test strategy (Phase 2+)
 
-pytest under `../tests/ir/`: registry completeness (every public op in the evoxc
+pytest under `../../tests/ir/`: registry completeness (every public op in the evoxc
 contract is declared; arities/attrs/effects correct); shape-inference hooks
 (static + symbolic dims per hook, broadcast/reshape/conv formulas, ShapeError
 cases); `verify()` invariants

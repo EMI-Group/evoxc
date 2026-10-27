@@ -235,7 +235,7 @@ Fallback semantics (implemented in `rules.py`):
 
 ## Test strategy
 
-pytest suite lives in `../tests/block/` (sibling — read-only from here;
+pytest suite lives in `../../tests/block/` (sibling — read-only from here;
 escalate test writes to root). Planned coverage:
 - declaration: factory + decorator forms, spec derivation from annotations,
   duplicate/invalid names, invalid effects/policies, attribute schema

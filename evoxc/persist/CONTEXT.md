@@ -114,13 +114,13 @@ except FileCache's documented compute_fn policy.
 
 ## Test strategy
 
-pytest under `../tests/persist/` (sibling, read-only from here — escalate
+pytest under `../../tests/persist/` (sibling, read-only from here — escalate
 test writes to root): container round-trips (every codec type incl.
 symbolic dims), truncated/bit-flipped files → "corrupt", version bump →
 "newer format", payload_type mismatch, atomicity (no partial file on
 failed write), cache hit/miss/recompute-on-corrupt/clear, key determinism
 + sensitivity to every keying input. Cross-checked by
-`../tests/test_spec_compliance.py` (serialization round-trips).
+`../../tests/test_spec_compliance.py` (serialization round-trips).
 
 ## Routing table
 
@@ -140,7 +140,7 @@ exact-type + qualified-name fallback, cycle detection, read-only decoded
 arrays), `container.py` (byte-layout save/load, atomic writes, strict
 validation), `cache.py` (`compute_key`, `FileCache`). Validated end-to-end
 (codec→container→cache round-trips, tamper detection, version mismatch,
-atomicity, recompute-on-corrupt) by the pytest suite in `../tests/persist/`
+atomicity, recompute-on-corrupt) by the pytest suite in `../../tests/persist/`
 (5 files, 91 tests: `test_codec.py` 33, `test_container.py` 22,
 `test_cache.py` 16, `test_persistence_errors.py` 15,
 `test_integration.py` 5 — owned by root, read-only from here).
@@ -169,7 +169,7 @@ atomicity, recompute-on-corrupt) by the pytest suite in `../tests/persist/`
   `payload_fields` is ANY codec-encodable value, so a
   `dict[str, np.ndarray]` (100–400 named weight arrays) saves + loads
   directly today (`{"arrays": {"weights": ..., ...}}` is exercised in
-  `../tests/persist/test_container.py:34`). Cost: JSON + base64 npy in one
+  `../../tests/persist/test_container.py:34`). Cost: JSON + base64 npy in one
   in-memory string, ~4/3 size blowup, whole payload materialized on both
   save and load. Decode returns arrays `setflags(write=False)` — copy
   (`np.array(a)`) if a consumer needs a writable buffer.
