@@ -935,3 +935,147 @@ def test_pipeline_objects(tmp_path, capsys):
     assert bound.functions == executable.functions
     assert bound.device == executable.device
     np.testing.assert_array_equal(etl.run(bound, x, b).numpy(), out.numpy())
+
+
+# ---------------------------------------------------------------------------
+# Explicit device synchronization (Executable.synchronize)
+# ---------------------------------------------------------------------------
+#
+# ``synchronize`` is the EXPLICIT completion boundary of the pipeline
+# (``etl/pipeline.py``): it waits for device work submitted by earlier
+# ``run`` calls, forwards to the backend executable when that exposes the
+# optional method, and is a documented no-op otherwise (the numpy backend
+# and, for its synchronous ``run``, iree). NOTHING in etl calls it
+# implicitly — ``etl.run`` performs no per-call sync.
+
+
+class _FakeBackendExecutable:
+    """Minimal backend-executable stand-in (only ``synchronize`` matters)."""
+
+    backend_name = "numpy"
+    functions = ("main",)
+    device = etl.Device("cpu", 0)
+
+    def __init__(self):
+        self.sync_calls = 0
+
+    def run(self, flat_input_tensors, options=None):
+        return list(flat_input_tensors)
+
+    def synchronize(self):
+        self.sync_calls += 1
+
+
+def test_executable_synchronize_forwards_to_the_backend():
+    """``Executable.synchronize`` delegates when the backend exposes it."""
+    backend_executable = _FakeBackendExecutable()
+    executable = etl.pipeline.Executable(backend_executable, signature=None)
+    assert executable.synchronize() is None
+    assert backend_executable.sync_calls == 1
+    assert executable.synchronize() is None  # repeatable, one call each time
+    assert backend_executable.sync_calls == 2
+
+
+def test_executable_synchronize_is_a_noop_without_a_backend_method():
+    """No backend method -> the documented pipeline-level no-op (returns None)."""
+
+    class _NoSyncBackendExecutable:
+        backend_name = "numpy"
+        functions = ("main",)
+        device = etl.Device("cpu", 0)
+
+        def run(self, flat_input_tensors, options=None):
+            return list(flat_input_tensors)
+
+    backend_executable = _NoSyncBackendExecutable()
+    assert not hasattr(backend_executable, "synchronize")
+    executable = etl.pipeline.Executable(backend_executable, signature=None)
+    assert executable.synchronize() is None
+    assert executable.synchronize() is None
+
+
+def test_executable_synchronize_numpy_noop_preserves_runs():
+    """A built numpy executable: callable, ``None``, idempotent, value-neutral."""
+    executable = etl.build(_linear, *_LINEAR_SPECS)
+    assert executable.device == etl.Device("cpu", 0)
+    # The numpy backend exposes no ``synchronize`` of its own — the pipeline
+    # method is the (documented) no-op for it.
+    assert not hasattr(executable.backend_executable, "synchronize")
+    assert callable(executable.synchronize)
+
+    x, w, b = _linear_inputs()
+    before = etl.run(executable, x, w, b).numpy()
+    assert executable.synchronize() is None
+    assert executable.synchronize() is None  # idempotent (two calls in a row)
+    after = etl.run(executable, x, w, b).numpy()
+    np.testing.assert_array_equal(after, before)  # values untouched
+    _check_flat_out(etl.Tensor(after), x.numpy(), w.numpy(), b.numpy())
+
+    # A DIFFERENT input after a sync is unaffected too (no cached state).
+    x2 = etl.tensor(np.full((2, 3), 1.5, dtype=np.float32))
+    assert executable.synchronize() is None
+    out2 = etl.run(executable, x2, w, b)
+    _check_flat_out(out2, x2.numpy(), w.numpy(), b.numpy())
+
+
+def test_bind_synchronize_delegates():
+    """``etl.bind(...)`` exposes the same method, delegating to the executable."""
+    executable = etl.build(_dot_relu, *_dot_relu_specs())
+    x = etl.tensor(np.arange(6, dtype=np.float32).reshape(2, 3))
+    w = etl.ones((3, 4), dtype=etl.float32)
+    bound = etl.bind(executable, w=w)
+    assert isinstance(bound, etl.pipeline.BoundExecutable)
+    assert callable(bound.synchronize)
+    assert bound.synchronize() is None  # numpy no-op on the wrapped executable
+
+    # Delegation is real (not a second no-op implementation): a spy on the
+    # wrapped executable's method sees the call.
+    calls = []
+    real = executable.synchronize
+
+    def spy():
+        calls.append(1)
+        return real()
+
+    executable.synchronize = spy
+    try:
+        assert bound.synchronize() is None
+        assert calls == [1]
+        assert bound.synchronize() is None
+        assert calls == [1, 1]
+    finally:
+        del executable.synchronize
+
+    # The bound executable still runs identically afterwards.
+    np.testing.assert_array_equal(
+        etl.run(bound, x).numpy(), etl.run(executable, x, w).numpy()
+    )
+
+
+def test_run_does_not_synchronize_implicitly(monkeypatch):
+    """``etl.run`` never calls ``synchronize`` — dispatch overlap stays a feature."""
+    executable = etl.build(_linear, *_LINEAR_SPECS)
+    calls = []
+    # The numpy backend executable has no synchronize of its own; installing a
+    # counting hook makes ANY implicit call visible (non-brittle: the hook is
+    # only reachable through the documented forwarding path).
+    monkeypatch.setattr(
+        executable.backend_executable,
+        "synchronize",
+        lambda: calls.append(1),
+        raising=False,
+    )
+
+    x, w, b = _linear_inputs()
+    for _ in range(3):
+        out = etl.run(executable, x, w, b)
+        _check_flat_out(out, x.numpy(), w.numpy(), b.numpy())
+    assert calls == []  # zero implicit synchronization across runs
+
+    # ...and so does ``etl.evaluate`` (build + run): still zero.
+    etl.evaluate(_linear, x, w, b)
+    assert calls == []
+
+    # The explicit call is the only way to reach it.
+    assert executable.synchronize() is None
+    assert calls == [1]

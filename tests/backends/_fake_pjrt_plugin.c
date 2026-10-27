@@ -24,6 +24,13 @@
  *   -DETL_FAKE_PJRT_MAJOR_VERSION=N override pjrt_api_version.major_version
  *   ETL_FAKE_PJRT_FAIL_STEP=<entry point name>  (env): make that call fail
  *   ETL_FAKE_PJRT_FAIL_MESSAGE=<text>           (env): the error message
+ *   ETL_FAKE_PJRT_NO_DEVICE_EVENT=<any>         (env): leave the
+ *       device-complete-event slot NULL when the caller requests one
+ *       (simulates a plugin violating the
+ *       PJRT_LoadedExecutable_Execute_Args.device_complete_events contract)
+ *   ETL_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT=<any> (env): write a real
+ *       device-complete event and THEN fail the execute (the driver's
+ *       stray-handle cleanup path)
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -850,6 +857,23 @@ static PJRT_Error* fake_PJRT_LoadedExecutable_Execute(
     return make_error("fake: only one device is supported");
   if (!args->output_lists || !args->output_lists[0])
     return make_error("fake: output_lists missing");
+  /* DEVICE-COMPLETE EVENT: one handle per device (num_devices == 1 here)
+   * when the caller asks for it (device_complete_events != NULL); a NULL
+   * slot (the default) keeps the zero-plugin-cost path. The event is
+   * written BEFORE the output buffers, so the FAIL_AFTER knob below can
+   * hand the driver a stray handle without leaking buffers. */
+  if (args->device_complete_events) {
+    const char* no_event = getenv("ETL_FAKE_PJRT_NO_DEVICE_EVENT");
+    if (!no_event || !*no_event) {
+      args->device_complete_events[0] = make_event();
+    }
+    {
+      const char* fail_after = getenv("ETL_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT");
+      if (fail_after && *fail_after)
+        return make_error(
+            "injected fake failure after writing a device-complete event");
+    }
+  }
   /* output_lists[0] is a PJRT_Buffer* whose VALUE is the caller-allocated
    * array of num_outputs PJRT_Buffer* (see the header's contract). */
   PJRT_Buffer** out = (PJRT_Buffer**)args->output_lists[0];
