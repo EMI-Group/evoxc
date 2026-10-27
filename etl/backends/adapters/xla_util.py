@@ -1004,7 +1004,7 @@ class _LoadedExecutable(_Handle):
 
         ``events`` is the optional DEVICE-COMPLETE-EVENT sink: passing a
         list requests ONE per-device ``PJRT_Event*`` completion handle from
-        the plugin (``PJRT_ExecuteOptions.device_complete_events``;
+        the plugin (``PJRT_LoadedExecutable_Execute_Args.device_complete_events``;
         ``num_devices`` is always 1 in this driver) and, ON SUCCESS, appends
         its RAW handle value to that list — an ``int``, or ``None``/``0``
         when the plugin returned no event (appended as-is so the caller can

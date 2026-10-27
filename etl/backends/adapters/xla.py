@@ -1031,7 +1031,8 @@ class XlaExecutable(CompilerExecutable):
             reason = (
                 "the PJRT plugin returned no device-complete event for a "
                 "device-resident run (it violated the "
-                "PJRT_ExecuteOptions.device_complete_events contract), so "
+                "PJRT_LoadedExecutable_Execute_Args.device_complete_events "
+                "contract), so "
                 "XlaExecutable.synchronize() cannot honestly report "
                 "completion — use an explicit .to(cpu) readback (or the "
                 "plugin's own synchronization) instead."
