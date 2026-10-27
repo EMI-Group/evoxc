@@ -14,6 +14,12 @@ Two things are pinned here:
 Section 12 pins the **tied-weight contract**: ``tie_word_embeddings=True`` means
 the output head IS ``embed.weight``, so there is no ``lm_head.weight`` key,
 exactly one embedding array, and no extra graph input.
+Section 13 pins the **Qwen3 / QK-Norm** variant of the same family: the extra
+per-head ``attn.q_norm``/``attn.k_norm`` canonical keys (taken verbatim, shaped
+``(head_dim,)``), the three explicit error paths around them, parity against the
+oracle on GQA/MHA/batched configs, a semantic pin that the norms are actually
+applied (scaling one changes the logits; the same checkpoint on a llama config
+does not), and packed-weight round-tripping of the extra ``(head_dim,)`` leaves.
 Everything here is offline and numpy-only (no torch / transformers / network):
 configs are dicts, checkpoints are synthetic seeded arrays, and "weights" are
 random but well-scaled so fp32 stays well-conditioned.
@@ -30,6 +36,7 @@ from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFUnsupportedError, HFWeightError
 from etl_hf.load import LoadedModel, validate_params
 from etl_hf.models import llama
+from etl_hf.pack import pack_params, pack_plan
 from etl_hf.pipeline import build, predict, run
 from etl_hf.program import forward_fn, param_specs, reference_logits
 
@@ -78,6 +85,53 @@ def _cfg(**overrides) -> ModelConfig:
     return ModelConfig.from_dict(_llama_json(**overrides))
 
 
+#: Qwen3 config fields shared by the QK-Norm section: hidden 16 with 4 query
+#: heads and 2 KV heads (GQA) but an **explicit** ``head_dim=8`` that differs
+#: from ``hidden_size // num_attention_heads`` (16 // 4 == 4), so a QK-Norm scale
+#: that wrongly used ``hidden_size`` — or a graph that reshaped by
+#: ``hidden // heads`` — cannot pass. ``sliding_window`` / ``use_sliding_window``
+#: are spelled out (full attention) because the Qwen3 config guard refuses any
+#: sliding-window request.
+_QWEN3_JSON = {
+    "hidden_size": 16,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 32,
+    "vocab_size": 32,
+    "num_hidden_layers": 2,
+    "max_position_embeddings": 16,
+}
+
+
+def _qwen3_json(**overrides) -> dict:
+    """A minimal Qwen3 HF config dict (Llama-shaped + per-head QK-Norm).
+
+    ``model_type="qwen3"`` is the only thing that selects QK-Norm: the config
+    parser derives ``qk_norm=True`` from it (a static graph-specialisation value,
+    part of ``ModelConfig.digest``), never from checkpoint contents.
+
+    Args:
+        **overrides: config fields to replace.
+
+    Returns:
+        dict: the raw config dict.
+    """
+    raw = _llama_json(
+        model_type="qwen3",
+        sliding_window=None,
+        use_sliding_window=False,
+        **_QWEN3_JSON,
+    )
+    raw.update(overrides)
+    return raw
+
+
+def _qwen3_cfg(**overrides) -> ModelConfig:
+    """Build a :class:`ModelConfig` from :func:`_qwen3_json` plus overrides."""
+    return ModelConfig.from_dict(_qwen3_json(**overrides))
+
+
 #: The config whose linears are ALL non-square, so a missing or extra transpose
 #: can never accidentally pass: hidden 16, 4 query heads x head_dim 8 => q_dim 32,
 #: 1 KV head x head_dim 8 => kv_dim 8, intermediate 32, vocab 32.
@@ -103,7 +157,9 @@ def _hf_state_dict(cfg: ModelConfig, *, seed: int = 0, head: str = "present") ->
             ``"absent"`` (no ``lm_head.weight`` key at all).
 
     Returns:
-        dict: ``str -> float32 ndarray`` in HF orientation.
+        dict: ``str -> float32 ndarray`` in HF orientation. A ``cfg.qk_norm``
+        (Qwen3) config additionally gets the per-head ``self_attn.q_norm.weight``
+        / ``k_norm.weight`` scales, shaped ``(head_dim,)`` exactly like HF.
     """
     rng = np.random.default_rng(seed)
     hidden = cfg.hidden_size
@@ -123,6 +179,11 @@ def _hf_state_dict(cfg: ModelConfig, *, seed: int = 0, head: str = "present") ->
         state[prefix + "self_attn.k_proj.weight"] = draw((kv_dim, hidden))
         state[prefix + "self_attn.v_proj.weight"] = draw((kv_dim, hidden))
         state[prefix + "self_attn.o_proj.weight"] = draw((hidden, q_dim))
+        if cfg.qk_norm:
+            # Qwen3: one RMSNorm scale per head, over the last axis head_dim
+            # (NOT hidden_size), applied after the head split and before RoPE.
+            state[prefix + "self_attn.q_norm.weight"] = draw((cfg.head_dim,))
+            state[prefix + "self_attn.k_norm.weight"] = draw((cfg.head_dim,))
         state[prefix + "post_attention_layernorm.weight"] = draw((hidden,))
         state[prefix + "mlp.gate_proj.weight"] = draw((inter, hidden))
         state[prefix + "mlp.up_proj.weight"] = draw((inter, hidden))
@@ -730,3 +791,212 @@ def test_validate_params_accepts_a_tied_tree_and_rejects_a_redundant_head():
         validate_params(cfg, redundant)
     with pytest.raises(etl.ETLError, match="lm_head.weight"):
         run(build(forward_fn(cfg, seq_len=4), cfg), redundant, ids)
+
+
+# ---------------------------------------------------------------------------
+# 13. Qwen3 / QK-Norm (the same family, plus per-head q/k RMSNorm)
+# ---------------------------------------------------------------------------
+def _qwen3_params(cfg: ModelConfig, *, seed: int = 0) -> dict:
+    """Canonical Qwen3 params from the synthetic Qwen3 checkpoint (seed 0)."""
+    return llama.canonicalize_weights(cfg, _hf_state_dict(cfg, seed=seed))
+
+
+def _plain_llama_cfg(**overrides) -> ModelConfig:
+    """The *same* architecture and dimensions as :func:`_qwen3_cfg`, but ``llama``.
+
+    ``model_type`` is the only difference, so this config declares
+    ``qk_norm=False``: identical weights minus the ``q``/``k`` norm scales.
+    """
+    return ModelConfig.from_dict({**_qwen3_json(**overrides), "model_type": "llama"})
+
+
+def test_qwen3_config_declares_qk_norm_statically():
+    """``qk_norm`` is derived from ``model_type`` alone and changes the digest."""
+    qwen3, llama_cfg = _qwen3_cfg(), _plain_llama_cfg()
+    assert qwen3.model_type == "qwen3" and qwen3.family == "llama"
+    assert qwen3.qk_norm is True
+    assert llama_cfg.qk_norm is False
+    assert qwen3.digest != llama_cfg.digest
+    # head_dim is explicit and differs from hidden // heads in every test below.
+    assert qwen3.head_dim == 8 != qwen3.hidden_size // qwen3.num_attention_heads
+
+
+def test_qwen3_canonical_keys_and_verbatim_qk_norm():
+    """Untied/tied key sets, ``(head_dim,)`` shapes and verbatim (untransposed) values."""
+    cfg = _qwen3_cfg()
+    state = _hf_state_dict(cfg)
+    params = llama.canonicalize_weights(cfg, state)
+    layers = cfg.num_hidden_layers
+
+    assert len(params) == 2 + 11 * layers + 1  # embed + (9 + 2 QK-Norm) per layer + norm + head
+    assert set(params) == set(llama.param_specs(cfg))
+    for index in range(layers):
+        for norm in ("q_norm", "k_norm"):
+            canonical = f"layers.{index}.attn.{norm}.weight"
+            raw = state[f"model.layers.{index}.self_attn.{norm}.weight"]
+            assert raw.shape == (cfg.head_dim,)
+            assert params[canonical].shape == (cfg.head_dim,) != (cfg.hidden_size,)
+            # Verbatim: a 1-D scale is never transposed or reshaped.
+            assert np.array_equal(params[canonical], raw), canonical
+            spec = llama.param_specs(cfg)[canonical]
+            assert spec.shape == (cfg.head_dim,) and spec.dtype == etl.float32
+
+    tied_cfg = _qwen3_cfg(tie_word_embeddings=True)
+    tied = llama.canonicalize_weights(tied_cfg, _hf_state_dict(tied_cfg, head="absent"))
+    assert len(tied) == 2 + 11 * layers
+    assert set(tied) == set(llama.param_specs(tied_cfg))
+    assert set(params) - set(tied) == {"lm_head.weight"}
+    # The llama config of the same dims has exactly two fewer per-layer keys.
+    plain = set(llama.param_specs(_plain_llama_cfg()))
+    assert set(params) - plain == {
+        f"layers.{index}.attn.{norm}.weight"
+        for index in range(layers)
+        for norm in ("q_norm", "k_norm")
+    }
+
+
+def test_qwen3_canonicalize_missing_qk_norm_raises():
+    """A Qwen3 checkpoint without a q/k norm scale names the key and QK-Norm."""
+    cfg = _qwen3_cfg()
+    state = _hf_state_dict(cfg)
+    del state["model.layers.1.self_attn.k_norm.weight"]
+    with pytest.raises(HFWeightError) as info:
+        llama.canonicalize_weights(cfg, state)
+    message = str(info.value)
+    assert "model.layers.1.self_attn.k_norm.weight" in message
+    assert "layers.1.attn.k_norm.weight" in message  # the canonical target
+    assert "QK-Norm" in message and "qwen3" in message
+
+
+def test_qk_norm_keys_on_a_non_qwen3_config_are_rejected():
+    """A llama/mistral/qwen2 config rejects leftover q/k norm keys with a qwen3 hint."""
+    cfg = _plain_llama_cfg()
+    assert cfg.qk_norm is False
+    state = _hf_state_dict(_qwen3_cfg())  # identical dims, but QK-Norm tensors
+    with pytest.raises(HFWeightError) as info:
+        llama.canonicalize_weights(cfg, state)
+    message = str(info.value)
+    assert "q_norm" in message and "k_norm" in message
+    assert "QK-Norm" in message and "'qwen3'" in message
+    assert "qk_norm=False" in message
+
+
+def test_qwen3_wrong_shape_qk_norm_raises():
+    """A ``(hidden_size,)`` scale where the config requires ``(head_dim,)`` is an error."""
+    cfg = _qwen3_cfg()
+    state = _hf_state_dict(cfg)
+    state["model.layers.0.self_attn.q_norm.weight"] = np.ones(cfg.hidden_size, np.float32)
+    with pytest.raises(HFWeightError) as info:
+        llama.canonicalize_weights(cfg, state)
+    message = str(info.value)
+    assert "model.layers.0.self_attn.q_norm.weight" in message
+    assert f"requires ({cfg.head_dim},)" in message
+
+
+@pytest.mark.parametrize(
+    "overrides, seq, batch, case",
+    [
+        pytest.param({}, 4, 1, "gqa-head_dim-8", id="gqa-head_dim_override"),
+        pytest.param(
+            {"num_key_value_heads": 4}, 4, 1, "mha-head_dim-8", id="mha"
+        ),
+        pytest.param({}, 3, 2, "gqa-head_dim-8-batch2", id="batch_two"),
+    ],
+)
+def test_qwen3_parity_against_the_reference(overrides, seq, batch, case):
+    """Graph vs the numpy oracle: GQA (head_dim override), MHA and batch 2.
+
+    Measured ``max |graph - reference|`` is ≤ 1.8e-7 on these synthetic weights
+    (fp32 accumulation-order noise); the bound below is the documented fp32
+    tolerance, and the measured value is reported in the failure message.
+    """
+    cfg = _qwen3_cfg(**overrides)
+    assert cfg.qk_norm is True
+    max_abs = _assert_parity(cfg, seq=seq, batch=batch)
+    assert max_abs <= 1e-5, (
+        f"Qwen3 QK-Norm parity ({case}) regressed: max |graph - reference| = "
+        f"{max_abs:g} (heads={cfg.num_attention_heads}/{cfg.num_key_value_heads}, "
+        f"head_dim={cfg.head_dim}, batch={batch}, seq={seq})"
+    )
+
+
+def test_qk_norm_is_genuinely_applied():
+    """Scaling q_norm/k_norm (or dropping them for llama) changes the logits.
+
+    A graph that silently skipped the QK-Norm would still pass a graph-vs-oracle
+    comparison if the oracle skipped it too; this test pins the semantics from
+    the outside: the ``(head_dim,)`` scales are live in both the q and the k
+    path, and the same checkpoint on a ``llama`` config (no QK-Norm) differs.
+    """
+    cfg = _qwen3_cfg()
+    params = _qwen3_params(cfg)
+    ids = _ids(cfg, 1, 4)
+    base = _run(cfg, 4, 1, params, ids)
+
+    for norm in ("q_norm", "k_norm"):
+        for index in range(cfg.num_hidden_layers):
+            scaled = dict(params)
+            key = f"layers.{index}.attn.{norm}.weight"
+            scaled[key] = np.ascontiguousarray(params[key] * np.float32(2.5))
+            moved = _run(cfg, 4, 1, scaled, ids)
+            delta = float(np.max(np.abs(moved - base)))
+            assert delta > 1e-3, (
+                f"{key} is inert: scaling it by 2.5 moved the logits by only "
+                f"{delta:g} — QK-Norm is not being applied to that tensor"
+            )
+
+    # Same weights minus the QK-Norm tensors, on a llama config: no per-head
+    # norm at all, so the logits must differ materially from the qwen3 graph.
+    plain_cfg = _plain_llama_cfg()
+    plain_params = {
+        key: value
+        for key, value in params.items()
+        if "attn.q_norm" not in key and "attn.k_norm" not in key
+    }
+    assert set(plain_params) == set(llama.param_specs(plain_cfg))
+    plain = _run(plain_cfg, 4, 1, plain_params, ids)
+    assert float(np.max(np.abs(plain - base))) > 1e-3
+    # ... while both sides agree with their own oracle (the difference is
+    # semantics, not a broken graph).
+    np.testing.assert_allclose(
+        plain, llama.reference(plain_cfg, plain_params, ids), rtol=1e-5, atol=1e-6
+    )
+
+
+def test_qwen3_packed_weights_match_the_oracle():
+    """``pack_plan``/``pack_params`` round-trip the extra ``(head_dim,)`` leaves."""
+    cfg = _qwen3_cfg()
+    params = _qwen3_params(cfg)
+    plan = pack_plan(llama.param_specs(cfg))
+    packed = pack_params(plan, params)
+    assert set(packed) == set(plan.specs)
+    ids = _ids(cfg, 1, 4)
+    defn = llama.graph(cfg, 4, batch_size=1, pack_plan=plan)
+    executable = etl.build(defn, plan.specs, etl.TensorSpec((1, 4), etl.int32))
+    got = etl.run(executable, packed, ids).numpy()
+    want = llama.reference(cfg, params, ids)
+    max_abs = float(np.max(np.abs(got - want)))
+    assert max_abs <= 1e-5, (
+        f"packed Qwen3 forward diverged from the oracle: max |packed - reference| = "
+        f"{max_abs:g} (packed inputs={len(plan.specs)}, canonical keys={len(params)})"
+    )
+    assert np.all(np.isfinite(got))
+
+
+def test_qwen3_validate_params_and_predict():
+    """``validate_params``/``predict`` handle the QK-Norm tree like any other."""
+    cfg = _qwen3_cfg()
+    params = _qwen3_params(cfg)
+    validated = validate_params(cfg, params)
+    assert set(validated) == set(llama.param_specs(cfg))
+    ids = _ids(cfg, 1, 4)
+    np.testing.assert_allclose(
+        predict(_loaded(cfg, validated), ids, seq_len=4),
+        reference_logits(cfg, validated, ids),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    broken = dict(params)
+    del broken["layers.1.attn.q_norm.weight"]
+    with pytest.raises(HFWeightError, match="layers.1.attn.q_norm.weight"):
+        validate_params(cfg, broken)

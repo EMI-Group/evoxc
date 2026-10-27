@@ -21,7 +21,12 @@ What is pinned here:
   (``etl.BackendError`` naming ``erf``) while the very same graph still builds
   and runs on the numpy interpreter — a backend limitation, not a broken graph;
 * export is deterministic (byte-identical on repeat) and config-sensitive;
-* ``batch_size=2`` exports with a *static* batch extent (no ``?`` dynamic dims).
+* ``batch_size=2`` exports with a *static* batch extent (no ``?`` dynamic dims);
+* the **Qwen3** (``cfg.qk_norm``) variant of the llama graph exports the same
+  whole forward, with the two extra per-head ``(head_dim,)`` RMSNorms per layer
+  visible as exactly two extra mean-square reductions (and their sqrt/divide
+  chain) while the attention/dot/RoPE structure is unchanged — those scales stay
+  graph inputs like every other weight.
 
 Every measurement taken while the tests run lands in :data:`MEASURED` (keyed by
 a label), so a failure message can carry the actual numbers and a human (or the
@@ -572,3 +577,157 @@ def test_batch_size_two_exports_static_batch(
         f"batch extent must not change the IR op count — "
         f"{_summary(label)} vs {_summary(one_label)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 10. Qwen3 / QK-Norm exports as the same whole forward, plus two norms per layer
+# ---------------------------------------------------------------------------
+
+#: 1-layer grouped-query **Qwen3**: identical dimensions to :data:`LLAMA_TINY`,
+#: but ``model_type="qwen3"`` declares the per-head QK-Norm (``cfg.qk_norm``), so
+#: the graph carries an extra ``(head_dim,)`` RMSNorm on q and on k per layer.
+#: ``sliding_window``/``use_sliding_window`` are spelled out as full attention
+#: (the Qwen3 config guard refuses anything else).
+QWEN3_TINY: dict[str, object] = {
+    **LLAMA_TINY,
+    "model_type": "qwen3",
+    "sliding_window": None,
+    "use_sliding_window": False,
+}
+
+
+def test_qwen3_tiny_exports_whole_forward() -> None:
+    """A 1-layer Qwen3 forward exports as one func with every model construct."""
+    cfg = ModelConfig.from_dict(QWEN3_TINY)
+    assert cfg.qk_norm is True, "model_type='qwen3' must declare QK-Norm"
+    label = "qwen3_tiny_S8_B1"
+    graph, text = _trace(llama_mod, cfg, SEQ_LEN, 1, label=label)
+
+    graph.verify()
+    assert text.strip().startswith("module {"), (
+        f"export must be an MLIR module, got: {text[:80]!r}; {_summary(label)}"
+    )
+    assert "func.func @main" in text, (
+        f"the whole forward must be a single exported @main function; {_summary(label)}"
+    )
+    _require(
+        text,
+        {
+            "dot": ("stablehlo.dot_general", "stablehlo.dot"),
+            "reduce": ("stablehlo.reduce",),
+            "softmax_exp": ("stablehlo.exponential",),
+            "rope_cos": ("stablehlo.cosine",),
+            "rope_sin": ("stablehlo.sine",),
+            "rmsnorm": ("stablehlo.rsqrt", "stablehlo.sqrt"),
+            "divide": ("stablehlo.divide",),
+            "silu": ("stablehlo.logistic",),
+            "causal_mask": ("stablehlo.compare",),
+            "embed_gather": ("stablehlo.gather",),
+        },
+        label,
+    )
+
+
+def test_qwen3_weights_stay_graph_inputs() -> None:
+    """QK-Norm weights are graph inputs too: one spec per canonical key, no payloads."""
+    cfg = ModelConfig.from_dict(QWEN3_TINY)
+    label = "qwen3_tiny_S8_B1"
+    graph, text = _trace(llama_mod, cfg, SEQ_LEN, 1, label=label)
+
+    specs = llama_mod.param_specs(cfg)
+    # Two extra ``(head_dim,)`` specs per layer, all ordinary graph inputs.
+    for index in range(int(cfg.num_hidden_layers)):
+        for norm in ("q_norm", "k_norm"):
+            spec = specs[f"layers.{index}.attn.{norm}.weight"]
+            assert tuple(spec.shape) == (int(cfg.head_dim),), (
+                f"{norm} must be per-head (head_dim={cfg.head_dim},), got {spec.shape}"
+            )
+    assert len(graph.tensor_specs) == len(specs) + 1, (
+        f"graph must take exactly the {len(specs)} weight specs + 1 ids spec, "
+        f"got {len(graph.tensor_specs)} — {_summary(label)}"
+    )
+
+    constants = text.count("stablehlo.constant")
+    assert constants < 40, (
+        f"too many stablehlo.constant ops — QK-Norm weights are being inlined "
+        f"instead of passed as inputs — {_summary(label)}"
+    )
+    literals = re.findall(r"dense<\[([^\]]*)\]>", text)
+    biggest_literal = max((len(lit.split(",")) for lit in literals), default=0)
+    assert biggest_literal <= 4 * SEQ_LEN, (
+        f"largest dense literal has {biggest_literal} elements — only O(seq_len) "
+        f"structural constants are allowed (no weight payloads) — {_summary(label)}"
+    )
+
+
+@pytest.mark.parametrize("layers", [1, 2], ids=["1layer", "2layer"])
+def test_qwen3_adds_two_rmsnorms_per_layer(layers: int) -> None:
+    """QK-Norm shows up as exactly two extra RMSNorms per layer, nothing else.
+
+    Measured per layer: ``reduce_mean`` +2, ``sqrt`` +2 (one RMSNorm each for q
+    and k), ``multiply`` +6, ``add`` +2, ``divide`` +2, ``constant`` +4 (the eps
+    literal and its broadcast) — 18 extra IR ops per layer. Everything else
+    (attention dots, gather, transpose, RoPE cos/sin, softmax, SiLU, causal
+    mask) is identical, so QK-Norm adds norms and never new linear/attention
+    structure. The assertion is the measured relationship against the
+    equivalent llama config, scaled by the layer count.
+    """
+    qwen3_cfg = ModelConfig.from_dict({**QWEN3_TINY, "num_hidden_layers": layers})
+    llama_cfg = ModelConfig.from_dict({**LLAMA_TINY, "num_hidden_layers": layers})
+    assert qwen3_cfg.qk_norm is True and llama_cfg.qk_norm is False
+
+    llama_label = (
+        "llama_tiny_S8_B1" if layers == 1 else f"llama_{layers}layer_S8_B1"
+    )
+    qwen3_label = f"qwen3_{layers}layer_S8_B1"
+    _graph_l, _text_l = _trace(llama_mod, llama_cfg, SEQ_LEN, 1, label=llama_label)
+    graph_q, _text_q = _trace(llama_mod, qwen3_cfg, SEQ_LEN, 1, label=qwen3_label)
+
+    llama_hist = MEASURED[llama_label]["histogram"]
+    qwen3_hist = MEASURED[qwen3_label]["histogram"]
+    assert isinstance(llama_hist, dict) and isinstance(qwen3_hist, dict)
+
+    def count(hist: dict, op: str) -> int:
+        return int(hist.get(op, 0))
+
+    assert count(qwen3_hist, "reduce_mean") - count(llama_hist, "reduce_mean") == 2 * layers, (
+        f"each layer needs one mean-square reduction per QK-Norm (q and k): "
+        f"llama={count(llama_hist, 'reduce_mean')} "
+        f"qwen3={count(qwen3_hist, 'reduce_mean')} layers={layers}"
+    )
+    assert count(qwen3_hist, "sqrt") - count(llama_hist, "sqrt") == 2 * layers, (
+        f"each QK-Norm adds one sqrt: llama={count(llama_hist, 'sqrt')} "
+        f"qwen3={count(qwen3_hist, 'sqrt')} layers={layers}"
+    )
+    # The extra norms are graph INPUTS: two more weight specs per layer.
+    qwen3_specs = llama_mod.param_specs(qwen3_cfg)
+    assert len(qwen3_specs) - len(llama_mod.param_specs(llama_cfg)) == 2 * layers
+    assert len(graph_q.tensor_specs) == len(qwen3_specs) + 1
+    assert MEASURED[qwen3_label]["tensor_specs"] - MEASURED[llama_label]["tensor_specs"] == 2 * layers
+
+    # Only the norm vocabulary changes — no new dots/gathers/rope/etc.
+    changed = {
+        op
+        for op in set(llama_hist) | set(qwen3_hist)
+        if count(llama_hist, op) != count(qwen3_hist, op)
+    }
+    assert changed == {"multiply", "add", "divide", "reduce_mean", "sqrt", "constant"}, (
+        f"QK-Norm must add norms only, but these ops changed: {sorted(changed)} — "
+        f"llama={llama_hist} qwen3={qwen3_hist}"
+    )
+    # Per-layer arithmetic: every changed count differs by a multiple of the
+    # layer count (the same work repeated per block).
+    per_layer = {
+        "multiply": 6,
+        "add": 2,
+        "divide": 2,
+        "reduce_mean": 2,
+        "sqrt": 2,
+        "constant": 4,
+    }
+    for op, each in per_layer.items():
+        assert count(qwen3_hist, op) - count(llama_hist, op) == each * layers, (
+            f"{op}: qwen3 - llama = "
+            f"{count(qwen3_hist, op) - count(llama_hist, op)}, expected "
+            f"{each} * {layers} — {_summary(qwen3_label)}"
+        )
