@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="evoxcStackTitle">
-  <title id="evoxcStackTitle">The evoxc explicit stack: @evoxc.defn → Graph → LoweredProgram → CompiledArtifact → Executable → Tensor, joined by evoxc.trace, evoxc.lower, evoxc.compile, evoxc.load and evoxc.run; graph-to-graph transforms (vectorize, vmap, grad, jvp, vjp) leave and re-enter Graph; below the compiler boundary sit the numpy interpreter (the default backend) and the external ML compilers IREE, XLA and TVM.</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="evoxcStackTitle" aria-describedby="evoxcStackDesc">
+  <title id="evoxcStackTitle">evoxc — EvoX Compiler: the explicit stack</title>
+  <desc id="evoxcStackDesc">The evoxc — EvoX Compiler explicit stack: @evoxc.defn → Graph → LoweredProgram → CompiledArtifact → Executable → Tensor, joined by evoxc.trace, evoxc.lower, evoxc.compile, evoxc.load and evoxc.run; graph-to-graph transforms (vectorize, vmap, grad, jvp, vjp) leave and re-enter Graph; below the compiler boundary sit the numpy interpreter (the default backend) and the external ML compilers IREE, XLA and TVM.</desc>
 
   <defs>
     <marker id="arrowCyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">

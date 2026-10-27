@@ -1,10 +1,9 @@
 # assets — README-only SVG assets
-
 Hand-written SVG used by `README.md` only: no code imports them, there is no build step, no generated output and no dependency — edit the files directly.
-
-`evoxc-mark.svg` — 128×128 (viewBox `0 0 128 128`) project mark, an SSA dataflow glyph (two inputs → one op node → one output), displayed at 96×96.
-`evoxc-stack.svg` — 1200×560 (viewBox `0 0 1200 560`) hero diagram of the explicit staging pipeline, displayed full width.
-
+`evoxc-mark.svg` — 128×128 (viewBox `0 0 128 128`) project mark for **evoxc, the EvoX Compiler**: an SSA dataflow glyph (two inputs → one op node → one output), displayed at 96×96.
+`evoxc-stack.svg` — 1200×560 (viewBox `0 0 1200 560`) hero diagram of the explicit staging pipeline — `@evoxc.defn` → `Graph` (EvoXIR) → `LoweredProgram` (StableHLO) → `CompiledArtifact` → `Executable` → `Tensor`, with the graph→graph transforms (`vectorize`/`vmap`/`grad`/`jvp`/`vjp`) and the two backend families below the compiler boundary — displayed full width.
 Palette contract (both files): card `#0d1117`, inner card `#161b22`, border `#30363d`, text `#e6edf3`, muted `#8b949e` (opacity variants allowed); accents violet `#7c5cff` (frontend/language), cyan `#22d3ee` (graph/IR), green `#34d399` (runtime/execution), amber `#f0b429` (compilers). System sans for prose labels, `ui-monospace` for stage and function names.
-
+Identity contract: every internal id and accessible label uses the `evoxc` name — `evoxcMarkTitle`/`evoxcMarkDesc`/`evoxcMarkStroke` in the mark, `evoxcStackTitle`/`evoxcStackDesc` in the stack diagram (arrow markers `arrowCyan`/`arrowAmber`/`arrowGreen` are palette names, not product names).
+Accessibility contract: each SVG's `<title>`/`<desc>` pair names the product as "evoxc — EvoX Compiler" and references `@evoxc.defn` plus the public stage functions `evoxc.trace/lower/compile/load/run`; the `<svg>` element wires them with `aria-labelledby` + `aria-describedby`. Never reintroduce the pre-rename project names in text or ids.
 **Rule:** the diagram text MUST stay in sync with the public stage names in `./evoxc/CONTEXT.md` — `@evoxc.defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor` — the verbs between them (`trace`, `lower`, `compile`, `load`, `run`) and the backends (`numpy interpreter`, `IREE · XLA (PJRT) · TVM`). Renaming a stage in the library updates `evoxc-stack.svg` in the same change.
+Geometry and palette are fixed: rebranding edits text and ids only, never shapes.
