@@ -5,6 +5,7 @@ Everything here is offline: configs are plain dicts written to ``tmp_path``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import FrozenInstanceError
 
@@ -44,6 +45,27 @@ GPT2_JSON = {
     "tie_word_embeddings": True,
 }
 
+#: The shape of a real ``Qwen/Qwen3-0.6B`` config: the llama field mapping plus
+#: an explicit ``head_dim`` and an explicitly-off sliding window.
+QWEN3_JSON = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "model_type": "qwen3",
+    "vocab_size": 151936,
+    "hidden_size": 1024,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "intermediate_size": 3072,
+    "hidden_act": "silu",
+    "max_position_embeddings": 40960,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 1000000.0,
+    "tie_word_embeddings": True,
+    "sliding_window": None,
+    "use_sliding_window": False,
+}
+
 
 def write_config(tmp_path, payload, name="config.json"):
     """Write ``payload`` (a dict, or raw text) as ``config.json`` and return the path."""
@@ -58,7 +80,7 @@ def write_config(tmp_path, payload, name="config.json"):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("model_type", ["llama", "mistral", "qwen2"])
+@pytest.mark.parametrize("model_type", ["llama", "mistral", "qwen2", "qwen3"])
 def test_llama_family_model_types(model_type):
     cfg = ModelConfig.from_dict({**LLAMA_JSON, "model_type": model_type})
     assert cfg.family == "llama"
@@ -71,10 +93,41 @@ def test_llama_family_model_types(model_type):
     assert cfg.tie_word_embeddings is False
 
 
+@pytest.mark.parametrize("model_type", ["llama", "mistral", "qwen2"])
+def test_non_qwen3_llama_family_types_have_no_qk_norm(model_type):
+    cfg = ModelConfig.from_dict({**LLAMA_JSON, "model_type": model_type})
+    assert cfg.family == "llama"
+    assert cfg.qk_norm is False
+
+
+def test_qwen3_declares_qk_norm_and_honours_explicit_head_dim():
+    cfg = ModelConfig.from_dict(QWEN3_JSON)
+    assert cfg.family == "llama"
+    assert cfg.model_type == "qwen3"
+    assert cfg.qk_norm is True
+    assert cfg.head_dim == 128
+    # An explicit head_dim different from hidden_size // heads is honoured here too.
+    assert cfg.hidden_size // cfg.num_attention_heads == 64
+    assert cfg.num_key_value_heads == 8
+    assert cfg.rope_theta == 1000000.0
+    assert cfg.layer_norm_eps == 1e-6
+    assert cfg.tie_word_embeddings is True
+
+
+def test_qwen3_qk_norm_is_derived_from_model_type_alone():
+    """QK-Norm is a static config value — never inferred from extra JSON fields."""
+    cfg = ModelConfig.from_dict({**LLAMA_JSON, "model_type": "qwen3"})
+    assert cfg.qk_norm is True
+    # An extra ``qk_norm`` JSON field is ignored: only model_type decides.
+    cfg = ModelConfig.from_dict({**LLAMA_JSON, "qk_norm": True})
+    assert cfg.qk_norm is False
+
+
 def test_family_map_covers_every_supported_model_type():
     assert FAMILY_BY_MODEL_TYPE["llama"] == "llama"
     assert FAMILY_BY_MODEL_TYPE["mistral"] == "llama"
     assert FAMILY_BY_MODEL_TYPE["qwen2"] == "llama"
+    assert FAMILY_BY_MODEL_TYPE["qwen3"] == "llama"
     assert FAMILY_BY_MODEL_TYPE["gpt2"] == "gpt2"
 
 
@@ -293,6 +346,42 @@ def test_digest_changes_with_every_graph_field(field, value):
     assert other.digest != base.digest
 
 
+def test_qk_norm_is_a_graph_specialisation_field_in_the_digest():
+    """``qk_norm`` is derived, so it is pinned through ``dataclasses.replace``."""
+    base = ModelConfig.from_dict(LLAMA_JSON)
+    assert base.qk_norm is False
+    with_qk_norm = dataclasses.replace(base, qk_norm=True)
+    assert with_qk_norm.qk_norm is True
+    assert with_qk_norm.digest != base.digest
+    # The digest difference is qk_norm alone, not some other field.
+    changed = [
+        f.name
+        for f in dataclasses.fields(base)
+        if getattr(base, f.name) != getattr(with_qk_norm, f.name)
+    ]
+    assert changed == ["qk_norm"]
+
+
+def test_qwen3_and_llama_configs_with_the_same_sizes_digest_differently():
+    same_sizes = {k: v for k, v in QWEN3_JSON.items() if k not in ("model_type", "head_dim")}
+    llama_cfg = ModelConfig.from_dict({**same_sizes, "model_type": "llama", "head_dim": 64})
+    qwen3_cfg = ModelConfig.from_dict({**same_sizes, "model_type": "qwen3", "head_dim": 64})
+    assert llama_cfg.family == qwen3_cfg.family == "llama"
+    assert (llama_cfg.hidden_size, llama_cfg.num_hidden_layers) == (
+        qwen3_cfg.hidden_size,
+        qwen3_cfg.num_hidden_layers,
+    )
+    assert llama_cfg.qk_norm is False and qwen3_cfg.qk_norm is True
+    assert llama_cfg.digest != qwen3_cfg.digest
+
+
+def test_qk_norm_is_excluded_from_nothing_but_raw():
+    """A qwen3 config's raw extra fields still do not change its digest."""
+    base = ModelConfig.from_dict(QWEN3_JSON)
+    with_extra = ModelConfig.from_dict({**QWEN3_JSON, "unknown_extra": 1})
+    assert base.digest == with_extra.digest
+
+
 def test_raw_is_excluded_from_equality_and_hash():
     base = ModelConfig.from_dict(LLAMA_JSON)
     other = ModelConfig.from_dict({**LLAMA_JSON, "extra": 1})
@@ -415,3 +504,125 @@ def test_non_dict_payload():
     with pytest.raises(HFConfigError) as err:
         ModelConfig.from_dict(["not", "a", "config"], source="x.json")
     assert "x.json" in str(err.value)
+
+
+# ---------------------------------------------------------------------------
+# Qwen3 sliding-window guard (QK-Norm is supported; sliding attention is not)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [True, 1, "yes"])
+def test_qwen3_use_sliding_window_is_rejected(value):
+    with pytest.raises(HFUnsupportedError) as err:
+        ModelConfig.from_dict(
+            {**QWEN3_JSON, "use_sliding_window": value}, source="qwen3.json"
+        )
+    message = str(err.value)
+    assert "use_sliding_window" in message
+    assert "qwen3" in message
+    assert "qwen3.json" in message
+    assert "v1" in message
+
+
+@pytest.mark.parametrize(
+    "layer_types",
+    [
+        ["sliding_attention"],
+        ["full_attention", "sliding_attention"],
+        ["full_attention", "full_attention", "sliding_attention"],
+    ],
+)
+def test_qwen3_non_full_attention_layer_types_are_rejected(layer_types):
+    with pytest.raises(HFUnsupportedError) as err:
+        ModelConfig.from_dict({**QWEN3_JSON, "layer_types": layer_types})
+    message = str(err.value)
+    assert "layer_types" in message
+    assert "qwen3" in message
+    assert "sliding_attention" in message
+    assert "full_attention" in message
+
+
+def test_qwen3_layer_types_must_be_a_list():
+    """A malformed ``layer_types`` is a config error naming the field."""
+    with pytest.raises(HFConfigError) as err:
+        ModelConfig.from_dict({**QWEN3_JSON, "layer_types": "full_attention"})
+    assert "layer_types" in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"use_sliding_window": None},
+        {},
+    ],
+    ids=["none", "absent"],
+)
+def test_qwen3_positive_sliding_window_without_explicit_false_is_rejected(overrides):
+    base = {k: v for k, v in QWEN3_JSON.items() if k != "use_sliding_window"}
+    raw = {**base, "sliding_window": 4096, **overrides}
+    with pytest.raises(HFUnsupportedError) as err:
+        ModelConfig.from_dict(raw, source="qwen3-window.json")
+    message = str(err.value)
+    assert "sliding_window" in message
+    assert "use_sliding_window" in message
+    assert "qwen3" in message
+    assert "qwen3-window.json" in message
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sliding_window": None, "use_sliding_window": False},
+        {"sliding_window": None},
+        {"use_sliding_window": False},
+        {},
+        {"layer_types": []},
+        {"layer_types": ["full_attention", "full_attention"]},
+        {"sliding_window": 4096, "use_sliding_window": False},
+        {"sliding_window": 0},
+    ],
+)
+def test_qwen3_full_attention_declarations_are_accepted(overrides):
+    """Full causal attention is expressible; these are the real-config shapes."""
+    raw = {**QWEN3_JSON, **overrides}
+    cfg = ModelConfig.from_dict(raw)
+    assert cfg.family == "llama"
+    assert cfg.model_type == "qwen3"
+    assert cfg.qk_norm is True
+
+
+def test_qwen3_real_shaped_config_parses():
+    """The real ``Qwen/Qwen3-0.6B`` field values parse (sliding_window null/false)."""
+    cfg = ModelConfig.from_dict(QWEN3_JSON)
+    assert (cfg.vocab_size, cfg.hidden_size, cfg.num_hidden_layers) == (
+        151936,
+        1024,
+        28,
+    )
+    assert (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim) == (
+        16,
+        8,
+        128,
+    )
+    assert cfg.intermediate_size == 3072
+    assert cfg.rope_theta == 1000000.0
+    assert cfg.max_position_embeddings == 40960
+
+
+def test_rope_scaling_rejection_still_applies_to_qwen3():
+    with pytest.raises(HFUnsupportedError) as err:
+        ModelConfig.from_dict(
+            {**QWEN3_JSON, "rope_scaling": {"type": "linear", "factor": 4.0}}
+        )
+    assert "rope_scaling" in str(err.value)
+    assert "v1" in str(err.value)
+
+
+def test_qwen3_qk_norm_survives_from_json_and_from_dir(tmp_path):
+    """QK-Norm is part of the parsed config whichever constructor is used."""
+    write_config(tmp_path, QWEN3_JSON)
+    from_json = ModelConfig.from_json(tmp_path / "config.json")
+    from_dir = ModelConfig.from_dir(tmp_path)
+    assert from_json == from_dir
+    assert from_json.qk_norm is from_dir.qk_norm is True
+    assert ModelConfig.from_dict(QWEN3_JSON).digest == from_json.digest

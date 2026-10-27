@@ -132,7 +132,7 @@ def test_model_types_agree_with_each_module():
 
 def test_family_specs_accept_the_configs_own_family():
     """Each registry entry drives a real build path for a tiny config of its family."""
-    for raw in (_LLAMA_JSON, _GPT2_JSON):
+    for raw in (_LLAMA_JSON, {**_LLAMA_JSON, "model_type": "qwen3"}, _GPT2_JSON):
         cfg = ModelConfig.from_dict(raw)
         spec = get_family(cfg.family)
         assert spec.name == cfg.family
@@ -144,8 +144,32 @@ def test_family_specs_accept_the_configs_own_family():
         )
 
 
-def test_llama_spec_covers_mistral_and_qwen2():
-    assert set(get_family("llama").model_types) == {"llama", "mistral", "qwen2"}
+def test_llama_spec_covers_mistral_qwen2_and_qwen3():
+    assert set(get_family("llama").model_types) == {"llama", "mistral", "qwen2", "qwen3"}
+
+
+# ---------------------------------------------------------------------------
+# Qwen3 QK-Norm at the registry level
+# ---------------------------------------------------------------------------
+def test_qwen3_param_specs_carry_per_layer_qk_norm_scales():
+    """Qwen3 (``qk_norm=True``) adds one ``(head_dim,)`` scale per layer and head type."""
+    qwen3 = ModelConfig.from_dict({**_LLAMA_JSON, "model_type": "qwen3"})
+    assert qwen3.qk_norm is True
+    specs = get_family("llama").param_specs(qwen3)
+    for layer in range(qwen3.num_hidden_layers):
+        for suffix in ("attn.q_norm.weight", "attn.k_norm.weight"):
+            key = f"layers.{layer}.{suffix}"
+            assert key in specs, key
+            # Per head, NOT (hidden_size,).
+            assert tuple(specs[key].shape) == (qwen3.head_dim,), key
+    assert qwen3.head_dim == qwen3.hidden_size // qwen3.num_attention_heads
+
+    llama = ModelConfig.from_dict(_LLAMA_JSON)
+    assert llama.qk_norm is False
+    llama_specs = get_family("llama").param_specs(llama)
+    assert not any("q_norm" in key or "k_norm" in key for key in llama_specs)
+    # Same config sizes ⇒ exactly two extra keys per layer for the Qwen3 config.
+    assert len(specs) == len(llama_specs) + 2 * qwen3.num_hidden_layers
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +224,7 @@ def test_get_family_unknown_raises_naming_the_registry(name):
         ("llama", "llama"),
         ("mistral", "llama"),
         ("qwen2", "llama"),
+        ("qwen3", "llama"),
         ("gpt2", "gpt2"),
     ],
 )
@@ -223,7 +248,9 @@ def test_family_for_model_type_agrees_with_model_config_family():
     """Registry routing and config parsing must never disagree."""
     for model_type in config_module.FAMILY_BY_MODEL_TYPE:
         raw = dict(
-            _LLAMA_JSON if model_type in ("llama", "mistral", "qwen2") else _GPT2_JSON
+            _LLAMA_JSON
+            if model_type in ("llama", "mistral", "qwen2", "qwen3")
+            else _GPT2_JSON
         )
         raw["model_type"] = model_type
         cfg = ModelConfig.from_dict(raw)
