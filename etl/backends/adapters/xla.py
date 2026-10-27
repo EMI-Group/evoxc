@@ -76,6 +76,7 @@ bodies. ``import etl`` / ``import etl.backends`` never import this module
 from __future__ import annotations
 
 import base64
+import threading
 import weakref
 from typing import Any, ClassVar
 
@@ -649,6 +650,16 @@ class XlaExecutable(CompilerExecutable):
       ``.numpy()`` raises the standard ``core.DeviceError``; read them back
       via the explicit ``t.to(cpu).numpy()``).
 
+    **A device-resident run returns after ENQUEUE, not after completion.**
+    The driver requests the plugin's per-device completion event on every
+    device-resident run and hands the raw handle to this executable, so
+    ``run()`` costs only the dispatch; use the explicit
+    ``synchronize()`` (or an explicit ``t.to(cpu)`` readback) before
+    timing or observing results. Nothing synchronizes implicitly — no
+    hidden wait anywhere in ``run``. CPU (host-staging) runs stay
+    synchronous: their outputs are already host copies when ``run``
+    returns.
+
     ``save``/``load`` are the SHARED ``CompilerExecutable``
     implementations (artifact round-trip; the executable is reconstructed
     explicitly at ``load`` — device handles are never serialized).
@@ -695,6 +706,14 @@ class XlaExecutable(CompilerExecutable):
         # ``core.BackendError`` on a mismatch), then the contract is
         # trusted — XLA executable output types are static.
         self._outputs_verified = False
+        # EXPLICIT device synchronization state (see ``synchronize``): the
+        # raw ``PJRT_Event*`` completion handles of every device-resident run
+        # that is still pending, the lock guarding them (runs and the sync
+        # may come from different threads), and — when the plugin returned no
+        # event for a run — the reason synchronization cannot be honest.
+        self._pending_events: list[int] = []
+        self._events_lock = threading.Lock()
+        self._sync_unavailable_reason: str | None = None
 
     def close(self) -> None:
         """Release the plugin handles (executable first, then the client ref).
@@ -705,7 +724,26 @@ class XlaExecutable(CompilerExecutable):
         output) still holds a reference (``release_client``). Not part of
         the ``Executable`` protocol; call it when done with the executable
         (the process also reclaims everything at exit).
+
+        Outstanding DEVICE-COMPLETE events from earlier runs are DESTROYED
+        here, never awaited: ``close`` must not block on device work that
+        was enqueued (the documented contract is that a device-resident run
+        returns after ENQUEUE — call ``synchronize()`` first when you need
+        completion). Destroy failures are best-effort/swallowed so this
+        cleanup can never make ``close`` itself fail, and no handle leaks on
+        any path.
         """
+        with self._events_lock:
+            pending = self._pending_events
+            self._pending_events = []
+            self._sync_unavailable_reason = None
+        plugin = self._plugin
+        if plugin is not None:
+            for handle in pending:
+                try:
+                    plugin.destroy_event(handle)
+                except BaseException:
+                    pass
         if self.native_module is not None:
             self.native_module.close()
             self.native_module = None
@@ -764,6 +802,13 @@ class XlaExecutable(CompilerExecutable):
         are built into a pre-sized list which the same pass validates. One
         shared-client reference (and one finalizer) is taken per run's
         output set, not per output tensor.
+
+        ASYNC ENQUEUE (binding): a DEVICE-RESIDENT run returns once the work
+        is ENQUEUED — the plugin's completion event for the dispatch is
+        recorded on this executable instead of being awaited. ``synchronize()``
+        (or an explicit ``t.to(cpu)`` readback) is therefore required before
+        timing or observing completion. A CPU (host-staging) run stays
+        synchronous — its outputs are host copies when it returns.
         """
         from ..options import validate_options
 
@@ -869,11 +914,18 @@ class XlaExecutable(CompilerExecutable):
 
         if device_resident:
             buffers = arrays  # _Buffer handles owned by their payloads
+            # The plugin's completion event for this dispatch: requested
+            # here and committed to ``_pending_events`` the instant the
+            # execute returns (BEFORE any output validation, so a late
+            # failure can never leak the handle). Never on the CPU path.
+            events: list = []
             output_buffers = self.native_module.execute(
                 buffers,
                 execute_device=self._execute_device,
                 output_meta=plan.output_meta,
+                events=events,
             )
+            self._record_run_events(events)
             num_outputs = plan.num_outputs
             if len(output_buffers) != num_outputs:
                 raise core.BackendError(
@@ -957,6 +1009,98 @@ class XlaExecutable(CompilerExecutable):
                     f"{actual_shape}"
                 )
         return tensors
+
+    # ---------------------------------------------------------- synchronizing
+
+    def _record_run_events(self, events: list) -> None:
+        """Commit a device-resident run's completion-event handles.
+
+        Called by ``run`` IMMEDIATELY after the driver's ``execute`` returns
+        — before any output validation — so a handle the plugin handed out
+        can never be lost to a later failure. The TRUTHY handles join
+        ``_pending_events`` (they are awaited + destroyed by
+        ``synchronize``/``close``); a ``0``/``None`` handle means the plugin
+        returned NO event, so honest synchronization is impossible: the
+        reason is recorded (once, overwritten) and raised by the next
+        ``synchronize()`` — ``run`` itself never raises for it and never
+        claims completion silently.
+        """
+        handles = [handle for handle in events if handle]
+        reason = None
+        if len(handles) != len(events):
+            reason = (
+                "the PJRT plugin returned no device-complete event for a "
+                "device-resident run (it violated the "
+                "PJRT_ExecuteOptions.device_complete_events contract), so "
+                "XlaExecutable.synchronize() cannot honestly report "
+                "completion — use an explicit .to(cpu) readback (or the "
+                "plugin's own synchronization) instead."
+            )
+        with self._events_lock:
+            if handles:
+                self._pending_events.extend(handles)
+            if reason is not None:
+                self._sync_unavailable_reason = reason
+
+    def synchronize(self) -> None:
+        """Wait until device work submitted by previous ``run`` calls finished.
+
+        Device-resident runs return after ENQUEUE (the plugin's per-device
+        completion event is recorded rather than awaited), so this is the
+        EXPLICIT boundary where the device is known to be caught up — call
+        it before timing a run or reading results through anything other
+        than an explicit ``t.to(cpu)`` readback (which synchronizes on its
+        own). Nothing calls it implicitly.
+
+        It awaits then destroys EVERY completion-event handle pending at
+        call time and is reusable/idempotent: many runs → one
+        ``synchronize()`` waits for all of them, and a second call (nothing
+        pending) is a no-op that performs no plugin FFI at all — the idle
+        fast path. Handles are taken under the executable's event lock and
+        the list is swapped for a fresh one, so work enqueued CONCURRENTLY
+        (by another thread's ``run``) belongs to a later sync and is never
+        lost. Every handle is awaited AND destroyed even when an await
+        fails: the FIRST failure is re-raised after the rest are cleaned
+        up, so no handle leaks on the error path. If a run recorded that the
+        plugin returned no completion event, a ``core.BackendError`` naming
+        that is raised once (the reason is cleared).
+
+        Raises ``core.BackendError`` naming the closed executable if it is
+        called after ``close()`` released the plugin while handles were
+        still pending (they can be neither awaited nor destroyed then).
+        """
+        if not self._pending_events and self._sync_unavailable_reason is None:
+            return  # idle: nothing pending, no reason — zero FFI, O(1)
+        with self._events_lock:
+            handles = self._pending_events
+            self._pending_events = []
+            reason = self._sync_unavailable_reason
+            self._sync_unavailable_reason = None
+        plugin = self._plugin
+        if handles and plugin is None:
+            raise core.BackendError(
+                f"cannot synchronize this closed XlaExecutable: "
+                f"{len(handles)} device-complete event handle(s) from earlier "
+                "runs are still pending, but the PJRT plugin it was loaded on "
+                "has been released — they can be neither awaited nor "
+                "destroyed. Synchronize before closing the executable."
+            )
+        first_error: BaseException | None = None
+        for handle in handles:
+            try:
+                plugin.await_event(handle)
+            except BaseException as exc:  # keep cleaning up the rest
+                if first_error is None:
+                    first_error = exc
+            try:
+                plugin.destroy_event(handle)
+            except BaseException as exc:  # a leak-free error path wins
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+        if reason is not None:
+            raise core.BackendError(reason)
 
     def _build_run_plan(self) -> _XlaRunPlan:
         """Derive (and cache) the per-executable run plan.
