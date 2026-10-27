@@ -313,7 +313,7 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 | `./etl_hf/ops.py` | Graph idioms (norms/activations/softmax/mask/RoPE/head layout) + `ACTIVATIONS`/`EXPORT_UNSAFE_ACTIVATIONS`. |
 | `./etl_hf/reference.py` | Independent pure-numpy oracle primitives (no `etl` import) — the thing graphs are validated against. |
 | `./etl_hf/families.py` | `FamilySpec`, the `FAMILIES` registry, `get_family`, `family_for_model_type`, `resolve_family`. |
-| `./etl_hf/models/` | Per-family graph builders (`llama.py`, `gpt2.py`) plus the shared block assembly `_common.py`; `models/__init__.py` re-exports nothing (import acyclicity). |
+| `./etl_hf/models/` | Per-family graph builders (`llama.py` — llama/mistral/qwen2/qwen3, the Qwen3 case adding per-head QK-Norm — and `gpt2.py`) plus the shared block assembly `_common.py`; `models/__init__.py` re-exports nothing (import acyclicity). |
 | `./etl_hf/pack.py` | Opt-in packed weights: `PackPlan`/`pack_plan`/`pack_params`/`is_packed_tree` — bucket the canonical `param_specs` by `(dtype, rank, shape[1:])`, concatenate along axis 0 on the host, unpack inside the graph with static `etl.slice`. |
 | `./etl_hf/errors.py` | The `HFError` hierarchy (rooted at `etl.core.ETLError`). |
 | `./etl_hf/_validate.py` | Internal argument guards shared by `load`/`program`/`pipeline`. |
