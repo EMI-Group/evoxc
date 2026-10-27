@@ -9,8 +9,9 @@ fields, usable directly as a build-cache key.
 
 Two supported config families (see :data:`FAMILY_BY_MODEL_TYPE`):
 
-* ``llama`` — HF ``LlamaConfig`` / ``MistralConfig`` / ``Qwen2Config``
-  (RMSNorm, RoPE, GQA, SwiGLU-style MLP).
+* ``llama`` — HF ``LlamaConfig`` / ``MistralConfig`` / ``Qwen2Config`` /
+  ``Qwen3Config`` (RMSNorm, RoPE, GQA, SwiGLU-style MLP; Qwen3 adds the
+  per-head QK-Norm, recorded as the static :attr:`ModelConfig.qk_norm`).
 * ``gpt2`` — HF ``GPT2Config`` (LayerNorm, learned positional embeddings,
   tied head). Its compact key names (``n_embd``/``n_head``/``n_layer``/…)
   are normalised onto the canonical fields here.
@@ -49,10 +50,13 @@ __all__ = ["ModelConfig", "FAMILY_BY_MODEL_TYPE"]
 #: HF ``model_type`` → ``etl_hf`` family key. Adding a model family that reuses
 #: an existing architecture is a one-line change here (plus its per-family key
 #: parser in :meth:`ModelConfig.from_dict` when the key names differ).
+#: ``qwen3`` reuses the ``llama`` architecture with the extra per-head QK-Norm
+#: (see :attr:`ModelConfig.qk_norm`).
 FAMILY_BY_MODEL_TYPE: dict[str, str] = {
     "llama": "llama",
     "mistral": "llama",
     "qwen2": "llama",
+    "qwen3": "llama",
     "gpt2": "gpt2",
 }
 
@@ -80,6 +84,13 @@ class ModelConfig:
     ``raw`` keeps the parsed JSON for diagnostics; it takes part in neither
     equality nor hashing, so two configs loaded from files that differ only in
     harmless extra HF fields compare (and digest) equal.
+
+    ``qk_norm`` records **Qwen3-style QK-Norm**: an extra RMSNorm of size
+    ``head_dim`` applied per head to the queries and keys after the head split
+    and before RoPE. It is a *static graph specialisation property derived from*
+    ``model_type`` (``qwen3`` → ``True``), never inferred at run time from
+    checkpoint contents — one config is one graph. :attr:`digest` covers it
+    automatically because ``digest`` hashes every non-``raw`` field.
     """
 
     model_type: str
@@ -96,6 +107,7 @@ class ModelConfig:
     tie_word_embeddings: bool
     rope_theta: float | None
     head_dim: int
+    qk_norm: bool = False
     raw: dict = field(default_factory=dict, compare=False, repr=False)
 
     # -- constructors -------------------------------------------------------
@@ -158,9 +170,11 @@ class ModelConfig:
                 f"{sorted(FAMILY_BY_MODEL_TYPE)}"
             )
         _reject_rope_scaling(raw, source)
+        if model_type == "qwen3":
+            _reject_qwen3_unsupported(raw, source)
 
         if family == "llama":
-            values = _parse_llama(raw, source)
+            values = _parse_llama(raw, source, model_type=model_type)
         else:  # pragma: no branch - FAMILY_BY_MODEL_TYPE has exactly two families
             values = _parse_gpt2(raw, source)
         values = _finish(values, source)
@@ -305,13 +319,81 @@ def _reject_rope_scaling(raw: dict, source: str) -> None:
     )
 
 
+def _reject_qwen3_unsupported(raw: dict, source: str) -> None:
+    """Reject the Qwen3 config options etl_hf does not implement.
+
+    Qwen3 reuses the Llama architecture (RMSNorm, RoPE, GQA, SwiGLU) plus the
+    per-head QK-Norm that :attr:`ModelConfig.qk_norm` records. The one thing v1
+    cannot express is **sliding-window attention**, so any config asking for it
+    is refused here rather than silently building a full-attention graph that
+    diverges from HuggingFace.
+
+    Accepted (the real ``Qwen/Qwen3-0.6B`` config passes): ``sliding_window``
+    absent or ``None``, ``use_sliding_window`` absent/``False``, and a
+    ``layer_types`` list that is absent, empty, or made only of
+    ``"full_attention"`` entries. ``sliding_window`` set to a positive integer
+    while ``use_sliding_window`` is not explicitly ``False`` is rejected too
+    (the HF default flips the switch on in that case).
+
+    Args:
+        raw: the parsed HF config JSON object.
+        source: originating file/dict name, used in the error message.
+
+    Raises:
+        HFUnsupportedError: the config asks for sliding-window attention.
+    """
+    use_sliding_window = raw.get("use_sliding_window")
+    if use_sliding_window:
+        raise HFUnsupportedError(
+            f"{source}: config field 'use_sliding_window' = {use_sliding_window!r} "
+            f"is not implemented in etl_hf v1 for model_type 'qwen3'; "
+            f"sliding-window attention would be silently replaced by full causal "
+            f"attention and diverge from HuggingFace — use a checkpoint with "
+            f"'use_sliding_window': false"
+        )
+
+    layer_types = raw.get("layer_types")
+    if layer_types:
+        if not isinstance(layer_types, (list, tuple)):
+            raise HFConfigError(
+                f"{source}: config field 'layer_types' must be a list of strings, "
+                f"got {type(layer_types).__name__} ({layer_types!r})"
+            )
+        unsupported = [
+            entry for entry in layer_types if entry != "full_attention"
+        ]
+        if unsupported:
+            raise HFUnsupportedError(
+                f"{source}: config field 'layer_types' = {list(layer_types)!r} "
+                f"requests non-full attention layers {unsupported!r}, which is not "
+                f"implemented in etl_hf v1 for model_type 'qwen3'; only "
+                f"'full_attention' layer types are supported"
+            )
+
+    sliding_window = raw.get("sliding_window")
+    if isinstance(sliding_window, int) and not isinstance(sliding_window, bool):
+        if sliding_window > 0 and use_sliding_window is not False:
+            raise HFUnsupportedError(
+                f"{source}: config fields 'sliding_window' = {sliding_window} together "
+                f"with 'use_sliding_window' = {use_sliding_window!r} request "
+                f"sliding-window attention, which is not implemented in etl_hf v1 for "
+                f"model_type 'qwen3'; set 'use_sliding_window': false (or "
+                f"'sliding_window': null) to declare full causal attention"
+            )
+
+
 # ---------------------------------------------------------------------------
 # per-family parsers
 # ---------------------------------------------------------------------------
 
 
-def _parse_llama(raw: dict, source: str) -> dict:
-    """Normalise a ``LlamaConfig``/``MistralConfig``/``Qwen2Config`` JSON object."""
+def _parse_llama(raw: dict, source: str, *, model_type: str = "llama") -> dict:
+    """Normalise a ``LlamaConfig``/``MistralConfig``/``Qwen2``/``Qwen3`` JSON object.
+
+    ``model_type`` selects the one architectural difference inside this family:
+    ``qwen3`` applies a per-head QK-Norm (recorded as the static ``qk_norm``
+    graph-specialisation field), every other covered ``model_type`` does not.
+    """
     num_attention_heads = _int_field(raw, ("num_attention_heads",), source)
     return {
         "vocab_size": _int_field(raw, ("vocab_size",), source),
@@ -336,6 +418,8 @@ def _parse_llama(raw: dict, source: str) -> dict:
             raw, ("rope_theta",), source, default=_DEFAULT_ROPE_THETA
         ),
         "head_dim": _int_field(raw, ("head_dim",), source, default=None),
+        # Qwen3 is the only covered model_type with per-head QK-Norm.
+        "qk_norm": model_type == "qwen3",
     }
 
 
@@ -374,6 +458,8 @@ def _parse_gpt2(raw: dict, source: str) -> dict:
         "rope_theta": None,
         # GPT-2 has no per-head dimension override (and no GQA).
         "head_dim": None,
+        # No per-head QK-Norm.
+        "qk_norm": False,
     }
 
 

@@ -59,7 +59,7 @@ class FamilySpec:
         name: the ``etl_hf`` family key (``ModelConfig.family``), e.g.
             ``"llama"``.
         model_types: every HF ``model_type`` string this family covers, sorted
-            (``("llama", "mistral", "qwen2")`` for the Llama family).
+            (``("llama", "mistral", "qwen2", "qwen3")`` for the Llama family).
         canonicalize_weights: ``(cfg, raw) -> dict[str, np.ndarray]`` — the HF
             state dict → canonical ``(in_features, out_features)`` weight map.
         param_specs: ``(cfg) -> dict[str, etl.TensorSpec]`` — the graph-input

@@ -13,7 +13,7 @@ The API is **functional** and split along etl's own value model into three layer
 | **staging** | `pipeline.py` | *where and how does it run?* | `build`, `run`, `predict`, `place_params`, `place_ids`, `resolve_build_options`, the `DEFAULT_*` option constants |
 
 Nothing here is a class with behaviour: `LoadedModel` is a `typing.NamedTuple` of field access only, and every operation is a module-level function taking its inputs as arguments.
-Two model families are implemented — **`llama`** (HF `llama`/`mistral`/`qwen2`) and **`gpt2`** (HF `gpt2`, e.g. `gpt2`/`distilgpt2`) — each as one `@etl.defn` forward whose weights are ordinary graph inputs.
+Two model families are implemented — **`llama`** (HF `llama`/`mistral`/`qwen2`/`qwen3`, the Qwen3 case adding per-head QK-Norm via the static `qk_norm` config field) and **`gpt2`** (HF `gpt2`, e.g. `gpt2`/`distilgpt2`) — each as one `@etl.defn` forward whose weights are ordinary graph inputs.
 Parity is pinned against an **independent pure-numpy oracle** (`reference.py`, no `etl` import) and, when `torch`+`transformers` are installed, against the real HuggingFace implementation (`tests/test_torch_oracle.py`).
 Whole-graph StableHLO export is pinned without any compiler (`tests/test_export.py`); the compiled `iree` paths are pinned when `iree` is installed (`tests/test_iree_llvm_cpu.py`, `tests/test_iree_rocm.py`), and the compiled `xla` path is validated by the benchmark harness (`../bench_logs/hf_bench.py` → `../bench_logs/hf_bench_results.md`), not by a gated test.
 
@@ -111,12 +111,12 @@ def predict(loaded, input_ids=None, *, params=None, seq_len=None, batch_size=Non
 ### `etl_hf/config.py` — HF `config.json` → frozen static `ModelConfig`
 
 ```python
-FAMILY_BY_MODEL_TYPE: dict[str, str] = {"llama": "llama", "mistral": "llama", "qwen2": "llama", "gpt2": "gpt2"}
+FAMILY_BY_MODEL_TYPE: dict[str, str] = {"llama": "llama", "mistral": "llama", "qwen2": "llama", "qwen3": "llama", "gpt2": "gpt2"}
 @dataclass(frozen=True)
 class ModelConfig:
     model_type, family, vocab_size, hidden_size, num_hidden_layers, num_attention_heads,
     num_key_value_heads, intermediate_size, hidden_act, layer_norm_eps, max_position_embeddings,
-    tie_word_embeddings, rope_theta, head_dim, raw                       # `raw`: parsed JSON, diagnostics only
+    tie_word_embeddings, rope_theta, head_dim, qk_norm, raw              # `raw`: parsed JSON, diagnostics only
     @staticmethod
     def from_json(path) -> "ModelConfig"
     @staticmethod
@@ -127,9 +127,10 @@ class ModelConfig:
     def digest(self) -> str          # 16-hex sha256 over every graph-specialising field, `raw` excluded
 ```
 
-Llama reads `rms_norm_eps` (1e-6), `hidden_act` (`"silu"`), `rope_theta` (10000.0), `num_key_value_heads` (= heads), `tie_word_embeddings` (False) and an explicit `head_dim` override else `hidden_size // num_attention_heads`.
-GPT-2 normalises its compact keys (`n_embd`/`n_head`/`n_layer`/`n_vocab`/`n_positions`/`n_inner`/`activation_function`/`layer_norm_epsilon`, with canonical fallbacks), defaults `n_inner` to `4 × hidden_size` (HF writes `null`), activation to `"gelu_new"`, eps to 1e-5, ties embeddings, and pins `rope_theta`/`head_dim` to `None`.
+Llama reads `rms_norm_eps` (1e-6), `hidden_act` (`"silu"`), `rope_theta` (10000.0), `num_key_value_heads` (= heads), `tie_word_embeddings` (False) and an explicit `head_dim` override else `hidden_size // num_attention_heads`; `qk_norm` is derived from `model_type` alone (`"qwen3"` → `True`, everything else `False`) — a static graph specialisation value, never inferred at run time from checkpoint contents, and covered by `digest` like every other non-`raw` field.
+GPT-2 normalises its compact keys (`n_embd`/`n_head`/`n_layer`/`n_vocab`/`n_positions`/`n_inner`/`activation_function`/`layer_norm_epsilon`, with canonical fallbacks), defaults `n_inner` to `4 × hidden_size` (HF writes `null`), activation to `"gelu_new"`, eps to 1e-5, ties embeddings, pins `rope_theta`/`head_dim` to `None` and `qk_norm` to `False`.
 Validation raises `HFConfigError` for head-count divisibility, non-positive/non-int sizes and unknown `model_type` (listing the supported set), and `HFUnsupportedError` for non-empty `rope_scaling` (a scaled-RoPE model would silently diverge from HF, so it is refused rather than approximated).
+A `qwen3` config additionally runs the Qwen3 guard: any request for sliding-window attention is an explicit `HFUnsupportedError` — truthy `use_sliding_window`, a non-empty `layer_types` list with any entry other than `"full_attention"`, or a positive integer `sliding_window` while `use_sliding_window` is not explicitly `False` (so `sliding_window: null`/absent and the real `Qwen/Qwen3-0.6B` config pass).
 `ModelConfig` values are **static graph specialisation values**: one config = one graph, and `digest` is directly usable as a cache key (configs differing only in harmless extra HF fields digest equal).
 
 ### `etl_hf/weights.py` — checkpoint readers (numpy + stdlib only, no key mapping)
@@ -200,7 +201,8 @@ canonicalize_weights(cfg, raw), param_specs(cfg), graph(cfg, seq_len, batch_size
 Graph contract (both families): `params` is the flat canonical dict (exactly the `param_specs` keys), `input_ids` is `(batch_size, seq_len)` `int32`, `logits` is `(batch_size, seq_len, vocab_size)` float32; all shapes static; every weight a graph **input**, never `etl.constant`.
 **Orientation rule — `(in_features, out_features)`** for every weight fed to `etl.dot(x, W)`: llama linears are `(out, in)` in HF and transposed at load; GPT-2 `Conv1D` weights are already `(in, out)` and are **not** transposed; `lm_head.weight` is `(hidden, vocab)` in both (HF stores `(vocab, hidden)`).
 **Tied embeddings — one graph input, never two**: `tie_word_embeddings=True` omits `lm_head.weight` from both `param_specs` and `canonicalize_weights`, and the graph feeds `params["embed.weight"]` to the token gather and — as `etl.transpose(embed)` — to the final projection. A tied tree carries one key fewer (`gpt2` 196 keys / 124 439 808 params, `distilgpt2` 100 / 81 912 576, `tiny_gpt2` 36 / 102 714; untied `tiny_llama` 21 / 1 032 272).
-**llama canonical keys (`2 + 9·L + 1` untied, `2 + 9·L` tied)**: `embed.weight` ← `model.embed_tokens.weight`; per layer `attn_norm.weight` ← `input_layernorm.weight`, `attn.{q,k,v,o}.weight` ← `self_attn.*_proj.weight`.T, `mlp_norm.weight` ← `post_attention_layernorm.weight`, `mlp.{gate,up,down}.weight` ← `mlp.*_proj.weight`.T; then `final_norm.weight` ← `model.norm.weight` and, untied only, `lm_head.weight` ← `lm_head.weight`.T.
+**llama canonical keys (`2 + 9·L + 1` untied, `2 + 9·L` tied; Qwen3 adds `2·L` QK-Norm keys)**: `embed.weight` ← `model.embed_tokens.weight`; per layer `attn_norm.weight` ← `input_layernorm.weight`, `attn.{q,k,v,o}.weight` ← `self_attn.*_proj.weight`.T, `mlp_norm.weight` ← `post_attention_layernorm.weight`, `mlp.{gate,up,down}.weight` ← `mlp.*_proj.weight`.T; then `final_norm.weight` ← `model.norm.weight` and, untied only, `lm_head.weight` ← `lm_head.weight`.T. A `cfg.qk_norm` (Qwen3) config adds per layer `attn.q_norm.weight` ← `self_attn.q_norm.weight` and `attn.k_norm.weight` ← `self_attn.k_norm.weight`, both **verbatim** (never transposed) and both `(head_dim,)` — per head, not `(hidden_size,)`; one `_layer_records(cfg)` list drives `_expected_shapes`, `canonicalize_weights` and `reference`, so specs/weights/oracle cannot drift, and the `qk_norm=False` path returns the unchanged 9-record order.
+**QK-Norm placement**: in both the graph and the numpy oracle, `rms_norm(q, attn.q_norm.weight, eps)` / `rms_norm(k, attn.k_norm.weight, eps)` run **after `split_heads` and before `apply_rope`**, over the last axis `head_dim` — the HF `Qwen3Attention` order. A Qwen3 config missing those checkpoint keys is a `HFWeightError` naming QK-Norm; a non-Qwen3 config carrying them is a `HFWeightError` whose leftover-key hint explains that only `model_type == "qwen3"` declares QK-Norm.
 **gpt2 canonical keys (`16·L + 5` untied, `16·L + 4` tied)**: `embed.weight` ← `wte.weight`, `pos_embed.weight` ← `wpe.weight`; per layer `attn_norm.{weight,bias}` ← `ln_1.*`, `attn.{q,k,v}.{weight,bias}` ← column blocks `[0:H]`/`[H:2H]`/`[2H:3H]` of the fused `attn.c_attn.*`, `attn.o.*` ← `attn.c_proj.*`, `mlp_norm.*` ← `ln_2.*`, `mlp.fc1.*` ← `mlp.c_fc.*`, `mlp.fc2.*` ← `mlp.c_proj.*`; then `final_norm.*` ← `ln_f.*` and, untied only, `lm_head.weight` ← `lm_head.weight`.T.
 Llama attention dims derive from `cfg.head_dim`; GPT-2 always uses `hidden_size // num_attention_heads`.
 Both canonicalisers resolve tied heads explicitly: a tied config shipping `lm_head.weight` is verified (`np.allclose`), consumed and dropped; a disagreeing tied head is `HFWeightError`, and an untied config without it is `HFWeightError` listing the remedy.
@@ -283,6 +285,7 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 - **Exact-erf GELU is numpy-backend-only**: `hidden_act: "gelu"`/`"erf"` builds `ops.gelu_erf` (which uses `etl.erf`, a v1 StableHLO export deferral), so the graph runs on the numpy interpreter and raises an explicit `etl.BackendError` on any compiler backend — with `HFUnsupportedError` from the activation gate even earlier, and never a silent tanh substitute.
 - **Static shapes only** — one graph per `(config, seq_len, batch_size)`; `seq_len > max_position_embeddings` is `HFConfigError` and a mismatched `input_ids` shape is `etl.ShapeError` telling you to build another length rather than reshape.
 - **The llama family is bias-free**: any `*.bias` key raises `HFUnsupportedError` (v1 covers `attention_bias=False`/`mlp_bias=False` models only).
+- **Qwen3 is full-attention only**: `model_type: "qwen3"` is supported (Llama architecture + per-head QK-Norm, exactly `Qwen/Qwen3-0.6B`), but any sliding-window request raises `HFUnsupportedError` from the config guard — a truthy `use_sliding_window`, a `layer_types` entry other than `"full_attention"`, or a positive `sliding_window` without `use_sliding_window: false`. QK-Norm is declared by the config (`qk_norm`, derived from `model_type`) and never inferred from checkpoint keys.
 - **Per-family key allowlists**: llama ignores `model.rotary_emb.inv_freq`; GPT-2 ignores `h.{i}.attn.bias` / `h.{i}.attn.masked_bias`. Everything else must map onto the canonical scheme or it is an `HFWeightError` listing the offending keys.
 - **`rope_scaling` is unsupported** (`HFUnsupportedError` unless `None`/`{}`/`[]`).
 - **No KV cache, no incremental decode, no sampling, no training**: every call re-runs the whole graph over `seq_len` tokens.

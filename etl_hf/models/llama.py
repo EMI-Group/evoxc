@@ -1,11 +1,14 @@
-"""The Llama / Mistral (and Qwen2) family: HF checkpoint → ONE ``etl`` graph.
+"""The Llama / Mistral / Qwen2 / Qwen3 family: HF checkpoint → ONE ``etl`` graph.
 
-A HuggingFace ``LlamaForCausalLM`` / ``MistralForCausalLM`` checkpoint is a
-pre-norm transformer with **RMSNorm**, **RoPE**, **grouped-query attention** and a
-**SwiGLU** MLP. This module turns such a checkpoint into a single static-shape
-``@etl.defn`` forward pass — ``params, input_ids -> logits`` — plus a canonical
-weight map, a :class:`etl.TensorSpec` tree for those weights, and an
-*independent* pure-numpy reference forward used as the parity oracle.
+A HuggingFace ``LlamaForCausalLM`` / ``MistralForCausalLM`` / ``Qwen2`` /
+``Qwen3`` checkpoint is a pre-norm transformer with **RMSNorm**, **RoPE**,
+**grouped-query attention** and a **SwiGLU** MLP. Qwen3 is the same
+architecture plus a **per-head QK-Norm** (an extra RMSNorm of size ``head_dim``
+on the queries and keys after the head split and before RoPE), declared by the
+config's static ``qk_norm`` field. This module turns such a checkpoint into a
+single static-shape ``@etl.defn`` forward pass — ``params, input_ids -> logits``
+— plus a canonical weight map, a :class:`etl.TensorSpec` tree for those weights,
+and an *independent* pure-numpy reference forward used as the parity oracle.
 
 Everything here is assembly of already-public pieces:
 
@@ -61,8 +64,9 @@ __all__ = [
 #: ``etl_hf`` family key implemented by this module.
 FAMILY = "llama"
 
-#: HF ``model_type`` values this architecture covers (all Llama-shaped).
-MODEL_TYPES = ("llama", "mistral", "qwen2")
+#: HF ``model_type`` values this architecture covers (all Llama-shaped; Qwen3
+#: adds the QK-Norm declared by ``ModelConfig.qk_norm``).
+MODEL_TYPES = ("llama", "mistral", "qwen2", "qwen3")
 
 #: Checkpoint keys that are deliberately ignored rather than reported as
 #: unexpected: older HF checkpoints persist the RoPE inverse frequencies as a
@@ -71,7 +75,10 @@ _IGNORED_KEYS: frozenset[str] = frozenset({"model.rotary_emb.inv_freq"})
 
 #: Per-layer canonical suffix → ``(HF sub-key, transpose?)``. Linears are
 #: transposed (HF ``(out, in)`` → canonical ``(in, out)``); norm scales are 1-D
-#: and taken verbatim.
+#: and taken verbatim. This is the **base** record set of the Llama architecture;
+#: :func:`_layer_records` appends the Qwen3 QK-Norm records when the config
+#: declares them, so :func:`_expected_shapes` and
+#: :func:`canonicalize_weights` always iterate the same ordered list.
 _LAYER_RECORDS: tuple[tuple[str, str, bool], ...] = (
     ("attn_norm.weight", "input_layernorm.weight", False),
     ("attn.q.weight", "self_attn.q_proj.weight", True),
@@ -83,6 +90,36 @@ _LAYER_RECORDS: tuple[tuple[str, str, bool], ...] = (
     ("mlp.up.weight", "mlp.up_proj.weight", True),
     ("mlp.down.weight", "mlp.down_proj.weight", True),
 )
+
+#: The extra per-layer records a Qwen3 (``cfg.qk_norm``) checkpoint carries: one
+#: RMSNorm scale per attention head, applied to q and k after the head split and
+#: before RoPE. ``head_dim``-sized (NOT ``hidden_size``), taken verbatim (1-D).
+_QK_NORM_RECORDS: tuple[tuple[str, str, bool], ...] = (
+    ("attn.q_norm.weight", "self_attn.q_norm.weight", False),
+    ("attn.k_norm.weight", "self_attn.k_norm.weight", False),
+)
+
+
+def _layer_records(cfg: ModelConfig) -> tuple[tuple[str, str, bool], ...]:
+    """The ordered per-layer ``(canonical suffix, HF sub-key, transpose?)`` list.
+
+    The single source of per-layer key ordering: :func:`_expected_shapes`,
+    :func:`canonicalize_weights` and :func:`reference` all iterate this list, so
+    the specs tree, the loaded weights and the numpy oracle can never drift.
+
+    ``cfg.qk_norm`` False (the default for llama/mistral/qwen2) returns the
+    ``_LAYER_RECORDS`` tuple unchanged — same keys, same order. True (Qwen3)
+    inserts the two QK-Norm records after the attention linears.
+
+    Args:
+        cfg: the ``family == "llama"`` config.
+
+    Returns:
+        tuple: ``(canonical suffix, HF sub-key, transpose?)`` in canonical order.
+    """
+    if not cfg.qk_norm:
+        return _LAYER_RECORDS
+    return _LAYER_RECORDS[:5] + _QK_NORM_RECORDS + _LAYER_RECORDS[5:]
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +185,9 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
     Note:
         ``attn.q/k/v/o`` shapes derive from ``cfg.head_dim`` (which may differ
         from ``hidden_size // num_attention_heads`` when HF sets it explicitly),
-        never from an assumed ``hidden_size // num_attention_heads``.
+        never from an assumed ``hidden_size // num_attention_heads``. The Qwen3
+        QK-Norm scales (present only when ``cfg.qk_norm``) are
+        ``(cfg.head_dim,)`` — per head, NOT ``(hidden_size,)``.
 
     Note:
         A ``tie_word_embeddings=True`` config has **no** ``lm_head.weight`` key:
@@ -169,20 +208,30 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
     inter = cfg.intermediate_size
     vocab = cfg.vocab_size
 
+    # Per-layer shapes keyed by the same canonical suffixes _layer_records yields,
+    # so the record order (and the QK-Norm inclusion) is decided in exactly one
+    # place.
+    layer_shapes: dict[str, tuple[int, ...]] = {
+        "attn_norm.weight": (hidden,),
+        "attn.q.weight": (hidden, q_dim),
+        "attn.k.weight": (hidden, kv_dim),
+        "attn.v.weight": (hidden, kv_dim),
+        "attn.o.weight": (q_dim, hidden),
+        "attn.q_norm.weight": (cfg.head_dim,),
+        "attn.k_norm.weight": (cfg.head_dim,),
+        "mlp_norm.weight": (hidden,),
+        "mlp.gate.weight": (hidden, inter),
+        "mlp.up.weight": (hidden, inter),
+        "mlp.down.weight": (inter, hidden),
+    }
+
     shapes: dict[str, tuple[int, ...]] = {
         "embed.weight": (vocab, hidden),
     }
     for index in range(cfg.num_hidden_layers):
         prefix = f"layers.{index}."
-        shapes[f"{prefix}attn_norm.weight"] = (hidden,)
-        shapes[f"{prefix}attn.q.weight"] = (hidden, q_dim)
-        shapes[f"{prefix}attn.k.weight"] = (hidden, kv_dim)
-        shapes[f"{prefix}attn.v.weight"] = (hidden, kv_dim)
-        shapes[f"{prefix}attn.o.weight"] = (q_dim, hidden)
-        shapes[f"{prefix}mlp_norm.weight"] = (hidden,)
-        shapes[f"{prefix}mlp.gate.weight"] = (hidden, inter)
-        shapes[f"{prefix}mlp.up.weight"] = (hidden, inter)
-        shapes[f"{prefix}mlp.down.weight"] = (inter, hidden)
+        for suffix, _hf_suffix, _transpose in _layer_records(cfg):
+            shapes[f"{prefix}{suffix}"] = layer_shapes[suffix]
     shapes["final_norm.weight"] = (hidden,)
     if not cfg.tie_word_embeddings:
         shapes["lm_head.weight"] = (hidden, vocab)
@@ -221,13 +270,17 @@ def _as_f32(key: str, value: object) -> np.ndarray:
     return np.ascontiguousarray(array.astype(np.float32))
 
 
-def _missing_key_error(hf_key: str, canonical: str, available: list[str]) -> HFWeightError:
+def _missing_key_error(
+    hf_key: str, canonical: str, available: list[str], *, qk_norm: bool = False
+) -> HFWeightError:
     """Build the "required key absent" error, with near-miss suggestions.
 
     Args:
         hf_key: the absent checkpoint key.
         canonical: the canonical key it would have produced.
         available: every key present in the checkpoint.
+        qk_norm: whether the config declares Qwen3 QK-Norm (adds the QK-Norm
+            explanation to the message).
 
     Returns:
         HFWeightError: the error to raise (naming key, canonical target, and a
@@ -235,6 +288,14 @@ def _missing_key_error(hf_key: str, canonical: str, available: list[str]) -> HFW
     """
     near = difflib.get_close_matches(hf_key, available, n=3, cutoff=0.6)
     hint = f"; nearest available keys: {near}" if near else ""
+    if qk_norm and ("q_norm" in hf_key or "k_norm" in hf_key):
+        return HFWeightError(
+            f"missing required checkpoint key {hf_key!r} (needed for canonical "
+            f"weight {canonical!r}){hint}. The qwen3 config declares QK-Norm "
+            f"(cfg.qk_norm=True), so 'self_attn.q_norm.weight' and "
+            f"'self_attn.k_norm.weight' are required — this checkpoint looks like a "
+            f"plain Llama/Mistral/Qwen2 state dict, not a Qwen3 one."
+        )
     return HFWeightError(
         f"missing required checkpoint key {hf_key!r} (needed for canonical "
         f"weight {canonical!r}){hint}. etl_hf models.llama expects a Llama/Mistral "
@@ -250,11 +311,11 @@ def _missing_key_error(hf_key: str, canonical: str, available: list[str]) -> HFW
 def canonicalize_weights(
     cfg: ModelConfig, raw: Mapping[str, np.ndarray]
 ) -> dict[str, np.ndarray]:
-    """Map an HF Llama/Mistral state dict onto the canonical flat key scheme.
+    """Map an HF Llama/Mistral/Qwen2/Qwen3 state dict onto the canonical flat keys.
 
     Canonical keys (``params`` is a FLAT ``dict[str, np.float32 ndarray]``; every
     linear weight is **``(in_features, out_features)``**, i.e. HF's ``(out, in)``
-    transposed at load, and every norm scale is ``(hidden_size,)``)::
+    transposed at load, and every norm scale is ``(hidden_size,)`` unless noted)::
 
         embed.weight                       (vocab_size, hidden_size)      <- model.embed_tokens.weight (verbatim)
         layers.{i}.attn_norm.weight        (hidden_size,)                 <- model.layers.{i}.input_layernorm.weight
@@ -262,12 +323,21 @@ def canonicalize_weights(
         layers.{i}.attn.k.weight           (hidden_size, n_kv_heads*head_dim)  <- ...k_proj.weight            .T
         layers.{i}.attn.v.weight           (hidden_size, n_kv_heads*head_dim)  <- ...v_proj.weight            .T
         layers.{i}.attn.o.weight           (n_heads*head_dim, hidden_size)     <- ...o_proj.weight            .T
+        layers.{i}.attn.q_norm.weight      (head_dim,)  [QK-Norm only]     <- ...self_attn.q_norm.weight  (verbatim)
+        layers.{i}.attn.k_norm.weight      (head_dim,)  [QK-Norm only]     <- ...self_attn.k_norm.weight  (verbatim)
         layers.{i}.mlp_norm.weight         (hidden_size,)                 <- ...post_attention_layernorm.weight
         layers.{i}.mlp.gate.weight         (hidden_size, intermediate)    <- ...mlp.gate_proj.weight     .T
         layers.{i}.mlp.up.weight           (hidden_size, intermediate)    <- ...mlp.up_proj.weight       .T
         layers.{i}.mlp.down.weight         (intermediate, hidden_size)    <- ...mlp.down_proj.weight     .T
         final_norm.weight                  (hidden_size,)                 <- model.norm.weight
         lm_head.weight                     (hidden_size, vocab_size)      <- lm_head.weight .T (UNTIED only)
+
+    QK-Norm: a ``cfg.qk_norm`` config (Qwen3) additionally requires the
+    per-head ``self_attn.q_norm.weight`` / ``k_norm.weight`` scales, mapped
+    verbatim (1-D, never transposed) onto ``attn.q_norm.weight`` /
+    ``attn.k_norm.weight``; they are ``(head_dim,)``, not ``(hidden_size,)``.
+    A config without QK-Norm rejects leftover ``q_norm``/``k_norm`` keys rather
+    than dropping them.
 
     Weight tying: with ``tie_word_embeddings`` the output head IS
     ``embed.weight``, so a tied tree has **no** ``lm_head.weight`` entry (one key
@@ -325,7 +395,7 @@ def canonicalize_weights(
     def take(hf_key: str, canonical: str, transpose: bool) -> np.ndarray:
         """Fetch + convert + shape-check one required key (records consumption)."""
         if hf_key not in raw:
-            raise _missing_key_error(hf_key, canonical, keys)
+            raise _missing_key_error(hf_key, canonical, keys, qk_norm=cfg.qk_norm)
         array = _as_f32(hf_key, raw[hf_key])
         if transpose:
             array = np.ascontiguousarray(np.transpose(array))
@@ -351,7 +421,7 @@ def canonicalize_weights(
 
     params["embed.weight"] = take("model.embed_tokens.weight", "embed.weight", False)
     for index in range(cfg.num_hidden_layers):
-        for suffix, hf_suffix, transpose in _LAYER_RECORDS:
+        for suffix, hf_suffix, transpose in _layer_records(cfg):
             canonical = f"layers.{index}.{suffix}"
             params[canonical] = take(f"model.layers.{index}.{hf_suffix}", canonical, transpose)
     params["final_norm.weight"] = take("model.norm.weight", "final_norm.weight", False)
@@ -394,11 +464,21 @@ def canonicalize_weights(
 
     unexpected = sorted(set(keys) - consumed - _IGNORED_KEYS)
     if unexpected:
+        qk_hint = ""
+        if not cfg.qk_norm:
+            qk_leftovers = [key for key in unexpected if "q_norm" in key or "k_norm" in key]
+            if qk_leftovers:
+                qk_hint = (
+                    f" — {qk_leftovers} look like QK-Norm weights: only the 'qwen3' "
+                    f"model_type declares QK-Norm (cfg.qk_norm=True), and this config's "
+                    f"model_type is {cfg.model_type!r} (qk_norm=False); use a Qwen3 "
+                    f"config for a QK-Norm checkpoint, or drop those tensors"
+                )
         raise HFWeightError(
             f"unsupported checkpoint keys: {unexpected} — every key must map onto "
             f"the canonical scheme (unrecognised keys are an error so a checkpoint "
             f"variant can never be silently mis-mapped); ignored by design: "
-            f"{sorted(_IGNORED_KEYS)}"
+            f"{sorted(_IGNORED_KEYS)}{qk_hint}"
         )
     return params
 
@@ -447,7 +527,7 @@ def graph(
     *,
     pack_plan: "PackPlan | None" = None,
 ) -> Callable[..., object]:
-    """Build the ``@etl.defn`` Llama/Mistral forward pass for one static shape.
+    """Build the ``@etl.defn`` Llama/Mistral/Qwen2/Qwen3 forward for one static shape.
 
     The forward pass is HF's ``LlamaModel``: token-embedding gather →
     ``num_hidden_layers`` of [RMSNorm → RoPE'd grouped-query causal attention →
@@ -455,13 +535,23 @@ def graph(
     Concretely, per block::
 
         h  = rms_norm(x, attn_norm)                       # RMSNorm, no mean-centering
-        q  = apply_rope(split_heads(linear(h, attn.q), n_q),  cos, sin)
-        k  = apply_rope(split_heads(linear(h, attn.k), n_kv), cos, sin)
+        q  = split_heads(linear(h, attn.q), n_q)
+        k  = split_heads(linear(h, attn.k), n_kv)
+        q  = rms_norm(q, attn.q_norm)                     # Qwen3 QK-Norm only
+        k  = rms_norm(k, attn.k_norm)                     # Qwen3 QK-Norm only
+        q  = apply_rope(q, cos, sin)
+        k  = apply_rope(k, cos, sin)
         v  = split_heads(linear(h, attn.v), n_kv)
         k, v = repeat_kv(k, rep), repeat_kv(v, rep)       # GQA/MQA (no-op when rep == 1)
         x += linear(attention(q, k, v, causal_mask, head_dim ** -0.5), attn.o)
         h  = rms_norm(x, mlp_norm)
         x += gated_mlp(h, mlp.gate, mlp.up, mlp.down, act)  # act(gate) * up, then down
+
+    **Qwen3 QK-Norm** (``cfg.qk_norm``, on for ``model_type == "qwen3"``): the
+    per-head RMSNorm is applied to ``q`` and ``k`` **after** ``split_heads`` and
+    **before** ``apply_rope``, over the last axis ``head_dim`` and with the
+    ``(head_dim,)`` scale — never over ``hidden_size``, and never after RoPE.
+    The non-QK-Norm path is byte-identical to the pre-Qwen3 graph.
 
     Everything is static: ``seq_len``/``batch_size`` are baked in, the causal mask
     and the RoPE tables are computed *in-graph* (no ``etl.constant`` payload, no
@@ -530,6 +620,7 @@ def graph(
     scale = head_dim**-0.5
     act = ops.resolve_activation(cfg.hidden_act)
     tied = cfg.tie_word_embeddings
+    qk_norm = cfg.qk_norm
     b, s = batch_size, seq_len
 
     @etl.defn
@@ -550,6 +641,11 @@ def graph(
             q = ops.split_heads(_common.linear(h, params[prefix + "attn.q.weight"]), n_heads)
             k = ops.split_heads(_common.linear(h, params[prefix + "attn.k.weight"]), n_kv_heads)
             v = ops.split_heads(_common.linear(h, params[prefix + "attn.v.weight"]), n_kv_heads)
+            if qk_norm:
+                # Qwen3 QK-Norm: per-head RMSNorm over head_dim, applied to q/k
+                # AFTER the head split and BEFORE RoPE (HF Qwen3Attention order).
+                q = ops.rms_norm(q, params[prefix + "attn.q_norm.weight"], eps)
+                k = ops.rms_norm(k, params[prefix + "attn.k_norm.weight"], eps)
             q = ops.apply_rope(q, cos, sin)
             k = ops.apply_rope(k, cos, sin)
             k = ops.repeat_kv(k, n_rep)
@@ -615,7 +711,7 @@ def _reference_param(
 def reference(
     cfg: ModelConfig, params: Mapping[str, np.ndarray], input_ids: np.ndarray
 ) -> np.ndarray:
-    """Independent pure-numpy Llama/Mistral forward — the parity oracle.
+    """Independent pure-numpy Llama/Mistral/Qwen2/Qwen3 forward — the parity oracle.
 
     Composed **only** from :mod:`etl_hf.reference` primitives (never ``etl``), in
     a deliberately different formulation from the graph: per-head attention
@@ -624,6 +720,10 @@ def reference(
     out_features)``** orientation (``x @ W``). Both the causal mask
     (:func:`etl_hf.reference.additive_causal_mask`, ``0`` on and below the
     diagonal) and the RoPE layout (HF ``rotate_half``) are the HF conventions.
+
+    Qwen3 QK-Norm (``cfg.qk_norm``): the ``(head_dim,)`` q/k scales are applied
+    through :func:`etl_hf.reference.rms_norm` to the ``(b, n, s, head_dim)``
+    tensors — after the head split and before RoPE, matching the graph.
 
     Args:
         cfg: the ``family == "llama"`` config.
@@ -704,6 +804,11 @@ def reference(
         q = heads(h @ weights[prefix + "attn.q.weight"], n_heads)
         k = heads(h @ weights[prefix + "attn.k.weight"], n_kv_heads)
         v = heads(h @ weights[prefix + "attn.v.weight"], n_kv_heads)
+        if cfg.qk_norm:
+            # Qwen3 QK-Norm: per-head RMSNorm over head_dim, after the head
+            # split and before RoPE — exactly the graph's order.
+            q = _numpy_ref.rms_norm(q, weights[prefix + "attn.q_norm.weight"], eps)
+            k = _numpy_ref.rms_norm(k, weights[prefix + "attn.k_norm.weight"], eps)
         q = _numpy_ref.apply_rope(q, cos, sin)
         k = _numpy_ref.apply_rope(k, cos, sin)
         # attention() repeats the KV heads itself (heads_q // heads_kv).
