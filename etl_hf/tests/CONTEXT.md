@@ -8,26 +8,26 @@ Everything is offline and numpy-only by default (no torch, no compiler), so the 
 
 ## Counts (default env: torch/transformers and iree absent, checkpoint + golden caches present)
 
-**675 collected in 15 modules — 647 passed, 28 skipped**; with the `iree` extra **666 passed, 9 skipped**; with the extra and `ETL_HF_BIG=1` **672 passed, 3 skipped** (torch absent only — the ROCm device-resident and real-size legs really run on this GPU host).
-Skip groups: torch/transformers absent (3), `iree` absent (19), `ETL_HF_BIG` unset (6).
+**725 collected in 15 modules — 695 passed, 30 skipped, 0 failed** in the default env (`uv run --with pytest python -m pytest etl_hf/tests`); the `--extra iree` and `--extra iree` + `ETL_HF_BIG=1` legs run with strictly fewer skips (the iree / real-size / torch groups actually execute on this host).
+Skip groups (default env): torch/transformers absent (4), `iree` absent (22), `ETL_HF_BIG` unset (4).
 
 | Module | Collected | Area |
 |---|---|---|
-| `test_build.py` | 94 | `pipeline` + `program` staging |
-| `test_config.py` | 70 | `ModelConfig` parsing |
-| `test_export.py` | 11 | whole-graph StableHLO export |
-| `test_families.py` | 33 | family registry |
+| `test_build.py` | 96 | `pipeline` + `program` staging |
+| `test_config.py` | 99 | `ModelConfig` parsing |
+| `test_export.py` | 15 | whole-graph StableHLO export |
+| `test_families.py` | 35 | family registry |
 | `test_gpt2.py` | 67 | GPT-2 parity/canonicalisation |
 | `test_iree_llvm_cpu.py` | 7 | iree/llvm-cpu parity |
 | `test_iree_rocm.py` | 11 | iree/ROCm device-resident |
-| `test_llama.py` | 43 | Llama/Mistral parity/canonicalisation |
+| `test_llama.py` | 54 | Llama/Mistral parity/canonicalisation |
 | `test_ops.py` | 83 | `ops` graph idioms |
 | `test_pack.py` | 38 | packed weights |
 | `test_public_api.py` | 88 | public surface + functional invariants |
-| `test_real_checkpoints.py` | 10 | real checkpoints end-to-end |
+| `test_real_checkpoints.py` | 11 | real checkpoints end-to-end |
 | `test_reference.py` | 59 | the numpy oracle |
+| `test_torch_oracle.py` | 12 | optional torch oracle |
 | `test_weights.py` | 50 | checkpoint readers |
-| `test_torch_oracle.py` | 11 | optional torch oracle |
 
 ## What each module pins
 
