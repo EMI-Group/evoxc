@@ -1767,6 +1767,11 @@ class IreeExecutable(CompilerExecutable):
        path never touches host memory either way.
     5. Validate output count + dtype against the signature output specs.
 
+    ``run`` already blocks on the device queue, so ``synchronize()`` is a
+    documented no-op — it exists so every compiler executable exposes the
+    same call shape (the xla adapter's device-resident run is asynchronous
+    and needs it).
+
     ``save`` / ``load`` are inherited from ``CompilerExecutable``: ``save``
     persists the underlying ``CompiledArtifact`` (device handles are NEVER
     serialized — reconstruction is explicit); ``load`` reads the artifact,
@@ -1975,6 +1980,22 @@ class IreeExecutable(CompilerExecutable):
             for i, result in enumerate(results):
                 outputs[i] = core.Tensor(IreeDevicePayload(result, core_device))
         return outputs
+
+    # --------------------------------------------------------- synchronize
+    def synchronize(self) -> None:
+        """Explicit no-op: ``run`` already blocks on the device queue.
+
+        IREE's ``run`` is synchronous — the input buffers are handed to the
+        invoke and the outputs are its results, so nothing is outstanding by
+        the time ``run`` returns. This method exists purely so every compiler
+        executable exposes the same call shape (``exe.synchronize()``) and
+        callers never need to know which backend they hold; it adds no
+        per-call sync, flag or FFI call. The xla adapter's device-resident
+        run IS asynchronous and needs it.
+
+        Returns ``None``; calling it repeatedly is harmless.
+        """
+        return None
 
     # ------------------------------------------------------------- internals
 
