@@ -3,7 +3,7 @@
 Companion to `./CONTEXT.md` in the same directory.
 Everything here is REFERENCE material — measured numbers, machinery detail, probe narratives and host recipes — moved out of `CONTEXT.md` so that file stays readable in full.
 Nothing here is a second contract: the binding rules, per-adapter option surfaces, capability matrices, constraints and the numbered Known Issues live in `CONTEXT.md`.
-Known-Issue sections here use the SAME numbers as `CONTEXT.md` (`## Known Issue 3`, `## Known Issue 9`, `## Known Issue 10`, `## Known Issue 13`) so cross-references stay stable.
+Known-Issue sections here use the SAME numbers as `CONTEXT.md` (`## Known Issue 3`, `## Known Issue 9`, `## Known Issue 10`, `## Known Issue 11`, `## Known Issue 13`, `## Known Issue 14`) so cross-references stay stable.
 
 ## IREE — host→device staging tiers (byte-level machinery)
 
@@ -142,6 +142,13 @@ What works:
 Per-version verdicts: 3.9.0 compiles the NSGA2/MOEAD-class tell graphs 12/12 clean with full numpy parity (user-pinnable for MO compile work) but its cuda runtime crashes ~9/10 on SO step graphs (Known Issue 11) and it still SIGSEGVs on NSGA3-class graphs. 3.12.0rc fixes the compiler but its runtime is unusable for these graphs. Cross-version loading is not a workaround (the bytecode version is rejected).
 Conclusion: MO/while-heavy graphs are upstream-blocked on 3.10/3.11 and out of scope — use the numpy backend or the xla route; the `iree`/`compilers` extras pin `>=3.11.0,<3.12` for both compiler and runtime, which must match.
 
+## Known Issue 11 — iree 3.9.0 cuda runtime SIGSEGV on SO step graphs (historical)
+
+Measurement record only — superseded by the 3.11.0 runtime behaviour (Known Issue 8).
+- Measured with `iree-base-runtime` 3.9.0, driver 535.247.01, RTX A6000.
+- The evox SO harness crashes ~9/10 runs at the FIRST `etl.run` on cuda, at any scale; the fault is an error-path use-after-free/race in `iree._runtime_libs._runtime*.so`.
+- Host fact from the same box: GPU 7 reports 2689 uncorrected ECC errors (`CUDA_ERROR_ECC_UNCORRECTABLE` at HAL-device creation) — exclude that device from probes.
+
 ## Known Issue 13 — rank-0-result reductions on IREE GPU
 
 Diagnosis (MI300X/gfx942, iree 3.11, a 10000×100 evox SO-shaped step `@etl.defn`):
@@ -173,6 +180,22 @@ Compiler-flag sweep — no substitute exists. At both the isolated-reduce MLIR l
 
 RNG is not implicated: on rocm the inline SplitMix64 i64 expansion (`random_uniform` 1M f32, 0.0769 ms) is 1.9× FASTER than the native `stablehlo.rng_bit_generator` THREE_FRY path (0.1433 ms), so i64 emulation is not a bottleneck — the cuda-era "threefry wins at small sizes" result does not carry over to rocm bulk draws.
 Host-side per-step overhead is small: the real DE 10000×100 loop measures 2.30 ms/step with `full_fit_history` on and 2.15 ms with it off (the ~0.15 ms delta is the per-step `to(cpu).numpy()` sync), vs 1.94 ms for the bare module ⇒ ~0.2–0.4 ms of wrapper/invoke.
+
+## Known Issue 14 — measured host cost ladder
+
+Conditions: MI300X VF / rocm, 12-in/12-out evox-SO-shaped step, best-of-N≥200; these pre-plan-driven numbers are followed by the plan-driven restatement at the end of this section.
+- `etl.run` end-to-end 150 µs iree / 140 µs xla, of which pipeline flatten+validate+unflatten ≈16–31 µs (~20 %) and `backend_executable.run` 124 µs iree / 111 µs xla.
+- Bare-metal bounds: iree prepacked `VmVariantList` 85 µs, iree `entry(*darrs)` 96 µs (ArgumentPacker + DeviceArray extraction), xla raw `PJRT_LoadedExecutable_Execute`+destroy 87 µs (leaky 78 µs) — HOST DISPATCH only, because that call returns after ENQUEUE (Known Issue 17).
+- xla `_XlaDeviceRunGroup` + 12 `XlaDevicePayload`s adds ≈14 µs, and payload release is FREE (weakref.finalize, 0.1 µs / 1.0 µs iree), so the addressable gap is ≈54–65 µs/call.
+- Shape of the cost: per-IO leaf ≈2–3.5 µs (pipeline and adapter both) and per-op ≈0 (±1 µs across 1→16 ops), with per-output overhead +12.3 µs iree / +7.2 µs xla — cost tracks leaf count, never graph size, and pytree nesting is irrelevant (a flat 12-tuple leaf set costs the same as the evox 5-child `WorkflowState`).
+- The PJRT execute floor is host dispatch, not device latency: four back-to-back leaky executes cost exactly 4× a single execute and exec-only ≈ exec+destroy − 2 µs/buffer, but `PJRT_LoadedExecutable_Execute` returns after ENQUEUE (Known Issue 17), so those figures measure DISPATCH only.
+- The device-resident path requests `PJRT_LoadedExecutable_Execute_Args.device_complete_events` (a 1-element slot in `xla_util._execute_scaffolding`) and tracks the handles for the explicit `XlaExecutable.synchronize()`; the host-staging CPU path still awaits its `PJRT_Buffer_ToHostBuffer` event.
+- Nothing inside `run` performs a D2H copy or a completed-work wait on either adapter (outputs stay device-resident payloads; `.to(cpu)`/`.numpy()` is the caller's explicit readback).
+
+Plan-driven restatement (current run paths: input contract, buffer build and output wrap folded into one pass each):
+- The same es-shaped step measures `etl.run` 135.7 µs iree / 127.8 µs xla and `backend_executable.run` 109.7 µs iree / 95.4 µs xla.
+- The per-output composition costs ≈0.5 µs iree (payload + `core.Tensor`, from ≈1.2) and ≈0.4 µs xla.
+- So the residual adapter-side cost is the invoke floor plus ≈2–3 µs per I/O leaf, and the whole remainder is attributed to the invoke, never to re-derived per-leaf work.
 
 ## Why iree's native THREE_FRY is the default (`rng_bit_generator` capability)
 
