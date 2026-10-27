@@ -351,7 +351,7 @@ Committed results, raw records and the probe scripts live in [`etl/bench/`](etl/
 
 ## Built on etl: `etl_hf`
 
-[`etl_hf`](etl_hf/CONTEXT.md) loads a real HuggingFace checkpoint and runs the **whole model forward as ONE etl graph** — a 124M-parameter transformer goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a separate top-level package, used from this checkout, **not part of the `etl` distribution**; `import etl` never imports it, `torch` or `transformers`.
+[`etl_hf`](etl_hf/CONTEXT.md) loads a real HuggingFace checkpoint and runs the **whole model forward as ONE etl graph** — a 124M-parameter GPT-2, or an 8B-parameter Qwen3, goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a separate top-level package, used from this checkout, **not part of the `etl` distribution**; `import etl` never imports it, `torch` or `transformers`.
 
 The API follows etl's value model in three layers that never blur: checkpoint IO produces **data** (`load_config` → frozen `ModelConfig`, `load_params` → `dict[str, np.ndarray]`, `load_hf` → a plain `LoadedModel` record); `forward_fn` is the pure **compute function** `(params, input_ids) -> logits` that captures no weights — every parameter is an ordinary graph input, never `etl.constant`; and `build`/`run` are the **staging** stages, `build` being `trace → lower → compile → load` via `build_cached`.
 
@@ -372,9 +372,9 @@ host = etl_hf.predict(loaded, ids, backend="iree")    # host-facing shorthand ->
 oracle = etl_hf.reference_logits(cfg, params, ids)    # independent pure-numpy oracle
 ```
 
-- **Families:** `llama` (also `mistral`/`qwen2` — RMSNorm, RoPE, GQA, SwiGLU) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
-- **Parity** against real `torch`/`transformers` logits on five checkpoints: ≤4e-4 max-abs on the 124M models' fp32 legs (≈1e-6–3e-6 relative) — fp32 accumulation order only.
-- **Device-resident on ROCm:** place weights and ids once (`place_params`/`place_ids`) and feed the device outputs back in; re-placing weights per call measured 2.4×–11.7× slower.
+- **Families:** `llama` (also `mistral`/`qwen2`/`qwen3` — RMSNorm, RoPE, GQA, SwiGLU; Qwen3 adds per-head QK-Norm) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
+- **Parity** against real `torch`/`transformers` logits on eight checkpoints (`tiny_llama`, `tiny_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`, `qwen3_0_6b`, `qwen3_1_7b`, `qwen3_8b`): ≤2e-4 max-abs / ≈5e-6 relative on the largest fp32 legs — fp32 accumulation order only.
+- **Device-resident on ROCm, and measured against PyTorch honestly:** weights and ids are placed once (`place_params`/`place_ids`) and the device outputs feed back in (re-placing per call measured 2.4×–11.7× slower); every timed device call is `run` + the explicit `Executable.synchronize()` (the xla device-resident `run` only enqueues), so the head-to-head against eager **and** compiled `torch-rocm` is apples-to-apples — `xla`/rocm wins all 12 GPU cells vs eager torch (1.34×–8.30×, 5–38× vs torch-cpu) at `seq_len` 32/128 up to Qwen3-8B, with the true-fp32 leg still ahead in 11/12; `iree`/rocm wins 6/12. Numbers: [`bench_logs/hf_bench_results.md`](bench_logs/hf_bench_results.md).
 - **Opt-in weight packing** (`pack_weights=True`, `pack_params`) collapses the weight tree into ~4 graph inputs — bit-identical, and it works around IREE's llvm-cpu SIGSEGV above ~161 distinct inputs (an unpacked 124M model has 196).
 - **Deferred by design:** exact-`erf` GELU configs are numpy-only (`erf` is a StableHLO v1 deferral); dynamic shapes, kv-cache/incremental decode and generation loops are out of scope — this is the forward graph, not a serving stack.
 
