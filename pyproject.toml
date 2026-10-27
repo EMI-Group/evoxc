@@ -84,7 +84,7 @@ hf = ["torch>=2.0", "transformers>=4.40"]
 # separate top-level HuggingFace package in this checkout) must never be
 # installed as part of `evoxc`, and these setuptools globs cannot match it:
 # `evoxc.*` requires the literal `evoxc.` prefix, so `evoxc_hf` / `evoxc_hf.*` are
-# unmatched (and `include` no longer starts with the greedy `evoxc*` pattern).
+# unmatched (the `include` list deliberately uses no greedy `evoxc*` pattern).
 include = ["evoxc", "evoxc.*"]
 # Tests are colocated with their packages, never shipped.
 exclude = ["evoxc_hf.tests", "evoxc_hf.tests.*"]
