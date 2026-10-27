@@ -1,6 +1,6 @@
 """evoxc — EvoX Compiler.
 
-A minimal, explicit, compiler-neutral tensor graph runtime.
+A minimal, explicit, compiler-neutral tensor graph compiler and runtime.
 
 The public surface is the contract documented in this package's CONTEXT.md
 (read it). Everything here is an explicit staging step or a transparent
