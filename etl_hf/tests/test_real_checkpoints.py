@@ -34,8 +34,9 @@ Guards, in order:
   into ``pytest.skip`` — the module is green (skipped) on a machine with no
   network and never hangs.
 * **Real-size checkpoints are opt-in** behind ``ETL_HF_BIG=1``
-  (``distilgpt2`` ≈ 0.34 GB of weights, ``gpt2`` ≈ 0.52 GB), and the 124M GPT-2
-  is additionally skipped when the host does not have the memory headroom.
+  (``distilgpt2`` ≈ 0.34 GB of weights, ``gpt2`` ≈ 0.52 GB, ``Qwen/Qwen3-0.6B``
+  ≈ 1.5 GB of bf16 weights), and the 124M GPT-2 and Qwen3-0.6B cases are
+  additionally skipped when the host does not have the memory headroom.
 * **No torch / transformers / iree in the default path**: the oracle is plain
   numpy and the default backend for a cpu device is the numpy interpreter.  The
   single exception is the opt-in packed-weights case
@@ -189,14 +190,17 @@ def _total_params(tree) -> int:
 def _llama_param_count(cfg) -> int:
     """Parameter count of the llama family computed independently from the config.
 
-    Per layer: ``q``/``o`` are ``(hidden, hidden)``, ``k``/``v`` are
-    ``(hidden, kv_heads * head_dim)`` (GQA-aware), the two RMSNorm scales are
-    ``hidden`` each, and the SwiGLU MLP is three ``hidden × intermediate``
-    matrices. The token embedding is ``vocab × hidden`` and the final norm
-    ``hidden``; ``lm_head`` is its own ``hidden × vocab`` matrix **only** when the
-    config is untied — a tied head IS ``embed.weight`` (one graph input, used
-    transposed), so it contributes nothing. Used to check the loaded checkpoint
-    against arithmetic rather than against itself.
+    Per layer: ``q``/``o`` are ``(hidden, q_width)`` / ``(q_width, hidden)`` with
+    ``q_width = heads * head_dim`` (which equals ``hidden`` for llama/mistral but
+    is **2048 vs a 1024-wide hidden** for Qwen3-0.6B), ``k``/``v`` are
+    ``(hidden, kv_head_count * head_dim)`` (GQA-aware), the two RMSNorm scales are
+    ``hidden`` each, the SwiGLU MLP is three ``hidden × intermediate`` matrices,
+    and a ``qk_norm`` config (Qwen3) adds two per-head ``head_dim`` scales. The
+    token embedding is ``vocab × hidden`` and the final norm ``hidden``;
+    ``lm_head`` is its own ``hidden × vocab`` matrix **only** when the config is
+    untied — a tied head IS ``embed.weight`` (one graph input, used transposed),
+    so it contributes nothing. Used to check the loaded checkpoint against
+    arithmetic rather than against itself.
 
     Args:
         cfg: an :class:`etl_hf.config.ModelConfig` of the ``llama`` family.
@@ -205,12 +209,14 @@ def _llama_param_count(cfg) -> int:
         int: expected total parameter count of the canonical tree.
     """
     hidden = cfg.hidden_size
+    q_width = cfg.num_attention_heads * cfg.head_dim
     kv_width = cfg.num_key_value_heads * cfg.head_dim
     per_layer = (
-        2 * hidden * hidden  # q + o
+        2 * hidden * q_width  # q + o (head_dim × heads may exceed hidden: Qwen3)
         + 2 * hidden * kv_width  # k + v (GQA)
         + 2 * hidden  # attn_norm + mlp_norm scales
         + 3 * hidden * cfg.intermediate_size  # gate + up + down
+        + (2 * cfg.head_dim if cfg.qk_norm else 0)  # Qwen3 per-head QK-Norm scales
     )
     return (
         cfg.num_hidden_layers * per_layer
@@ -799,6 +805,204 @@ def test_real_gpt2_end_to_end_when_memory_allows():
     )
     # Measured here: max_abs ≈ 2.1e-4 (≈ 1.5e-6 relative to |logits|max ≈ 147).
     assert max_rel <= 1e-5, f"gpt2 relative parity regressed: {max_rel:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# 6b. Qwen/Qwen3-0.6B — the real QK-Norm checkpoint (ETL_HF_BIG=1)
+# ---------------------------------------------------------------------------
+#: The one real checkpoint whose config declares QK-Norm: a ``model_type:
+#: "qwen3"`` config maps to the ``llama`` family with ``qk_norm=True``, so its
+#: canonical tree carries two extra per-head ``(head_dim,)`` RMSNorm scales per
+#: layer, applied to q/k after the head split and before RoPE.
+_QWEN3_SLUG = "qwen3_0_6b"
+
+#: Canonical key count: ``2 + 11·L`` (``embed`` + ``final_norm`` plus, per layer,
+#: the 9 base records and the 2 QK-Norm records) — tied, so no ``lm_head.weight``.
+_QWEN3_LAYERS = 28
+_QWEN3_CANONICAL_KEYS = 2 + 11 * _QWEN3_LAYERS
+
+#: Total canonical parameters of ``Qwen/Qwen3-0.6B`` (596,049,920 = the
+#: checkpoint's 751,632,384 stored elements minus the verified-and-dropped tied
+#: ``lm_head`` copy).  Pinned as a literal so the assertion is arithmetic on the
+#: config, not a restatement of whatever the loader produced.
+_QWEN3_PARAMS = 596_049_920
+
+#: ``Qwen3-0.6B`` at float32 is a ~2.4 GB canonical tree plus the ~1.5 GB raw
+#: checkpoint held while canonicalising, so demand ~6 GB of available host memory
+#: and skip (never fail) on a smaller host.
+_QWEN3_MIN_MEMORY = 6 * 1024**3
+
+
+@pytest.fixture(scope="module")
+def qwen3_loaded() -> LoadedModel:
+    """Load ``Qwen/Qwen3-0.6B`` **once** for the whole module (opt-in, guarded).
+
+    Module-scoped because loading is the expensive part here (a 1.5 GB bf16
+    checkpoint widened to a 2.4 GB float32 canonical tree); the graph is
+    specialised afterwards by the ordinary ``forward_fn``/``build`` staging.
+
+    Skips — never fails — when ``ETL_HF_BIG=1`` is unset, when the checkpoint is
+    not downloadable, or when the host lacks the memory headroom.
+
+    Returns:
+        etl_hf.LoadedModel: the loaded checkpoint (config + canonical host params).
+    """
+    if os.environ.get("ETL_HF_BIG") != "1":
+        pytest.skip(
+            "real-size checkpoints are opt-in: set ETL_HF_BIG=1 "
+            "(Qwen/Qwen3-0.6B downloads ~1.5 GB of bf16 weights)"
+        )
+    available = _available_memory_bytes()
+    if 0 < available < _QWEN3_MIN_MEMORY:
+        pytest.skip(
+            f"Qwen3-0.6B needs ~4 GB RSS (a 2.4 GB fp32 canonical tree plus the raw "
+            f"1.5 GB checkpoint), so {_QWEN3_MIN_MEMORY / 1024**3:.0f} GB of available "
+            f"host memory is demanded; only {available / 1024**2:.0f} MB is available"
+        )
+    return load_hf(hf_download.require_model(_QWEN3_SLUG))
+
+
+@_BIG
+def test_real_qwen3_qk_norm_end_to_end(qwen3_loaded):
+    """Qwen3-0.6B (28 layers, QK-Norm, tied) → 310 keys / 596,049,920 params → 1e-4.
+
+    The end-to-end pin for the Qwen3 branch of the ``llama`` family on a **real**
+    checkpoint: the config's static ``qk_norm`` field, the two extra per-head
+    ``(head_dim,)`` scales per layer, the verified-and-dropped tied head, the
+    whole 596M-parameter forward as ONE graph whose weights are all inputs, and
+    logit parity against the independent numpy oracle.
+    """
+    loaded = qwen3_loaded
+    cfg, params = loaded.config, loaded.params
+
+    # --- the real config values (asserted, never assumed) --------------------
+    assert (loaded.family, cfg.family) == ("llama", "llama")
+    assert cfg.model_type == "qwen3"
+    assert cfg.qk_norm is True, (
+        f"model_type 'qwen3' must declare per-head QK-Norm, got qk_norm={cfg.qk_norm!r}"
+    )
+    assert (cfg.num_hidden_layers, cfg.hidden_size) == (28, 1024)
+    assert (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim) == (16, 8, 128)
+    assert (cfg.intermediate_size, cfg.vocab_size) == (3072, 151936)
+    assert (cfg.max_position_embeddings, cfg.hidden_act) == (40960, "silu")
+    assert (cfg.rope_theta, cfg.layer_norm_eps) == (1_000_000, 1e-06)
+    assert cfg.tie_word_embeddings is True
+    assert hf_ops.activation_is_export_safe(cfg.hidden_act) is True
+
+    # --- the canonical tree: 310 keys, no lm_head, per-head QK-Norm scales ---
+    specs = param_specs(cfg)
+    assert set(params) == set(specs), "params and param_specs must describe one tree"
+    assert len(params) == _QWEN3_CANONICAL_KEYS == 310, (
+        f"Qwen3-0.6B is tagged 2 + 11·L = {_QWEN3_CANONICAL_KEYS} canonical keys; "
+        f"got {len(params)}"
+    )
+    assert "lm_head.weight" not in params and "lm_head.weight" not in specs, (
+        f"tie_word_embeddings=True keeps no separate head, got "
+        f"{sorted(name for name in params if 'lm_head' in name)}"
+    )
+    for index in (0, _QWEN3_LAYERS // 2, _QWEN3_LAYERS - 1):
+        for suffix in ("attn.q_norm.weight", "attn.k_norm.weight"):
+            name = f"layers.{index}.{suffix}"
+            assert name in params and name in specs, f"missing QK-Norm key {name}"
+            assert params[name].shape == (cfg.head_dim,) == (128,), (
+                f"{name} must be a per-head ({cfg.head_dim},) scale, got {params[name].shape}"
+            )
+            assert params[name].dtype == np.dtype(np.float32), (
+                f"{name} must be float32 after widening, got {params[name].dtype}"
+            )
+    # Head width is heads·head_dim (2048) here, NOT hidden (1024) — the reason q/o
+    # are 2× larger than a naive hidden × hidden accounting assumes.
+    assert params["layers.0.attn.q.weight"].shape == (1024, 2048)
+    assert params["layers.0.attn.k.weight"].shape == (1024, 1024)  # 8 kv heads
+    assert params["layers.0.attn.o.weight"].shape == (2048, 1024)
+    assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
+
+    expected = _llama_param_count(cfg)
+    assert expected == _QWEN3_PARAMS, f"Qwen3 param arithmetic changed: {expected:,}"
+    assert _total_params(params) == _total_params(specs) == expected == 596_049_920, (
+        f"parameter accounting: params={_total_params(params):,} "
+        f"specs={_total_params(specs):,} arithmetic={expected:,} "
+        f"[{_describe(loaded)}]"
+    )
+
+    # The tied head the checkpoint ships is a byte-copy of the embedding: read the
+    # raw checkpoint back and verify it before accepting that it was dropped.
+    raw = weights.load_checkpoint(hf_download.require_model(_QWEN3_SLUG))
+    try:
+        assert len(raw) == 311, f"the checkpoint stores 311 tensors, got {len(raw)}"
+        assert "lm_head.weight" in raw, "this checkpoint is expected to ship its tied head"
+        np.testing.assert_array_equal(raw["lm_head.weight"], raw["model.embed_tokens.weight"])
+        assert "lm_head.weight" not in params, (
+            "the shipped tied head must be consumed and dropped, never kept as a "
+            "second graph input"
+        )
+        np.testing.assert_array_equal(params["embed.weight"], raw["model.embed_tokens.weight"])
+    finally:
+        del raw  # never hold the raw 1.5 GB dict and the canonical tree at once
+
+    # --- the whole model as ONE graph: every weight an explicit input --------
+    graph = _trace(loaded, seq_len=4)
+    assert len(graph.tensor_specs) == len(params) + 1 == 311, (
+        f"weights must be graph inputs (one leaf each) + one ids input: "
+        f"{len(graph.tensor_specs)} inputs for {len(params)} parameters"
+    )
+    graph.verify()
+    ops = _ops_total(graph)
+    assert ops > 1_000, (
+        f"a 28-layer Qwen3 should be a large graph, got {ops} ops "
+        f"[{_describe(loaded, graph, seq_len=4)}]"
+    )
+    text = stablehlo.export(graph)
+    constants = text.count("stablehlo.constant")
+    # Measured here: 465,594 bytes / 4,748 lines / 545 constants for 2,585 IR ops
+    # — the constants are scalars and the small in-graph RoPE tables, never a
+    # weight (a single inlined 151936×1024 embedding would dwarf the whole text).
+    assert len(text) < 2_000_000 and constants <= 800, (
+        f"the export must stay compact — weights are inputs, never inlined constants: "
+        f"{len(text)} bytes / {len(text.splitlines())} lines / {constants} constants "
+        f"[{_describe(loaded, graph, seq_len=4)}]"
+    )
+    # seq_len is baked into shapes, never into the program: the op count is
+    # identical for a longer sequence (QK-Norm adds two rms_norm ops per layer,
+    # not a per-position unroll).
+    longer = _trace(loaded, seq_len=8)
+    ops_longer = _ops_total(longer)
+    assert ops_longer == ops, (
+        f"the IR op count must not depend on seq_len: seq4={ops} ops, "
+        f"seq8={ops_longer} ops [{_describe(loaded, graph, seq_len=4)} | "
+        f"{_describe(loaded, longer, seq_len=8)}]"
+    )
+
+    # --- parity: the numpy-backend graph vs the independent numpy oracle -----
+    input_ids = _ids(1, 4)
+    executable = build(forward_fn(cfg, seq_len=4), cfg, backend="numpy", cache=etl.CompileCache())
+    assert len(executable.signature.input_specs) == len(params) + 1
+    got = run(executable, params, input_ids).numpy()
+    want = reference_logits(cfg, params, input_ids)
+    assert got.shape == want.shape == (1, 4, cfg.vocab_size), (
+        f"logits must be (batch, seq_len, vocab), got graph {got.shape} "
+        f"vs reference {want.shape}"
+    )
+    assert got.dtype == want.dtype == np.dtype(np.float32)
+    max_abs, max_rel = _parity(got, want)
+    described = _describe(loaded, graph, seq_len=4)
+    assert bool(np.isfinite(got).all()) and np.isfinite(want).all(), (
+        f"Qwen3 logits must be finite [{described}]"
+    )
+    # Distribution agreement: the argmax must be identical at every position (a
+    # single wrong QK-Norm placement would move them).
+    got_top, want_top = np.argmax(got, axis=-1), np.argmax(want, axis=-1)
+    agreement = float(np.mean(got_top == want_top))
+    assert agreement == 1.0, (
+        f"Qwen3 argmax agreement {agreement:.3f} (expected 1.0); graph "
+        f"{got_top.tolist()} vs reference {want_top.tolist()} "
+        f"[max_abs={max_abs:.3e}, max_rel_vs_scale={max_rel:.3e} {described}]"
+    )
+    assert max_abs <= 1e-4, (
+        f"Qwen3 parity vs the numpy reference: max_abs={max_abs:.3e} (budget 1.0e-04), "
+        f"max_rel_vs_scale={max_rel:.3e}, argmax agreement {agreement:.3f}, "
+        f"|logits|max={float(np.abs(want).max()):.3e} [{described}]"
+    )
 
 
 # ---------------------------------------------------------------------------

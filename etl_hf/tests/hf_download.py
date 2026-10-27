@@ -67,6 +67,10 @@ MODELS: dict[str, str] = {
     "tiny_gpt2": "sshleifer/tiny-gpt2",
     "distilgpt2": "distilgpt2",
     "gpt2": "openai-community/gpt2",
+    # real-size opt-in (BIG_MODELS, needs $ETL_HF_BIG=1): the Qwen3 checkpoint,
+    # the only real checkpoint whose config declares per-head QK-Norm
+    # (`qk_norm=True`), i.e. the end-to-end coverage for the Qwen3/llama family.
+    "qwen3_0_6b": "Qwen/Qwen3-0.6B",
     # alias slugs (see ALIASES) — the SAME checkpoints, golden-harness spelling
     "tiny_random_llama": "hf-internal-testing/tiny-random-LlamaForCausalLM",
     "tiny_random_mistral": "hf-internal-testing/tiny-random-MistralForCausalLM",
@@ -84,7 +88,7 @@ ALIASES: dict[str, str] = {
 }
 
 #: Slugs large enough that tests gate them behind an environment variable.
-BIG_MODELS: frozenset[str] = frozenset({"distilgpt2", "gpt2"})
+BIG_MODELS: frozenset[str] = frozenset({"distilgpt2", "gpt2", "qwen3_0_6b"})
 
 #: Slugs the CLI downloads when ``--slugs`` is not given.
 DEFAULT_SLUGS: tuple[str, ...] = ("tiny_llama", "tiny_mistral", "tiny_gpt2")

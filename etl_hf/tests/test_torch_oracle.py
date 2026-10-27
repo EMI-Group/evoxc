@@ -92,6 +92,10 @@ Tolerances (and why)
 * ``sshleifer/tiny-gpt2``'s logits are ordinary (``max |logit| ≈ 0.13``), so it
   is held to the same 1e-4 absolute budget as the other tiny checkpoints — the
   legacy-format checkpoint is *not* a known failure (see below).
+* the opt-in real ``Qwen/Qwen3-0.6B`` case (section 2b, ``ETL_HF_BIG=1``) ≤
+  **2e-4 abs** *and* ≤ **1e-5 relative** — its fp32 logits reach ``max|logit| ≈
+  23``, and both etl paths (the pure-numpy oracle and the traced/staged graph)
+  are measured against the same HF forward, argmax agreement asserted 1.0.
 
 Legacy-format checkpoints (why ``tiny_gpt2`` matters)
 ----------------------------------------------------
@@ -111,6 +115,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -850,6 +855,165 @@ def test_hf_in_process_parity(slug: str):
             f"{int(got_top[index])} vs HuggingFace {int(want_top[index])} "
             f"(margin {float(margins[index]):.3e})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 2b. the real Qwen3 checkpoint (per-head QK-Norm) against the real HF forward
+# ---------------------------------------------------------------------------
+#: The one real checkpoint whose config declares QK-Norm (``model_type:
+#: "qwen3"`` → family ``llama`` with ``qk_norm=True``): two extra per-head
+#: ``(head_dim,)`` RMSNorm scales per layer, applied to q/k after the head split
+#: and before RoPE.  Nothing in the tiny synthetic checkpoints exercises that
+#: placement against an external oracle, so this case does.
+_QWEN3_SLUG = "qwen3_0_6b"
+
+#: Real-size checkpoints are opt-in: this case loads a 0.6B model twice (torch
+#: float32, then etl float32) and needs ~5-6 GB of RSS.
+_BIG = pytest.mark.skipif(
+    os.environ.get("ETL_HF_BIG") != "1",
+    reason="real-size checkpoints are opt-in: set ETL_HF_BIG=1 "
+    "(Qwen/Qwen3-0.6B ≈ 1.5 GB of bf16 weights)",
+)
+
+#: The fixed token recipe: batch 1, seq_len 8, every id < the 151936 vocab (and
+#: deliberately including the Qwen3 bos/eos ids 151643 / 151645).
+_QWEN3_IDS = np.asarray([[1, 42, 1000, 20000, 151643, 777, 151645, 5]], dtype=np.int32)
+
+#: Absolute budget for a real 0.6B fp32 forward: the two implementations differ
+#: only in accumulation order, so 2e-4 leaves room for that and nothing else.
+_QWEN3_ATOL = 2e-4
+
+
+def _hf_qwen3_logits(directory: object, input_ids: np.ndarray) -> np.ndarray:
+    """Run the REAL HF ``Qwen3ForCausalLM`` forward on CPU and return float32 logits.
+
+    Loaded in float32 with the explicit, deterministic ``eager`` attention
+    implementation (no fused/SDPA kernel whose accumulation order would blur the
+    comparison) and evaluated on CPU only — this suite must never occupy a GPU.
+
+    Args:
+        directory: the local checkpoint directory (``config.json`` + weights).
+        input_ids: ``(batch, seq_len)`` integral token ids.
+
+    Returns:
+        np.ndarray: float32 logits, ``(batch, seq_len, vocab_size)``.
+
+    Raises:
+        RuntimeError: the model cannot be loaded or is not a causal LM — the
+            oracle never substitutes another implementation.
+    """
+    torch, transformers = _oracle()
+    try:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            str(directory), dtype=torch.float32, attn_implementation="eager"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot run the HuggingFace oracle for {_QWEN3_SLUG!r} ({directory!r}): "
+            f"{type(exc).__name__}: {exc}. This test pre-loads the checkpoint with "
+            "transformers' AutoModelForCausalLM and never substitutes another "
+            "implementation, so an unsupported architecture/unreadable checkpoint is "
+            "an error rather than a silent mismatch"
+        ) from exc
+    model.eval()
+    model.to("cpu")
+    # The GPU stays free: every parameter must have landed on the CPU.
+    devices = sorted({parameter.device.type for parameter in model.parameters()})
+    assert devices == ["cpu"], f"the HF oracle must run on CPU only, got devices {devices}"
+    ids = torch.as_tensor(np.asarray(input_ids), dtype=torch.long, device="cpu")
+    with torch.no_grad():
+        logits = model(input_ids=ids).logits
+    return logits.detach().float().cpu().numpy()
+
+
+@_BIG
+@pytest.mark.skipif(not _oracle_available(), reason=_ORACLE_SKIP_REASON)
+def test_qwen3_hf_oracle_parity():
+    """Qwen3-0.6B (QK-Norm, tied) — BOTH etl paths agree with the real HF forward.
+
+    Two independent etl-side results are compared against the same HuggingFace
+    logits: the pure-numpy oracle (:func:`etl_hf.program.reference_logits`, whose
+    QK-Norm placement is hand-written) and a traced-and-staged numpy-backend
+    graph (``forward_fn`` → ``build`` → ``run``, whose QK-Norm placement lives in
+    the graph composition).  Both must clear the same absolute budget and agree on
+    the argmax at every position — a wrong QK-Norm placement (before the head
+    split, on ``hidden_size`` instead of ``head_dim``, or after RoPE) moves both.
+
+    Tolerances: :data:`_QWEN3_ATOL` absolute, plus the shared scale-relative
+    budget, so a large-magnitude logit cannot buy tolerance for a wrong one.
+    """
+    _oracle()  # presence check: skips (never errors) without torch/transformers
+    directory = hf_download.require_model(_QWEN3_SLUG)
+
+    # --- the external oracle first, so the ~2.4 GB torch model is freed early -
+    want = _hf_qwen3_logits(directory, _QWEN3_IDS)
+    seq_len = int(_QWEN3_IDS.shape[1])
+    assert want.shape == (1, seq_len, 151936), (
+        f"the HF oracle must return (1, {seq_len}, 151936) logits, got {want.shape}"
+    )
+    print(
+        f"\n[Qwen3-0.6B] HF logits: shape={want.shape} "
+        f"scale(max|logit|)={float(np.max(np.abs(want))):.4e}"
+    )
+
+    # --- the etl side: the numpy oracle AND the traced/staged graph ----------
+    from etl_hf import build, forward_fn, load_hf, run
+    from etl_hf.program import param_specs, reference_logits
+
+    loaded = load_hf(directory)
+    cfg, params = loaded.config, loaded.params
+    assert (cfg.model_type, cfg.family, cfg.qk_norm) == ("qwen3", "llama", True), (
+        f"expected the Qwen3/QK-Norm llama family, got model_type={cfg.model_type!r} "
+        f"family={cfg.family!r} qk_norm={cfg.qk_norm!r}"
+    )
+    assert len(params) == len(param_specs(cfg)) == 310, (
+        f"Qwen3-0.6B is tied: 2 + 11·28 = 310 canonical keys, got {len(params)}"
+    )
+    reference = reference_logits(cfg, params, _QWEN3_IDS)
+    executable = build(forward_fn(cfg, seq_len=seq_len), cfg, backend="numpy")
+    declared = len(executable.signature.input_specs)
+    assert declared == len(params) + 1, (
+        f"the graph must consume one input per canonical weight plus the ids: "
+        f"{len(params)} + 1, declared {declared}"
+    )
+    graph_logits = run(executable, params, _QWEN3_IDS).numpy()
+
+    want_top = np.argmax(want, axis=-1)
+    for label, ours in (
+        ("etl_hf.reference_logits (pure-numpy oracle)", reference),
+        ("etl_hf numpy graph (forward_fn→build→run)", graph_logits),
+    ):
+        assert ours.shape == want.shape == (1, seq_len, cfg.vocab_size), (
+            f"{label}: shape {ours.shape} vs HuggingFace {want.shape}"
+        )
+        report = _assert_parity(
+            ours,
+            want,
+            rtol=_REAL_RTOL,
+            atol=_QWEN3_ATOL,
+            require_relative=True,
+            label=f"{_QWEN3_SLUG} {label} (seq_len={seq_len})",
+        )
+        ours_top = np.argmax(ours, axis=-1)
+        agreement = float(np.mean(ours_top == want_top))
+        print(
+            f"[Qwen3-0.6B] {label}: max-abs={report.max_abs:.3e} "
+            f"(budget {_QWEN3_ATOL:.0e}), rel-to-absmax={report.scale_rel:.3e} "
+            f"(budget {_REAL_RTOL:.0e}), argmax agreement={agreement:.3f} "
+            f"(scale={report.scale:.3e})"
+        )
+        mismatched = np.argwhere(ours_top != want_top)
+        if mismatched.size:
+            index = tuple(int(part) for part in mismatched[0])
+            near_tie = np.partition(want, -2, axis=-1)[..., -2:]
+            margin = float(near_tie[index][1] - near_tie[index][0])
+            raise AssertionError(
+                f"{_QWEN3_SLUG} {label}: argmax disagrees at {mismatched.shape[0]} of "
+                f"{want_top.size} position(s) (agreement {agreement:.3f}); first at "
+                f"(batch, seq)={index}: etl_hf {int(ours_top[index])} vs HuggingFace "
+                f"{int(want_top[index])} (top-2 margin {margin:.3e}); "
+                f"max-abs={report.max_abs:.3e}, rel-to-absmax={report.scale_rel:.3e}"
+            )
 
 
 # ---------------------------------------------------------------------------
