@@ -3,7 +3,7 @@
 
 <h1 align="center">evoxc</h1>
 
-<p><strong>EvoX Compiler</strong> — a minimal, explicit, compiler-neutral tensor graph runtime.</p>
+<p><strong>EvoX Compiler</strong> — a minimal, explicit, compiler-neutral tensor graph compiler and runtime.</p>
 
 <p>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
@@ -16,7 +16,7 @@
 <p><a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#backends">Backends</a> · <a href="#how-evoxc-compares">vs others</a> · <a href="#install">Install</a></p>
 </div>
 
-evoxc is a Python tensor <em>language</em> whose program is an explicit SSA graph. You build the graph; evoxc owns the frontend (trace → transform → IR → StableHLO); external ML compilers own the optimization, scheduling, memory planning and code generation. With no compiler installed it still runs — on a reference numpy interpreter.
+**evoxc** is the **EvoX Compiler**: a Python-embedded tensor-graph compiler and runtime whose input language is an explicit SSA tensor graph. You build the graph, and evoxc owns the frontend (trace → transform → EvoXIR → StableHLO export) and the explicit staging pipeline around it — `lower`, `compile`, `load`, `run`. External ML compilers own the optimization, scheduling, memory planning and code generation. With no compiler installed it still runs — on a reference numpy interpreter.
 
 ---
 
@@ -24,11 +24,11 @@ evoxc is a Python tensor <em>language</em> whose program is an explicit SSA grap
 
 A modern numerical framework fuses five different things into one opaque stack: a tensor language, a tracer, a compiler, a scheduler and an allocator. The result is convenient, and the program stops being an object you can hold — it is re-derived on every call, re-specialized when a Python value changes, re-captured when a guard fails, and the compiler quietly owns semantics the author never wrote down: implicit tracing, hidden caches, automatic resharding, eager/graph mode switches.
 
-evoxc splits that stack along one hard line. Above it is the **frontend**: a tensor language in which the program is an explicit, inspectable, persistable, transformable SSA graph, and every staging step is a public function with a public object for its result. Below it are **external compilers** — IREE, XLA via PJRT, TVM — which receive StableHLO and own how the computation executes. Nothing on the evoxc side pretends to be a compiler, and nothing below the line may change what the program means.
+evoxc splits that stack along one hard line. Above it is the **frontend**, which evoxc owns: the tensor-graph language in which the program is an explicit, inspectable, persistable, transformable SSA graph, and the staging contract that carries it to a compiler — every step a public function with a public object for its result. Below it are **external compilers** — IREE, XLA via PJRT, TVM — which receive StableHLO and own how the computation is optimized, scheduled, allocated and generated. evoxc owns the frontend, the IR and the staging contract, never kernel scheduling or code generation; nothing below the line may change what the program means.
 
 ## Four words
 
-**Minimal** — `numpy` is the only hard dependency; pure Python, no native code, no runtime, no code generator, no kernel library. The default backend interprets the IR with numpy kernels. *So what: no compiler toolchain stands between you and a running graph.*
+**Minimal** — `numpy` is the only hard dependency; pure Python, no native code, no device runtime, no code generator, no kernel library. The default backend interprets the IR with numpy kernels. *So what: no compiler toolchain stands between you and a running graph.*
 
 **Explicit** — every stage is a public function (`trace`, `lower`, `compile`, `load`, `run`) and every object a distinct public type (`Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor`); convenience APIs are documented shorthand whose exact expansion is in their docstrings. *So what: you can stop at any stage, inspect it, save it, or ship it.*
 
@@ -38,7 +38,7 @@ evoxc splits that stack along one hard line. Above it is the **frontend**: a ten
 
 ## The stack: from a Python graph to an ML compiler
 
-<img src="assets/evoxc-stack.svg" alt="The explicit evoxc stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="100%">
+<img src="assets/evoxc-stack.svg" alt="The explicit evoxc (EvoX Compiler) stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="100%">
 
 | stage | public function | resulting object | what it produces | what it never does silently |
 |---|---|---|---|---|
@@ -380,7 +380,7 @@ oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy
 
 ## How evoxc compares
 
-**evoxc is a substrate, not a framework.** PyTorch and JAX are complete numerical ecosystems; Nx is the Elixir-native equivalent that evoxc deliberately mirrors semantically (explicit `defn` graphs, `block`, `vectorize`, pluggable backends). evoxc does not try to replace them and borrows freely: numpy ergonomics, Nx's graph semantics, JAX's key-based RNG and function transforms. What it offers is a smaller, sharper contract.
+**evoxc is a compiler frontend and runtime, not a framework.** PyTorch and JAX are complete numerical ecosystems; Nx is the Elixir-native equivalent that evoxc deliberately mirrors semantically (explicit `defn` graphs, `block`, `vectorize`, pluggable backends). evoxc does not try to replace them and borrows freely: numpy ergonomics, Nx's graph semantics, JAX's key-based RNG and function transforms. What it offers is a smaller, sharper contract.
 
 **The one thing evoxc does differently: the program is a first-class object.** No eager mode, no implicit tracing, no mode switch, no compiler-owned semantics. `torch.compile` and `torch.export` capture graphs, `jax.jit` traces at every call, Nx executes `defn` eagerly through a backend — all three are reasonable designs that derive the program *inside* the framework. In evoxc the graph is what you wrote: an inspectable, diffable, saveable, transformable value, and every stage from `trace` to `run` is a public function with a public result type.
 
@@ -391,7 +391,7 @@ oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy
 | program identity / staging | eager execution; graphs captured by `torch.compile` / `torch.export` | Python traced at each `jit`; StableHLO on demand (`jax.export`) | explicit `defn` graph language, executed eagerly via a backend (`Nx.Defn.compile/1` for compiled) | every stage an explicit public function; the `Graph` is an artifact you keep, save and ship |
 | where transforms run | autograd/`torch.func` over tensors, and inside the captured graph | function transforms (`jit`/`vmap`/`grad`) composed in Python | graph-level `grad`/`vectorize` inside `defn` | graph → graph on an already-traced `Graph`; backends never see `vmap` |
 | in-graph control flow | `torch.cond` / `torch.while_loop` (dynamo also captures Python control flow, with guards) | `lax.cond` / `while_loop` / `scan` | `cond` / `while_loop` / `scan` | `evoxc.cond` / `while_loop` / `scan`; a Python `if` on a symbolic value raises `TraceError` |
-| backend philosophy | owns kernels, Inductor + Triton codegen, hardware stack | XLA/PJRT is the compiler | pluggable backends (EXLA, Torchx, …) | owns no compiler: StableHLO out, adapters over IREE / XLA-PJRT / TVM |
+| backend philosophy | owns kernels, Inductor + Triton codegen, hardware stack | XLA/PJRT is the compiler | pluggable backends (EXLA, Torchx, …) | owns the frontend, IR and staging contract — not codegen: StableHLO out, adapters over IREE / XLA-PJRT / TVM |
 | custom kernel escape hatch | C++/CUDA extensions, `triton.jit` over torch tensors | `custom_call`, Pallas | custom `defn` ops / backend custom calls | `evoxc.external_call` + name-keyed registry (per-backend slots, host or device-resident boundaries), `evoxc.block` for graph ops |
 | RNG | stateful generators | key-based functional PRNG (multi-algorithm) | stateful backend RNG | key-based functional, 3 algorithms, bit-identical per key |
 | sparse | `torch.sparse` layouts (a separate world) | `jax.experimental.sparse` (BCOO/BCSR, experimental) | no first-class sparse type in core | `evoxc.sparse` COO/CSR/CSC, 16 ops, flows through transforms and control flow (numpy-only in v1) |
@@ -455,4 +455,4 @@ Test suite: **6797 collected — 6716 passed, 81 skipped, 3 xfailed, 0 failed** 
 
 ## License
 
-Apache-2.0. evoxc is part of the **EvoX** ecosystem: the graph runtime underneath evolutionary computation workloads, deliberately small enough to read.
+Apache-2.0. evoxc is part of the **EvoX** ecosystem: the compiler, frontend and graph runtime underneath evolutionary computation workloads, deliberately small enough to read.
