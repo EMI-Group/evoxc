@@ -87,8 +87,8 @@ device-resident loop.
   but NO `untied_allocation` field.
 - **Contention:** with NULL-events blocking execute, another tenant's kernel queue on the same GPU is exposed
   per call (under a torch matmul hammer: p90 18.4 ms, max 862 ms vs quiet med 0.112 ms).
-- **Deployment gotcha:** the evox harness (`evox/benchmarks/etl_vs_torch/bench_common.py::evoxc_backend_spec`)
-  maps `evoxc-xla-cuda` → `("xla", None)` behind a stale note claiming the adapter rejects non-cpu devices at
+- **Deployment gotcha:** the evox harness (`evox/benchmarks/etl_vs_torch/bench_common.py::etl_backend_spec`)
+  maps `etl-xla-cuda` → `("xla", None)` behind a stale note claiming the adapter rejects non-cpu devices at
   load — false since the device-resident implementation. `device=None` re-stages all state leaves from host
   every step ⇒ exactly the 4–16 ms/step class recorded in its BENCHMARK_RESULTS.md. Fix: `("xla", "cuda:0")`
   — expect 12–28× (≈0.36 ms/step).
