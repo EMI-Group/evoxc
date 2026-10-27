@@ -436,7 +436,7 @@ CONTEXT.md      architecture, contracts and status (root, the source of truth)
 
 Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, graph transforms, `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `evoxc.bench` harness.
 
-Test suite: **6837 collected — 6789 passed, 46 skipped, 3 xfailed, 0 failed** with IREE installed; **6367 passed, 95 skipped, 3 xfailed** compiler-free. Every skip is a host or dependency guard (no CUDA device, optional compiler package absent, a torch-present inverse pin, the io pristine-process guard, no ROCm HIP runtime in this process).
+Test suite: **6837 collected — 6789 passed, 46 skipped, 3 xfailed, 0 failed** with IREE installed; **6367 passed, 95 skipped, 3 xfailed** compiler-free. Every skip is a host or dependency guard (no NVIDIA CUDA device, no Vulkan ICD, no PJRT plugin, a torch-present inverse pin, the io pristine-process guard).
 
 <details>
 <summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
