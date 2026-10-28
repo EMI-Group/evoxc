@@ -56,16 +56,8 @@ from evoxc.transforms._metadata import MappedAxes, UNMAPPED, ValueEnv
 
 @dataclass(frozen=True)
 class SwitchRecord:
-    """One switch class emitted by `batch_functions`.
-
-    Attributes:
-        group: The merge group's name — the IR category name for a category
-            group, ``",".join(sorted(names))`` for an explicit op-name set.
-        variants: The variant names in first-appearance order (an op's IR
-            name; two variants differing only in attributes share a name).
-        rows_per_variant: The function indices using each variant, aligned
-            with `variants`.
-    """
+    """One switched position: `group`, `variants` (first-appearance order) and
+    `rows_per_variant` — the GLOBAL function indices using each variant."""
 
     group: str
     variants: Tuple[str, ...]
@@ -76,17 +68,17 @@ class SwitchRecord:
 class BatchReport:
     """What one `batch_functions` merge actually did (the `batch_report`).
 
-    Attributes:
-        n_functions: The number of merged functions (the function-axis length).
-        value_classes: The number of REACHABLE computation classes emitted.
-        shared_classes: How many of those were contributed by ≥2 functions.
-        switched: The switch classes, in emission order.
-        stacked_constants: How many constants were stacked into a per-row
-            constant (payloads differed across functions).
-        output_muxes: How many outputs were muxed from ≥2 distinct producing
-            classes.
-        emitted_ops: Ops in the merged entry block minus the `return`
-            terminator.
+    `value_classes` counts the REACHABLE classes emitted; `shared_classes` the
+    ones contributed by ≥2 functions; `stacked_constants` the constants whose
+    payloads differed; `output_muxes` the outputs muxed from ≥2 classes;
+    `emitted_ops` the merged entry block's ops minus the `return`.
+    `bands`/`band_sizes`/`band_strategy` describe the partition (`"flat"` for
+    `bands=None`, `"explicit"` for an int ``K``, `"auto"` for the automatic
+    one); `cost_estimate`/`flat_cost_estimate` are the static model's numbers
+    for the CHOSEN and the flat partition (``None`` unless the model ran).
+    With several bands the per-class counters are TOTALS across bands
+    (`shared_classes` sums a band's classes contributed by ≥2 of THAT BAND's
+    functions) and `emitted_ops` counts band slices and output concatenations.
     """
 
     n_functions: int
@@ -96,6 +88,11 @@ class BatchReport:
     stacked_constants: int = 0
     output_muxes: int = 0
     emitted_ops: int = 0
+    bands: int = 1
+    band_sizes: Tuple[int, ...] = ()
+    band_strategy: str = "flat"
+    cost_estimate: Optional[float] = None
+    flat_cost_estimate: Optional[float] = None
 
     def as_dict(self) -> dict:
         """A plain-`dict` view (nested `SwitchRecord`s expanded to dicts)."""
@@ -116,6 +113,11 @@ class BatchReport:
             "stacked_constants": self.stacked_constants,
             "output_muxes": self.output_muxes,
             "emitted_ops": self.emitted_ops,
+            "bands": self.bands,
+            "band_sizes": list(self.band_sizes),
+            "band_strategy": self.band_strategy,
+            "cost_estimate": self.cost_estimate,
+            "flat_cost_estimate": self.flat_cost_estimate,
         }
 
 
@@ -168,19 +170,14 @@ def _align_switch_candidate(
 ) -> ir.Value:
     """Broadcast one switch candidate to the mapped ``(N, *(1,), *per_row)`` shape.
 
-    A switch class is MAPPED (its value genuinely depends on the function row),
-    so EVERY candidate must carry the leading function axis before the `select`
-    mux — an unmapped candidate (shared inputs ⇒ unmapped variants) is broadcast
-    along a fresh leading axis, with trailing size-one padding up to the largest
-    per-row rank among the candidates (the pointwise-rules alignment
-    convention). A mapped candidate keeps its values and only gains the padding;
-    with equal per-row ranks (the normal case) both are returned unchanged, so
-    the already-working mapped path emits exactly the same ops as before.
-
-    Raises:
-        core.TransformError: the candidate's batch axes are not leading, or its
-            shape cannot broadcast to the aligned switch shape — never a raw
-            `ShapeError` from the `select`.
+    A switch class is MAPPED, so every candidate carries the leading function
+    axis before the `select` mux: an unmapped one is broadcast along a fresh
+    leading axis, trailing size-one padding goes up to the largest per-row rank
+    (the pointwise alignment convention), and a mapped candidate keeps its
+    values (with equal per-row ranks both are returned unchanged, so the mapped
+    path emits exactly the ops it always did). A non-leading-axes or
+    non-broadcastable candidate raises `core.TransformError` — never a raw
+    `ShapeError` from the `select`.
     """
     if axes.axes != tuple(range(axes.count)):
         raise core.TransformError(
@@ -258,7 +255,15 @@ def _operand_axes(op: ir.Op, value: ir.Value, env: ValueEnv) -> MappedAxes:
 
 
 class _Merged:
-    """Mutable state of one merge (kept out of the public surface)."""
+    """Mutable state of one merge (kept out of the public surface).
+
+    One instance drives ONE merge unit: the whole population in the flat merge,
+    or one BAND of the banded merge. `n` is that unit's program count (the BAND
+    size for a band — masks and stacked constants are unit-sized); the band
+    hooks `band_args` (leaf index → band-local `ir.Value`, `_bands._BandInputs`)
+    and `row_map` (band-local index → GLOBAL function index, for the user-facing
+    `SwitchRecord.rows_per_variant`) stay `None` for the flat merge.
+    """
 
     def __init__(
         self,
@@ -266,6 +271,8 @@ class _Merged:
         dag: MergeDAG,
         n_functions: int,
         groups: Sequence[Any],
+        band_args: Any = None,
+        row_map: Optional[Tuple[int, ...]] = None,
     ):
         self.graphs = graphs
         self.dag = dag
@@ -278,6 +285,9 @@ class _Merged:
         self.stacked_constants = 0
         self.output_muxes = 0
         self.new_block: Optional[ir.Block] = None
+        #: Band hooks (`None` = the flat merge).
+        self.band_args = band_args
+        self.row_map = tuple(row_map) if row_map is not None else None
         #: Source location of the `batch_functions` call, given to the helper ops
         #: the mux machinery emits itself (masks/selects/broadcasts) — they have
         #: no contributing original op to inherit a location from.
@@ -285,11 +295,19 @@ class _Merged:
 
     # -- operand resolution --
 
+    def global_rows(self, rows: Sequence[int]) -> Tuple[int, ...]:
+        """Band-local program indices → GLOBAL function indices (identity when flat)."""
+        if self.row_map is None:
+            return tuple(rows)
+        return tuple(self.row_map[row] for row in rows)
+
     def operand_value(self, program_index: int, value: ir.Value) -> ir.Value:
         """The merged-graph value standing for `value` of program `program_index`."""
         program = self.dag.programs[program_index]
         arg_index = program.arg_ids.get(id(value))
         if arg_index is not None:
+            if self.band_args is not None:
+                return self.band_args[arg_index]
             return self.new_block.arguments[arg_index]
         class_id, result_index = self.dag.slot_of(program_index, value)
         values = self.emitted.get(class_id)
@@ -433,7 +451,7 @@ class _Merged:
                     variant_op.name for variant_op, _values, _axes in per_variant
                 ),
                 rows_per_variant=tuple(
-                    tuple(rows) for rows in info.rows
+                    self.global_rows(rows) for rows in info.rows
                 ),
             )
         )
@@ -505,6 +523,10 @@ class _Merged:
             for ref, value in aligned[1:]:
                 mask = _row_mask(rows_by_ref[ref], acc.type.rank, self.n)
                 acc = ops.select(_sym(mask), _sym(value), _sym(acc)).value
+            # A muxed output is ALWAYS mapped (mapping is what makes row i take
+            # function i's value); recording it keeps the env truthful for the
+            # banded driver, which combines per-band output values.
+            self.env.set(acc, MappedAxes((0,)))
             outputs.append(acc)
         _stamp_locations(self.new_block, helper_start, self.call_site)
         return tuple(outputs)
@@ -527,40 +549,18 @@ def _require_rule(op: ir.Op):
     return rule
 
 
-def emit_merged_graph(
-    graphs: Sequence[Graph],
-    dag: MergeDAG,
+def new_merged_module(
+    graph0: Graph,
     entries: Sequence[Optional[int]],
-    out_entries: Sequence[Optional[int]],
-    groups: Sequence[Any],
-) -> Graph:
-    """Build the merged `Graph` (and attach `graph.batch_report`).
+    n_functions: int,
+) -> Tuple[ir.Builder, ir.Module, ir.Block, List[core.TensorSpec], List[MappedAxes]]:
+    """Build the merged module/function skeleton (steps 1-2 of a merge).
 
-    Args:
-        graphs: The traced programs being merged (identical signatures).
-        dag: Their class DAG (`_merge.build_merge_dag`).
-        entries: One ``0``/``None`` per TENSOR input leaf — ``0`` marks the
-            input's leading axis as the function axis (the merged spec gains a
-            static leading dim of length ``len(graphs)``), ``None`` shares the
-            input unmapped across every function.
-        out_entries: One ``0``/``None`` per TENSOR output leaf.
-        groups: The `switch_ops` merge groups (declaration order).
-
-    Returns:
-        The merged `Graph`, with `graph.batch_report` set to its `BatchReport`.
-
-    Raises:
-        core.TransformError: conflicting result types inside one switch group,
-            `out_axes=None` on a mapped/muxed output, or an internal
-            bookkeeping violation.
+    Shared by the flat and the banded driver (`_bands.emit_banded_graph`). A
+    mapped input leaf gains a STATIC leading `n_functions` dim (never a symbolic
+    `Dim`); unmapped leaves are reused unchanged. Returns
+    ``(builder, module, new_block, new_specs, input_axes)``.
     """
-    graph0 = graphs[0]
-    old_function = dag.programs[0].function
-    n_functions = len(graphs)
-
-    # 1. New input specs: mapped leaves gain a STATIC leading dim of length N
-    #    (never a symbolic `Dim` — the merged graph stays fully static for
-    #    compiler backends); unmapped leaves are reused unchanged.
     new_specs = []
     input_axes = []
     for spec, entry in zip(graph0.tensor_specs, entries):
@@ -578,7 +578,6 @@ def emit_merged_graph(
         )
         input_axes.append(MappedAxes((0,)))
 
-    # 2. Build the NEW module/function (the input graphs are never mutated).
     builder = ir.Builder()
     module = builder.build_module(
         name=graph0.module.name, metadata=dict(graph0.module.metadata)
@@ -587,11 +586,66 @@ def emit_merged_graph(
         ir.ValueType(spec.dtype, tuple(spec.shape)) for spec in new_specs
     )
     function = builder.build_function(
-        name=old_function.name,
+        name=graph0.module.functions[0].name,
         input_types=input_types,
-        metadata=dict(old_function.metadata),
+        metadata=dict(graph0.module.functions[0].metadata),
     )
-    new_block = function.entry_block
+    return builder, module, function.entry_block, new_specs, input_axes
+
+
+def finish_merged_graph(
+    graph0: Graph,
+    builder: ir.Builder,
+    new_block: ir.Block,
+    new_specs: Sequence[core.TensorSpec],
+    output_values: Sequence[ir.Value],
+    source_locations: Dict[int, Any],
+) -> Graph:
+    """Terminate the merged entry block and wrap it into a new `Graph`.
+
+    The `return` inherits `graph0`'s location; trees/static values are carried
+    over verbatim. The caller attaches its own `BatchReport`.
+    """
+    builder.set_terminator(
+        new_block,
+        "return",
+        operands=output_values,
+        location=graph0.module.functions[0].entry_block.terminator.location,
+    )
+    return Graph(
+        builder.module,
+        graph0.input_specs,
+        new_specs,
+        graph0.output_tree,
+        graph0.static_values,
+        graph0.output_static_values,
+        source_locations,
+    )
+
+
+def emit_merged_graph(
+    graphs: Sequence[Graph],
+    dag: MergeDAG,
+    entries: Sequence[Optional[int]],
+    out_entries: Sequence[Optional[int]],
+    groups: Sequence[Any],
+) -> Graph:
+    """Build the merged `Graph` (and attach `graph.batch_report`) — the FLAT merge.
+
+    `graphs` are the traced programs, `dag` their class DAG, `entries`
+    (`out_entries`) one ``0``/``None`` per TENSOR input (output) leaf — ``0``
+    makes that leaf's leading axis the function axis, ``None`` leaves it
+    unmapped/shared — and `groups` the `switch_ops` merge groups. Raises
+    `core.TransformError` for conflicting result types inside one switch group,
+    `out_axes=None` on a mapped/muxed output, or an internal violation.
+    """
+    graph0 = graphs[0]
+    n_functions = len(graphs)
+
+    # 1-2. New input specs + the new module/function (inputs never mutated).
+    builder, _module, new_block, new_specs, input_axes = new_merged_module(
+        graph0, entries, n_functions
+    )
 
     # 3. Seed the metadata env for the new block args and carry the input
     #    source locations forward (every program shares the same arg layout).
@@ -623,19 +677,12 @@ def emit_merged_graph(
         output_values = state.emit_outputs(out_entries)
 
     # 5. Terminate and wrap into a new Graph.
-    builder.set_terminator(
+    graph = finish_merged_graph(
+        graph0,
+        builder,
         new_block,
-        "return",
-        operands=output_values,
-        location=dag.programs[0].terminator.location,
-    )
-    graph = Graph(
-        module,
-        graph0.input_specs,
         new_specs,
-        graph0.output_tree,
-        graph0.static_values,
-        graph0.output_static_values,
+        output_values,
         state.source_locations,
     )
     shared = sum(
@@ -651,5 +698,8 @@ def emit_merged_graph(
         stacked_constants=state.stacked_constants,
         output_muxes=state.output_muxes,
         emitted_ops=len(new_block.ops) - 1,
+        bands=1,
+        band_sizes=(n_functions,),
+        band_strategy="flat",
     )
     return graph

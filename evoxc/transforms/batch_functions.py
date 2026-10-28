@@ -23,6 +23,19 @@ Emission strategy (never a silent Python-loop fallback):
 * every other divergence is still CORRECT via `select`-muxing where the values
   diverge (constant stacking resp. output muxing).
 
+Banding (`bands=`): the merge can split the population into CONTIGUOUS bands
+and merge each band independently, gluing the per-band outputs with one
+`concatenate` (plus a static row re-permutation when the bands are not in
+function order).
+Banding trades DISPATCHES for wasted work: within a band only that band's
+functions share positions, so a divergent position computes one op per DISTINCT
+variant of the band instead of one per variant of the whole population, while
+work shared only across bands is recomputed per band and each band pays its
+input slicing.
+`bands=None` (the default) is the single-band flat merge and stays
+BYTE-IDENTICAL to the pre-`bands` output; see `_bands` for the partition rules
+and the static cost model behind `bands="auto"`.
+
 The returned `Graph` carries `graph.batch_report` — a `BatchReport` describing
 what the merge did (`BatchReport` / `SwitchRecord` are re-exported here from
 `_emit`, where the report is assembled).
@@ -38,6 +51,7 @@ from evoxc import ir
 from evoxc.trace import Graph, trace
 from evoxc.trace._tree import _iter_leaf_paths, _static_equal
 from evoxc.transforms import batching
+from evoxc.transforms import _bands
 from evoxc.transforms._emit import BatchReport, SwitchRecord, emit_merged_graph
 from evoxc.transforms._merge import (
     MergeDAG,
@@ -77,6 +91,7 @@ def batch_functions(
     out_axes: Any = 0,
     *,
     switch_ops: Any = None,
+    bands: Any = None,
 ) -> Any:
     """Merge N same-signature programs into one graph with a function axis.
 
@@ -111,6 +126,25 @@ def batch_functions(
             iterable of op names (validated against the IR registry). Ops of one
             group at the same graph position become one op per variant plus a
             static per-row `select` mask cascade.
+        bands: the band ("cluster") strategy — how the N functions are
+            PARTITIONED before merging. `None` (default) merges them all on one
+            function axis (byte-identical to the pre-`bands` output); an `int`
+            `K` with ``1 <= K <= N`` merges K contiguous bands whose sizes are
+            as even as possible, larger bands first (``N=10, K=3`` →
+            ``(4, 3, 3)`` rows ``(0-3) (4-6) (7-9)``); ``"auto"`` lets the
+            static cost model choose among the flat partition, the structural
+            fingerprint partition (programs that would share every class) and
+            the fingerprint partition with all singletons coalesced into one
+            trailing misc band (see `_bands`). Banding trades dispatches for
+            wasted work: a divergent position emits one op per DISTINCT variant
+            of its band instead of one per variant of the whole population, at
+            the cost of re-computing cross-band sharing plus one input slice
+            and (collectively) one output concatenation per band. `K=1` and an
+            auto-resolved single band emit the flat graph. Validated here, so a
+            bad value raises before any tracing (callable path included).
+            v1 restriction: `bands` other than `None` requires `out_axes=0` for
+            every tensor output (a per-band value cannot be one unmapped
+            output) — `core.TransformError` otherwise.
 
     Returns:
         * `Graph` when given `Graph`s — the merged graph, with
@@ -122,16 +156,18 @@ def batch_functions(
 
     Raises:
         TypeError: `fns` is not a non-empty sequence, mixes Graphs with
-            callables, holds an unsupported element, or `switch_ops` is
-            malformed.
+            callables, holds an unsupported element, `switch_ops` is
+            malformed, or `bands` is a bool / an unsupported type.
         core.TraceError: mismatched input/output tree structure or static
             leaves between functions.
         core.DTypeError / core.ShapeError / core.DeviceError: per-leaf dtype /
             shape / device mismatch between functions.
-        core.TransformError: invalid `axes`/`out_axes` entries, an op without a
-            batching rule in any program (naming the function index), region-
-            bearing control flow, a registered output pytree node with static
-            leaves (v1 deferral), or conflicting switch-variant result types.
+        core.TransformError: invalid `axes`/`out_axes` entries, an unknown
+            `bands` value or a band count outside ``1..N``, `bands` combined
+            with an `out_axes=None` tensor output, an op without a batching
+            rule in any program (naming the function index), region-bearing
+            control flow, a registered output pytree node with static leaves
+            (v1 deferral), or conflicting switch-variant result types.
 
     Example:
         g0 = evoxc.trace(lambda x: evoxc.sin(x), spec)
@@ -140,6 +176,9 @@ def batch_functions(
         y = evoxc.evaluate(...)  # row 0 == sin(x), row 1 == cos(x)
     """
     items, kind = _validate_fns(fns)
+    # `bands` is validated BEFORE any tracing (the callable path included), so a
+    # bad band count can never leave half-traced programs behind.
+    _bands.normalize_bands(bands, len(items))
     groups = parse_switch_groups(switch_ops)
     if kind == "graph":
         try:
@@ -150,9 +189,11 @@ def batch_functions(
             ) from exc
         entries = batching._tensor_input_axes(items[0], normalized)
         out_entries = _normalize_out_axes(items[0], out_axes)
-        return _merge_graphs(items, entries, out_entries, groups)
+        return _merge_graphs(items, entries, out_entries, groups, bands)
     return TransformCallable(
-        build=lambda *args: _batch_callables(items, args, axes, out_axes, groups),
+        build=lambda *args: _batch_callables(
+            items, args, axes, out_axes, groups, bands
+        ),
         kind="batch_functions",
         doc=_BATCH_FUNCTIONS_CALLABLE_DOC,
     )
@@ -161,7 +202,7 @@ def batch_functions(
 # --- callable path ----------------------------------------------------------
 
 
-def _batch_callables(fns, args, axes, out_axes, groups) -> Graph:
+def _batch_callables(fns, args, axes, out_axes, groups, bands=None) -> Graph:
     """`TransformCallable` body: strip → trace every fn once → merge.
 
     Axes are normalized against the BATCHED argument specs and the leading
@@ -175,7 +216,7 @@ def _batch_callables(fns, args, axes, out_axes, groups) -> Graph:
     )
     graphs = [trace(fn, *stripped) for fn in fns]
     out_entries = _normalize_out_axes(graphs[0], out_axes)
-    return _merge_graphs(graphs, entries, out_entries, groups)
+    return _merge_graphs(graphs, entries, out_entries, groups, bands)
 
 
 # --- fns validation ---------------------------------------------------------
@@ -495,12 +536,58 @@ def _merge_graphs(
     entries: Sequence[Optional[int]],
     out_entries: Sequence[Optional[int]],
     groups: Sequence[MergeGroup],
+    bands: Any = None,
 ) -> Graph:
-    """Validate the merge and build the merged graph (the two-phase core)."""
+    """Validate the merge and build the merged graph (the two-phase core).
+
+    Validation runs FIRST and in the documented order (program shape, the
+    cross-function contract, per-op batchability, output pytree nodes), so a
+    banded merge reports exactly the errors a flat one would.
+
+    Then the partition is resolved: ``bands=None`` is the flat emitter;
+    ``bands=K`` is `_bands.even_partition`; ``bands="auto"`` is
+    `_bands.plan_auto_partition` under the static cost model. A SINGLE-band
+    partition (`K=1`, or an auto resolution that keeps every function together)
+    delegates to the flat emitter too, so its graph is byte-identical to
+    `bands=None` — only the report's band fields differ.
+    """
     for index, graph in enumerate(graphs):
         _program_function(graph, index)
     _check_contract(graphs)
     _check_ops(graphs)
     _check_output_nodes(graphs)
-    dag: MergeDAG = build_merge_dag(graphs, groups)
-    return emit_merged_graph(graphs, dag, entries, out_entries, groups)
+    n_functions = len(graphs)
+    strategy, band_count = _bands.normalize_bands(bands, n_functions)
+    if strategy == _bands.BAND_STRATEGY_FLAT:
+        dag: MergeDAG = build_merge_dag(graphs, groups)
+        return emit_merged_graph(graphs, dag, entries, out_entries, groups)
+    # A per-band value cannot be a single unmapped output; checked before the
+    # partition so `bands=1` obeys the same contract as any other band count.
+    _bands.check_banded_out_entries(out_entries)
+    cost_estimate = flat_cost_estimate = None
+    if strategy == _bands.BAND_STRATEGY_AUTO:
+        partition, cost_estimate, flat_cost_estimate = _bands.plan_auto_partition(
+            graphs, entries, groups
+        )
+    else:
+        partition = _bands.even_partition(n_functions, band_count)
+    if len(partition) == 1:
+        dag = build_merge_dag(graphs, groups)
+        graph = emit_merged_graph(graphs, dag, entries, out_entries, groups)
+        report = graph.batch_report
+        report.bands = 1
+        report.band_sizes = (n_functions,)
+        report.band_strategy = strategy
+        report.cost_estimate = cost_estimate
+        report.flat_cost_estimate = flat_cost_estimate
+        return graph
+    return _bands.emit_banded_graph(
+        graphs,
+        partition,
+        entries,
+        out_entries,
+        groups,
+        strategy,
+        cost_estimate,
+        flat_cost_estimate,
+    )
