@@ -19,7 +19,10 @@ Per class, in emission order (see `./CONTEXT.md` "Batch functions"):
 * **switch class** (≥2 variants in one merge group) — every variant is emitted
   through its own rule over the SAME operand stack, then the variants are
   muxed per result with a static per-row `select` mask cascade (variant 0 needs
-  no mask).
+  no mask). A switch class is ALWAYS MAPPED: its value depends on the function
+  row, so every candidate is aligned to the mapped shape first (an UNMAPPED
+  candidate — shared-input variants — is broadcast along a fresh leading
+  function axis, see `_align_switch_candidate`).
 
 Outputs: one value per tensor output leaf, in output-leaf order. A single
 distinct producing class passes through (a broadcast is inserted only when the
@@ -145,12 +148,69 @@ def _row_mask(rows: Sequence[int], rank: int, n_functions: int) -> ir.Value:
     Shape ``(N,) + (1,) * (rank - 1)`` — one mask shape per emitted result rank
     (``rank`` includes the leading function axis; `rank` 0/1 both give
     ``(N,)``) so numpy broadcast against any ``(N, *per_row)`` operand aligns
-    the function axis and never a per-row dim.
+    the function axis and never a per-row dim. Callers pass the rank of the
+    ALIGNED (mapped) mux operand, i.e. ``1 + row_rank``.
     """
     shape = (n_functions,) + (1,) * max(rank - 1, 0)
     payload = np.zeros(shape, dtype=bool)
     payload[list(rows)] = True
     return ops.constant(core.tensor(payload)).value
+
+
+def _align_switch_candidate(
+    value: ir.Value,
+    axes: MappedAxes,
+    target_row_rank: int,
+    n_functions: int,
+    op_name: str,
+    group_label: str,
+) -> ir.Value:
+    """Broadcast one switch candidate to the mapped ``(N, *(1,), *per_row)`` shape.
+
+    A switch class is MAPPED (its value genuinely depends on the function row),
+    so EVERY candidate must carry the leading function axis before the `select`
+    mux — an unmapped candidate (shared inputs ⇒ unmapped variants) is broadcast
+    along a fresh leading axis, with trailing size-one padding up to the largest
+    per-row rank among the candidates (the pointwise-rules alignment
+    convention). A mapped candidate keeps its values and only gains the padding;
+    with equal per-row ranks (the normal case) both are returned unchanged, so
+    the already-working mapped path emits exactly the same ops as before.
+
+    Raises:
+        core.TransformError: the candidate's batch axes are not leading, or its
+            shape cannot broadcast to the aligned switch shape — never a raw
+            `ShapeError` from the `select`.
+    """
+    if axes.axes != tuple(range(axes.count)):
+        raise core.TransformError(
+            f"batch_functions: switch group {group_label!r} candidate of op "
+            f"'{op_name}' carries non-leading batch axes {axes.axes} — "
+            "batch_functions values are mapped on the leading function axis only"
+        )
+    row_shape = tuple(value.type.shape[axes.count:])
+    target = (
+        (n_functions,) + (1,) * (target_row_rank - len(row_shape)) + row_shape
+    )
+    if tuple(value.type.shape) == target:
+        return value
+    if len(value.type.shape) > len(target):
+        raise core.TransformError(
+            f"batch_functions: switch group {group_label!r} candidate of op "
+            f"'{op_name}' has shape {tuple(value.type.shape)}, which cannot be "
+            f"aligned to the mapped switch shape {target} — the variants of one "
+            "switch class must agree on their per-row shape; drop that op from "
+            "switch_ops"
+        )
+    try:
+        return _broadcast(value, target)
+    except core.ShapeError as exc:
+        raise core.TransformError(
+            f"batch_functions: switch group {group_label!r} candidate of op "
+            f"'{op_name}' has shape {tuple(value.type.shape)}, which cannot be "
+            f"broadcast to the mapped switch shape {target} — the variants of "
+            "one switch class must have broadcast-compatible per-row shapes; "
+            "drop that op from switch_ops"
+        ) from exc
 
 
 def _stamp_locations(new_block: ir.Block, before: set, location) -> None:
@@ -305,9 +365,9 @@ class _Merged:
             values, out_axes = _run_rule(
                 rule, variant_op, operands, axes, self.new_block
             )
-            per_variant.append((variant_op, values))
+            per_variant.append((variant_op, values, out_axes))
         reference_types = tuple(value.type for value in per_variant[0][1])
-        for variant_op, values in per_variant[1:]:
+        for variant_op, values, _axes in per_variant[1:]:
             if tuple(value.type for value in values) != reference_types:
                 raise core.TransformError(
                     "batch_functions: switch group "
@@ -316,20 +376,54 @@ class _Merged:
                     f"'{per_variant[0][0].name}') — a select mux needs "
                     "identical result types; drop that op from switch_ops"
                 )
-        acc = list(per_variant[0][1])
-        for index, (variant_op, values) in enumerate(per_variant[1:], start=1):
+        # A switch class is ALWAYS mapped: every candidate is aligned to the
+        # mapped (N, *(1,), *per_row) shape (unmapped candidates — shared inputs
+        # — gain the leading function axis) and the mux result is MappedAxes((0,)).
+        target_row_rank = max(
+            value.type.rank - candidate_axes.count
+            for _op, values, result_axes in per_variant
+            for value, candidate_axes in zip(values, result_axes)
+        )
+        first_op, first_values, first_axes = per_variant[0]
+        acc = [
+            _align_switch_candidate(
+                value, candidate_axes, target_row_rank, self.n,
+                first_op.name, group.label,
+            )
+            for value, candidate_axes in zip(first_values, first_axes)
+        ]
+        for index, (variant_op, values, result_axes) in enumerate(
+            per_variant[1:], start=1
+        ):
             rows = info.rows[index]
-            for result_index, value in enumerate(values):
-                mask = _row_mask(
-                    rows, acc[result_index].type.rank, self.n
+            for result_index, (value, candidate_axes) in enumerate(
+                zip(values, result_axes)
+            ):
+                aligned = _align_switch_candidate(
+                    value, candidate_axes, target_row_rank, self.n,
+                    variant_op.name, group.label,
                 )
-                acc[result_index] = ops.select(
-                    _sym(mask), _sym(value), _sym(acc[result_index])
-                ).value
+                mask = _row_mask(rows, aligned.type.rank, self.n)
+                try:
+                    acc[result_index] = ops.select(
+                        _sym(mask), _sym(aligned), _sym(acc[result_index])
+                    ).value
+                except core.ShapeError as exc:
+                    raise core.TransformError(
+                        f"batch_functions: switch group {group.label!r} variants "
+                        f"'{variant_op.name}' and '{first_op.name}' produced "
+                        f"result shapes {tuple(aligned.type.shape)} and "
+                        f"{tuple(acc[result_index].type.shape)} that one select "
+                        "cannot mux — the variants of one switch class must "
+                        "agree on their per-row shape; drop that op from "
+                        "switch_ops"
+                    ) from exc
         self.switched.append(
             SwitchRecord(
                 group=group.label,
-                variants=tuple(variant_op.name for variant_op, _ in per_variant),
+                variants=tuple(
+                    variant_op.name for variant_op, _values, _axes in per_variant
+                ),
                 rows_per_variant=tuple(
                     tuple(rows) for rows in info.rows
                 ),
