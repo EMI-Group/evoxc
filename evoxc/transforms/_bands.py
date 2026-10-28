@@ -602,7 +602,7 @@ def emit_banded_graph(
 
     Raises:
         core.TransformError: an internal bookkeeping violation or a shape
-            problem while slicing/gathering/concanetenating band values.
+            problem while slicing/gathering/concatenating band values.
     """
     graph0 = graphs[0]
     n_functions = len(graphs)
