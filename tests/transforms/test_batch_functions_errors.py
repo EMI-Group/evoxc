@@ -482,7 +482,7 @@ def test_sparse_output_is_rejected_explicitly():
 # (a TransformError), so this is a message/reachability gap, not a silent
 # merge — the assertions below pin the DOCUMENTED contract.
 @pytest.mark.xfail(
-    strict=False,
+    strict=True,
     reason=(
         "BUG(evoxc): the registered-output-node guard (_check_output_nodes) "
         "is shadowed by out_axes normalization, so the documented message is "
