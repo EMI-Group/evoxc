@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 552" width="1200" height="552" role="img" aria-labelledby="evoxcHardwareTitle" aria-describedby="evoxcHardwareDesc">
+  <title id="evoxcHardwareTitle">evoxc — EvoX Compiler: hardware support</title>
+  <desc id="evoxcHardwareDesc">Hardware support in evoxc — EvoX Compiler: one traced graph goes through evoxc.trace, evoxc.lower, evoxc.compile, evoxc.load and evoxc.run onto the numpy interpreter (cpu only, the default backend) or onto a compiler adapter — IREE reaching llvm-cpu, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV; XLA reaching CUDA and ROCm through a user-provided PJRT plugin, and CPU only through a compiled test plugin (dashed); TVM reaching CPU end-to-end, with ROCm compile-only (dashed). Placement is physical: Tensor.to(device) is the only transfer primitive and run outputs stay on the device they ran on.</desc>
+
+  <defs>
+    <marker id="evoxcHardwareArrowViolet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c5cff"/>
+    </marker>
+    <marker id="evoxcHardwareArrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f0b429"/>
+    </marker>
+    <marker id="evoxcHardwareArrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <!-- page card -->
+  <rect x="0.75" y="0.75" width="1198.5" height="550.5" rx="14" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- header -->
+  <text x="24" y="46" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" letter-spacing="2.4" fill="#8b949e">HARDWARE SUPPORT</text>
+  <text x="1176" y="46" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#8b949e">one graph &#183; choose a backend and a device</text>
+
+  <!-- column captions -->
+  <text x="24" y="68" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" letter-spacing="1.5" fill="#8b949e" fill-opacity="0.8">PROGRAM</text>
+  <text x="300" y="68" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" letter-spacing="1.5" fill="#8b949e" fill-opacity="0.8">BACKEND</text>
+  <text x="850" y="68" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" letter-spacing="1.5" fill="#8b949e" fill-opacity="0.8">HARDWARE</text>
+
+  <!-- ============ left: your program ============ -->
+  <rect x="24" y="78" width="244" height="358" rx="12" fill="#161b22" stroke="#7c5cff" stroke-width="1.5"/>
+  <rect x="40" y="96" width="20" height="3" rx="1.5" fill="#7c5cff"/>
+  <text x="40" y="126" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">your program</text>
+  <text x="40" y="144" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">a traced graph &#8212; one object</text>
+  <path d="M 40 160 L 252 160" fill="none" stroke="#30363d" stroke-width="1"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#e6edf3">
+    <text x="40" y="186">@evoxc.defn</text>
+    <text x="40" y="208">evoxc.trace</text>
+    <text x="40" y="230">evoxc.lower</text>
+    <text x="40" y="252">evoxc.compile</text>
+    <text x="40" y="274">evoxc.load</text>
+    <text x="40" y="296">evoxc.run</text>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9.5" fill="#8b949e" text-anchor="end">
+    <text x="252" y="186">Defn</text>
+    <text x="252" y="208">Graph</text>
+    <text x="252" y="230">LoweredProgram</text>
+    <text x="252" y="252">CompiledArtifact</text>
+    <text x="252" y="274">Executable</text>
+    <text x="252" y="296">Tensor</text>
+  </g>
+
+  <path d="M 40 316 L 252 316" fill="none" stroke="#30363d" stroke-width="1"/>
+  <text x="40" y="340" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">the graph never changes &#8212;</text>
+  <text x="40" y="356" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">only the path it takes does.</text>
+  <text x="40" y="380" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#e6edf3">backend= &#183; device=</text>
+  <rect x="40" y="392" width="150" height="24" rx="12" fill="#0d1117" stroke="#7c5cff" stroke-width="1.5"/>
+  <text x="52" y="408" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#e6edf3">no implicit moves</text>
+
+  <!-- program -> every backend (one bus, violet) -->
+  <g fill="none" stroke="#7c5cff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 268 210 L 280 210"/>
+    <path d="M 280 116 L 280 398"/>
+    <path d="M 280 116 L 297 116" marker-end="url(#evoxcHardwareArrowViolet)"/>
+    <path d="M 280 210 L 297 210" marker-end="url(#evoxcHardwareArrowViolet)"/>
+    <path d="M 280 304 L 297 304" marker-end="url(#evoxcHardwareArrowViolet)"/>
+    <path d="M 280 398 L 297 398" marker-end="url(#evoxcHardwareArrowViolet)"/>
+  </g>
+
+  <!-- ============ middle: backend adapters ============ -->
+
+  <!-- numpy interpreter -->
+  <rect x="300" y="78" width="240" height="76" rx="12" fill="#161b22" stroke="#34d399" stroke-width="1.5"/>
+  <rect x="316" y="94" width="20" height="3" rx="1.5" fill="#34d399"/>
+  <text x="316" y="119" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">numpy interpreter</text>
+  <text x="316" y="136" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">cpu</text>
+  <text x="316" y="149" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">the default backend &#183; symbolic shapes</text>
+
+  <!-- IREE -->
+  <rect x="300" y="172" width="240" height="76" rx="12" fill="#161b22" stroke="#f0b429" stroke-width="1.5"/>
+  <rect x="316" y="188" width="20" height="3" rx="1.5" fill="#f0b429"/>
+  <text x="316" y="213" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">IREE</text>
+  <text x="316" y="230" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">llvm-cpu &#183; cuda</text>
+  <text x="316" y="243" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">rocm &#183; vulkan-spirv</text>
+
+  <!-- XLA -->
+  <rect x="300" y="266" width="240" height="76" rx="12" fill="#161b22" stroke="#f0b429" stroke-width="1.5"/>
+  <rect x="316" y="282" width="20" height="3" rx="1.5" fill="#f0b429"/>
+  <text x="316" y="307" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">XLA</text>
+  <text x="316" y="324" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">cuda &#183; rocm</text>
+  <text x="316" y="337" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">user-provided PJRT plugin .so</text>
+
+  <!-- TVM -->
+  <rect x="300" y="360" width="240" height="76" rx="12" fill="#161b22" stroke="#f0b429" stroke-width="1.5"/>
+  <rect x="316" y="376" width="20" height="3" rx="1.5" fill="#f0b429"/>
+  <text x="316" y="401" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">TVM</text>
+  <text x="316" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">cpu end-to-end</text>
+  <text x="316" y="431" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">rocm &#183; compile-only</text>
+
+  <!-- ============ right: hardware ============ -->
+
+  <!-- CPU -->
+  <rect x="850" y="78" width="326" height="76" rx="12" fill="#161b22" stroke="#34d399" stroke-width="1.5"/>
+  <rect x="866" y="94" width="20" height="3" rx="1.5" fill="#34d399"/>
+  <text x="866" y="119" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">CPU</text>
+  <text x="866" y="136" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">Device(&quot;cpu&quot;, 0)</text>
+  <text x="866" y="149" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">always available &#8212; the fallback</text>
+
+  <!-- NVIDIA CUDA -->
+  <rect x="850" y="172" width="326" height="76" rx="12" fill="#161b22" stroke="#34d399" stroke-width="1.5"/>
+  <rect x="866" y="188" width="20" height="3" rx="1.5" fill="#34d399"/>
+  <text x="866" y="213" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">NVIDIA CUDA</text>
+  <text x="866" y="230" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">Device(&quot;cuda&quot;, 0)</text>
+  <text x="866" y="243" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">cuda device kind</text>
+
+  <!-- AMD ROCm -->
+  <rect x="850" y="266" width="326" height="76" rx="12" fill="#161b22" stroke="#34d399" stroke-width="1.5"/>
+  <rect x="866" y="282" width="20" height="3" rx="1.5" fill="#34d399"/>
+  <text x="866" y="307" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">AMD ROCm</text>
+  <text x="866" y="324" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">Device(&quot;rocm&quot;, 0)</text>
+  <text x="866" y="337" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">rocm device kind &#183; hip is an alias</text>
+
+  <!-- Vulkan -->
+  <rect x="850" y="360" width="326" height="76" rx="12" fill="#161b22" stroke="#34d399" stroke-width="1.5"/>
+  <rect x="866" y="376" width="20" height="3" rx="1.5" fill="#34d399"/>
+  <text x="866" y="401" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">Vulkan</text>
+  <text x="866" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">Device(&quot;vulkan&quot;, 0)</text>
+  <text x="866" y="431" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">vulkan-spirv</text>
+
+  <!-- ============ backend -> hardware wires ============ -->
+
+  <!-- numpy interpreter: cpu only (green, direct) -->
+  <path d="M 542 110 L 842 110" fill="none" stroke="#34d399" stroke-width="1.5" stroke-linecap="round" marker-end="url(#evoxcHardwareArrowGreen)"/>
+
+  <!-- IREE: all four targets (amber bus, lane x=640) -->
+  <g fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 542 210 L 640 210"/>
+    <path d="M 640 90 L 640 392"/>
+    <path d="M 640 90 L 842 90" marker-end="url(#evoxcHardwareArrowAmber)"/>
+    <path d="M 640 196 L 842 196" marker-end="url(#evoxcHardwareArrowAmber)"/>
+    <path d="M 640 288 L 842 288" marker-end="url(#evoxcHardwareArrowAmber)"/>
+    <path d="M 640 392 L 842 392" marker-end="url(#evoxcHardwareArrowAmber)"/>
+  </g>
+
+  <!-- XLA: cuda + rocm solid, cpu dashed (lane x=700) -->
+  <g fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 542 304 L 700 304"/>
+    <path d="M 700 226 L 700 310"/>
+    <path d="M 700 226 L 842 226" marker-end="url(#evoxcHardwareArrowAmber)"/>
+    <path d="M 700 310 L 842 310" marker-end="url(#evoxcHardwareArrowAmber)"/>
+  </g>
+  <g fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 4">
+    <path d="M 700 130 L 700 226"/>
+    <path d="M 700 130 L 842 130"/>
+  </g>
+  <text x="836" y="122" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#8b949e">test plugin</text>
+
+  <!-- TVM: cpu solid, rocm dashed (lane x=760) -->
+  <g fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 542 398 L 760 398"/>
+    <path d="M 760 148 L 760 398"/>
+    <path d="M 760 148 L 842 148" marker-end="url(#evoxcHardwareArrowAmber)"/>
+  </g>
+  <g fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 4">
+    <path d="M 760 330 L 842 330"/>
+  </g>
+  <text x="836" y="345" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#8b949e">compile-only</text>
+
+  <!-- ============ legend + footer ============ -->
+  <path d="M 24 456 L 1176 456" fill="none" stroke="#30363d" stroke-width="1"/>
+
+  <path d="M 24 476 L 56 476" fill="none" stroke="#34d399" stroke-width="1.5" stroke-linecap="round" marker-end="url(#evoxcHardwareArrowGreen)"/>
+  <text x="66" y="480" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#e6edf3">numpy interpreter path</text>
+
+  <path d="M 250 476 L 282 476" fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" marker-end="url(#evoxcHardwareArrowAmber)"/>
+  <text x="292" y="480" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#e6edf3">compiler adapter path &#183; IREE &#183; XLA &#183; TVM</text>
+
+  <path d="M 610 476 L 642 476" fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="5 4"/>
+  <text x="652" y="480" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b949e">dashed = documented limit</text>
+
+  <path d="M 24 494 L 1176 494" fill="none" stroke="#30363d" stroke-width="1"/>
+  <text x="600" y="516" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" letter-spacing="0.6" fill="#8b949e">one graph &#183; cpu &#183; cuda &#183; rocm (alias hip) &#183; vulkan</text>
+  <text x="600" y="536" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e" fill-opacity="0.72">placement is physical &#8212; Tensor.to(device) is the only transfer, run outputs stay on their device, evoxc.devices() reports what this host has</text>
+</svg>

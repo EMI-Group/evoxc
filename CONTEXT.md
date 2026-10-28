@@ -147,6 +147,11 @@ The API is **functional**, split along evoxc's value model into three layers: `l
 
 ## Notes for Agents
 
-**README (`./README.md`) is the front page and a derived document.** It states the four defining properties (simple / minimal / explicit / compiler-neutral), the pipeline `defn → trace → Graph → transform → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor`, and the per-feature sections. Every claim and number in it must trace back to a `CONTEXT.md` (this file, `./evoxc/CONTEXT.md`) or a committed bench results file — when those change, update the README in the same change, and never introduce a number that is not in those sources. The "How evoxc compares" section is deliberately charitable (PyTorch/JAX/Nx are described by their own documented designs, no strawmen); keep it that way.
+**README (`./README.md`) is the front page and a derived document.**
+It states the four defining properties (simple / minimal / explicit / compiler-neutral), the pipeline `defn → trace → Graph → transform → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor`, and the per-feature sections.
+Every claim and number in it must trace back to a `CONTEXT.md` (this file, `./evoxc/CONTEXT.md`) or a committed bench results file — when those change, update the README in the same change, and never introduce a number that is not in those sources.
+The "How evoxc compares" section is concise prose with NO comparison table, deliberately charitable (PyTorch/JAX/Nx are described by their own documented designs, no strawmen) — keep it that way, and keep its "reach for something else / port it with EvoX Genesis" paragraph honest about what evoxc lacks.
+Its "Hardware support" section and its diagram `./assets/evoxc-hardware.svg` derive every per-backend and per-device claim (IREE, XLA via the PJRT plugin, TVM compile-only on ROCm, the numpy interpreter as the CPU fallback) from `./evoxc/backends/adapters/CONTEXT.md` — no new numbers, no unvalidated target, and StableHLO export is never drawn as a hardware path.
+Its "Acknowledgements" section credits **EvoX Genesis** (https://github.com/EMI-Group/genesis) as the sole tool the project is written with.
 
 **Naming.** The project is **EvoX Compiler**; `evoxc` is the short name, the Python package and the distribution name. The HuggingFace integration is the separate top-level package `evoxc_hf` (not shipped in the `evoxc` distribution).
