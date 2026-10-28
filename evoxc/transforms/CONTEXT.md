@@ -2,7 +2,7 @@
 
 ## Intent
 
-Frontend graph transformations: `vectorize` (the batching primitive), `vmap` (transparent function-side sugar over vectorize), and automatic differentiation (`grad` / `jvp` / `vjp`). Everything here is **graph → graph**: the result of any transform is an ordinary `Graph` of ordinary `evoxc.ops` ops — backends need NO vectorize/autodiff runtime support (binding: `../../CONTEXT.md` design principle 7, `../CONTEXT.md` transforms bullet).
+Frontend graph transformations: `vectorize` (the batching primitive), `vmap` (transparent function-side sugar over vectorize), `batch_functions` (merging N same-signature programs onto one static function axis), and automatic differentiation (`grad` / `jvp` / `vjp`). Everything here is **graph → graph**: the result of any transform is an ordinary `Graph` of ordinary `evoxc.ops` ops — backends need NO vectorize/autodiff runtime support (binding: `../../CONTEXT.md` design principle 7, `../CONTEXT.md` transforms bullet).
 
 There is deliberately **no execution here**: transforms never import `evoxc.backends` / `evoxc.pipeline` and never run tensors. When a transform is given a plain function or `Defn` (rather than a `Graph`), it cannot know input shapes without specs, so it returns a `TransformCallable` mapping `TensorSpec`s → transformed `Graph` (see **Spec-callable convention** below). Calling that callable with concrete `Tensor`s raises `TraceError` — explicit staging applies here as everywhere.
 
