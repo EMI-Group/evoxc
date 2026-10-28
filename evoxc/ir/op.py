@@ -8,7 +8,7 @@ region structure) lives in its ``OpDef`` in the registry (``op_defs``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .location import Location
 from .value import Use, Value
@@ -17,6 +17,34 @@ if TYPE_CHECKING:
     from .block import Block
     from .op_defs import OpDef
     from .region import Region
+
+
+# --- lazily cached registry callable -----------------------------------------
+#
+# ``op_defs`` lives in the same package and imports from it, so it cannot be
+# imported at module scope here (cycle). It must stay a LAZY import, but the
+# ``from .op_defs import opdef`` statement itself costs ~2 us per execution
+# (``importlib._handle_fromlist``), and ``Op.opdef`` is a hot path (the
+# ``batch_functions`` merge reads it for every op of every program).
+#
+# We therefore cache the FUNCTION REFERENCE on first use — never a lookup
+# RESULT: the registry may grow after import (the public ``register_opdef``
+# accepts new defs at runtime, and lazily-imported ``op_defs`` category
+# modules register theirs on first touch), so a ``name -> OpDef`` memo would
+# wrongly pin a negative result for a name that was looked up before it was
+# registered. The cache below only skips the repeated import statement.
+_OPDEF_LOOKUP: Optional[Callable[[str], "OpDef"]] = None
+
+
+def _load_opdef_lookup() -> Callable[[str], "OpDef"]:
+    """Return the registry ``opdef(name)`` callable, importing it on first use."""
+    global _OPDEF_LOOKUP
+    fn = _OPDEF_LOOKUP
+    if fn is None:
+        from .op_defs import opdef as fn
+
+        _OPDEF_LOOKUP = fn
+    return fn
 
 
 @dataclass
@@ -51,10 +79,16 @@ class Op:
 
     @property
     def opdef(self) -> "OpDef":
-        """The registered ``OpDef`` for this op's name."""
-        from .op_defs import opdef
+        """The registered ``OpDef`` for this op's name.
 
-        return opdef(self.name)
+        The registry is consulted on every access (op defs may be registered
+        at runtime); only the lazy import of the registry callable is cached
+        (see ``_load_opdef_lookup``).
+        """
+        fn = _OPDEF_LOOKUP
+        if fn is None:
+            fn = _load_opdef_lookup()
+        return fn(self.name)
 
     @property
     def effect(self) -> str:

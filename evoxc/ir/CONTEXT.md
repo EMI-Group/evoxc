@@ -255,6 +255,15 @@ in `printer.py`.
 - Unknown op name in `opdef()` → `KeyError`; duplicate registration →
   `ValueError`; version/format mismatch on deserialize → `PersistenceError`;
   structural violations → `VerificationError`.
+- `Op.opdef`/`Op.effect`/`Op.is_terminator` are hot read paths (the
+  `batch_functions` merge reads them for every op of every program). `op.py`
+  keeps the mandatory lazy `op_defs` import but caches only the registry
+  CALLABLE (`_OPDEF_LOOKUP`, populated by `_load_opdef_lookup` on first use) —
+  never a `name -> OpDef` result: the registry may grow after import
+  (`ir.register_opdef`, lazily-imported `op_defs` category modules), so a name
+  looked up before registration MUST resolve afterwards, and an unknown name
+  must still raise the registry's `KeyError`. `effect`/`is_terminator`
+  delegate to `opdef`, so one cache serves all three.
 - No `numpy()`, storage, device, or DLPack on any IR object — the IR is pure
   structure (values are references, not data).
 
