@@ -56,8 +56,17 @@ from evoxc.transforms._metadata import MappedAxes, UNMAPPED, ValueEnv
 
 @dataclass(frozen=True)
 class SwitchRecord:
-    """One switched position: `group`, `variants` (first-appearance order) and
-    `rows_per_variant` — the GLOBAL function indices using each variant."""
+    """One switch class emitted by `batch_functions`.
+
+    Attributes:
+        group: The merge group's name — the IR category name for a category
+            group, ``",".join(sorted(names))`` for an explicit op-name set.
+        variants: The variant names in first-appearance order (an op's IR
+            name; two variants differing only in attributes share a name).
+        rows_per_variant: The function indices using each variant, aligned
+            with `variants`; these are GLOBAL function indices, also when the
+            merge is banded.
+    """
 
     group: str
     variants: Tuple[str, ...]
@@ -68,14 +77,28 @@ class SwitchRecord:
 class BatchReport:
     """What one `batch_functions` merge actually did (the `batch_report`).
 
-    `value_classes` counts the REACHABLE classes emitted; `shared_classes` the
-    ones contributed by ≥2 functions; `stacked_constants` the constants whose
-    payloads differed; `output_muxes` the outputs muxed from ≥2 classes;
-    `emitted_ops` the merged entry block's ops minus the `return`.
-    `bands`/`band_sizes`/`band_strategy` describe the partition (`"flat"` for
-    `bands=None`, `"explicit"` for an int ``K``, `"auto"` for the automatic
-    one); `cost_estimate`/`flat_cost_estimate` are the static model's numbers
-    for the CHOSEN and the flat partition (``None`` unless the model ran).
+    Attributes:
+        n_functions: The number of merged functions (the function-axis length).
+        value_classes: The number of REACHABLE computation classes emitted.
+        shared_classes: How many of those were contributed by ≥2 functions.
+        switched: The switch classes, in emission order.
+        stacked_constants: How many constants were stacked into a per-row
+            constant (payloads differed across functions).
+        output_muxes: How many outputs were muxed from ≥2 distinct producing
+            classes.
+        emitted_ops: Ops in the merged entry block minus the `return`
+            terminator.
+        bands: The number of merge bands (1 for the flat merge and for a
+            single-band merge).
+        band_sizes: The band sizes, in band order (`(N,)` for a single-band
+            merge).
+        band_strategy: `"flat"` for `bands=None`, `"explicit"` for an int
+            ``K``, `"auto"` for the automatic partition.
+        cost_estimate: The static cost model's estimate for the CHOSEN
+            partition (``None`` unless the model ran, i.e. ``bands="auto"``).
+        flat_cost_estimate: The same model's estimate for the flat partition
+            (``None`` unless the model ran).
+
     With several bands the per-class counters are TOTALS across bands
     (`shared_classes` sums a band's classes contributed by ≥2 of THAT BAND's
     functions) and `emitted_ops` counts band slices and output concatenations.
@@ -170,14 +193,19 @@ def _align_switch_candidate(
 ) -> ir.Value:
     """Broadcast one switch candidate to the mapped ``(N, *(1,), *per_row)`` shape.
 
-    A switch class is MAPPED, so every candidate carries the leading function
-    axis before the `select` mux: an unmapped one is broadcast along a fresh
-    leading axis, trailing size-one padding goes up to the largest per-row rank
-    (the pointwise alignment convention), and a mapped candidate keeps its
-    values (with equal per-row ranks both are returned unchanged, so the mapped
-    path emits exactly the ops it always did). A non-leading-axes or
-    non-broadcastable candidate raises `core.TransformError` — never a raw
-    `ShapeError` from the `select`.
+    A switch class is MAPPED (its value genuinely depends on the function row),
+    so EVERY candidate must carry the leading function axis before the `select`
+    mux — an unmapped candidate (shared inputs ⇒ unmapped variants) is broadcast
+    along a fresh leading axis, with trailing size-one padding up to the largest
+    per-row rank among the candidates (the pointwise-rules alignment
+    convention). A mapped candidate keeps its values and only gains the padding;
+    with equal per-row ranks (the normal case) both are returned unchanged, so
+    the already-working mapped path emits exactly the same ops as before.
+
+    Raises:
+        core.TransformError: the candidate's batch axes are not leading, or its
+            shape cannot broadcast to the aligned switch shape — never a raw
+            `ShapeError` from the `select`.
     """
     if axes.axes != tuple(range(axes.count)):
         raise core.TransformError(
