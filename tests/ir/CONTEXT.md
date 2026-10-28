@@ -4,16 +4,18 @@
 
 pytest suite validating the `evoxc.ir` package (sibling — the contract lives in
 `../../evoxc/ir/CONTEXT.md`, read it before touching these tests). These tests are
-the executable spec of the IR layer: the op registry (canonical 105-op v1 set),
-`verify()` invariants, serialization round-trips/integrity, `pretty_print`
-golden output, the `Builder`, shape-inference hooks, and the SSA data model.
-803 tests, all fast (whole file set runs <2s).
+the executable spec of the IR layer: the op registry (canonical 119-op v1 set)
+and its lookup contract, `verify()` invariants, serialization
+round-trips/integrity, `pretty_print` golden output, the `Builder`,
+shape-inference hooks, and the SSA data model.
+862 tests, all fast (whole file set runs <2s).
 
 ## Test files
 
 | File | Covers |
 |---|---|
-| `test_registry.py` | 105-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
+| `test_registry.py` | 119-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
+| `test_opdef_lookup.py` | 12 tests — the op-def lookup contract and the cached-lookup-callable speed hook: unregistered name → `KeyError` with `has_opdef` False and no registry mutation, `register_opdef` returns its argument / rejects duplicates with `ValueError` (first registration wins) / is reversible, repeated `opdef` calls return the identical `OpDef`, `Op.opdef` is `ir.opdef(op.name)` for every op of a traced graph, `op._OPDEF_LOOKUP` caches only the registry callable (never a name→`OpDef` mapping), NO negative memo (an `Op` built and looked up before registration raises then resolves after it, and raises again once removed), and an extra registered `OpDef` disturbs neither tracing nor `verify()` |
 | `test_verify.py` | valid modules + one test per violation class from `verify()`'s docstring: module/function/region/op/SSA/use-bookkeeping/shape_fn-agreement/attr-schema violations, location-annotated messages, TypeError on non-Module |
 | `test_serialize.py` | payload schema, multi-feature round-trips (symbolic dims, constants as base64 npy, all effect kinds, if/while regions, multi-function + `call`), original id preservation, fast-forwarded counters, tamper detection (sha256), version/format rejection (PersistenceError) |
 | `test_pretty_print.py` | exact-string goldens: SSA headers, %N renumbering, attribute rendering (sorted keys, `?` for None, ndarray summaries), locations, multi-arg header wrapping, nested `^bbN` region labels |
@@ -37,12 +39,14 @@ Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
 
 ## Notes for agents
 
-- **Registry is global — never leave test-only OpDefs registered.** Two tests
-  in `test_verify.py` need fake ops (`_test_halt`, `_test_no_rule`); they are
-  registered by the `test_only_opdefs` fixture, which restores the registry to
-  its exact pre-fixture state in a `finally` (pops from `evoxc.ir.op_defs._REGISTRY`).
-  Import-time registration broke `test_registry.py`'s canonical-set assertions
-  when the two files ran in one pytest process.
+- **Registry is global — never leave test-only OpDefs registered.** `test_verify.py`
+  needs two fake ops (`_test_halt`, `_test_no_rule`, via its `test_only_opdefs`
+  fixture) and `test_opdef_lookup.py` registers one throwaway def per test (via
+  its `throwaway_opdef` fixture / local `try`+`finally` blocks); both restore
+  `evoxc.ir.op_defs._REGISTRY` to its exact pre-fixture state in a `finally`
+  (popping the test-only names). Import-time registration broke
+  `test_registry.py`'s canonical-set assertions when the files ran in one
+  pytest process.
 - Test modules must NOT import each other's helpers; keep fixtures/helpers local
   to each file (avoids cross-file coupling and ordering hazards).
 - The dominant pattern for `test_verify.py` violations: build a valid module via
