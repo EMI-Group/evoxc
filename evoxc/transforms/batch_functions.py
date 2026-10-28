@@ -38,13 +38,13 @@ and the static cost model behind `bands="auto"`.
 
 `alignment=` chooses how a `switch_ops` position's class is picked — the only
 positions where two programs can place DIFFERENT ops at one skeleton.
-`"occurrence"` (the default) keeps the k-th distinct variant of a program at the
-k-th occurrence class, i.e. the pre-`alignment` output byte for byte;
-`"variant"` lets a variant an existing class already holds win over the
-occurrence-position class (sibling branches like `(x+1) * (x-1)` vs
-`(x-1) * (x+1)` then get one class per op instead of two mixed classes), and
-`"auto"` is variant-first with the occurrence fallback plus a last-resort reuse
-of any other free class so it never creates more classes than `"occurrence"`.
+`"variant"` (the default) lets a variant an existing class already holds win
+over the occurrence-position class (sibling branches like `(x+1) * (x-1)` vs
+`(x-1) * (x+1)` then get one class per op instead of two mixed classes);
+`"occurrence"` keeps the k-th distinct variant of a program at the k-th
+occurrence class, i.e. the byte-identical legacy output; `"auto"` is
+variant-first with the occurrence fallback plus a last-resort reuse of any other
+free class so it never creates more classes than `"occurrence"`.
 It is a PURE PERFORMANCE heuristic — see `_merge._align_class` — so every mode
 produces bit-identical numbers; constants are never aligned (they stack by
 occurrence, which is what folds N payloads into one stacked constant).
@@ -67,6 +67,7 @@ from evoxc.transforms import batching
 from evoxc.transforms import _bands
 from evoxc.transforms._emit import BatchReport, SwitchRecord, emit_merged_graph
 from evoxc.transforms._merge import (
+    DEFAULT_ALIGNMENT,
     MergeDAG,
     MergeGroup,
     _opdef,
@@ -106,7 +107,7 @@ def batch_functions(
     *,
     switch_ops: Any = None,
     bands: Any = None,
-    alignment: Any = "occurrence",
+    alignment: Any = DEFAULT_ALIGNMENT,
 ) -> Any:
     """Merge N same-signature programs into one graph with a function axis.
 
@@ -162,19 +163,19 @@ def batch_functions(
             output) — `core.TransformError` otherwise.
         alignment: how a `switch_ops` position's CLASS is chosen — i.e. which
             emitted op a program's op joins when two programs put different ops
-            at one skeleton. `"occurrence"` (default) = the k-th distinct
-            variant of a program at a skeleton joins the k-th class created for
-            that skeleton (byte-identical to the output without this option);
-            `"variant"` = a variant an EXISTING class of that skeleton already
-            holds (and which does not yet hold this program) wins over the
-            occurrence-position class, so sibling branches such as
-            ``(x+1) * (x-1)`` vs ``(x-1) * (x+1)`` get one class per op instead
-            of two mixed classes; `"auto"` = variant-first with the
-            occurrence-position fallback, plus a last-resort reuse of any other
-            free class of the skeleton, so it never creates more classes than
-            `"occurrence"`. Case-insensitive. Only switch-group positions are
-            aligned: non-switched positions have one variant per skeleton by
-            construction and CONSTANTS stack by occurrence (payload deliberately
+            at one skeleton. `"variant"` (default) = a variant an EXISTING class
+            of that skeleton already holds (and which does not yet hold this
+            program) wins over the occurrence-position class, so sibling
+            branches such as ``(x+1) * (x-1)`` vs ``(x-1) * (x+1)`` get one
+            class per op instead of two mixed classes; `"occurrence"` = the k-th
+            distinct variant of a program at a skeleton joins the k-th class
+            created for that skeleton (the byte-identical legacy output);
+            `"auto"` = variant-first with the occurrence-position fallback, plus
+            a last-resort reuse of any other free class of the skeleton, so it
+            never creates more classes than `"occurrence"`. Case-insensitive.
+            Only switch-group positions are aligned: non-switched positions have
+            one variant per skeleton by construction and CONSTANTS stack by
+            occurrence (payload deliberately
             outside the identity), which is what folds N distinct payloads into
             ONE stacked constant. The class assignment is a PURE PERFORMANCE
             heuristic — every assignment is row-correct because a class's
@@ -245,7 +246,7 @@ def batch_functions(
 
 
 def _batch_callables(
-    fns, args, axes, out_axes, groups, bands=None, alignment="occurrence"
+    fns, args, axes, out_axes, groups, bands=None, alignment=DEFAULT_ALIGNMENT
 ) -> Graph:
     """`TransformCallable` body: strip → trace every fn once → merge.
 
@@ -581,7 +582,7 @@ def _merge_graphs(
     out_entries: Sequence[Optional[int]],
     groups: Sequence[MergeGroup],
     bands: Any = None,
-    alignment: str = "occurrence",
+    alignment: str = DEFAULT_ALIGNMENT,
 ) -> Graph:
     """Validate the merge and build the merged graph (the two-phase core).
 
