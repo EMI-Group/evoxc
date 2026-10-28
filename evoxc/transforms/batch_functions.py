@@ -36,6 +36,19 @@ input slicing.
 BYTE-IDENTICAL to the pre-`bands` output; see `_bands` for the partition rules
 and the static cost model behind `bands="auto"`.
 
+`alignment=` chooses how a `switch_ops` position's class is picked — the only
+positions where two programs can place DIFFERENT ops at one skeleton.
+`"occurrence"` (the default) keeps the k-th distinct variant of a program at the
+k-th occurrence class, i.e. the pre-`alignment` output byte for byte;
+`"variant"` lets a variant an existing class already holds win over the
+occurrence-position class (sibling branches like `(x+1) * (x-1)` vs
+`(x-1) * (x+1)` then get one class per op instead of two mixed classes), and
+`"auto"` is variant-first with the occurrence fallback plus a last-resort reuse
+of any other free class so it never creates more classes than `"occurrence"`.
+It is a PURE PERFORMANCE heuristic — see `_merge._align_class` — so every mode
+produces bit-identical numbers; constants are never aligned (they stack by
+occurrence, which is what folds N payloads into one stacked constant).
+
 The returned `Graph` carries `graph.batch_report` — a `BatchReport` describing
 what the merge did (`BatchReport` / `SwitchRecord` are re-exported here from
 `_emit`, where the report is assembled).
@@ -58,6 +71,7 @@ from evoxc.transforms._merge import (
     MergeGroup,
     _opdef,
     build_merge_dag,
+    normalize_alignment,
     parse_switch_groups,
 )
 from evoxc.transforms._wrappers import TransformCallable
@@ -92,6 +106,7 @@ def batch_functions(
     *,
     switch_ops: Any = None,
     bands: Any = None,
+    alignment: Any = "occurrence",
 ) -> Any:
     """Merge N same-signature programs into one graph with a function axis.
 
@@ -145,6 +160,27 @@ def batch_functions(
             v1 restriction: `bands` other than `None` requires `out_axes=0` for
             every tensor output (a per-band value cannot be one unmapped
             output) — `core.TransformError` otherwise.
+        alignment: how a `switch_ops` position's CLASS is chosen — i.e. which
+            emitted op a program's op joins when two programs put different ops
+            at one skeleton. `"occurrence"` (default) = the k-th distinct
+            variant of a program at a skeleton joins the k-th class created for
+            that skeleton (byte-identical to the output without this option);
+            `"variant"` = a variant an EXISTING class of that skeleton already
+            holds (and which does not yet hold this program) wins over the
+            occurrence-position class, so sibling branches such as
+            ``(x+1) * (x-1)`` vs ``(x-1) * (x+1)`` get one class per op instead
+            of two mixed classes; `"auto"` = variant-first with the
+            occurrence-position fallback, plus a last-resort reuse of any other
+            free class of the skeleton, so it never creates more classes than
+            `"occurrence"`. Case-insensitive. Only switch-group positions are
+            aligned: non-switched positions have one variant per skeleton by
+            construction and CONSTANTS stack by occurrence (payload deliberately
+            outside the identity), which is what folds N distinct payloads into
+            ONE stacked constant. The class assignment is a PURE PERFORMANCE
+            heuristic — every assignment is row-correct because a class's
+            operands are shared by slot equality — so `alignment` can never
+            change the numbers, only the op/select count. Composes with `bands`
+            (per-band class DAGs use the same alignment).
 
     Returns:
         * `Graph` when given `Graph`s — the merged graph, with
@@ -157,13 +193,15 @@ def batch_functions(
     Raises:
         TypeError: `fns` is not a non-empty sequence, mixes Graphs with
             callables, holds an unsupported element, `switch_ops` is
-            malformed, or `bands` is a bool / an unsupported type.
+            malformed, `bands` is a bool / an unsupported type, or `alignment`
+            is not a string.
         core.TraceError: mismatched input/output tree structure or static
             leaves between functions.
         core.DTypeError / core.ShapeError / core.DeviceError: per-leaf dtype /
             shape / device mismatch between functions.
         core.TransformError: invalid `axes`/`out_axes` entries, an unknown
-            `bands` value or a band count outside ``1..N``, `bands` combined
+            `bands` value or a band count outside ``1..N``, an unknown
+            `alignment` spelling, `bands` combined
             with an `out_axes=None` tensor output, an op without a batching
             rule in any program (naming the function index), region-bearing
             control flow, a registered output pytree node with static leaves
@@ -176,9 +214,11 @@ def batch_functions(
         y = evoxc.evaluate(...)  # row 0 == sin(x), row 1 == cos(x)
     """
     items, kind = _validate_fns(fns)
-    # `bands` is validated BEFORE any tracing (the callable path included), so a
-    # bad band count can never leave half-traced programs behind.
+    # `bands` and `alignment` are validated BEFORE any tracing (the callable
+    # path included), so a bad band count or alignment spelling can never leave
+    # half-traced programs behind.
     _bands.normalize_bands(bands, len(items))
+    alignment = normalize_alignment(alignment)
     groups = parse_switch_groups(switch_ops)
     if kind == "graph":
         try:
@@ -189,10 +229,12 @@ def batch_functions(
             ) from exc
         entries = batching._tensor_input_axes(items[0], normalized)
         out_entries = _normalize_out_axes(items[0], out_axes)
-        return _merge_graphs(items, entries, out_entries, groups, bands)
+        return _merge_graphs(
+            items, entries, out_entries, groups, bands, alignment
+        )
     return TransformCallable(
         build=lambda *args: _batch_callables(
-            items, args, axes, out_axes, groups, bands
+            items, args, axes, out_axes, groups, bands, alignment
         ),
         kind="batch_functions",
         doc=_BATCH_FUNCTIONS_CALLABLE_DOC,
@@ -202,7 +244,9 @@ def batch_functions(
 # --- callable path ----------------------------------------------------------
 
 
-def _batch_callables(fns, args, axes, out_axes, groups, bands=None) -> Graph:
+def _batch_callables(
+    fns, args, axes, out_axes, groups, bands=None, alignment="occurrence"
+) -> Graph:
     """`TransformCallable` body: strip → trace every fn once → merge.
 
     Axes are normalized against the BATCHED argument specs and the leading
@@ -216,7 +260,7 @@ def _batch_callables(fns, args, axes, out_axes, groups, bands=None) -> Graph:
     )
     graphs = [trace(fn, *stripped) for fn in fns]
     out_entries = _normalize_out_axes(graphs[0], out_axes)
-    return _merge_graphs(graphs, entries, out_entries, groups, bands)
+    return _merge_graphs(graphs, entries, out_entries, groups, bands, alignment)
 
 
 # --- fns validation ---------------------------------------------------------
@@ -537,6 +581,7 @@ def _merge_graphs(
     out_entries: Sequence[Optional[int]],
     groups: Sequence[MergeGroup],
     bands: Any = None,
+    alignment: str = "occurrence",
 ) -> Graph:
     """Validate the merge and build the merged graph (the two-phase core).
 
@@ -550,6 +595,10 @@ def _merge_graphs(
     partition (`K=1`, or an auto resolution that keeps every function together)
     delegates to the flat emitter too, so its graph is byte-identical to
     `bands=None` — only the report's band fields differ.
+
+    `alignment` is the canonical `_merge` spelling; it reaches EVERY class DAG
+    this merge builds (the flat one, the per-band ones, and the cost model's
+    per-band DAGs, so `bands="auto"` estimates the graph it actually emits).
     """
     for index, graph in enumerate(graphs):
         _program_function(graph, index)
@@ -559,7 +608,7 @@ def _merge_graphs(
     n_functions = len(graphs)
     strategy, band_count = _bands.normalize_bands(bands, n_functions)
     if strategy == _bands.BAND_STRATEGY_FLAT:
-        dag: MergeDAG = build_merge_dag(graphs, groups)
+        dag: MergeDAG = build_merge_dag(graphs, groups, alignment)
         return emit_merged_graph(graphs, dag, entries, out_entries, groups)
     # A per-band value cannot be a single unmapped output; checked before the
     # partition so `bands=1` obeys the same contract as any other band count.
@@ -567,12 +616,12 @@ def _merge_graphs(
     cost_estimate = flat_cost_estimate = None
     if strategy == _bands.BAND_STRATEGY_AUTO:
         partition, cost_estimate, flat_cost_estimate = _bands.plan_auto_partition(
-            graphs, entries, groups
+            graphs, entries, groups, alignment
         )
     else:
         partition = _bands.even_partition(n_functions, band_count)
     if len(partition) == 1:
-        dag = build_merge_dag(graphs, groups)
+        dag = build_merge_dag(graphs, groups, alignment)
         graph = emit_merged_graph(graphs, dag, entries, out_entries, groups)
         report = graph.batch_report
         report.bands = 1
@@ -590,4 +639,5 @@ def _merge_graphs(
         strategy,
         cost_estimate,
         flat_cost_estimate,
+        alignment,
     )

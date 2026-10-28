@@ -35,6 +35,31 @@ different constants) inside ONE program land in SEPARATE classes, while an
 exact repeat reuses one class. Each class therefore holds at most one distinct
 variant per program.
 
+``alignment`` (`ALIGNMENTS`) chooses HOW that class is picked for a position
+covered by a `switch_ops` merge group — the only positions where two programs
+can put DIFFERENT variants at one skeleton: ``"occurrence"`` (default) = the
+class at the program's occurrence index, created on demand (byte-identical
+output); ``"variant"`` = a class of the skeleton that already holds this
+variant and does not yet hold this program, else the occurrence class;
+``"auto"`` = ``"variant"`` plus a last-resort reuse of any other free class of
+the skeleton before creating one.
+
+Constants are DELIBERATELY excluded (`_align_class` aligns ``("group", ...)``
+identities only): a constant class stacks its members' per-row payloads by
+OCCURRENCE, which is what folds N distinct GP weight payloads into ONE stacked
+``(N, ...)`` constant — variant alignment would explode them into N constants
+and undo the batching.
+
+**Correctness invariant (binding).** Every class assignment is ROW-CORRECT: a
+class's operands are shared BY SLOT EQUALITY (the skeleton includes the operand
+slots), so all contributors' operands are the same emitted values and the class
+value at row p is that row's variant applied to p's own operands. `alignment`
+is therefore a PURE PERFORMANCE HEURISTIC (op count, select count), never a
+semantic choice — it cannot change any number. The ONE hard rule: a second
+distinct-variant op of the same program must never join one class (its `select`
+mask would overwrite row p), hence every lookup below filters on "does not
+already hold this program".
+
 `_opdef` memoizes the IR op-def lookup (the lazy `evoxc.ir.op_defs` import) for
 the per-op hot path; each op's `variant_id` is computed ONCE and carried on its
 contributor tuple so emission never recomputes it.
@@ -350,8 +375,11 @@ class ClassInfo:
     Attributes:
         class_id: Monotonically increasing class id.
         skeleton: ``(identity, operand_slots, result_types)``.
-        occurrence: The class's occurrence index within its skeleton (see the
-            module docstring).
+        occurrence: The occurrence index (within its skeleton) that CREATED the
+            class — under ``alignment="occurrence"`` that is exactly the class's
+            position; an aligned mode may reuse a class created at another
+            occurrence, so treat it as creation metadata only (see the module
+            docstring).
         result_count: Number of results of the contributing ops.
         contributors: ``(program_index, op, variant)`` triples, in scan order
             (one per program per distinct variant; an exact repeat within one
@@ -461,8 +489,150 @@ def _identity(op: ir.Op, variant: tuple, groups: Sequence[MergeGroup]) -> tuple:
     return variant
 
 
-def build_merge_dag(graphs: Sequence[Graph], groups: Sequence[MergeGroup]) -> MergeDAG:
-    """Build the class DAG of `graphs` under the merge `groups`.
+# --- class alignment (`alignment=`) -----------------------------------------
+
+
+#: Default: a program's k-th distinct variant at a skeleton goes to that
+#: skeleton's k-th occurrence class (byte-identical to the pre-`alignment`
+#: output).
+ALIGNMENT_OCCURRENCE = "occurrence"
+#: Variant-first: a class that already holds this variant (and not this program)
+#: wins over the occurrence-position class.
+ALIGNMENT_VARIANT = "variant"
+#: Variant-first plus a last-resort reuse of any other free class of the
+#: skeleton before creating one (never creates a class `"variant"` would reuse).
+ALIGNMENT_AUTO = "auto"
+
+#: Every accepted `alignment` spelling, in preference order (index 0 = default).
+ALIGNMENTS: Tuple[str, ...] = (
+    ALIGNMENT_OCCURRENCE,
+    ALIGNMENT_VARIANT,
+    ALIGNMENT_AUTO,
+)
+DEFAULT_ALIGNMENT = ALIGNMENT_OCCURRENCE
+
+
+def normalize_alignment(alignment: Any) -> str:
+    """Normalize `alignment` into one of `ALIGNMENTS` (case-insensitive,
+    whitespace-stripped), rejecting anything else LOUDLY.
+
+    Raises:
+        TypeError: `alignment` is not a string.
+        core.TransformError: `alignment` is not an accepted spelling.
+    """
+    if not isinstance(alignment, str):
+        raise TypeError(
+            "batch_functions: alignment must be a string, one of "
+            f"{list(ALIGNMENTS)}; got {type(alignment).__name__}"
+        )
+    normalized = alignment.strip().lower()
+    if normalized not in ALIGNMENTS:
+        raise core.TransformError(
+            f"batch_functions: unknown alignment {alignment!r}; accepted forms "
+            f"are {list(ALIGNMENTS)}"
+        )
+    return normalized
+
+
+@dataclass
+class _SkeletonClasses:
+    """Class bookkeeping of ONE skeleton, shared by every program of a merge.
+
+    Attributes:
+        buckets: ``occurrence index -> class ids at that position``, in creation
+            order (a list because the aligned modes can append a second class
+            there when the first already holds this program).
+        class_ids: Every class id of this skeleton, in creation order (the
+            ``"auto"`` last-resort scan order).
+        variant_classes: ``variant -> class ids holding it``, in creation order
+            (the aligned modes' variant lookup); populated for `switch_ops`
+            positions only, the sole places two programs can differ.
+    """
+
+    buckets: Dict[int, List[int]] = field(default_factory=dict)
+    class_ids: List[int] = field(default_factory=list)
+    variant_classes: Dict[tuple, List[int]] = field(default_factory=dict)
+
+
+def _free_class(
+    candidate_ids: Sequence[int], dag: MergeDAG, program_index: int
+) -> Optional[int]:
+    """The first candidate class that does NOT already hold `program_index`.
+
+    Contributors are appended in non-decreasing program order (programs are
+    scanned in order), so a class holds the current program iff its LAST
+    contributor has this program index — one comparison, never a scan.
+    """
+    for class_id in candidate_ids:
+        contributors = dag.classes[class_id].contributors
+        if not contributors or contributors[-1][0] != program_index:
+            return class_id
+    return None
+
+
+def _align_class(
+    classes: _SkeletonClasses,
+    skeleton: tuple,
+    variant: tuple,
+    occurrence: int,
+    n_results: int,
+    dag: MergeDAG,
+    program_index: int,
+    alignment: str,
+) -> int:
+    """Pick (creating it when needed) the class for one op of `program_index`.
+
+    Order of preference (every choice is row-correct — see the module docstring's
+    correctness invariant; this is a PURE performance heuristic):
+      1. `alignment` != ``"occurrence"`` AND the identity is a `switch_ops` MERGE
+         GROUP: a class of this skeleton that already holds `variant` and does
+         not yet hold `program_index`. Constants are excluded by construction
+         (`switchable`) and exact-structure identities need no alignment (every
+         program there has the same variant).
+      2. The occurrence bucket's first class free for this program.
+      3. ``"auto"`` only: any other free class of the skeleton (a last resort
+         that only ever REDUCES the class count relative to ``"variant"``).
+      4. A NEW class (appended to the occurrence bucket and to `class_ids`).
+    """
+    switchable = skeleton[0][0] == "group"
+    if switchable and alignment != ALIGNMENT_OCCURRENCE:
+        class_id = _free_class(
+            classes.variant_classes.get(variant, ()), dag, program_index
+        )
+        if class_id is not None:
+            return class_id
+    bucket = classes.buckets.get(occurrence)
+    if bucket is None:
+        bucket = classes.buckets[occurrence] = []
+    class_id = _free_class(bucket, dag, program_index)
+    if class_id is None and switchable and alignment == ALIGNMENT_AUTO:
+        class_id = _free_class(classes.class_ids, dag, program_index)
+    if class_id is None:
+        class_id = len(dag.classes)
+        bucket.append(class_id)
+        classes.class_ids.append(class_id)
+        dag.classes[class_id] = ClassInfo(
+            class_id=class_id,
+            skeleton=skeleton,
+            occurrence=occurrence,
+            result_count=n_results,
+        )
+        dag.order.append(class_id)
+    if switchable:
+        ids = classes.variant_classes.get(variant)
+        if ids is None:
+            classes.variant_classes[variant] = [class_id]
+        elif class_id not in ids:
+            ids.append(class_id)
+    return class_id
+
+
+def build_merge_dag(
+    graphs: Sequence[Graph],
+    groups: Sequence[MergeGroup],
+    alignment: str = DEFAULT_ALIGNMENT,
+) -> MergeDAG:
+    """Build the class DAG of `graphs` under the merge `groups` and `alignment`.
 
     Programs are scanned in order, each program's ops in program order
     (topological by construction), skipping the `return` terminator; the
@@ -470,22 +640,28 @@ def build_merge_dag(graphs: Sequence[Graph], groups: Sequence[MergeGroup]) -> Me
     output slots is computed (`MergeDAG.reachable`), a valid emission order
     (with identical programs it reduces to the original program order).
 
+    `alignment` (`normalize_alignment`'s canonical spelling) only affects
+    positions covered by a `switch_ops` merge group — see `_align_class` for the
+    preference order and the row-correctness invariant that makes it a pure
+    performance heuristic.
+
     The caller is responsible for the structural/contract validation (identical
     signatures, single-function single-block programs, every op batchable) and
     for the block-arg-count check — this function assumes them.
     """
+    alignment = normalize_alignment(alignment)
     dag = MergeDAG()
-    #: ``skeleton -> class ids indexed by occurrence`` (global, one hash lookup
-    #: per op: the per-program `own` map below is keyed by the skeleton too).
-    class_keys: Dict[tuple, List[int]] = {}
+    #: ``skeleton -> its class bookkeeping`` (global, one hash lookup per op: the
+    #: per-program `own` map below is keyed by the skeleton too).
+    skeleton_classes: Dict[tuple, _SkeletonClasses] = {}
     for program_index, graph in enumerate(graphs):
         function = graph.module.functions[0]
         block = function.entry_block
         arg_ids = {id(argument): i for i, argument in enumerate(block.arguments)}
         terminator = block.terminator
         slots: Dict[int, Tuple[int, int]] = {}
-        #: ``skeleton -> (variant -> class_id, variants seen, global class ids)``.
-        own: Dict[tuple, Tuple[Dict[tuple, int], List[tuple], List[int]]] = {}
+        #: ``skeleton -> (variant -> class_id, variants seen, classes)``.
+        own: Dict[tuple, Tuple[Dict[tuple, int], List[tuple], _SkeletonClasses]] = {}
         for op in block.ops:
             if _opdef(op.name).is_terminator:
                 continue
@@ -504,27 +680,25 @@ def build_merge_dag(graphs: Sequence[Graph], groups: Sequence[MergeGroup]) -> Me
             skeleton = (identity, operand_slots, result_types)
             entry = own.get(skeleton)
             if entry is None:
-                class_ids = class_keys.get(skeleton)
-                if class_ids is None:
-                    class_ids = class_keys[skeleton] = []
-                own[skeleton] = entry = ({}, [], class_ids)
-            by_variant, variants_seen, class_ids = entry
+                classes = skeleton_classes.get(skeleton)
+                if classes is None:
+                    classes = skeleton_classes[skeleton] = _SkeletonClasses()
+                own[skeleton] = entry = ({}, [], classes)
+            by_variant, variants_seen, classes = entry
             class_id = by_variant.get(variant)
             if class_id is None:
                 occurrence = len(variants_seen)
                 variants_seen.append(variant)
-                if occurrence < len(class_ids):
-                    class_id = class_ids[occurrence]
-                else:
-                    class_id = len(dag.classes)
-                    class_ids.append(class_id)
-                    dag.classes[class_id] = ClassInfo(
-                        class_id=class_id,
-                        skeleton=skeleton,
-                        occurrence=occurrence,
-                        result_count=len(op.results),
-                    )
-                    dag.order.append(class_id)
+                class_id = _align_class(
+                    classes,
+                    skeleton,
+                    variant,
+                    occurrence,
+                    len(op.results),
+                    dag,
+                    program_index,
+                    alignment,
+                )
                 by_variant[variant] = class_id
             info = dag.classes[class_id]
             info.contributors.append((program_index, op, variant))

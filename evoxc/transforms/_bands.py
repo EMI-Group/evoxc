@@ -323,10 +323,17 @@ def _row_dependent(
 
 
 def band_cost(
-    graphs: Sequence[Graph], entries: Sequence[Optional[int]], groups: Sequence[Any]
+    graphs: Sequence[Graph],
+    entries: Sequence[Optional[int]],
+    groups: Sequence[Any],
+    alignment: str = _merge.DEFAULT_ALIGNMENT,
 ) -> float:
-    """The model's cost of merging `graphs` as ONE band."""
-    dag = build_merge_dag(graphs, groups)
+    """The model's cost of merging `graphs` as ONE band.
+
+    `alignment` is the `batch_functions` class-alignment spelling the merge will
+    use, so the model prices the class DAG the emitter actually builds.
+    """
+    dag = build_merge_dag(graphs, groups, alignment)
     dependent = _row_dependent(dag, entries)
     size = len(graphs)
     total = 0.0
@@ -353,11 +360,14 @@ def partition_cost(
     partition: Sequence[Sequence[int]],
     entries: Sequence[Optional[int]],
     groups: Sequence[Any],
+    alignment: str = _merge.DEFAULT_ALIGNMENT,
 ) -> float:
     """The model's cost of a whole partition (bands + per-band overhead)."""
     total = 0.0
     for rows in partition:
-        total += band_cost([graphs[index] for index in rows], entries, groups)
+        total += band_cost(
+            [graphs[index] for index in rows], entries, groups, alignment
+        )
     if len(partition) > 1:
         total += BAND_OVERHEAD * len(partition)
     return total
@@ -367,6 +377,7 @@ def plan_auto_partition(
     graphs: Sequence[Graph],
     entries: Sequence[Optional[int]],
     groups: Sequence[Any],
+    alignment: str = _merge.DEFAULT_ALIGNMENT,
 ) -> Tuple[Tuple[Tuple[int, ...], ...], float, float]:
     """Choose the cheapest candidate partition (`bands="auto"`).
 
@@ -403,7 +414,10 @@ def plan_auto_partition(
             continue
         seen.add(candidate)
         unique.append(candidate)
-    costs = [partition_cost(graphs, cand, entries, groups) for cand in unique]
+    costs = [
+        partition_cost(graphs, cand, entries, groups, alignment)
+        for cand in unique
+    ]
     best = 0
     for index in range(1, len(costs)):
         if costs[index] < costs[best]:
@@ -581,6 +595,7 @@ def emit_banded_graph(
     strategy: str,
     cost_estimate: Optional[float] = None,
     flat_cost_estimate: Optional[float] = None,
+    alignment: str = _merge.DEFAULT_ALIGNMENT,
 ) -> Graph:
     """Build the merged graph of a multi-band merge (and attach `batch_report`).
 
@@ -596,6 +611,11 @@ def emit_banded_graph(
         cost_estimate: The model's estimate for `partition`, when the model ran.
         flat_cost_estimate: The model's estimate for the flat partition, when
             the model ran.
+        alignment: The `batch_functions` class-alignment spelling — every band's
+            class DAG is built with it (per-band class DAGs align exactly like
+            the flat one; `SwitchRecord.rows_per_variant` stays in GLOBAL
+            function indices because it is mapped through the band's row map,
+            which is independent of the class assignment).
 
     Returns:
         The merged `Graph`, with `graph.batch_report` set.
@@ -632,7 +652,7 @@ def emit_banded_graph(
     with _suppress_location_capture(), with_builder(builder):
         for rows in partition:
             band_graphs = [graphs[index] for index in rows]
-            band_dag = build_merge_dag(band_graphs, groups)
+            band_dag = build_merge_dag(band_graphs, groups, alignment)
             band_size = len(rows)
             state = _emit._Merged(
                 band_graphs,
