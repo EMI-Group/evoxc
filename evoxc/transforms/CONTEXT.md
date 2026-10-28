@@ -159,9 +159,10 @@ Transforms are graph→graph, but `vmap(f)/batch_functions(fns)/grad(f)/jvp(f)/v
 | `vectorize.py` | public `vectorize` + axes validation/normalization |
 | `batching.py` | batching rule registry + core vectorize rewriting algorithm |
 | `vmap.py` | public `vmap`, spec derivation (shared `_derive_unvectorized_args_and_entries`), output-axis rearrangement |
-| `batch_functions.py` | public `batch_functions` + `BatchReport`/`SwitchRecord` re-exports, `fns`/`axes`/`out_axes`/`switch_ops` validation, cross-function contract + per-op rule checks, spec-callable path |
+| `batch_functions.py` | public `batch_functions` + `BatchReport`/`SwitchRecord` re-exports, `fns`/`axes`/`out_axes`/`switch_ops`/`bands` validation, cross-function contract + per-op rule checks, single-band delegation vs `_bands.emit_banded_graph`, spec-callable path |
 | `_merge.py` | `batch_functions` class DAG: attribute canonicalization, merge groups, skeleton/`occurrence` classification, reachability, emission order (no IR) |
-| `_emit.py` | `batch_functions` batched emission: rule rebuild, switch mux, constant stacking, output mux, `Graph` construction, report assembly |
+| `_emit.py` | `batch_functions` batched emission: rule rebuild, switch mux, constant stacking, output mux, `Graph` construction, report assembly (`new_merged_module`/`finish_merged_graph` shared with the banded driver, `_Merged(band_args=…, row_map=…)`) |
+| `_bands.py` | `batch_functions` banded strategy: `bands` normalization, even/fingerprint partitions, the `"auto"` cost model, per-band input views (`_BandInputs`) and output concatenation (`_combine_bands`), the banded emission driver |
 | `autodiff.py` | JVP/VJP rule registries, `ZeroTangent`, forward/backward sweeps |
 | `grad.py`, `jvp.py`, `vjp.py` | public AD entry points |
 | `rules.py` | builtin rules for the standard op set (registered at import) |
