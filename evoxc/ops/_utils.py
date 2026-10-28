@@ -11,6 +11,7 @@ active-builder hook). It must never import ``evoxc.backends``.
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
 from typing import Iterable, Tuple, Union
@@ -35,6 +36,30 @@ __all__ = [
 #: Environment variable that disables call-site location capture (any non-empty
 #: value equal to "1" disables). See :func:`get_location`.
 EVOXC_DISABLE_LOCATIONS_ENV = "EVOXC_DISABLE_LOCATIONS"
+
+#: Nesting depth of `_suppress_location_capture()` blocks (re-entrant; 0 = off).
+_location_suppression_depth = 0
+
+
+@contextlib.contextmanager
+def _suppress_location_capture():
+    """Internal: disable call-site capture for the duration of the block (re-entrant).
+
+    Used by internal graph-EMITTER transforms that build thousands of ops whose
+    locations are reassigned afterwards anyway (see
+    `evoxc.transforms.batch_functions`): `get_location` returns
+    `ir.Location.unknown()` while any block is active, skipping the
+    `inspect.stack()` walk entirely. Not public API — nothing outside `evoxc`
+    internals may use it. Exceptions inside the block never leave the counter
+    stuck (restored in `finally`).
+    """
+    global _location_suppression_depth
+    _location_suppression_depth += 1
+    try:
+        yield
+    finally:
+        _location_suppression_depth -= 1
+
 
 #: Natural (un-hinted) dtypes for Python scalars promoted to 0-d constant ops.
 #: Numpy's python-scalar defaults: int -> int64, float -> float64,
@@ -124,6 +149,8 @@ def get_location(depth: int = 1) -> "ir.Location":
         Never raises — location capture failure degrades to
         ``ir.Location.unknown()`` (a missing location must not break tracing).
     """
+    if _location_suppression_depth:
+        return ir.Location.unknown()
     if os.environ.get(EVOXC_DISABLE_LOCATIONS_ENV) == "1":
         return ir.Location.unknown()
     try:
