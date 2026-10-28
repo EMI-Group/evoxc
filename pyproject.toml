@@ -1,14 +1,51 @@
 [build-system]
-requires = ["setuptools>=68"]
+# setuptools >= 77 is the first release with PEP 639 support, which this file
+# uses for the license metadata below (`license = "<SPDX expression>"` plus
+# `license-files`). The backend stays `setuptools.build_meta`.
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "evoxc"
 version = "0.1.0"
 description = "EvoX Compiler — a minimal, explicit, compiler-neutral tensor graph compiler and runtime"
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+# PEP 639: an SPDX license expression + the license file(s) shipped in the
+# distribution. The legacy `license = { text = ... }` table and the deprecated
+# `License ::` classifiers are deliberately NOT used (setuptools >= 77 rejects
+# the combination), so the license is declared exactly once, here.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "The EvoX Authors" }]
+maintainers = [{ name = "The EvoX Authors" }]
+keywords = [
+    "compiler",
+    "tensor",
+    "graph",
+    "mlir",
+    "stablehlo",
+    "iree",
+    "xla",
+    "tvm",
+    "numerical-computing",
+    "jax-like",
+]
+# Every classifier is factually true for this package: pure Python, numpy-only
+# runtime dependency, no native code, no OS-specific behaviour.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+]
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
@@ -78,6 +115,14 @@ bench = ["torch>=2.0"]
 #     pure numpy + stdlib, and evoxc's hard dependencies stay numpy-only.
 # (c) `import evoxc` never imports `evoxc_hf`, torch, or transformers.
 hf = ["torch>=2.0", "transformers>=4.40"]
+
+# Only URLs that are known to be real. No `Homepage`/`Source` entry is declared:
+# this project has no public repository URL yet (the local git remote is a
+# pre-rename mirror, not a project homepage), and a wrong link is worse than
+# none.
+[project.urls]
+"EvoX ecosystem" = "https://github.com/EMI-Group"
+Genesis = "https://github.com/EMI-Group/genesis"
 
 [tool.setuptools.packages.find]
 # ONLY the `evoxc` distribution: `evoxc` and its subpackages. `evoxc_hf` (the
