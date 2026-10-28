@@ -35,14 +35,16 @@ different constants) inside ONE program land in SEPARATE classes, while an
 exact repeat reuses one class. Each class therefore holds at most one distinct
 variant per program.
 
-``alignment`` (`ALIGNMENTS`) chooses HOW that class is picked for a position
-covered by a `switch_ops` merge group — the only positions where two programs
-can put DIFFERENT variants at one skeleton: ``"occurrence"`` (default) = the
-class at the program's occurrence index, created on demand (byte-identical
-output); ``"variant"`` = a class of the skeleton that already holds this
-variant and does not yet hold this program, else the occurrence class;
-``"auto"`` = ``"variant"`` plus a last-resort reuse of any other free class of
-the skeleton before creating one.
+``alignment`` (`ALIGNMENTS`, default `DEFAULT_ALIGNMENT` = ``"variant"``)
+chooses HOW that class is picked for a position covered by a `switch_ops` merge
+group — the only positions where two programs can put DIFFERENT variants at one
+skeleton: ``"variant"`` (default) = a class of the skeleton that already holds
+this variant and does not yet hold this program, else the occurrence class
+(sibling branches such as ``(x+1) * (x-1)`` vs ``(x-1) * (x+1)`` then get one
+class per op instead of two mixed classes); ``"occurrence"`` = the class at the
+program's occurrence index, created on demand (the byte-identical legacy
+output); ``"auto"`` = ``"variant"`` plus a last-resort reuse of any other free
+class of the skeleton before creating one.
 
 Constants are DELIBERATELY excluded (`_align_class` aligns ``("group", ...)``
 identities only): a constant class stacks its members' per-row payloads by
@@ -492,24 +494,24 @@ def _identity(op: ir.Op, variant: tuple, groups: Sequence[MergeGroup]) -> tuple:
 # --- class alignment (`alignment=`) -----------------------------------------
 
 
-#: Default: a program's k-th distinct variant at a skeleton goes to that
-#: skeleton's k-th occurrence class (byte-identical to the pre-`alignment`
-#: output).
+#: Legacy byte-stable mode: a program's k-th distinct variant at a skeleton goes
+#: to that skeleton's k-th occurrence class (the pre-`alignment` output).
 ALIGNMENT_OCCURRENCE = "occurrence"
-#: Variant-first: a class that already holds this variant (and not this program)
-#: wins over the occurrence-position class.
+#: DEFAULT: variant-first — a class that already holds this variant (and not this
+#: program) wins over the occurrence-position class.
 ALIGNMENT_VARIANT = "variant"
 #: Variant-first plus a last-resort reuse of any other free class of the
 #: skeleton before creating one (never creates a class `"variant"` would reuse).
 ALIGNMENT_AUTO = "auto"
 
-#: Every accepted `alignment` spelling, in preference order (index 0 = default).
+#: Every accepted `alignment` spelling (the listing order only shapes the
+#: validation error text — `DEFAULT_ALIGNMENT` is the effective default).
 ALIGNMENTS: Tuple[str, ...] = (
     ALIGNMENT_OCCURRENCE,
     ALIGNMENT_VARIANT,
     ALIGNMENT_AUTO,
 )
-DEFAULT_ALIGNMENT = ALIGNMENT_OCCURRENCE
+DEFAULT_ALIGNMENT = ALIGNMENT_VARIANT
 
 
 def normalize_alignment(alignment: Any) -> str:
@@ -584,9 +586,10 @@ def _align_class(
 
     Order of preference (every choice is row-correct — see the module docstring's
     correctness invariant; this is a PURE performance heuristic):
-      1. `alignment` != ``"occurrence"`` AND the identity is a `switch_ops` MERGE
-         GROUP: a class of this skeleton that already holds `variant` and does
-         not yet hold `program_index`. Constants are excluded by construction
+      1. `alignment` is an ALIGNED mode (``"variant"``/``"auto"``, i.e. not
+         ``"occurrence"``) AND the identity is a `switch_ops` MERGE GROUP: a
+         class of this skeleton that already holds `variant` and does not yet
+         hold `program_index`. Constants are excluded by construction
          (`switchable`) and exact-structure identities need no alignment (every
          program there has the same variant).
       2. The occurrence bucket's first class free for this program.
