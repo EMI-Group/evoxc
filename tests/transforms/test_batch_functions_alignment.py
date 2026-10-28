@@ -27,13 +27,13 @@ alignment; G validation/errors (non-str → `TypeError`, unknown spelling →
 `core.TransformError`, both before any tracing) and inertness outside
 `switch_ops` groups.
 
-DEFAULT-ALIGNMENT NOTE: the default at this HEAD is `"occurrence"`
-(`_merge.DEFAULT_ALIGNMENT` and the public signature default) — exactly what
-`evoxc/transforms/CONTEXT.md` documents, and what these tests pin. Flipping the
-default to `"variant"` is a documented, recommended-but-not-yet-made
-PRODUCTION follow-up (see the `alignment` docstring in `batch_functions.py`),
-NOT a test change: when it happens, the default pins here move together with
-`_merge`.
+DEFAULT-ALIGNMENT NOTE: the default is `"variant"` (`_merge.DEFAULT_ALIGNMENT`
+and the public signature default) — exactly what `evoxc/transforms/CONTEXT.md`
+documents, and what the default pins here assert. `"occurrence"` remains an
+accepted EXPLICIT value: it is the byte-stable LEGACY policy (the pre-`alignment`
+output — same class numbering, `SwitchRecord` order, emitted op sequence), so
+every count pin below that states occurrence numbers passes
+`alignment="occurrence"` explicitly.
 
 `alignment` is a PURE performance heuristic — it can only change the op/select
 COUNT, never a number — so these tests assert OP COUNTS and never timings.
@@ -178,35 +178,57 @@ UNREDUCED_BRANCHY_COUNTS = {
     "variant": (6, 0),
     "auto": (6, 0),
 }
-# --- A. The default: `"occurrence"`, byte-identical to omitting the option
-def test_signature_default_is_occurrence():
-    """The public `alignment` default at this HEAD is `"occurrence"`.
+# --- A. The default: `"variant"`, byte-identical to omitting the option
+def test_signature_default_is_variant():
+    """The public `alignment` default is `"variant"`.
 
     Documented default (`evoxc/transforms/CONTEXT.md` § "Alignment of switched
-    positions"): `"occurrence"`. A `"variant"` default is a production
-    follow-up, not a test change — see the module docstring.
+    positions"): `"variant"`. `"occurrence"` remains an accepted EXPLICIT
+    value — the byte-stable LEGACY policy.
     """
     parameter = inspect.signature(evoxc.batch_functions).parameters["alignment"]
-    assert parameter.default == "occurrence"
+    assert parameter.default == "variant"
     # The implementation's single source of truth agrees with the public
-    # signature, and `ALIGNMENTS` order (index 0 = default) is documented.
-    assert _merge.ALIGNMENT_OCCURRENCE == "occurrence"
-    assert _merge.DEFAULT_ALIGNMENT == _merge.ALIGNMENT_OCCURRENCE
-    assert _merge.DEFAULT_ALIGNMENT == _merge.ALIGNMENTS[0]
+    # signature, and `DEFAULT_ALIGNMENT` is one of the accepted spellings (the
+    # `ALIGNMENTS` listing order only shapes the validation error text).
+    assert _merge.ALIGNMENT_VARIANT == "variant"
+    assert _merge.DEFAULT_ALIGNMENT == _merge.ALIGNMENT_VARIANT
+    assert _merge.DEFAULT_ALIGNMENT in _merge.ALIGNMENTS
+    assert _merge.normalize_alignment(_merge.DEFAULT_ALIGNMENT) == "variant"
     assert _merge.ALIGNMENTS == ("occurrence", "variant", "auto")
-    assert _merge.normalize_alignment(_merge.DEFAULT_ALIGNMENT) == "occurrence"
-def test_omitted_alignment_is_byte_identical_to_occurrence():
-    """Omitting `alignment` == `alignment="occurrence"`, byte for byte."""
+    # `"occurrence"` stays a valid explicit spelling (the legacy policy).
+    assert _merge.ALIGNMENT_OCCURRENCE == "occurrence"
+    assert _merge.normalize_alignment("occurrence") == "occurrence"
+def test_omitted_alignment_is_byte_identical_to_variant():
+    """Omitting `alignment` == `alignment="variant"`, byte for byte.
+
+    `"variant"` is the documented default, so the omitted option must emit
+    exactly the explicit-`"variant"` graph; `"occurrence"` (the byte-stable
+    legacy policy) is reachable only by asking for it.
+    """
     graphs = branchy_graphs()
     omitted = merged(graphs, switch_ops=True)
-    explicit = merged(graphs, switch_ops=True, alignment="occurrence")
+    explicit = merged(graphs, switch_ops=True, alignment="variant")
     assert stablehlo.export(omitted) == stablehlo.export(explicit)
     assert op_names(omitted) == op_names(explicit)
     assert omitted.batch_report.as_dict() == explicit.batch_report.as_dict()
-    # Non-vacuity: the pinned graphs ARE the switched occurrence shape (a
-    # default that happened to emit the `"variant"` DAG would fail here).
-    assert counts(omitted) == BRANCHY_COUNTS["occurrence"]
+    # Non-vacuity: the pinned graphs ARE the switched variant shape (a default
+    # that happened to emit the `"occurrence"` DAG would fail here) ...
+    assert counts(omitted) == BRANCHY_COUNTS["variant"]
     assert counts(omitted) == counts(explicit)
+    # ... and the legacy policy is a genuinely DIFFERENT graph on this
+    # population, so the pin above compares two distinguishable merges.
+    assert counts(merged(graphs, switch_ops=True, alignment="occurrence")) == (
+        BRANCHY_COUNTS["occurrence"]
+    )
+    # Without a `switch_ops` merge group there is no switch position to align,
+    # so `alignment` is inert: the omitted default and all three explicit modes
+    # emit the identical graph (alignment only picks among SWITCHED classes).
+    unswitched = [merged(graphs)] + [
+        merged(graphs, alignment=mode) for mode in ALIGNMENT_MODES
+    ]
+    assert len({stablehlo.export(graph) for graph in unswitched}) == 1
+    assert len({tuple(op_names(graph)) for graph in unswitched}) == 1
 # --- B. `"variant"` / `"auto"` are accepted and build a valid graph
 @pytest.mark.parametrize("alignment", ["variant", "auto"])
 def test_variant_and_auto_produce_a_valid_graph(alignment):

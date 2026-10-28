@@ -185,9 +185,13 @@ def three_op_program(x):
 # ---------------------------------------------------------------------------
 
 #: `(id, population factory, merge kwargs, canonical emitted-op count)`.
-#: Every count below is the measured value at this HEAD; the assertion that
-#: matters for the hook is the invariant ALSO pinned for all of them: the
-#: `inspect.stack` call count stays exactly 1.
+#: Every count below is the measured value at this HEAD for the `alignment`
+#: policy its `kwargs` STATE (`"occurrence"` unless the merge omits the option,
+#: in which case the default `"variant"` applies) — the class-alignment policy
+#: changes how many classes a switched position emits, so a count is only
+#: meaningful next to its policy. The assertion that matters for the hook is the
+#: invariant ALSO pinned for all of them: the `inspect.stack` call count stays
+#: exactly 1, whatever the alignment emits.
 SUPPRESSION_CASES = [
     pytest.param(
         lambda: chain_population(12, 32),
@@ -197,27 +201,37 @@ SUPPRESSION_CASES = [
     ),
     pytest.param(
         divergent_population,
-        {"switch_ops": True},
+        {"switch_ops": True, "alignment": "occurrence"},
         17,
-        id="flat-divergent-10",
+        id="flat-divergent-10-occurrence",
     ),
     pytest.param(
         divergent_population,
-        {"switch_ops": True, "bands": 3},
+        {"switch_ops": True, "bands": 3, "alignment": "occurrence"},
         55,
-        id="banded-explicit-3",
+        id="banded-explicit-3-occurrence",
     ),
     pytest.param(
         divergent_population,
-        {"switch_ops": True, "bands": "auto"},
+        {"switch_ops": True, "bands": "auto", "alignment": "occurrence"},
         17,
-        id="banded-auto-flat-partition",
+        id="banded-auto-flat-partition-occurrence",
     ),
     pytest.param(
         lambda: divergent_population(variants=(_plus_minus, _plus_plus, _times_plus)),
         {"switch_ops": True, "bands": "auto"},
         21,
         id="banded-auto-two-bands",
+    ),
+    # The DEFAULT policy (`alignment` omitted → `_merge.DEFAULT_ALIGNMENT`, i.e.
+    # `"variant"`): the same `bands=3` merge as `banded-explicit-3-occurrence`
+    # emits 40 ops instead of 55, because sibling variants share one class per
+    # skeleton. Both policies therefore stay pinned.
+    pytest.param(
+        divergent_population,
+        {"switch_ops": True, "bands": 3},
+        40,
+        id="banded-explicit-3-default-variant",
     ),
 ]
 
