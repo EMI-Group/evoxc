@@ -85,10 +85,13 @@ from evoxc.transforms._metadata import MappedAxes, UNMAPPED
 
 #: `bands=None` — the single-band flat merge.
 BAND_STRATEGY_FLAT = "flat"
+
 #: An explicit band count `K`.
 BAND_STRATEGY_EXPLICIT = "explicit"
+
 #: The automatic partition (`BAND_STRATEGY_AUTO` chosen by the cost model).
 BAND_STRATEGY_AUTO = "auto"
+
 #: The `bands="auto"` spelling.
 AUTO = "auto"
 
@@ -104,7 +107,6 @@ CATEGORY_WEIGHTS = {
 }
 DEFAULT_CATEGORY_WEIGHT = 1.0
 SYMBOLIC_DIM_FALLBACK = 1
-
 
 # --- band validation --------------------------------------------------------
 
@@ -201,7 +203,6 @@ def even_partition(n: int, k: int) -> Tuple[Tuple[int, ...], ...]:
         position += size
     return tuple(bands)
 
-
 # --- structural fingerprints ------------------------------------------------
 
 
@@ -268,7 +269,6 @@ def fingerprint_partition(
     for index, graph in enumerate(graphs):
         buckets.setdefault(program_fingerprint(graph, groups), []).append(index)
     return tuple(tuple(rows) for rows in buckets.values())
-
 
 # --- the static cost model --------------------------------------------------
 
@@ -415,7 +415,6 @@ def plan_auto_partition(
         )
     return unique[best], costs[best], costs[0]
 
-
 # --- band-local input views -------------------------------------------------
 
 
@@ -515,7 +514,6 @@ class _BandInputs:
             _emit._stamp_locations(self._new_block, start, self._call_site)
             self._index_value = value
         return value
-
 
 # --- the banded driver ------------------------------------------------------
 
