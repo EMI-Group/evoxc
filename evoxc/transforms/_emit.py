@@ -44,6 +44,7 @@ import numpy as np
 from evoxc import core
 from evoxc import ir
 from evoxc import ops
+from evoxc.ops._utils import _suppress_location_capture, get_location
 from evoxc.trace import Graph, current_builder, with_builder
 from evoxc.transforms import batching
 from evoxc.transforms._merge import ClassInfo, MergeDAG
@@ -213,11 +214,11 @@ def _align_switch_candidate(
         ) from exc
 
 
-def _stamp_locations(new_block: ir.Block, before: set, location) -> None:
-    """Give every op emitted since `before` the contributing op's location."""
-    for emitted in new_block.ops:
-        if emitted.id not in before:
-            emitted.location = location
+def _stamp_locations(new_block: ir.Block, start: int, location) -> None:
+    """Give every op emitted from index `start` on the contributing op's location."""
+    block_ops = new_block.ops
+    for index in range(start, len(block_ops)):
+        block_ops[index].location = location
 
 
 def _run_rule(
@@ -234,12 +235,12 @@ def _run_rule(
     with the NEW module's operand values; the rule's return value is validated
     and every emitted op inherits the original op's source location.
     """
-    before = {emitted.id for emitted in new_block.ops}
+    start = len(new_block.ops)
     new_values, new_axes = rule(op, operands, axes)
     new_values, new_axes = batching._validate_rule_result(
         op, new_values, new_axes
     )
-    _stamp_locations(new_block, before, op.location)
+    _stamp_locations(new_block, start, op.location)
     return new_values, new_axes
 
 
@@ -277,6 +278,10 @@ class _Merged:
         self.stacked_constants = 0
         self.output_muxes = 0
         self.new_block: Optional[ir.Block] = None
+        #: Source location of the `batch_functions` call, given to the helper ops
+        #: the mux machinery emits itself (masks/selects/broadcasts) — they have
+        #: no contributing original op to inherit a location from.
+        self.call_site: Any = None
 
     # -- operand resolution --
 
@@ -316,14 +321,14 @@ class _Merged:
     def emit_constant(self, info: ClassInfo) -> None:
         """Emit a constant class: shared when all payloads agree, else stacked."""
         payloads: Dict[int, np.ndarray] = {}
-        for program_index, op in info.contributors:
+        for program_index, op, _variant in info.contributors:
             payloads[program_index] = np.asarray(op.attributes["value"])
         first = min(payloads)
         reference = payloads[first]
         all_equal = all(
             np.array_equal(payload, reference) for payload in payloads.values()
         )
-        before = {op.id for op in self.new_block.ops}
+        start = len(self.new_block.ops)
         program_index, op = info.representative
         if all_equal:
             value = ops.constant(core.tensor(reference)).value
@@ -333,7 +338,7 @@ class _Merged:
             value = ops.constant(core.tensor(np.stack(rows, axis=0))).value
             axes = MappedAxes((0,))
             self.stacked_constants += 1
-        _stamp_locations(self.new_block, before, op.location)
+        _stamp_locations(self.new_block, start, op.location)
         self.env.set(value, axes)
         self.emitted[info.class_id] = (value,)
         graph = self.graphs[program_index]
@@ -376,6 +381,9 @@ class _Merged:
                     f"'{per_variant[0][0].name}') — a select mux needs "
                     "identical result types; drop that op from switch_ops"
                 )
+        # Everything from here on is emitted by the mux machinery itself (no
+        # contributing original op) — it gets the `batch_functions` call site.
+        helper_start = len(self.new_block.ops)
         # A switch class is ALWAYS mapped: every candidate is aligned to the
         # mapped (N, *(1,), *per_row) shape (unmapped candidates — shared inputs
         # — gain the leading function axis) and the mux result is MappedAxes((0,)).
@@ -429,6 +437,7 @@ class _Merged:
                 ),
             )
         )
+        _stamp_locations(self.new_block, helper_start, self.call_site)
         self.set_emitted(
             info, tuple(acc), (MappedAxes((0,)),) * len(acc)
         )
@@ -438,6 +447,7 @@ class _Merged:
     def emit_outputs(self, out_entries: Sequence[Optional[int]]) -> Tuple[ir.Value, ...]:
         """One merged value per tensor output leaf, in output-leaf order."""
         outputs = []
+        helper_start = len(self.new_block.ops)
         leaf_count = len(self.dag.programs[0].terminator.operands)
         if len(out_entries) != leaf_count:
             raise core.TransformError(
@@ -496,6 +506,7 @@ class _Merged:
                 mask = _row_mask(rows_by_ref[ref], acc.type.rank, self.n)
                 acc = ops.select(_sym(mask), _sym(value), _sym(acc)).value
             outputs.append(acc)
+        _stamp_locations(self.new_block, helper_start, self.call_site)
         return tuple(outputs)
 
 
@@ -595,7 +606,14 @@ def emit_merged_graph(
             state.source_locations[new_arg.id] = location
 
     # 4. Emit every reachable class in emission order, then the outputs.
-    with with_builder(builder):
+    #    Location capture is suppressed for the whole emission: a rule-emitted
+    #    op is re-stamped with its contributing ORIGINAL op's location
+    #    (`_stamp_locations`), the helper ops the mux machinery emits itself
+    #    are stamped with the ONE call site captured here, and
+    #    `graph.source_locations` is carried from the original graphs — so the
+    #    per-op `inspect.stack()` walk of `ops` would be pure overhead.
+    state.call_site = get_location()
+    with _suppress_location_capture(), with_builder(builder):
         for class_id in dag.reachable:
             info = dag.classes[class_id]
             if info.representative[1].name == "constant":

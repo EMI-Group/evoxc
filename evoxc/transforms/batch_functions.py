@@ -42,6 +42,7 @@ from evoxc.transforms._emit import BatchReport, SwitchRecord, emit_merged_graph
 from evoxc.transforms._merge import (
     MergeDAG,
     MergeGroup,
+    _opdef,
     build_merge_dag,
     parse_switch_groups,
 )
@@ -383,7 +384,7 @@ def _check_ops(graphs: Sequence[Graph]) -> None:
     for index, graph in enumerate(graphs):
         block = graph.module.functions[0].entry_block
         for op in block.ops:
-            if op.is_terminator:
+            if _opdef(op.name).is_terminator:
                 continue
             if op.regions:
                 raise core.TransformError(

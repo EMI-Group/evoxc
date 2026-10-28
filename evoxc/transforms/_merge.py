@@ -34,10 +34,15 @@ matching group in declaration order wins).
 different constants) inside ONE program land in SEPARATE classes, while an
 exact repeat reuses one class. Each class therefore holds at most one distinct
 variant per program.
+
+`_opdef` memoizes the IR op-def lookup (the lazy `evoxc.ir.op_defs` import) for
+the per-op hot path; each op's `variant_id` is computed ONCE and carried on its
+contributor tuple so emission never recomputes it.
 """
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -55,7 +60,37 @@ from evoxc.trace import Graph
 DEFAULT_SWITCH_CATEGORIES: Tuple[str, ...] = ("elementwise", "comparison")
 
 
+# --- op-definition lookup (hot path) ----------------------------------------
+
+
+#: Memo of ``op name -> ir.OpDef`` — avoids the per-op lazy `evoxc.ir.op_defs`
+#: import inside ``Op.opdef``/``is_terminator``. Op defs are registered once at
+#: `evoxc.ir` import time and never re-registered, so the mapping is immutable.
+_OPDEF_CACHE: Dict[str, "ir.OpDef"] = {}
+
+
+def _opdef(name: str) -> "ir.OpDef":
+    """The registered `ir.OpDef` for `name`, memoized (raises `KeyError` if absent)."""
+    definition = _OPDEF_CACHE.get(name)
+    if definition is None:
+        definition = _OPDEF_CACHE[name] = ir.opdef(name)
+    return definition
+
+
 # --- attribute canonicalization ---------------------------------------------
+
+
+#: Memo of ``np.dtype -> str(dtype)``: `str(np.dtype)` is comparatively slow
+#: and every constant attribute canonicalization needs the same few tokens.
+_DTYPE_TOKENS: Dict[np.dtype, str] = {}
+
+
+def _dtype_token(dtype: np.dtype) -> str:
+    """``str(dtype)``, memoized (equal dtypes share one token)."""
+    token = _DTYPE_TOKENS.get(dtype)
+    if token is None:
+        token = _DTYPE_TOKENS[dtype] = str(np.dtype(dtype))
+    return token
 
 
 def canonical_value(value: Any) -> Any:
@@ -82,9 +117,9 @@ def canonical_value(value: Any) -> Any:
       ``("repr", type name, repr)``.
     """
     if isinstance(value, np.ndarray):
-        return ("ndarray", str(value.dtype), tuple(value.shape), value.tobytes())
+        return ("ndarray", _dtype_token(value.dtype), tuple(value.shape), value.tobytes())
     if isinstance(value, np.dtype):
-        return ("dtype", str(value))
+        return ("dtype", _dtype_token(value))
     if isinstance(value, ir.ValueType):
         return value
     if isinstance(value, core.Dim):
@@ -179,8 +214,7 @@ class MergeGroup:
     def matches(self, op: ir.Op) -> bool:
         """True when `op` belongs to this group."""
         if self.kind == "category":
-            definition = ir.opdef(op.name)
-            return definition.category == self.category
+            return _opdef(op.name).category == self.category
         return op.name in self.names
 
 
@@ -319,44 +353,54 @@ class ClassInfo:
         occurrence: The class's occurrence index within its skeleton (see the
             module docstring).
         result_count: Number of results of the contributing ops.
-        contributors: ``(program_index, op)`` pairs, in scan order (one per
-            program per distinct variant; an exact repeat within one program
-            contributes twice).
+        contributors: ``(program_index, op, variant)`` triples, in scan order
+            (one per program per distinct variant; an exact repeat within one
+            program contributes twice). The op's `variant_id` is computed once
+            at scan time and carried here so emission never recomputes it.
         variants: Distinct `variant_id`s in first-appearance order.
         rows: Program indices per variant, aligned with `variants`.
+        variant_index: ``variant -> index in `variants``` (bookkeeping only).
     """
 
     class_id: int
     skeleton: tuple
     occurrence: int
     result_count: int
-    contributors: List[Tuple[int, ir.Op]] = field(default_factory=list)
+    contributors: List[Tuple[int, ir.Op, tuple]] = field(default_factory=list)
     variants: List[tuple] = field(default_factory=list)
     rows: List[List[int]] = field(default_factory=list)
+    variant_index: Dict[tuple, int] = field(default_factory=dict)
+    #: Lazily built ``variant -> first (program_index, op) contributor``.
+    _representatives: Optional[Dict[tuple, Tuple[int, ir.Op]]] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def representative(self) -> Tuple[int, ir.Op]:
         """The first `(program_index, op)` contributor."""
-        return self.contributors[0]
+        program_index, op, _variant = self.contributors[0]
+        return program_index, op
 
     @property
     def program_indices(self) -> Tuple[int, ...]:
         """Distinct contributing program indices, in first-appearance order."""
-        seen: List[int] = []
-        for program_index, _op in self.contributors:
-            if program_index not in seen:
-                seen.append(program_index)
-        return tuple(seen)
+        return tuple(dict.fromkeys(pi for pi, _op, _variant in self.contributors))
 
     def representative_for(self, variant: tuple) -> Tuple[int, ir.Op]:
         """The first `(program_index, op)` contributor of one variant."""
-        for program_index, op in self.contributors:
-            if variant_id(op) == variant:
-                return program_index, op
-        raise core.TransformError(
-            "batch_functions: internal error — no contributor for variant "
-            f"{variant!r} of class {self.class_id}"
-        )
+        representatives = self._representatives
+        if representatives is None:
+            representatives = {}
+            for program_index, op, contributor_variant in self.contributors:
+                representatives.setdefault(contributor_variant, (program_index, op))
+            self._representatives = representatives
+        entry = representatives.get(variant)
+        if entry is None:
+            raise core.TransformError(
+                "batch_functions: internal error — no contributor for variant "
+                f"{variant!r} of class {self.class_id}"
+            )
+        return entry
 
 
 class MergeDAG:
@@ -396,14 +440,25 @@ class MergeDAG:
         return self.slot_of(program_index, value)
 
 
-def _identity(op: ir.Op, groups: Sequence[MergeGroup]) -> tuple:
-    """The op's skeleton identity (constants merge always; groups switch)."""
+_RESULT_TYPE = operator.attrgetter("type")
+
+
+def _result_types(op: ir.Op) -> tuple:
+    """``tuple(result.type for result in op.results)`` — the C-level spelling."""
+    return tuple(map(_RESULT_TYPE, op.results))
+
+
+def _identity(op: ir.Op, variant: tuple, groups: Sequence[MergeGroup]) -> tuple:
+    """The op's skeleton identity (constants merge always; groups switch).
+
+    `variant` is the op's already-computed `variant_id` — never recomputed here.
+    """
     if op.name == "constant":
         return ("constant",)
     for group in groups:
         if group.matches(op):
             return ("group", group.key)
-    return variant_id(op)
+    return variant
 
 
 def build_merge_dag(graphs: Sequence[Graph], groups: Sequence[MergeGroup]) -> MergeDAG:
@@ -420,39 +475,49 @@ def build_merge_dag(graphs: Sequence[Graph], groups: Sequence[MergeGroup]) -> Me
     for the block-arg-count check — this function assumes them.
     """
     dag = MergeDAG()
-    class_keys: Dict[tuple, int] = {}
+    #: ``skeleton -> class ids indexed by occurrence`` (global, one hash lookup
+    #: per op: the per-program `own` map below is keyed by the skeleton too).
+    class_keys: Dict[tuple, List[int]] = {}
     for program_index, graph in enumerate(graphs):
         function = graph.module.functions[0]
         block = function.entry_block
         arg_ids = {id(argument): i for i, argument in enumerate(block.arguments)}
         terminator = block.terminator
         slots: Dict[int, Tuple[int, int]] = {}
-        seen_variants: Dict[tuple, List[tuple]] = {}
-        own: Dict[tuple, int] = {}
+        #: ``skeleton -> (variant -> class_id, variants seen, global class ids)``.
+        own: Dict[tuple, Tuple[Dict[tuple, int], List[tuple], List[int]]] = {}
         for op in block.ops:
-            if op.is_terminator:
+            if _opdef(op.name).is_terminator:
                 continue
-            identity = _identity(op, groups)
-            operand_slots = tuple(
-                ("input", arg_ids[id(operand)])
-                if id(operand) in arg_ids
-                else slots[id(operand)]
-                for operand in op.operands
-            )
-            result_types = tuple(result.type for result in op.results)
-            skeleton = (identity, operand_slots, result_types)
             variant = variant_id(op)
-            key = (skeleton, variant)
-            class_id = own.get(key)
+            identity = _identity(op, variant, groups)
+            operand_slots = []
+            append_slot = operand_slots.append
+            for operand in op.operands:
+                input_index = arg_ids.get(id(operand))
+                if input_index is not None:
+                    append_slot(("input", input_index))
+                else:
+                    append_slot(slots[id(operand)])
+            operand_slots = tuple(operand_slots)
+            result_types = _result_types(op)
+            skeleton = (identity, operand_slots, result_types)
+            entry = own.get(skeleton)
+            if entry is None:
+                class_ids = class_keys.get(skeleton)
+                if class_ids is None:
+                    class_ids = class_keys[skeleton] = []
+                own[skeleton] = entry = ({}, [], class_ids)
+            by_variant, variants_seen, class_ids = entry
+            class_id = by_variant.get(variant)
             if class_id is None:
-                variants_seen = seen_variants.setdefault(skeleton, [])
                 occurrence = len(variants_seen)
                 variants_seen.append(variant)
-                class_key = (skeleton, occurrence)
-                class_id = class_keys.get(class_key)
-                if class_id is None:
+                if occurrence < len(class_ids):
+                    class_id = class_ids[occurrence]
+                else:
                     class_id = len(dag.classes)
-                    class_keys[class_key] = class_id
+                    class_ids.append(class_id)
                     dag.classes[class_id] = ClassInfo(
                         class_id=class_id,
                         skeleton=skeleton,
@@ -460,16 +525,22 @@ def build_merge_dag(graphs: Sequence[Graph], groups: Sequence[MergeGroup]) -> Me
                         result_count=len(op.results),
                     )
                     dag.order.append(class_id)
-                own[key] = class_id
+                by_variant[variant] = class_id
             info = dag.classes[class_id]
-            info.contributors.append((program_index, op))
-            if variant in info.variants:
-                rows = info.rows[info.variants.index(variant)]
-                if program_index not in rows:
-                    rows.append(program_index)
-            else:
+            info.contributors.append((program_index, op, variant))
+            variant_position = info.variant_index.get(variant)
+            if variant_position is None:
+                variant_position = len(info.variants)
+                info.variant_index[variant] = variant_position
                 info.variants.append(variant)
                 info.rows.append([program_index])
+            else:
+                # Contributors arrive in non-decreasing program order (programs
+                # are scanned in order), so the last entry is the only possible
+                # duplicate — one comparison instead of a scan.
+                rows = info.rows[variant_position]
+                if rows[-1] != program_index:
+                    rows.append(program_index)
             for index, result in enumerate(op.results):
                 slots[id(result)] = (class_id, index)
         dag.slots.append(slots)
