@@ -192,7 +192,7 @@ Sibling: `../../tests/transforms/` → test suite for this module (read-only fro
 ## Test strategy
 
 `../../tests/transforms/`: `test_vectorize.py` (per-op batching, metadata propagation, `TransformError` for missing rules), `test_vmap.py` (sugar semantics, once-only tracing, out_axes incl. size-one insertion and `None` mismatch, nested vmap), `test_batch_functions.py` (merge contract: identical programs emit no `select`, switch groups + `SwitchRecord`, output muxes, constant stacking, `batch_report` fields, spec-callable path, every validation error), `test_grad.py` / `test_jvp.py` / `test_vjp.py` (numerical checks vs finite differences), `test_vmap_vectorize_equivalence.py` (IR equality per the equivalence contract), `test_block_rules.py` (`block:<name>` namespacing). Spec-compliance additions live in `../../tests/test_spec_compliance.py` (vmap≡vectorize sugar, unsupported-op errors, transformed graphs contain only ordinary ops). CPU only, pytest.
-The sibling suite does not yet pin `alignment` (no test asserts a byte-identical `occurrence` merge or a `variant` op count) — that pinning is test-side work for `../../tests/`.
+`test_batch_functions_bands.py` (band validation, per-band row-exactness, `bands=1`≡`bands=None` byte-identity, `"auto"` partition decisions, global `SwitchRecord` rows under banding), `test_batch_functions_alignment.py` (`"variant"` default pin, `variant` vs `occurrence` op counts, constants still stack by occurrence) and `test_batch_functions_speed_pins.py` (the `inspect.stack`-call-count pin for the location-suppression hook, location preservation) pin the strategy layer.
 
 ## Known Issues
 
