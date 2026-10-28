@@ -21,6 +21,9 @@ plus a `select` mask cascade, the function axis is a STATIC python `int`
 that stages through the explicit pipeline and persists through
 `Graph.save`/`load`, and the transform is deterministic and never mutates its
 input graphs.
+Policy-dependent structural counts (switch records, exact op/`select`/class
+counts) are pinned with an explicit `alignment="occurrence"`, so a future
+default change cannot silently move them.
 
 Execution is explicit staging only (`lower → compile → load → run`) — numpy
 backend, CPU, small shapes.
@@ -267,6 +270,8 @@ def test_public_surface():
     report = graph.batch_report
     assert isinstance(report, evoxc.BatchReport)
     assert isinstance(report.switched[0], evoxc.SwitchRecord)
+    # The report surface is pinned EXACTLY: adding a field is a contract change
+    # (the band partition and the static cost model are reported here too).
     assert set(report.as_dict()) == {
         "n_functions",
         "value_classes",
@@ -275,6 +280,30 @@ def test_public_surface():
         "stacked_constants",
         "output_muxes",
         "emitted_ops",
+        "bands",
+        "band_sizes",
+        "band_strategy",
+        "cost_estimate",
+        "flat_cost_estimate",
+    }
+    # Value types of the band/cost fields on this FLAT merge (`bands=None`):
+    # one band covering every function, no cost model (that only runs for
+    # `bands="auto"`), so both estimates stay `None`.
+    assert report.bands == 1
+    assert isinstance(report.band_sizes, tuple)
+    assert report.band_sizes == (2,)
+    assert report.band_strategy == "flat"
+    assert report.cost_estimate is None
+    assert report.flat_cost_estimate is None
+    # `as_dict` is a plain-data view: tuples become lists, `SwitchRecord`s dicts.
+    payload = report.as_dict()
+    assert payload["band_sizes"] == [2]
+    assert isinstance(payload["switched"], list)
+    assert all(isinstance(entry, dict) for entry in payload["switched"])
+    assert set(payload["switched"][0]) == {
+        "group",
+        "variants",
+        "rows_per_variant",
     }
 
 
@@ -707,7 +736,8 @@ class TestStructuralProperties:
             return evoxc.multiply(x, x)
 
         graph0 = evoxc.trace(squaring, spec)
-        graph = merged([graph0, graph0])
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged([graph0, graph0], alignment="occurrence")
 
         names = op_names(graph)
         assert "select" not in names
@@ -729,7 +759,8 @@ class TestStructuralProperties:
         """`x + 1.0` twice: constant + add shared, plus vectorize's reshape."""
         spec = evoxc.TensorSpec((3,), F32)
         graph0 = evoxc.trace(lambda x: x + 1.0, spec)
-        graph = merged([graph0, graph0])
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged([graph0, graph0], alignment="occurrence")
 
         names = op_names(graph)
         assert names == ["constant", "reshape", "add", "return"]
@@ -755,7 +786,8 @@ class TestStructuralProperties:
             return evoxc.sin(x) * 2.0
 
         graphs = [evoxc.trace(f_shift, spec), evoxc.trace(f_scale, spec)]
-        graph = merged(graphs)
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged(graphs, alignment="occurrence")
 
         assert op_names(graph).count("sin") == 1
         assert graph.batch_report.shared_classes >= 1
@@ -785,7 +817,8 @@ class TestStructuralProperties:
             evoxc.trace(f_subtract, spec),
             evoxc.trace(f_multiply, spec),
         ]
-        graph = merged(graphs, switch_ops=switch_ops())
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged(graphs, switch_ops=switch_ops(), alignment="occurrence")
 
         report = graph.batch_report
         assert isinstance(report.switched, tuple) and len(report.switched) == 1
@@ -870,7 +903,8 @@ class TestStructuralProperties:
         """`axes=None` + `switch_ops=True`: shared candidates get the axis."""
         spec = evoxc.TensorSpec(shape, F32)
         graphs = elementwise_programs(n_variants, spec)
-        graph = merged(graphs, axes=None, switch_ops=True)
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged(graphs, axes=None, switch_ops=True, alignment="occurrence")
 
         if shape == ():
             shared = np.array(0.75, dtype=np.float32)
@@ -904,7 +938,8 @@ class TestStructuralProperties:
             evoxc.trace(f_add_two, spec),
             evoxc.trace(f_multiply, spec),
         ]
-        graph = merged(graphs, axes=None, switch_ops=True)
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged(graphs, axes=None, switch_ops=True, alignment="occurrence")
 
         record = graph.batch_report.switched[0]
         assert record.variants == ("add", "multiply")
@@ -929,7 +964,8 @@ class TestStructuralProperties:
             return evoxc.multiply(evoxc.multiply(x, 1.0), 1.0)
 
         graphs = [evoxc.trace(f_add, spec), evoxc.trace(f_multiply, spec)]
-        graph = merged(graphs, axes=None, switch_ops=True)
+        # `alignment` is pinned EXPLICITLY: the counts below are policy-dependent.
+        graph = merged(graphs, axes=None, switch_ops=True, alignment="occurrence")
 
         report = graph.batch_report
         assert report.switched == (
