@@ -215,7 +215,16 @@ from .trace import Defn, Graph, cond, defn, scan, trace, while_loop  # noqa: F40
 
 # --- Graph transforms (evoxc.transforms) -------------------------------------
 from . import transforms  # noqa: F401
-from .transforms import grad, jvp, vectorize, vjp, vmap  # noqa: F401
+from .transforms import (  # noqa: F401
+    BatchReport,
+    SwitchRecord,
+    batch_functions,
+    grad,
+    jvp,
+    vectorize,
+    vjp,
+    vmap,
+)
 
 # --- Backends (evoxc.backends) -----------------------------------------------
 from . import backends  # noqa: F401
