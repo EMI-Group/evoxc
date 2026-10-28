@@ -18,7 +18,8 @@ Emission strategy (never a silent Python-loop fallback):
   at all);
 * positions with the same skeleton but different ops inside a merge group
   (`switch_ops`) become one op per variant plus a static per-row `select` mask
-  cascade;
+  cascade (the muxed value is ALWAYS mapped on the function axis, whatever the
+  mappedness of the shared inputs);
 * every other divergence is still CORRECT via `select`-muxing where the values
   diverge (constant stacking resp. output muxing).
 
