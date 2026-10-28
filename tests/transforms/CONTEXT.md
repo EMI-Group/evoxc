@@ -34,3 +34,12 @@ Tests for `evoxc.transforms` (sibling binding contract: `../../evoxc/transforms/
 - `evoxc.sum` axes must be an int/tuple (lists raise TypeError); `evoxc.evaluate` rejects static (non-tensor) args — use numpy references there.
 - `evoxc.scan` lowers a step-0 `gather` into the entry block, so vectorizing it raises the gather deferral ("cannot batch op 'gather' with mapped data but unmapped indices") before the `while` op is reached — still a TransformError per contract (use `in_axes=(0, None)` on the scan state to reach the `while` path).
 - When a test exposes behavior contradicting the evoxc contract, do NOT fix evoxc (sibling, read-only) and do NOT weaken the test: mark it with `# BUG(evoxc): <description>` and keep it failing, with the repro recorded in this file's Known Issues.
+- `evoxc.build`/`evoxc.evaluate` do NOT accept a `TransformCallable` or a transformed `Graph` (they trace a callable; vmap/grad/batch_functions all raise the same way) — stage the graph with the explicit `lower → compile → load → run` chain instead, and call the spec-callable (`transform(*specs)`) to obtain the graph.
+- A merge's own mask `constant`s and `select`s carry the `batch_functions` CALL-SITE `Location`, so two `serialize_module` comparisons are byte-identical only when both merges are invoked from the same source line.
+
+## Known Issues
+
+- **BUG(evoxc) — the registered-output-node guard is shadowed by `out_axes` normalization** (`tests/transforms/test_batch_functions_errors.py::test_sparse_output_reaches_the_registered_node_guard`, `xfail(strict=True)`): a graph returning a sparse value hits `_normalize_out_axes` first, and no plain `0`/`None`/int-pytree can match a registered node's `TreeSpec`, so the documented "returns a registered pytree node with static leaves … batched output-aux remapping is a v1 deferral" message is unreachable; the merge is still rejected explicitly with the out_axes structure-mismatch `TransformError` (never a silent batched-aux merge).
+  Repro: `g = evoxc.trace(lambda x: evoxc.sparse.from_dense(x), evoxc.TensorSpec((3, 3), evoxc.float32)); evoxc.batch_functions([g, g], out_axes=(None,) * g.output_tree.num_leaves)` → `TransformError: the out_axes pytree does not match the output structure`.
+  Delete this entry (and the xfail marker) when evoxc raises the guard first.
+
