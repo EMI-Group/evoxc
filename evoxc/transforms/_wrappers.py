@@ -1,8 +1,9 @@
 """Internal `TransformCallable` — the spec→Graph convention for fn inputs.
 
-When a public transform (`vmap` / `grad` / `jvp` / `vjp`) is given a plain
-function or `Defn` instead of a `Graph`, input shapes are unknown at transform
-time and transforms never execute tensors. The transform therefore returns a
+When a public transform (`vmap` / `batch_functions` / `grad` / `jvp` / `vjp`) is
+given a plain function or `Defn` instead of a `Graph`, input shapes are unknown
+at transform time and transforms never execute tensors. The transform therefore
+returns a
 `TransformCallable`: calling it with a structure of `TensorSpec`s (and static
 values) builds and returns the transformed `Graph`. This is transparent sugar
 — each public module's docstring states the exact expansion. See
@@ -34,7 +35,7 @@ class TransformCallable:
         doc: Optional[str] = None,
     ) -> None:
         self._build = build
-        #: One of "vmap" | "grad" | "jvp" | "vjp".
+        #: One of "vmap" | "batch_functions" | "grad" | "jvp" | "vjp".
         self.kind = kind
         if doc:
             self.__doc__ = doc

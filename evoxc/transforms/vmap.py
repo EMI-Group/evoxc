@@ -153,11 +153,24 @@ def _derive_unvectorized_args(args, in_axes):
     Concrete `core.Tensor` leaves raise `core.TraceError` (transforms never
     execute; `TransformCallable` performs the same check at its boundary).
     """
+    return _derive_unvectorized_args_and_entries(args, in_axes, "vmap")[0]
+
+
+def _derive_unvectorized_args_and_entries(args, in_axes, what="vmap"):
+    """`_derive_unvectorized_args` + the per-tensor-leaf axes entries.
+
+    Returns ``(unvectorized_args, entries)`` where `entries` holds one ``0``
+    (mapped) / ``None`` (unmapped) per TENSOR spec leaf, in
+    `graph.tensor_specs` order — the pre-normalized form `batch_functions`
+    needs (it cannot re-normalize against the traced graph: tracing STRIPS the
+    leading dim, so an `axes=0` on a scalar-per-function input would fail the
+    rank check). `what` prefixes the error messages ("vmap" by default).
+    """
     args_leaves, args_spec = core.flatten(args)
     for index, leaf in enumerate(args_leaves):
         if isinstance(leaf, core.Tensor):
             raise core.TraceError(
-                "calling an evoxc.vmap result with concrete Tensors is not "
+                f"calling an evoxc.{what} result with concrete Tensors is not "
                 f"supported (argument leaf {index}): transforms build Graphs "
                 "from TensorSpecs and never execute. Pass TensorSpecs to "
                 "obtain the transformed Graph, then build/run it explicitly "
@@ -179,7 +192,7 @@ def _derive_unvectorized_args(args, in_axes):
     if in_axes is None or _is_int(in_axes):
         if len(tensor_positions) != 1 and not has_registered:
             raise core.TransformError(
-                "vmap: a bare int/None in_axes applies only when the "
+                f"{what}: a bare int/None in_axes applies only when the "
                 "arguments have exactly ONE tensor spec; got "
                 f"{len(tensor_positions)} tensor specs — pass a pytree "
                 "matching the argument structure instead"
@@ -192,7 +205,7 @@ def _derive_unvectorized_args(args, in_axes):
         axes_leaves, axes_spec = core.flatten(in_axes)
         if has_registered:
             entries, mismatch = _broadcast_registered_axes(
-                axes_spec, args_spec, axes_leaves, tensor_positions, "vmap"
+                axes_spec, args_spec, axes_leaves, tensor_positions, what
             )
         else:
             mismatch = core.first_mismatch_path(
@@ -201,7 +214,7 @@ def _derive_unvectorized_args(args, in_axes):
             entries = list(axes_leaves) if mismatch is None else None
         if mismatch is not None:
             raise core.TransformError(
-                "vmap: the in_axes pytree does not match the argument "
+                f"{what}: the in_axes pytree does not match the argument "
                 f"structure — first mismatch at pytree path "
                 f"{core.format_path(mismatch)}; in_axes must be a pytree with "
                 "the same container structure as the arguments (0 maps a "
@@ -209,8 +222,9 @@ def _derive_unvectorized_args(args, in_axes):
             )
 
     normalized = _normalize_axis_entries(
-        entries, tensor_positions, ranks, "vmap"
+        entries, tensor_positions, ranks, what
     )
+    tensor_entries = [normalized[position] for position in sorted(tensor_positions)]
     # Tensor leaves UNDER a registered pytree node (e.g. a sparse-tensor
     # node's indices/values leaves) keep their shape UNCHANGED when mapped:
     # their leading dim is NOT a batch dim (sparse COO indices are
@@ -238,7 +252,7 @@ def _derive_unvectorized_args(args, in_axes):
             )
         else:
             unvectorized_leaves.append(leaf)
-    return core.unflatten(unvectorized_leaves, args_spec)
+    return core.unflatten(unvectorized_leaves, args_spec), tensor_entries
 
 
 # --- output-axis rearrangement ----------------------------------------------

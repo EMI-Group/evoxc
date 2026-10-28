@@ -1,0 +1,504 @@
+"""Public `batch_functions` — merge N same-signature programs onto one graph.
+
+`batch_functions(fns, axes=0, out_axes=0, *, switch_ops=None)` merges a LIST of
+N traced `Graph`s (or of plain callables/`Defn`s) with IDENTICAL input and
+output signatures but DIFFERENT implementations into ONE `Graph` whose leading
+axis is a **static "function axis"** of length N: row i evaluates function i.
+
+Binding semantics (see `./CONTEXT.md` "Batch functions"): for any run-time
+inputs, ``run(merged, *inputs)`` row i equals ``run(graphs[i], *rowwise_i)`` —
+a mapped (`axes` entry ``0``) input supplies row i of its leading axis, an
+unmapped (``None``) input is shared by every function, static leaves are shared
+(validated), and output row i is function i's output.
+
+Emission strategy (never a silent Python-loop fallback):
+
+* positions where all functions run the SAME op become ONE batched op (exactly
+  `vectorize` speed — with identical programs the result contains no `select`
+  at all);
+* positions with the same skeleton but different ops inside a merge group
+  (`switch_ops`) become one op per variant plus a static per-row `select` mask
+  cascade;
+* every other divergence is still CORRECT via `select`-muxing where the values
+  diverge (constant stacking resp. output muxing).
+
+The returned `Graph` carries `graph.batch_report` — a `BatchReport` describing
+what the merge did (`BatchReport` / `SwitchRecord` are re-exported here from
+`_emit`, where the report is assembled).
+"""
+
+from __future__ import annotations
+
+import collections.abc
+from typing import Any, List, Optional, Sequence, Tuple
+
+from evoxc import core
+from evoxc import ir
+from evoxc.trace import Graph, trace
+from evoxc.trace._tree import _iter_leaf_paths, _static_equal
+from evoxc.transforms import batching
+from evoxc.transforms._emit import BatchReport, SwitchRecord, emit_merged_graph
+from evoxc.transforms._merge import (
+    MergeDAG,
+    MergeGroup,
+    build_merge_dag,
+    parse_switch_groups,
+)
+from evoxc.transforms._wrappers import TransformCallable
+from evoxc.transforms.vectorize import (
+    _is_int,
+    _normalize_axes,
+    _normalize_axis_entries,
+)
+from evoxc.transforms.vmap import _derive_unvectorized_args_and_entries
+
+__all__ = ["batch_functions", "BatchReport", "SwitchRecord"]
+
+_BATCH_FUNCTIONS_CALLABLE_DOC = """\
+`batch_functions(fns)` applied to a sequence of callables/`Defn`s returns a
+TransformCallable: calling it with a structure of TensorSpecs (mapped inputs
+include the leading function axis) + static values traces EVERY function
+exactly once with the same stripped specs and returns the merged Graph, whose
+leading axis of length len(fns) is a static "function axis".
+
+Equivalent to: strip the leading function-axis dim from each mapped spec, trace
+each function, then merge the resulting graphs (mapped inputs/outputs keep a
+static leading dim of length len(fns))."""
+
+
+# --- public entry point -----------------------------------------------------
+
+
+def batch_functions(
+    fns: Sequence[Any],
+    axes: Any = 0,
+    out_axes: Any = 0,
+    *,
+    switch_ops: Any = None,
+) -> Any:
+    """Merge N same-signature programs into one graph with a function axis.
+
+    Args:
+        fns: A non-empty ``list``/``tuple`` (any `collections.abc.Sequence`
+            except `str`/`bytes`) of traced `Graph`s **or** of plain
+            callables/`Defn`s — never mixed. Every program must have the same
+            input AND output tree structure and per-leaf dtype/shape/device,
+            plus identical recorded static leaves; the implementations may
+            differ freely.
+        axes: `int 0` or `None`, or a pytree thereof matching each function's
+            input tree. Entry `0` makes that input leaf's leading axis the
+            FUNCTION axis (the merged input gains a static leading dim of
+            length ``len(fns)``); `None` shares the input unmapped across every
+            function. Normalization is exactly `vectorize`'s: a bare int/None
+            only when the graph has exactly ONE tensor input (or a registered
+            pytree node in the tree), recorded static positions must be `None`,
+            entries must be ``{0, None}`` and non-zero ints raise
+            `core.TransformError` (v1 deferral).
+        out_axes: pytree matching the output tree, entries ``{0, None}``. `0`
+            (the default) keeps the leading function axis on the output; `None`
+            is allowed only when the merged output is NOT mapped (else
+            `core.TransformError` — a batch axis is never silently dropped).
+            Supported cases need no rearrangement ops beyond an explicit
+            broadcast of an unmapped output under `out_axes=0`.
+        switch_ops: op-switching policy. `None`/`False` (default) switches
+            nothing (only exact-structure sharing + value muxing); `True` uses
+            the default merge groups (the IR categories
+            ``{"elementwise", "comparison"}``); any other iterable (not `str`)
+            gives explicit groups, each element either a category name (`str`,
+            validated against ``{o.category for o in ir.all_opdefs()}``) or an
+            iterable of op names (validated against the IR registry). Ops of one
+            group at the same graph position become one op per variant plus a
+            static per-row `select` mask cascade.
+
+    Returns:
+        * `Graph` when given `Graph`s — the merged graph, with
+          ``graph.batch_report`` (a `BatchReport`) describing the merge.
+        * `TransformCallable` (`kind="batch_functions"`) when given callables —
+          calling it with TensorSpecs returns the merged `Graph`; every wrapped
+          function is traced exactly once per call and concrete `Tensor` args
+          raise `core.TraceError` (transforms never execute).
+
+    Raises:
+        TypeError: `fns` is not a non-empty sequence, mixes Graphs with
+            callables, holds an unsupported element, or `switch_ops` is
+            malformed.
+        core.TraceError: mismatched input/output tree structure or static
+            leaves between functions.
+        core.DTypeError / core.ShapeError / core.DeviceError: per-leaf dtype /
+            shape / device mismatch between functions.
+        core.TransformError: invalid `axes`/`out_axes` entries, an op without a
+            batching rule in any program (naming the function index), region-
+            bearing control flow, a registered output pytree node with static
+            leaves (v1 deferral), or conflicting switch-variant result types.
+
+    Example:
+        g0 = evoxc.trace(lambda x: evoxc.sin(x), spec)
+        g1 = evoxc.trace(lambda x: evoxc.cos(x), spec)
+        merged = evoxc.transforms.batch_functions([g0, g1], switch_ops=True)
+        y = evoxc.evaluate(...)  # row 0 == sin(x), row 1 == cos(x)
+    """
+    items, kind = _validate_fns(fns)
+    groups = parse_switch_groups(switch_ops)
+    if kind == "graph":
+        try:
+            normalized = _normalize_axes(items[0], axes)
+        except core.TransformError as exc:
+            raise core.TransformError(
+                "batch_functions: invalid axes: " + str(exc)
+            ) from exc
+        entries = batching._tensor_input_axes(items[0], normalized)
+        out_entries = _normalize_out_axes(items[0], out_axes)
+        return _merge_graphs(items, entries, out_entries, groups)
+    return TransformCallable(
+        build=lambda *args: _batch_callables(items, args, axes, out_axes, groups),
+        kind="batch_functions",
+        doc=_BATCH_FUNCTIONS_CALLABLE_DOC,
+    )
+
+
+# --- callable path ----------------------------------------------------------
+
+
+def _batch_callables(fns, args, axes, out_axes, groups) -> Graph:
+    """`TransformCallable` body: strip → trace every fn once → merge.
+
+    Axes are normalized against the BATCHED argument specs and the leading
+    function-axis dim is stripped from each mapped spec BEFORE tracing (the
+    traced graphs therefore carry the per-function specs — running
+    `vectorize._normalize_axes` on them afterwards would mis-rank-check an
+    `axes=0` on a scalar-per-function input).
+    """
+    stripped, entries = _derive_unvectorized_args_and_entries(
+        args, axes, "batch_functions"
+    )
+    graphs = [trace(fn, *stripped) for fn in fns]
+    out_entries = _normalize_out_axes(graphs[0], out_axes)
+    return _merge_graphs(graphs, entries, out_entries, groups)
+
+
+# --- fns validation ---------------------------------------------------------
+
+
+def _validate_fns(fns) -> Tuple[List[Any], str]:
+    """Validate `fns`; return ``(items, kind)`` with kind ``graph``/``callable``.
+
+    `fns` must be a non-empty `collections.abc.Sequence` (a `str`/`bytes` is
+    rejected — it is a sequence of characters, never a program list) holding
+    either ONLY traced `Graph`s or ONLY callables/`Defn`s; mixing the two kinds
+    is a `TypeError` naming both kinds and an index.
+    """
+    if isinstance(fns, (str, bytes, bytearray)) or not isinstance(
+        fns, collections.abc.Sequence
+    ):
+        raise TypeError(
+            "batch_functions: fns must be a non-empty sequence (list/tuple) of "
+            "traced Graphs or of callables/@evoxc.defn functions, got "
+            f"{type(fns).__name__}"
+        )
+    items = list(fns)
+    if not items:
+        raise TypeError(
+            "batch_functions: fns must be a non-empty sequence of traced "
+            "Graphs or of callables — got an empty sequence"
+        )
+    is_graph = [isinstance(item, Graph) for item in items]
+    if all(is_graph):
+        return items, "graph"
+    if any(is_graph):
+        graph_index = is_graph.index(True)
+        other_index = next(i for i, flag in enumerate(is_graph) if not flag)
+        raise TypeError(
+            "batch_functions: fns must not mix traced Graphs with callables — "
+            f"element {graph_index} is a Graph while element {other_index} is "
+            f"a {type(items[other_index]).__name__}; pass one kind only"
+        )
+    for index, item in enumerate(items):
+        if not (callable(item) or getattr(item, "__evoxc_defn__", False)):
+            raise TypeError(
+                f"batch_functions: fns[{index}] must be a traced Graph or a "
+                f"callable/@evoxc.defn function, got {type(item).__name__}"
+            )
+    return items, "callable"
+
+
+# --- cross-function contract validation -------------------------------------
+
+
+def _program_function(graph: Graph, index: int) -> ir.Function:
+    """The graph's single entry function (v1 program-shape guard)."""
+    try:
+        function = batching._entry_function(graph)
+    except core.TransformError as exc:
+        raise core.TransformError(
+            f"batch_functions: function {index}: {exc}"
+        ) from exc
+    block = function.entry_block
+    terminator = block.terminator
+    if terminator is None or terminator.name != "return":
+        raise core.TransformError(
+            f"batch_functions: function {index}: the entry block has no "
+            "'return' terminator (v1 graphs terminate with 'return')"
+        )
+    if len(block.arguments) != len(graph.tensor_specs):
+        raise core.TransformError(
+            f"batch_functions: function {index}: the graph function has "
+            f"{len(block.arguments)} block args but {len(graph.tensor_specs)} "
+            "tensor input specs"
+        )
+    return function
+
+
+def _tensor_paths(tree_spec, static_records) -> List[Tuple[Any, ...]]:
+    """Pytree paths of the TENSOR leaves of `tree_spec`, in flat leaf order."""
+    paths = list(_iter_leaf_paths(tree_spec))
+    static_positions = {record.index for record in static_records}
+    return [
+        path
+        for position, path in enumerate(paths)
+        if position not in static_positions
+    ]
+
+
+def _check_static_leaves(
+    expected: Sequence[Any], got: Sequence[Any], index: int, what: str
+) -> None:
+    """Static leaves must match function 0 in both kind and value."""
+    for record0, record in zip(expected, got):
+        if record.kind == record0.kind and _static_equal(
+            record.value, record0.value
+        ):
+            continue
+        raise core.TraceError(
+            f"batch_functions: function {index}: static {what} leaf at pytree "
+            f"path {core.format_path(record0.path)} differs from function 0 "
+            f"(function 0 records {record0.value!r} of kind {record0.kind!r}, "
+            f"function {index} passes {record.value!r} of kind "
+            f"{record.kind!r}); static values specialize the graph and must "
+            "match across all merged functions"
+        )
+
+
+def _check_contract(graphs: Sequence[Graph]) -> None:
+    """Validate that every function shares function 0's full signature.
+
+    Compares each function ``k >= 1`` against function 0: identical input and
+    output pytree STRUCTURE (`core.TraceError`, with the first mismatch path),
+    identical tensor-leaf count, per-leaf dtype (`core.DTypeError`), shape
+    (`core.ShapeError`) and device (`core.DeviceError`), and identical recorded
+    static input/output leaves (type + value; ndarray leaves via
+    `np.array_equal` semantics — `core.TraceError`). The merged input specs are
+    function 0's `TensorSpec`s (name/device preserved): only shapes may change,
+    and only for mapped leaves.
+    """
+    graph0 = graphs[0]
+    input_paths = _tensor_paths(graph0.input_specs, graph0.static_values)
+    output_paths = _tensor_paths(graph0.output_tree, graph0.output_static_values)
+    output_types0 = graph0.module.functions[0].entry_block.terminator.operands
+    for index, graph in enumerate(graphs[1:], start=1):
+        function = _program_function(graph, index)
+        mismatch = core.first_mismatch_path(
+            graph.input_specs, graph0.input_specs, leaf_vs_empty_is_mismatch=True
+        )
+        if mismatch is not None:
+            raise core.TraceError(
+                f"batch_functions: function {index}: the input tree structure "
+                f"differs from function 0 — first mismatch at pytree path "
+                f"{core.format_path(mismatch)}"
+            )
+        if len(graph.tensor_specs) != len(graph0.tensor_specs):
+            raise core.TraceError(
+                f"batch_functions: function {index}: {len(graph.tensor_specs)} "
+                f"tensor inputs but function 0 has {len(graph0.tensor_specs)}"
+            )
+        for leaf, (spec0, spec) in enumerate(
+            zip(graph0.tensor_specs, graph.tensor_specs)
+        ):
+            path = core.format_path(input_paths[leaf])
+            if spec.dtype != spec0.dtype:
+                raise core.DTypeError(
+                    f"batch_functions: function {index}: input leaf {leaf} at "
+                    f"pytree path {path} has dtype {spec.dtype} but function 0 "
+                    f"has {spec0.dtype}"
+                )
+            if tuple(spec.shape) != tuple(spec0.shape):
+                raise core.ShapeError(
+                    f"batch_functions: function {index}: input leaf {leaf} at "
+                    f"pytree path {path} has shape {tuple(spec.shape)} but "
+                    f"function 0 has {tuple(spec0.shape)}"
+                )
+            if spec.device != spec0.device:
+                raise core.DeviceError(
+                    f"batch_functions: function {index}: input leaf {leaf} at "
+                    f"pytree path {path} lives on device {spec.device} but "
+                    f"function 0 has {spec0.device}"
+                )
+        _check_static_leaves(graph0.static_values, graph.static_values, index, "input")
+
+        mismatch = core.first_mismatch_path(
+            graph.output_tree, graph0.output_tree, leaf_vs_empty_is_mismatch=True
+        )
+        if mismatch is not None:
+            raise core.TraceError(
+                f"batch_functions: function {index}: the output tree structure "
+                f"differs from function 0 — first mismatch at pytree path "
+                f"{core.format_path(mismatch)}"
+            )
+        outputs = function.entry_block.terminator.operands
+        if len(outputs) != len(output_types0):
+            raise core.TraceError(
+                f"batch_functions: function {index}: the graph returns "
+                f"{len(outputs)} tensor values but function 0 returns "
+                f"{len(output_types0)}"
+            )
+        for leaf, (value0, value) in enumerate(zip(output_types0, outputs)):
+            path = core.format_path(output_paths[leaf])
+            if value.type.dtype != value0.type.dtype:
+                raise core.DTypeError(
+                    f"batch_functions: function {index}: output leaf {leaf} at "
+                    f"pytree path {path} has dtype {value.type.dtype} but "
+                    f"function 0 has {value0.type.dtype}"
+                )
+            if tuple(value.type.shape) != tuple(value0.type.shape):
+                raise core.ShapeError(
+                    f"batch_functions: function {index}: output leaf {leaf} at "
+                    f"pytree path {path} has shape {tuple(value.type.shape)} "
+                    f"but function 0 has {tuple(value0.type.shape)}"
+                )
+        _check_static_leaves(
+            graph0.output_static_values, graph.output_static_values, index, "output"
+        )
+
+
+def _check_ops(graphs: Sequence[Graph]) -> None:
+    """Every op in every program must be batchable (or a `constant`).
+
+    Region-bearing control flow (`cond`/`while_loop`/`scan`) and every op
+    without a registered batching rule (looked up through
+    `batching._rule_key`, so `block:<name>` / `external:<name>` namespacing
+    works) is a v1 deferral of `batch_functions` — an explicit
+    `core.TransformError` naming the op and the function index, never a silent
+    Python-loop fallback.
+    """
+    for index, graph in enumerate(graphs):
+        block = graph.module.functions[0].entry_block
+        for op in block.ops:
+            if op.is_terminator:
+                continue
+            if op.regions:
+                raise core.TransformError(
+                    f"batch_functions: cannot batch op '{op.name}' from "
+                    f"function {index}: region-bearing control-flow ops "
+                    "(cond/while_loop/scan) are not supported by "
+                    "batch_functions in v1 — v1 deferral of batch_functions"
+                )
+            if op.name == "constant":
+                continue
+            key = batching._rule_key(op)
+            if key in batching.batching_rules:
+                continue
+            raise core.TransformError(
+                f"batch_functions: cannot batch op '{op.name}' from function "
+                f"{index}: no batching rule registered for key '{key}' — v1 "
+                "deferral of batch_functions (runtime_call/external_call, "
+                "collectives, sparse/random/sorting/linalg ops and block calls "
+                "without their namespaced rules are not batchable); register a "
+                f"rule with register_batching_rule('{key}', fn) or drop the op "
+                "from the merged programs — there is no silent Python-loop "
+                "fallback"
+            )
+
+
+def _check_output_nodes(graphs: Sequence[Graph]) -> None:
+    """Registered output pytree nodes with static leaves are a v1 deferral.
+
+    `batch_functions` prepends a static function axis to every mapped output,
+    which would go stale for node metadata derived from tensor shapes (e.g. a
+    sparse value's `dense_shape`). `register_batched_aux_remap` handles this
+    for `vectorize`; `batch_functions` deliberately does NOT attempt batched aux
+    remapping in v1.
+    """
+
+    def walk(spec) -> bool:
+        if batching._lookup_batched_aux_remap(spec) is not None:
+            return True
+        return any(walk(child) for child in spec.children)
+
+    for index, graph in enumerate(graphs):
+        if walk(graph.output_tree):
+            raise core.TransformError(
+                "batch_functions: function "
+                f"{index} returns a registered pytree node with static leaves "
+                "(e.g. a sparse tensor) — batched output-aux remapping is a v1 "
+                "deferral of batch_functions; densify the output or stay on "
+                "evoxc.vmap"
+            )
+
+
+# --- out_axes normalization -------------------------------------------------
+
+
+def _normalize_out_axes(
+    graph: Graph, out_axes
+) -> List[Optional[int]]:
+    """Normalize `out_axes` into one ``0``/``None`` per TENSOR output leaf.
+
+    Mirrors the front half of `vmap._rearrange_outputs`: the pytree must match
+    the graph's output structure (first-mismatch-path `core.TransformError`
+    otherwise), static output leaves must be `None`, entries must be
+    ``{0, None}`` (non-zero ints are the v1 non-leading-axes deferral), and a
+    bare int/None is accepted only with at most ONE tensor output. No
+    rearrangement ops are emitted — the caller only reads the entries.
+    """
+    static_positions = {record.index for record in graph.output_static_values}
+    tensor_positions = set(range(graph.output_tree.num_leaves)) - static_positions
+    if out_axes is None or _is_int(out_axes):
+        if len(tensor_positions) > 1:
+            raise core.TransformError(
+                "batch_functions: a bare int/None out_axes applies only when "
+                f"the graph has at most ONE tensor output; got "
+                f"{len(tensor_positions)} tensor outputs — pass a pytree "
+                "matching the output structure instead"
+            )
+        entries = [
+            out_axes if index in tensor_positions else None
+            for index in range(graph.output_tree.num_leaves)
+        ]
+    else:
+        axes_leaves, axes_spec = core.flatten(out_axes)
+        mismatch = core.first_mismatch_path(
+            axes_spec, graph.output_tree, leaf_vs_empty_is_mismatch=True
+        )
+        if mismatch is not None:
+            raise core.TransformError(
+                "batch_functions: the out_axes pytree does not match the "
+                f"output structure — first mismatch at pytree path "
+                f"{core.format_path(mismatch)}; out_axes must be a pytree with "
+                "the same container structure as the outputs (0 keeps the "
+                "leading function axis, None requires the output unmapped)"
+            )
+        entries = list(axes_leaves)
+    # No rank range-check for outputs: entry 0 on a rank-0 unmapped output is
+    # the legal "broadcast to the function axis" case, not an error.
+    normalized = _normalize_axis_entries(
+        entries, tensor_positions, None, "batch_functions"
+    )
+    return [normalized[position] for position in sorted(tensor_positions)]
+
+
+# --- merge driver -----------------------------------------------------------
+
+
+def _merge_graphs(
+    graphs: Sequence[Graph],
+    entries: Sequence[Optional[int]],
+    out_entries: Sequence[Optional[int]],
+    groups: Sequence[MergeGroup],
+) -> Graph:
+    """Validate the merge and build the merged graph (the two-phase core)."""
+    for index, graph in enumerate(graphs):
+        _program_function(graph, index)
+    _check_contract(graphs)
+    _check_ops(graphs)
+    _check_output_nodes(graphs)
+    dag: MergeDAG = build_merge_dag(graphs, groups)
+    return emit_merged_graph(graphs, dag, entries, out_entries, groups)
