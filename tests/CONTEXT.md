@@ -46,7 +46,7 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 | `./numpy/` | enp sugar tests |
 | `./trace/` | defn/trace/control-flow tests |
 | `./block/` | custom op tests |
-| `./transforms/` | vmap/grad/jvp/vjp tests |
+| `./transforms/` | vmap/grad/jvp/vjp + `batch_functions` tests (12 files; `test_batch_functions.py` 55 semantics/structure, `test_batch_functions_errors.py` 44 + 1 `xfail(strict=True)` pin, `test_batch_functions_integration.py` 6 incl. iree/llvm-cpu parity + StableHLO export) |
 | `./backends/` | backend interface + stablehlo export goldens (eigh batched/sequential, two-stage split reduction, emitter parity incl. region pins) + compiler-framework & IREE/XLA/TVM adapter tests (incl. the device-resident suites `test_iree_rocm_device_resident.py` (ROCm/HIP) and `test_iree_vulkan_device_resident.py` (Vulkan/SPIR-V), the device-less Vulkan suites `test_vulkan_target.py` / `test_iree_vulkan_acquisition.py`, the XLA ctypes-plugin/device-resident hot-path suites, and the shared non-collected guard helpers `_rocm_guard.py` / `_adapter_utils.py` / `_fake_pjrt_plugin.c` — see its own CONTEXT.md) |
 | `./dist/` | collective semantics tests |
 | `./sparse/` | sparse-tensor suite (evoxc.sparse): value model / ops / errors / transforms / control flow / pipeline / backends / deferrals — see `./sparse/CONTEXT.md` |
