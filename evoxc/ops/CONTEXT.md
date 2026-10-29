@@ -10,6 +10,10 @@ The frontend tensor-operation namespace: every numerical op that can appear in a
 2. **Trace requirement.** Every op calls `_utils.check_in_trace()` FIRST; no active trace → `core.TraceError` mentioning `evoxc.trace` / `@evoxc.defn` / `evoxc.evaluate`.
 3. **Construction.** Build via `builder.create(op_name, ...)` on the active builder; op names, arities, attrs, and effects are declared in `evoxc.ir`'s op registry (the canonical table — `ops` keeps no parallel op-definition table; `_opdefs.py` is deleted). Attach a call-site `Location` (`_utils.get_location`) to every op; env `EVOXC_DISABLE_LOCATIONS=1` disables capture (then `ir.Location.unknown()`). `_utils._suppress_location_capture()` (internal, re-entrant context manager) also disables capture for internal graph emitters and takes precedence over the env var.
 
+4. **Results.** Wrap the IR result value in `core.SymbolicTensor(value=..., dtype=..., shape=..., location=...)`. Shape is always statically computed (`DimExpr` arithmetic) at build time; runtime numpy enforces exact semantics.
+5. **Static values.** All non-tensor parameters (axes, shapes, padding, `k`, dtype, callback) are static Python values that specialize the graph. Changing one = a different op; no hidden guards.
+6. **Sugar rule.** `sum`/`max`/`min`/`mean`/`prod` are documented shorthand for `reduce_*` with the same kwargs — nothing else is sugar.
+
 ### Location capture mechanism & cost (binding)
 
 `_utils.get_location(depth=1)` walks the interpreter frame stack DIRECTLY — `sys._getframe(depth)` then `f_back` — reading `frame.f_code.co_filename` / `frame.f_lineno`; it never calls `inspect.stack()` (which materializes a `FrameInfo` per frame and pulls source lines through `linecache`, the dominant trace cost before: ~59 % of trace time, ~0.22 ms per graph node vs ~0.017 ms with capture off).
@@ -17,10 +21,6 @@ Returned value is unchanged: the first frame OUTSIDE the `evoxc` package as `ir.
 Package membership is `_utils._inside_evoxc_package(filename)` — the SAME `os.path.commonpath([_EVOXC_ROOT, os.path.realpath(filename)])` rule, now memoized per DISTINCT filename in `_INSIDE_EVOXC_CACHE` (cap `_INSIDE_EVOXC_CACHE_LIMIT` = 4096; past the cap answers are computed, just not stored), so relative/symlinked spellings still classify identically.
 `EVOXC_DISABLE_LOCATIONS=1` and an active `_suppress_location_capture()` block still short-circuit before any frame access (zero cost); `sys._getframe` raising (a `depth` deeper than the stack, or a missing intrinsic on a non-CPython runtime) degrades to `ir.Location.unknown()`. Capture never raises.
 Measured (`/tmp/iree311`, numpy 2.5.4, best-of-3): 256-tree / ~32-node random population 0.216 → 0.018 ms/node (disabled-reference 0.016, i.e. 12× faster, within 10 % of free); vmap+grad-heavy graphs 0.762 → 0.050 ms/node (16×); small single graph 718 → 106 µs per trace (7×, the fixed `inspect.stack` cost is gone).
-
-4. **Results.** Wrap the IR result value in `core.SymbolicTensor(value=..., dtype=..., shape=..., location=...)`. Shape is always statically computed (`DimExpr` arithmetic) at build time; runtime numpy enforces exact semantics.
-5. **Static values.** All non-tensor parameters (axes, shapes, padding, `k`, dtype, callback) are static Python values that specialize the graph. Changing one = a different op; no hidden guards.
-6. **Sugar rule.** `sum`/`max`/`min`/`mean`/`prod` are documented shorthand for `reduce_*` with the same kwargs — nothing else is sugar.
 
 ## Dtype promotion (design decision — binding)
 
