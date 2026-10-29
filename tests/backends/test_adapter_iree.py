@@ -26,6 +26,16 @@ Pinned here:
   raise ``evoxc.BackendError`` NAMING the feature.
 * the lowered payload is the shared StableHLO contract: ``format ==
   "stablehlo"``, ``format_version == 1``, MLIR text, entry functions.
+* the per-dispatch buffer-binding-limit rejection (HIP/CUDA HAL cap of 16,
+  checked at executable LOAD — ``adapters/CONTEXT.md`` Known Issue #19):
+  ``_raise_if_dispatch_binding_limit`` rewrites EXACTLY that runtime text into
+  an actionable ``core.BackendError`` (observed count, cap, compile target,
+  the three remedies; the original ``ValueError`` as ``__cause__``), annotates
+  the split/external-kernel ``segment_index``, and leaves every other iree
+  load failure — the llvm-cpu command-buffer cap, the mixed-install trap —
+  with its previous wording; ``TestIreeBindingLimitError`` also drives the real
+  ROCm/HIP wall (K=15 pieces ⇒ 16 bindings loads and runs, K=16 ⇒ 17 bindings
+  is rejected), GPU-guarded.
 
 IREE runs the real MLIR compiler (seconds per compile), so the 2s-per-file
 convention does not apply here; the module keeps the compile count low via
@@ -43,6 +53,7 @@ import evoxc
 from evoxc.backends.adapters import iree
 
 from tests.backends import _adapter_utils as u
+from tests.backends import _rocm_guard as rocm_guard
 
 NAME = "iree"
 
@@ -345,3 +356,273 @@ def test_batched_dot_vmap_shared_weight_parity(adapter_backend):
     assert actual.numpy().shape == expected.numpy().shape
     # Cross-compiler fp32 bound, same as the other batched-dot parity tests.
     np.testing.assert_allclose(actual.numpy(), expected.numpy(), rtol=1e-3, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# 9. per-dispatch binding limit (HIP/CUDA HAL cap, raised at executable LOAD)
+# ---------------------------------------------------------------------------
+
+#: The documented runtime rejection text of the HIP/CUDA verifier
+#: (``runtime/src/iree/hal/drivers/{hip,cuda}/native_executable.c``; see
+#: ``evoxc/backends/adapters/CONTEXT.md`` Known Issue #19).
+HIP_BINDING_LIMIT_TEXT = (
+    "hip/native_executable.c:223: INVALID_ARGUMENT; failed to create "
+    "executable; exports[0] binding_flags count 21 exceeds maximum of 16 "
+    "(IREE_HAL_HIP_MAX_DISPATCH_BINDING_COUNT)"
+)
+
+#: The llvm-cpu command-buffer dispatch cap — a DIFFERENT runtime message
+#: that ``_raise_if_dispatch_binding_limit`` deliberately does NOT rewrite
+#: (Known Issue #19: the local-task caps are out of its scope).
+LOCAL_TASK_COMMAND_BUFFER_TEXT = (
+    "hal/module.c:1077: OUT_OF_RANGE; binding count 47 > 32"
+)
+
+#: The mixed-install trap text (Known Issue #7) — unrelated to bindings and
+#: therefore never rewritten.
+MIXED_INSTALL_TEXT = (
+    "required module features [Ch] are not available in this runtime "
+    "configuration"
+)
+
+
+def _install_fake_iree_runtime(monkeypatch, load_vm_module, flatbuffer_loader=None):
+    """Patch the ``iree.runtime`` entry points ``_load_vm_module`` calls.
+
+    ``_load_vm_module`` imports ``iree.runtime as rt`` INSIDE its body and then
+    calls ``rt.Config`` / ``rt.VmModule.copy_buffer`` / ``rt.load_vm_module``
+    (GPU kinds) or ``rt.load_vm_flatbuffer`` (CPU), so patching the attributes
+    of the real module reaches it. The device/VM-module scaffolding is faked so
+    no real flatbuffer is parsed; only the loader under test is real (a stub).
+    ``monkeypatch`` restores every attribute on teardown.
+    """
+    import types
+
+    import iree.runtime as rt
+
+    class _FakeVmModule:
+        @staticmethod
+        def copy_buffer(vm_instance, vmfb):
+            return object()
+
+    monkeypatch.setattr(
+        rt, "Config", lambda device=None: types.SimpleNamespace(vm_instance=object())
+    )
+    monkeypatch.setattr(rt, "VmModule", _FakeVmModule)
+    monkeypatch.setattr(rt, "load_vm_module", load_vm_module)
+    if flatbuffer_loader is not None:
+        monkeypatch.setattr(rt, "load_vm_flatbuffer", flatbuffer_loader)
+
+
+def _binding_wall_fn(k):
+    """K ``reshape(divide(reduce_sum(x_i), N), (1,))`` pieces, concatenated.
+
+    IREE rewrites the ``stablehlo.concatenate`` into a ``flow.tensor.update``
+    chain and fuses it (plus each piece's trailing elementwise ``divide``)
+    into ONE dispatch reading the K reduce outputs — K+1 bindings (Known
+    Issue #19's measured worst case).
+    """
+
+    def fn(*xs):
+        pieces = [
+            evoxc.reshape(evoxc.divide(evoxc.sum(x), _BINDING_WALL_DIVISOR), (1,))
+            for x in xs
+        ]
+        return evoxc.concatenate(pieces, axis=0)
+
+    return fn
+
+
+#: Reduced-row length and the divisor of the synthetic binding-wall graph.
+_BINDING_WALL_ROWS = 4
+_BINDING_WALL_DIVISOR = 4.0
+
+
+def _binding_wall_specs(k):
+    return tuple(
+        evoxc.TensorSpec((_BINDING_WALL_ROWS,), evoxc.float32) for _ in range(k)
+    )
+
+
+def _binding_wall_args(k, seed=0):
+    """Host inputs whose reduce sums are exactly representable in fp32."""
+    rng = np.random.default_rng(seed)
+    return [
+        (rng.integers(0, 4, size=(_BINDING_WALL_ROWS,)) / 4.0).astype(np.float32)
+        for _ in range(k)
+    ]
+
+
+class TestIreeBindingLimitError:
+    """The per-dispatch 16-binding HAL cap -> actionable ``core.BackendError``.
+
+    Pins ``evoxc/backends/adapters/iree.py::_raise_if_dispatch_binding_limit``
+    and its wiring inside the shared ``_load_vm_module`` (Known Issue #19):
+    ONLY the HIP/CUDA binding-limit rejection is rewritten (with the original
+    ``ValueError`` as ``__cause__``); every other iree load failure keeps its
+    previous wording. GPU-free except the last pin, which needs a real ROCm
+    device (one small compile + load, no timing — the box's GPU is shared).
+    """
+
+    # -- the message contract (pure unit) ----------------------------------
+
+    def test_hip_binding_limit_becomes_actionable_backend_error(self):
+        exc = ValueError(HIP_BINDING_LIMIT_TEXT)
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            iree._raise_if_dispatch_binding_limit(exc, "rocm")
+        message = str(excinfo.value)
+        # The observed count and the cap, both spelled out.
+        assert "needs 21 bindings" in message
+        assert "cap of 16" in message
+        # The device kind AND the compile target it corresponds to.
+        assert "target 'rocm'" in message
+        assert "ROCm/HIP" in message
+        # The three documented remedies, verbatim.
+        assert "FEWER bands" in message
+        assert "target_backends=['llvm-cpu']" in message
+        assert "numpy" in message
+        # Nothing was silently retried/recompiled/fallen back.
+        assert "Nothing was retried" in message
+        # The original runtime error is preserved as the cause.
+        assert excinfo.value.__cause__ is exc
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+    def test_segment_index_names_the_external_kernel_segment(self):
+        exc = ValueError(HIP_BINDING_LIMIT_TEXT)
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            iree._raise_if_dispatch_binding_limit(exc, "rocm", segment_index=2)
+        message = str(excinfo.value)
+        assert "external-kernel segment 2" in message
+        assert "needs 21 bindings" in message
+        assert excinfo.value.__cause__ is exc
+
+    @pytest.mark.parametrize("kind", ["cuda", "cpu", "vulkan"])
+    def test_kind_dependent_label_and_default_cap(self, kind):
+        # No numeric cap in the text => the per-kind table supplies it; the
+        # label/target follow the kind. Vulkan has NO cap (bindings become
+        # descriptor-set layouts), so its message names "the HAL's cap".
+        text = "hip/native_executable.c:223: exports[0] binding_flags exceed"
+        exc = ValueError(text)
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            iree._raise_if_dispatch_binding_limit(exc, kind)
+        message = str(excinfo.value)
+        assert "an unstated number of bindings" in message
+        expected_target = iree._EXPECTED_TARGET_BY_KIND[kind]
+        assert f"target {expected_target!r}" in message
+        if kind == "vulkan":
+            assert "the HAL's cap" in message
+        else:
+            assert f"cap of {iree._DISPATCH_BINDING_LIMITS[kind]}" in message
+
+    def test_non_binding_limit_errors_are_left_alone(self):
+        # Returns ``None`` (no raise) for both non-binding texts.
+        assert (
+            iree._raise_if_dispatch_binding_limit(
+                ValueError(LOCAL_TASK_COMMAND_BUFFER_TEXT), "cpu"
+            )
+            is None
+        )
+        assert (
+            iree._raise_if_dispatch_binding_limit(ValueError(MIXED_INSTALL_TEXT), "cpu")
+            is None
+        )
+        # The HIP text only counts when the kind-independent message pattern
+        # OR the runtime source marker matches — an unrelated ValueError with
+        # the word "binding" is not enough.
+        assert (
+            iree._raise_if_dispatch_binding_limit(
+                ValueError("binding a python callback failed"), "rocm"
+            )
+            is None
+        )
+
+    # -- the shared load path ----------------------------------------------
+
+    def test_load_vm_module_rewrites_the_hip_binding_limit(self, monkeypatch):
+        def _boom(vm_module, config):
+            raise ValueError(HIP_BINDING_LIMIT_TEXT)
+
+        _install_fake_iree_runtime(monkeypatch, _boom)
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            iree._load_vm_module(b"\x00vmfb", "rocm", runtime_device=None)
+        assert "needs 21 bindings" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+    def test_load_vm_module_passes_unrelated_errors_through(self, monkeypatch):
+        original = ValueError("totally unrelated runtime failure")
+
+        def _boom(vm_module, config):
+            raise original
+
+        _install_fake_iree_runtime(monkeypatch, _boom)
+        with pytest.raises(ValueError) as excinfo:
+            iree._load_vm_module(b"\x00vmfb", "cuda", runtime_device=None)
+        # Same exception object, unchanged type and message (never wrapped).
+        assert excinfo.value is original
+        assert str(excinfo.value) == "totally unrelated runtime failure"
+
+    def test_cpu_load_prioritises_the_binding_limit_over_the_mixed_install_wrapper(
+        self, monkeypatch
+    ):
+        # On the CPU path the binding-limit recognition runs BEFORE the
+        # mixed-install wrapper, so the message is never misattributed.
+
+        def _boom(vmfb, driver=None):
+            raise ValueError(HIP_BINDING_LIMIT_TEXT)
+
+        _install_fake_iree_runtime(monkeypatch, None, flatbuffer_loader=_boom)
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            iree._load_vm_module(b"\x00vmfb", "cpu", runtime_device=None)
+        message = str(excinfo.value)
+        assert "needs 21 bindings" in message
+        assert "MIXED IREE INSTALL" not in message
+
+    def test_cpu_load_keeps_the_mixed_install_wrapper(self, monkeypatch):
+        def _boom(vmfb, driver=None):
+            raise ValueError(MIXED_INSTALL_TEXT)
+
+        _install_fake_iree_runtime(monkeypatch, None, flatbuffer_loader=_boom)
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            iree._load_vm_module(b"\x00vmfb", "cpu", runtime_device=None)
+        assert "MIXED IREE INSTALL" in str(excinfo.value)
+
+    # -- the real driver shape (GPU-guarded) -------------------------------
+
+    def test_real_rocm_driver_binding_wall(self):
+        # K=15 pieces => 16 bindings (the cap): compiles, LOADS and runs.
+        # K=16 pieces => 17 bindings: the HAL verifier rejects the module at
+        # load and evoxc converts it into the actionable BackendError.
+        # ONE compile per K on the shared MI300X, no timing.
+        device = rocm_guard.require_rocm()
+        specs15 = _binding_wall_specs(15)
+        args15 = _binding_wall_args(15)
+        exe = evoxc.build(
+            _binding_wall_fn(15),
+            *specs15,
+            backend=NAME,
+            target_backends=["rocm"],
+            device=device,
+        )
+        out = evoxc.run(
+            exe, *[evoxc.core.Tensor(a).to(device) for a in args15]
+        )
+        host = np.asarray(out.to(evoxc.core.Device("cpu", 0)).numpy())
+        # Exactly-representable fp32 data ⇒ a bit-exact reduce + divide.
+        expected = np.array(
+            [a.astype(np.float64).sum() / _BINDING_WALL_DIVISOR for a in args15],
+            dtype=np.float32,
+        )
+        assert host.shape == (15,)
+        np.testing.assert_array_equal(host, expected)
+
+        with pytest.raises(evoxc.core.BackendError) as excinfo:
+            evoxc.build(
+                _binding_wall_fn(16),
+                *_binding_wall_specs(16),
+                backend=NAME,
+                target_backends=["rocm"],
+                device=device,
+            )
+        message = str(excinfo.value)
+        assert "needs 17 bindings" in message
+        assert "cap of 16" in message

@@ -17,6 +17,11 @@ into the package):
   ``CompiledArtifact``.
 * ``load(artifact)`` — validates ``artifact.backend == self.name`` and
   returns an executable (never re-compiling).
+* the verification-pass COUNT (``ir.verify`` walks): exactly ONE for a graph
+  with nothing to inline (the post-inline re-verification is provably
+  redundant, and the export uses ``stablehlo._emit_verified`` instead of the
+  verifying public ``export``), exactly TWO when a portable decomposition was
+  spliced; the public ``export`` still verifies its input once.
 
 Every test builds its stub through ``_make_stub`` with a DISTINCT backend
 name, so the process-global registry never collides across tests. CPU only;
@@ -343,3 +348,76 @@ def test_lowered_and_artifact_save_load_roundtrip(tmp_path):
     assert restored_artifact.backend == artifact.backend == "persist-stub"
     assert restored_artifact.target == "cpu"
     assert restored_artifact.payload == artifact.payload
+
+
+# ---------------------------------------------------------------------------
+# 7. verification-pass count (the redundancy proof at the ``inline_portables``
+#    call site must stay TRUE — never a silent correctness relaxation)
+# ---------------------------------------------------------------------------
+def _count_verifications(monkeypatch):
+    """Count full ``ir.verify`` walks from BOTH reachable call sites.
+
+    ``CompilerBackend.lower`` reaches verification through exactly two names:
+    ``Graph.verify()`` (``evoxc.trace.graph`` calls ``ir.verify`` via the
+    ``evoxc.ir`` module attribute, resolved at CALL time) and
+    ``stablehlo.export`` (which bound ``verify`` into its own module namespace
+    at import). Patching both keeps the count honest wherever a walk happens.
+    """
+    import evoxc.ir as ir_mod
+    from evoxc.backends import stablehlo as stablehlo_mod
+
+    calls = []
+    real = ir_mod.verify
+
+    def counting(module):
+        calls.append(module)
+        return real(module)
+
+    monkeypatch.setattr(ir_mod, "verify", counting)
+    monkeypatch.setattr(stablehlo_mod, "verify", counting)
+    return calls
+
+
+def test_lower_verifies_exactly_once_without_inlining(monkeypatch):
+    # A graph with nothing to splice is verified ONCE: the defensive
+    # post-inline ``graph.verify()`` is provably redundant when
+    # ``inline_portables`` reports zero expansions, and the export uses the
+    # private ``stablehlo._emit_verified`` fast path instead of the public
+    # (verifying) ``export``.
+    stub = _make_stub("verify-count-plain")
+    graph = _add_graph()
+    calls = _count_verifications(monkeypatch)
+    lowered = stub.lower(graph)
+    assert len(calls) == 1
+    assert calls[0] is graph.module
+    assert "stablehlo.add" in lowered.payload["mlir_text"]
+
+
+def test_lower_verifies_twice_when_a_portable_is_inlined(monkeypatch):
+    # When a portable decomposition IS spliced into the module, the module has
+    # changed since the first walk, so the defensive re-verification runs: 2
+    # walks total (pre-inline + post-inline) — and STILL not a third from the
+    # export fast path.
+    stub = _make_stub("verify-count-inline")
+    graph = _block_graph()
+    calls = _count_verifications(monkeypatch)
+    lowered = stub.lower(graph)
+    assert len(calls) == 2
+    assert calls[0] is calls[1] is graph.module
+    mlir_text = lowered.payload["mlir_text"]
+    assert "block_call" not in mlir_text
+    assert "stablehlo.add" in mlir_text
+
+
+def test_public_export_still_verifies_its_input(monkeypatch):
+    # Contrast pin: the PUBLIC entry point never takes the fast path — its
+    # contract is "verify first", so it performs one walk (which is exactly
+    # why ``lower`` calls the private entry point instead).
+    from evoxc.backends import stablehlo as stablehlo_mod
+
+    calls = _count_verifications(monkeypatch)
+    graph = _add_graph()
+    text = stablehlo_mod.export(graph)
+    assert len(calls) == 1
+    assert calls[0] is graph.module
+    assert text == stablehlo_mod._emit_verified(graph.module)
