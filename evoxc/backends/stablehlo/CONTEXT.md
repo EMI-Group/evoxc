@@ -161,6 +161,7 @@ iree/tvm declare `dynamic_shapes=True` but support is PER-OP partial — the exp
 - Adding a new exporter option: Writer flag + normalizer in `Writer.__init__`, `export()` docstring, an `_exporter_options` entry in `../compiler.py` (+ an optional `default_<option>` `ClassVar`), and each consuming adapter's `KNOWN_OPTIONS["lower"]`.
 
 ## Design decisions
+- **Constant payloads are rendered as fully expanded `dense<[...]>` literals** (`_constant_text`, `writer.py:4852-4878`), so text size is O(elements) per constant: a `batch_functions`-merged population graph at N=1000 is 10.5 MB of which 9.0 MB (86 %) is 993 i1 select-mask constants of shape `tensor<1000x1xi1>` (`_row_mask` in `../../transforms/_emit.py:171-183`) and only 1.2 MB is op text (≈83 B/op); a plain 20 000-op elementwise chain is 1.14 MB (≈57 B/op, no constants). Text size is NOT a compile-time lever: parse+ingest of that 10.5 MB is ~1.3 s versus a 26.5 s iree compile (measured model: Known Issue 18 in `../adapters/CONTEXT.md`), and MLIR's compact `dense<"0x...">` hex form is unusable for i1 here (`tensor<1000x1xi1>` rejects the 125-byte bit-packed payload, accepts 1000 bytes = one byte per element).
 
 - **Verify before export** — `export()` runs `module.verify()` first, so emission never works from invalid IR.
 - **Program-order emission** — ops emit in block order, so program order IS effect order (write/read/collective/callback semantics preserved).
