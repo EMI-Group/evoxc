@@ -7,6 +7,13 @@ to `evoxc.core`/`evoxc.ir` (+ stdlib and `./ops.py`); `evoxc.pipeline` never
 imported. The Writer receives an already-unwrapped `evoxc.ir.Module` from
 `export()` (Graph handling stays in `__init__.py`).
 
+Constant PAYLOAD text is not composed here: `_constant_text` delegates to
+`./constants.py` (`dense_text`), which renders a `dense<[...]>` elements
+attribute for a whole numpy payload with C-level loops (plus the float
+formatting primitives `_fmt_float`/`_re_split_exp` and the IEEE hex tables
+this module imports) — see that module's docstring for why the per-element
+recursion it replaced dominated large merged-graph exports.
+
 Emission conventions (syntax verified against the StableHLO spec at
 https://openxla.org/stablehlo/spec and stablehlo/dialect/StablehloOps.td):
 
@@ -88,6 +95,7 @@ from evoxc.core import BackendError, Dim, DimExpr
 
 from . import ops as mapping
 from . import random_export
+from .constants import dense_text, _fmt_float
 from .eigh_batched import EighBatchedMixin
 from .split_reduce import (
     SplitReductionMixin,
@@ -100,13 +108,6 @@ from .split_reduce import (
 if TYPE_CHECKING:
     from evoxc.ir import Block, Function, Module, Op, Value
 
-# Hex float spellings of IEEE special values (valid MLIR float literals;
-# keyed by bit width). Used for inf/nan dense elements and extreme reduce
-# init values.
-_HEX_NAN = {16: "0x7E00", 32: "0x7FC00000", 64: "0x7FF8000000000000"}
-_HEX_INF = {16: "0x7C00", 32: "0x7F800000", 64: "0x7FF0000000000000"}
-_HEX_NINF = {16: "0xFC00", 32: "0xFF800000", 64: "0xFFF0000000000000"}
-
 #: Reducer-region body mnemonic per evoxc reduction kind.
 _REDUCE_BODY_MNEMONIC = {
     "sum": "add",
@@ -114,33 +115,6 @@ _REDUCE_BODY_MNEMONIC = {
     "min": "minimum",
     "prod": "multiply",
 }
-
-
-def _fmt_float(value: float, bits: int = 64) -> str:
-    """Format a float as a valid MLIR float literal (mandatory decimal
-    point; inf/nan via IEEE hex spelling for the given bit width)."""
-    value = float(value)
-    if np.isnan(value):
-        return _HEX_NAN[bits]
-    if np.isinf(value):
-        return _HEX_NINF[bits] if value < 0 else _HEX_INF[bits]
-    text = repr(value)
-    if "e" in text or "E" in text:
-        mantissa, exponent = _re_split_exp(text)
-        if "." not in mantissa:
-            mantissa += ".0"
-        return f"{mantissa}E{exponent}"
-    if "." not in text:
-        text += ".0"
-    return text
-
-
-def _re_split_exp(text: str):
-    """Split a repr-format float into (mantissa, exponent) at e/E."""
-    for i, ch in enumerate(text):
-        if ch in "eE":
-            return text[:i], text[i + 1 :]
-    return text, ""
 
 
 class _Emitted(str):
@@ -4850,32 +4824,12 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return f"dense<[[{', '.join(map(str, range(n)))}]]> : tensor<1x{n}xi64>"
 
     def _constant_text(self, array) -> str:
-        """`dense<[...]>` elements attribute for a numpy array payload."""
-        arr = np.asarray(array)
-        if arr.size == 0:
-            return "dense<>"
-        bits = arr.dtype.itemsize * 8
+        """`dense<[...]>` elements attribute for a numpy array payload.
 
-        def fmt_item(v):
-            if isinstance(v, (bool, np.bool_)):
-                return "true" if v else "false"
-            if isinstance(v, (int, np.integer)):
-                return str(int(v))
-            if isinstance(v, (float, np.floating)):
-                return _fmt_float(float(v), bits)
-            if isinstance(v, (complex, np.complexfloating)):
-                return (
-                    f"({_fmt_float(float(v.real), bits)}, "
-                    f"{_fmt_float(float(v.imag), bits)})"
-                )
-            return str(v)
-
-        def nest(a):
-            if a.ndim == 0:
-                return fmt_item(a.item())
-            return "[" + ", ".join(nest(a[i]) for i in range(a.shape[0])) + "]"
-
-        return "dense<" + nest(arr) + ">"
+        Rendering (per-dtype bulk token/nesting emission + the memoised
+        large-payload path) lives in `./constants.py`; the characters are
+        the same ones the historical per-element recursion produced."""
+        return dense_text(array)
 
     @staticmethod
     def _loc(op: Op) -> str:
