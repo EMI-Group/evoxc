@@ -37,7 +37,7 @@ commensurate because a dispatch is what an element-op costs when the op is
 small)::
 
     DISPATCH_COST  = 512.0   # one emitted op == dispatching 512 element-ops
-    BAND_OVERHEAD  = 1024.0  # per band: one input slice + one output concat
+    BAND_OVERHEAD  = 8192.0  # per band: input slice/gather + concat piece + probe
     CONSTANT_COST  = 128.0   # materializing one constant
     CATEGORY_WEIGHTS = {"linalg": 12, "reduction": 2, "sorting": 2, "sparse": 4}
     DEFAULT_CATEGORY_WEIGHT = 1
@@ -57,8 +57,14 @@ roughly what 512 element-ops cost, so banding pays off once a divergent
 position's per-row element count is in that range and never helps for deep
 elementwise chains over small vectors (see `BatchReport.cost_estimate` /
 `flat_cost_estimate` for the model's own verdict on a real merge).
-`BAND_OVERHEAD = 1024` covers the slicing + concatenation an extra band emits,
-so the model never splits a population it cannot save work on.
+`BAND_OVERHEAD = 8192` covers everything an extra band emits on top of its own
+classes — the per-mapped-input slice/gather view, one output concat piece and the
+per-band bookkeeping — measured at ~2-3 dispatches on a 1024-element row
+(one dispatch ≈ 5 us on numpy ≈ 4000 element-equivalents), and it is the knob
+that keeps the model from splitting a population whose flat merge already shares
+its work (`bands="auto"` then stays flat, which measured faster in every such
+case: a 12-program switched population 0.15 vs 0.39 ms, a 10-program one-op
+population 0.13 vs 0.22 ms).
 The model exists only to CHOOSE a partition for `bands="auto"`; it is static
 program metadata (shapes/ops), never a measurement, and it is not used for the
 explicit `K` path.
@@ -104,7 +110,7 @@ AUTO = "auto"
 
 #: Static cost model — see the module docstring for the rationale.
 DISPATCH_COST = 512.0
-BAND_OVERHEAD = 1024.0
+BAND_OVERHEAD = 8192.0
 CONSTANT_COST = 128.0
 CATEGORY_WEIGHTS = {
     "linalg": 12.0,
