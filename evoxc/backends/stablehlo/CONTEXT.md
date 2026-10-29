@@ -204,6 +204,17 @@ iree/tvm declare `dynamic_shapes=True` but support is PER-OP partial — the exp
 4. **Consequences (one line each)** — the count composition costs ~+37 lines / +2.7–2.9 KB of text for a region-nested sort and ~+2–4 % run time for a while-body `eigh`; the select fallback makes a while-bearing `cond` cost the SUM of both branches (both execute unconditionally, ~2× a bare `eigh`) because every op reaching the exporter is pure — effectful ops defer — so only the selected value reaches consumers.
    The root cause is iree 3.11's `local-task` driver mis-executing a `stablehlo.while` nested in a `stablehlo.if`: the SAME compiled module is correct under `local-sync`; capture topology is NOT the cause.
 
+## Emitted op count vs IR op count (amplification)
+
+Lowerings of large elementwise/select-muxed graphs are dominated by EMITTED OP COUNT (iree-compile wall time tracks the line/op count), so this is the current amplification contract; the writer does NO CSE, constant dedup, folding or reordering, so it never emits FEWER ops than the IR.
+- Baseline: one IR op ⇒ one MLIR op line (plus a terminator), except `stop_gradient` (0 — the result is aliased to the operand, `writer.py:4664`) and the region-bearing emitters (a whole `while`/`if`/`reduce` group as one unit).
+- Shape equalization (`_equalize_operand`, `writer.py:874`): each operand whose shape differs from the result but is numpy-broadcastable costs +1 `stablehlo.broadcast_in_dim` (scalar/rank-0 operand, size-1 dim, rank promotion); a DYNAMIC result dim adds `get_dimension_size` + `reshape` per dynamic dim plus one `concatenate` and emits `dynamic_broadcast_in_dim` (`_emit_dynamic_broadcast`, `writer.py:810`).
+- Dtype equalization: each operand whose dtype differs from the emitted op's target dtype costs +1 `stablehlo.convert` — `_emit_elementwise` (`writer.py:784-792`), `_emit_compare` (`writer.py:1052-1062`, target `np.result_type` of the operands), `_emit_select` (`writer.py:1010-1021`, target the result dtype; the i1 pred is never converted).
+- So a `x <op> python_scalar` IR pair is 3 emitted ops (constant + broadcast + op) and a `(N,D) <op> (D,)` pair is 2; `compare` on mixed numerics and `select` on mixed branch dtypes add one convert per mismatched operand.
+- Decompositions are fixed small multiples: `square` 1 op (`multiply x, x`), `relu` 3 (scalar constant + its broadcast + `maximum`), `reduce_mean` a reduce plus a divide (plus the divisor constant/broadcast).
+- A `constant` op is exactly 1 line whose TEXT is O(elements), formatted one Python scalar at a time (`_constant_text`, `writer.py:4852`) — no size gate, no dedup, no separate serialization (see "Constant emission path").
+- NO exporter option reduces emitted op count for a graph with no reduce/while/sort/eigh/dot/random op: `split_reduction`(and its two export-only knobs) is gated inside `_reduce_core_with_split` (`split_reduce.py:632`), `while_init_rewrite`/`sort_emission`/`eigh_algorithm`/`dot_precision`/`rng_bit_generator` each inside their own emitters. For such graphs all six are byte-identical no-ops; the levers are graph-level (fewer IR ops, fewer scalar/broadcast operands, fewer dtype mixtures, no large `evoxc.constant`).
+
 ## Known upstream crash classes (current state)
 
 These are LIVE facts about iree 3.11 (and one 3.9.0 class below); the probe evidence and per-variant rates are in `./EMISSION-NOTES.md` §16–§17.
