@@ -2,14 +2,15 @@
 
 ## Intent
 
-Colocated tests for `evoxc_hf`: a source-only top-level package that ships in no wheel or sdist of `evoxc`, so its tests live here rather than under `../../tests/`, which mirrors `evoxc` only (`pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]`, package list `include = ["evoxc", "evoxc.*"]` — these globs cannot match `evoxc_hf`/`evoxc_hf.*`, and `exclude = ["evoxc_hf.tests", "evoxc_hf.tests.*"]` keeps the suite out of publishing as belt-and-braces).
+Colocated tests for `evoxc_hf` — the import package of the `evoxc-hf` distribution, whose modules live in the sibling src tree `../src/evoxc_hf/`: the suite stays at the project top level, outside `src/`, so it is never shipped in the wheel (and `uv_build` cannot reach it).
+It lives here rather than under `../../tests/` because that directory mirrors `evoxc` only; the root `pyproject.toml` `testpaths = ["tests", "evoxc_hf/tests"]` still collects both suites.
 The suite pins the **external** contracts — config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, parity against an independent oracle — plus the **functional shape** of the API: `evoxc_hf.load` (checkpoint → config + params), `evoxc_hf.program` (memoised forward, specs, oracle), `evoxc_hf.pipeline` (build/run/predict/placement), joined only by ordinary values.
 Everything is offline and numpy-only by default (no torch, no compiler), so the contract verifies on a bare `uv run --with pytest` install; only the guarded checkpoint readers touch the network.
 
 ## Counts (default env: torch/transformers and iree absent, checkpoint + golden caches present)
 
-**725 collected in 15 modules — 695 passed, 30 skipped, 0 failed** in the default env (`uv run --with pytest python -m pytest evoxc_hf/tests`); the `--extra iree` and `--extra iree` + `EVOXC_HF_BIG=1` legs run with strictly fewer skips (the iree / real-size / torch groups actually execute on this host).
-Skip groups (default env): torch/transformers absent (4), `iree` absent (22), `EVOXC_HF_BIG` unset (4).
+**727 collected in 15 modules — 694 passed, 33 skipped, 0 failed** in the default env (`PYTHONPATH=evoxc_hf/src uv run --with pytest python -m pytest evoxc_hf/tests`, or the bare command once the workspace member is installed with `uv sync --all-packages`); the `--extra iree` and `--extra iree` + `EVOXC_HF_BIG=1` legs run with strictly fewer skips (the iree / real-size / torch groups actually execute on this host).
+Skip groups (default env): `iree` absent (22), torch/transformers absent (4), `EVOXC_HF_BIG` unset (4), torch goldens absent (3).
 
 | Module | Collected | Area |
 |---|---|---|
@@ -22,11 +23,11 @@ Skip groups (default env): torch/transformers absent (4), `iree` absent (22), `E
 | `test_iree_rocm.py` | 11 | iree/ROCm device-resident |
 | `test_llama.py` | 54 | Llama/Mistral parity/canonicalisation |
 | `test_ops.py` | 83 | `ops` graph idioms |
-| `test_pack.py` | 38 | packed weights |
+| `test_pack.py` | 44 | packed weights |
 | `test_public_api.py` | 88 | public surface + functional invariants |
 | `test_real_checkpoints.py` | 11 | real checkpoints end-to-end |
 | `test_reference.py` | 59 | the numpy oracle |
-| `test_torch_oracle.py` | 12 | optional torch oracle |
+| `test_torch_oracle.py` | 8 | optional torch oracle |
 | `test_weights.py` | 50 | checkpoint readers |
 
 ## What each module pins
@@ -49,7 +50,7 @@ Skip groups (default env): torch/transformers absent (4), `iree` absent (22), `E
 
 ## How to run
 
-`pytest` is not in the base uv env: `uv run --with pytest python -m pytest evoxc_hf/tests -q` (add `--extra iree` for the compiled path; `uv run --isolated --extra iree …` for GPU work — the base env has no iree, so `evoxc.devices()` shows only cpu).
+`pytest` is not in the base uv env: `PYTHONPATH=evoxc_hf/src uv run --with pytest python -m pytest evoxc_hf/tests -q` (drop the prefix after `uv sync --all-packages`; add `--extra iree` for the compiled path; `uv run --isolated --extra iree …` for GPU work — the base env has no iree, so `evoxc.devices()` shows only cpu).
 Take authoritative counts from `--junit-xml`: iree's nanobind teardown can abort at exit and swallow the `-q` summary; also export `PYTHONUNBUFFERED=1` on a GPU host so buffered diagnostics survive a redirect.
 Never assert timings (the GPU is shared): measured numbers live in module-level `MEASURED` dicts or assertion messages.
 Use `$TMPDIR` (never `/tmp`) for scratch files, and never write into `../../bench_logs/` or `../../evoxc/`.
