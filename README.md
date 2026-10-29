@@ -397,7 +397,7 @@ Placement is physical and explicit: `Tensor.to(device)` is the only transfer pri
 
 ## Built on evoxc: `evoxc_hf`
 
-[`evoxc_hf`](evoxc_hf/CONTEXT.md) loads a real HuggingFace checkpoint and runs the **whole model forward as ONE evoxc graph** — a 124M-parameter GPT-2, or a 14B-parameter Qwen3, goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a separate top-level package, used from this checkout, **not part of the `evoxc` distribution**; `import evoxc` never imports it, `torch` or `transformers`.
+[`evoxc_hf`](evoxc_hf/CONTEXT.md) — the **`evoxc-hf` distribution** (`pip install evoxc-hf`) — loads a real HuggingFace checkpoint and runs the **whole model forward as ONE evoxc graph** — a 124M-parameter GPT-2, or a 14B-parameter Qwen3, goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a **separate distribution published independently from this same repository** (a `uv` workspace member with its own version, release tag and PyPI release), built only on evoxc's public API: the import name stays `evoxc_hf`, no `evoxc` wheel or sdist contains it, and `import evoxc` never imports it, `torch` or `transformers`.
 
 The API follows evoxc's value model in three layers that never blur: checkpoint IO produces **data** (`load_config` → frozen `ModelConfig`, `load_params` → `dict[str, np.ndarray]`, `load_hf` → a plain `LoadedModel` record); `forward_fn` is the pure **compute function** `(params, input_ids) -> logits` that captures no weights — every parameter is an ordinary graph input, never `evoxc.constant`; and `build`/`run` are the **staging** stages, `build` being `trace → lower → compile → load` via `build_cached`.
 
@@ -440,18 +440,26 @@ oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy
 pip install evoxc               # numpy only — a complete system, running on the default numpy interpreter
 pip install "evoxc[iree]"       # + the IREE adapter: llvm-cpu, CUDA, ROCm, Vulkan-SPIRV
 pip install "evoxc[compilers]"  # + IREE and TVM
+
+pip install evoxc-hf            # the HuggingFace layer — a separate distribution built on evoxc
+pip install "evoxc-hf[hf]"      # + torch/transformers reference oracles for evoxc-hf (never runtime requirements)
 ```
+
+`evoxc` and `evoxc-hf` are two **independent distributions** built from this one repository (one `uv` workspace, one `uv.lock`, one version per project); each is installed and upgrades on its own, and neither contains the other.
 
 From source — the checkout, for development (`requires-python >= 3.11`):
 
 ```bash
-uv sync --all-extras          # the locked dev environment: numpy + every optional adapter
-uv run pytest                 # CPU-only suite
+uv sync --all-packages --extra dev   # the locked workspace environment: both distributions + pytest
+uv run pytest                        # CPU-only suite
+uv build --all-packages              # build both wheels + sdists into dist/
 
-# or with pip:
-pip install -e ".[dev]"       # editable install + pytest
+# or with pip, evoxc alone from the checkout:
+pip install -e ".[dev]"              # editable install + pytest
 pytest
 ```
+
+**A plain `uv sync` is not enough for development:** it installs the root project only and *uninstalls* the workspace member, leaving `evoxc_hf/` in the checkout looking importable as a namespace package — so `import evoxc_hf` silently resolves to the wrong, unbuilt thing. Always pass `--all-packages` (add `--all-extras` to install every optional extra of both projects: the adapters and the `evoxc-hf` oracles).
 
 | extra | installs | enables |
 |---|---|---|
@@ -461,13 +469,20 @@ pytest
 | `iree` | `iree-base-compiler` + `iree-base-runtime` (3.11.x) | the IREE adapter on llvm-cpu / cuda / rocm / vulkan |
 | `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib only for its bundled MLIR bindings; `jax` is never imported) |
 | `compilers` | IREE + TVM | both adapters at once |
-| `hf` | `torch`, `transformers` | `evoxc_hf` reference oracles — never a runtime requirement |
 | *(xla)* | **no extra** | the XLA adapter loads a user-provided PJRT C API plugin `.so` (`EVOXC_PJRT_PLUGIN` or `plugin_path`) |
 
+`torch` and `transformers` are **not** an `evoxc` extra any more — the HuggingFace reference oracles live on the `evoxc-hf` distribution: `pip install "evoxc-hf[hf]"`. `evoxc`'s hard dependency stays numpy-only.
+
+| `evoxc-hf` extra | installs | enables |
+|---|---|---|
+| `hf` | `torch`, `transformers` | the reference oracles that validate and benchmark `evoxc-hf` — never runtime requirements |
+| `dev` | `pytest` | the `evoxc-hf` test suite |
+
 ```
-evoxc/            the package: core, ir, ops, trace, transforms, backends, dist, sparse,
-                random, io, pipeline, persist, build_cache, block, external, bench
-evoxc_hf/         HuggingFace integration — separate top-level package, used from the checkout
+evoxc/            the `evoxc` distribution's package: core, ir, ops, trace, transforms, backends, dist,
+                sparse, random, io, pipeline, persist, build_cache, block, external, bench
+evoxc_hf/         the separate `evoxc-hf` distribution: workspace member, src layout
+                (evoxc_hf/src/evoxc_hf/), own pyproject/README/LICENSE/version/extras
 tests/          pytest suite mirroring evoxc/ + spec-compliance tests
 bench_logs/     probe scripts, committed bench records and generated reports
 assets/         the diagrams in this README

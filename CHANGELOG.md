@@ -54,5 +54,19 @@ scheduling and code generation are delegated to external compilers.
   when available, PyTorch — references.
 - A pure-Python wheel built with `uv_build`, with the version single-sourced from
   `pyproject.toml` and read back through `importlib.metadata`.
+- Two independently published distributions from one repository: `evoxc` (the
+  workspace-root project) and `evoxc-hf` (the workspace member at
+  `evoxc_hf/`, src layout `evoxc_hf/src/evoxc_hf/`), each with its own version,
+  its own release tag (`v<version>` / `evoxc-hf-v<version>`) and its own PyPI
+  release. `pip install evoxc` is unchanged and numpy-only; `pip install
+  evoxc-hf` adds the HuggingFace layer, which builds only on evoxc's public API
+  (`evoxc` never imports `evoxc_hf`).
+- The HuggingFace reference oracles (`torch` + `transformers`, used only to
+  validate and benchmark that layer — never runtime requirements) are the `hf`
+  extra of `evoxc-hf`, installed with `pip install "evoxc-hf[hf]"`; this
+  replaces `pip install evoxc[hf]`, which no longer exists.
+- Development and CI install both projects from the single root `uv.lock` with
+  `uv sync --all-packages` (e.g. `uv sync --all-packages --extra dev`); a plain
+  `uv sync` installs the root project only and uninstalls the workspace member.
 
 [0.1.0]: https://github.com/EMI-Group/evoxc/releases/tag/v0.1.0
