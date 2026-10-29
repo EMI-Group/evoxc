@@ -45,6 +45,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -65,7 +66,14 @@ from evoxc_hf.pipeline import (
 from evoxc_hf.load import LoadedModel, load_hf
 from evoxc_hf.pack import pack_params, pack_plan
 from evoxc_hf.program import forward_fn, param_specs
-from evoxc_hf.tests import hf_download
+
+# ``hf_download`` lives next to this file. The tests are deliberately NOT part of
+# the ``evoxc_hf`` package (src layout: ``evoxc_hf/src/evoxc_hf``), so the helper
+# is imported as a sibling top-level module rather than ``evoxc_hf.tests``.
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+import hf_download  # noqa: E402  (needs the sys.path entry above)
 # --- module guards: clean skips, never errors (no iree / no GPU / not opted in) ---
 def _iree_available() -> bool:
     """Probe for the IREE bindings **without importing them** (metadata lookup)."""

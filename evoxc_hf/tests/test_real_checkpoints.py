@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -80,8 +81,16 @@ from evoxc_hf.load import LoadedModel, load_hf
 from evoxc_hf.pack import pack_params, pack_plan
 from evoxc_hf.pipeline import build, place_params, predict, run
 from evoxc_hf.program import forward_fn, param_specs, reference_logits
-from evoxc_hf.tests import hf_download
-from evoxc_hf.tests.test_export import _count_ops
+
+# ``hf_download`` and ``test_export`` live next to this file. The tests are
+# deliberately NOT part of the ``evoxc_hf`` package (src layout:
+# ``evoxc_hf/src/evoxc_hf``), so helpers are imported as sibling top-level
+# modules rather than as ``evoxc_hf.tests.*``.
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+import hf_download  # noqa: E402  (needs the sys.path entry above)
+from test_export import _count_ops  # noqa: E402  (needs the sys.path entry above)
 
 # ---------------------------------------------------------------------------
 # guards

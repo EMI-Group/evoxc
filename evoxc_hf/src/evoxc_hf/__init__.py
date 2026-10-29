@@ -66,6 +66,13 @@ torch / transformers / safetensors / iree are **never** imported at module scope
 
 from __future__ import annotations
 
+# pyproject.toml's `[project].version` is the SINGLE source of truth for the
+# version — this package only reads it back from the installed distribution
+# metadata, so the two can never drift. NOTE: the DISTRIBUTION name is
+# hyphenated (`evoxc-hf`, PyPI-normalised to `evoxc_hf`) while the IMPORT name
+# below is not.
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 from evoxc_hf import (
     config,
     families,
@@ -96,7 +103,10 @@ from evoxc_hf.pack import PackPlan, pack_params, pack_plan
 from evoxc_hf.pipeline import build, place_ids, place_params, predict, run
 from evoxc_hf.program import forward_fn, param_specs, reference_logits
 
-__version__ = "0.1.0"
+try:
+    __version__ = _distribution_version("evoxc-hf")
+except _PackageNotFoundError:  # a bare source checkout: no installed distribution
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     # -- loading (checkpoint -> static config + host params) ------------------
