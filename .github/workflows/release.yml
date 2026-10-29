@@ -1,0 +1,134 @@
+# Release — build, verify, publish to PyPI, then attach the artifacts.
+#
+# Trigger: publishing a GitHub Release whose tag is `v<version>` (e.g. `v0.1.0`,
+# matching `[project].version` in pyproject.toml). There is NO version bump and
+# NO version derivation anywhere in this workflow: pyproject.toml is the single
+# source of truth, and `build` FAILS if the tag does not match it.
+#
+# Publishing uses PyPI trusted publishing (OIDC) — no API token / password is
+# stored in this repository or in any secret. The PyPI side must have a pending
+# trusted publisher configured for:
+#   project: evoxc | owner: EMI-Group | repository: evoxc
+#   workflow: release.yml | environment: pypi
+# and the GitHub repository must have an environment named `pypi`.
+# Human procedure: RELEASING.md.
+#
+# Job chain: build → publish → attach. `publish` needs `build`, and `attach`
+# needs BOTH, so a failed PyPI publish never leaves a GitHub Release with
+# artifacts half-attached, and nothing is published at all when the version
+# check fails.
+#
+# OPTIONAL, NOT ENABLED — TestPyPI dry run:
+# To rehearse a release without touching the real index, add a manual trigger
+# to this workflow:
+#   on:
+#     release: { types: [published] }
+#     workflow_dispatch:
+# and a separate dry-run job that uploads to TestPyPI instead of PyPI:
+#   testpypi:
+#     needs: build
+#     if: github.event_name == 'workflow_dispatch'
+#     runs-on: ubuntu-latest
+#     environment: testpypi
+#     permissions: { id-token: write }
+#     steps:
+#       - uses: actions/download-artifact@v4
+#         with: { name: dist, path: dist }
+#       - uses: pypa/gh-action-pypi-publish@release/v1
+#         with:
+#           repository-url: https://test.pypi.org/legacy/
+#           # no `password`: trusted publishing, environment `testpypi`
+# TestPyPI needs its OWN pending trusted publisher (see RELEASING.md). Keep the
+# dry run out of the default path — a draft/pre-release GitHub Release already
+# gives you a build-only rehearsal because `published` does not fire for drafts.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # `attach` uploads artifacts to the GitHub Release
+  id-token: write # OIDC token for PyPI trusted publishing
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build + verify (${{ github.event.release.tag_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set up uv (Python 3.12)
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Build sdist + wheel from the tagged tree
+        run: uv build --out-dir dist
+
+      - name: Fail if the release tag does not match [project].version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          echo "pyproject [project].version = ${version}"
+          echo "release tag                  = ${TAG}"
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::Release tag '${TAG}' does not match pyproject.toml version '${version}' (expected tag 'v${version}'). Nothing will be published. Bump [project].version in pyproject.toml, commit, tag v<version>, and publish a GitHub Release for that tag."
+            exit 1
+          fi
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/evoxc
+    permissions:
+      id-token: write # scope the OIDC token to this job only
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # No `password` / `user` / token input on purpose: the action mints an
+      # OIDC token and PyPI's pending trusted publisher validates it.
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  attach:
+    name: attach artifacts to the GitHub Release
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Attach sdist + wheel to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "${TAG}" dist/* --clobber

@@ -35,7 +35,16 @@ Pytree utilities (pure sugar over flatten/unflatten — no new semantics):
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _distribution_version
+
+# pyproject.toml's `[project].version` is the SINGLE source of truth for the
+# version — this package only reads it back from the installed distribution
+# metadata, so the two can never drift.
+try:
+    __version__ = _distribution_version("evoxc")
+except _PackageNotFoundError:  # a bare source checkout: no installed distribution
+    __version__ = "0.0.0+unknown"
 
 # --- Value model (evoxc.core) ------------------------------------------------
 from . import core  # noqa: F401

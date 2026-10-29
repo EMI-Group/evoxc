@@ -62,6 +62,7 @@ evoxc learns from Nx (explicit numerical language, `block`, `vectorize`, `runtim
 | `./probe_new_emitters.py` | Repo-root probe script: exercises the new StableHLO emissions (gather/sort/argsort/argmax/argmin/tile/scatter/shifts/random) through iree llvm-cpu/cuda vs numpy with bit-exact checks; superseded by the pinned parity suite `tests/backends/test_iree_emitters_parity.py`. |
 | `./assets/` | README-only SVG diagrams — the `evoxc` mark, the "explicit stack" figure and the "hardware support" figure rendered in `./README.md` (no code, no build step; see its own CONTEXT.md for the palette/diagram contract). |
 | `./pyproject.toml` | Packaging, deps (numpy only), pytest config. |
+| `./.github/workflows/` + `./RELEASING.md` | GitHub Actions automation: `ci.yml` (pytest on Python 3.11–3.14 with the `dev` extra, one `compilers` job exercising the IREE/TVM adapter legs, and a packaging job that builds with `uv build`, runs `twine check` and guards the distribution boundary) and `release.yml` (tag-driven `v<version>` → version-vs-tag check → PyPI trusted publishing via OIDC → artifacts attached to the GitHub Release); the human release procedure lives in `./RELEASING.md`. |
 
 Cross-references: none yet (sibling dirs are read-only — escalate writes to parent).
 

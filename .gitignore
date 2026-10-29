@@ -6,6 +6,9 @@ __pycache__/
 .eggs/
 build/
 /dist/
+# release artifacts of a stray `python -m build` / `uv build` outside `dist/`
+*.whl
+*.tar.gz
 .pytest_cache/
 .coverage
 htmlcov/
