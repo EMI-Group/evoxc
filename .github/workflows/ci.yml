@@ -1,0 +1,129 @@
+# CI — evoxc (EvoX Compiler), pure Python, numpy-only hard runtime dependency.
+#
+# Job split:
+#   test       — the full pytest suite on every supported Python (3.11–3.14) with
+#                only the `dev` extra (pytest). This is the gate: the compiler
+#                adapters (iree/tvm/xla) and the torch legs SKIP cleanly when
+#                their extras are absent, so this job stays fast and offline-ish.
+#   compilers  — the same suite with the `compilers` extra on ONE Python (3.12),
+#                which is what exercises the IREE and TVM adapter legs end-to-end.
+#   packaging  — `uv build` + `twine check` + a distribution-boundary guard: the
+#                `evoxc` wheel/sdist must ship `evoxc` only, never `evoxc_hf`.
+#
+# Skips are host/dependency guards, not failures: no NVIDIA CUDA device, no
+# compiler / PJRT plugin / Vulkan ICD, no torch, and the GPU-guarded test groups
+# all skip by design. `tests/test_packaging.py` (the distribution boundary) runs
+# as part of the `test` job's suite, so `packaging` does not re-run pytest.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Superseded pushes/PR updates cancel their own in-flight runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Python ${{ matrix.python }})
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      # `--locked` fails if uv.lock disagrees with pyproject.toml.
+      - name: Install (dev extra)
+        run: uv sync --locked --python ${{ matrix.python }} --extra dev
+
+      - name: Run pytest
+        run: uv run pytest -q
+
+  compilers:
+    name: test (compilers, py3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Python 3.12)
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # This downloads a large toolchain (IREE base compiler/runtime 3.11.x +
+      # apache-tvm + jaxlib), which is the point: it is the ONLY job that
+      # exercises the IREE/TVM adapter legs for real. The XLA adapter legs
+      # self-skip here — they need a user-provided PJRT plugin
+      # (`EVOXC_PJRT_PLUGIN`), which CI does not have.
+      - name: Install (dev + compilers extras)
+        run: uv sync --locked --python 3.12 --extra dev --extra compilers
+
+      - name: Run pytest
+        run: uv run pytest -q
+
+  packaging:
+    name: packaging (build + metadata)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Python 3.12)
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # Build in isolation: `uv build` produces dist/evoxc-<version>-py3-none-any.whl
+      # and dist/evoxc-<version>.tar.gz. No `uv sync` is needed here because the
+      # remaining steps read files and metadata only (pytest is not re-run —
+      # tests/test_packaging.py already ran in the `test` job).
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      - name: Assert the expected artifacts exist
+        run: |
+          set -euo pipefail
+          version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          echo "pyproject version: ${version}"
+          ls -l dist
+          wheel="dist/evoxc-${version}-py3-none-any.whl"
+          sdist="dist/evoxc-${version}.tar.gz"
+          [ -f "${wheel}" ] || { echo "::error::missing wheel ${wheel}"; exit 1; }
+          [ -f "${sdist}" ] || { echo "::error::missing sdist ${sdist}"; exit 1; }
+
+      - name: Guard the distribution boundary (no evoxc_hf / etl in the wheel)
+        run: |
+          set -euo pipefail
+          uv run --no-project python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          forbidden = {"evoxc_hf", "etl"}
+          bad = [n for n in names if n.split("/")[0] in forbidden]
+          if bad:
+              print(f"::error::{wheels[0]} ships non-evoxc packages: {bad[:5]}")
+              sys.exit(1)
+          print(f"ok: {len(names)} entries, no evoxc_hf / etl")
+          PY
