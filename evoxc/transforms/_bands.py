@@ -21,11 +21,13 @@ Partition rules (`normalize_bands` / `even_partition` / `plan_auto_partition`):
 * ``bands=None`` — the flat merge (byte-identical to the pre-`bands` output);
 * ``bands=K`` (``1 <= K <= N``) — K contiguous bands, sizes as even as
   possible, LARGER bands first (``N=10, K=3`` → ``(0,1,2,3) (4,5,6) (7,8,9)``);
-* ``bands="auto"`` — the cheapest of three candidate partitions under the
-  static cost model below: the flat one, the FINGERPRINT partition (programs
-  with the same structural fingerprint — "programs that would share every
-  class" — in one band, bands in first-appearance order) and the fingerprint
-  partition with all SINGLETON groups coalesced into one trailing misc band.
+* ``bands="auto"`` — the cheapest candidate partition under the static cost
+  model below: the flat one, the FINGERPRINT partition (programs with the same
+  structural fingerprint — "programs that would share every class" — in one
+  band, bands in first-appearance order), the fingerprint partition with all
+  SINGLETON groups coalesced into one trailing misc band, and the GEOMETRIC
+  LADDER (`ladder_partitions`: ``k`` in ``AUTO_BAND_LADDER`` =
+  ``(2, 4, 8, 16, 32, 64)`` clipped to ``2..N-1``, plus ``k = N``).
   Flat is candidate 0, so the chosen cost can never exceed the flat cost.
 * `bands=1` and an auto-resolved single band delegate to the flat emitter, so
   their graph is BYTE-IDENTICAL to `bands=None` (only the report differs).
@@ -42,10 +44,15 @@ small)::
     SYMBOLIC_DIM_FALLBACK = 1  # a Dim/DimExpr/None dim counts as 1 element
 
 A class costs ``DISPATCH_COST + work(op) * rows`` per distinct VARIANT plus
-``DISPATCH_COST + elements * rows`` per extra variant (the `select` mux), where
-``rows`` is the band size for a ROW-DEPENDENT class (one that reads a mapped
-input) and 1 otherwise, and ``work(op) = static result elements * category
-weight``. `DISPATCH_COST = 512` is the measured crossover: a dispatch costs
+``DISPATCH_COST + elements * band_size`` per extra variant (the `select` mux,
+per-row by construction), where ``rows`` is the band size for a class whose
+VARIANT OPS read ``rows``-many rows — one that reaches a mapped input, a SWITCH
+class (a muxed value is mapped) or a STACKED constant (``(n, *payload_shape)``)
+— and 1 otherwise, and ``work(op) = static result elements * category weight``.
+Row-dependence PROPAGATES through operand slots (`_class_row_dependence`), so a
+shared-input population (``axes=None``) whose per-program constants are its
+only per-row difference prices its whole chain per row instead of once.
+`DISPATCH_COST = 512` is the measured crossover: a dispatch costs
 roughly what 512 element-ops cost, so banding pays off once a divergent
 position's per-row element count is in that range and never helps for deep
 elementwise chains over small vectors (see `BatchReport.cost_estimate` /
@@ -107,6 +114,12 @@ CATEGORY_WEIGHTS = {
 }
 DEFAULT_CATEGORY_WEIGHT = 1.0
 SYMBOLIC_DIM_FALLBACK = 1
+
+#: The geometric band counts the ``"auto"`` planner tries on top of the
+#: structural (fingerprint) candidates, ascending (clipped to ``2..n-1``, with
+#: ``k = n`` appended by `ladder_partitions`).
+AUTO_BAND_LADDER: Tuple[int, ...] = (2, 4, 8, 16, 32, 64)
+
 
 # --- band validation --------------------------------------------------------
 
@@ -295,31 +308,58 @@ def op_work(op: "ir.Op") -> float:
     return _static_elements(_merge._result_types(op)) * weight
 
 
-def _row_dependent(
+def _class_row_dependence(
     dag: "_merge.MergeDAG", entries: Sequence[Optional[int]]
-) -> Dict[int, bool]:
-    """``class_id -> whether the class's value depends on the function row``.
+) -> "Tuple[Dict[int, bool], Dict[int, bool]]":
+    """Per-class row-dependence flags (see `band_cost`).
 
-    A class is row-dependent iff one of its operand chains reaches a MAPPED
-    input leaf (an `entries` entry of ``0``) — its values then differ per row,
-    so its per-row work is multiplied by the band size.
+    Returns ``(operand_rows, value_rows)``:
+
+    * ``operand_rows[class_id]`` — the class's VARIANT ops work on that many
+      rows, i.e. one of its operand slots is row-dependent;
+    * ``value_rows[class_id]`` — the class's EMITTED VALUE carries the function
+      axis (that many rows of real work for every consumer).
+
+    Both propagate through operand slots, and both are seeded by three sources:
+
+    * a MAPPED input leaf (`entries` entry of ``0``);
+    * a SWITCH class (``len(info.variants) >= 2``) — its value is muxed per row
+      by static select masks, so the emitted value is mapped even when every
+      operand is unmapped (`_emit._align_switch_candidate` broadcasts the
+      candidates), and a consumer then works on `size` rows;
+    * a constant class the emitter STACKS (`_emit.constant_payloads_agree` is
+      ``False`` — the payloads differ across the contributing functions):
+      `_emit._Merged.emit_constant` builds a ``(size, *payload_shape)`` per-row
+      constant, so every consumer of it recomputes its value on every row of
+      the band. This is what makes a SHARED-INPUT population (`axes=None`, the
+      GP/tree-evaluation shape, where per-program constants are the only
+      per-row difference) price its work per row instead of once.
     """
-    dependent: Dict[int, bool] = {}
+    operand_rows: Dict[int, bool] = {}
+    value_rows: Dict[int, bool] = {}
     for class_id in dag.order:
         info = dag.classes[class_id]
         program_index, op = info.representative
-        flag = False
+        operand_dependent = False
         for operand in op.operands:
             ref = dag.ref_of(program_index, operand)
             if ref[0] == "input":
                 if entries[ref[1]] is not None:
-                    flag = True
+                    operand_dependent = True
                     break
-            elif dependent.get(ref[0], False):
-                flag = True
+            elif value_rows.get(ref[0], False):
+                operand_dependent = True
                 break
-        dependent[class_id] = flag
-    return dependent
+        if op.name == "constant":
+            stacked = not _emit.constant_payloads_agree(
+                _emit.constant_payloads(info)
+            )
+            operand_rows[class_id] = stacked
+            value_rows[class_id] = stacked
+        else:
+            operand_rows[class_id] = operand_dependent
+            value_rows[class_id] = operand_dependent or len(info.variants) >= 2
+    return operand_rows, value_rows
 
 
 def band_cost(
@@ -334,7 +374,7 @@ def band_cost(
     use, so the model prices the class DAG the emitter actually builds.
     """
     dag = build_merge_dag(graphs, groups, alignment)
-    dependent = _row_dependent(dag, entries)
+    operand_rows, value_rows = _class_row_dependence(dag, entries)
     size = len(graphs)
     total = 0.0
     for class_id in dag.reachable:
@@ -343,14 +383,16 @@ def band_cost(
         if op.name == "constant":
             total += CONSTANT_COST
             continue
-        rows = size if dependent.get(class_id, False) else 1
+        rows = size if operand_rows.get(class_id, False) else 1
         for variant in info.variants:
             _program, variant_op = info.representative_for(variant)
             total += DISPATCH_COST + op_work(variant_op) * rows
         extra = len(info.variants) - 1
         if extra:
+            # A switch mux (mask + `select`, plus one broadcast per unmapped
+            # candidate) is per-row by construction.
             total += extra * (
-                DISPATCH_COST + _static_elements(_merge._result_types(op)) * rows
+                DISPATCH_COST + _static_elements(_merge._result_types(op)) * size
             )
     return total
 
@@ -361,16 +403,40 @@ def partition_cost(
     entries: Sequence[Optional[int]],
     groups: Sequence[Any],
     alignment: str = _merge.DEFAULT_ALIGNMENT,
+    memo: Optional[Dict[Tuple[int, ...], float]] = None,
 ) -> float:
-    """The model's cost of a whole partition (bands + per-band overhead)."""
+    """The model's cost of a whole partition (bands + per-band overhead).
+
+    `memo` caches per-band costs by band rows (valid for one population): the
+    auto candidates often share bands (e.g. the fingerprint partition and a
+    ladder step), and a band cost is a class-DAG build.
+    """
     total = 0.0
     for rows in partition:
-        total += band_cost(
-            [graphs[index] for index in rows], entries, groups, alignment
-        )
+        key = tuple(rows)
+        cost = memo.get(key) if memo is not None else None
+        if cost is None:
+            cost = band_cost(
+                [graphs[index] for index in key], entries, groups, alignment
+            )
+            if memo is not None:
+                memo[key] = cost
+        total += cost
     if len(partition) > 1:
         total += BAND_OVERHEAD * len(partition)
     return total
+
+
+def ladder_partitions(n: int) -> List[Tuple[Tuple[int, ...], ...]]:
+    """The geometric even-partition candidates of the ``"auto"`` ladder.
+
+    ``even_partition(n, k)`` for ``k`` in `AUTO_BAND_LADDER` clipped to
+    ``2..n-1`` (so the flat merge is never a duplicate and the all-singleton
+    partition is always last), plus ``k = n`` itself.
+    """
+    counts = [k for k in AUTO_BAND_LADDER if 2 <= k <= n - 1]
+    counts.append(n)
+    return [even_partition(n, k) for k in dict.fromkeys(counts)]
 
 
 def plan_auto_partition(
@@ -382,9 +448,15 @@ def plan_auto_partition(
     """Choose the cheapest candidate partition (`bands="auto"`).
 
     Candidates, in priority order (earlier wins a tie): the FLAT partition, the
-    fingerprint partition, and the fingerprint partition with all singleton
-    groups coalesced into ONE trailing misc band (omitted when there are no
-    singletons). Duplicates are dropped preserving order.
+    fingerprint partition, the fingerprint partition with all singleton groups
+    coalesced into ONE trailing misc band (omitted when there are no
+    singletons), then the geometric ladder `ladder_partitions` — ``k`` in
+    {2, 4, 8, 16, 32, 64} ∩ ``2..n-1`` and ``k = n``, ascending (a tie between
+    two ladder steps goes to the smaller band count, i.e. the cheaper glue).
+    The ladder is what makes the measured optimum of a DIVERGENT population
+    reachable: its fingerprints are all distinct, so the structural candidates
+    degenerate to {flat, k = n} while the measured argmin sits in between (or
+    at ``k = n``). Duplicates are dropped preserving order.
 
     Returns:
         ``(partition, chosen_cost, flat_cost)``.
@@ -406,6 +478,7 @@ def plan_auto_partition(
         (tuple(range(n)),),
         buckets,
         coalesced,
+        *ladder_partitions(n),
     ]
     unique: List[Tuple[Tuple[int, ...], ...]] = []
     seen = set()
@@ -414,8 +487,9 @@ def plan_auto_partition(
             continue
         seen.add(candidate)
         unique.append(candidate)
+    memo: Dict[Tuple[int, ...], float] = {}
     costs = [
-        partition_cost(graphs, cand, entries, groups, alignment)
+        partition_cost(graphs, cand, entries, groups, alignment, memo)
         for cand in unique
     ]
     best = 0

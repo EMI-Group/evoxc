@@ -279,6 +279,34 @@ def _operand_axes(op: ir.Op, value: ir.Value, env: ValueEnv) -> MappedAxes:
     return env.get(value)
 
 
+# --- constant-class payloads ------------------------------------------------
+
+
+def constant_payloads(info: ClassInfo) -> Dict[int, np.ndarray]:
+    """``contributing program index -> payload array`` of a constant class."""
+    return {
+        program_index: np.asarray(op.attributes["value"])
+        for program_index, op, _variant in info.contributors
+    }
+
+
+def constant_payloads_agree(payloads: Dict[int, np.ndarray]) -> bool:
+    """Whether every payload of a constant class is equal to the reference one.
+
+    The reference is the LOWEST contributing program's payload (the same choice
+    `_Merged.emit_constant` makes for the non-contributing rows of a stacked
+    constant). ``True`` ⇒ the emitter shares ONE unmapped constant; ``False`` ⇒
+    it STACKS a ``(n, *payload_shape)`` per-row constant, which makes the class
+    value — and everything downstream of it — row-dependent.
+    """
+    if len(payloads) < 2:
+        return True
+    reference = payloads[min(payloads)]
+    return all(
+        np.array_equal(payload, reference) for payload in payloads.values()
+    )
+
+
 # --- emission ---------------------------------------------------------------
 
 
@@ -366,14 +394,9 @@ class _Merged:
 
     def emit_constant(self, info: ClassInfo) -> None:
         """Emit a constant class: shared when all payloads agree, else stacked."""
-        payloads: Dict[int, np.ndarray] = {}
-        for program_index, op, _variant in info.contributors:
-            payloads[program_index] = np.asarray(op.attributes["value"])
-        first = min(payloads)
-        reference = payloads[first]
-        all_equal = all(
-            np.array_equal(payload, reference) for payload in payloads.values()
-        )
+        payloads = constant_payloads(info)
+        reference = payloads[min(payloads)]
+        all_equal = constant_payloads_agree(payloads)
         start = len(self.new_block.ops)
         program_index, op = info.representative
         if all_equal:
