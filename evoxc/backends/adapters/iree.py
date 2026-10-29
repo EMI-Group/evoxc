@@ -165,6 +165,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import threading
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -343,7 +344,6 @@ def _detect_rocm_target() -> str | None:
     adapter never guesses an arch; a wrong-arch ROCm code object fails at
     device load with an obscure message).
     """
-    import re
     import shutil
     import subprocess
 
@@ -764,7 +764,123 @@ def _acquire_cached_rocm_device(device: Device, runtime_args: list[str]) -> Any:
     )
 
 
-def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
+#: The per-dispatch BUFFER-BINDING cap each HAL enforces when it verifies an
+#: executable at LOAD time (``None`` = no count cap). See
+#: ``_raise_if_dispatch_binding_limit`` for what is counted.
+_DISPATCH_BINDING_LIMITS: dict[str, int | None] = {
+    "cuda": 16,
+    "rocm": 16,
+    "cpu": 64,
+    "vulkan": None,
+}
+
+#: The runtime's binding-limit rejection text, e.g. ``exports[0] binding_flags
+#: count 21 exceeds maximum of 16`` (HIP/CUDA ``native_executable.c``, the
+#: local-task ``executable_library_util.c``).
+_BINDING_LIMIT_PATTERN = re.compile(
+    r"binding_flags count (\d+) exceeds maximum of (\d+)"
+)
+
+#: The runtime source file that performs the check — the fallback recognition
+#: signal if the message wording ever changes.
+_BINDING_LIMIT_SOURCE = "native_executable.c"
+
+
+def _raise_if_dispatch_binding_limit(
+    exc: BaseException, device_kind: str, segment_index: int | None = None
+) -> None:
+    """Re-raise ``exc`` as an actionable ``core.BackendError`` iff it is the
+    HAL per-dispatch buffer-binding-limit rejection; otherwise return.
+
+    The HIP and CUDA HALs reject an executable whose ONE exported dispatch
+    binds more than 16 buffers (``IREE_HAL_HIP_MAX_DISPATCH_BINDING_COUNT`` /
+    ``IREE_HAL_CUDA_MAX_DISPATCH_BINDING_COUNT`` = 16), the local-task CPU ABI
+    allows 64, and Vulkan has no count cap (bindings become descriptor-set
+    layouts). The check runs in the RUNTIME at executable load
+    (``hip|cuda/native_executable.c``), not in ``iree-compile``, and evoxc
+    cannot see the count at ``lower()``/``compile()`` — HAL layout assignment
+    (``compiler/plugins/target/ROCM/ROCMTarget.cpp``) decides it, so it
+    surfaces here as a raw ``ValueError`` from the runtime.
+
+    Recognition is by MESSAGE TEXT (the documented runtime wording, with the
+    runtime source file as fallback) and it is deliberately narrow: every
+    other iree failure keeps its existing behavior and wording. Nothing is
+    retried, recompiled, split or silently fallen back — the caller's graph
+    shape is the fix, and the message says which one.
+    """
+    text = str(exc)
+    match = _BINDING_LIMIT_PATTERN.search(text)
+    observed: int | None = None
+    maximum: int | None = None
+    if match is not None:
+        observed, maximum = int(match.group(1)), int(match.group(2))
+    elif not (
+        _BINDING_LIMIT_SOURCE in text
+        and "binding" in text.lower()
+        and "exceed" in text.lower()
+    ):
+        return
+    if maximum is None:
+        maximum = _DISPATCH_BINDING_LIMITS.get(device_kind)
+
+    label = {
+        "cuda": "CUDA",
+        "rocm": "ROCm/HIP",
+        "cpu": "local-task CPU",
+        "vulkan": "Vulkan",
+    }.get(device_kind, device_kind)
+    target = _EXPECTED_TARGET_BY_KIND.get(device_kind, device_kind)
+    where = (
+        ""
+        if segment_index is None
+        else f" (external-kernel segment {segment_index})"
+    )
+    observed_text = (
+        "an unstated number of bindings"
+        if observed is None
+        else f"{observed} bindings"
+    )
+    limit_text = (
+        "the HAL's cap"
+        if maximum is None
+        else f"the {label} HAL's cap of {maximum}"
+    )
+    raise core.BackendError(
+        f"IREE could not load the compiled VM module on the "
+        f"{label} device{where}: one fused dispatch needs {observed_text}, "
+        f"exceeding {limit_text} per exported dispatch (backend "
+        f"{IreeBackend.name!r}, compile target {target!r}).\n"
+        f"A dispatch's binding count is the number of DISTINCT runtime "
+        f"tensor operands + results of that ONE fused dispatch; tensor "
+        f"constants never count (they are pooled or baked in).\n"
+        f"The HIP and CUDA HALs cap it at 16 (iree "
+        f"runtime/src/iree/hal/drivers/{{hip,cuda}}/native_executable.c), "
+        f"the local-task CPU ABI at 64, and Vulkan has no cap (bindings "
+        f"become descriptor-set layouts).\n"
+        f"iree-compile decides the count during HAL layout assignment, so "
+        f"evoxc cannot detect it at lower()/compile() — it surfaces here, "
+        f"at executable load.\n"
+        f"Remedies:\n"
+        f"  (a) for an evoxc.batch_functions graph, use FEWER bands (a "
+        f"larger band size) or bands=None, so each band's fused region "
+        f"stays under the cap;\n"
+        f"  (b) split the graph so no fused elementwise region consumes "
+        f"more than 16 tensors (combine inputs, or reorder/split the "
+        f"expression);\n"
+        f"  (c) run the same graph with backend='iree' and "
+        f"target_backends=['llvm-cpu'] (local-task allows 64), or on the "
+        f"'numpy' backend.\n"
+        f"Nothing was retried, recompiled or silently fallen back; the "
+        f"graph shape is the fix."
+    ) from exc
+
+
+def _load_vm_module(
+    vmfb: bytes,
+    device_kind: str,
+    runtime_device: Any,
+    segment_index: int | None = None,
+) -> Any:
     """Load one VM flatbuffer onto ``runtime_device`` (shared load path).
 
     CUDA, ROCm and Vulkan (``device_kind`` in ``_GPU_DEVICE_KINDS``): the
@@ -776,16 +892,32 @@ def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
     rejecting the module's required features — the mixed-install trap, see
     ``adapters/CONTEXT.md`` Known Issue #7) is surfaced as an actionable
     ``core.BackendError`` naming the cause and remedy.
+
+    On EVERY kind, an iree per-dispatch buffer-binding-limit rejection (see
+    ``_raise_if_dispatch_binding_limit`` and Known Issue #19) is surfaced as
+    its own actionable ``core.BackendError`` naming the limit, the observed
+    count and the remedies — it is recognized BEFORE the mixed-install
+    wrapper on the CPU path so its message is never misattributed. Every
+    other failure propagates unchanged (GPU kinds) or takes the mixed-install
+    wrapper (CPU, ``ValueError`` only). ``segment_index`` only annotates the
+    binding-limit message for the split/external-kernel load path.
     """
     import iree.runtime as rt
 
     if device_kind in _GPU_DEVICE_KINDS:
         config = rt.Config(device=runtime_device)
         vm_module = rt.VmModule.copy_buffer(config.vm_instance, vmfb)
-        return rt.load_vm_module(vm_module, config)
+        try:
+            return rt.load_vm_module(vm_module, config)
+        except Exception as exc:
+            # Only the binding-limit failure is rewritten; every other
+            # exception is re-raised untouched (bare ``raise``).
+            _raise_if_dispatch_binding_limit(exc, device_kind, segment_index)
+            raise
     try:
         return rt.load_vm_flatbuffer(vmfb, driver="local-task")
     except ValueError as exc:
+        _raise_if_dispatch_binding_limit(exc, device_kind, segment_index)
         # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md): the
         # legacy iree-compiler/iree-runtime distributions and the current
         # iree-base-* distributions share the SAME 'iree' Python namespace
@@ -1486,7 +1618,11 @@ class IreeBackend(CompilerBackend):
            runtime VM verifier rejecting the module's required features — see
            ``adapters/CONTEXT.md`` Known Issue #7, the mixed-install trap) is
            surfaced as an actionable ``core.BackendError`` naming the cause
-           and remedy, with the original exception as ``__cause__``.
+           and remedy, with the original exception as ``__cause__``; on ANY
+           device kind a HAL per-dispatch buffer-binding-limit rejection
+           (HIP/CUDA cap 16 — Known Issue #19) is surfaced as its own
+           actionable ``core.BackendError`` naming the limit, the observed
+           count and the remedies.
 
         NEVER re-traces / re-lowers / re-compiles — load-time mismatches fail
         clearly (root error strategy).
@@ -1697,7 +1833,9 @@ class IreeBackend(CompilerBackend):
                     f"{expected_target!r}) — never silently recompile"
                 )
             vmfb = base64.b64decode(raw["vmfb_base64"].encode("ascii"))
-            module = _load_vm_module(vmfb, device_kind, runtime_device)
+            module = _load_vm_module(
+                vmfb, device_kind, runtime_device, segment_index=index
+            )
             core_device = device if device is not None else Device("cpu", 0)
             input_specs = tuple(
                 core.TensorSpec(shape=value_type.shape, dtype=value_type.dtype)
