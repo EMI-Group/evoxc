@@ -142,46 +142,79 @@ def _bool_text(arr) -> str:
     """`[true, false, ...]` — `str(list)` then the two bool spellings.
 
     Payloads of ``_BOOL_BULK_MIN_ELEMENTS`` or more render through
-    ``_bool_text_bulk`` (same characters, built with a numpy byte tile
-    instead of a per-element Python ``repr``); smaller ones keep the
-    historical path."""
+    ``_bool_text_bulk`` (same characters, built from ONE numpy byte tile plus
+    one ``str`` slice/join per row instead of a per-element Python ``repr``);
+    smaller ones keep the plain C-level path (measured cheaper below the
+    crossover — see ``_BOOL_BULK_MIN_ELEMENTS``)."""
     if arr.size >= _BOOL_BULK_MIN_ELEMENTS:
         return _bool_text_bulk(arr)
     text = str(arr.tolist())
     return text.replace("True", "true").replace("False", "false")
 
 
-#: Payload size from which `_bool_text` switches to the bulk tile path (below
-#: it the tile machinery costs more than the plain ``str(list)``).
-_BOOL_BULK_MIN_ELEMENTS = 64
+#: Payload size from which `_bool_text` switches to the bulk tile path.
+#: Both paths produce the same characters; this is a pure speed heuristic.
+#: Measured crossover (best of 9, ``EVOXC_DISABLE_LOCATIONS=1``): the plain
+#: ``str(list)`` + two ``str.replace`` path is C-level and wins below it
+#: (96 elements: 3.6 µs vs 4.4 µs; 64: 2.5 vs 3.6; 128: 4.7 vs 4.8 — a tie),
+#: while the bulk path is 1.2–2.4× faster above it (256: 8.5 vs 6.9; 4096:
+#: 157 vs 104; 262144 = a (256, 1024) mask: 11.1 ms vs 9.0 ms).
+_BOOL_BULK_MIN_ELEMENTS = 128
 
 
 def _bool_text_bulk(arr) -> str:
-    """Byte-identical twin of ``str(arr.tolist()).replace(...)`` for a bool
-    payload, without the per-element Python repr.
+    """Byte-identical twin of ``str(arr.tolist()).replace(...)`` for a large
+    bool payload, rendered with ONE flat numpy pass plus O(#rows) ``str``
+    slices — never a numpy call per row.
 
-    ``str(list)`` renders ``[True, False, ...]`` (nested ``[ ]`` per rank)
-    and the two replaces only lower the leading letter, so the text is
-    ``"[" + ", ".join("true"/"false" tokens) + "]"`` nested per rank. The
-    innermost row's tokens are built as a numpy ``uint8`` tile —
-    ``code, ',', ' '`` per element with ``code`` = ``'0'``/``'1'`` — decoded
-    in one C-level call and turned into the two spellings by two
-    ``str.replace`` passes (neither spelling contains a digit, so the
-    replacements cannot cascade); nesting then joins the rows."""
+    ``str(list)`` renders ``[True, False, ...]`` (one ``[ ]`` pair per axis,
+    ``", "`` between siblings) and the two replaces only lower the leading
+    letter, so the text is ``"[" + ", ".join(tokens) + "]"`` nested per rank.
+    Every element contributes exactly THREE bytes to the innermost level —
+    ``code, ',', ' '`` with ``code`` = ``'0'``/``'1'`` — which makes the whole
+    payload ONE ``uint8`` tile (one ``np.empty`` + three strided assignments +
+    one ``tobytes``/``decode``) and makes a row of ``C`` elements a FIXED byte
+    slice ``flat[3*j*C : 3*(j+1)*C - 2]`` (the trailing ``, `` dropped, since
+    ``str(list)`` has no separator after the last element).  Nesting is then
+    one ``str.join`` per row GROUP, from the innermost axis outward, and the
+    two spelling replaces run ONCE over the whole nested text (neither
+    spelling contains a digit, so they cannot cascade).
+
+    Nothing here may recurse per row: the earlier per-row variant built the
+    tile inside the recursion, so a rank-2 payload paid a full numpy
+    allocation + ``tobytes`` + two replaces PER ROW (~2 µs/row — 582 µs for a
+    256-row mask whose text is 2 KB), making it 4× slower than the plain
+    ``str(list)`` path it replaced on exactly the shapes that matter.  A
+    (256, 1) mask now costs 28 µs and a (256, 1024) one 9 ms (vs 32 µs /
+    11 ms for the plain path), with one ``str`` slice + one join member per
+    row."""
     if arr.ndim == 0:
         # `str(arr.tolist())` of a 0-d array is the bare Python bool.
         return "true" if bool(arr) else "false"
-    if arr.ndim > 1:
-        return "[" + ", ".join(_bool_text_bulk(sub) for sub in arr) + "]"
-    codes = np.ascontiguousarray(arr).reshape(-1).view(np.uint8) + 48
-    tile = np.empty(codes.size * 3, dtype=np.uint8)
-    tile[0::3] = codes
+    shape = arr.shape
+    if arr.size == 0:
+        # Empty payloads still nest one bracket pair per surviving row
+        # (`[[], []]`), so defer to the C-level reference spelling.
+        return str(arr.tolist()).replace("True", "true").replace("False", "false")
+    flat = np.ascontiguousarray(arr).reshape(-1)
+    count = flat.size
+    tile = np.empty(count * 3, dtype=np.uint8)
+    tile[0::3] = flat.view(np.uint8) + 48  # '0' / '1' codes
     tile[1::3] = 44  # ','
     tile[2::3] = 32  # ' '
-    # Drop the trailing ", " (the `_re_split_exp`-free equivalent of the
-    # separator join `str(list)` performs).
-    flat = tile[:-2].tobytes().decode("latin-1")
-    return "[" + flat.replace("0", "false").replace("1", "true") + "]"
+    text = tile[:-2].tobytes().decode("latin-1")
+    inner = shape[-1]
+    rows = [
+        text[3 * start : 3 * start + 3 * inner - 2]
+        for start in range(0, count, inner)
+    ]
+    for axis in range(len(shape) - 2, -1, -1):
+        size = shape[axis]
+        rows = [
+            "[" + "], [".join(rows[i : i + size]) + "]"
+            for i in range(0, len(rows), size)
+        ]
+    return ("[" + rows[0] + "]").replace("0", "false").replace("1", "true")
 
 
 def _float_text(arr, bits=None) -> str:
