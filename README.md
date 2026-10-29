@@ -9,7 +9,7 @@
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
   <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, IREE, XLA, TVM"></a>
-  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-6792%20passing-4c9a72?style=flat-square" alt="tests: 6792 passing"></a>
+  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7511%20passing-4c9a72?style=flat-square" alt="tests: 7511 passing"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
@@ -495,7 +495,7 @@ CONTEXT.md      architecture, contracts and status (root, the source of truth)
 
 Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, graph transforms, `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `evoxc.bench` harness.
 
-Test suite: **6792 passed, 44 skipped, 4 xfailed, 0 failed** with all extras installed (IREE + TVM + torch); **6367 passed, 95 skipped, 3 xfailed, 0 failed** compiler-free. Every skip is a host or dependency guard (no NVIDIA CUDA device, no Vulkan ICD, no PJRT plugin, a torch-present inverse pin, the io pristine-process guard).
+Test suite (both colocated suites, `./tests/` + `./evoxc_hf/tests/`): **7511 passed, 77 skipped, 4 xfailed, 0 failed** with all extras installed (IREE + TVM + torch); **7086 passed, 129 skipped, 4 xfailed, 0 failed** compiler-free. Every skip is a host or dependency guard (no NVIDIA CUDA device, no Vulkan ICD, no PJRT plugin, a torch-present inverse pin, the io pristine-process guard).
 
 <details>
 <summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
