@@ -81,6 +81,24 @@ return the same `Executable`, and one graph serves every checkpoint with the sam
 config. `predict` is the single host-facing shorthand: build → run → one explicit
 `Tensor.to(Device("cpu", 0))` → `numpy`.
 
+## Packed weights (opt-in)
+
+```python
+fwd = evoxc_hf.forward_fn(loaded.config, seq_len=32, pack_weights=True)
+plan = evoxc_hf.pack_plan(evoxc_hf.param_specs(loaded.config))
+
+packed = evoxc_hf.pack_params(plan, loaded.params)       # pack on the host, then place
+exe = evoxc_hf.build(fwd, loaded.config, pack_weights=True, backend="iree")
+```
+
+`pack_weights=True` concatenates the canonical spec tree into a handful of
+bucket inputs (bucketed by `(dtype, rank, shape[1:])`, unpacked inside the graph
+with static `evoxc.slice`), so a model with ~200 weight inputs becomes a 4-5
+input graph — the 124M `gpt2` drops from 196 weight inputs to 4. It is generic
+over any `param_specs` tree, bit-identical to the unpacked path, and mainly buys
+headroom in IREE's Python runtime on LLVM-CPU. Packing is not free (the packed
+tree is a second copy of the weights), which is why it is opt-in.
+
 ## Supported models
 
 - **`llama`** — HF `llama`, `mistral`, `qwen2`, `qwen3` (RMSNorm, RoPE, GQA,
@@ -112,6 +130,21 @@ installed, against the real HuggingFace logits.
 `evoxc` wheel or sdist, and the dependency is strictly one-way — `evoxc_hf`
 imports only the public `evoxc` API, and `evoxc` never imports `evoxc_hf`.
 Requires Python ≥ 3.11, with `numpy` + `evoxc` as its only required dependencies.
+
+## Development
+
+This distribution uses a `src` layout (`evoxc_hf/src/evoxc_hf/`) inside the evoxc
+uv workspace, with its test suite colocated at `evoxc_hf/tests/`. From the
+repository root:
+
+```bash
+uv sync --all-packages            # installs evoxc + evoxc_hf into the workspace venv
+uv run --with pytest python -m pytest evoxc_hf/tests
+```
+
+Without installing the workspace member, `PYTHONPATH=evoxc_hf/src` makes the same
+suite run. The reference-oracle and compiled-path legs need the extras:
+`uv run --all-packages --extra hf --extra iree …`.
 
 ## License
 

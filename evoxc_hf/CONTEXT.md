@@ -297,13 +297,12 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 
 ## Constraints
 
-- **No new hard dependency**; `torch`/`transformers` appear only in tests behind availability guards as external golden oracles, `iree` only behind `skipif` guards, and no `safetensors`/`huggingface_hub` package is required.
+- **No new hard dependency**: `torch`/`transformers` appear only behind availability guards as golden oracles, `iree` only behind `skipif` guards.
 - **Never modify `../evoxc/`** (sibling node — read-only; escalate core gaps to the parent agent). Gaps are composed around here and documented: `rsqrt` → `1/sqrt`, `erf` → numpy-backend-only GELU.
 - **Explicit errors only**: everything derives from `evoxc.core.EVOXCError` via `HFError` (or `ValueError`/`TypeError` for pure host-side argument errors), messages name the file/field/tensor/key, and there is never a silent fallback, dtype swap or positional guess.
 - **Static-shape-first**: dynamic dims are not a goal; a mismatched `seq_len`/`batch_size` is an explicit `HFConfigError`/`evoxc.ShapeError`.
 - **Files stay small** (~1000 lines baseline, one concern per module); no duplicate family logic — shared attention/norm/MLP pieces live in `ops.py` / `models/_common.py`. `pipeline.py` sits at ~1110 lines: one concern (the verbatim option matrix plus `build`/`run`/`predict`/placement), each function documented in place.
-- **Tests stay outside the package** in `./tests/`: never shipped, and because the top-level directory is not a Python package they import their sibling helpers through an explicit `sys.path` entry.
-- **Packaging constraint**: `src` layout, distribution `evoxc-hf` / import `evoxc_hf`, and the version bumped ONLY in `evoxc_hf/pyproject.toml` (the package reads it back from the installed distribution metadata).
+- **Packaging**: the version lives only in `evoxc_hf/pyproject.toml`; the package reads it back from the installed distribution metadata.
 - **Status (measured)**: **727 collected — 694 passed / 33 skipped** with `PYTHONPATH=evoxc_hf/src uv run --with pytest python -m pytest evoxc_hf/tests` in the base env (no workspace member installed), zero failures and zero errors; every skip is a host/dependency guard (torch/transformers absent, `EVOXC_HF_BIG` unset, `iree` absent).
   The real `Qwen/Qwen3-0.6B` legs run explicitly with `EVOXC_HF_BIG=1` + `EVOXC_HF_MODELS_DIR=…` under a torch/transformers venv.
 - **Status (capability)**: both families trace, verify, export to StableHLO and run on the numpy interpreter, and the same graph compiles and runs on **every validated compiler adapter** — one IREE program on `llvm-cpu` and — packed where needed — device-resident on ROCm, plus device-resident **XLA/ROCm** via a user-provided PJRT plugin.
@@ -313,7 +312,7 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
   `tiny_llama`, `tiny_mistral` and `sshleifer/tiny-gpt2` agree to ≤1.8e-7 max-abs, and the torch-free goldens over `../bench_logs/hf_goldens/` range from bit-exact (`tiny_gpt2`) to 1.5e-4 (`gpt2`).
 - **Status (vs PyTorch, `../bench_logs/hf_bench_results.md`)**: one whole-forward graph in the device-resident same-device loop (`asdevicearray` = 0) over five checkpoints at `seq_len` 32/128 — **`xla`/rocm beats torch-rocm in 6/6 measured cells (7.2×–10.0×)** and **`iree`/rocm in 5/6 (0.73×–9.1×)**, the single loss being `gpt2` at `seq_len=128`.
   XLA's default fp32 `dot` is TF32-class, so the opt-in `dot_precision="HIGHEST"` leg is the bit-accurate one (rel-to-absmax ~2e-6, argmax 1.0, 3%–29% more latency).
-  Legs that cannot run fail explicitly, never silently: `tiny_mistral` on `iree`/`xla` (its `gelu` needs `evoxc.erf`) and `distilgpt2`/`gpt2` at `seq_len=128` on iree-llvm-cpu (upstream `iree-compile` stack-allocation limit); the xla legs are ROCm-only (no XLA CPU plugin on that host). Harness: `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `hf_bench_data/`).
+  Legs that cannot run fail explicitly, never silently: `tiny_mistral` on `iree`/`xla` (its `gelu` needs `evoxc.erf`) and `distilgpt2`/`gpt2` at `seq_len=128` on iree-llvm-cpu (upstream `iree-compile` stack-allocation limit); the xla legs are ROCm-only (no XLA CPU plugin on that host).
 
 ## Known Issues
 
