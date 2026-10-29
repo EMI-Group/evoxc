@@ -1,5 +1,5 @@
 <div align="center">
-<img src="assets/evoxc-mark.svg" width="96" alt="evoxc">
+<img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-mark.svg" width="96" alt="evoxc">
 
 <h1 align="center">evoxc</h1>
 
@@ -38,7 +38,7 @@ evoxc splits that stack along one hard line. Above it is the **frontend**, which
 
 ## The stack: from a Python graph to an ML compiler
 
-<img src="assets/evoxc-stack.svg" alt="The explicit evoxc (EvoX Compiler) stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="100%">
+<img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-stack.svg" alt="The explicit evoxc (EvoX Compiler) stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="100%">
 
 | stage | public function | resulting object | what it produces | what it never does silently |
 |---|---|---|---|---|
@@ -384,7 +384,7 @@ Committed results, raw records and the probe scripts live in [`evoxc/bench/`](ev
 
 ## Hardware support
 
-<img src="assets/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through IREE (llvm-cpu, NVIDIA CUDA, AMD ROCm, Vulkan-SPIRV), XLA via a user-provided PJRT plugin (NVIDIA CUDA and AMD ROCm; cpu only through a compiled test plugin) or TVM (cpu end-to-end, AMD ROCm compile-only)." width="100%">
+<img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through IREE (llvm-cpu, NVIDIA CUDA, AMD ROCm, Vulkan-SPIRV), XLA via a user-provided PJRT plugin (NVIDIA CUDA and AMD ROCm; cpu only through a compiled test plugin) or TVM (cpu end-to-end, AMD ROCm compile-only)." width="100%">
 
 The same graph runs on CPU, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV — what changes is a `backend=` and a `device=`, never a rewrite. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`, and `evoxc.devices()` enumerates what this host actually has.
 

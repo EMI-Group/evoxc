@@ -120,11 +120,14 @@ bench = ["torch>=2.0"]
 # (c) `import evoxc` never imports `evoxc_hf`, torch, or transformers.
 hf = ["torch>=2.0", "transformers>=4.40"]
 
-# Only URLs that are known to be real. No `Homepage`/`Source` entry is declared:
-# this project has no public repository URL yet (the local git remote is a
-# pre-rename mirror, not a project homepage), and a wrong link is worse than
-# none.
+# The canonical project repository is `EMI-Group/evoxc` — the same owner/repo the
+# release workflow (`.github/workflows/release.yml`), `RELEASING.md` (trusted
+# publisher fields) and the CHANGELOG's link references assume.
 [project.urls]
+Homepage = "https://github.com/EMI-Group/evoxc"
+Source = "https://github.com/EMI-Group/evoxc"
+Issues = "https://github.com/EMI-Group/evoxc/issues"
+Changelog = "https://github.com/EMI-Group/evoxc/blob/main/CHANGELOG.md"
 "EvoX ecosystem" = "https://github.com/EMI-Group"
 Genesis = "https://github.com/EMI-Group/genesis"
 
@@ -141,13 +144,15 @@ module-root = ""
 module-name = "evoxc"
 # The sdist additionally ships these checkout paths (anchored patterns; `**`
 # recurses), so a built-from-sdist tree can still run the test suite:
-#   tests/**     — the pytest suite that mirrors the package layout
-#   assets/**    — README-only SVG diagrams referenced by the packaged README
-#   conftest.py  — the root pytest configuration that makes `tests/` importable
+#   tests/**      — the pytest suite that mirrors the package layout
+#   assets/**     — README-only SVG diagrams referenced by the packaged README
+#   conftest.py   — the root pytest configuration that makes `tests/` importable
+#   CHANGELOG.md  — read by the packaged suite's release-hygiene leg, so that
+#                   leg works from an unpacked sdist too
 # Deliberately NOT shipped: `evoxc_hf/` (a separate package used from the
 # checkout, see the `hf` extra above), `bench_logs/` (benchmark scratch area)
 # and the root probe scripts (`probe_new_emitters.py`).
-source-include = ["tests/**", "assets/**", "conftest.py"]
+source-include = ["tests/**", "assets/**", "conftest.py", "CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 # `tests/` mirrors the `evoxc` package; `evoxc_hf/tests/` is colocated with the

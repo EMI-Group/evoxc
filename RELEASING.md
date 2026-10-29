@@ -24,10 +24,12 @@ GitHub/PyPI environment **`pypi`**.
 
 1. **Create and push the GitHub repository** — `EMI-Group/evoxc` — and push `main`
    (with `.github/workflows/ci.yml` and `.github/workflows/release.yml`).
-2. **Add the project URLs** to `[project.urls]` in `pyproject.toml`:
-   `Homepage`, `Source`, `Issues` (the current file deliberately lists no
-   repository URL). *This is done by the release owner as a normal `pyproject.toml`
-   change, not by tooling and not as part of the release workflow.*
+2. **Confirm the repository name everywhere it is hard-coded** — `[project.urls]`
+   in `pyproject.toml`, the pending-publisher fields in step 3 below, and the
+   absolute `https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/…`
+   image URLs in `README.md` (needed for the diagrams to render on the PyPI
+   project page) must all name the same real repository. They currently assume
+   **`EMI-Group/evoxc`**; edit them if the repository lands somewhere else.
 3. **Create the PyPI pending trusted publisher** at
    <https://pypi.org/manage/account/publishing/> — the project `evoxc` does not exist
    on PyPI yet, so this is a *pending* publisher, and the fields must match the
