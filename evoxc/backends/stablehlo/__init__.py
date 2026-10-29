@@ -178,6 +178,38 @@ def export(graph_or_module, options: dict | None = None) -> str:
             f"evoxc.ir.Module, got {type(graph_or_module).__name__}"
         )
     verify(module)
+    return _emit_verified(module, options=options)
+
+
+def _emit_verified(module: Module, options: dict | None = None) -> str:
+    """Emit StableHLO MLIR for a module the CALLER has already verified.
+
+    Private fast path for ``CompilerBackend.lower()``, which verifies the
+    graph and then provably does not mutate its module before exporting it
+    (see the proof at the ``inline_portables`` call in ``compiler.py``): the
+    verification it would repeat here is a full ``ir.verify`` walk of a byte-
+    identical SSA graph (``ir.verify``'s ``_verify_uses`` is superlinear in
+    use-count, so this walk is 30-50% of ``lower`` on merged graphs).
+
+    Contract (binding):
+
+    - The caller has already verified this EXACT module object and has not
+      mutated it since. Never call this on unverified IR — the public
+      ``export()`` (which verifies first, unchanged) is the entry point for
+      everything else, including Graph objects.
+    - Output is byte-identical to ``export(module, options)``: same
+      ``Writer``, same options.
+    - The type check is kept (nanoseconds) so a wrong call fails with the
+      same ``TypeError`` class the public entry point raises; the resolved
+      module (not a Graph) is expected here, so the message names that.
+    """
+    if not isinstance(module, Module):
+        raise TypeError(
+            "evoxc.backends.stablehlo._emit_verified: expected an already "
+            "verified evoxc.ir.Module, got "
+            f"{type(module).__name__} — use "
+            "evoxc.backends.stablehlo.export for graphs/unverified modules"
+        )
     from .writer import Writer
 
     return Writer(module, options=options).write()

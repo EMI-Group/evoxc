@@ -57,7 +57,8 @@ class CompilerBackend(Backend):
     Subclasses declare ``name`` and ``capabilities`` and implement
     ``compile`` / ``load`` (and optionally override ``check_available`` —
     concrete, no-op by default). ``lower`` is shared: verify ->
-    capability pre-check -> portable inlining -> verify -> StableHLO
+    capability pre-check -> portable inlining -> (re-verify, ONLY if the
+    inlining actually changed the module) -> StableHLO
     export -> ``Signature`` recording -> MLIR-text payload. A backend
     declaring ``Capabilities.external_calls`` (v1: the iree adapter)
     additionally SPLITS graphs containing ``external_call`` ops into
@@ -69,8 +70,13 @@ class CompilerBackend(Backend):
 
     The lower-time contract (binding):
 
-    - ``graph.verify()`` surfaces ``core.VerificationError`` as-is
-      (before AND after inlining — defensive).
+    - ``graph.verify()`` surfaces ``core.VerificationError`` as-is, BEFORE
+      the capability pre-check (error precedence is binding). The
+      defensive post-inline verification runs only when
+      ``inline_portables`` actually expanded something — a zero expansion
+      count leaves the module byte-identical, so the second walk would be
+      provably redundant; the export reuses that same verdict instead of
+      verifying a third time (``stablehlo._emit_verified``).
     - Capability pre-check on the LIVE op walk (``inline.iter_ops``),
       every rejection naming the missing feature:
       ``runtime_call`` requires ``capabilities.runtime_calls``;
@@ -255,9 +261,16 @@ class CompilerBackend(Backend):
            rejected ``block_call`` at step 2); backends without host-dispatch
            additionally inline ``external_call`` ops that have a registered
            portable (with a ``UserWarning`` per kernel name).
-        4. ``graph.verify()`` again (defensive, cheap).
-        5. ``stablehlo.export(graph, options={"rng_bit_generator": ...})`` —
-           the capability gate for ops: deferred ops raise
+        4. ``graph.verify()`` again — DEFENSIVE and CONDITIONAL: it runs
+           ONLY when step 3 reported at least one expansion. A zero return
+           means ``inline_portables``'s first walk found nothing to splice,
+           so the module is byte-for-byte the one verified at step 1 and
+           re-walking it is provably redundant (the proof is spelled out at
+           the call site).
+        5. ``stablehlo._emit_verified(graph.module, options={...})`` — the
+           StableHLO MLIR text (byte-identical to ``stablehlo.export``,
+           whose public signature and verified-input contract are
+           unchanged) and the capability gate for ops: deferred ops raise
            ``core.BackendError`` naming them; the ``rng_bit_generator``
            exporter option selects the native ``stablehlo.rng_bit_generator``
            emission per random algorithm (threefry2x32/philox4x32_10; absent
@@ -343,7 +356,7 @@ class CompilerBackend(Backend):
                 self._check_value_dtype(result.type.dtype, f"op '{op.name}'")
                 self._check_static_shape(result.type.shape, f"op '{op.name}'")
 
-        inline_portables(
+        inline_expansions = inline_portables(
             graph.module,
             keep_backend_impls=None,
             # v1 rule: backends without host-dispatch get the
@@ -354,7 +367,27 @@ class CompilerBackend(Backend):
             inline_external_portables=not capabilities.external_calls,
             backend_name=self.name,
         )
-        graph.verify()  # defensive post-inline verification
+        # Defensive post-inline verification — SKIPPED when it is provably
+        # redundant (proof, binding): ``inline_portables`` is the ONLY thing
+        # that mutates ``graph.module`` between the ``graph.verify()`` above
+        # and this point. It is a fixpoint driver whose return value is the
+        # number of expansions it performed, and the counter is incremented
+        # only AFTER ``_next_inline_target`` selects an op to splice (a walk
+        # that itself never touches the module). So a ZERO return means the
+        # FIRST ``_next_inline_target`` walk found no expandable op — nothing
+        # was spliced, nothing was removed — and ``graph.module`` is
+        # byte-for-byte the module already verified at step 1; re-walking its
+        # SSA graph would yield provably no new information (and
+        # ``ir.verify``'s ``_verify_uses`` is superlinear in use-count, so
+        # merged graphs pay 30-50% of ``lower`` for the extra passes). A
+        # NON-ZERO return means the module DID change, so the defensive
+        # verification is kept — semantics are never weakened, only a
+        # provably-redundant walk is dropped. NOTE: nothing below this point
+        # may mutate the module before the export (the export's own
+        # verification is skipped on the same proof — see
+        # ``stablehlo._emit_verified``).
+        if inline_expansions:
+            graph.verify()  # defensive post-inline verification (module changed)
 
         # Adapter host-dispatch for external kernels (round 2): a backend
         # declaring ``Capabilities.external_calls`` (v1: the iree adapter)
@@ -364,9 +397,18 @@ class CompilerBackend(Backend):
         if capabilities.external_calls and contains_external_call(graph.module):
             return self._lower_external_segments(graph, options)
 
-        from .stablehlo import export
+        # The module was verified above (step 1) and provably not mutated
+        # since (step 4's proof), so the export's own verification would be a
+        # THIRD full ``ir.verify`` walk of the same SSA graph — use the
+        # exporter's private "already verified" entry point instead. The
+        # PUBLIC ``stablehlo.export`` keeps verifying (its contract is
+        # unchanged); it is still the entry point for the segment path below,
+        # whose segment modules are freshly built and never verified before.
+        from .stablehlo import _emit_verified
 
-        mlir_text = export(graph, options=self._exporter_options(options))
+        mlir_text = _emit_verified(
+            graph.module, options=self._exporter_options(options)
+        )
 
         from evoxc.backends.numpy.interpreter import entry_function
 
