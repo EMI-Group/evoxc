@@ -12,8 +12,8 @@ active-builder hook). It must never import ``evoxc.backends``.
 from __future__ import annotations
 
 import contextlib
-import inspect
 import os
+import sys
 from typing import Iterable, Tuple, Union
 
 import numpy as np
@@ -48,8 +48,8 @@ def _suppress_location_capture():
     Used by internal graph-EMITTER transforms that build thousands of ops whose
     locations are reassigned afterwards anyway (see
     `evoxc.transforms.batch_functions`): `get_location` returns
-    `ir.Location.unknown()` while any block is active, skipping the
-    `inspect.stack()` walk entirely. Not public API — nothing outside `evoxc`
+    `ir.Location.unknown()` while any block is active, skipping the frame walk
+    entirely. Not public API — nothing outside `evoxc`
     internals may use it. Exceptions inside the block never leave the counter
     stuck (restored in `finally`).
     """
@@ -77,6 +77,13 @@ PYTHON_SCALAR_DTYPES = {
 _EVOXC_ROOT = os.path.realpath(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+#: ``{filename: inside_evoxc}`` memo for the realpath-based package-membership
+#: test: one ``realpath`` + ``commonpath`` per DISTINCT filename rather than per
+#: candidate frame (tracing re-walks the same handful of op-helper files).
+_INSIDE_EVOXC_CACHE: dict[str, bool] = {}
+#: Size cap for the memo. Past it the answer is still computed correctly, it is
+#: just not memoized (bounded memory for pathological exec/eval-spawned paths).
+_INSIDE_EVOXC_CACHE_LIMIT = 4096
 
 #: dtype NAMES a Python ``bool``/``int`` scalar is weak toward (NEP 50
 #: semantics implemented explicitly — see :func:`weak_scalar_dtype`).
@@ -125,10 +132,17 @@ def check_in_trace() -> "ir.Builder":
 def get_location(depth: int = 1) -> "ir.Location":
     """Capture the Python call site of the *user* op call.
 
-    Walks ``inspect.stack()`` starting ``depth`` frames up the call stack,
-    skipping every frame whose filename lives inside the ``evoxc`` package
-    directory (so internal helper frames never pollute user locations), and
-    returns ``ir.Location(file=..., line=...)`` for the first external frame.
+    Walks the interpreter frame stack directly (``sys._getframe`` then
+    ``f_back``) starting ``depth`` frames up, reading ``co_filename`` /
+    ``f_lineno`` off each frame — no ``inspect.stack()``, no ``FrameInfo``, no
+    source-line/``linecache`` work. Frames whose filename lives inside the
+    ``evoxc`` package directory are skipped (so internal helper frames never
+    pollute user locations), and the first external frame becomes
+    ``ir.Location(file=..., line=...)``.
+
+    ``sys._getframe`` is a CPython/PyPy intrinsic (evoxc targets CPython ≥ 3.11);
+    where it is missing the ``AttributeError`` degrades to
+    ``ir.Location.unknown()`` like any other capture failure.
 
     If the environment variable ``EVOXC_DISABLE_LOCATIONS`` is set to ``"1"``,
     returns ``ir.Location.unknown()`` immediately (zero stack-walk cost; useful
@@ -146,21 +160,29 @@ def get_location(depth: int = 1) -> "ir.Location":
         frame exists.
 
     Raises:
-        Never raises — location capture failure degrades to
-        ``ir.Location.unknown()`` (a missing location must not break tracing).
+        Never raises — location capture failure (including a ``depth`` deeper
+        than the stack, where ``sys._getframe`` raises ``ValueError``) degrades
+        to ``ir.Location.unknown()`` (a missing location must not break
+        tracing).
     """
     if _location_suppression_depth:
         return ir.Location.unknown()
     if os.environ.get(EVOXC_DISABLE_LOCATIONS_ENV) == "1":
         return ir.Location.unknown()
     try:
-        for frame in inspect.stack()[depth:]:
-            filename = frame.filename
-            if not filename or filename.startswith("<"):
-                continue  # no real source path (builtins, frozen modules)
-            if _inside_evoxc_package(filename):
-                continue  # internal helper frame
-            return ir.Location(file=filename, line=frame.lineno, col=0)
+        frame = sys._getframe(depth)
+    except Exception:
+        return ir.Location.unknown()  # depth beyond the stack depth
+    try:
+        while frame is not None:
+            filename = frame.f_code.co_filename
+            if (
+                filename
+                and filename[0] != "<"
+                and not _inside_evoxc_package(filename)
+            ):
+                return ir.Location(file=filename, line=frame.f_lineno, col=0)
+            frame = frame.f_back
     except Exception:
         # Contract: location capture must never break tracing — degrade.
         pass
@@ -168,11 +190,26 @@ def get_location(depth: int = 1) -> "ir.Location":
 
 
 def _inside_evoxc_package(filename: str) -> bool:
-    """True when ``filename`` lives inside the ``evoxc`` package directory."""
-    try:
-        return os.path.commonpath([_EVOXC_ROOT, os.path.realpath(filename)]) == _EVOXC_ROOT
-    except ValueError:
-        return False  # different drives (Windows) — never inside
+    """True when ``filename`` lives inside the ``evoxc`` package directory.
+
+    Memoized per filename (``_INSIDE_EVOXC_CACHE``): the answer is a pure
+    function of the filename — the package root is fixed at import time — so the
+    ``os.path.realpath`` + ``os.path.commonpath`` work runs once per distinct
+    path instead of once per candidate frame. Relative and symlinked spellings
+    get the SAME answer as the uncached computation: the cache key is the raw
+    filename and the computation still realpaths it.
+    """
+    cached = _INSIDE_EVOXC_CACHE.get(filename)
+    if cached is None:
+        try:
+            cached = (
+                os.path.commonpath([_EVOXC_ROOT, os.path.realpath(filename)]) == _EVOXC_ROOT
+            )
+        except ValueError:
+            cached = False  # different drives (Windows) — never inside
+        if len(_INSIDE_EVOXC_CACHE) < _INSIDE_EVOXC_CACHE_LIMIT:
+            _INSIDE_EVOXC_CACHE[filename] = cached
+    return cached
 
 
 def as_operand(x, *, dtype_hint=None, location=None) -> "core.SymbolicTensor":

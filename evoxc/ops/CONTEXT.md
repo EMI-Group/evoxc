@@ -9,9 +9,18 @@ The frontend tensor-operation namespace: every numerical op that can appear in a
 1. **Operands.** `SymbolicTensor` or Python scalars (`bool`/`int`/`float`/`complex`), the latter auto-promoted to 0-d Constant ops (transparent sugar) via `_utils.as_operand`. A concrete `Tensor` operand → `core.TraceError` with the mandated three-option message: (1) make it an explicit input, (2) embed explicitly with `evoxc.constant`, (3) evoxc has no eager mode — use `evoxc.evaluate`. Any other operand kind (list, ndarray, str, None) → `TypeError`. At least one operand of a binary op must be a `SymbolicTensor`.
 2. **Trace requirement.** Every op calls `_utils.check_in_trace()` FIRST; no active trace → `core.TraceError` mentioning `evoxc.trace` / `@evoxc.defn` / `evoxc.evaluate`.
 3. **Construction.** Build via `builder.create(op_name, ...)` on the active builder; op names, arities, attrs, and effects are declared in `evoxc.ir`'s op registry (the canonical table — `ops` keeps no parallel op-definition table; `_opdefs.py` is deleted). Attach a call-site `Location` (`_utils.get_location`) to every op; env `EVOXC_DISABLE_LOCATIONS=1` disables capture (then `ir.Location.unknown()`). `_utils._suppress_location_capture()` (internal, re-entrant context manager) also disables capture for internal graph emitters and takes precedence over the env var.
+
 4. **Results.** Wrap the IR result value in `core.SymbolicTensor(value=..., dtype=..., shape=..., location=...)`. Shape is always statically computed (`DimExpr` arithmetic) at build time; runtime numpy enforces exact semantics.
 5. **Static values.** All non-tensor parameters (axes, shapes, padding, `k`, dtype, callback) are static Python values that specialize the graph. Changing one = a different op; no hidden guards.
 6. **Sugar rule.** `sum`/`max`/`min`/`mean`/`prod` are documented shorthand for `reduce_*` with the same kwargs — nothing else is sugar.
+
+### Location capture mechanism & cost (binding)
+
+`_utils.get_location(depth=1)` walks the interpreter frame stack DIRECTLY — `sys._getframe(depth)` then `f_back` — reading `frame.f_code.co_filename` / `frame.f_lineno`; it never calls `inspect.stack()` (which materializes a `FrameInfo` per frame and pulls source lines through `linecache`, the dominant trace cost before: ~59 % of trace time, ~0.22 ms per graph node vs ~0.017 ms with capture off).
+Returned value is unchanged: the first frame OUTSIDE the `evoxc` package as `ir.Location(file=<frame filename>, line=<frame lineno>, col=0)`; frames with an empty or `<…>` filename are skipped.
+Package membership is `_utils._inside_evoxc_package(filename)` — the SAME `os.path.commonpath([_EVOXC_ROOT, os.path.realpath(filename)])` rule, now memoized per DISTINCT filename in `_INSIDE_EVOXC_CACHE` (cap `_INSIDE_EVOXC_CACHE_LIMIT` = 4096; past the cap answers are computed, just not stored), so relative/symlinked spellings still classify identically.
+`EVOXC_DISABLE_LOCATIONS=1` and an active `_suppress_location_capture()` block still short-circuit before any frame access (zero cost); `sys._getframe` raising (a `depth` deeper than the stack, or a missing intrinsic on a non-CPython runtime) degrades to `ir.Location.unknown()`. Capture never raises.
+Measured (`/tmp/iree311`, numpy 2.5.4, best-of-3): 256-tree / ~32-node random population 0.216 → 0.018 ms/node (disabled-reference 0.016, i.e. 12× faster, within 10 % of free); vmap+grad-heavy graphs 0.762 → 0.050 ms/node (16×); small single graph 718 → 106 µs per trace (7×, the fixed `inspect.stack` cost is gone).
 
 ## Dtype promotion (design decision — binding)
 
@@ -64,7 +73,7 @@ The generic SSA machinery and the op **registry** live in `evoxc.ir`, and the ca
 | File | Area |
 |---|---|
 | `__init__.py` | Re-exports the 102 public names (`__all__`); import-time `_registration.register_operator_handlers()` |
-| `_utils.py` | Internal: `check_in_trace`, `get_location`, `_suppress_location_capture`, `as_operand`, `weak_scalar_dtype`, `promote_dtypes`, `broadcast_shapes`, `reduced_shape`, `normalize_axes` + `EVOXC_DISABLE_LOCATIONS_ENV` |
+| `_utils.py` | Internal: `check_in_trace`, `get_location`, `_suppress_location_capture`, `_inside_evoxc_package` (per-filename memoized), `as_operand`, `weak_scalar_dtype`, `promote_dtypes`, `broadcast_shapes`, `reduced_shape`, `normalize_axes` + `EVOXC_DISABLE_LOCATIONS_ENV` |
 | `elementwise.py` | `add subtract multiply divide power remainder maximum minimum abs negate square sqrt exp log log1p sin cos tan acos floor ceil round tanh sigmoid relu gelu erf sign cast bitwise_and bitwise_or bitwise_xor bitwise_left_shift bitwise_right_shift` |
 | `comparison.py` | `equal not_equal less less_equal greater greater_equal logical_and logical_or logical_not select` |
 | `indexing.py` | `broadcast reshape transpose slice gather scatter concatenate pad` (+ `getitem`, the operator-handler entry — not in `__all__`) |
