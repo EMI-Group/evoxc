@@ -30,8 +30,11 @@ merged `Graph`):
 * **C. `bands=1` ≡ `bands=None`** — byte-identical StableHLO export text and
   entry-block op-name sequence; only the report's band fields differ.
 * **D. `bands="auto"`** — identical programs resolve to ONE band, two disjoint
-  structural groups to TWO bands (never costlier than flat), and `switch_ops`
-  collapses the fingerprints into a single band.
+  structural groups to TWO bands (never costlier than flat), `switch_ops` on
+  those same groups still beats flat via the fingerprint bands (a switched class
+  is per-row in the cost model, so a homogeneous band wins), and a divergent
+  seeded GP population is banded by the model's ladder (`bands > 1`, cheaper
+  than flat, row-exact).
 * **E. Global switch rows** — a banded `SwitchRecord.rows_per_variant` holds
   GLOBAL function indices, never band-local ones.
 * **F. Persistence** — `Graph.save`/`load` round-trips the numbers and drops
@@ -40,6 +43,7 @@ merged `Graph`):
   matches the numpy backend (guarded: the file is green compiler-free).
 """
 import importlib.util
+import random
 
 import numpy as np
 import pytest
@@ -492,24 +496,105 @@ def test_auto_splits_two_disjoint_groups():
     assert_row_exact(run_graph(graph, rows), graphs, [(rows[i],) for i in range(10)])
 
 
-def test_auto_with_switch_ops_collapses_the_fingerprints():
-    """`switch_ops` erases the structural difference the fingerprints key on.
+def test_auto_with_switch_ops_keeps_the_fingerprint_bands():
+    """`switch_ops` does not erase the structural difference the fingerprints key on.
 
-    With switch groups every elementwise position fingerprints as
-    ``("group", key)`` whatever op sits there, so the two structural groups above
-    become ONE fingerprint bucket: the fingerprint partition equals the flat
-    partition, auto resolves to a SINGLE band and reports the flat cost. (A
-    property of the partition, not a heuristic bug — once positions are
-    interchangeable there is nothing left for a band to save.)
+    The two structural groups above stay TWO fingerprint buckets under
+    `switch_ops` (a `switch_ops` class is per-ROW in the cost model — one op per
+    variant plus a `select` mux on all 10 rows — so the fingerprint partition is
+    no longer degenerate), and the two bands now WIN: each band computes ONE
+    variant over its own 5 rows instead of two variants (plus their muxes) over
+    all 10, which is what the model's row-dependence propagation prices.
     """
-    report = merged(two_group_graphs(), switch_ops=True, bands="auto").batch_report
-    assert (report.bands, report.band_sizes) == (1, (10,))
+    graphs = two_group_graphs()
+    graph = merged(graphs, switch_ops=True, bands="auto")
+    report = graph.batch_report
+    assert (report.bands, report.band_sizes) == (2, (5, 5))
     assert report.band_strategy == "auto"
-    assert report.cost_estimate == report.flat_cost_estimate
-    # Switching makes the FLAT partition itself pricier (each switch position
-    # pays one op per variant plus its `select` mux on all 10 rows).
-    unswitched = merged(two_group_graphs(), bands="auto")
+    # The model's verdict: the fingerprint partition is CHEAPER than flat …
+    assert (report.cost_estimate, report.flat_cost_estimate) == (39168.0, 64640.0)
+    assert report.cost_estimate < report.flat_cost_estimate
+    # … because switching makes the FLAT partition itself pricier (each switch
+    # position pays one op per variant plus its `select` mux on all 10 rows),
+    # while the same population merged flat WITHOUT switching is cheaper again.
+    unswitched = merged(graphs, bands="auto")
     assert unswitched.batch_report.flat_cost_estimate < report.flat_cost_estimate
+    # … and the banded merge is still row-exact.
+    rows = np.random.default_rng(11).standard_normal((10, 1024)).astype(np.float32)
+    assert_row_exact(
+        run_graph(graph, rows), graphs, [(rows[index],) for index in range(10)]
+    )
+
+
+# --- the divergent GP population -------------------------------------------
+
+#: Seeded RNG for the GP population — fixed so the partition never flakes.
+GP_SEED = 20240607
+
+#: The expression alphabet: binary ops combine the running value with a
+#: per-program constant, unary ops are the GP-style nonlinearities.
+GP_BINARY = (evoxc.add, evoxc.subtract, evoxc.multiply)
+GP_UNARY = (evoxc.sin, evoxc.cos, evoxc.tanh)
+
+#: The shared input of the GP population (`axes=None` — every program reads the
+#: SAME row, so the per-program constants are its only per-row difference).
+GP_SPEC = evoxc.TensorSpec((1024,), evoxc.float32)
+
+#: Population size of the GP merge (`N` — also the length of the function axis).
+GP_SIZE = 16
+
+
+def random_expression(rng, depth=3):
+    """One seeded random expression program (`x -> …`) of a fixed tree depth."""
+
+    def build(level):
+        if level == 0:
+            constant = float(round(rng.uniform(-2.0, 2.0), 3))
+            return lambda x, c=constant: evoxc.add(x, c)
+        if rng.random() < 0.35:
+            unary = GP_UNARY[rng.randrange(len(GP_UNARY))]
+            inner = build(level - 1)
+            return lambda x, u=unary, i=inner: u(i(x))
+        binary = GP_BINARY[rng.randrange(len(GP_BINARY))]
+        constant = float(round(rng.uniform(-2.0, 2.0), 3))
+        inner = build(level - 1)
+        return lambda x, b=binary, c=constant, i=inner: b(i(x), c)
+
+    return build(depth)
+
+
+def gp_population(n_functions=GP_SIZE, seed=GP_SEED):
+    """`n_functions` seeded random programs over the shared `GP_SPEC`."""
+    rng = random.Random(seed)
+    return [evoxc.trace(random_expression(rng), GP_SPEC) for _ in range(n_functions)]
+
+
+def test_auto_bands_a_divergent_gp_population():
+    """A random GP population is BANDED and cheaper than flat — a regression pin.
+
+    All 16 fingerprints are distinct, so the structural candidates degenerate
+    (singleton buckets, and the coalesced one is the flat partition itself) and
+    it is the model's geometric ladder that finds the win — which only exists
+    because row-dependence propagates through the class DAG: with `axes=None`
+    every per-program constant STACKS, so flat prices every switch variant on
+    all 16 rows while each band pays only for the variants its own rows contain.
+    Measured at this HEAD: 8 bands of 2 (the ladder's `k = 8` step),
+    225280.0 < 727040.0.
+    """
+    graphs = gp_population()
+    graph = merged(graphs, axes=None, switch_ops=True, bands="auto")
+    report = graph.batch_report
+    assert report.band_strategy == "auto"
+    assert report.bands > 1
+    assert sum(report.band_sizes) == report.n_functions == GP_SIZE
+    assert report.cost_estimate is not None and report.flat_cost_estimate is not None
+    assert report.cost_estimate < report.flat_cost_estimate
+    # Row i of the merged run is program i's own run of the SAME shared input.
+    shared = np.linspace(-1.0, 1.0, 1024, dtype=np.float32)
+    actual = to_np_tree(run_graph(graph, shared))
+    expected = np.stack([to_np_tree(run_graph(program, shared)) for program in graphs])
+    assert actual.shape == expected.shape == (GP_SIZE, 1024)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------

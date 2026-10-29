@@ -3,8 +3,9 @@
 Contract under test (binding): `evoxc/transforms/_emit.py`
 (`emit_merged_graph`, `_stamp_locations`, `finish_merged_graph`),
 `evoxc/transforms/_bands.py` (`emit_banded_graph`, `_combine_bands`),
-`evoxc/ops/_utils.py` (`get_location`, `_suppress_location_capture`), summarised
-in `evoxc/transforms/CONTEXT.md` § "Phase 2 — emission (`_emit.py`)".
+`evoxc/ops/_utils.py` (`get_location`, `_inside_evoxc_package`,
+`_suppress_location_capture`), summarised in `evoxc/transforms/CONTEXT.md`
+§ "Phase 2 — emission (`_emit.py`)".
 
 A merge is an EMITTER: it builds a whole graph of ordinary ops in one go, so the
 per-op call-site capture of `ops` would be pure overhead. Instead the merged
@@ -13,18 +14,23 @@ graph is re-stamped afterwards with its contributing ORIGINAL ops' locations
 get ONE call site captured once per merge. Two hooks implement that, and this
 module pins BOTH without ever measuring wall-clock time:
 
-1. **Suppression hook.** `_suppress_location_capture()` is a private,
+1. **One call site per merge.** `_suppress_location_capture()` is a private,
    re-entrant context manager that makes `get_location()` return
-   `ir.Location.unknown()` WITHOUT the `inspect.stack()` walk. Both drivers do
+   `ir.Location.unknown()` without walking a single frame. Both drivers do
    `call_site = get_location()` exactly ONCE, OUTSIDE the suppression block, and
    then emit every op (rules, stacked constants, band slices/gathers/
-   concatenations, mux `select`s) INSIDE it. So **`inspect.stack` is called
-   exactly ONCE per merge — independently of how many ops the merge emits**.
-   Loud caveat: `get_location` wraps its walk in `try/except Exception`, so a
-   monkeypatched `inspect.stack` that RAISES is silently swallowed — "the merge
-   still succeeds" alone proves nothing. The CALL COUNT is the real contract, so
-   every case below installs a counting `inspect.stack` that ALSO raises and
-   pins the exact count (`== 1`).
+   concatenations, mux `select`s) INSIDE it. The drivers reach `get_location`
+   through their own module-level binding (`from evoxc.ops._utils import
+   get_location`), so the natural seam for the pin is those bindings:
+   `evoxc.transforms._emit.get_location` and `evoxc.transforms._bands.get_location`
+   are each wrapped in a DELEGATING counter, and **a merge invokes exactly ONE
+   of them, exactly once** — the flat driver (`_emit`, which also serves
+   `bands=1` and an auto-resolved single band) or the banded driver (`_bands`),
+   never both — independently of how many ops the merge emits, and the value
+   captured there is REAL (never `Location.unknown()`).
+   `inspect.stack` is a SECOND invariant: location capture is a cheap
+   `sys._getframe` walk that never touches `inspect.stack()`, so the raising
+   `inspect.stack` stand-in installed by every case must be called ZERO times.
 
 2. **Location preservation.** Suppressing capture must not lose source
    information: every non-terminator op of the merged graph carries a REAL
@@ -45,6 +51,7 @@ import pytest
 import evoxc
 from evoxc import core
 from evoxc import ir
+from evoxc.transforms import _bands, _emit
 
 F32 = evoxc.float32
 
@@ -89,10 +96,9 @@ def verifies(graph):
 class _StackCounter:
     """A counting `inspect.stack` stand-in that ALSO raises on every call.
 
-    Raising is the loud half of the pin: `get_location`'s `except Exception`
-    swallows it, so a merge that walked the stack would still "succeed" while
-    silently losing every location. The `calls` counter is the half that
-    actually proves the suppression hook works.
+    Location capture is a `sys._getframe` walk, so `inspect.stack` must never be
+    reached: the count is pinned at ZERO for every case (and the raise makes an
+    accidental traversal loud instead of merely slow).
     """
 
     def __init__(self):
@@ -100,20 +106,114 @@ class _StackCounter:
 
     def __call__(self, *args, **kwargs):
         self.calls += 1
-        raise AssertionError("stack walk attempted during the merge")
+        raise AssertionError("inspect.stack() reached during the merge")
+
+
+class _CaptureCounter:
+    """A DELEGATING stand-in for one driver's module-level `get_location` binding.
+
+    The drivers import `get_location` by value, so wrapping `_emit.get_location`
+    / `_bands.get_location` intercepts exactly the ONE call each driver makes
+    outside its suppression block. The stand-in delegates with `depth + 1` so it
+    skips its OWN frame: the captured location is byte-identical to the one the
+    driver's own call would have produced (the merge call site), never the
+    wrapper's line.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.calls = 0
+        self.locations = []
+
+    def __call__(self, depth=1, **kwargs):
+        location = self._real(depth + 1, **kwargs)
+        self.calls += 1
+        self.locations.append(location)
+        return location
+
+
+class _CountingProxy:
+    """A verbatim PASS-THROUGH counter for a helper called with its own args.
+
+    Used for `evoxc.ops._utils._inside_evoxc_package`, whose single positional
+    argument is a FILENAME (so it must be delegated unchanged, never with a
+    shifted `depth`).
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self._real(*args, **kwargs)
+
+
+class _MergeHooks:
+    """Both seams ONE merge touches: its driver call site and `inspect.stack`.
+
+    Installed for the duration of a single merge (the `monkeypatch` fixture
+    restores all three bindings afterwards).
+    """
+
+    def __init__(self, monkeypatch):
+        self.emit = _CaptureCounter(_emit.get_location)
+        self.bands = _CaptureCounter(_bands.get_location)
+        self.stack = _StackCounter()
+        monkeypatch.setattr(_emit, "get_location", self.emit)
+        monkeypatch.setattr(_bands, "get_location", self.bands)
+        monkeypatch.setattr(inspect, "stack", self.stack)
+
+    @property
+    def calls(self):
+        """Total driver `get_location` invocations made by the merge."""
+        return self.emit.calls + self.bands.calls
+
+    @property
+    def locations(self):
+        """Every location the merge captured, in call order."""
+        return self.emit.locations + self.bands.locations
 
 
 def counting_merge(monkeypatch, graphs, **kwargs):
-    """`batch_functions(graphs, **kwargs)` + the number of `inspect.stack` calls.
+    """`batch_functions(graphs, **kwargs)` + the hooks it exercised.
 
-    The counter is installed ONLY around the merge — tracing happens before, so
-    the count is the merge's own stack-walk cost (exactly the quantity the
+    The seams are installed ONLY around the merge — tracing happens before, so
+    the counts are the merge's own capture cost (exactly the quantity the
     suppression hook exists to keep at one).
     """
-    counter = _StackCounter()
-    monkeypatch.setattr(inspect, "stack", counter)
+    hooks = _MergeHooks(monkeypatch)
     graph = evoxc.batch_functions(graphs, **kwargs)
-    return graph, counter.calls
+    return graph, hooks
+
+
+def assert_one_call_site_capture(graph, hooks):
+    """ONE real call site captured per merge, on ONE driver, never `inspect.stack`."""
+    assert hooks.calls == 1, (
+        "batch_functions must capture its ONE call-site location outside the "
+        "suppression block, got "
+        f"{hooks.emit.calls} _emit + {hooks.bands.calls} _bands get_location() "
+        "calls"
+    )
+    # Exactly one of the two drivers owns the capture: the flat emitter (also
+    # for `bands=1` and an auto-resolved single band) or the banded driver.
+    expected = (1, 0) if graph.batch_report.bands == 1 else (0, 1)
+    assert (hooks.emit.calls, hooks.bands.calls) == expected, (
+        "a merge with "
+        f"bands={graph.batch_report.bands} must capture its call site on "
+        f"{'_emit' if expected[0] else '_bands'} only, got "
+        f"_emit={hooks.emit.calls} _bands={hooks.bands.calls}"
+    )
+    (location,) = hooks.locations
+    assert location != ir.Location.unknown(), (
+        "the merge's ONE call site must be a REAL location — the suppression "
+        "block must not swallow it"
+    )
+    assert location.file == __file__ and location.line > 0
+    assert hooks.stack.calls == 0, (
+        "location capture is a sys._getframe walk — it must never reach "
+        f"inspect.stack(), got {hooks.stack.calls} call(s)"
+    )
 
 
 # --- populations (fixed, deterministic) ------------------------------------
@@ -181,7 +281,7 @@ def three_op_program(x):
 
 
 # ---------------------------------------------------------------------------
-# 1. Suppression hook — `inspect.stack` is called EXACTLY ONCE per merge
+# 1. One call site per merge — one driver capture, zero `inspect.stack` calls
 # ---------------------------------------------------------------------------
 
 #: `(id, population factory, merge kwargs, canonical emitted-op count)`.
@@ -190,8 +290,9 @@ def three_op_program(x):
 #: in which case the default `"variant"` applies) — the class-alignment policy
 #: changes how many classes a switched position emits, so a count is only
 #: meaningful next to its policy. The assertion that matters for the hook is the
-#: invariant ALSO pinned for all of them: the `inspect.stack` call count stays
-#: exactly 1, whatever the alignment emits.
+#: invariant ALSO pinned for all of them: exactly ONE driver `get_location()`
+#: invocation per merge, and ZERO `inspect.stack` calls, whatever the alignment
+#: emits.
 SUPPRESSION_CASES = [
     pytest.param(
         lambda: chain_population(12, 32),
@@ -238,63 +339,59 @@ SUPPRESSION_CASES = [
 
 @pytest.mark.parametrize("build, kwargs, emitted_ops", SUPPRESSION_CASES)
 def test_merge_walks_the_stack_exactly_once(monkeypatch, build, kwargs, emitted_ops):
-    """ONE `inspect.stack` call per merge, whatever the emission size.
+    """ONE call-site capture per merge, whatever the emission size.
 
-    The fake stack raises on EVERY call; the merge must not even notice (the
-    raise is swallowed by `get_location`) while the counter proves the
-    suppression block covered the whole emission.
+    The merge must call its driver's `get_location` exactly once (on ONE of the
+    two drivers) and never touch `inspect.stack` — the suppression block is what
+    keeps the per-op captures of `ops` from walking the frames again.
     """
     graphs = build()
-    graph, calls = counting_merge(monkeypatch, graphs, **kwargs)
+    graph, hooks = counting_merge(monkeypatch, graphs, **kwargs)
     verifies(graph)
 
-    assert calls == 1, (
-        "batch_functions must capture its ONE call-site location outside the "
-        f"suppression block and never walk the stack again, got {calls} "
-        f"inspect.stack() calls (kwargs={kwargs!r})"
-    )
-    assert graph.batch_report.emitted_ops == emitted_ops
+    assert_one_call_site_capture(graph, hooks)
+    assert graph.batch_report.emitted_ops == emitted_ops, kwargs
     # The count is a small CONSTANT — it never scales with the emission.
     assert graph.batch_report.emitted_ops >= 17
     assert len(entry_ops(graph)) == emitted_ops + 1  # + the `return`
 
 
 def test_long_chain_merge_emits_many_ops_for_one_stack_walk(monkeypatch):
-    """`emitted_ops >> 1` and `calls == 1`: the hook is size-independent.
+    """`emitted_ops >> 1` and ONE capture: the hook is size-independent.
 
-    A 32-program population of 12-op chains emits 25 ops for ONE stack walk; the
-    ratio is the point — the per-op capture of `ops` is what the suppression
-    block removes.
+    A 32-program population of 12-op chains emits 25 ops for ONE call-site
+    capture; the ratio is the point — the per-op capture of `ops` is what the
+    suppression block removes.
     """
     graphs = chain_population(12, 32)
-    graph, calls = counting_merge(monkeypatch, graphs, switch_ops=True)
+    graph, hooks = counting_merge(monkeypatch, graphs, switch_ops=True)
     verifies(graph)
 
     report = graph.batch_report
     assert report.emitted_ops == 25
     assert report.n_functions == 32
-    assert calls == 1
-    assert report.emitted_ops > 10 * calls  # a small constant vs a big emission
+    assert_one_call_site_capture(graph, hooks)
+    assert report.emitted_ops > 10 * hooks.calls  # a small constant vs a big emission
 
 
 @pytest.mark.parametrize("length, emitted_ops", [(12, 25), (24, 49), (48, 97)])
 def test_call_count_does_not_scale_with_the_emitted_op_count(
     monkeypatch, length, emitted_ops
 ):
-    """4× the emitted ops ⇒ the SAME single stack walk (the hook's whole point).
+    """4× the emitted ops ⇒ the SAME single capture (the hook's whole point).
 
     The same 32 identical programs are merged at three chain lengths; only the
-    emission grows (2·length + 1 ops), the `inspect.stack` count stays at 1.
+    emission grows (2·length + 1 ops), the driver capture count stays at 1.
     """
     graphs = chain_population(length, 32)
-    graph, calls = counting_merge(monkeypatch, graphs, switch_ops=True)
+    graph, hooks = counting_merge(monkeypatch, graphs, switch_ops=True)
     verifies(graph)
     assert graph.batch_report.emitted_ops == emitted_ops
-    assert calls == 1
+    assert_one_call_site_capture(graph, hooks)
 
 
 def test_constant_stacking_merge_walks_the_stack_once(monkeypatch):
-    """The stacked-constant path emits a `(N, ...)` constant per class — 1 walk."""
+    """The stacked-constant path emits a `(N, ...)` constant per class — 1 capture."""
     spec = evoxc.TensorSpec((1024,), F32)
     graphs = []
     for index in range(6):
@@ -305,9 +402,9 @@ def test_constant_stacking_merge_walks_the_stack_once(monkeypatch):
 
         graphs.append(evoxc.trace(program, spec))
 
-    graph, calls = counting_merge(monkeypatch, graphs, switch_ops=True)
+    graph, hooks = counting_merge(monkeypatch, graphs, switch_ops=True)
     verifies(graph)
-    assert calls == 1
+    assert_one_call_site_capture(graph, hooks)
     assert graph.batch_report.stacked_constants == 1
     assert graph.batch_report.emitted_ops == 5
 
@@ -316,29 +413,50 @@ def test_suppression_context_manager_returns_unknown_without_a_walk(monkeypatch)
     """Direct pin of the MECHANISM behind the counts above (internal API).
 
     While a `_suppress_location_capture()` block is active, `get_location()`
-    answers `ir.Location.unknown()` immediately — no `inspect.stack` call at all
-    — and the block is RE-ENTRANT (nested blocks restore the previous depth).
+    answers `ir.Location.unknown()` immediately — it short-circuits on the
+    suppression depth BEFORE any frame work, so `_inside_evoxc_package` is never
+    consulted (0 calls) and `inspect.stack` is never reached — and the block is
+    RE-ENTRANT (nested blocks restore the previous depth).
+
+    Outside every block one direct `get_location()` from THIS test body is a
+    real capture again: exactly ONE `_inside_evoxc_package` classification (this
+    module's own filename) and a non-unknown location.
     """
+    from evoxc.ops import _utils as ops_utils
     from evoxc.ops._utils import _suppress_location_capture, get_location
 
-    counter = _StackCounter()
-    monkeypatch.setattr(inspect, "stack", counter)
+    stack_counter = _StackCounter()
+    monkeypatch.setattr(inspect, "stack", stack_counter)
+    # The merge drivers' seam is installed too (no merge runs in this test), so
+    # its zero count shows the block sits BELOW both drivers' capture path.
+    hooks = _MergeHooks(monkeypatch)
+    inside = _CountingProxy(ops_utils._inside_evoxc_package)
+    monkeypatch.setattr(ops_utils, "_inside_evoxc_package", inside)
 
-    assert counter.calls == 0
     with _suppress_location_capture():
         assert get_location() == ir.Location.unknown()
         with _suppress_location_capture():  # re-entrant: still suppressed
             assert get_location() == ir.Location.unknown()
         assert get_location() == ir.Location.unknown()
-    assert counter.calls == 0, (
-        "get_location() must short-circuit on the suppression depth before "
+        # Suppressed capture short-circuits before classifying any frame.
+        assert inside.calls == 0
+        assert hooks.calls == 0
+    assert stack_counter.calls == 0, (
+        "get_location() must short-circuit on the suppression depth without "
         "touching inspect.stack()"
     )
 
-    # Positive control: outside the block the walk is consulted again (the fake
-    # raises, and `get_location` degrades to `unknown` — never propagates).
-    assert get_location() == ir.Location.unknown()
-    assert counter.calls == 1
+    # Positive control: outside the block a real capture happens — exactly one
+    # candidate frame is classified and the location is this module's own line.
+    location = get_location()
+    assert location != ir.Location.unknown()
+    assert location.file == __file__
+    assert location.line > 0
+    assert inside.calls == 1, (
+        "one real capture classifies exactly ONE frame filename, got "
+        f"{inside.calls} _inside_evoxc_package calls"
+    )
+    assert stack_counter.calls == 0
 
 
 # ---------------------------------------------------------------------------
