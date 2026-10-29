@@ -1,33 +1,57 @@
-# Release — build, verify, publish to PyPI, then attach the artifacts.
+# Release — build ONE distribution from the tagged tree, verify it against its
+# own pyproject.toml, publish it to PyPI, then attach the artifacts.
 #
-# Trigger: publishing a GitHub Release whose tag is `v<version>` (e.g. `v0.1.0`,
-# matching `[project].version` in pyproject.toml). There is NO version bump and
-# NO version derivation anywhere in this workflow: pyproject.toml is the single
-# source of truth, and `build` FAILS if the tag does not match it.
+# This repository is a uv workspace that ships TWO PyPI distributions from ONE
+# `uv.lock`, so a release carries TWO tag schemes and the tag decides which
+# distribution is built (routed once, in `build`, into the `package` /
+# `pyproject` / `prefix` step outputs):
+#   tag `v<version>`          → distribution `evoxc`    — the workspace ROOT
+#                               project (`./pyproject.toml`, tag prefix `v`)
+#   tag `evoxc-hf-v<version>` → distribution `evoxc-hf` — the workspace MEMBER
+#                               (`./evoxc_hf/pyproject.toml`, import name
+#                               `evoxc_hf`, tag prefix `evoxc-hf-v`)
+# Any other tag fails loudly in `build`: nothing is built and nothing is
+# published. There is NO version bump and NO version derivation anywhere in this
+# workflow — each project's pyproject.toml is the single source of truth for its
+# OWN version, and `build` FAILS if `<prefix><version>` does not equal the tag.
 #
 # Publishing uses PyPI trusted publishing (OIDC) — no API token / password is
-# stored in this repository or in any secret. The PyPI side must have a pending
-# trusted publisher configured for:
-#   project: evoxc | owner: EMI-Group | repository: evoxc
+# stored in this repository or in any secret. The PyPI side must have TWO
+# pending trusted publishers, both pointing at THIS workflow and the `pypi`
+# environment:
+#   project: evoxc    | owner: EMI-Group | repository: evoxc
+#   project: evoxc-hf | owner: EMI-Group | repository: evoxc
 #   workflow: release.yml | environment: pypi
 # and the GitHub repository must have an environment named `pypi`.
 # Human procedure: RELEASING.md.
 #
-# Job chain: build → publish → attach. `publish` needs `build`, and `attach`
-# needs BOTH, so a failed PyPI publish never leaves a GitHub Release with
-# artifacts half-attached, and nothing is published at all when the version
-# check fails.
+# ORDERING: publish an `evoxc` release BEFORE an `evoxc-hf` release whenever the
+# `evoxc-hf` minimum `evoxc` version is new (`dependencies = ["evoxc>=X", ...]`
+# in evoxc_hf/pyproject.toml). Otherwise the freshly published `evoxc-hf` wheel
+# requires an `evoxc` version PyPI does not have yet, and `pip install evoxc-hf`
+# fails for everyone until the second release lands.
+#
+# Job chain: build → (publish-evoxc | publish-evoxc-hf) → attach. Exactly ONE
+# publish job runs, selected by the routed package; they are two jobs instead of
+# one because each carries its own `environment.url` (and each PyPI pending
+# trusted publisher is bound to its own project). `attach` needs ALL THREE with
+# an `if:` that tolerates the always-skipped sibling, so the artifacts are still
+# attached to the GitHub Release, while a failed build or a failed publish keeps
+# them off the Release — nothing is left half-published.
 #
 # OPTIONAL, NOT ENABLED — TestPyPI dry run:
-# To rehearse a release without touching the real index, add a manual trigger
-# to this workflow:
+# To rehearse a release without touching the real index, add a manual trigger to
+# this workflow:
 #   on:
 #     release: { types: [published] }
 #     workflow_dispatch:
-# and a separate dry-run job that uploads to TestPyPI instead of PyPI:
-#   testpypi:
+#     # and give the route step something to read, e.g. an `inputs.tag` string
+# and TWO dry-run jobs that mirror the publish jobs one-for-one (both selected
+# the same way — by the routed package — so also gate them on
+# `github.event_name == 'workflow_dispatch'`):
+#   testpypi-evoxc:
 #     needs: build
-#     if: github.event_name == 'workflow_dispatch'
+#     if: github.event_name == 'workflow_dispatch' && needs.build.outputs.package == 'evoxc'
 #     runs-on: ubuntu-latest
 #     environment: testpypi
 #     permissions: { id-token: write }
@@ -38,9 +62,13 @@
 #         with:
 #           repository-url: https://test.pypi.org/legacy/
 #           # no `password`: trusted publishing, environment `testpypi`
-# TestPyPI needs its OWN pending trusted publisher (see RELEASING.md). Keep the
-# dry run out of the default path — a draft/pre-release GitHub Release already
-# gives you a build-only rehearsal because `published` does not fire for drafts.
+#   testpypi-evoxc-hf:  # identical, but needs.build.outputs.package == 'evoxc-hf'
+# TestPyPI needs its OWN pending trusted publisher for EACH project (two of them
+# — see RELEASING.md). Order matters on the dry run too: rehearse `evoxc` before
+# `evoxc-hf`, because resolving the member's `evoxc>=X` requirement needs that
+# version to be installable from somewhere. Keep the dry run out of the default
+# path — a draft/pre-release GitHub Release already gives you a build-only
+# rehearsal because `published` does not fire for drafts.
 name: Release
 
 on:
@@ -59,6 +87,12 @@ jobs:
   build:
     name: build + verify (${{ github.event.release.tag_name }})
     runs-on: ubuntu-latest
+    outputs:
+      # Consumed by the two publish jobs' `if:`. (The version guard and the
+      # build step read the same routing through `steps.route.outputs.*`.)
+      package: ${{ steps.route.outputs.package }}
+      pyproject: ${{ steps.route.outputs.pyproject }}
+      prefix: ${{ steps.route.outputs.prefix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,19 +104,62 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      - name: Build sdist + wheel from the tagged tree
-        run: uv build --out-dir dist
-
-      - name: Fail if the release tag does not match [project].version
+      # ONE routing decision for the whole run: the tag names the distribution.
+      # Everything downstream reads these outputs (job outputs are set above),
+      # so the accepted tag schemes live in exactly one place.
+      - name: Route the release tag to a distribution
+        id: route
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          echo "pyproject [project].version = ${version}"
-          echo "release tag                  = ${TAG}"
-          if [ "v${version}" != "${TAG}" ]; then
-            echo "::error::Release tag '${TAG}' does not match pyproject.toml version '${version}' (expected tag 'v${version}'). Nothing will be published. Bump [project].version in pyproject.toml, commit, tag v<version>, and publish a GitHub Release for that tag."
+          tag="${TAG}"
+          # The two patterns are disjoint — one starts `v<digit>`, the other
+          # `evoxc-hf-v<digit>` — so the order does not matter; every other tag
+          # falls through to the `::error::` branch below.
+          case "${tag}" in
+            v[0-9]*)
+              package="evoxc"
+              pyproject="pyproject.toml"
+              prefix="v"
+              ;;
+            evoxc-hf-v[0-9]*)
+              package="evoxc-hf"
+              pyproject="evoxc_hf/pyproject.toml"
+              prefix="evoxc-hf-v"
+              ;;
+            *)
+              echo "::error::Unrecognised release tag '${tag}'. Accepted tag schemes: 'v<version>' for the 'evoxc' distribution (root project, e.g. v0.1.0) and 'evoxc-hf-v<version>' for the 'evoxc-hf' distribution (workspace member evoxc_hf/, e.g. evoxc-hf-v0.1.0). Nothing was built or published."
+              exit 1
+              ;;
+          esac
+          {
+            echo "package=${package}"
+            echo "pyproject=${pyproject}"
+            echo "prefix=${prefix}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "tag '${tag}' -> distribution '${package}' (version source: ${pyproject}, tag prefix: ${prefix})"
+
+      # `--package` names the workspace project, so the root project is not
+      # built for an `evoxc-hf` release (and vice versa). Artifact names are
+      # normalized: `evoxc-hf` → `evoxc_hf-<version>-py3-none-any.whl`.
+      - name: Build sdist + wheel from the tagged tree
+        run: uv build --package ${{ steps.route.outputs.package }} --out-dir dist
+
+      - name: Fail if the release tag does not match the routed [project].version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PACKAGE: ${{ steps.route.outputs.package }}
+          PYPROJECT: ${{ steps.route.outputs.pyproject }}
+          PREFIX: ${{ steps.route.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          version="$(uv run --no-project python -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "${PYPROJECT}")"
+          echo "${PACKAGE} ${PYPROJECT} [project].version = ${version}"
+          echo "release tag                            = ${TAG}"
+          echo "expected tag                           = ${PREFIX}${version}"
+          if [ "${PREFIX}${version}" != "${TAG}" ]; then
+            echo "::error::Release tag '${TAG}' does not match ${PYPROJECT} version '${version}' (expected tag '${PREFIX}${version}'). Nothing will be published. Bump [project].version in ${PYPROJECT}, commit, tag '${PREFIX}<version>', and publish a GitHub Release for that tag."
             exit 1
           fi
 
@@ -97,9 +174,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: publish to PyPI
+  # Exactly one of the next two jobs runs — the tag routed to its project. Two
+  # jobs (not one) so each can declare its own `environment.url`, which PyPI
+  # shows as the deployment target. A plain `if:` still requires `build` to have
+  # succeeded (GitHub applies an implicit success() status check), so a failed
+  # build publishes nothing.
+  publish-evoxc:
+    name: publish evoxc to PyPI
     needs: build
+    if: needs.build.outputs.package == 'evoxc'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -113,13 +196,41 @@ jobs:
           path: dist
 
       # No `password` / `user` / token input on purpose: the action mints an
-      # OIDC token and PyPI's pending trusted publisher validates it.
-      - name: Publish to PyPI (trusted publishing)
+      # OIDC token and the `evoxc` pending trusted publisher validates it.
+      - name: Publish evoxc to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-evoxc-hf:
+    name: publish evoxc-hf to PyPI
+    needs: build
+    if: needs.build.outputs.package == 'evoxc-hf'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/evoxc-hf
+    permissions:
+      id-token: write # scope the OIDC token to this job only
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # Same OIDC path, different project: the `evoxc-hf` pending trusted
+      # publisher is bound to this workflow + the `pypi` environment too.
+      - name: Publish evoxc-hf to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
 
   attach:
     name: attach artifacts to the GitHub Release
-    needs: [build, publish]
+    needs: [build, publish-evoxc, publish-evoxc-hf]
+    # One of the two publish jobs is ALWAYS skipped (a release carries a single
+    # distribution), and GitHub propagates `skipped` through `needs` — without a
+    # status-check function this job would be skipped too and the artifacts
+    # would never be attached. `!failure()` lets it run when nothing failed (a
+    # skipped sibling is not a failure), and the explicit `build` result check
+    # guarantees there are artifacts to attach.
+    if: ${{ !failure() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

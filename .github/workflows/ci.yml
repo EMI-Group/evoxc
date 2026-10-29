@@ -1,19 +1,40 @@
-# CI — evoxc (EvoX Compiler), pure Python, numpy-only hard runtime dependency.
+# CI — the evoxc uv workspace: TWO PyPI distributions (`evoxc` and `evoxc-hf`)
+# built from ONE repo and locked by ONE `uv.lock`.
 #
 # Job split:
-#   test       — the full pytest suite on every supported Python (3.11–3.14) with
-#                only the `dev` extra (pytest). This is the gate: the compiler
-#                adapters (iree/tvm/xla) and the torch legs SKIP cleanly when
-#                their extras are absent, so this job stays fast and offline-ish.
+#   test       — the full pytest suite on every supported Python (3.11–3.14)
+#                with only the `dev` extra (pytest). `--all-packages` installs
+#                BOTH workspace projects: a plain `uv sync` installs the root
+#                only and UNINSTALLS the member `evoxc-hf`, which would leave
+#                `import evoxc_hf` resolving to the unbuilt source tree (see
+#                [tool.uv.workspace] in pyproject.toml). `testpaths` already
+#                covers both suites (`tests` + `evoxc_hf/tests`), so one pytest
+#                run gates both distributions. This job is the gate: the
+#                compiler adapters (iree/tvm/xla) and the torch legs SKIP
+#                cleanly when their extras are absent.
 #   compilers  — the same suite with the `compilers` extra on ONE Python (3.12),
-#                which is what exercises the IREE and TVM adapter legs end-to-end.
-#   packaging  — `uv build` + `twine check` + a distribution-boundary guard: the
-#                `evoxc` wheel/sdist must ship `evoxc` only, never `evoxc_hf`.
+#                which is what exercises the IREE and TVM adapter legs
+#                end-to-end. `--extra` resolves per project, so `--extra
+#                compilers` reaches the root project even though the
+#                `evoxc-hf` member defines no such extra.
+#   packaging  — `uv build --all-packages` (FOUR artifacts: a wheel + an sdist
+#                per distribution) + `twine check` + a two-way
+#                distribution-boundary guard on the BUILT archives: the `evoxc`
+#                wheel/sdist must ship `evoxc` only, and the `evoxc_hf`
+#                wheel/sdist must ship `evoxc_hf` only — neither distribution
+#                may ever contain the other.
+#
+# Deliberately NOT in CI: the `evoxc-hf` reference-oracle legs (`torch` +
+# `transformers` via the `hf` extra). They validate evoxc_hf against the real
+# HuggingFace implementation and need a large dependency set plus checkpoint
+# downloads — far too heavy for every push/PR — so those tests SKIP here and are
+# run by hand.
 #
 # Skips are host/dependency guards, not failures: no NVIDIA CUDA device, no
-# compiler / PJRT plugin / Vulkan ICD, no torch, and the GPU-guarded test groups
-# all skip by design. `tests/test_packaging.py` (the distribution boundary) runs
-# as part of the `test` job's suite, so `packaging` does not re-run pytest.
+# compiler / PJRT plugin / Vulkan ICD, no torch/transformers, and the
+# GPU-guarded test groups all skip by design. `tests/test_packaging.py` (the
+# in-process distribution boundary) runs as part of the `test` job's suite, so
+# `packaging` does not re-run pytest — it guards the built artifacts instead.
 name: CI
 
 on:
@@ -46,10 +67,13 @@ jobs:
           python-version: ${{ matrix.python }}
           enable-cache: true
 
-      # `--locked` fails if uv.lock disagrees with pyproject.toml.
-      - name: Install (dev extra)
-        run: uv sync --locked --python ${{ matrix.python }} --extra dev
+      # `--locked` fails if uv.lock disagrees with either pyproject.toml.
+      # `--all-packages` is mandatory in this workspace: it installs the
+      # `evoxc-hf` member alongside the root `evoxc` project.
+      - name: Install (dev extra, both workspace packages)
+        run: uv sync --locked --python ${{ matrix.python }} --all-packages --extra dev
 
+      # One run covers both distributions (`testpaths = ["tests", "evoxc_hf/tests"]`).
       - name: Run pytest
         run: uv run pytest -q
 
@@ -70,8 +94,8 @@ jobs:
       # exercises the IREE/TVM adapter legs for real. The XLA adapter legs
       # self-skip here — they need a user-provided PJRT plugin
       # (`EVOXC_PJRT_PLUGIN`), which CI does not have.
-      - name: Install (dev + compilers extras)
-        run: uv sync --locked --python 3.12 --extra dev --extra compilers
+      - name: Install (dev + compilers extras, both workspace packages)
+        run: uv sync --locked --python 3.12 --all-packages --extra dev --extra compilers
 
       - name: Run pytest
         run: uv run pytest -q
@@ -88,42 +112,122 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      # Build in isolation: `uv build` produces dist/evoxc-<version>-py3-none-any.whl
-      # and dist/evoxc-<version>.tar.gz. No `uv sync` is needed here because the
-      # remaining steps read files and metadata only (pytest is not re-run —
-      # tests/test_packaging.py already ran in the `test` job).
-      - name: Build sdist + wheel
-        run: uv build
+      # `--all-packages` builds BOTH workspace projects into dist/:
+      #   dist/evoxc-<v>-py3-none-any.whl      dist/evoxc-<v>.tar.gz
+      #   dist/evoxc_hf-<v>-py3-none-any.whl   dist/evoxc_hf-<v>.tar.gz
+      # (artifact filenames are normalized: the `evoxc-hf` project name becomes
+      # `evoxc_hf`). A plain `uv build` would build the root project only — the
+      # member has to be requested explicitly. No `uv sync` is needed here
+      # because the remaining steps read archives and metadata only (pytest is
+      # not re-run — tests/test_packaging.py already ran in the `test` job).
+      - name: Build sdists + wheels (both distributions)
+        run: uv build --all-packages --out-dir dist
 
       - name: Check distribution metadata
         run: uvx twine check dist/*
 
-      - name: Assert the expected artifacts exist
+      - name: Assert the four expected artifacts exist
         run: |
           set -euo pipefail
-          version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          echo "pyproject version: ${version}"
+          evoxc_version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          evoxc_hf_version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("evoxc_hf/pyproject.toml", "rb"))["project"]["version"])')"
+          echo "evoxc    version: ${evoxc_version}"
+          echo "evoxc-hf version: ${evoxc_hf_version}"
           ls -l dist
-          wheel="dist/evoxc-${version}-py3-none-any.whl"
-          sdist="dist/evoxc-${version}.tar.gz"
-          [ -f "${wheel}" ] || { echo "::error::missing wheel ${wheel}"; exit 1; }
-          [ -f "${sdist}" ] || { echo "::error::missing sdist ${sdist}"; exit 1; }
+          for artifact in \
+            "evoxc-${evoxc_version}-py3-none-any.whl" \
+            "evoxc-${evoxc_version}.tar.gz" \
+            "evoxc_hf-${evoxc_hf_version}-py3-none-any.whl" \
+            "evoxc_hf-${evoxc_hf_version}.tar.gz" ; do
+            if [ ! -f "dist/${artifact}" ]; then
+              echo "::error::missing artifact dist/${artifact} — expected four: an evoxc and an evoxc_hf wheel + sdist"
+              exit 1
+            fi
+          done
+          count="$(find dist -maxdepth 1 -type f | wc -l)"
+          if [ "${count}" -ne 4 ]; then
+            echo "::error::expected exactly the 4 artifacts above (evoxc + evoxc_hf wheel/sdist) in dist/, got ${count} file(s)"
+            exit 1
+          fi
 
-      - name: Guard the distribution boundary (no evoxc_hf / etl in the wheel)
+      - name: Guard the distribution boundary (each archive ships its own package only)
         run: |
           set -euo pipefail
           uv run --no-project python - <<'PY'
-          import glob
           import sys
+          import tarfile
+          import tomllib
           import zipfile
 
-          wheels = glob.glob("dist/*.whl")
-          assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
-          names = zipfile.ZipFile(wheels[0]).namelist()
-          forbidden = {"evoxc_hf", "etl"}
-          bad = [n for n in names if n.split("/")[0] in forbidden]
-          if bad:
-              print(f"::error::{wheels[0]} ships non-evoxc packages: {bad[:5]}")
+          def version_of(path):
+              with open(path, "rb") as fh:
+                  return tomllib.load(fh)["project"]["version"]
+
+          def fail(artifact, message):
+              print(f"::error::{artifact}: {message}")
               sys.exit(1)
-          print(f"ok: {len(names)} entries, no evoxc_hf / etl")
+
+          def wheel_entries(artifact):
+              with zipfile.ZipFile(artifact) as zf:
+                  return zf.namelist()
+
+          def sdist_entries(artifact):
+              with tarfile.open(artifact) as tf:
+                  return tf.getnames()
+
+          def top_level(entries):
+              return {entry.split("/")[0] for entry in entries}
+
+          V = version_of("pyproject.toml")
+          V_HF = version_of("evoxc_hf/pyproject.toml")
+
+          # 1. The `evoxc` wheel ships exactly `evoxc` + its own dist-info.
+          artifact = f"dist/evoxc-{V}-py3-none-any.whl"
+          entries = wheel_entries(artifact)
+          tops = top_level(entries)
+          bad = sorted(t for t in tops if t.startswith("evoxc_hf"))
+          if bad:
+              fail(artifact, f"ships {bad} — `evoxc_hf` belongs to the SEPARATE distribution `evoxc-hf` (`evoxc_hf/pyproject.toml`) and must never be inside the `evoxc` one")
+          expected = {"evoxc", f"evoxc-{V}.dist-info"}
+          if tops != expected:
+              fail(artifact, f"top-level entries must be exactly {sorted(expected)}, got {sorted(tops)}")
+
+          # 2. The `evoxc_hf` wheel ships exactly `evoxc_hf` + its own dist-info.
+          artifact = f"dist/evoxc_hf-{V_HF}-py3-none-any.whl"
+          entries = wheel_entries(artifact)
+          tops = top_level(entries)
+          bad = sorted(n for n in entries if n == "evoxc" or n.startswith("evoxc/"))
+          if bad:
+              fail(artifact, f"ships the `evoxc` package ({bad[:5]}) — `evoxc` is the workspace ROOT distribution and a declared runtime dependency, never vendored into `evoxc-hf`")
+          expected = {"evoxc_hf", f"evoxc_hf-{V_HF}.dist-info"}
+          if tops != expected:
+              fail(artifact, f"top-level entries must be exactly {sorted(expected)}, got {sorted(tops)}")
+
+          # 3. The `evoxc` sdist has a single `evoxc-<version>` root and no
+          #    `evoxc_hf` path at all.
+          artifact = f"dist/evoxc-{V}.tar.gz"
+          entries = sdist_entries(artifact)
+          root = f"evoxc-{V}"
+          roots = top_level(entries)
+          if roots != {root}:
+              fail(artifact, f"must have the single root {root!r}, got {sorted(roots)}")
+          bad = sorted(n for n in entries if "evoxc_hf" in n)
+          if bad:
+              fail(artifact, f"ships {len(bad)} `evoxc_hf` path(s), e.g. {bad[:5]} — the workspace member is a separate distribution and never part of the root sdist")
+
+          # 4. The `evoxc_hf` sdist has a single `evoxc_hf-<version>` root, no
+          #    `evoxc` package and ships the license file.
+          artifact = f"dist/evoxc_hf-{V_HF}.tar.gz"
+          entries = sdist_entries(artifact)
+          root = f"evoxc_hf-{V_HF}"
+          roots = top_level(entries)
+          if roots != {root}:
+              fail(artifact, f"must have the single root {root!r}, got {sorted(roots)}")
+          bad = sorted(n for n in entries if n == f"{root}/evoxc" or n.startswith(f"{root}/evoxc/"))
+          if bad:
+              fail(artifact, f"ships the `evoxc` package ({bad[:5]}) — build `evoxc` from the workspace ROOT project instead")
+          if not any(n.split("/")[-1] == "LICENSE" for n in entries):
+              fail(artifact, 'does not ship the LICENSE file (license-files = ["LICENSE"] in evoxc_hf/pyproject.toml)')
+
+          print(f"ok: evoxc {V} wheel/sdist ship `evoxc` only; evoxc_hf {V_HF} wheel/sdist ship `evoxc_hf` only")
           PY
