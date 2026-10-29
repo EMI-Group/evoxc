@@ -1,9 +1,12 @@
 [build-system]
-# setuptools >= 77 is the first release with PEP 639 support, which this file
-# uses for the license metadata below (`license = "<SPDX expression>"` plus
-# `license-files`). The backend stays `setuptools.build_meta`.
-requires = ["setuptools>=77.0.3"]
-build-backend = "setuptools.build_meta"
+# `uv_build` — a pure-Python-only build backend (no setuptools, no egg-info, no
+# SOURCES.txt manifest that a stale build can poison). It ships EXACTLY ONE
+# top-level module per distribution (see `[tool.uv.build-backend]` below), which
+# makes the `evoxc_hf` leak structurally impossible rather than a config promise,
+# and it preserves the PEP 639 license metadata below verbatim
+# (`License-Expression` + `License-File` in the wheel METADATA).
+requires = ["uv_build>=0.13.6,<0.14"]
+build-backend = "uv_build"
 
 [project]
 name = "evoxc"
@@ -13,8 +16,8 @@ readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
 # PEP 639: an SPDX license expression + the license file(s) shipped in the
 # distribution. The legacy `license = { text = ... }` table and the deprecated
-# `License ::` classifiers are deliberately NOT used (setuptools >= 77 rejects
-# the combination), so the license is declared exactly once, here.
+# `License ::` classifiers are deliberately NOT used, so the license is declared
+# exactly once, here.
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "The EvoX Authors" }]
@@ -106,8 +109,9 @@ bench = ["torch>=2.0"]
 #     checkout (HuggingFace checkpoint loading / compiled execution built ON
 #     evoxc, one-way dependency). It is deliberately NOT part of the `evoxc`
 #     distribution: a wheel/sdist of `evoxc` contains no `evoxc_hf` — see
-#     [tool.setuptools.packages.find] below, which matches only `evoxc` /
-#     `evoxc.*`. Nothing installs `evoxc_hf` for you today; use it from a checkout.
+#     [tool.uv.build-backend] below, which declares `evoxc` as the ONE shipped
+#     module and cannot reach a sibling top-level package.
+#     Nothing installs `evoxc_hf` for you today; use it from a checkout.
 # (b) `pip install evoxc[hf]` pulls ONLY the optional oracle deps below — the
 #     real-torch/real-transformers reference implementations used to validate
 #     and benchmark `evoxc_hf`. They are NEVER runtime requirements: `evoxc_hf`'s
@@ -124,15 +128,26 @@ hf = ["torch>=2.0", "transformers>=4.40"]
 "EvoX ecosystem" = "https://github.com/EMI-Group"
 Genesis = "https://github.com/EMI-Group/genesis"
 
-[tool.setuptools.packages.find]
-# ONLY the `evoxc` distribution: `evoxc` and its subpackages. `evoxc_hf` (the
-# separate top-level HuggingFace package in this checkout) must never be
-# installed as part of `evoxc`, and these setuptools globs cannot match it:
-# `evoxc.*` requires the literal `evoxc.` prefix, so `evoxc_hf` / `evoxc_hf.*` are
-# unmatched (the `include` list deliberately uses no greedy `evoxc*` pattern).
-include = ["evoxc", "evoxc.*"]
-# Tests are colocated with their packages, never shipped.
-exclude = ["evoxc_hf.tests", "evoxc_hf.tests.*"]
+[tool.uv.build-backend]
+# This repo uses a FLAT layout (`./evoxc/` sits at the root, not under `src/`),
+# so the module root is the repository root itself. Without `module-root = ""`
+# uv_build assumes src-layout and fails with
+# "Expected a Python module at: src/evoxc/__init__.py".
+module-root = ""
+# The ONLY shipped module. uv_build packages exactly the `<module-root>/<name>`
+# directory, so the separate top-level `evoxc_hf` package in this checkout is
+# structurally unbuildable into an `evoxc` wheel or sdist — not a glob that
+# could be widened by accident.
+module-name = "evoxc"
+# The sdist additionally ships these checkout paths (anchored patterns; `**`
+# recurses), so a built-from-sdist tree can still run the test suite:
+#   tests/**     — the pytest suite that mirrors the package layout
+#   assets/**    — README-only SVG diagrams referenced by the packaged README
+#   conftest.py  — the root pytest configuration that makes `tests/` importable
+# Deliberately NOT shipped: `evoxc_hf/` (a separate package used from the
+# checkout, see the `hf` extra above), `bench_logs/` (benchmark scratch area)
+# and the root probe scripts (`probe_new_emitters.py`).
+source-include = ["tests/**", "assets/**", "conftest.py"]
 
 [tool.pytest.ini_options]
 # `tests/` mirrors the `evoxc` package; `evoxc_hf/tests/` is colocated with the
