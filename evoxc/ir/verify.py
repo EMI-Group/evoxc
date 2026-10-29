@@ -122,8 +122,13 @@ def verify(module: Module) -> None:
             f"verify() expects an ir.Module, got {type(module).__name__}"
         )
     _verify_module(module)
+    # Per-CALL scratch memo for result-type inference (never module-global, so
+    # concurrent ``verify`` calls on a chunked compile pool cannot interfere,
+    # and a stale verdict can never be served for a mutated module — the dict
+    # dies with this call). See ``_verify_result_types`` for the key contract.
+    type_memo: dict[tuple, tuple[ValueType, ...]] = {}
     for function in module.functions:
-        _verify_function(module, function)
+        _verify_function(module, function, type_memo)
     values, ops = _collect_ids(module)
     _verify_uses(values, ops)
 
@@ -179,7 +184,9 @@ def _verify_module(module: Module) -> None:
 # Function level
 # ---------------------------------------------------------------------------
 
-def _verify_function(module: Module, function: Function) -> None:
+def _verify_function(
+    module: Module, function: Function, type_memo: dict[tuple, tuple[ValueType, ...]]
+) -> None:
     fname = function.name
     region = function.region
     if not isinstance(region, Region):
@@ -246,7 +253,7 @@ def _verify_function(module: Module, function: Function) -> None:
             f"function '{fname}': output_types {actual} disagree with the "
             f"return operands' types {expected_outputs}"
         )
-    _verify_block_ops(module, block, frozenset())
+    _verify_block_ops(module, block, frozenset(), type_memo)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +298,12 @@ def _verify_block_terminator(block: Block, context: str) -> None:
         _fail(f"{context}: terminator must be the 'return' op, got '{ops[-1].name}'")
 
 
-def _verify_block_ops(module: Module, block: Block, scope: frozenset[int]) -> None:
+def _verify_block_ops(
+    module: Module,
+    block: Block,
+    scope: frozenset[int],
+    type_memo: dict[tuple, tuple[ValueType, ...]],
+) -> None:
     """Check every op of ``block`` in order, then recurse into nested regions.
 
     ``scope`` holds the ids of all values defined before this block (block
@@ -315,7 +327,7 @@ def _verify_block_ops(module: Module, block: Block, scope: frozenset[int]) -> No
     for op in block.ops:
         if not isinstance(op, Op):
             _fail(f"block op must be an Op, got {type(op).__name__}")
-        _verify_op(module, op)
+        _verify_op(module, op, type_memo)
         if op.parent is not block:
             _fail(
                 f"op '{op.name}' (id {op.id}): parent is not its block",
@@ -335,13 +347,17 @@ def _verify_block_ops(module: Module, block: Block, scope: frozenset[int]) -> No
                     op.location,
                 )
         for region in op.regions:
-            _verify_nested_region(module, op, region, local)
+            _verify_nested_region(module, op, region, local, type_memo)
         for result in op.results:
             local.add(result.id)
 
 
 def _verify_nested_region(
-    module: Module, op: Op, region: Region, scope: frozenset[int]
+    module: Module,
+    op: Op,
+    region: Region,
+    scope: frozenset[int],
+    type_memo: dict[tuple, tuple[ValueType, ...]],
 ) -> None:
     if not isinstance(region, Region):
         _fail(
@@ -408,15 +424,19 @@ def _verify_nested_region(
                 op.location,
             )
         _verify_block_terminator(block, f"op '{op.name}' region")
-        _verify_block_ops(module, block, base)
+        _verify_block_ops(module, block, base, type_memo)
 
 
 # ---------------------------------------------------------------------------
 # Op level
 # ---------------------------------------------------------------------------
 
-def _verify_op(module: Module, op: Op) -> None:
-    where = f"op '{op.name}' (id {op.id})"
+def _verify_op(
+    module: Module, op: Op, type_memo: dict[tuple, tuple[ValueType, ...]]
+) -> None:
+    # Message prefixes (``where``) are formatted INSIDE each failure branch:
+    # one f-string per op would otherwise be built eagerly and thrown away on
+    # the (overwhelmingly common) success path.
     loc = op.location
     try:
         opdef_obj = opdef(op.name)
@@ -425,14 +445,14 @@ def _verify_op(module: Module, op: Op) -> None:
         return
     if not opdef_obj.check_arity(len(op.operands)):
         _fail(
-            f"{where}: operand count {len(op.operands)} violates declared "
-            f"arity {opdef_obj.arity}",
+            f"op '{op.name}' (id {op.id}): operand count "
+            f"{len(op.operands)} violates declared arity {opdef_obj.arity}",
             loc,
         )
     if len(op.regions) != opdef_obj.regions:
         _fail(
-            f"{where}: has {len(op.regions)} regions, declared "
-            f"{opdef_obj.regions}",
+            f"op '{op.name}' (id {op.id}): has {len(op.regions)} regions, "
+            f"declared {opdef_obj.regions}",
             loc,
         )
     result_count = opdef_obj.result_count
@@ -441,63 +461,92 @@ def _verify_op(module: Module, op: Op) -> None:
         if isinstance(result_count, int):
             if n_results != result_count:
                 _fail(
-                    f"{where}: result count {n_results} != declared "
-                    f"{result_count}",
+                    f"op '{op.name}' (id {op.id}): result count {n_results} "
+                    f"!= declared {result_count}",
                     loc,
                 )
         else:
             lo, hi = result_count
             if n_results < lo or (hi is not None and n_results > hi):
                 _fail(
-                    f"{where}: result count {n_results} outside declared "
-                    f"range {result_count}",
+                    f"op '{op.name}' (id {op.id}): result count {n_results} "
+                    f"outside declared range {result_count}",
                     loc,
                 )
-    _verify_attrs(opdef_obj, op, where, loc)
+    # An op with NO attributes whose OpDef declares NONE has nothing to check:
+    # no unknown keys, no required attributes, no values to type-check. The
+    # ``isinstance`` arm keeps a non-dict ``attributes`` failing with the same
+    # message as ever (a falsy non-dict such as ``0`` or ``""``).
+    attributes = op.attributes
+    if (
+        attributes
+        or opdef_obj.attributes
+        or not isinstance(attributes, dict)
+    ):
+        _verify_attrs(opdef_obj, op, loc)
     for i, operand in enumerate(op.operands):
         if not isinstance(operand, Value):
             _fail(
-                f"{where}: operand {i} must be a Value, got "
-                f"{type(operand).__name__}",
+                f"op '{op.name}' (id {op.id}): operand {i} must be a Value, "
+                f"got {type(operand).__name__}",
                 loc,
             )
     for i, result in enumerate(op.results):
         if not isinstance(result, Value):
             _fail(
-                f"{where}: result {i} must be a Value, got "
-                f"{type(result).__name__}",
+                f"op '{op.name}' (id {op.id}): result {i} must be a Value, "
+                f"got {type(result).__name__}",
                 loc,
             )
         if result.owner is not op:
-            _fail(f"{where}: result %{result.id} is not owned by this op", loc)
+            _fail(
+                f"op '{op.name}' (id {op.id}): result %{result.id} is not "
+                "owned by this op",
+                loc,
+            )
         if result.index != i:
             _fail(
-                f"{where}: result %{result.id} has index {result.index}, "
-                f"expected {i}",
+                f"op '{op.name}' (id {op.id}): result %{result.id} has index "
+                f"{result.index}, expected {i}",
                 loc,
             )
-    _verify_result_types(module, op, opdef_obj, loc)
+    _verify_result_types(module, op, opdef_obj, loc, type_memo)
 
 
-def _verify_attrs(opdef_obj: OpDef, op: Op, where: str, loc: Location | None) -> None:
+def _verify_attrs(opdef_obj: OpDef, op: Op, loc: Location | None) -> None:
+    # The ``name -> AttrSpec`` schema dict is only built when the op actually
+    # carries attributes; the required-attribute scan runs off the declared
+    # tuple (usually empty), so an attribute-free op costs no dict at all.
     attributes = op.attributes
     if not isinstance(attributes, dict):
-        _fail(f"{where}: attributes must be a dict, got {type(attributes).__name__}", loc)
-    schema = {spec.name: spec for spec in opdef_obj.attributes}
-    for key in attributes:
-        if key not in schema:
-            _fail(f"{where}: unknown attribute '{key}'", loc)
+        _fail(
+            f"op '{op.name}' (id {op.id}): attributes must be a dict, got "
+            f"{type(attributes).__name__}",
+            loc,
+        )
+    if attributes:
+        schema = {spec.name: spec for spec in opdef_obj.attributes}
+        for key in attributes:
+            if key not in schema:
+                _fail(
+                    f"op '{op.name}' (id {op.id}): unknown attribute '{key}'",
+                    loc,
+                )
     for spec in opdef_obj.attributes:
         if spec.required and spec.name not in attributes:
-            _fail(f"{where}: missing required attribute '{spec.name}'", loc)
-    for key, value in attributes.items():
-        spec = schema[key]
-        if not _attr_matches(spec, value):
             _fail(
-                f"{where}: attribute '{key}' must be {spec.type}, got "
-                f"{_value_desc(value)}",
+                f"op '{op.name}' (id {op.id}): missing required attribute "
+                f"'{spec.name}'",
                 loc,
             )
+    if attributes:
+        for key, value in attributes.items():
+            if not _attr_matches(schema[key], value):
+                _fail(
+                    f"op '{op.name}' (id {op.id}): attribute '{key}' must be "
+                    f"{schema[key].type}, got {_value_desc(value)}",
+                    loc,
+                )
 
 
 def _attr_matches(spec: AttrSpec, value: Any) -> bool:
@@ -576,25 +625,66 @@ def _attr_matches(spec: AttrSpec, value: Any) -> bool:
 # Result-type agreement
 # ---------------------------------------------------------------------------
 
+_MISS = object()
+
+
 def _verify_result_types(
-    module: Module, op: Op, opdef_obj: OpDef, loc: Location | None
+    module: Module,
+    op: Op,
+    opdef_obj: OpDef,
+    loc: Location | None,
+    type_memo: dict[tuple, tuple[ValueType, ...]],
 ) -> None:
-    where = f"op '{op.name}' (id {op.id})"
     if opdef_obj.shape_fn is not None:
         input_types = tuple(operand.type for operand in op.operands)
-        try:
-            expected = opdef_obj.shape_fn(input_types, dict(op.attributes))
-        except (ShapeError, ValueError, TypeError) as error:
-            _fail(f"{where}: result-type inference failed: {error}", loc)
-            return
+        # Memoized re-derivation (the dominant per-op cost of a large verify:
+        # ``shape_fn`` broadcasts/reduces symbolic shapes from scratch every
+        # time). A ``shape_fn`` is a PURE function of (operand types,
+        # attributes), so for an op carrying NO attributes the inferred result
+        # types are fully determined by the op NAME (its registered def) and
+        # the operand ``ValueType`` tuple — both hashable (frozen
+        # ``ValueType``/``Dim``/``DimExpr``). Unhashable shapes (only possible
+        # in a corrupt module) simply skip the memo; they never take a
+        # different verification path.
+        key = None
+        expected = _MISS
+        if not op.attributes:
+            try:
+                key = (opdef_obj.name, input_types)
+                expected = type_memo.get(key, _MISS)
+            except TypeError:
+                key = None
+        if expected is _MISS:
+            try:
+                expected = opdef_obj.shape_fn(input_types, dict(op.attributes))
+            except (ShapeError, ValueError, TypeError) as error:
+                _fail(
+                    f"op '{op.name}' (id {op.id}): result-type inference "
+                    f"failed: {error}",
+                    loc,
+                )
+                return
+            if key is not None:
+                type_memo[key] = expected
         if len(expected) != len(op.results):
             _fail(
-                f"{where}: inference yields {len(expected)} results, recorded "
-                f"{len(op.results)}",
+                f"op '{op.name}' (id {op.id}): inference yields "
+                f"{len(expected)} results, recorded {len(op.results)}",
                 loc,
             )
         for i, (expected_type, result) in enumerate(zip(expected, op.results)):
-            _check_type_agreement(op, i, expected_type, result.type, loc)
+            actual = result.type
+            # Fast path: the recorded type already IS the inferred one (the
+            # overwhelmingly common case, since the Builder records what the
+            # same shape_fn returned). Anything else goes through the helper so
+            # every message stays byte-identical.
+            if (
+                type(actual) is ValueType
+                and actual.dtype == expected_type.dtype
+                and actual.shape == expected_type.shape
+            ):
+                continue
+            _check_type_agreement(op, i, expected_type, actual, loc)
     else:
         _verify_op_specific_results(module, op, loc)
 
@@ -602,23 +692,22 @@ def _verify_result_types(
 def _check_type_agreement(
     op: Op, index: int, expected: ValueType, actual: Any, loc: Location | None
 ) -> None:
-    where = f"op '{op.name}' (id {op.id})"
     if not isinstance(actual, ValueType):
         _fail(
-            f"{where}: result {index} type must be a ValueType, got "
-            f"{type(actual).__name__}",
+            f"op '{op.name}' (id {op.id}): result {index} type must be a "
+            f"ValueType, got {type(actual).__name__}",
             loc,
         )
     if expected.dtype != actual.dtype:
         _fail(
-            f"{where}: result {index} dtype mismatch: inferred {expected.dtype}, "
-            f"recorded {actual.dtype}",
+            f"op '{op.name}' (id {op.id}): result {index} dtype mismatch: "
+            f"inferred {expected.dtype}, recorded {actual.dtype}",
             loc,
         )
     if expected.shape != actual.shape:
         _fail(
-            f"{where}: result {index} shape mismatch: inferred "
-            f"{expected.shape!r}, recorded {actual.shape!r}",
+            f"op '{op.name}' (id {op.id}): result {index} shape mismatch: "
+            f"inferred {expected.shape!r}, recorded {actual.shape!r}",
             loc,
         )
 
@@ -645,8 +734,15 @@ def _verify_op_specific_results(module: Module, op: Op, loc: Location | None) ->
     name = op.name
     if name == "constant":
         payload = op.attributes["value"]
+        actual = op.results[0].type
+        if (
+            type(actual) is ValueType
+            and actual.dtype == np.dtype(payload.dtype)
+            and actual.shape == tuple(payload.shape)
+        ):
+            return  # already agrees — no intermediate ValueType needed
         expected = ValueType(np.dtype(payload.dtype), tuple(payload.shape))
-        _check_type_agreement(op, 0, expected, op.results[0].type, loc)
+        _check_type_agreement(op, 0, expected, actual, loc)
     elif name == "if":
         result_types = tuple(value.type for value in op.results)
         for r_index, region in enumerate(op.regions):
@@ -771,10 +867,30 @@ def _collect_ids(module: Module) -> tuple[dict[int, Value], dict[int, Op]]:
 
 
 def _verify_uses(values: dict[int, Value], ops: dict[int, Op]) -> None:
+    """Check use bookkeeping in BOTH directions.
+
+    One forward pass validates every recorded ``Use`` and, in the SAME pass,
+    builds an identity-keyed index of the recorded ``(value, op, operand)``
+    triples. The reverse pass then answers "does this operand have a matching
+    record?" with one O(1) set lookup instead of scanning the operand value's
+    whole use list — the scan made verification QUADRATIC in the use count of
+    a value (a shared input or constant feeding thousands of ops scanned
+    thousands of records per operand; measured 2.8 M generator calls on a
+    27 k-op merged graph).
+
+    The index is a per-CALL local (thread-safe, never survives ``verify``), so
+    a mutated module can never be served a stale verdict. Keys are
+    module-unique ids — ``_collect_ids`` has already rejected duplicate value
+    and op ids, so an id pair identifies the same objects the ``is``
+    comparisons below would. Records belonging to a value the forward pass
+    never visited (impossible for a valid module — dominance already pinned
+    every operand to an in-scope id) fall back to the original scan, so the
+    two-directions semantics are byte-identical.
+    """
     # Forward: every Use recorded on a value refers back to that value at the
     # recorded operand index, targets an op of this module, and appears once.
+    recorded: set[tuple[int, int, int]] = set()
     for vid, value in values.items():
-        seen: set[tuple[int, int]] = set()
         for use in value.uses:
             if not isinstance(use, Use):
                 _fail(
@@ -800,20 +916,26 @@ def _verify_uses(values: dict[int, Value], ops: dict[int, Op]) -> None:
                     f"value %{vid}: use record refers to an op outside the "
                     f"module '{owner.name}'"
                 )
-            key = (owner.id, index)
-            if key in seen:
+            # Duplicates are per value, and the key carries the value id — so
+            # one shared index also serves the duplicate check.
+            triple = (vid, owner.id, index)
+            if triple in recorded:
                 _fail(
                     f"value %{vid}: duplicate use record for op '{owner.name}' "
                     f"operand {index}"
                 )
-            seen.add(key)
+            recorded.add(triple)
     # Reverse: every operand of every op has a matching recorded Use.
     for op in ops.values():
+        op_id = op.id
         for i, operand in enumerate(op.operands):
-            if not any(
+            if (operand.id, op_id, i) in recorded:
+                continue
+            if any(
                 use.owner is op and use.operand_index == i for use in operand.uses
             ):
-                _fail(
-                    f"op '{op.name}' (id {op.id}): operand {i} (%{operand.id}) "
-                    "has no matching Use record"
-                )
+                continue
+            _fail(
+                f"op '{op.name}' (id {op.id}): operand {i} (%{operand.id}) "
+                "has no matching Use record"
+            )
