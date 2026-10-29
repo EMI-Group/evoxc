@@ -287,7 +287,88 @@ def _is_static_one(dim) -> bool:
 
 def _shape_is_static(shape) -> bool:
     """True when every dim of ``shape`` is a concrete int."""
-    return all(_is_static_dim(d) for d in shape)
+    for dim in shape:  # explicit loop: this is per-op hot (no genexpr frame)
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            return False
+    return True
+
+
+#: ``stablehlo/ops.py``'s dtype table, bound once: `mlir_dtype` re-wraps its
+#: argument in ``np.dtype`` for every call, but `ValueType.dtype` is ALWAYS
+#: already a normalized ``np.dtype`` (see `evoxc.ir.types.ValueType`), so the
+#: hot path is a plain dict lookup.
+_DTYPE_MAP = mapping.DTYPE_MAP
+
+
+def _mlir_dtype(dtype) -> str:
+    """`mapping.mlir_dtype` without the redundant ``np.dtype`` re-wrap.
+
+    Same result and the same ``KeyError`` for unmapped dtypes (callers keep
+    their own ``BackendError`` wording)."""
+    if isinstance(dtype, np.dtype):
+        return _DTYPE_MAP[dtype]
+    return mapping.mlir_dtype(dtype)
+
+
+#: Op name -> its `mapping.lookup_mapping` mnemonic for the ELEMENTWISE
+#: family. `lookup_mapping` walks all seven mapping tables and
+#: ``ELEMENTWISE_MAP`` is the first, so for an elementwise-routed op the
+#: answer IS this dict's entry (one dict lookup instead of the table walk);
+#: `_emit_elementwise` still falls back to `lookup_mapping` when absent.
+_ELEMENTWISE_MNEMONIC = dict(mapping.ELEMENTWISE_MAP)
+
+#: ``SPECIAL_EMITTERS`` family -> the Writer method that emits it.
+_SPECIAL_EMITTER_METHODS = {
+    "gather": "_emit_gather",
+    "scatter": "_emit_scatter",
+    "sort": "_emit_sort",
+    "argsort": "_emit_argsort",
+    "arg_reduce": "_emit_arg_reduce",
+    "tile": "_emit_tile",
+    "eigh": "_emit_eigh",
+    "diag": "_emit_diag",
+    "random": "_emit_random",
+}
+
+#: Op name -> the UNBOUND Writer emitter function for it (``fn(writer, op)``),
+#: built once at import from the STATIC mapping tables (see
+#: `_build_emitters`). `Writer._emit_op` is then one dict lookup instead of a
+#: `mapping.status` scan plus a six-way membership chain per op — the single
+#: most-executed path in a large export. A name in NO table (or deferred) is
+#: ABSENT, so `_emit_op` raises the same `BackendError`; the build order
+#: mirrors the historical dispatch chain exactly (DECOMPOSITIONS first, then
+#: DEFERRED_OPS, then the direct tables in chain order), and the dict is
+#: module-level CONSTANT state (never mutated per export).
+_EMITTERS: dict = {}
+
+
+def _build_emitters() -> dict:
+    """Resolve `_EMITTERS` against the `Writer` class (called once, after the
+    class body). Precedence follows `Writer._emit_op`'s original chain:
+    ``DECOMPOSITIONS`` -> ``DEFERRED_OPS`` -> the direct tables in the order
+    elementwise, ``select``, comparison, constant, shape, if, while,
+    collective, special emitters (first match wins, so ``select`` — also in
+    ``SHAPE_MAP`` — keeps its dedicated emitter)."""
+    names: dict[str, str] = {}
+    for op_name in mapping.ELEMENTWISE_MAP:
+        names.setdefault(op_name, "_emit_elementwise")
+    names.setdefault("select", "_emit_select")
+    for op_name in mapping.COMPARISON_MAP:
+        names.setdefault(op_name, "_emit_compare")
+    names.setdefault("constant", "_emit_constant")
+    for op_name in mapping.SHAPE_MAP:
+        names.setdefault(op_name, "_emit_shape")
+    names.setdefault("if", "_emit_if")
+    names.setdefault("while", "_emit_while")
+    for op_name in mapping.COLLECTIVE_MAP:
+        names.setdefault(op_name, "_emit_collective")
+    for op_name, family in mapping.SPECIAL_EMITTERS.items():
+        names.setdefault(op_name, _SPECIAL_EMITTER_METHODS[family])
+    for op_name in mapping.DEFERRED_OPS:
+        names.pop(op_name, None)
+    for op_name in mapping.DECOMPOSITIONS:
+        names[op_name] = "_emit_decomposed"
+    return {op_name: getattr(Writer, method) for op_name, method in names.items()}
 
 
 def _normalize_rng_bit_generator(value) -> frozenset:
@@ -403,6 +484,20 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         #: used where the emitted program's types legitimately differ from
         #: the IR's symbolic types (all_gather/reduce_scatter axis dims).
         self._type_overrides: dict[int, str] = {}
+        #: Per-export memo of rendered ``tensor<...>`` type texts keyed by
+        #: ``(dtype, shape)`` — a value's type is IMMUTABLE for the whole
+        #: export and merged graphs reuse a handful of shapes across
+        #: thousands of ops, so this replaces the per-op dtype lookup +
+        #: dim loop + join with one dict hit (see `_type_text`).
+        #: A fresh Writer per `export()` call keeps this free of cross-graph
+        #: state; it grows O(#distinct (dtype, shape) pairs) for one export
+        #: and dies with it. Single-threaded by construction (one Writer is
+        #: created and used inside one `export()` call), so a plain dict is
+        #: correct — no lock, no eviction.
+        self._type_cache: dict[tuple, str] = {}
+        #: Same memo for the scalar element type text ``tensor<i32>`` used by
+        #: scalar constants (keyed by dtype; O(#dtypes) growth).
+        self._elem_type_cache: dict[object, str] = {}
         #: rng_bit_generator exporter option (see random_export): frozenset
         #: of algorithm names with native emission enabled.
         self._rng_bit_generator = _normalize_rng_bit_generator(
@@ -573,7 +668,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         else:
             results = " -> (" + ", ".join(self._vt_value(t) for t in outputs) + ")"
         text = "\n".join(prelude + body)
-        indented = self._indent(text, 1) if text else ""
+        if not text:
+            indented = ""
+        elif any("\n" in unit for unit in prelude + body):
+            # A region-bearing group carries its own newlines: indent the
+            # whole text (identical to the per-unit join below, which only
+            # covers the unit SEPARATORS).
+            indented = self._indent(text, 1)
+        else:
+            # One 4 MB `str.replace` avoided on a large single-function graph;
+            # `"  " + "\n".join(units).replace("\n", "\n  ")` is exactly
+            # `"  " + "\n  ".join(units)` when no unit contains a newline.
+            indented = "  " + "\n  ".join(prelude + body)
         return f"func.func @{fn.name}({args}){results} {{\n{indented}\n}}"
 
     def write_op(self, op: Op) -> str:
@@ -586,7 +692,7 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         dtype via `mapping.mlir_dtype` (unknown ⇒ BackendError naming it);
         int dims literal; `Dim`/`DimExpr`/`None` → `?`."""
         try:
-            m = mapping.mlir_dtype(dtype)
+            m = _mlir_dtype(dtype)
         except KeyError:
             raise BackendError(
                 f"stablehlo export: dtype {dtype!r} has no StableHLO type "
@@ -596,6 +702,24 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         if dims:
             dims += "x"
         return f"tensor<{dims}{m}>"
+
+    def _type_text(self, dtype, shape) -> str:
+        """Memoized `mlir_type` (see `_type_cache`).
+
+        Both key components are immutable for the export: ``ValueType.dtype``
+        is a normalized ``np.dtype`` and ``ValueType.shape`` always a tuple.
+        Keys hash on their CONTENT (``np.dtype``/``int``/``Dim``/``DimExpr``
+        all hash by value), so two equal shapes share one entry. A non-tuple
+        ``shape`` argument (only reachable through the public `mlir_type`,
+        never from the emitters) is normalized first so the key stays
+        hashable — the rendered text is identical either way.
+        """
+        key = (dtype, shape if type(shape) is tuple else tuple(shape))
+        text = self._type_cache.get(key)
+        if text is None:
+            text = self.mlir_type(dtype, shape)
+            self._type_cache[key] = text
+        return text
 
     def render_attr(self, value) -> str:
         """Render a Python value as MLIR attribute syntax.
@@ -651,59 +775,34 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # --- Dispatch ---
 
     def _emit_op(self, op: Op) -> str:
-        name = op.name
-        if name == "return":
-            return ""  # terminators are emitted by the block emitters
-        status = mapping.status(name)
-        if status == "deferred":
+        """One `_EMITTERS` dict lookup (built from the static mapping tables,
+        see `_build_emitters`); a name in no table — including the deferred
+        ops — raises the same `core.BackendError` the historical
+        `mapping.status` chain raised."""
+        emitter = _EMITTERS.get(op.name)
+        if emitter is None:
+            if op.name == "return":
+                return ""  # terminators are emitted by the block emitters
             raise self._unsupported(op)
-        if status == "decompose":
-            return self._emit_decomposed(op)
-        if name in mapping.ELEMENTWISE_MAP:
-            return self._emit_elementwise(op)
-        if name == "select":
-            return self._emit_select(op)
-        if name in mapping.COMPARISON_MAP:
-            return self._emit_compare(op)
-        if name == "constant":
-            return self.render_constant(op.result)
-        if name in mapping.SHAPE_MAP:
-            return self._emit_shape(op)
-        if name == "if":
-            return self._emit_if(op)
-        if name == "while":
-            return self._emit_while(op)
-        if name in mapping.COLLECTIVE_MAP:
-            return self._emit_collective(op)
-        if name in mapping.SPECIAL_EMITTERS:
-            return self._emit_special(op)
-        raise self._unsupported(op)
+        return emitter(self, op)
+    def _emit_constant(self, op: Op) -> str:
+        """`constant` ops render from their result value (`render_constant`)."""
+        return self.render_constant(op.result)
+    def _emit_random(self, op: Op) -> str:
+        """`random_*` ops emit through `random_export` (algorithm-aware)."""
+        return random_export.emit_random_op(self, op)
 
     def _emit_special(self, op: Op) -> str:
         """Dispatch ops that need dedicated multi-op emitters (see
         ``mapping.SPECIAL_EMITTERS``): gather/scatter/sort/argsort/argmax/
         argmin/tile, the ``eigh`` Jacobi composition, the ``diag``
-        compositions, and the SplitMix64 random expansions."""
-        family = mapping.SPECIAL_EMITTERS[op.name]
-        if family == "gather":
-            return self._emit_gather(op)
-        if family == "scatter":
-            return self._emit_scatter(op)
-        if family == "sort":
-            return self._emit_sort(op)
-        if family == "argsort":
-            return self._emit_argsort(op)
-        if family == "arg_reduce":
-            return self._emit_arg_reduce(op)
-        if family == "tile":
-            return self._emit_tile(op)
-        if family == "eigh":
-            return self._emit_eigh(op)
-        if family == "diag":
-            return self._emit_diag(op)
-        if family == "random":
-            return random_export.emit_random_op(self, op)
-        raise self._unsupported(op)
+        compositions, and the SplitMix64 random expansions.
+        `_emit_op` targets those emitters directly; this remains the named
+        dispatch for direct callers."""
+        method = _SPECIAL_EMITTER_METHODS.get(mapping.SPECIAL_EMITTERS[op.name])
+        if method is None:
+            raise self._unsupported(op)
+        return getattr(self, method)(op)
 
     def _emit_elementwise(self, op: Op) -> str:
         """Unary/binary elementwise ops (incl. cast).
@@ -722,12 +821,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         emits ``stablehlo.convert`` in the functional-type custom form
         (operand and result types differ by definition).
         """
-        mnemonic = mapping.lookup_mapping(op.name)
+        mnemonic = _ELEMENTWISE_MNEMONIC.get(op.name)
+        if mnemonic is None:
+            # Defensive: only names routed here by `_EMITTERS` reach this
+            # emitter, and all of them live in ELEMENTWISE_MAP (the first
+            # table `lookup_mapping` searches) — so this returns the same
+            # mnemonic, or raises the same KeyError, as the historical call.
+            mnemonic = mapping.lookup_mapping(op.name)
         if op.name == "bitwise_right_shift":
             # numpy `np.right_shift` is dtype-natural: arithmetic on signed,
             # logical on unsigned. Operands are converted to the result dtype
             # below, so the result dtype decides the StableHLO mnemonic.
-            shift_dtype = np.dtype(op.result.type.dtype)
+            shift_dtype = op.result.type.dtype
             if shift_dtype.kind == "u":
                 mnemonic = "stablehlo.shift_right_logical"
             elif shift_dtype.kind == "i":
@@ -738,35 +843,47 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                     f"over dtype {shift_dtype!r} is not supported (the "
                     "frontend requires integer operands)"
                 )
-        result_shape = tuple(op.result.type.shape)
-        result_name = self._bind_results(op)[0]
-        shape_source = self._shape_source(op.operands, result_shape)
+        result_type = op.result.type
+        result_shape = result_type.shape
+        # Name-consumption ORDER is part of the emitted text: the result name
+        # is bound BEFORE any broadcast/convert intermediate (a single-result
+        # op, so `_bind_results(op)[0]` — the generic form — binds exactly
+        # this value).
+        result_name = self._bind_value(op.result)
+        shape_source = (
+            None
+            if _shape_is_static(result_shape)
+            else self._shape_source(op.operands, result_shape)
+        )
         lines: list[str] = []
         names = []
         for operand in op.operands:
             name, extra = self._equalize_operand(operand, result_shape, shape_source)
-            lines.extend(extra)
+            if extra:
+                lines.extend(extra)
             names.append(name)
         if op.name == "cast":
             operand_type = self._vt(op.operands[0].type)
             lines.append(
                 f"{result_name} = stablehlo.convert {names[0]} : "
-                f"({operand_type}) -> {self._vt(op.result.type)}"
+                f"({operand_type}) -> {self._vt(result_type)}"
             )
         else:
-            result_dtype = np.dtype(op.result.type.dtype)
-            for i, (name, operand) in enumerate(zip(names, op.operands)):
-                if np.dtype(operand.type.dtype) != result_dtype:
+            result_dtype = result_type.dtype
+            for i, operand in enumerate(op.operands):
+                if operand.type.dtype != result_dtype:
+                    # `type_str` of the operand dtype at the RESULT shape:
+                    # the operand was equalized to that shape above.
                     converted = self._new_name()
                     lines.append(
-                        f"{converted} = stablehlo.convert {name} : "
+                        f"{converted} = stablehlo.convert {names[i]} : "
                         f"({self._type_str(operand.type.dtype, result_shape)}) -> "
                         f"{self._type_str(result_dtype, result_shape)}"
                     )
                     names[i] = converted
             lines.append(
                 f"{result_name} = {mnemonic} {', '.join(names)} : "
-                f"{self._vt(op.result.type)}"
+                f"{self._vt(result_type)}"
             )
         return "\n".join(lines)
 
@@ -867,7 +984,7 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         "dynamic broadcast".
         """
         name = self._name(value)
-        shape = tuple(value.type.shape)
+        shape = value.type.shape  # already a tuple (ValueType normalizes)
         if shape == result_shape:
             return name, []
         rank_diff = len(result_shape) - len(shape)
@@ -4680,7 +4797,13 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 break
             text = self._emit_op(op)
             if text:
-                units.extend(_split_atomic_units(text))
+                # Fast path for the overwhelmingly common single-line unit
+                # (`_split_atomic_units` would return `[text]` unchanged);
+                # a region-bearing group still goes through the splitter.
+                if "\n" in text:
+                    units.extend(_split_atomic_units(text))
+                else:
+                    units.append(text)
         return units
 
     def _split_region_invariants(self, units, forbidden=()):
@@ -4744,11 +4867,12 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return [self._bind_value(r) for r in op.results]
 
     def _bind_value(self, value: Value) -> str:
-        name = self._names.get(id(value))
-        if name is None:
-            name = self._new_name()
+        try:
+            return self._names[id(value)]
+        except KeyError:
+            name = f"%{next(self._counter)}"
             self._names[id(value)] = name
-        return name
+            return name
 
     def _name(self, value: Value) -> str:
         return self._bind_value(value)
@@ -4757,18 +4881,28 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return f"%{next(self._counter)}"
 
     def _vt(self, vt) -> str:
-        return self.mlir_type(vt.dtype, vt.shape)
+        """Rendered type of a `ValueType`, memoized (see `_type_cache`)."""
+        return self._type_text(vt.dtype, vt.shape)
 
     def _vt_value(self, value: Value) -> str:
         """Rendered tensor type of `value`, honoring per-value overrides
         (see `_type_overrides`)."""
-        return self._type_overrides.get(id(value), self._vt(value.type))
+        override = self._type_overrides.get(id(value))
+        if override is not None:
+            return override
+        return self._type_text(value.type.dtype, value.type.shape)
 
     def _type_str(self, dtype, shape) -> str:
-        return self.mlir_type(dtype, shape)
+        return self._type_text(dtype, shape)
 
     def _elem_type(self, dtype) -> str:
-        return f"tensor<{mapping.mlir_dtype(dtype)}>"
+        """Scalar element type text, memoized per dtype. An unmapped dtype
+        still raises the same `KeyError` `mapping.mlir_dtype` raised."""
+        text = self._elem_type_cache.get(dtype)
+        if text is None:
+            text = f"tensor<{_mlir_dtype(dtype)}>"
+            self._elem_type_cache[dtype] = text
+        return text
 
     def _result_types_str(self, results) -> str:
         types = [self._vt(r.type) for r in results]
@@ -4848,3 +4982,8 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     def _indent(text: str, level: int) -> str:
         pad = "  " * level
         return pad + text.replace("\n", "\n" + pad)
+
+
+#: Resolved AFTER the class body (it binds the `Writer` emitter methods); a
+#: module-level constant table thereafter — see `_build_emitters`.
+_EMITTERS.update(_build_emitters())

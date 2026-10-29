@@ -139,9 +139,49 @@ def _render(arr) -> str:
 
 
 def _bool_text(arr) -> str:
-    """`[true, false, ...]` — `str(list)` then the two bool spellings."""
+    """`[true, false, ...]` — `str(list)` then the two bool spellings.
+
+    Payloads of ``_BOOL_BULK_MIN_ELEMENTS`` or more render through
+    ``_bool_text_bulk`` (same characters, built with a numpy byte tile
+    instead of a per-element Python ``repr``); smaller ones keep the
+    historical path."""
+    if arr.size >= _BOOL_BULK_MIN_ELEMENTS:
+        return _bool_text_bulk(arr)
     text = str(arr.tolist())
     return text.replace("True", "true").replace("False", "false")
+
+
+#: Payload size from which `_bool_text` switches to the bulk tile path (below
+#: it the tile machinery costs more than the plain ``str(list)``).
+_BOOL_BULK_MIN_ELEMENTS = 64
+
+
+def _bool_text_bulk(arr) -> str:
+    """Byte-identical twin of ``str(arr.tolist()).replace(...)`` for a bool
+    payload, without the per-element Python repr.
+
+    ``str(list)`` renders ``[True, False, ...]`` (nested ``[ ]`` per rank)
+    and the two replaces only lower the leading letter, so the text is
+    ``"[" + ", ".join("true"/"false" tokens) + "]"`` nested per rank. The
+    innermost row's tokens are built as a numpy ``uint8`` tile —
+    ``code, ',', ' '`` per element with ``code`` = ``'0'``/``'1'`` — decoded
+    in one C-level call and turned into the two spellings by two
+    ``str.replace`` passes (neither spelling contains a digit, so the
+    replacements cannot cascade); nesting then joins the rows."""
+    if arr.ndim == 0:
+        # `str(arr.tolist())` of a 0-d array is the bare Python bool.
+        return "true" if bool(arr) else "false"
+    if arr.ndim > 1:
+        return "[" + ", ".join(_bool_text_bulk(sub) for sub in arr) + "]"
+    codes = np.ascontiguousarray(arr).reshape(-1).view(np.uint8) + 48
+    tile = np.empty(codes.size * 3, dtype=np.uint8)
+    tile[0::3] = codes
+    tile[1::3] = 44  # ','
+    tile[2::3] = 32  # ' '
+    # Drop the trailing ", " (the `_re_split_exp`-free equivalent of the
+    # separator join `str(list)` performs).
+    flat = tile[:-2].tobytes().decode("latin-1")
+    return "[" + flat.replace("0", "false").replace("1", "true") + "]"
 
 
 def _float_text(arr, bits=None) -> str:
