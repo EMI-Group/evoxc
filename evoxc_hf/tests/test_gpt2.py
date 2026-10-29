@@ -18,6 +18,9 @@ key, exactly one embedding array, and no extra graph input.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -30,7 +33,14 @@ from evoxc_hf.load import LoadedModel, load_hf, validate_params
 from evoxc_hf.models import gpt2
 from evoxc_hf.pipeline import build, predict, run
 from evoxc_hf.program import forward_fn, param_specs, reference_logits
-from evoxc_hf.tests import hf_download
+
+# ``hf_download`` lives next to this file. The tests are deliberately NOT part of
+# the ``evoxc_hf`` package (src layout: ``evoxc_hf/src/evoxc_hf``), so the helper
+# is imported as a sibling top-level module rather than ``evoxc_hf.tests``.
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+import hf_download  # noqa: E402  (needs the sys.path entry above)
 
 #: Base synthetic config: tiny but non-degenerate (non-square MLP, 4 heads).
 BASE_CONFIG: dict = {

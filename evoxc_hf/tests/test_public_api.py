@@ -50,6 +50,7 @@ import json
 import struct
 import subprocess
 import sys
+import tomllib
 import types
 from pathlib import Path
 
@@ -59,6 +60,16 @@ import pytest
 import evoxc
 import evoxc_hf
 from evoxc_hf import errors as errors_module
+
+#: This subproject's ``pyproject.toml`` — the ONE source of the version.
+_PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
+
+
+def _declared_version() -> str:
+    """The version ``evoxc_hf/pyproject.toml`` declares for the distribution."""
+    with open(_PYPROJECT, "rb") as handle:
+        return tomllib.load(handle)["project"]["version"]
+
 
 #: Every documented public name, and the ``(module, attribute)`` it re-exports.
 _EXPECTED_EXPORTS = {
@@ -157,7 +168,10 @@ def _hermetic_env(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_import_evoxc_hf_works_and_has_a_version():
     assert isinstance(evoxc_hf.__version__, str)
-    assert evoxc_hf.__version__ == "0.1.0"
+    # ``pyproject.toml`` is the single source of truth: the package reads its own
+    # installed distribution metadata back, and a bare source checkout (nothing
+    # installed) falls back to the documented sentinel.
+    assert evoxc_hf.__version__ in (_declared_version(), "0.0.0+unknown")
     assert evoxc_hf.__doc__, "the package needs a docstring (it is the entry point)"
 
 
@@ -680,7 +694,9 @@ def test_public_api_is_usable_from_scratch():
         "      'build:', type(evoxc_hf.build).__name__,\n"
         "      'oop:', hasattr(evoxc_hf, 'HFModel'))\n"
     )
-    assert (
-        output.strip()
-        == "load_hf 0.1.0 ['gpt2', 'llama'] build: function oop: False"
-    )
+    # ``__version__`` comes from the installed distribution metadata (the
+    # declared version) or the bare-checkout sentinel — never a hardcoded literal.
+    function_name, version, rest = output.strip().split(" ", 2)
+    assert function_name == "load_hf"
+    assert version in (_declared_version(), "0.0.0+unknown")
+    assert rest == "['gpt2', 'llama'] build: function oop: False"

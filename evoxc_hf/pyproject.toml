@@ -1,0 +1,75 @@
+[build-system]
+# `uv_build` — the same pure-Python-only backend the root `evoxc` project uses,
+# so this subproject has no setuptools/egg-info/SOURCES.txt state to go stale.
+requires = ["uv_build>=0.13.6,<0.14"]
+build-backend = "uv_build"
+
+[project]
+name = "evoxc-hf"
+version = "0.1.0"
+description = "Run a HuggingFace checkpoint's whole forward pass as ONE compiled EvoX graph"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.11"
+# PEP 639: an SPDX license expression + the license file shipped in the
+# distribution. `LICENSE` is a tracked relative symlink to the repo-root license,
+# so the text is declared exactly once for the whole repository.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "The EvoX Authors" }]
+maintainers = [{ name = "The EvoX Authors" }]
+keywords = [
+    "compiler",
+    "tensor",
+    "graph",
+    "huggingface",
+    "transformers",
+    "llama",
+    "gpt2",
+    "iree",
+    "stablehlo",
+]
+# Every classifier is factually true for this package: pure Python, no native
+# code, numpy + evoxc only as runtime dependencies, no OS-specific behaviour.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+]
+# `evoxc` is the workspace-root project (this package is a member of the same uv
+# workspace); `numpy` is the only other hard dependency. The checkpoint readers
+# are pure numpy + stdlib, so no `safetensors`/`huggingface_hub` is required.
+dependencies = ["evoxc>=0.1.0", "numpy>=1.24"]
+
+[project.optional-dependencies]
+# Reference oracles ONLY — never runtime requirements. `torch`/`transformers`
+# are the real HuggingFace implementation used to validate and benchmark this
+# package against; `import evoxc_hf` works without either.
+hf = ["torch>=2.0", "transformers>=4.40"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/EMI-Group/evoxc"
+Source = "https://github.com/EMI-Group/evoxc/tree/main/evoxc_hf"
+Issues = "https://github.com/EMI-Group/evoxc/issues"
+Changelog = "https://github.com/EMI-Group/evoxc/blob/main/CHANGELOG.md"
+
+[tool.uv.build-backend]
+# This subproject uses a src layout (`src/evoxc_hf/`) because `uv_build` rejects
+# `module-root = ".."` — the repository root is the `evoxc` project, not this one.
+module-root = "src"
+# Explicit rather than inferred: the distribution name is `evoxc-hf` but the
+# import name stays `evoxc_hf`, and uv_build must ship exactly that one module.
+module-name = "evoxc_hf"
+
+[tool.uv.sources]
+# `evoxc` is resolved from the workspace root project, never from PyPI, so the
+# two packages are always developed and tested together.
+evoxc = { workspace = true }
