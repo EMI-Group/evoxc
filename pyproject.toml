@@ -1,9 +1,10 @@
 [build-system]
 # `uv_build` — a pure-Python-only build backend (no setuptools, no egg-info, no
 # SOURCES.txt manifest that a stale build can poison). It ships EXACTLY ONE
-# top-level module per distribution (see `[tool.uv.build-backend]` below), which
-# makes the `evoxc_hf` leak structurally impossible rather than a config promise,
-# and it preserves the PEP 639 license metadata below verbatim
+# top-level module per distribution (see `[tool.uv.build-backend]` below), so
+# this `evoxc` distribution and the workspace-member `evoxc-hf` distribution can
+# never contain each other — a structural guarantee, not a config promise — and
+# it preserves the PEP 639 license metadata below verbatim
 # (`License-Expression` + `License-File` in the wheel METADATA).
 requires = ["uv_build>=0.13.6,<0.14"]
 build-backend = "uv_build"
@@ -104,21 +105,12 @@ compilers = [
 # compares against PyTorch. The evoxc library itself never imports torch, and
 # `import evoxc` must work without it.
 bench = ["torch>=2.0"]
-# HuggingFace integration — OPTIONAL, and NOT shipped as part of `evoxc`.
-# (a) `evoxc_hf` is a separate top-level package that lives in this repo
-#     checkout (HuggingFace checkpoint loading / compiled execution built ON
-#     evoxc, one-way dependency). It is deliberately NOT part of the `evoxc`
-#     distribution: a wheel/sdist of `evoxc` contains no `evoxc_hf` — see
-#     [tool.uv.build-backend] below, which declares `evoxc` as the ONE shipped
-#     module and cannot reach a sibling top-level package.
-#     Nothing installs `evoxc_hf` for you today; use it from a checkout.
-# (b) `pip install evoxc[hf]` pulls ONLY the optional oracle deps below — the
-#     real-torch/real-transformers reference implementations used to validate
-#     and benchmark `evoxc_hf`. They are NEVER runtime requirements: `evoxc_hf`'s
-#     own checkpoint readers (config.json + safetensors/pytorch_model.bin) are
-#     pure numpy + stdlib, and evoxc's hard dependencies stay numpy-only.
-# (c) `import evoxc` never imports `evoxc_hf`, torch, or transformers.
-hf = ["torch>=2.0", "transformers>=4.40"]
+# HuggingFace integration ships as the SEPARATE distribution `evoxc-hf`, built
+# from the workspace member `./evoxc_hf/` (`pip install evoxc-hf`). Its
+# oracle-only dependencies (torch/transformers, used solely to validate and
+# benchmark it — never at runtime) live behind `evoxc-hf[hf]`, not here.
+# `evoxc`'s own hard dependencies stay numpy-only, and `import evoxc` never
+# imports `evoxc_hf`, torch or transformers.
 
 # The canonical project repository is `EMI-Group/evoxc` — the same owner/repo the
 # release workflow (`.github/workflows/release.yml`), `RELEASING.md` (trusted
@@ -131,16 +123,33 @@ Changelog = "https://github.com/EMI-Group/evoxc/blob/main/CHANGELOG.md"
 "EvoX ecosystem" = "https://github.com/EMI-Group"
 Genesis = "https://github.com/EMI-Group/genesis"
 
+[tool.uv.workspace]
+# ONE repo, TWO independent distributions: the root project ships `evoxc`, the
+# member `./evoxc_hf/` ships `evoxc-hf` (import name `evoxc_hf`, src layout at
+# `evoxc_hf/src/evoxc_hf/`, dependency `evoxc = { workspace = true }`). They
+# share this single `uv.lock` at the root but keep one version per project and
+# are tagged/published separately: `v<ver>` for evoxc, `evoxc-hf-v<ver>` for
+# evoxc-hf.
+# Development and CI MUST use `uv sync --all-packages` (e.g.
+# `uv sync --locked --all-packages --extra dev`). A PLAIN `uv sync` installs the
+# root only and UNINSTALLS the member — leaving the `evoxc_hf/` directory in the
+# checkout looking importable as a namespace package, so `import evoxc_hf` would
+# silently pick up the wrong (unbuilt) thing instead of the installed
+# distribution.
+members = ["evoxc_hf"]
+
 [tool.uv.build-backend]
 # This repo uses a FLAT layout (`./evoxc/` sits at the root, not under `src/`),
 # so the module root is the repository root itself. Without `module-root = ""`
 # uv_build assumes src-layout and fails with
 # "Expected a Python module at: src/evoxc/__init__.py".
 module-root = ""
-# The ONLY shipped module. uv_build packages exactly the `<module-root>/<name>`
-# directory, so the separate top-level `evoxc_hf` package in this checkout is
-# structurally unbuildable into an `evoxc` wheel or sdist — not a glob that
-# could be widened by accident.
+# The ONLY shipped module of THIS distribution. uv_build packages exactly the
+# `<module-root>/<name>` directory, so this wheel/sdist carries `evoxc` and
+# nothing else. The sibling `evoxc-hf` distribution is built from its OWN
+# workspace-member project at `./evoxc_hf/src/evoxc_hf/`, and since each
+# distribution ships exactly one module, neither can contain the other — not a
+# glob that could be widened by accident.
 module-name = "evoxc"
 # The sdist additionally ships these checkout paths (anchored patterns; `**`
 # recurses), so a built-from-sdist tree can still run the test suite:
@@ -149,15 +158,21 @@ module-name = "evoxc"
 #   conftest.py   — the root pytest configuration that makes `tests/` importable
 #   CHANGELOG.md  — read by the packaged suite's release-hygiene leg, so that
 #                   leg works from an unpacked sdist too
-# Deliberately NOT shipped: `evoxc_hf/` (a separate package used from the
-# checkout, see the `hf` extra above), `bench_logs/` (benchmark scratch area)
-# and the root probe scripts (`probe_new_emitters.py`).
+# Deliberately NOT shipped: the workspace member `evoxc_hf/` (a SEPARATE
+# distribution built from its own project at `./evoxc_hf/`, hence never part of
+# this project's sdists), `bench_logs/` (benchmark scratch area) and the root
+# probe scripts (`probe_new_emitters.py`).
 source-include = ["tests/**", "assets/**", "conftest.py", "CHANGELOG.md"]
 
 [tool.pytest.ini_options]
-# `tests/` mirrors the `evoxc` package; `evoxc_hf/tests/` is colocated with the
-# separate `evoxc_hf` package.
+# `tests/` mirrors the `evoxc` package; the workspace member distribution
+# `evoxc-hf` keeps its own tests colocated under `evoxc_hf/tests/`.
 testpaths = ["tests", "evoxc_hf/tests"]
+# `evoxc_hf` lives in the member project's src layout. `uv sync --all-packages`
+# installs it, but a venv created by a plain `uv sync` does NOT (see
+# [tool.uv.workspace]) — this entry keeps a bare `uv run pytest` able to import
+# the member in that case too.
+pythonpath = ["evoxc_hf/src"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
 # NOTE: do NOT include "dist" in norecursedirs — `tests/dist/` is a test

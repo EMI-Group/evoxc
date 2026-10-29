@@ -8,6 +8,12 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+members = [
+    "evoxc",
+    "evoxc-hf",
+]
+
 [[package]]
 name = "annotated-doc"
 version = "0.0.5"
@@ -196,10 +202,6 @@ compilers = [
 dev = [
     { name = "pytest" },
 ]
-hf = [
-    { name = "torch" },
-    { name = "transformers" },
-]
 interop = [
     { name = "torch" },
 ]
@@ -225,11 +227,38 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "torch", marker = "extra == 'bench'", specifier = ">=2.0" },
-    { name = "torch", marker = "extra == 'hf'", specifier = ">=2.0" },
     { name = "torch", marker = "extra == 'interop'", specifier = ">=2.0" },
+]
+provides-extras = ["interop", "dev", "iree", "tvm", "compilers", "bench"]
+
+[[package]]
+name = "evoxc-hf"
+version = "0.1.0"
+source = { editable = "evoxc_hf" }
+dependencies = [
+    { name = "evoxc" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+]
+hf = [
+    { name = "torch" },
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "evoxc", editable = "." },
+    { name = "numpy", specifier = ">=1.24" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
+    { name = "torch", marker = "extra == 'hf'", specifier = ">=2.0" },
     { name = "transformers", marker = "extra == 'hf'", specifier = ">=4.40" },
 ]
-provides-extras = ["interop", "dev", "iree", "tvm", "compilers", "bench", "hf"]
+provides-extras = ["hf", "dev"]
 
 [[package]]
 name = "filelock"
