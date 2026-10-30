@@ -324,6 +324,22 @@ _IREE_DEFAULT_LLVMCPU_ARGS = (
 #                               undetectable arch with no user flag raises an
 #                               actionable BackendError — never a guess.
 _IREE_DEFAULT_ROCM_ARGS_NAME = "--iree-rocm-target"
+# The evoxc-defined ``dispatch_formation`` compile option maps to the DERIVED
+# flag below (value stripped + lowercased before the lookup; ``"default"``
+# derives NO flag, so an unset/default option is byte-identical to today).
+# The derived flag joins ``defaults`` in ``_resolve_iree_compile_args``, so the
+# same name-collision machinery applies: a user
+# ``--iree-dispatch-creation-enable-aggressive-fusion`` in
+# ``iree_compile_args``/``EVOXC_IREE_COMPILE_ARGS`` replaces the derived flag —
+# never both. The flag is deliberately NOT in ``_IREE_DENIED_COMPILE_FLAGS``.
+# Measured effect on ``evoxc.batch_functions`` merged-population graphs (pop
+# 1000 / rows 1024, rocm): 596 -> 548 IREE dispatches (-8.1 %), warm per-call
+# 2.439 -> 2.220 ms (-9.0 %), compile wall time unchanged (11.69 -> 11.40 s)
+# and identical numerics.
+_DISPATCH_FORMATION_MODES: dict[str, tuple[str, ...]] = {
+    "default": (),
+    "aggressive": ("--iree-dispatch-creation-enable-aggressive-fusion",),
+}
 
 
 def _detect_rocm_target() -> str | None:
@@ -439,6 +455,7 @@ def _resolve_iree_compile_args(
     user_args: list[str] | None,
     opt_level_args: tuple[str, ...] = (),
     vulkan_target_args: tuple[str, ...] = (),
+    dispatch_formation_args: tuple[str, ...] = (),
 ) -> list[str]:
     """Final ``extra_args`` for ``iree.compiler.compile_str``.
 
@@ -459,6 +476,15 @@ def _resolve_iree_compile_args(
     ``iree_compile_args``/``EVOXC_IREE_COMPILE_ARGS`` wins by name and the
     derived flag is dropped — never both.
 
+    ``dispatch_formation_args`` is the same mechanism for the evoxc
+    ``dispatch_formation`` compile option
+    (``("--iree-dispatch-creation-enable-aggressive-fusion",)`` for
+    ``"aggressive"``, or ``()`` when unset/``"default"`` — byte-identical to
+    the pre-option behavior): it joins ``defaults``, so a user
+    ``--iree-dispatch-creation-enable-aggressive-fusion`` in
+    ``iree_compile_args``/``EVOXC_IREE_COMPILE_ARGS`` wins by name and the
+    derived flag is dropped — never both.
+
     Target-specific defaults join ``defaults`` only when their target is
     requested: the llvm-cpu codegen/link flags for ``"llvm-cpu"``, the
     detected ``--iree-rocm-target=<arch>`` for ``"rocm"`` (see
@@ -469,6 +495,7 @@ def _resolve_iree_compile_args(
         list(_IREE_DEFAULT_COMPILE_ARGS)
         + list(opt_level_args)
         + list(vulkan_target_args)
+        + list(dispatch_formation_args)
     )
     if "llvm-cpu" in target_backends:
         defaults.extend(_IREE_DEFAULT_LLVMCPU_ARGS)
@@ -1103,6 +1130,19 @@ class IreeBackend(CompilerBackend):
     #: via ``..options.normalize_opt_level``; translated to the derived flag
     #: ``--iree-opt-level=N``, which is overridable by name collision like
     #: every other default — a user ``--iree-opt-level=N`` wins, never both);
+    #: ``vulkan_target`` (SPIR-V target profile sugar for
+    #: ``--iree-vulkan-target=<profile>``) and ``dispatch_formation``
+    #: (``"default"`` | ``"aggressive"``, case-insensitive,
+    #: whitespace-stripped: UNSET/``"default"`` derives NO flag and is
+    #: byte-identical to today, while ``"aggressive"`` derives the single flag
+    #: ``--iree-dispatch-creation-enable-aggressive-fusion`` — measured on
+    #: ``evoxc.batch_functions`` merged-population graphs at 596 -> 548
+    #: dispatches, -9.0 % warm per-call on rocm at pop 1000 / rows 1024, with
+    #: compile time unchanged and identical numerics; a user raw
+    #: ``--iree-dispatch-creation-enable-aggressive-fusion`` wins by name, and
+    #: both compile paths — ``compile`` and the segmented external-call
+    #: ``_compile_segments`` — resolve through ``_resolve_compile_options``, so
+    #: nothing else needs changing);
     #: the load option ``iree_runtime_args`` (iree runtime/loader flags,
     #: parsed loudly at load). No run options in v1 (a non-empty run options
     #: dict raises BackendError). The reserved exporter lower options
@@ -1145,6 +1185,7 @@ class IreeBackend(CompilerBackend):
                 "iree_compile_args",
                 "opt_level",
                 "vulkan_target",
+                "dispatch_formation",
             }
         ),
         "load": frozenset({"iree_runtime_args"}),
@@ -1378,8 +1419,22 @@ class IreeBackend(CompilerBackend):
         too, so a user ``--iree-vulkan-target=<profile>`` wins by name —
         never both. Setting ``vulkan_target`` without requesting
         ``"vulkan-spirv"`` is a loud ``core.BackendError`` (an explicit
-        option is never silently ignored). Returns
-        ``(target_backends, extra_args)``.
+        option is never silently ignored). The ``dispatch_formation`` compile
+        option (``"default"`` | ``"aggressive"``, case-insensitive,
+        whitespace-stripped; UNSET/``"default"`` = no flag, byte-for-byte
+        current behavior) is translated to the derived flag
+        ``--iree-dispatch-creation-enable-aggressive-fusion`` for
+        ``"aggressive"`` — measured on ``evoxc.batch_functions``
+        merged-population graphs (pop 1000 / rows 1024, rocm) at 596 -> 548
+        IREE dispatches (-8.1 %), warm per-call 2.439 -> 2.220 ms (-9.0 %) and
+        compile wall time unchanged, with identical numerics. That derived
+        flag joins ``defaults`` too, so a user
+        ``--iree-dispatch-creation-enable-aggressive-fusion`` wins by name —
+        never both; it is deliberately NOT in ``_IREE_DENIED_COMPILE_FLAGS``.
+        An unknown spelling/non-string is a loud ``core.BackendError``. Both
+        compile paths (``compile`` and the segmented external-call
+        ``_compile_segments``) go through this resolver, so nothing else needs
+        changing. Returns ``(target_backends, extra_args)``.
         """
         raw_targets = (options or {}).get("target_backends", ["llvm-cpu"])
         if (
@@ -1443,11 +1498,30 @@ class IreeBackend(CompilerBackend):
             )
         else:
             vulkan_target_args = (f"--iree-vulkan-target={raw_vulkan_target}",)
+        raw_dispatch_formation = (options or {}).get("dispatch_formation")
+        if raw_dispatch_formation is None:
+            dispatch_formation_args: tuple[str, ...] = ()
+        elif not isinstance(raw_dispatch_formation, str) or (
+            raw_dispatch_formation.strip().lower()
+            not in _DISPATCH_FORMATION_MODES
+        ):
+            raise core.BackendError(
+                f"the {self.name} 'dispatch_formation' compile option must be "
+                f"one of {sorted(_DISPATCH_FORMATION_MODES)!r} "
+                f"(e.g. dispatch_formation='aggressive' -> "
+                f"--iree-dispatch-creation-enable-aggressive-fusion), got "
+                f"{raw_dispatch_formation!r}"
+            )
+        else:
+            dispatch_formation_args = _DISPATCH_FORMATION_MODES[
+                raw_dispatch_formation.strip().lower()
+            ]
         extra_args = _resolve_iree_compile_args(
             target_backends,
             user_args,
             opt_level_args=opt_level_args,
             vulkan_target_args=vulkan_target_args,
+            dispatch_formation_args=dispatch_formation_args,
         )
         return target_backends, extra_args
 

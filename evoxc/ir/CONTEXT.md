@@ -47,8 +47,10 @@ arithmetic over symbolic dims uses core's `DimExpr`.
 Control-flow ops own their bodies as `Op.regions`: `if` holds `(true, false)`,
 `while` holds `(cond, body)`. Operand values are passed by binding them to the
 entry-block arguments of each region (MLIR style): block-arg count/type must
-match operand count/type. v1: every region is single-block (function regions
-and nested); multi-block regions are reserved for future versions. `return`
+match operand count/type. v1: FUNCTION regions must be single-block
+(`verify.py:197-204`); nested regions must be non-empty (`verify.py:369`) but
+`verify`/`serialize` tolerate several blocks there (`verify.py:413`,
+`serialize.py:575-580`) — only the Builder ever builds one. `return`
 is the v1 terminator (category "terminator") — **added to the canonical set**
 because verification requires a terminator and the frontend op list contains
 none; the frontend never names it directly.
@@ -153,6 +155,11 @@ reject unsupported ops explicitly via capabilities, never silently. IR name
 note: the collective is `broadcast_collective` (the shape op `broadcast`
 already owns that name).
 
+**Registered arities (binding):** `concatenate` is VARIADIC — `arity=(1, None)`, ONE op with N operands and no cap (a 1-operand concatenate is an identity); `if`/`while` are `(1, None)`; `call`/`runtime_call`/`external_call`/`block_call`/`return` are `(0, None)`; `OpDef.check_arity` is the only arity gate (Builder `_prepare_op`, `verify._verify_op`), so nothing else caps operand count.
+`concatenate.axis` is a REQUIRED `ATTR_INT` (no default); `scatter`/`gather`/`slice`/`pad` arities are fixed 3/2/1/1.
+There is NO `dynamic_update_slice`/`iota`/`arange` IR op — `evoxc.arange` is a frontend Constant-op composition (`../numpy/creation.py`), so a static index vector for `scatter`/`gather` is a `constant` op with an inlined payload.
+`infer_scatter` only returns operand 0's type (no IR-level indices/updates shape validation — `../ops/indexing.py` and the numpy kernel enforce it); `infer_concatenate` promotes dtypes via `np.result_type(*dtypes)` and folds the axis dims into a left-associative `DimExpr("add", ...)` chain.
+
 **15-op batch (design notes):** `topk` is a frontend composition over
 sort/argsort + gather (no IR op; static `k` ≤ extent → `ShapeError`, symbolic
 extent → runtime error). `stack` = reshape + concatenate composition. `flip`/
@@ -170,6 +177,12 @@ pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules.
 Numpy backend: full reference. Compiler backends (stablehlo/iree/xla/tvm)
 defer the 8 new IR ops with explicit `BackendError` (no exporter entries
 added); compositions work via their components.
+
+**Absent op kinds (verified against `op_defs/`):** there is NO `iota`, NO `dynamic_update_slice`, NO `topk`/`stack` IR op, and NO buffer/alias or in-place op — `EFFECT_WRITE` is declared but unused (`effects.py`: "reserved for future stateful ops (none in v1)"), so every value is produced exactly once (SSA) and `scatter` is the ONLY update-shaped op, marked `pure` and functional (numpy `put_along_axis` on a COPY; `infer_scatter` returns operand 0's exact type).
+A generated index grid (`arange`) and zero/one/eye/linspace grids are frontend Constant compositions (`../numpy/creation.py`, `../ops/structural.py` → `ops.constant`), i.e. a payload-bearing `constant` op, never an index op; `broadcast` of a 0-d constant is the payload-free way to materialize a zero-filled buffer of a static or symbolic shape.
+`concatenate` is VARIADIC (`arity=(1, None)`) — K operands in one op, no pairwise tree.
+`slice`'s `start_indices`/`limit_indices`/`strides` are `ATTR_INTS` (plain static ints only; `limit_indices` is schema-required, so its `None` branch in `infer_slice` is unreachable through the Builder), while `broadcast`/`reshape` `shape` attrs accept `int | Dim | DimExpr | None`.
+`return` is variadic (`arity=(0, None)`, `result_count=0`) — a function yields N values; `Function.output_types` is derived from its operands.
 
 ## Builder (op-construction API)
 
@@ -333,6 +346,7 @@ rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
 terminators). CPU only.
 
 ## Known Issues
+- **Count of record is 119 ops; `__init__.py`'s module docstring still says "97 ops"** (stale). Verified split: elementwise 38 + comparison 6, structure 13, reduction 9, sorting 2, linalg 12, control 8 + terminator 1, collective 8, sparse 16, random 6 — 11 categories, `{o.category for o in ir.all_opdefs()}`. Use `ir.op_names()`/`ir.all_opdefs()` rather than the docstring.
 
 - **Generic inference + ops-side compensation (sanctioned division of
   labor):** the registry keeps generic hooks — `divide` →

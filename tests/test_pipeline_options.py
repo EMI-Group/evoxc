@@ -27,6 +27,12 @@ Pinned here:
   ``EVOXC_SPLIT_REDUCTION`` -> ``split_reduction`` (coerced to a real ``bool``)
   apply at every compiler backend's lower stage only, obey the same
   precedence, and reach the exporter end to end (final gated section).
+* the iree compile-stage row ``EVOXC_DISPATCH_FORMATION`` ->
+  ``dispatch_formation`` (whitespace-stripped only; the iree adapter validates
+  the value — ``default``/unset = no flag, ``aggressive`` = the derived
+  ``--iree-dispatch-creation-enable-aggressive-fusion``) obeys the same
+  precedence; its derived-flag-vs-raw-flag interaction is pinned by
+  ``tests/backends/test_dispatch_formation.py``.
 * an unknown backend / a stage with no table entry is a no-op.
 * full-path stub tests (a functional ``"iree"`` stub registered under the
   adapter name, exactly like ``pipeline_env_defaults_test.py``): the env
@@ -76,6 +82,7 @@ OPTION_ENV_VARS = (
     "EVOXC_TVM_TARGET",
     "EVOXC_TVM_PASS_CONFIGS",
     "EVOXC_OPT_LEVEL",
+    "EVOXC_DISPATCH_FORMATION",
     # load stage
     "EVOXC_IREE_RUNTIME_ARGS",
     # lower stage (the reserved exporter options)
@@ -163,11 +170,12 @@ def test_env_option_table_entries():
 def test_env_option_table_keys_and_parsers():
     """The documented env var -> option key mapping (parsers are functions)."""
     iree_compile = ENV_OPTION_TABLE[("iree", "compile")]
-    assert len(iree_compile) == 3
+    assert len(iree_compile) == 4
     assert {entry[1] for entry in iree_compile} == {
         "iree_compile_args",
         "opt_level",
         "vulkan_target",
+        "dispatch_formation",
     }
     args_entry = next(
         entry for entry in iree_compile if entry[1] == "iree_compile_args"
@@ -186,6 +194,15 @@ def test_env_option_table_keys_and_parsers():
     )
     assert opt_level_entry[:2] == ("EVOXC_OPT_LEVEL", "opt_level")
     assert callable(opt_level_entry[2])
+    dispatch_entry = next(
+        entry for entry in iree_compile if entry[1] == "dispatch_formation"
+    )
+    assert dispatch_entry[:2] == ("EVOXC_DISPATCH_FORMATION", "dispatch_formation")
+    assert callable(dispatch_entry[2])
+    # The parser only strips whitespace — the iree adapter validates the value.
+    assert dispatch_entry[2]("EVOXC_DISPATCH_FORMATION", "  aggressive  ") == (
+        "aggressive"
+    )
 
     iree_load = ENV_OPTION_TABLE[("iree", "load")]
     assert len(iree_load) == 1
@@ -454,6 +471,77 @@ def test_opt_level_env_numpy_noop(monkeypatch):
     always a no-op for it."""
     monkeypatch.setenv("EVOXC_OPT_LEVEL", "O2")
     assert apply_env_options("numpy", {}, "compile") == {}
+
+
+# ---------------------------------------------------------------------------
+# EVOXC_DISPATCH_FORMATION — the iree dispatch-formation knob (same class of
+# option as opt_level, but the VALUE is validated by the adapter, not here)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_formation_env_applied_at_compile(monkeypatch):
+    """EVOXC_DISPATCH_FORMATION applies at the iree compile stage, resolved to
+    the ``dispatch_formation`` option key."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", "aggressive")
+    assert apply_env_options("iree", {}, "compile") == {
+        "dispatch_formation": "aggressive"
+    }
+
+
+def test_dispatch_formation_env_whitespace_stripped(monkeypatch):
+    """Only whitespace is stripped — case is left to the adapter (which is
+    case-insensitive), so the env value reaches it verbatim otherwise."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", "  AGGRESSIVE  ")
+    assert apply_env_options("iree", {}, "compile") == {
+        "dispatch_formation": "AGGRESSIVE"
+    }
+
+
+def test_dispatch_formation_env_unset_absent(monkeypatch):
+    """An unset EVOXC_DISPATCH_FORMATION contributes no key at all (the
+    adapter's ``"default"`` behaviour — no derived flag)."""
+    assert apply_env_options("iree", {}, "compile") == {}
+    assert apply_env_options("iree", {"target_backends": ["llvm-cpu"]},
+                             "compile") == {"target_backends": ["llvm-cpu"]}
+
+
+def test_dispatch_formation_explicit_wins_env(monkeypatch):
+    """An explicit dispatch_formation key always wins over the env var."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", "aggressive")
+    assert apply_env_options(
+        "iree", {"dispatch_formation": "default"}, "compile"
+    ) == {"dispatch_formation": "default"}
+
+
+def test_dispatch_formation_env_stage_scoped(monkeypatch):
+    """EVOXC_DISPATCH_FORMATION applies at the iree compile stage only."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", "aggressive")
+    for stage in ("lower", "load", "run"):
+        assert apply_env_options("iree", {}, stage) == {}
+
+
+def test_dispatch_formation_env_other_backends_noop(monkeypatch):
+    """The option is iree-only: xla/tvm/numpy have no row for it."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", "aggressive")
+    for backend in ("xla", "tvm", "numpy"):
+        assert apply_env_options(backend, {}, "compile") == {}
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t \n"])
+def test_dispatch_formation_blank_env_is_unset(monkeypatch, value):
+    """An empty/whitespace EVOXC_DISPATCH_FORMATION is treated as unset."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", value)
+    assert apply_env_options("iree", {}, "compile") == {}
+
+
+def test_dispatch_formation_value_not_validated_here(monkeypatch):
+    """An unknown spelling is NOT rejected by the env parser — validation is
+    the adapter's job (loud ``BackendError`` at compile), exactly like
+    ``vulkan_target``; the resolver only strips."""
+    monkeypatch.setenv("EVOXC_DISPATCH_FORMATION", " banana ")
+    assert apply_env_options("iree", {}, "compile") == {
+        "dispatch_formation": "banana"
+    }
 
 
 def test_unknown_backend_noop(monkeypatch):
