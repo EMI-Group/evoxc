@@ -47,8 +47,10 @@ arithmetic over symbolic dims uses core's `DimExpr`.
 Control-flow ops own their bodies as `Op.regions`: `if` holds `(true, false)`,
 `while` holds `(cond, body)`. Operand values are passed by binding them to the
 entry-block arguments of each region (MLIR style): block-arg count/type must
-match operand count/type. v1: every region is single-block (function regions
-and nested); multi-block regions are reserved for future versions. `return`
+match operand count/type. v1: FUNCTION regions must be single-block
+(`verify.py:197-204`); nested regions must be non-empty (`verify.py:369`) but
+`verify`/`serialize` tolerate several blocks there (`verify.py:413`,
+`serialize.py:575-580`) — only the Builder ever builds one. `return`
 is the v1 terminator (category "terminator") — **added to the canonical set**
 because verification requires a terminator and the frontend op list contains
 none; the frontend never names it directly.
@@ -152,6 +154,11 @@ Declaring an op here does NOT mean every backend implements it — backends
 reject unsupported ops explicitly via capabilities, never silently. IR name
 note: the collective is `broadcast_collective` (the shape op `broadcast`
 already owns that name).
+
+**Registered arities (binding):** `concatenate` is VARIADIC — `arity=(1, None)`, ONE op with N operands and no cap (a 1-operand concatenate is an identity); `if`/`while` are `(1, None)`; `call`/`runtime_call`/`external_call`/`block_call`/`return` are `(0, None)`; `OpDef.check_arity` is the only arity gate (Builder `_prepare_op`, `verify._verify_op`), so nothing else caps operand count.
+`concatenate.axis` is a REQUIRED `ATTR_INT` (no default); `scatter`/`gather`/`slice`/`pad` arities are fixed 3/2/1/1.
+There is NO `dynamic_update_slice`/`iota`/`arange` IR op — `evoxc.arange` is a frontend Constant-op composition (`../numpy/creation.py`), so a static index vector for `scatter`/`gather` is a `constant` op with an inlined payload.
+`infer_scatter` only returns operand 0's type (no IR-level indices/updates shape validation — `../ops/indexing.py` and the numpy kernel enforce it); `infer_concatenate` promotes dtypes via `np.result_type(*dtypes)` and folds the axis dims into a left-associative `DimExpr("add", ...)` chain.
 
 **15-op batch (design notes):** `topk` is a frontend composition over
 sort/argsort + gather (no IR op; static `k` ≤ extent → `ShapeError`, symbolic
