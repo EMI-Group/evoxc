@@ -153,6 +153,11 @@ reject unsupported ops explicitly via capabilities, never silently. IR name
 note: the collective is `broadcast_collective` (the shape op `broadcast`
 already owns that name).
 
+**Registered arities (binding):** `concatenate` is VARIADIC — `arity=(1, None)`, ONE op with N operands and no cap (a 1-operand concatenate is an identity); `if`/`while` are `(1, None)`; `call`/`runtime_call`/`external_call`/`block_call`/`return` are `(0, None)`; `OpDef.check_arity` is the only arity gate (Builder `_prepare_op`, `verify._verify_op`), so nothing else caps operand count.
+`concatenate.axis` is a REQUIRED `ATTR_INT` (no default); `scatter`/`gather`/`slice`/`pad` arities are fixed 3/2/1/1.
+There is NO `dynamic_update_slice`/`iota`/`arange` IR op — `evoxc.arange` is a frontend Constant-op composition (`../numpy/creation.py`), so a static index vector for `scatter`/`gather` is a `constant` op with an inlined payload.
+`infer_scatter` only returns operand 0's type (no IR-level indices/updates shape validation — `../ops/indexing.py` and the numpy kernel enforce it); `infer_concatenate` promotes dtypes via `np.result_type(*dtypes)` and folds the axis dims into a left-associative `DimExpr("add", ...)` chain.
+
 **15-op batch (design notes):** `topk` is a frontend composition over
 sort/argsort + gather (no IR op; static `k` ≤ extent → `ShapeError`, symbolic
 extent → runtime error). `stack` = reshape + concatenate composition. `flip`/
