@@ -171,6 +171,12 @@ Numpy backend: full reference. Compiler backends (stablehlo/iree/xla/tvm)
 defer the 8 new IR ops with explicit `BackendError` (no exporter entries
 added); compositions work via their components.
 
+**Absent op kinds (verified against `op_defs/`):** there is NO `iota`, NO `dynamic_update_slice`, NO `topk`/`stack` IR op, and NO buffer/alias or in-place op — `EFFECT_WRITE` is declared but unused (`effects.py`: "reserved for future stateful ops (none in v1)"), so every value is produced exactly once (SSA) and `scatter` is the ONLY update-shaped op, marked `pure` and functional (numpy `put_along_axis` on a COPY; `infer_scatter` returns operand 0's exact type).
+A generated index grid (`arange`) and zero/one/eye/linspace grids are frontend Constant compositions (`../numpy/creation.py`, `../ops/structural.py` → `ops.constant`), i.e. a payload-bearing `constant` op, never an index op; `broadcast` of a 0-d constant is the payload-free way to materialize a zero-filled buffer of a static or symbolic shape.
+`concatenate` is VARIADIC (`arity=(1, None)`) — K operands in one op, no pairwise tree.
+`slice`'s `start_indices`/`limit_indices`/`strides` are `ATTR_INTS` (plain static ints only; `limit_indices` is schema-required, so its `None` branch in `infer_slice` is unreachable through the Builder), while `broadcast`/`reshape` `shape` attrs accept `int | Dim | DimExpr | None`.
+`return` is variadic (`arity=(0, None)`, `result_count=0`) — a function yields N values; `Function.output_types` is derived from its operands.
+
 ## Builder (op-construction API)
 
 `Builder.create(op_name, operands=(), attributes=None, result_types=None,
