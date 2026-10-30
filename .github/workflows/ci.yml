@@ -133,7 +133,7 @@ jobs:
           evoxc_hf_version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("evoxc_hf/pyproject.toml", "rb"))["project"]["version"])')"
           echo "evoxc    version: ${evoxc_version}"
           echo "evoxc-hf version: ${evoxc_hf_version}"
-          ls -l dist
+          ls -la dist
           for artifact in \
             "evoxc-${evoxc_version}-py3-none-any.whl" \
             "evoxc-${evoxc_version}.tar.gz" \
@@ -144,9 +144,16 @@ jobs:
               exit 1
             fi
           done
-          count="$(find dist -maxdepth 1 -type f | wc -l)"
+          # Count the DISTRIBUTION ARCHIVES only. `uv build` writes its own
+          # 1-byte `dist/.gitignore` (content `*`) into the out dir alongside
+          # the archives, so a bare `find dist -maxdepth 1 -type f` counts a
+          # fifth file and this assertion would fail on a clean build (that is
+          # exactly the gotcha that broke CI). Matching `*.whl`/`*.tar.gz`
+          # still fails loudly on a stray extra wheel or sdist, and ignores
+          # dotfiles (`twine check dist/*` skips them for the same reason).
+          count="$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)"
           if [ "${count}" -ne 4 ]; then
-            echo "::error::expected exactly the 4 artifacts above (evoxc + evoxc_hf wheel/sdist) in dist/, got ${count} file(s)"
+            echo "::error::expected exactly 4 wheel/sdist artifacts (evoxc + evoxc_hf, a wheel and an sdist each) in dist/, got ${count} file(s)"
             exit 1
           fi
 
