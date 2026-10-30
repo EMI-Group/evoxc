@@ -55,6 +55,17 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 - **Collectives**: ALL collective ops dispatch through the `CollectiveExecutor` hook; default `SingleRankCollectiveExecutor` = identity on one rank; tests install multi-rank simulators via `set_collective_executor`. Group semantics are simulation-only in v1.
 - **Persistence**: `NumpyExecutable.save` saves the underlying `CompiledArtifact`; the executable is reconstructed explicitly at `load` — device handles are never serialized.
 
+## Run cost model (what one `run` pays, structurally)
+
+- **The interpreter is an op-by-op Python loop, so per-call cost is LINEAR in op count** — one `for op in block.ops` iteration per op with no fusion, no batching, and no precompiled plan.
+- Per op the loop pays: one env-stack operand walk (`_resolve_value`, a dict `.get` per enclosing frame per operand), ONE dict lookup `kernels.dispatch(op.name)` (`KERNEL_TABLE.get`), the kernel call, single-`Tensor`→tuple normalization, per-result validation (`_validate_result`: exact dtype compare + one `shapes.evaluate_dim_expr` Python call per non-`None` declared dim), and one `env[value.id] = tensor` store.
+- Kernels add their own per-operand/result Python cost on top of the numpy work: every non-`constant` kernel unwraps operands with `Tensor.numpy()` and re-wraps each result in `core.Tensor`; `constant` re-wraps the snapped payload WITHOUT copying it.
+- `op.name`/`op.operands`/`op.results` are plain `ir.Op` dataclass fields (cheap); `op.opdef`/`op.effect` consult the registry and are therefore NOT on the run path.
+- **What is cached across calls**: the `Interpreter` object and the kernel table are built once per executable (`NumpyExecutable.__init__`; `register_all()` idempotent via a module flag), so `run` rebuilds only per-execution state — the dim `bindings` dict, one `KernelContext`, and one env dict per executing block.
+- **Control flow multiplies the loop cost per iteration**: `if`/`while`/`call` kernels re-enter `run_region` → `_run_block`, so a loop body pays the same per-op Python cost on EVERY iteration (the graph is never specialized per iteration).
+- The pipeline wrapper's plan caching (input/output plans, `_prepare_flat_inputs`/`_unflatten_outputs`) belongs to `evoxc/pipeline.py`, not to this backend: the numpy backend's own per-call work is the per-op loop above, so a merged `batch_functions` graph's numpy runtime is `emitted_ops` × (Python dispatch overhead + numpy work on row-stacked arrays).
+- Recorded measurements live in sibling nodes, not here: numpy merged-graph per-program-row / per-call runtimes (including the `bands` matrix) are in `../../transforms/CONTEXT.md`, and the leaf-driven `evoxc.run` wrapper cost is in `../../CONTEXT.md` "Notes for agents".
+
 ## Error behavior (binding)
 
 - Unsupported ops/features encountered at run time (capability drift) ⇒ `core.BackendError` **naming the op** — never a silent skip.
