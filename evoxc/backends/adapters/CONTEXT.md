@@ -166,7 +166,7 @@ Same adapter and the same device-resident machinery as cuda/rocm — a fourth co
 
 IREE forms dispatches AFTER lowering, so this knob is a compile-stage flag and the dispatch count is IDENTICAL on `llvm-cpu` and `rocm` for the same MLIR — measured on every configuration below (596/548 and 2191/2021 on both targets).
 Only one flag moves it: `dispatch_formation="aggressive"` (options table) → `--iree-dispatch-creation-enable-aggressive-fusion`. It is OPT-IN; the adapter default stays flag-free.
-Full sweep, per-chunk numbers and the probe: `bench_logs/dispatch_formation_findings.md` + `probe_dispatch_formation.py` (repo-root probe scratch area).
+Full sweep, per-chunk numbers and the probe: [`../../bench/dispatch_formation_findings.md`](../../bench/dispatch_formation_findings.md) + [`../../bench/probe_dispatch_formation.py`](../../bench/probe_dispatch_formation.py), raw records in `../../bench/dispatch_formation_results.json`.
 
 **Fragmentation is NOT multi-use splitting.** `--iree-dispatch-creation-fuse-multi-use` is ON by DEFAULT in iree 3.11 (explicit `=false` on one 137-dispatch chunk WORSENS it to 222), and passing it explicitly changes nothing (596); neither does `--iree-dispatch-creation-enable-aggressive-reshape-movement` (596).
 The ~1-executable-per-program fragmentation is ELEMENTWISE-FUSION GRANULARITY: each dispatch is one `linalg.generic` holding 37–69 arith/math ops, and the dispatcher breaks exactly where aggressive fusion will not merge two consumers.
