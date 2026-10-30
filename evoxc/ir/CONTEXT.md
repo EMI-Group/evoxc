@@ -47,8 +47,10 @@ arithmetic over symbolic dims uses core's `DimExpr`.
 Control-flow ops own their bodies as `Op.regions`: `if` holds `(true, false)`,
 `while` holds `(cond, body)`. Operand values are passed by binding them to the
 entry-block arguments of each region (MLIR style): block-arg count/type must
-match operand count/type. v1: every region is single-block (function regions
-and nested); multi-block regions are reserved for future versions. `return`
+match operand count/type. v1: FUNCTION regions must be single-block
+(`verify.py:197-204`); nested regions must be non-empty (`verify.py:369`) but
+`verify`/`serialize` tolerate several blocks there (`verify.py:413`,
+`serialize.py:575-580`) — only the Builder ever builds one. `return`
 is the v1 terminator (category "terminator") — **added to the canonical set**
 because verification requires a terminator and the frontend op list contains
 none; the frontend never names it directly.
