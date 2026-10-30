@@ -396,7 +396,10 @@ def _resolve_static_shape(shape: tuple[Any, ...], where: str) -> tuple[int, ...]
 
 #: Paths already initialized (PJRT_Plugin_Initialize is one-time per plugin).
 _initialized_plugins: set[str] = set()
-_initialized_lock = threading.Lock()
+#: Serializes the one-time ``PJRT_Plugin_Initialize``. No finalizer path takes
+#: this lock, so holding it across the plugin call is deadlock-free; it is
+#: reentrant anyway, so a nested load on the same thread can never hang on it.
+_initialized_lock = threading.RLock()
 
 
 def _find_plugin_path(options: dict | None = None) -> str:
@@ -437,6 +440,9 @@ def _load_plugin(options: dict | None = None) -> "PjrtPlugin":
             "built from the compatible PJRT C API header"
         ) from exc
     plugin = PjrtPlugin(path, library, api)
+    # ``initialize()`` is plugin code (it can allocate, i.e. run a GC pass whose
+    # finalizers touch ``_shared_clients_lock`` — never this lock), so it is
+    # safe inside this critical section; the lock is reentrant as well.
     with _initialized_lock:
         if path not in _initialized_plugins:
             plugin.initialize()
@@ -461,7 +467,23 @@ def _load_plugin(options: dict | None = None) -> "PjrtPlugin":
 
 #: path -> [client, refcount] (guarded by ``_shared_clients_lock``).
 _shared_clients: dict[str, list] = {}
-_shared_clients_lock = threading.Lock()
+#: Guards ``_shared_clients`` ONLY. NEVER held across a plugin call: this lock
+#: is taken by the payload/client FINALIZER path (``release_payloads``), and a
+#: finalizer can fire on the SAME thread inside any allocation (a GC pass) —
+#: holding this lock across such a call self-deadlocks permanently.
+#: Reentrant as a second line of defence: a finalizer that does fire while this
+#: thread already holds the lock can always take it recursively instead of
+#: hanging, and every critical section leaves the cache consistent.
+_shared_clients_lock = threading.RLock()
+#: Serializes the ``PJRT_Client_Create`` calls themselves (one client creation
+#: in flight process-wide) WITHOUT being held together with
+#: ``_shared_clients_lock``: real GPU plugins grab a large BFC pool per client
+#: and ABORT the process when one cannot be allocated, so two concurrent
+#: creations must never happen. No finalizer path takes this lock (the only
+#: callback that can run inside the create call is a ``weakref`` finalizer,
+#: which takes ``_shared_clients_lock`` only), so holding it across the plugin
+#: call is deadlock-free.
+_client_create_lock = threading.Lock()
 
 
 def acquire_client(plugin: "PjrtPlugin") -> "_Client":
@@ -473,15 +495,32 @@ def acquire_client(plugin: "PjrtPlugin") -> "_Client":
     reference is released. Creating a ``PJRT_Client`` can allocate the
     plugin's device memory pool, so the single-client-per-path cache is
     load-bearing for GPU plugins (see the section note above).
+
+    ``plugin.create_client()`` is called OUTSIDE ``_shared_clients_lock``
+    (with ``_client_create_lock`` held instead): the plugin call allocates
+    Python objects, so it can trigger a GC pass that runs a pending payload
+    finalizer (``release_payloads`` — which takes ``_shared_clients_lock``)
+    on THIS thread. Holding that lock across the create call deadlocks the
+    thread permanently. The cache lookup is therefore double-checked — fast
+    path under the lock, create outside it, then insert under the lock.
     """
+    path = plugin.path
     with _shared_clients_lock:
-        entry = _shared_clients.get(plugin.path)
-        if entry is None:
-            client = plugin.create_client()
-            _shared_clients[plugin.path] = [client, 1]
-            return client
-        entry[1] += 1
-        return entry[0]
+        entry = _shared_clients.get(path)
+        if entry is not None:
+            entry[1] += 1
+            return entry[0]
+    # Miss: create under the dedicated creation lock, holding NO state lock.
+    with _client_create_lock:
+        with _shared_clients_lock:
+            entry = _shared_clients.get(path)
+            if entry is not None:  # created while we waited for the lock
+                entry[1] += 1
+                return entry[0]
+        client = plugin.create_client()  # may run a finalizer (never deadlocks)
+        with _shared_clients_lock:
+            _shared_clients[path] = [client, 1]
+        return client
 
 
 def release_client(plugin: "PjrtPlugin") -> None:
@@ -489,7 +528,8 @@ def release_client(plugin: "PjrtPlugin") -> None:
 
     Destroys the client (``PJRT_Client_Destroy``) when the reference count
     reaches zero. Raises ``core.BackendError`` if the plugin fails the
-    destroy call — never silent.
+    destroy call — never silent. The destroy (a plugin call that can itself
+    run a finalizer through a GC pass) happens OUTSIDE the state lock.
     """
     with _shared_clients_lock:
         entry = _shared_clients.get(plugin.path)
@@ -519,6 +559,15 @@ def release_payloads(
     remained), the plugin freed its buffers with it, so nothing is touched
     — and a LATER re-created client for the same plugin path is never
     decremented by a stale payload.
+
+    LOCKING DISCIPLINE (load-bearing — this is a ``weakref`` finalizer, so it
+    runs wherever the GC pass that freed its referent happens to be, INCLUDING
+    inside another thread's — or the same thread's — critical section): only
+    the refcount bookkeeping runs under ``_shared_clients_lock``; every plugin
+    call (``buffer.close()`` / ``client.close()``, both of which can run a
+    finalizer themselves) happens OUTSIDE it. Never move a close inside the
+    lock: a finalizer re-entering this function from a lock the caller
+    already holds would deadlock the thread permanently.
     """
     with _shared_clients_lock:
         entry = _shared_clients.get(plugin.path)
