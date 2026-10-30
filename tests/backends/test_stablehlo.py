@@ -1453,3 +1453,192 @@ def test_random_multinomial_deferred_for_all_algorithms(key_spec, options):
     msg = str(excinfo.value)
     assert "op 'random_multinomial'" in msg
     assert "not supported in v1" in msg
+
+
+# --- 17. emission fast paths stay BYTE-IDENTICAL ----------------------------
+# Two exporter hot paths skip work that is provably redundant, and both are
+# OUTPUT-EQUALITY contracts (never approximations):
+#
+# * ``constants._bool_text`` routes large bool payloads through
+#   ``_bool_text_bulk`` (ONE numpy byte tile + O(#rows) ``str`` slices) instead
+#   of ``str(arr.tolist())``. The bulk path was briefly PER-ROW (a fresh numpy
+#   tile + two ``replace`` calls per row), which silently corrupts/slows the
+#   rendering on exactly the shapes that matter — so the characters must stay
+#   identical for every shape, rank and memory layout.
+# * ``stablehlo._emit_verified`` is the exporter's "caller already verified this
+#   exact module" entry point (used by ``CompilerBackend.lower``); it must
+#   produce text byte-identical to the public ``export``, which keeps verifying
+#   its input first.
+from evoxc.backends import stablehlo as _stablehlo
+from evoxc.backends.stablehlo import _emit_verified
+from evoxc.backends.stablehlo import constants as _constants
+from evoxc.backends.stablehlo.constants import (
+    _BOOL_BULK_MIN_ELEMENTS,
+    _bool_text,
+    _bool_text_bulk,
+)
+
+#: The characters ``_bool_text`` must always produce: ``str(arr.tolist())``
+#: with the two bool spellings lower-cased (the reference implementation the
+#: bulk fast path must reproduce exactly).
+def _bool_text_reference(arr) -> str:
+    return str(arr.tolist()).replace("True", "true").replace("False", "false")
+
+
+def _bool_payload(shape, seed=0):
+    """A deterministic bool array of ``shape`` (both spellings well covered)."""
+    if 0 in shape:
+        return np.zeros(shape, dtype=bool)
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 2, size=shape).astype(bool)
+
+
+def _bool_layout(arr, layout):
+    """Re-view ``arr`` in a non-C layout WITHOUT changing its contents."""
+    if layout == "C":
+        return np.ascontiguousarray(arr)
+    if layout == "F":
+        return np.asfortranarray(arr)
+    if layout == "reversed":
+        return arr[::-1]
+    if layout == "strided":
+        # A step-2 view of a fresh buffer: non-contiguous, same contents.
+        holder = np.zeros((2 * arr.shape[0], *arr.shape[1:]), dtype=bool)
+        holder[::2] = arr
+        return holder[::2]
+    raise AssertionError(f"unknown layout {layout!r}")
+
+
+#: Shapes covering rank 0, empty, below/at/above the bulk crossover, and a
+#: sizeable 2-D mask (the (256, 1) shape is the regression repro).
+_BOOL_TEXT_SHAPES = [
+    (256, 1),
+    (1000, 1),
+    (64, 128),
+    (5, 7, 3),
+    (5, 7, 4),
+    (128,),
+    (129,),
+    (3,),
+    (),
+    (0,),
+]
+
+_BOOL_TEXT_LAYOUTS = ["C", "F", "reversed", "strided"]
+
+
+def _bool_text_cases():
+    cases = []
+    for shape in _BOOL_TEXT_SHAPES:
+        for layout in _BOOL_TEXT_LAYOUTS:
+            if layout == "strided" and (shape == () or 0 in shape):
+                continue  # no first axis to stride over
+            if layout == "reversed" and shape == ():
+                continue
+            cases.append(pytest.param(shape, layout, id=f"{shape}-{layout}"))
+    return cases
+
+
+@pytest.mark.parametrize("shape,layout", _bool_text_cases())
+def test_bool_text_matches_the_str_list_rendering(shape, layout):
+    # The rendering contract: exactly ``str(arr.tolist())`` with the two bool
+    # spellings lower-cased — for every shape and memory layout.
+    view = _bool_layout(_bool_payload(shape), layout)
+    expected = _bool_text_reference(view)
+    assert _bool_text(view) == expected
+    # Above the crossover BOTH paths must agree with the reference (the bulk
+    # path is the one the exporter actually pays for on large masks).
+    if view.size >= _BOOL_BULK_MIN_ELEMENTS:
+        assert _bool_text_bulk(view) == expected
+
+
+def test_bool_text_routes_large_payloads_through_the_bulk_path(monkeypatch):
+    # Anti-vacuity: the equality pin above is only meaningful if the fast path
+    # is really exercised. ``_bool_text`` resolves ``_bool_text_bulk`` from the
+    # module globals at CALL time, so a counting wrapper proves the routing.
+    calls = []
+    real_bulk = _constants._bool_text_bulk
+
+    def counting_bulk(arr):
+        calls.append(arr.shape)
+        return real_bulk(arr)
+
+    monkeypatch.setattr(_constants, "_bool_text_bulk", counting_bulk)
+    below = _bool_payload((_BOOL_BULK_MIN_ELEMENTS - 1,))
+    at = _bool_payload((_BOOL_BULK_MIN_ELEMENTS,))
+    above = _bool_payload((_BOOL_BULK_MIN_ELEMENTS + 1,))
+    _bool_text(below)
+    assert calls == []
+    assert _bool_text(at) == _bool_text_reference(at)
+    assert _bool_text(above) == _bool_text_reference(above)
+    assert calls == [at.shape, above.shape]
+
+
+# --- _emit_verified: byte-identical to export(), export still verifies -----
+_MIXED_SPECS = (
+    evoxc.TensorSpec((2, 3), evoxc.int32),
+    evoxc.TensorSpec((2, 3), evoxc.float32),
+)
+
+
+def _fn_mixed_dtypes_with_constant(x, y):
+    """i32 operand + f32 operand (⇒ a ``stablehlo.convert``) + a constant."""
+    c = evoxc.constant(evoxc.tensor(np.arange(6, dtype=np.int32).reshape(2, 3)))
+    return evoxc.add(evoxc.multiply(x, c), evoxc.cast(y, evoxc.int32))
+
+
+def test_emit_verified_is_byte_identical_to_export():
+    graph = evoxc.trace(_fn_mixed_dtypes_with_constant, *_MIXED_SPECS)
+    text = _stablehlo.export(graph)
+    # Anti-vacuity: the graph really exercises a constant AND dtype equalization.
+    assert "stablehlo.constant" in text
+    assert "stablehlo.convert" in text
+    assert _emit_verified(graph.module) == text
+    # Same options in both entry points ⇒ still byte-identical.
+    assert _emit_verified(graph.module, options={}) == _stablehlo.export(
+        graph, options={}
+    )
+
+
+def test_emit_verified_rejects_a_graph_instead_of_a_module():
+    # The fast path takes an ALREADY-VERIFIED ``ir.Module``; a Graph is the
+    # public entry point's argument and must fail with the same TypeError class
+    # the public API uses (never a silent verify-and-emit).
+    graph = evoxc.trace(_fn_mixed_dtypes_with_constant, *_MIXED_SPECS)
+    with pytest.raises(TypeError) as excinfo:
+        _emit_verified(graph)
+    message = str(excinfo.value)
+    assert "already verified" in message
+    assert "export" in message
+
+
+def test_export_verifies_exactly_once_before_emitting(monkeypatch):
+    # ``export`` keeps its "verify FIRST" contract: one full ``ir.verify`` walk
+    # (through the ``verify`` bound in the exporter's own namespace), and the
+    # emitted text is exactly what the fast path produces for the same module.
+    calls = []
+    real_verify = _stablehlo.verify
+
+    def counting_verify(module):
+        calls.append(module)
+        return real_verify(module)
+
+    monkeypatch.setattr(_stablehlo, "verify", counting_verify)
+    graph = evoxc.trace(_fn_mixed_dtypes_with_constant, *_MIXED_SPECS)
+    text = _stablehlo.export(graph)
+    assert len(calls) == 1
+    assert calls[0] is graph.module
+    assert text == _emit_verified(graph.module)
+
+
+def test_export_never_emits_from_unverified_ir(monkeypatch):
+    # If verification fails, NOTHING is emitted — the fast path must not be
+    # reachable through ``export``.
+    def failing_verify(module):
+        raise evoxc.core.VerificationError("planted verification failure")
+
+    monkeypatch.setattr(_stablehlo, "verify", failing_verify)
+    graph = evoxc.trace(_fn_mixed_dtypes_with_constant, *_MIXED_SPECS)
+    with pytest.raises(evoxc.core.VerificationError) as excinfo:
+        _stablehlo.export(graph)
+    assert "planted verification failure" in str(excinfo.value)
