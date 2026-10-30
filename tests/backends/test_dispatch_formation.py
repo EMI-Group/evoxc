@@ -292,7 +292,15 @@ def _row_input():
 
 def test_merged_graph_parity_llvm_cpu_both_modes():
     """The flag only changes dispatch FORMATION — llvm-cpu results are
-    bit-identical with the option OFF and ON."""
+    bit-identical with the option OFF and ON.
+
+    Compiler-availability guarded (the local idiom of the other parity
+    suites): this leg really lowers + compiles + runs through iree, so in a
+    compiler-free configuration it must SKIP like every other compile leg
+    rather than fail with a ``BackendError``.
+    """
+    pytest.importorskip("iree.compiler")
+    pytest.importorskip("iree.runtime")
     graph = _merged_graph()
     x = _row_input()
     reference = _reference(x)
