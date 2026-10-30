@@ -258,6 +258,9 @@ Reducing carries is therefore a USER-SIDE graph change (recompute a derived carr
 - **`sort`/`argsort` on iree-cuda** — the pair emission's `stablehlo.sort` fails bufferization deterministically when the SORTED AXIS SIZE ≥ 32 (no multi-operand sort variant works there), and the 1-operand VALUES sort lowers to a single-threaded O(n²) kernel at any axis size. Both are handled by `sort_emission` (count composition), not by a code change here.
 - **iree/rocm `while`/`scan`** — the HIP HAL aborts at run time on certain loop shapes (loop carry initialized from a graph CONSTANT; condition reading a float carry). Same graphs are llvm-cpu-clean. See `../CONTEXT.md` Known Issues.
 - **Sequential `eigh` at n ∈ {4, 8, 12, 16}** crashes at compile on both llvm-cpu and cuda (`command_buffer_validation.c … OUT_OF_RANGE`, vectorization-threshold-dependent); the batched composition builds and runs clean at all four sizes. Sizes outside that family work in both compositions.
+- **`concatenate` emission has NO operand-count gate** — `_emit_concatenate` (`writer.py:1292-1301`) renders ALL operands into ONE `stablehlo.concatenate` over `{dimension = N}`.
+  Downstream, IREE rewrites a static concatenate into a host-side `flow.tensor.update` chain and fuses consecutive updates (plus each piece's trailing elementwise producer) into ONE dispatch carrying one binding per piece — which is how a wide combine hits the HIP/CUDA HAL cap of 16 bindings per dispatch, rejected at executable LOAD (`core.BackendError` from `../adapters/iree.py::_raise_if_dispatch_binding_limit`).
+  That cap, its measured counts and the emission-side remedies measured NOT to work (balanced pairwise concat tree, ≤16-operand chunking, a 2-D `(1,16)` axis-1 chunk — IREE re-associates same-axis concat chains) are recorded in `../adapters/CONTEXT.md` Known Issue 19; nothing in this node chunks, gates or re-associates concatenate operands.
 
 ## Constraints (binding)
 
