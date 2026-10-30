@@ -339,6 +339,7 @@ rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
 terminators). CPU only.
 
 ## Known Issues
+- **Count of record is 119 ops; `__init__.py`'s module docstring still says "97 ops"** (stale). Verified split: elementwise 38 + comparison 6, structure 13, reduction 9, sorting 2, linalg 12, control 8 + terminator 1, collective 8, sparse 16, random 6 — 11 categories, `{o.category for o in ir.all_opdefs()}`. Use `ir.op_names()`/`ir.all_opdefs()` rather than the docstring.
 
 - **Generic inference + ops-side compensation (sanctioned division of
   labor):** the registry keeps generic hooks — `divide` →
