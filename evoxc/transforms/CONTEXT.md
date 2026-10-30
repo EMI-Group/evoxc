@@ -128,7 +128,6 @@ Divergent TREE populations in the GP/tree-evaluation shape (per-program random e
 `axes=0` with a `(N, 1024)` input measures within 2 % of the `axes=None` column and auto makes the same pick on every cell: which leaf is mapped changes nothing once row-dependence propagates.
 iree/llvm-cpu on `gp_n32_d16`: flat 134.86 ms → k=32 4.37 ms, auto 4.57 ms on the SAME 1859-op graph (29× under flat), `cost_estimate` 1.56M vs `flat_cost_estimate` 24.8M; compile 1.83 s (flat) → 1.65 s (k=32), i.e. compile stays flat in K.
 Correctness: the banded graph is bit-identical to the flat one on llvm-cpu (max abs 0.0) and on iree-ROCm k=8 is identical to k=1 with k=N within 1.4e-6 abs / 6.2e-7 rel.
-`bands="auto"` reached the measured argmin on every population of the final matrix (13 of 13, numpy, ties included) and never lost to flat; the CPU-favourable cases still resolve cheaply — `identical` → 1 band, the 50+50 `two_groups` population → its 2 fingerprint bands, and a 10-program one-op switched population → flat (a measured tie).
 The residual risk is an ACCELERATOR (its dispatch is nearly free, so `DISPATCH_COST = 512` is ~10× too high there — see Known Issues) — the data-supported rule stays **`bands="auto"` on CPU, `bands=16` (or `bands=None`) on GPU**.
 `switch_ops=True` should not be combined with banding: once the population is banded there is no cross-row position left to switch, and it measured 13–66 % slower in every configuration.
 
