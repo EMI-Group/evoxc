@@ -167,7 +167,10 @@ def test_validate_options_unknown_key_lists_known_options_per_stage():
         "lower: dot_precision, eigh_algorithm, rng_bit_generator, "
         "sort_emission, split_reduction, while_init_rewrite" in message
     )
-    assert "compile: iree_compile_args, opt_level, target_backends" in message
+    assert (
+        "compile: dispatch_formation, iree_compile_args, opt_level, "
+        "target_backends" in message
+    )
     assert "load: iree_runtime_args" in message
     assert "run: (none)" in message
 
@@ -208,6 +211,7 @@ def test_adapter_known_options_declarations():
                 "iree_compile_args",
                 "opt_level",
                 "vulkan_target",
+                "dispatch_formation",
             }
         ),
         "load": frozenset({"iree_runtime_args"}),
