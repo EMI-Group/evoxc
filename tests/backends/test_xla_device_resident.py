@@ -37,6 +37,8 @@ lives in ``test_adapter_xla.py``).
 """
 
 import gc
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -382,6 +384,129 @@ def test_stale_payload_finalizer_never_touches_recreated_client(tmp_path):
     xla_util.release_client(plugin)
     assert plugin.path not in xla_util._shared_clients
     assert client_b.closed
+
+
+# ---------------------------------------------------------------------------
+# 5b. locking discipline: a finalizer collected INSIDE plugin.create_client()
+# ---------------------------------------------------------------------------
+
+_DEADLOCK_PIN_CHILD = r'''
+"""Child of test_acquire_client_finalizer_inside_create_does_not_deadlock."""
+import gc
+import weakref
+
+from evoxc.backends.adapters import xla_util
+
+
+def _lock_held_by_this_thread(lock):
+    """True when ``lock`` is held by the CURRENT thread (RLock or plain Lock)."""
+    owned = getattr(lock, "_is_owned", None)
+    if owned is not None:
+        return owned()
+    if lock.acquire(blocking=False):  # plain Lock: fails if ANY thread holds it
+        lock.release()
+        return False
+    return True
+
+
+fired = []
+
+
+class Buffer:
+    def close(self):
+        pass
+
+
+class Client:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class Plugin:
+    """Only what acquire_client/release_payloads touch (no C plugin needed)."""
+
+    path = "<deadlock-pin>"
+    created = 0
+
+    def create_client(self):
+        # THE DISCIPLINE: the plugin call runs under the creation lock only —
+        # never under the shared-clients state lock (the payload finalizer path
+        # takes that one, so holding it here deadlocks the thread forever).
+        assert not _lock_held_by_this_thread(xla_util._shared_clients_lock), (
+            "acquire_client called plugin.create_client() while holding "
+            "_shared_clients_lock — a GC pass running a payload finalizer "
+            "(release_payloads) here deadlocks the thread permanently"
+        )
+        assert xla_util._client_create_lock.locked(), (
+            "client creation must be serialized by _client_create_lock"
+        )
+        gc.collect()  # run any pending finalizer HERE (the pre-fix trigger)
+        Plugin.created += 1
+        return Client()
+
+
+_orig = xla_util.release_payloads
+
+
+def counting_release_payloads(plugin, client, buffers):
+    fired.append(1)
+    return _orig(plugin, client, buffers)
+
+
+xla_util.release_payloads = counting_release_payloads
+
+plugin = Plugin()
+run_client = xla_util.acquire_client(plugin)       # refcount 1: the cache entry
+gc.disable()                                       # deterministic pending state
+try:
+    victim = type("V", (), {})()
+    victim.me = victim                             # cycle: only the GC frees it
+    weakref.finalize(victim, counting_release_payloads,
+                     plugin, run_client, (Buffer(),))
+    del victim                                     # unreachable, finalizer pending
+    xla_util.release_client(plugin)                # entry gone -> next acquire CREATES
+    fresh = xla_util.acquire_client(plugin)        # pre-fix: hang here forever
+finally:
+    gc.enable()
+
+assert fresh is not run_client, "a fresh client must have been created"
+assert Plugin.created == 2, Plugin.created
+assert fired == [1], fired                         # finalized INSIDE the create call
+xla_util.release_client(plugin)
+assert xla_util._shared_clients == {}, xla_util._shared_clients
+del fresh
+gc.collect()
+print("OK")
+'''
+
+
+def test_acquire_client_finalizer_inside_create_does_not_deadlock():
+    """A pending payload finalizer collected INSIDE ``acquire_client``'s
+    ``plugin.create_client()`` call must not deadlock the thread.
+
+    Deterministic (no timing, no fake plugin, no C compiler): the finalizer's
+    referent is a reference CYCLE with GC disabled, so only the explicit
+    ``gc.collect()`` the stub plugin runs inside the create call can fire it —
+    exactly the pre-fix trigger (``acquire_client`` held the non-reentrant
+    ``_shared_clients_lock`` across the plugin call while ``release_payloads``
+    re-entered it on the same thread; see Known Issue 20 in
+    ``evoxc/backends/adapters/CONTEXT.md``).
+
+    Runs in a SUBPROCESS so a regression is a clean timeout + assertion
+    failure instead of a hang that poisons this process's module-global lock.
+    The in-child lock probes already fail fast (AssertionError) on the old
+    discipline; the timeout covers the hang class itself.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _DEADLOCK_PIN_CHILD],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert proc.stdout.strip().endswith("OK"), proc.stdout
 
 
 # ---------------------------------------------------------------------------
