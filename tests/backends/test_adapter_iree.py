@@ -43,6 +43,8 @@ one shared module-scoped artifact fixture plus one compile per distinct
 graph.
 """
 
+import gc
+
 import numpy as np
 import pytest
 
@@ -626,3 +628,18 @@ class TestIreeBindingLimitError:
         message = str(excinfo.value)
         assert "needs 17 bindings" in message
         assert "cap of 16" in message
+        # Release the rocm executable / device tensor HERE instead of leaving
+        # their teardown to a later collection point in an unrelated suite:
+        # with these finalizers still pending, the extra garbage shifts WHEN
+        # the xla suites' payload/client finalizers run, and
+        # ``xla_util.acquire_client`` holds the non-reentrant
+        # ``_shared_clients_lock`` across ``plugin.create_client()`` — a
+        # finalizer firing there self-deadlocks the process (measured: with
+        # this test leaving its rocm objects alive, a full
+        # ``pytest tests/backends`` run hung inside
+        # ``test_xla_device_resident.py::test_load_device_validation``; the
+        # same suite is green with the in-test collection below). The
+        # lock-ordering bug itself is a separate product issue — see this
+        # node's CONTEXT.md notes.
+        del exe, out, host
+        gc.collect()
