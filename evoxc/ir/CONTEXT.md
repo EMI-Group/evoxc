@@ -220,6 +220,43 @@ match schema (no unknown keys, required present, types tagged correctly),
 result types agree with `shape_fn` (when not None); value/SSA: unique ids,
 operands defined before use (dominance), `Use` bookkeeping consistent.
 
+### Verification cost model (measured; binding for future edits)
+
+`verify` is O(ops + uses) on a valid module, and every cache it uses is a
+per-CALL local — nothing is module-global or retained across calls, so
+concurrent `verify` calls (chunked compile pool) cannot interfere and a
+mutated module can never be served a stale verdict.
+Use bookkeeping is ONE forward pass that validates every `Use` record (type,
+owner, index, correct value, in-module op, no duplicate) and records the
+`(value id, op id, operand index)` triple in a per-call set; the duplicate-record
+check reuses that same set (the key already carries the value id), and the
+reverse pass ("every operand of every op has a matching record") is one O(1)
+membership test per operand.
+The reverse pass must NOT scan `operand.uses`: doing so made verification
+QUADRATIC in the use count of a shared value (a graph input or constant feeding
+thousands of ops — measured 2.8 M `any(...)` generator calls, exponent ≈1.4).
+The original scan survives only as the fallback for a record whose value the
+forward pass never visited (impossible for a valid module) — both-directions
+semantics and every message stay byte-identical.
+Result-type agreement memoizes `shape_fn(input_types, {})` in a per-call dict
+keyed on `(op name, operand ValueTypes)` for ops carrying NO attributes (a
+`shape_fn` is pure in those two inputs; `ValueType`/`Dim`/`DimExpr` are frozen);
+ops with attributes, and shapes that are unhashable (only in a corrupt
+module), simply skip the memo — symbolic broadcast/promotion is then derived
+once per distinct operand-type tuple instead of once per op.
+Message prefixes (`op 'x' (id N)`) are formatted only inside failure branches,
+the attribute check is skipped when `attributes` is an empty dict and the
+`OpDef` declares none, and type agreement / `constant` results compare against
+the recorded type before building an intermediate `ValueType`.
+Measured (CPython 3.12, `batch_functions`-merged random-expression graphs and
+`add` chains): 8 070 ops 56.5 → 30.6 ms, 31 921 ops 254.3 → 125.4 ms, 125 906
+ops 1 642 → 647 ms (whole-`verify` exponent 1.24 → 1.07, `_verify_uses`
+exponent 1.42 → 1.06); `evoxc.lower(graph, backend="iree")` on those graphs
+81.7 → 57.4 ms and 368.7 → 240.2 ms.
+`verify` is on every `lower()`/`Graph.verify()` path, so these constants matter:
+re-measure before adding any per-op work (f-strings, dict construction,
+re-derivation) to `_verify_op`/`_verify_result_types`.
+
 ## Serialization schema (payload dict)
 
 See the docstring in `serialize.py` (the full schema). Summary: `{format:
