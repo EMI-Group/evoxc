@@ -46,6 +46,7 @@ Design principle: *"we only took care of the graph, provide a clean pipeline, an
 | `EVOXC_TVM_TARGET` | tvm / compile | `tvm_target` | plain string (whitespace-stripped) |
 | `EVOXC_TVM_PASS_CONFIGS` | tvm / compile | `tvm_pass_configs` | JSON object (must decode to a dict) |
 | `EVOXC_OPT_LEVEL` | iree/tvm/xla / compile | `opt_level` | `'O0'`–`'O3'` (case-insensitive), `'0'`–`'3'`, or ints 0–3 (evoxc-validated value) |
+| `EVOXC_DISPATCH_FORMATION` | iree / compile | `dispatch_formation` | `"default"`/unset = no derived flag; `"aggressive"` (case-insensitive, whitespace-stripped — the VALUE is validated by the iree adapter) = the derived `--iree-dispatch-creation-enable-aggressive-fusion` |
 | `EVOXC_EIGH_ALGORITHM` | iree/tvm/xla / lower | `eigh_algorithm` | `"jacobi"` or `"jacobi_batched"` (whitespace-stripped; VALUE validated by the Writer) |
 | `EVOXC_SPLIT_REDUCTION` | iree/tvm/xla / lower | `split_reduction` | bool spellings (coerced by `normalize_bool_option`) |
 

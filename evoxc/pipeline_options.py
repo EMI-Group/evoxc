@@ -20,6 +20,7 @@ The env-option table (backend, stage) -> (env var, option key, parser):
 | ``EVOXC_TVM_TARGET``          | tvm     | compile | ``tvm_target``        | TVM target string                             |
 | ``EVOXC_TVM_PASS_CONFIGS``    | tvm     | compile | ``tvm_pass_configs``  | JSON object (must parse to a dict)            |
 | ``EVOXC_OPT_LEVEL``           | iree/tvm/xla | compile | ``opt_level``      | 'O0'..'O3' (case-insensitive), '0'..'3', or 0..3 (validated — evoxc-defined value) |
+| ``EVOXC_DISPATCH_FORMATION``  | iree    | compile | ``dispatch_formation`` | ``default`` / unset = no derived flag; ``aggressive`` (case-insensitive, whitespace-stripped; the VALUE is validated by the iree adapter) = ``--iree-dispatch-creation-enable-aggressive-fusion`` |
 | ``EVOXC_EIGH_ALGORITHM``      | iree/tvm/xla | lower | ``eigh_algorithm``    | ``jacobi`` or ``jacobi_batched`` (whitespace-stripped; the value is validated by the stablehlo Writer) |
 | ``EVOXC_SPLIT_REDUCTION``     | iree/tvm/xla | lower | ``split_reduction``   | bool: ``1``/``0``/``true``/``false``/``yes``/``no``/``on``/``off`` (case-insensitive; coerced by ``normalize_bool_option``) |
 
@@ -62,6 +63,16 @@ desktop GPUs — set a real profile (e.g. ``rdna3``, ``gfx1100``, or
 ``vulkan-spirv``'s other profiles) for anything beyond trivial modules. Only
 whitespace is stripped here; the compiler validates the profile VALUE (evoxc
 never parses compiler flags), so an unknown profile fails loudly at compile.
+
+``EVOXC_DISPATCH_FORMATION`` is the iree dispatch-formation knob — the same
+class of option as ``opt_level`` (evoxc-defined, set per pipeline stage) but
+with its VALUE validated by the iree adapter, not here: ``default`` (or unset)
+derives no flag (byte-identical compile args), ``aggressive`` derives
+``--iree-dispatch-creation-enable-aggressive-fusion``, and any other spelling
+raises a loud ``core.BackendError`` from the adapter. The derived flag joins
+the adapter's compile-args defaults, so a same-NAME raw flag passed explicitly
+in ``iree_compile_args`` still wins and the derived one is dropped (never
+both).
 
 The ``lower``-stage rows were added with the reserved exporter options
 ``eigh_algorithm`` / ``split_reduction`` (declared by all three compiler
@@ -189,6 +200,13 @@ ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
         ("EVOXC_IREE_VULKAN_TARGET", "vulkan_target",
          lambda var, value: value.strip()),
         ("EVOXC_OPT_LEVEL", "opt_level", _parse_opt_level),
+        # The iree-only dispatch-formation knob: only the whitespace is
+        # stripped, the ADAPTER validates the value ("default"/unset -> no
+        # derived flag, "aggressive" -> the derived
+        # ``--iree-dispatch-creation-enable-aggressive-fusion``, anything else
+        # -> a loud BackendError).
+        ("EVOXC_DISPATCH_FORMATION", "dispatch_formation",
+         lambda var, value: value.strip()),
     ),
     ("iree", "load"): (
         ("EVOXC_IREE_RUNTIME_ARGS", "iree_runtime_args", _parse_flag_list),
