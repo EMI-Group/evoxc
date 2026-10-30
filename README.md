@@ -314,7 +314,7 @@ def triton_add_iree(x):
     ...
 ```
 
-evoxc contains no Triton (or any other) kernel code — kernels are written against this interface in another repo, and graphs carry only the name, so a process that loads a saved graph must re-register its kernels. Backends without host dispatch fall back to a registered portable decomposition (`@handle.portable` over an `@evoxc.defn`) with a warning, or raise an explicit `BackendError`. Worked example: [`evoxc/bench/examples/op_external.py`](evoxc/bench/examples/op_external.py).
+evoxc contains no Triton (or any other) kernel code — kernels are written against this interface in another repo, and graphs carry only the name, so a process that loads a saved graph must re-register its kernels. Backends without host dispatch fall back to a registered portable decomposition (`@handle.portable` over an `@evoxc.defn`) with a warning, or raise an explicit `BackendError`. Worked examples: [`tests/ops/test_external_call.py`](tests/ops/test_external_call.py) (default slot) and [`tests/backends/test_external_call_iree.py`](tests/backends/test_external_call_iree.py) (IREE host and device-resident dispatch).
 
 ### Custom ops
 
@@ -368,7 +368,7 @@ python -m evoxc.bench                              # 98 examples, numpy/cpu conf
 python -m evoxc.bench --examples matmul,attention  # filter by name, category, or tag
 ```
 
-Committed results, raw records and the probe scripts live in [`evoxc/bench/`](evoxc/bench) and [`bench_logs/`](bench_logs).
+Committed results, raw records and the probe scripts live in [`evoxc/bench/`](evoxc/bench); the wider campaign records and generated reports are archived in the separate `evoxc-bench` repository.
 
 ## Backends
 
@@ -420,7 +420,7 @@ oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy
 
 - **Families:** `llama` (also `mistral`/`qwen2`/`qwen3` — RMSNorm, RoPE, GQA, SwiGLU; Qwen3 adds per-head QK-Norm) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
 - **Parity** against real `torch`/`transformers` logits on eight checkpoints (`tiny_llama`, `tiny_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`, `qwen3_0_6b`, `qwen3_1_7b`, `qwen3_8b`) and against the independent numpy oracle at 14B: ≤2e-4 max-abs / ≈5e-6 relative on the largest fp32 legs — fp32 accumulation order only.
-- **Device-resident on ROCm, and measured against PyTorch honestly:** weights and ids are placed once (`place_params`/`place_ids`) and the device outputs feed back in (re-placing per call measured 2.4×–11.7× slower); every timed device call is `run` + the explicit `Executable.synchronize()` (the xla device-resident `run` only enqueues), so the head-to-head against eager **and** compiled `torch-rocm` is apples-to-apples — `xla`/rocm beats eager torch in 13 of 14 GPU cells (up to 8.3×, tightening to parity and then losing at Qwen3-14B) at `seq_len` 32/128, while `torch.compile` — carried as its own baseline — wins the 8–14B short-sequence cells; `iree`/rocm wins 6 of 14 and trails badly at 8B+. Numbers: [`bench_logs/hf_bench_results.md`](bench_logs/hf_bench_results.md).
+- **Device-resident on ROCm, and measured against PyTorch honestly:** weights and ids are placed once (`place_params`/`place_ids`) and the device outputs feed back in (re-placing per call measured 2.4×–11.7× slower); every timed device call is `run` + the explicit `Executable.synchronize()` (the xla device-resident `run` only enqueues), so the head-to-head against eager **and** compiled `torch-rocm` is apples-to-apples — `xla`/rocm beats eager torch in 13 of 14 GPU cells (up to 8.3×, tightening to parity and then losing at Qwen3-14B) at `seq_len` 32/128, while `torch.compile` — carried as its own baseline — wins the 8–14B short-sequence cells; `iree`/rocm wins 6 of 14 and trails badly at 8B+. Numbers: `hf_bench_results.md`, archived in the separate `evoxc-bench` repository.
 - **Opt-in weight packing** (`pack_weights=True`, `pack_params`) collapses the weight tree into ~4 graph inputs — bit-identical, and it works around IREE's llvm-cpu SIGSEGV above ~161 distinct inputs (an unpacked 124M model has 196).
 - **Deferred by design:** exact-`erf` GELU configs are numpy-only (`erf` is a StableHLO v1 deferral); dynamic shapes, kv-cache/incremental decode and generation loops are out of scope — this is the forward graph, not a serving stack.
 
@@ -484,7 +484,6 @@ evoxc/            the `evoxc` distribution's package: core, ir, ops, trace, tran
 evoxc_hf/         the separate `evoxc-hf` distribution: workspace member, src layout
                 (evoxc_hf/src/evoxc_hf/), own pyproject/README/LICENSE/version/extras
 tests/          pytest suite mirroring evoxc/ + spec-compliance tests
-bench_logs/     probe scripts, committed bench records and generated reports
 assets/         the diagrams in this README
 CONTEXT.md      architecture, contracts and status (root, the source of truth)
 ```

@@ -76,8 +76,8 @@ dev = ["pytest>=7"]
 # crashes: 5/6 cases device-resident at 0.6-3.4 ms/step with parity ok, the
 # 6th (CMAES/Sphere/10000x100) completed but at 5628 ms/step with parity
 # rel 0.185 (ok=False) — a slow-path anomaly flagged for follow-up, not a
-# crash; see bench_logs/probe_iree_so_cuda.py and
-# evoxc/backends/adapters/CONTEXT.md Known Issue #10).
+# crash; see the SO-harness records archived in the separate `evoxc-bench`
+# repository and evoxc/backends/adapters/CONTEXT.md Known Issue #10).
 # WARNING (unchanged): iree 3.10.0/3.11.0 still ship an
 # upstream COMPILER bug (unbounded Stream AffinityAnalysis DFX recursion →
 # iree-compile SIGSEGV on while-loop-heavy programs: stablehlo.while with
@@ -160,7 +160,7 @@ module-name = "evoxc"
 #                   leg works from an unpacked sdist too
 # Deliberately NOT shipped: the workspace member `evoxc_hf/` (a SEPARATE
 # distribution built from its own project at `./evoxc_hf/`, hence never part of
-# this project's sdists), `bench_logs/` (benchmark scratch area) and the root
+# this project's sdists) and the root
 # probe scripts (`probe_new_emitters.py`).
 source-include = ["tests/**", "assets/**", "conftest.py", "CHANGELOG.md"]
 
