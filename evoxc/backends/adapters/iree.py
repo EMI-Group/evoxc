@@ -3005,11 +3005,36 @@ class IreeExternalExecutable(CompilerExecutable):
         ``core.Device``) wraps as ``core.Tensor(entry)`` directly. Never
         materializes a host copy. ``iree.runtime`` is imported lazily
         inside the function body (import acyclicity).
+
+        DLPack-capable entries (the Triton/torch round trip): an entry that
+        is neither an ``IreeDevicePayload`` nor a raw ``DeviceArray`` but
+        exposes ``__dlpack__`` + ``__dlpack_device__`` — e.g. a
+        ``torch.Tensor`` a kernel produced after importing the operand with
+        ``torch.from_dlpack`` — is IMPORTED into the run's HAL device as a
+        zero-copy ``IreeDevicePayload`` (``HalDevice.from_dlpack_capsule``);
+        the imported buffer aliases the producer's memory, so no copy is
+        made in either direction. The entry's DLPack device must match the
+        executable's device (else an explicit ``core.BackendError``), and
+        the producer must have completed its writes before returning —
+        returning a buffer still pending on another runtime's stream
+        requires that stream to be synchronized by the kernel (the adapter
+        adds no fence; see ``evoxc.external``).
         """
         import iree.runtime as rt
 
         if isinstance(entry, rt.DeviceArray):
             return core.Tensor(IreeDevicePayload(entry, self._core_device))
+        if isinstance(entry, IreeDevicePayload):
+            # Already a device payload (the duck-payload contract): wrap it
+            # directly, unchanged — never re-imported through DLPack.
+            return core.Tensor(entry)
+        if callable(getattr(entry, "__dlpack__", None)) and callable(
+            getattr(entry, "__dlpack_device__", None)
+        ):
+            array = _device_array_from_dlpack(
+                entry, self.runtime_device, self._core_device
+            )
+            return core.Tensor(IreeDevicePayload(array, self._core_device))
         return core.Tensor(entry)
 
 
@@ -3042,6 +3067,89 @@ def _runtime_modules() -> tuple[Any, Any]:
 # mapping helper and memoized per element type (a STATIC mapping: an element
 # type's numpy dtype never changes).
 _HAL_ELEMENT_DTYPES: dict[int, Any] = {}
+
+
+#: DLPack device-type codes (dlpack.h) for the device kinds a payload can
+#: export. CPU-kind payloads deliberately do not export (their explicit read
+#: path is ``.numpy()``), so only the accelerator kinds are listed; ``"hip"``
+#: is the accepted alias for the ROCm kind.
+_DLPACK_DEVICE_CODES: dict[str, int] = {
+    "cuda": 2,
+    "rocm": 10,
+    "hip": 10,
+    "vulkan": 7,
+}
+
+
+def _dlpack_device_id(device: Device) -> tuple[int, int]:
+    """``(device_type, device_id)`` DLPack reports for a ``core.Device``.
+
+    The device id is the 0-based ORDINAL the user wrote on the ``Device`` —
+    the mapping every DLPack consumer uses (torch on ROCm reports
+    ``(10, 0)`` for ``cuda:0``) — NEVER iree's internal 1-based HAL device
+    id. Kinds without a DLPack code (notably ``"cpu"``: a CPU-kind payload
+    is read through the explicit ``.numpy()`` path) raise explicitly.
+    """
+    code = _DLPACK_DEVICE_CODES.get(device.kind)
+    if code is None:
+        raise core.DeviceError(
+            f"device kind {device.kind!r} ({device!r}) has no DLPack export: "
+            "a CPU-kind payload is read through the explicit .numpy() path, "
+            "and other kinds must produce a device payload whose kind maps "
+            "onto a DLPack device type (cuda/rocm/hip/vulkan)."
+        )
+    return (code, device.index)
+
+
+def _device_array_from_dlpack(entry: Any, runtime_device: Any, core_device: Device) -> Any:
+    """Import a DLPack-capable object as an iree ``DeviceArray`` (zero-copy).
+
+    The ``device_resident=True`` external-kernel result path for a producer
+    that speaks DLPack (typically a ``torch.Tensor`` holding a Triton
+    kernel's output). ``HalDevice.from_dlpack_capsule`` wraps the PRODUCER's
+    memory in a HAL buffer view — no copy — and keeps it alive for the
+    buffer's lifetime (verified: the data survives the producer object).
+
+    The entry's ``__dlpack_device__`` must equal the executable's device
+    (0-based ordinal, the same mapping the export side uses) — importing a
+    buffer from another physical device would be silently wrong data, so it
+    raises ``core.BackendError`` instead. ``stream=None`` is passed to the
+    producer (no synchronization request: iree's HAL uses its own HIP queue,
+    so the KERNEL must have completed its writes before returning; see
+    ``evoxc.external``).
+    """
+    import iree.runtime as rt
+
+    expected = _dlpack_device_id(core_device)
+    try:
+        actual = tuple(int(part) for part in entry.__dlpack_device__())
+    except core.EVOXCError:
+        raise
+    except Exception as exc:
+        raise core.BackendError(
+            f"external kernel result exposes an unreadable "
+            f"__dlpack_device__ ({type(entry).__name__}): {exc}"
+        ) from exc
+    if actual != expected:
+        raise core.BackendError(
+            f"external kernel result is a DLPack tensor on device "
+            f"{actual!r}, but this executable runs on {core_device!r} "
+            f"(DLPack {expected!r}): a device-resident result must live on "
+            "the executable's device — no implicit cross-device transfer."
+        )
+    try:
+        capsule = entry.__dlpack__(stream=None)
+    except TypeError:
+        # A producer whose __dlpack__ has no stream parameter.
+        capsule = entry.__dlpack__()
+    try:
+        view = runtime_device.from_dlpack_capsule(capsule)
+    except Exception as exc:
+        raise core.BackendError(
+            f"external kernel result ({type(entry).__name__}) could not be "
+            f"imported as an iree HAL buffer on {core_device!r}: {exc}"
+        ) from exc
+    return rt.DeviceArray(runtime_device, view)
 
 
 def _hal_element_dtype(element_type: int) -> Any:
@@ -3206,6 +3314,107 @@ class IreeDevicePayload:
     def to_host(self) -> np.ndarray:
         """Materialize a host copy of the device buffer (lazy D2H)."""
         return self._array.to_host()
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """Report the DLPack ``(device_type, device_id)`` of this buffer.
+
+        The 0-based ordinal the user wrote on the ``core.Device`` maps 1:1
+        onto DLPack's device id (``Device("rocm", 0)`` -> ``(kDLROCM, 0)``,
+        ``Device("cuda", 1)`` -> ``(kDLCUDA, 1)``) — never iree's internal
+        1-based HAL device id. A CPU-kind payload (an llvm-cpu output) does
+        not export: its explicit read path is ``.numpy()``.
+        """
+        return _dlpack_device_id(self.device)
+
+    def __dlpack__(self, stream: Any = None, max_version: Any = None,
+                   copy: Any = None, dl_device: Any = None):
+        """Export this device buffer as a DLPack capsule — ZERO COPIES.
+
+        The capsule wraps the SAME HAL buffer the payload holds (created by
+        iree's ``HalDevice.create_dlpack_capsule``), so a device-aware
+        consumer (``torch.from_dlpack``) shares the memory: an in-place
+        write on either side is visible on the other. No host round-trip,
+        no implicit transfer — and therefore no dtype/shape adaptation
+        either (the buffer's own element type is exported).
+
+        Arguments follow the DLPack Python protocol:
+
+        - ``stream``: accepted and IGNORED. iree's ``run`` blocks (its HIP
+          queue is synchronized before results are returned), so the buffer
+          is complete when it is exported; ordering with the CONSUMER's own
+          stream is the consumer's business. A device-resident external
+          kernel that hands back a buffer it wrote ASYNCHRONOUSLY on another
+          runtime's stream must synchronize that stream itself before
+          returning (see ``evoxc.external``).
+        - ``max_version``: accepted and ignored (the runtime produces its
+          own capsule version; every consumer the adapter targets accepts
+          it).
+        - ``copy``: only ``None``/``False`` (never copy); ``copy=True``
+          raises an explicit :class:`core.DeviceError` — clone on the
+          consumer side instead.
+        - ``dl_device``: a requested DLPack device; a request for a
+          DIFFERENT device raises an explicit :class:`core.DeviceError`
+          (there is no cross-device export).
+
+        Raises:
+            core.DeviceError: CPU-kind payload (use ``.numpy()``), an
+                unsupported/unknown device kind, a requested copy or a
+                different ``dl_device``, a dtype the HAL element type cannot
+                round-trip (e.g. bfloat16 — read back via ``.to(cpu)``), or
+                an iree runtime without ``create_dlpack_capsule``.
+        """
+        if copy is True:
+            raise core.DeviceError(
+                "Tensor.__dlpack__(copy=True) is not supported for a "
+                "device-resident (iree) payload: the export is zero-copy by "
+                "construction. Ask the consumer to copy instead (e.g. "
+                "torch.from_dlpack(t).clone()) or read the data back with "
+                "t.to(core.Device('cpu', 0))."
+            )
+        dlpack_device = _dlpack_device_id(self.device)
+        if dl_device is not None:
+            requested = tuple(int(part) for part in dl_device)
+            if requested != dlpack_device:
+                raise core.DeviceError(
+                    f"Tensor.__dlpack__(dl_device={requested!r}) requested a "
+                    f"different DLPack device than this tensor's "
+                    f"{dlpack_device!r} ({self.device!r}): a device payload "
+                    "exports its own buffer only — no cross-device export."
+                )
+        array = self._array
+        view = getattr(array, "_buffer_view", None)
+        hal_device = getattr(array, "_device", None)
+        if view is None or hal_device is None:
+            raise core.DeviceError(
+                "Tensor.__dlpack__: this iree payload does not expose the "
+                "HAL buffer view/device needed for a DLPack export "
+                f"({type(array).__name__}) — read the data back with "
+                "t.to(core.Device('cpu', 0)) instead."
+            )
+        try:
+            raw_dtype = _hal_element_dtype(view.element_type)
+        except (AttributeError, ValueError) as exc:
+            raise core.DeviceError(
+                f"Tensor.__dlpack__: the HAL element type of this payload "
+                f"({self.dtype}) has no DLPack/numpy round-trip — read the "
+                "data back with t.to(core.Device('cpu', 0)) instead."
+            ) from exc
+        if raw_dtype != self._dtype:
+            raise core.DeviceError(
+                f"Tensor.__dlpack__: this payload's dtype {self._dtype} is "
+                f"an override of the buffer's element type {raw_dtype} (the "
+                "HAL cannot express it natively), so a zero-copy export "
+                "would hand the consumer the wrong dtype — read the data "
+                "back with t.to(core.Device('cpu', 0)) instead."
+            )
+        create_capsule = getattr(hal_device, "create_dlpack_capsule", None)
+        if not callable(create_capsule):
+            raise core.DeviceError(
+                "Tensor.__dlpack__: this iree runtime exposes no "
+                "HalDevice.create_dlpack_capsule — DLPack device export "
+                "needs a newer iree runtime (pip install -U 'iree-base-runtime')."
+            )
+        return create_capsule(view, dlpack_device[0], dlpack_device[1])
 
     def __array__(self, dtype: Any = None) -> np.ndarray:
         """``np.asarray`` fallback for host materialization.

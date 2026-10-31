@@ -9,11 +9,15 @@ is zero-copy in both directions.
 **Explicit placement (binding).** A tensor is always a *local physical
 tensor*: ndarray-backed data IS host memory and therefore always lives on
 ``Device("cpu", 0)``; a device payload lives on the device it declares.
-There are NO implicit device transfers in evoxc — ``.numpy()``/DLPack on a
-non-CPU-kind payload raise :class:`DeviceError`, and placing data on another
+There are NO implicit device transfers in evoxc — ``.numpy()`` on a
+non-CPU-kind payload raises :class:`DeviceError`, and placing data on another
 device is always the explicit ``Tensor.to(device)`` (which dispatches to the
 registered device-transfer provider for the target kind, see
-:func:`register_device_transfer_provider`).
+:func:`register_device_transfer_provider`). DLPack is the device-aware
+zero-copy interop path instead: a device payload that implements the
+optional ``__dlpack__`` / ``__dlpack_device__`` protocol (the iree adapter's
+``IreeDevicePayload`` does) shares its device buffer with the consumer
+without a copy.
 
 ``SymbolicTensor`` (see ``symbolic.py``) is the graph-side counterpart and
 must never be confused with a concrete ``Tensor``: concrete tensors cannot
@@ -239,10 +243,21 @@ class Tensor:
       must agree with it). Host access is EXPLICIT: a CPU-kind payload's
       ``.numpy()`` performs a LAZY fresh host copy on demand (never cached,
       so device-memory updates are never stale and no host memory is
-      retained), while a non-CPU-kind payload's ``.numpy()``/DLPack raise
+      retained), while a non-CPU-kind payload's ``.numpy()`` raises
       :class:`DeviceError` — no implicit device-to-host transfer; move the
       data with :meth:`Tensor.to`. ``__eq__`` compares metadata only
       (dtype/shape/device — never a hidden host copy).
+
+      A device payload may OPTIONALLY implement the DLPack export protocol —
+      ``__dlpack__(stream=None, max_version=None, copy=None, dl_device=None)
+      -> PyCapsule`` and ``__dlpack_device__() -> (device_type, device_id)``
+      — to hand its device buffer to a device-aware consumer
+      (``torch.from_dlpack``) with ZERO copies; ``Tensor.__dlpack__`` /
+      ``Tensor.__dlpack_device__`` then delegate to it. A non-CPU-kind
+      payload WITHOUT the protocol keeps the historical
+      :class:`DeviceError` (transfer explicitly via ``t.to(...)`` first), and
+      CPU-kind payloads never delegate (their explicit path is
+      ``.numpy()``).
 
     Concrete tensors are *local physical tensors* — multi-device layouts are
     prepared explicitly via ``split_tensor``/``replicate_tensor``, and moving
@@ -478,8 +493,10 @@ class Tensor:
 
         CPU-kind payloads (host-mappable memory): DLPack is unavailable —
         the caller materializes a host copy via ``.numpy()`` first.
-        Non-CPU-kind payloads (e.g. cuda): the memory is genuinely not host
-        memory — the caller must transfer explicitly (``t.to(...)``) first.
+        Non-CPU-kind payloads (e.g. cuda): either the memory is genuinely not
+        host memory — the caller must transfer explicitly (``t.to(...)``)
+        first — or the payload simply does not implement the optional
+        DLPack export protocol (see :class:`Tensor`).
         """
         if self.device.kind == "cpu":
             return DeviceError(
@@ -495,29 +512,76 @@ class Tensor:
             ".numpy() and export the host array."
         )
 
-    def __dlpack__(self, stream: Any = None):
+    def _payload_dlpack_exporter(self) -> Optional[Callable]:
+        """The device payload's DLPack export method, or ``None``.
+
+        Optional payload-protocol extension (see :class:`Tensor`): a device
+        payload may implement ``__dlpack__(stream=None, max_version=None,
+        copy=None, dl_device=None) -> PyCapsule`` plus
+        ``__dlpack_device__() -> (device_type, device_id)`` to hand its
+        buffer to a device-aware consumer zero-copy (the iree adapter's
+        :class:`evoxc.backends.adapters.iree.IreeDevicePayload` does). CPU-kind
+        payloads never delegate: their host copy is the explicit
+        ``.numpy()`` path, unchanged.
+        """
+        if self.device.kind == "cpu":
+            return None
+        exporter = getattr(self.data, "__dlpack__", None)
+        return exporter if callable(exporter) else None
+
+    def _payload_dlpack_device_probe(self) -> Optional[Callable]:
+        """The device payload's ``__dlpack_device__`` method, or ``None``."""
+        if self.device.kind == "cpu":
+            return None
+        probe = getattr(self.data, "__dlpack_device__", None)
+        return probe if callable(probe) else None
+
+    def __dlpack__(self, stream: Any = None, max_version: Any = None,
+                   copy: Any = None, dl_device: Any = None):
         """Export the tensor via DLPack (zero-copy capsule).
 
         ndarray-backed tensors: delegates to the underlying array's
         ``__dlpack__``; the consumer shares memory with this tensor (no
-        implicit copies on interop).
+        implicit copies on interop). The optional ``max_version`` /
+        ``copy`` / ``dl_device`` hints are not negotiated on this path
+        (unchanged legacy behavior — only ``stream`` reaches numpy).
 
-        Device-payload-backed tensors: DLPack is unavailable (exporting a
-        device buffer requires a device-aware consumer) — raises
-        :class:`DeviceError`. CPU-kind payloads are told to materialize a
-        host copy via ``.numpy()`` first; non-CPU-kind payloads (e.g. cuda)
-        are told to transfer explicitly via ``t.to(...)`` first (no
-        implicit device-to-host transfer).
+        Device-payload-backed tensors: delegates to the payload's own
+        ``__dlpack__`` when it implements the optional DLPack export
+        protocol (see :class:`Tensor`) — a device-aware consumer
+        (``torch.from_dlpack``, another framework) then shares the device
+        buffer with NO host round-trip. Otherwise the historical
+        :class:`DeviceError` is raised: CPU-kind payloads are told to
+        materialize a host copy via ``.numpy()`` first; non-CPU-kind
+        payloads are told to transfer explicitly via ``t.to(...)`` first
+        (no implicit device-to-host transfer).
 
         Args:
-            stream: Optional stream hint for the consumer (ignored for CPU
-                host memory).
+            stream: Optional consumer-stream hint, forwarded verbatim to the
+                delegate (the iree payload accepts and ignores it: its
+                ``run`` blocks, so the buffer is complete before export and
+                the consumer owns ordering for its own stream).
+            max_version: Optional maximum DLPack version the consumer can
+                take (forwarded to the payload delegate).
+            copy: Optional copy request (forwarded to the payload delegate;
+                the zero-copy device export rejects ``copy=True``
+                explicitly).
+            dl_device: Optional requested DLPack device (forwarded; the
+                device export rejects a different device explicitly).
 
         Returns:
             A DLPack capsule (``PyCapsule``).
         """
         if not isinstance(self.data, np.ndarray):
-            raise self._dlpack_unavailable()
+            exporter = self._payload_dlpack_exporter()
+            if exporter is None:
+                raise self._dlpack_unavailable()
+            return exporter(
+                stream=stream,
+                max_version=max_version,
+                copy=copy,
+                dl_device=dl_device,
+            )
         try:
             return self.data.__dlpack__(stream=stream)
         except TypeError:
@@ -535,18 +599,24 @@ class Tensor:
         ndarray-backed tensors always wrap numpy host memory, so the memory
         physically lives on the CPU — we report the device the memory
         ACTUALLY lives on, even if a ``device`` label (core.Device) is
-        attached. Per dlpack.h: kDLCPU = 1, kDLCUDA = 2, ...; device id 0 is
-        the sole CPU.
+        attached. Per dlpack.h: kDLCPU = 1, kDLCUDA = 2, ..., kDLROCM = 10;
+        device id 0 is the sole CPU.
 
-        Device-payload-backed tensors: DLPack is unavailable — raises
-        :class:`DeviceError` (see :meth:`__dlpack__`).
+        Device-payload-backed tensors: delegates to the payload's
+        ``__dlpack_device__`` (the same optional protocol as
+        :meth:`__dlpack__` — the payload owns the kind→DLPack-code mapping
+        because it owns the buffer). CPU-kind payloads, and payloads without
+        the protocol, raise :class:`DeviceError` (see :meth:`__dlpack__`).
 
         Returns:
             A ``(device_type, device_id)`` tuple: ``(1, 0)`` for CPU host
-            memory.
+            memory, e.g. ``(10, 0)`` for ``Device("rocm", 0)``.
         """
         if not isinstance(self.data, np.ndarray):
-            raise self._dlpack_unavailable()
+            probe = self._payload_dlpack_device_probe()
+            if probe is None:
+                raise self._dlpack_unavailable()
+            return probe()
         return (1, 0)
 
     def __eq__(self, other: Any) -> bool:

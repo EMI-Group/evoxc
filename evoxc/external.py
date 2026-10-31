@@ -5,7 +5,11 @@ run time by the numpy backend when it executes an ``external_call`` op. The
 mechanism is kernel-agnostic: the callable contract is plain numpy arrays in,
 plain numpy arrays (or a ``core.Tensor`` / tuple of them) out — a triton
 kernel written against this interface (in a DIFFERENT repo) will plug in via
-the same ``register_external_kernel`` call.
+the same ``register_external_kernel`` call. The ``device_resident=True``
+opt-in swaps host numpy arrays for device ``core.Tensor`` s (see that mode's
+bullet below): operands export zero-copy via DLPack
+(``torch.from_dlpack(tensor)``) and a returned ``torch.Tensor`` is imported
+back zero-copy — the Triton round trip.
 
 The registry is PER-BACKEND: each name maps to a dict of backend slots
 (``{backend_or_None: (callable, device_resident)}``), where ``None`` is the
@@ -43,6 +47,39 @@ Binding rules (see ``evoxc/CONTEXT.md``, "External kernels"):
   device-payload results METADATA-ONLY (count/dtype/shape — never a host
   copy). Host-mode kernels (the default, and every pre-existing
   registration) keep the exact numpy-in/numpy-out contract.
+
+  ZERO-COPY TRITON/TORCH ROUND TRIP (iree v1). Each operand is a
+  ``core.Tensor`` whose ``.data`` is the public
+  ``evoxc.backends.adapters.iree.IreeDevicePayload`` on the run's device; the
+  tensor itself is a DLPack EXPORTER (``core.Tensor.__dlpack__`` /
+  ``__dlpack_device__`` delegate to the payload), so a kernel imports it with
+  ``torch.from_dlpack(tensor)`` (or any other DLPack consumer) and shares the
+  HAL buffer — no host copy in either direction. The kernel may RETURN a
+  ``torch.Tensor``: the iree adapter imports it through
+  ``HalDevice.from_dlpack_capsule`` as a device payload on the run's device
+  (its ``__dlpack_device__`` must match the executable's device — mismatch
+  raises an explicit ``BackendError``), so a Triton launch re-enters the graph
+  zero-copy. Four rules the kernel author owns:
+
+      def triton_kernel(x):                  # device tensors in, torch out
+          t = torch.from_dlpack(x)           # zero-copy import of the operand
+          out = launch_my_triton_kernel(t)   # a torch.Tensor
+          torch.cuda.synchronize()           # (1) see below
+          return out                         # (2) zero-copy import back
+
+  (1) SYNCHRONIZATION: the adapter adds NO fence around the import or the
+  export. iree's HIP/CUDA HAL runs on its OWN stream, so a result still
+  pending on torch's stream must be synchronized (``torch.cuda.synchronize()``
+  / stream ordering) before returning — otherwise the next segment may read
+  in-flight memory. The export direction is safe as-is: iree's ``run`` blocks
+  on its device queue before results are handed to you.
+  (2) The returned tensor's memory is kept alive by the imported HAL buffer
+  (verified: it survives the producer object), and it must live on the
+  executable's device.
+  (3) No dtype adaption: the buffer's own element type is what crosses the
+  boundary (a dtype the HAL cannot express natively refuses the export).
+  (4) ``device_resident`` kernels are PURE and the registry is process-global
+  and never serialized — re-register in every process that runs the graph.
 - Registration is process-global and REPLACES any previous registration in
   the same backend slot (last registration wins — documented overwrite
   semantics; this makes hot-reloading kernels and adapter re-registration
