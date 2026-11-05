@@ -15,16 +15,32 @@ Execution model (binding, parent CONTEXT.md):
   dynamic runtime control flow, never specialized per iteration. Region ops
   may legally reference SSA values defined in ENCLOSING blocks (e.g.
   ``evoxc.scan``'s desugared regions capture the length constant and the ``xs``
-  leaves — they are not while-op operands): operand resolution walks the
-  interpreter's env STACK (``_env_stack``) from innermost to outermost.
-- **Kernel dispatch** is the ``kernels`` table (``kernels.dispatch(op_name)``);
-  the ``return`` terminator is special-cased in the loop, NOT dispatched.
+  leaves — they are not while-op operands): the run-time value environment is
+  ONE flat ``value.id -> Tensor`` store shared by every executing block, so a
+  value stays resolvable from any nested region for as long as SSA liveness
+  keeps it alive (block arguments are re-bound at each region entry).
+- **Kernel dispatch** is the ``kernels`` table (``kernels.dispatch(op_name)``),
+  resolved ONCE per op into the block's cached execution plan
+  (:func:`_build_plan`) instead of once per op per execution; the ``return``
+  terminator is special-cased in the plan, NOT dispatched.
+- **Dead values are released.** The plan also carries, per op, the value ids
+  whose last use is that op — a use inside a nested region is attributed to
+  the enclosing op (which is still running while the region executes). Only
+  values DEFINED in the executing block are ever released; values defined in
+  an enclosing block stay alive until that block's own plan frees them, so
+  nested regions and loop iterations always see their captures. A wrongly
+  released value surfaces as the unresolved-value ``BackendError`` below,
+  never as a silently wrong result.
 - **Output validation:** every kernel result is checked against the op's
   declared result types — dtype must match exactly (``BackendError`` naming
   the op); shape is validated ELEMENTWISE (``ShapeError`` naming op/index/
   dim): rank must match exactly, an expected ``None`` (runtime-dynamic) dim
   is unchecked, and every other dim must evaluate to the concrete runtime
-  dim. Kernels never silently coerce.
+  dim. Kernels never silently coerce. A result type whose declared shape is
+  fully STATIC (every entry a plain ``int``) skips the symbolic evaluation
+  entirely: the expected tuple is built once at plan time and compared with a
+  single tuple compare, falling back to the full symbolic validation (same
+  messages, built by the same helper) on any mismatch.
 
 ``KernelContext`` (the ``ctx`` of the kernel contract in
 ``kernels/__init__.py``) carries per-execution state:
@@ -32,7 +48,7 @@ Execution model (binding, parent CONTEXT.md):
 - ``bindings: dict[str, int]`` — symbolic-dim bindings for the current
   execution (extended positionally by ``run_region`` from region-arg shapes).
 - ``rank_context: RankContext`` — the effective execution context (from
-  ``exec_context.get_rank_context()``, honoring the per-``run`` override).
+  ``exec_context.get_rank_context()``, honoring the per-per-``run`` override).
 - ``module: ir.Module`` — the module being executed.
 - ``run_region(region, arg_tensors) -> list[Tensor]`` — binds the region's
   entry-block arguments to tensors, extends ``bindings``, and executes the
@@ -48,6 +64,8 @@ Execution model (binding, parent CONTEXT.md):
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from evoxc import core
 from evoxc import ir
@@ -186,6 +204,34 @@ def _shape_with_unchecked_nones(
     )
 
 
+def _mismatch_error(
+    op_name: str, index: int, actual: Tuple[int, ...], expected: Tuple[Optional[int], ...]
+) -> Optional[core.ShapeError]:
+    """Build the ``ShapeError`` for a result-shape mismatch (None when equal).
+
+    The SINGLE place result-shape mismatch wording is built, shared by the
+    static fast path (which detects the mismatch with one tuple compare and
+    only then constructs the message) and the full symbolic path — so the
+    text is byte-identical whichever path caught it: a rank mismatch first,
+    else the first offending dim (``None`` expected dims are unchecked).
+    """
+    if len(actual) != len(expected):
+        return core.ShapeError(
+            f"kernel for op '{op_name}' produced result {index} with shape "
+            f"{actual}, expected {expected} — rank mismatch"
+        )
+    for dim, (want, got) in enumerate(zip(expected, actual)):
+        if want is None:
+            continue  # runtime-dynamic dim: unchecked by design
+        if want != got:
+            return core.ShapeError(
+                f"kernel for op '{op_name}' produced result {index} with "
+                f"shape {actual}, expected {expected} — dim {dim}: got "
+                f"{got}, expected {want}"
+            )
+    return None
+
+
 def _validate_result(
     ctx: "KernelContext", op: ir.Op, index: int, tensor: core.Tensor, value: ir.Value
 ) -> None:
@@ -208,20 +254,162 @@ def _validate_result(
         )
     expected = _shape_with_unchecked_nones(value_type.shape, ctx.bindings)
     actual = tuple(tensor.shape)
-    if len(actual) != len(expected):
-        raise core.ShapeError(
-            f"kernel for op '{op.name}' produced result {index} with shape "
-            f"{actual}, expected {expected} — rank mismatch"
+    error = _mismatch_error(op.name, index, actual, expected)
+    if error is not None:
+        raise error
+
+
+def _store_results(
+    ctx: "KernelContext",
+    op: ir.Op,
+    result: Any,
+    result_ids: Tuple[int, ...],
+    store: Dict[int, core.Tensor],
+) -> None:
+    """Normalize, validate and store one op's kernel results (general path).
+
+    Used whenever the plan's static fast path cannot decide the result (a
+    multi-result op, a symbolic/``None`` declared shape, or a kernel that
+    returned a tuple / a non-ndarray-backed tensor): the count, dtype and
+    shape checks — and their messages — are exactly the historical ones.
+    """
+    if isinstance(result, core.Tensor):
+        results = (result,)
+    else:
+        results = tuple(result)
+    if len(results) != len(result_ids):
+        raise core.BackendError(
+            f"kernel for op '{op.name}' produced {len(results)} result(s), "
+            f"expected {len(result_ids)}"
         )
-    for dim, (want, got) in enumerate(zip(expected, actual)):
-        if want is None:
-            continue  # runtime-dynamic dim: unchecked by design
-        if want != got:
-            raise core.ShapeError(
-                f"kernel for op '{op.name}' produced result {index} with "
-                f"shape {actual}, expected {expected} — dim {dim}: got "
-                f"{got}, expected {want}"
+    if len(results) == 1:
+        _validate_result(ctx, op, 0, results[0], op.results[0])
+        store[result_ids[0]] = results[0]
+        return
+    for i, tensor in enumerate(results):
+        _validate_result(ctx, op, i, tensor, op.results[i])
+        store[result_ids[i]] = tensor
+
+
+def _raise_unresolved(value_id: int) -> None:
+    """Raise the unresolved-value ``BackendError`` naming the value id."""
+    raise core.BackendError(
+        f"cannot resolve value #{value_id} at run time — it is defined "
+        "in no enclosing block of the executing block (the module must "
+        "be invalid; verify should have rejected it)"
+    ) from None
+
+
+# ---------------------------------------------------------------------------
+# Per-block execution plan
+# ---------------------------------------------------------------------------
+
+
+class _BlockPlan:
+    """A block's precomputed execution plan (built once, reused per execution).
+
+    Attributes:
+        block: The ``ir.Block`` this plan belongs to. Held so its identity
+            (``id(block)``, the plan cache key) can never be reused by a
+            different block while the plan is cached.
+        steps: One tuple per non-terminator op, in block op order:
+            ``(op, kernel, operand_ids, result_ids, free_ids, fast, one)`` —
+            the resolved kernel callable, the flat-store ids of the operands
+            and results, the value ids whose last use is this op, and the
+            static-result fast path (``fast`` plus ``one = (dtype, shape)``
+            when the op has exactly one result with a fully static shape).
+        return_ids: The terminator's operand value ids, or ``None`` when the
+            block has no ``return`` terminator (an invalid module).
+    """
+
+    __slots__ = ("block", "steps", "return_ids")
+
+    def __init__(self, block: ir.Block, steps: tuple, return_ids: Optional[tuple]):
+        self.block = block
+        self.steps = steps
+        self.return_ids = return_ids
+
+
+def _record_region_uses(region: ir.Region, index: int, last_use: Dict[int, int]) -> None:
+    """Record every value use inside ``region`` as occurring at ``index``.
+
+    The enclosing op is still executing while its regions run, so a value it
+    captured cannot be released until the op itself has finished.
+    """
+    for block in region.blocks:
+        for op in block.ops:
+            for value in op.operands:
+                last_use[value.id] = index
+            for nested in op.regions:
+                _record_region_uses(nested, index, last_use)
+
+
+def _build_plan(block: ir.Block) -> _BlockPlan:
+    """Precompute the execution plan for one block (see ``_BlockPlan``).
+
+    Resolves each op's kernel ONCE (unknown op => the historical
+    ``core.BackendError`` from ``kernels.dispatch``, raised when the block is
+    first executed), records the flat-store ids, derives the static
+    result-shape fast path, and computes value liveness: the last op that
+    reads each value, where uses inside nested regions are attributed to the
+    enclosing op index and the terminator's operands are never released
+    before the block returns. Only values DEFINED in this block become
+    release candidates — enclosing-block values stay until their own block's
+    plan releases them.
+    """
+    terminator = block.terminator
+    body = block.ops[:-1] if terminator is not None else list(block.ops)
+
+    last_use: Dict[int, int] = {}
+    for index, op in enumerate(body):
+        for value in op.operands:
+            last_use[value.id] = index
+        for region in op.regions:
+            _record_region_uses(region, index, last_use)
+
+    return_ids: Optional[tuple] = None
+    if terminator is not None:
+        return_ids = tuple(value.id for value in terminator.operands)
+        terminator_index = len(body)
+        for value in terminator.operands:
+            last_use[value.id] = terminator_index
+
+    defined = set()
+    for op in body:
+        for value in op.results:
+            defined.add(value.id)
+
+    free_by_index: Dict[int, List[int]] = {}
+    for value_id in defined:
+        index = last_use.get(value_id)
+        if index is not None:
+            free_by_index.setdefault(index, []).append(value_id)
+
+    steps = []
+    for index, op in enumerate(body):
+        kernel = kernels.dispatch(op.name)
+        results = op.results
+        result_ids = tuple(value.id for value in results)
+        single = len(results) == 1
+        one = None
+        if single:
+            value_type = results[0].type
+            declared = value_type.shape
+            shape = tuple(declared)
+            if all(type(dim) is int for dim in shape):
+                one = (value_type.dtype, shape)
+        steps.append(
+            (
+                op,
+                kernel,
+                tuple(value.id for value in op.operands),
+                result_ids,
+                tuple(free_by_index.get(index, ())),
+                one is not None,
+                one,
             )
+        )
+    return _BlockPlan(block, tuple(steps), return_ids)
 
 
 class KernelContext:
@@ -347,29 +535,18 @@ class Interpreter:
             kernels.register_all()  # idempotent
         self.kernels_registered = True
         self._ctx: Optional[KernelContext] = None
-        #: Stack of value environments, innermost last. Nested region blocks
-        #: may legally reference SSA values defined in ENCLOSING blocks (e.g.
-        #: evoxc.scan's desugared regions capture the length constant and the
-        #: xs leaves — they are not while-op operands), so operand resolution
-        #: walks the stack from innermost to outermost.
-        self._env_stack: List[Dict[int, core.Tensor]] = []
-
-    def _resolve_value(self, value: ir.Value) -> core.Tensor:
-        """Resolve an operand value against the env stack (innermost first).
-
-        A value defined in an enclosing block falls through to the enclosing
-        frame. A miss (impossible for verified modules) raises
-        ``core.BackendError`` naming the value — never a silent skip.
-        """
-        for env in reversed(self._env_stack):
-            tensor = env.get(value.id)
-            if tensor is not None:
-                return tensor
-        raise core.BackendError(
-            f"cannot resolve value #{value.id} at run time — it is defined "
-            "in no enclosing block of the executing block (the module must "
-            "be invalid; verify should have rejected it)"
-        )
+        #: The flat run-time value environment: ``value.id -> Tensor``, shared
+        #: by every executing block (nested regions may reference SSA values
+        #: defined in ENCLOSING blocks — e.g. evoxc.scan's desugared regions
+        #: capture the length constant and the xs leaves, which are not
+        #: while-op operands). Block arguments are (re)bound at each block
+        #: entry; the plan's liveness-driven release keeps it bounded.
+        self._values: Dict[int, core.Tensor] = {}
+        #: ``id(block) -> _BlockPlan``. Modules are immutable once loaded, so
+        #: a block's plan is built on its first execution and reused for every
+        #: later execution (including loop iterations of nested regions). The
+        #: plan holds its block, so a cached key's id can never be reused.
+        self._plans: Dict[int, _BlockPlan] = {}
 
     # ------------------------------------------------------------------ run
 
@@ -420,6 +597,9 @@ class Interpreter:
         if rank_context is not None:
             previous = get_rank_context()
             set_rank_context(rank_context)
+        # A fresh run starts from an empty value store: SSA values are
+        # recomputed in program order (the plan's liveness release assumes it).
+        self._values.clear()
         try:
             ctx = KernelContext(
                 bindings=bindings,
@@ -431,6 +611,7 @@ class Interpreter:
             outputs = self._run_block(function.entry_block, flat_input_tensors)
         finally:
             self._ctx = None
+            self._values.clear()
             if previous is not None:
                 set_rank_context(previous)
 
@@ -456,49 +637,53 @@ class Interpreter:
     ) -> List[core.Tensor]:
         """Execute one block's ops in order; return the terminator's tensors.
 
-        The value environment maps ``value.id`` (module-unique ints) to
-        computed ``core.Tensor``s. The block's env is pushed onto the
-        interpreter's env STACK for the duration of the block, so nested
-        regions can resolve values defined in ENCLOSING blocks (their block
-        args bind only the region-arg values). The ``return`` terminator is
-        special-cased in the loop (NOT dispatched). Every other op dispatches
-        through ``kernels.dispatch(op_name)``; results are normalized to a
-        tuple and validated against the op's declared result types (dtype
-        exactly, shape with ``None`` dims unchecked). Nested regions reuse
-        the SAME loop via ``KernelContext.run_region``.
+        The block is executed from its cached plan (``_build_plan``, built on
+        first execution): operands are read from the flat ``value.id ->
+        Tensor`` store, the resolved kernel is called, results are validated
+        (static shapes via one tuple compare; symbolic/``None``/multi-result
+        through the full symbolic validation) and stored, and values whose
+        last use was this op are released. Nested regions reuse the SAME loop
+        via ``KernelContext.run_region``; every value they reference — own,
+        enclosing-block or loop-carried — is resolvable from the shared store.
+        A miss raises the unresolved-value ``core.BackendError`` (invalid
+        module, never a silent skip).
         """
         ctx = self._ctx
         assert ctx is not None, "Interpreter._run_block requires an active KernelContext"
-        env: Dict[int, core.Tensor] = {
-            argument.id: tensor
-            for argument, tensor in zip(block.arguments, arg_tensors)
-        }
-        self._env_stack.append(env)
-        try:
-            for op in block.ops:
-                if op.name == "return":
-                    return [
-                        self._resolve_value(value) for value in op.operands
-                    ]
-                kernel = kernels.dispatch(op.name)
-                operands = tuple(
-                    self._resolve_value(value) for value in op.operands
-                )
-                result = kernel(ctx, op, operands)
-                results = (
-                    (result,) if isinstance(result, core.Tensor) else tuple(result)
-                )
-                if len(results) != len(op.results):
-                    raise core.BackendError(
-                        f"kernel for op '{op.name}' produced {len(results)} "
-                        f"result(s), expected {len(op.results)}"
-                    )
-                for i, (tensor, value) in enumerate(zip(results, op.results)):
-                    _validate_result(ctx, op, i, tensor, value)
-                    env[value.id] = tensor
+        store = self._values
+        plan = self._plans.get(id(block))
+        if plan is None:
+            plan = _build_plan(block)
+            self._plans[id(block)] = plan
+        for argument, tensor in zip(block.arguments, arg_tensors):
+            store[argument.id] = tensor
+        for op, kernel, operand_ids, result_ids, free_ids, fast, one in plan.steps:
+            try:
+                operands = tuple([store[value_id] for value_id in operand_ids])
+            except KeyError as exc:
+                _raise_unresolved(exc.args[0])
+            result = kernel(ctx, op, operands)
+            if fast and type(result) is core.Tensor:
+                data = result.data
+                if (
+                    type(data) is np.ndarray
+                    and data.dtype == one[0]
+                    and data.shape == one[1]
+                ):
+                    store[result_ids[0]] = result
+                else:
+                    _store_results(ctx, op, result, result_ids, store)
+            else:
+                _store_results(ctx, op, result, result_ids, store)
+            for value_id in free_ids:
+                store.pop(value_id, None)
+        return_ids = plan.return_ids
+        if return_ids is None:
             raise core.BackendError(
                 "block executed to completion without a 'return' terminator — "
                 "the module is invalid (verify should have rejected it)"
             )
-        finally:
-            self._env_stack.pop()
+        try:
+            return [store[value_id] for value_id in return_ids]
+        except KeyError as exc:
+            _raise_unresolved(exc.args[0])
