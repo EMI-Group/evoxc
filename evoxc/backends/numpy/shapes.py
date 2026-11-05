@@ -96,7 +96,10 @@ def evaluate_dim_expr(expr: DimExpr | Dim | int, bindings: Mapping[str, int]) ->
     by evaluating the ops-level ``DimExpr`` output against the concrete input
     dims recorded for the entry function's block args.
     """
-    result = _resolve_dim(expr, bindings)
+    # A concrete ``int`` dim (the common case for the entries that are not
+    # fully static, e.g. a mixed ``(int, Dim)`` result shape) skips the
+    # recursive resolver entirely; the negativity check below still applies.
+    result = expr if type(expr) is int else _resolve_dim(expr, bindings)
     if result < 0:
         raise ShapeError(
             f"Dimension expression {expr!r} evaluated to a negative size "
