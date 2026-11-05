@@ -26,7 +26,8 @@ _BINARY_OPS = {
     "multiply": "Elementwise multiplication (broadcasting).",
     "divide": "Elementwise division (broadcasting).",
     "power": "Elementwise exponentiation (broadcasting).",
-    "remainder": "Elementwise remainder (numpy semantics; broadcasting).",
+    "remainder": "Elementwise remainder — numpy floormod semantics: the "
+    "result takes the sign of the divisor (broadcasting).",
     "maximum": "Elementwise maximum (broadcasting).",
     "minimum": "Elementwise minimum (broadcasting).",
     "logical_and": "Elementwise boolean AND (broadcasting).",
