@@ -86,7 +86,10 @@ ELEMENTWISE_MAP: dict[str, str] = {
     "multiply": "stablehlo.multiply",
     "divide": "stablehlo.divide",
     "power": "stablehlo.power",
-    "remainder": "stablehlo.remainder",
+    # `remainder` is NOT a direct mnemonic: evoxc's frontend contract is
+    # numpy `remainder` (FLOORMOD — the result has the sign of the DIVISOR
+    # and `a == (a // b) * b + a % b` holds), while `stablehlo.remainder`
+    # is C fmod (sign of the DIVIDEND). See DECOMPOSITIONS.
     "maximum": "stablehlo.maximum",
     "minimum": "stablehlo.minimum",
     "abs": "stablehlo.abs",
@@ -152,6 +155,11 @@ SPECIAL_EMITTERS: dict[str, str] = {
 DECOMPOSITIONS: dict[str, str] = {
     "square": "multiply(x, x)",
     "relu": "maximum(x, 0)",
+    "remainder": (
+        "floormod: fmod = stablehlo.remainder(a, b); "
+        "adjust = (fmod != 0) & ((fmod < 0) != (b < 0)); "
+        "select(adjust, fmod + b, fmod)"
+    ),
     "stop_gradient": "identity passthrough (emit operand directly)",
     "reduce_mean": "reduce-sum then divide by element count",
 }

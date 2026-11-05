@@ -307,3 +307,33 @@ Its 5-path dispatch: rank-1 operands / matched batch / non-batched fast paths �
 On the AMD validation host, `/usr/bin/python3` resolves `import evoxc` to the MAIN checkout (`/mnt/hdd_pool/bchuang/evoxc`, pip editable install `__editable__.evoxc-0.1.0.pth`) whenever the script's directory is not the worktree (scripts run from `/tmp` — cwd is only on `sys.path` for `-c`/stdin), and that checkout may lag the worktree.
 
 Any validation script must `sys.path.insert(0, "<worktree path>")` before `import evoxc`; a `/tmp` script that skips it silently validates the stale checkout (observed: it reproduced the upstream cuda sort bufferization failure with no `sort_emission` present in the writer at all — a usable accidental baseline, but misleading if unnoticed).
+## 21. `remainder` floormod export (`_emit_remainder`) — parity evidence
+
+`stablehlo.remainder` is C `fmod` (result sign follows the DIVIDEND); evoxc's frontend contract is numpy `remainder` = FLOORMOD (result sign follows the DIVISOR), which is what `np.remainder`, Python `%`, `evoxc.numpy.remainder` and the numpy reference backend do.
+The exporter therefore emits the standard correction inline (`_emit_remainder`, writer.py:4764, reached from `_emit_decomposed`): `fmod = stablehlo.remainder a, b`; `adjust = (fmod != 0) & ((fmod < 0) != (b < 0))`; `select(adjust, fmod + b, fmod)`.
+Emitted text for int32 `(2,3) % (3,)` — 12 op lines: 1 `broadcast_in_dim` (the (3,) divisor), 1 `stablehlo.remainder`, 1 zero `stablehlo.constant` + its `broadcast_in_dim`, 3 `"stablehlo.compare"` (NE fmod/0, LT fmod/0, LT b/0), `stablehlo.xor`, `stablehlo.and`, `stablehlo.add fmod, b`, `stablehlo.select`.
+Rank-0 operands skip both broadcasts (the zero constant is used directly); a symbolic result dim routes the zero through `dynamic_broadcast_in_dim` from the equalized lhs.
+Parity vs numpy through iree-base 3.11.0 / llvm-cpu (`evoxc.evaluate(fn, a, b, backend="iree", target_backends=["llvm-cpu"])`, `f(x, y) = evoxc.remainder(x, y)`), all bit-identical (max abs diff 0, same dtype):
+
+| case | values | numpy | iree |
+|---|---|---|---|
+| int32 mixed signs | `[-7,7,-7,7] % [3,-3,-3,3]` | `[2,-2,-1,1]` | exact |
+| int32 zero fmod | `[6,-6,0] % [3,3,-5]` | `[0,0,-5]` | exact |
+| int64 large | `[2^62+3, -2^62-3, 1] % [2^62+1, 2^62+1, -1]` | `[2, 2^62-1, 0]` | exact |
+| int64 extremes | `[-2^63, -2^63+1, 2^63-1] % (2^63-1)` | `[2^63-2, 0, 0]` | exact |
+| float32 mixed signs / ±0.0 dividend | `[-7.5,7.5,-7.5,-0.0,0.0] % [3,-3,-3,-3,-3]` | `[1.5,-1.5,-1.5,-0.0,-0.0]` | values exact; 1 signed-zero mismatch (see below) |
+| float64 fractional | `[5.25,-5.25,4.0] % 2.0` | `[1.25,0.75,0.0]` | exact |
+| float32 zero divisor | `[1,-1,0] % [0,-0,0]` | `[nan,nan,nan]` | exact (NaN) |
+| float64 infinite divisor | `[3,-3,0] % [inf,inf,-inf]` | `[3,inf,-0.0]` | values exact; 1 signed-zero mismatch (`0.0 % -inf` → `+0.0` vs numpy `-0.0`) |
+| float64 NaN operands | `[nan,1.5,-1.5] % [2,nan,nan]` | `[nan,nan,nan]` | exact (NaN) |
+| broadcast `(2,3) % (3,)` | int32 | — | exact |
+| broadcast scalar divisor | `[-7,7,-7] % -3` (int64) | `[-1,-2,-1]` | exact |
+| rank-0 scalars | `-7 % 3` int32 | `2` | exact |
+| mixed dtypes | int32 `%` int8 → int32 | — | exact (operand `stablehlo.convert`-ed) |
+| dynamic dim | `TensorSpec((dim("n"),3)) % (3,)`, n = 2 / 5 | — | exact at both sizes |
+| inside `cond` + `while_loop` (3 iterations) | int32 | — | exact |
+
+Edge facts (the measured truth, not aspiration): NaN always propagates (an adjusted `NaN + b` is still NaN); an infinite divisor matches numpy including the `-3 % inf = inf` half-line adjustment; a float zero divisor yields NaN like numpy; an integer zero divisor is UB in StableHLO while numpy returns 0 with a `RuntimeWarning` (unrepresentable — text unchanged).
+Signed ZEROS can differ by design: `0.0 % -3.0` is `-0.0` in numpy (sign follows the divisor) but the emitted fmod path yields `+0.0`; values compare equal (`allclose`/`==` pass) and only a `signbit` check would notice.
+Unsigned dtypes emit `stablehlo.remainder` ALONE (unsigned remainder is already non-negative — it IS fmod), but iree's function-signature dtype gate excludes EVERY unsigned dtype (declared set: bool/f16/f32/f64/i8/i16/i32/i64), so uint8/16/32/64 was validated by export text (`tensor<3xui8>` single `stablehlo.remainder`) plus a numpy emulation of the emitted sequence — no unsigned remainder of ANY form can execute through iree, before or after this change; the numpy backend covers it (uint8/uint16/uint32/uint64 remainder vs `np.remainder`, exact).
+Line-number drift: this section's anchors are current as of the change — `_emit_dot` 3732, `_emit_decomposed` 4723, `_emit_remainder` 4764, `render_constant` 760, `_constant_text` 5076 (the older §13/§18/§19 references had already drifted; re-grep before trusting them).
