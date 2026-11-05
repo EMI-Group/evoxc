@@ -89,15 +89,15 @@ dev = ["pytest>=7"]
 # is a user decision; evoxc's validated/default path is 3.11.x). Compiler and
 # runtime versions must MATCH (cross-version artifacts are rejected at load)
 # — see Known Issue #10 in evoxc/backends/adapters/CONTEXT.md.
-iree = ["iree-base-compiler>=3.11.0,<3.12", "iree-base-runtime>=3.11.0,<3.12"]
+iree = ["iree-base-compiler>=3.13.0,<3.14", "iree-base-runtime>=3.13.0,<3.14"]
 # tvm needs apache-tvm (StableHLO frontend + Relax VM) and jaxlib — jaxlib
 # ONLY for its bundled LLVM MLIR python bindings (the vendored
 # `jaxlib.mlir` namespace used by apache-tvm's translator). The `jax`
 # package is never imported anywhere.
 tvm = ["apache-tvm>=0.26", "jaxlib>=0.10,<0.11"]
 compilers = [
-    "iree-base-compiler>=3.11.0,<3.12",
-    "iree-base-runtime>=3.11.0,<3.12",
+    "iree-base-compiler>=3.13.0,<3.14",
+    "iree-base-runtime>=3.13.0,<3.14",
     "apache-tvm>=0.26",
     "jaxlib>=0.10,<0.11",
 ]
