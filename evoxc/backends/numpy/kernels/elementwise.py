@@ -43,7 +43,11 @@ __all__ = ["register_kernels"]
 
 #: Dtype kinds the numpy backend cannot compute with: object, bytes-string,
 #: unicode-string, void/structured.
-_UNSUPPORTED_KINDS = frozenset("OSUV")
+#: A plain STRING, not a frozenset: dtype kinds are single characters, so
+#: ``kind in _UNSUPPORTED_KINDS`` is one C-level character scan (~25 ns)
+#: instead of a hash lookup (~100 ns). The kernels run this test on every
+#: operand of every op, so it is worth the cheaper container.
+_UNSUPPORTED_KINDS = "OSUV"
 
 #: Vectorized ``math.erf`` (no scipy dependency). ``frompyfunc`` produces an
 #: object array; results are cast back to the operand dtype by ``_erf_array``.
@@ -51,7 +55,12 @@ _ERF_UFUNC = np.frompyfunc(math.erf, 1, 1)
 
 
 def _check_supported(op_name: str, *arrays: np.ndarray) -> None:
-    """Reject object/string/void/structured dtypes (never silently coerce)."""
+    """Reject object/string/void/structured dtypes (never silently coerce).
+
+    The ERROR path of the hot kernels: they test ``dtype.kind`` inline (see
+    ``_UNSUPPORTED_KINDS``) and only call this to build the message, so the
+    per-op happy path pays no Python call here.
+    """
     for array in arrays:
         if array.dtype.kind in _UNSUPPORTED_KINDS:
             raise core.BackendError(
@@ -71,6 +80,10 @@ def _check_broadcast(op_name: str, *shapes: tuple) -> None:
     numpy raises a raw ``ValueError`` on incompatible broadcasts; the backend
     contract requires ``core.ShapeError`` instead (the message names the op
     and embeds numpy's description, which lists every offending shape).
+
+    NOT called on the happy path any more (it costs ~1.2 us per op, and the
+    ufunc raises anyway): the broadcasting kernels call it from their
+    ``except`` block, so a mismatch still reports exactly this message.
     """
     try:
         np.broadcast_shapes(*shapes)
@@ -86,14 +99,31 @@ def _binary(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
     Comparison/logical ufuncs return a numpy SCALAR (``np.bool_``) on 0-d
     operands — ``np.asarray`` normalizes it to the 0-d ndarray ``core.Tensor``
     requires (a no-op for real arrays; dtype never changes).
+
+    Hot path (this is the most frequent kernel in interpreted graphs): the
+    dtype-kind test is inlined (no ``_check_supported`` call) and the
+    broadcast pre-check is GONE — numpy's own broadcast check raises
+    ``ValueError`` on the same condition, and ``_check_broadcast`` is called
+    from the handler to reproduce the canonical ``ShapeError`` wording. Any
+    other ``ValueError`` (e.g. an integer to a negative power) is re-raised
+    untouched, exactly as before.
     """
 
     def kernel(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         a, b = operands
-        a_arr, b_arr = a.numpy(), b.numpy()
-        _check_supported(op.name, a_arr, b_arr)
-        _check_broadcast(op.name, a_arr.shape, b_arr.shape)
-        return core.Tensor(np.asarray(np_fn(a_arr, b_arr)))
+        a_arr = a.numpy()
+        b_arr = b.numpy()
+        if (
+            a_arr.dtype.kind in _UNSUPPORTED_KINDS
+            or b_arr.dtype.kind in _UNSUPPORTED_KINDS
+        ):
+            _check_supported(op.name, a_arr, b_arr)
+        try:
+            result = np_fn(a_arr, b_arr)
+        except ValueError:
+            _check_broadcast(op.name, a_arr.shape, b_arr.shape)
+            raise
+        return core.Tensor(np.asarray(result))
 
     return kernel
 
@@ -103,32 +133,46 @@ def _unary(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
 
     ``logical_not`` returns a numpy scalar (``np.bool_``) on 0-d operands —
     ``np.asarray`` normalizes it to the 0-d ndarray ``core.Tensor`` requires
-    (a no-op for real arrays; dtype never changes).
+    (a no-op for real arrays; dtype never changes). The dtype-kind test is
+    inlined (``_check_supported`` only builds the error message).
     """
 
     def kernel(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         (x,) = operands
         x_arr = x.numpy()
-        _check_supported(op.name, x_arr)
+        if x_arr.dtype.kind in _UNSUPPORTED_KINDS:
+            _check_supported(op.name, x_arr)
         return core.Tensor(np.asarray(np_fn(x_arr)))
 
     return kernel
 
 
 def _max_min(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
-    """Kernel factory for ``maximum``/``minimum`` (numpy has no complex order)."""
+    """Kernel factory for ``maximum``/``minimum`` (numpy has no complex order).
+
+    Same hot-path treatment as ``_binary``: inlined dtype-kind test and the
+    broadcast check moved into the ``except`` handler.
+    """
 
     def kernel(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         a, b = operands
-        a_arr, b_arr = a.numpy(), b.numpy()
-        _check_supported(op.name, a_arr, b_arr)
-        if a_arr.dtype.kind == "c" or b_arr.dtype.kind == "c":
+        a_arr = a.numpy()
+        b_arr = b.numpy()
+        a_kind = a_arr.dtype.kind
+        b_kind = b_arr.dtype.kind
+        if a_kind in _UNSUPPORTED_KINDS or b_kind in _UNSUPPORTED_KINDS:
+            _check_supported(op.name, a_arr, b_arr)
+        if a_kind == "c" or b_kind == "c":
             raise core.BackendError(
                 f"op '{op.name}': complex inputs are not supported (numpy "
                 "defines no ordering for complex numbers)"
             )
-        _check_broadcast(op.name, a_arr.shape, b_arr.shape)
-        return core.Tensor(np.asarray(np_fn(a_arr, b_arr)))
+        try:
+            result = np_fn(a_arr, b_arr)
+        except ValueError:
+            _check_broadcast(op.name, a_arr.shape, b_arr.shape)
+            raise
+        return core.Tensor(np.asarray(result))
 
     return kernel
 
@@ -185,10 +229,15 @@ def _gelu(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
 
 
 def _cast(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
-    """``cast``: astype to the target dtype (attr normalized to a name string)."""
+    """``cast``: astype to the target dtype (attr normalized to a name string).
+
+    Hot op in decoded-graph workloads: the operand dtype-kind test is inlined
+    (``_check_supported`` only builds the message on the error path).
+    """
     (x,) = operands
     x_arr = x.numpy()
-    _check_supported(op.name, x_arr)
+    if x_arr.dtype.kind in _UNSUPPORTED_KINDS:
+        _check_supported(op.name, x_arr)
     target = np.dtype(op.attributes["dtype"])
     if target.kind in _UNSUPPORTED_KINDS:
         raise core.BackendError(
@@ -200,12 +249,30 @@ def _cast(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
 
 def _select(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """``select``: numpy ``where`` semantics — all three operands broadcast;
-    both branches are always evaluated (SSA)."""
+    both branches are always evaluated (SSA).
+
+    Same hot-path treatment as ``_binary``: inlined dtype-kind test, and the
+    three-operand broadcast check moved into the ``except`` handler (numpy's
+    ``where`` raises ``ValueError`` on the same condition).
+    """
     pred, on_true, on_false = operands
-    pred_arr, true_arr, false_arr = pred.numpy(), on_true.numpy(), on_false.numpy()
-    _check_supported(op.name, pred_arr, true_arr, false_arr)
-    _check_broadcast(op.name, pred_arr.shape, true_arr.shape, false_arr.shape)
-    return core.Tensor(np.where(pred_arr, true_arr, false_arr))
+    pred_arr = pred.numpy()
+    true_arr = on_true.numpy()
+    false_arr = on_false.numpy()
+    if (
+        pred_arr.dtype.kind in _UNSUPPORTED_KINDS
+        or true_arr.dtype.kind in _UNSUPPORTED_KINDS
+        or false_arr.dtype.kind in _UNSUPPORTED_KINDS
+    ):
+        _check_supported(op.name, pred_arr, true_arr, false_arr)
+    try:
+        result = np.where(pred_arr, true_arr, false_arr)
+    except ValueError:
+        _check_broadcast(
+            op.name, pred_arr.shape, true_arr.shape, false_arr.shape
+        )
+        raise
+    return core.Tensor(result)
 
 
 def _broadcast(ctx: Any, op: Any, operands: tuple) -> core.Tensor:

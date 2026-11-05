@@ -58,7 +58,10 @@ from ..shapes import evaluate_dim_expr
 __all__ = ["register_kernels"]
 
 #: numpy dtype kinds these kernels move: everything except object/str/void.
-_SUPPORTED_KINDS = frozenset("biufc")
+#: A plain STRING (dtype kinds are single characters) because the hot kernels
+#: test ``dtype.kind`` on every operand: ``kind in "biufc"`` is one C-level
+#: character scan (~25 ns) instead of a frozenset hash lookup (~100 ns).
+_SUPPORTED_KINDS = "biufc"
 
 
 def _check_data_dtype(arr: np.ndarray, op_name: str) -> None:
@@ -95,6 +98,25 @@ def _normalize_axis(axis: Any, rank: int, op_name: str) -> int:
     return axis
 
 
+#: Per-rank cached ``slice`` opdef defaults — ``(starts, limits, strides)``
+#: = all-zero starts, full limit (``None``), unit strides. The opdef declares
+#: ``None`` for each, so a graph may leave them unset; rebuilding the tuples
+#: per call would be pure garbage.
+_SLICE_DEFAULTS: dict = {}
+
+
+def _slice_defaults(rank: int) -> tuple:
+    """Cached ``(starts, limits, strides)`` defaults for ``rank``."""
+    cached = _SLICE_DEFAULTS.get(rank)
+    if cached is None:
+        cached = _SLICE_DEFAULTS[rank] = (
+            (0,) * rank,
+            (None,) * rank,
+            (1,) * rank,
+        )
+    return cached
+
+
 # ---------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------
@@ -103,23 +125,35 @@ def _normalize_axis(axis: Any, rank: int, op_name: str) -> int:
 def _reshape(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """``reshape``: evaluate the target shape against ``ctx.bindings``
     (``-1`` wildcard passes through to numpy; ``None`` entries cannot be
-    decided at run time => ``ShapeError``) then ``np.reshape``."""
+    decided at run time => ``ShapeError``) then ``np.reshape``.
+
+    Hot op in decoded-graph workloads, so the per-dim walk has a fast path:
+    a concrete non-negative int (and the single ``-1`` wildcard) is appended
+    directly — ``evaluate_dim_expr`` would return it unchanged for a
+    non-negative int and is skipped for the wildcard by the original code, so
+    the values are identical. Everything else (``Dim``/``DimExpr``/an
+    invalid negative/``None``/a bool) keeps the original slow path, which is
+    where the ``ShapeError``/``TypeError`` wording lives. ``arr.reshape``
+    replaces ``np.reshape`` for the same reason: numpy's module-level
+    wrapper (``_wrapfunc``) costs ~0.5 us per call for no added semantics.
+    """
     (x,) = operands
     arr = x.numpy()
-    _check_data_dtype(arr, "reshape")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "reshape")
     target = []
     for dim in op.attributes["shape"]:
+        if type(dim) is int and (dim >= 0 or dim == -1):
+            target.append(dim)
+            continue
         if dim is None:
             raise core.ShapeError(
                 "reshape: target shape contains a None (runtime-dynamic) dim "
                 "— the interpreter never guesses a dimension"
             )
-        if isinstance(dim, int) and not isinstance(dim, bool) and dim == -1:
-            target.append(-1)  # single wildcard, inferred by numpy
-            continue
         target.append(evaluate_dim_expr(dim, ctx.bindings))
     try:
-        result = np.reshape(arr, tuple(target))
+        result = arr.reshape(target)
     except (ValueError, IndexError) as exc:
         raise _shape_error("reshape", exc) from exc
     return core.Tensor(result)
@@ -127,13 +161,15 @@ def _reshape(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
 
 def _transpose(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """``transpose``: numpy ``transpose`` semantics; ``permutation=None`` =
-    full reversal (the opdef default)."""
+    full reversal (the opdef default). Uses the ndarray method (numpy's
+    module-level wrapper adds ~0.25 us per call for no added semantics)."""
     (x,) = operands
     arr = x.numpy()
-    _check_data_dtype(arr, "transpose")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "transpose")
     perm = op.attributes.get("permutation")
     try:
-        result = np.transpose(arr, axes=perm)
+        result = arr.transpose(perm)
     except (ValueError, IndexError) as exc:
         raise _shape_error("transpose", exc) from exc
     return core.Tensor(result)
@@ -151,39 +187,46 @@ def _slice(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """
     (x,) = operands
     arr = x.numpy()
-    _check_data_dtype(arr, "slice")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "slice")
     rank = arr.ndim
     starts = op.attributes.get("start_indices")
     limits = op.attributes.get("limit_indices")
     strides = op.attributes.get("strides")
-    if starts is None:
-        starts = (0,) * rank
+    # Per-dim length validation, then the slice tuple. Length checks are
+    # inline (a per-call loop over a tuple-of-pairs costs ~0.3 us) and the
+    # tuple is built with ``map(slice, ...)`` — the C-level loop is ~2x
+    # cheaper than a genexp and yields equal ``slice`` objects.
+    if starts is None or limits is None or strides is None:
+        d_starts, d_limits, d_strides = _slice_defaults(rank)
+        if starts is None:
+            starts = d_starts
+        if limits is None:
+            limits = d_limits
+        if strides is None:
+            strides = d_strides
     else:
-        starts = tuple(starts)
-    if limits is None:
-        limits = (None,) * rank
-    else:
-        limits = tuple(limits)
-    if strides is None:
-        strides = (1,) * rank
-    else:
-        strides = tuple(strides)
-    for name, seq in (
-        ("start_indices", starts),
-        ("limit_indices", limits),
-        ("strides", strides),
-    ):
-        if len(seq) != rank:
-            raise core.ShapeError(
-                f"slice: {name} has {len(seq)} entries for rank {rank}"
-            )
-    slices = tuple(
-        slice(start, limit, stride)
-        for start, limit, stride in zip(starts, limits, strides)
-    )
+        if type(starts) is not tuple:
+            starts = tuple(starts)
+        if type(limits) is not tuple:
+            limits = tuple(limits)
+        if type(strides) is not tuple:
+            strides = tuple(strides)
+    if len(starts) != rank:
+        raise core.ShapeError(
+            f"slice: start_indices has {len(starts)} entries for rank {rank}"
+        )
+    if len(limits) != rank:
+        raise core.ShapeError(
+            f"slice: limit_indices has {len(limits)} entries for rank {rank}"
+        )
+    if len(strides) != rank:
+        raise core.ShapeError(
+            f"slice: strides has {len(strides)} entries for rank {rank}"
+        )
     # np.asarray normalizes a 0-d result (numpy returns a scalar for
     # ``arr[()]``) to the 0-d ndarray core.Tensor requires.
-    return core.Tensor(np.asarray(arr[slices]))
+    return core.Tensor(np.asarray(arr[tuple(map(slice, starts, limits, strides))]))
 
 
 def _gather(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
@@ -195,25 +238,40 @@ def _gather(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     with a 0-d int counter) are handled natively. A multi-axis ``axes`` tuple
     has no numpy equivalent for one shared index tensor => ``BackendError``
     (never a silent fallback).
+
+    Hot op (it is the scan step and every decode-side lookup), so: dtype-kind
+    tests are inlined, a single-axis ``axes`` attribute (the overwhelmingly
+    common case — including the ``(0,)`` default) skips the set/sort
+    normalization, and the ndarray method replaces ``np.take`` (numpy's
+    module-level wrapper costs ~0.55 us per call for no added semantics).
     """
     x, indices_t = operands
     arr = x.numpy()
     indices = indices_t.numpy()
-    _check_data_dtype(arr, "gather")
-    _check_index_dtype(indices, "gather")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "gather")
+    if indices.dtype.kind not in "iu":
+        _check_index_dtype(indices, "gather")
     axes = op.attributes.get("axes", (0,))
-    if isinstance(axes, int):
-        axes = (axes,)
-    normalized = sorted({_normalize_axis(a, arr.ndim, "gather") for a in axes})
-    if len(normalized) != 1:
-        raise core.BackendError(
-            "gather: multi-axis gather is not supported by the numpy "
-            f"interpreter (axes {tuple(normalized)}) — a single shared index "
-            "tensor has no numpy equivalent for several gathered axes"
+    if type(axes) is tuple and len(axes) == 1:
+        # Single-axis fast path: ``sorted({normalize(a)})`` would yield
+        # exactly ``[normalize(a)]`` and pass the one-entry check below.
+        axis = _normalize_axis(axes[0], arr.ndim, "gather")
+    elif isinstance(axes, int):
+        axis = _normalize_axis(axes, arr.ndim, "gather")
+    else:
+        normalized = sorted(
+            {_normalize_axis(a, arr.ndim, "gather") for a in axes}
         )
-    axis = normalized[0]
+        if len(normalized) != 1:
+            raise core.BackendError(
+                "gather: multi-axis gather is not supported by the numpy "
+                f"interpreter (axes {tuple(normalized)}) — a single shared "
+                "index tensor has no numpy equivalent for several gathered axes"
+            )
+        axis = normalized[0]
     try:
-        result = np.take(arr, indices, axis=axis)
+        result = arr.take(indices, axis=axis)
     except (ValueError, IndexError) as exc:
         raise _shape_error("gather", exc) from exc
     # np.asarray normalizes a scalar result (np.take with a 0-d index — the
@@ -235,8 +293,10 @@ def _scatter(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     arr = x.numpy()
     indices = indices_t.numpy()
     updates = updates_t.numpy()
-    _check_data_dtype(arr, "scatter")
-    _check_index_dtype(indices, "scatter")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "scatter")
+    if indices.dtype.kind not in "iu":
+        _check_index_dtype(indices, "scatter")
     rank = arr.ndim
     axis = _normalize_axis(op.attributes.get("axis", 0), rank, "scatter")
     out = np.array(arr, copy=True)  # functional update: x is never mutated
@@ -260,7 +320,8 @@ def _concatenate(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     arrays = []
     for tensor in operands:
         arr = tensor.numpy()
-        _check_data_dtype(arr, "concatenate")
+        if arr.dtype.kind not in _SUPPORTED_KINDS:
+            _check_data_dtype(arr, "concatenate")
         arrays.append(arr)
     axis = op.attributes["axis"]
     result_dtype = op.results[0].type.dtype

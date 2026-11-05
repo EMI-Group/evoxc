@@ -28,12 +28,22 @@ from evoxc import core
 
 __all__ = ["register_kernels"]
 
+#: The declared ``argsort`` result dtype (``infer_arg_reduction``/``ops``
+#: contract): a module-level constant so the per-call comparison does not
+#: rebuild it.
+_INT64 = np.dtype("int64")
+
 #: numpy dtype kinds these kernels move: everything except object/str/void.
-_SUPPORTED_KINDS = frozenset("biufc")
+#: A plain STRING (dtype kinds are single characters) — the hot kernels test
+#: ``dtype.kind in _SUPPORTED_KINDS`` inline, one C-level character scan.
+_SUPPORTED_KINDS = "biufc"
 
 
 def _check_data_dtype(arr: np.ndarray, op_name: str) -> None:
-    """Reject object/str/void arrays — the interpreter never sorts them."""
+    """Reject object/str/void arrays — the interpreter never sorts them.
+
+    The ERROR path of the hot kernels (they test ``arr.dtype.kind`` inline).
+    """
     if arr.dtype.kind not in _SUPPORTED_KINDS:
         raise core.BackendError(
             f"{op_name}: unsupported dtype {arr.dtype} — the numpy "
@@ -46,20 +56,20 @@ def _shape_error(op_name: str, exc: Exception) -> core.ShapeError:
     return core.ShapeError(f"{op_name}: {exc}")
 
 
-def _sort_kind(stable: bool) -> str | None:
-    """numpy sort kind: ``"stable"`` when requested, else the default."""
-    return "stable" if stable else None
-
-
 def _sort(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """``sort``: numpy sort along ``axis``; ``descending`` = flip of the
     ascending result along the axis."""
     (x,) = operands
     arr = x.numpy()
-    _check_data_dtype(arr, "sort")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "sort")
     axis = op.attributes["axis"]
     try:
-        result = np.sort(arr, axis=axis, kind=_sort_kind(op.attributes["stable"]))
+        result = np.sort(
+            arr,
+            axis=axis,
+            kind="stable" if op.attributes["stable"] else None,
+        )
         if op.attributes["descending"]:
             result = np.flip(result, axis=axis)
     except (ValueError, IndexError) as exc:
@@ -69,21 +79,32 @@ def _sort(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
 
 def _argsort(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """``argsort``: numpy argsort along ``axis`` (int64 result); descending
-    = flip of the ascending indices along the axis."""
+    = flip of the ascending indices along the axis.
+
+    Uses the ndarray method rather than ``np.argsort``: the same computation
+    without numpy's module-level dispatch wrapper (~0.25 us per call).
+
+    ``argsort`` is one of the most expensive ops in interpreted graphs (real
+    sorting work) and the ``intp`` -> ``int64`` promotion is a fresh array
+    allocation on every call. When numpy already produced ``int64`` (every
+    64-bit platform) the result is passed straight through — no copy, and the
+    values/dtype are identical either way (the interpreter validates them).
+    """
     (x,) = operands
     arr = x.numpy()
-    _check_data_dtype(arr, "argsort")
+    if arr.dtype.kind not in _SUPPORTED_KINDS:
+        _check_data_dtype(arr, "argsort")
     axis = op.attributes["axis"]
     try:
-        result = np.argsort(
-            arr, axis=axis, kind=_sort_kind(op.attributes["stable"])
+        result = arr.argsort(
+            axis=axis, kind="stable" if op.attributes["stable"] else None
         )
         if op.attributes["descending"]:
             result = np.flip(result, axis=axis)
     except (ValueError, IndexError) as exc:
         raise _shape_error("argsort", exc) from exc
-    if result.dtype != np.dtype("int64"):
-        result = np.asarray(result, dtype=np.int64)
+    if result.dtype != _INT64:
+        result = np.asarray(result, dtype=_INT64)
     return core.Tensor(result)
 
 

@@ -67,6 +67,20 @@ _REDUCE_FUNCS = {
     "reduce_prod": np.prod,
 }
 
+#: The SAME five reducers as UNBOUND ndarray methods, dispatched by op name.
+#: Called as ``_REDUCE_METHODS[name](array, axis=..., keepdims=...)`` they
+#: compute exactly what the module-level functions above do (``np.sum`` etc.
+#: simply forward to these methods with ``dtype=None``/``out=None``), minus
+#: numpy's Python-level wrapper (``_wrapreduction``/``_methods._mean``,
+#: ~0.8-1 us per call) — reducers are hot in interpreted graphs.
+_REDUCE_METHODS = {
+    "reduce_sum": np.ndarray.sum,
+    "reduce_max": np.ndarray.max,
+    "reduce_min": np.ndarray.min,
+    "reduce_mean": np.ndarray.mean,
+    "reduce_prod": np.ndarray.prod,
+}
+
 #: expected ``reduce_op`` attribute value per reduce_* op name (IR contract,
 #: mirrors ``evoxc.ops.reductions._REDUCE_KINDS``).
 _REDUCE_KINDS = {
@@ -80,11 +94,18 @@ _REDUCE_KINDS = {
 #: numpy dtype kinds the reduction family refuses (object/bytes/str/void):
 #: reductions on them are either Python-level "arithmetic" or numpy errors —
 #: both silent-semantics traps. Rejected with ``core.BackendError``.
-_UNSUPPORTED_KINDS = frozenset("OSUV")
+#: A plain STRING: the kernels test single-character dtype kinds inline
+#: (``kind in _UNSUPPORTED_KINDS`` — one C-level character scan) and only
+#: call ``_check_dtype`` to build the message.
+_UNSUPPORTED_KINDS = "OSUV"
 
 
 def _check_dtype(op_name: str, array: np.ndarray) -> None:
-    """Reject object/bytes/str/void dtypes — never silently coerce or promote."""
+    """Reject object/bytes/str/void dtypes — never silently coerce or promote.
+
+    The ERROR path of the hot kernels (they test ``array.dtype.kind``
+    inline); this only builds the message.
+    """
     if array.dtype.kind in _UNSUPPORTED_KINDS:
         raise core.BackendError(
             f"kernel for op '{op_name}': unsupported dtype {array.dtype} — "
@@ -104,7 +125,8 @@ def _reduce(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """
     del ctx  # reductions need no symbolic-dim state (shapes come from numpy)
     array = operands[0].numpy()
-    _check_dtype(op.name, array)
+    if array.dtype.kind in _UNSUPPORTED_KINDS:
+        _check_dtype(op.name, array)
     reduce_op = op.attributes.get("reduce_op")
     expected_kind = _REDUCE_KINDS[op.name]
     if reduce_op is not None and reduce_op != expected_kind:
@@ -112,7 +134,6 @@ def _reduce(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
             f"kernel for op '{op.name}': reduce_op attribute {reduce_op!r} "
             f"does not match the op name (expected {expected_kind!r})"
         )
-    reducer = _REDUCE_FUNCS[op.name]
     axes = tuple(op.attributes.get("axes", ()))
     keepdims = bool(op.attributes.get("keepdims", False))
     if axes:
@@ -126,6 +147,7 @@ def _reduce(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         axis = None  # empty axes attr = reduce over ALL axes
     # numpy returns a SCALAR for full reductions (axis=None, keepdims=False)
     # — np.asarray normalizes to the 0-d ndarray core.Tensor requires.
+    reducer = _REDUCE_METHODS[op.name]
     return core.Tensor(np.asarray(reducer(array, axis=axis, keepdims=keepdims)))
 
 
@@ -139,11 +161,16 @@ def _arg_reduce(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """
     del ctx
     array = operands[0].numpy()
-    _check_dtype(op.name, array)
+    if array.dtype.kind in _UNSUPPORTED_KINDS:
+        _check_dtype(op.name, array)
     axis = op.attributes.get("axis")
     keepdims = bool(op.attributes.get("keepdims", False))
-    fn = np.argmax if op.name == "argmax" else np.argmin
-    result = fn(array, axis=axis)
+    # ndarray method, not np.argmax/np.argmin: same computation, without
+    # numpy's Python-level dispatch wrapper (~0.7 us per call).
+    if op.name == "argmax":
+        result = array.argmax(axis=axis)
+    else:
+        result = array.argmin(axis=axis)
     if result.dtype != np.int64:
         result = result.astype(np.int64)
     if keepdims:
@@ -169,7 +196,8 @@ def _cumprod(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """
     del ctx
     arr = operands[0].numpy()
-    _check_dtype(op.name, arr)
+    if arr.dtype.kind in _UNSUPPORTED_KINDS:
+        _check_dtype(op.name, arr)
     axis = op.attributes["axis"]
     reverse = bool(op.attributes.get("reverse", False))
     if arr.ndim == 0:
@@ -177,7 +205,7 @@ def _cumprod(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     if reverse:
         arr = np.flip(arr, axis=axis)
     try:
-        result = np.cumprod(arr, axis=axis, dtype=arr.dtype)
+        result = arr.cumprod(axis=axis, dtype=arr.dtype)
     except (ValueError, IndexError) as exc:
         raise core.ShapeError(f"cumprod: {exc}") from exc
     if reverse:
