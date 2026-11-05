@@ -16,7 +16,9 @@ pipeline run-boundary device check in ``evoxc/pipeline.py``):
 * run outputs are payload-backed ``core.Tensor``\\ s on the executable's
   ``core.Device``; ``.numpy()`` on them RAISES ``core.DeviceError`` (no
   implicit device-to-host transfer) — the explicit
-  ``t.to(core.Device("cpu", 0)).numpy()`` hop is the only host path;
+  ``t.to(core.Device("cpu", 0)).numpy()`` hop is the only host path, its
+  readback being adapter-owned (Known Issue 21 in
+  ``evoxc/backends/adapters/CONTEXT.md``);
 * run-boundary placement: a vulkan executable NEVER stages host inputs — a
   cpu:0 tensor (or a raw numpy array, auto-wrapped as cpu:0) raises
   ``core.DeviceError`` naming the input path + the ``t.to(...)`` remedy, while
@@ -29,20 +31,31 @@ pipeline run-boundary device check in ``evoxc/pipeline.py``):
   naming the enumerated COUNT, the enumerated device names and the requested
   index, and stating that vulkan ids are queried hashes rather than ordinals.
 
-ENVIRONMENT (the guard skips cleanly without it): IREE 3.11's vulkan driver
-HIDES software-rasterizer devices whose name begins with ``llvmpipe`` (a
-hard-coded device-name denylist in ``iree_hal_vulkan_is_device_visible()``,
-no flag/env override), so a host whose only Vulkan device is Mesa lavapipe
-must point ``VK_ICD_FILENAMES`` at an ICD whose device name IREE accepts (a
-renamed lavapipe ICD under a machine-local temp dir — never a repo path).
-Validated here against such an ICD, whose enumerated device is
-``lavapipe (LLVM 20.1.2, 256 bits)``. Pinning the variable also keeps the
-loader away from a wedged vendor ICD: with it unset, this host's loader
-dlopens a broken amdgpu ICD and ``get_driver("vulkan")`` HANGS instead of
-failing. A hang is neither a skip nor a failure, so the guard enumerates in a
-CHILD process under a timeout (``_probe_vulkan_devices``, following Known
-Issue 16b in ``evoxc/backends/adapters/CONTEXT.md``: "wrap any Vulkan/DRM probe
-in ``timeout``") and skips with that reason when it fires.
+ENVIRONMENT (the guard skips cleanly without it): on the PINNED iree
+(``iree-base-runtime`` 3.13.0, the extras pin ``>=3.13.0,<3.14``) the vulkan
+driver no longer hides a device by NAME, so this host's Mesa lavapipe — a
+software Vulkan device and the only Vulkan device here — IS enumerated: with
+``VK_ICD_FILENAMES`` UNSET, ``query_available_devices()`` returns it (its
+enumerated name begins ``llvmpipe (LLVM 20.1.2, 256 bits) (… Mesa 25.2.8 …)``)
+and this suite passes 6/6. An EMPTY enumeration therefore means no usable
+Vulkan device/ICD is visible to the LOADER in this process — diagnose with
+``query_available_devices()`` and ICD visibility (``VK_ICD_FILENAMES``), never
+with a device-name filter. IREE 3.11 and EARLIER did HIDE software-rasterizer
+devices whose name begins ``llvmpipe`` (a hard-coded device-name denylist in
+``iree_hal_vulkan_is_device_visible()``, no flag/env override), which is why
+the renamed-ICD ``VK_ICD_FILENAMES`` recipe (a copy of the lavapipe ICD whose
+device-name string that driver accepts, machine-local under a temp dir — never
+a repo path) is a 3.11-and-earlier FALLBACK / loader-pinning aid only, never a
+precondition for seeing a device on the pin (Known Issue 16 in
+``evoxc/backends/adapters/CONTEXT.md``).
+
+The hang hazard behind the child-process probe still stands (Known Issue 16b
+there: "wrap any Vulkan/DRM probe in ``timeout``"): a wedged vendor ICD can
+make ``get_driver("vulkan")`` HANG instead of failing, and a hang is neither a
+skip nor a failure. It is a RECORDED hazard rather than an always-observed one
+— on this host with the pinned runtime the enumeration returns in well under a
+second — so the guard keeps enumerating in a CHILD process under a timeout
+(``_probe_vulkan_devices``) and skips with that reason when the timeout fires.
 
 Deliberately NO timing / benchmarking here: only short correctness checks on
 a SHARED software device. Graphs stay TINY on purpose — IREE's default SPIR-V
@@ -190,20 +203,27 @@ def _build_exe(fn, specs, device, target_backends=None):
 # guard
 # ---------------------------------------------------------------------------
 
-#: Why the suite skips. Names BOTH the IREE 3.11 ``llvmpipe`` device-name
-#: denylist AND the ``VK_ICD_FILENAMES`` remedy (the ``_acquire_vulkan_device``
-#: contract in ``evoxc/backends/adapters/iree.py``).
+#: Why the suite skips. Current state on the pinned iree (3.13.0): NO device is
+#: hidden by name, so an empty enumeration means the loader sees no usable
+#: Vulkan device/ICD in this process; the 3.11 ``llvmpipe`` device-name denylist
+#: and its ``VK_ICD_FILENAMES`` remedy are named only as that-and-earlier
+#: history (the ``_acquire_vulkan_device`` contract in
+#: ``evoxc/backends/adapters/iree.py``).
 NO_VULKAN_DEVICE = (
     "no usable Vulkan device for IREE: iree.runtime.get_driver('vulkan') "
-    "enumerated no devices (or could not even create a driver instance). "
-    "IREE 3.11's vulkan driver HIDES software-rasterizer devices: "
-    "iree_hal_vulkan_is_device_visible() drops every device whose name begins "
-    "with 'llvmpipe' (a hard-coded device-name denylist with no flag or env "
-    "override), so a host whose only Vulkan device is Mesa lavapipe must "
-    "point the VK_ICD_FILENAMES environment variable at an ICD whose device "
-    "name IREE accepts (a renamed lavapipe ICD — machine-local, never a repo "
-    "path). Diagnose with "
-    "iree.runtime.get_driver('vulkan').query_available_devices()"
+    "enumerated no devices (or could not even create a driver instance), i.e. "
+    "no usable Vulkan device/ICD is visible to the loader in this process. On "
+    "the pinned iree-base-runtime 3.13.0 NO device is hidden by name — this "
+    "host's Mesa lavapipe is enumerated with VK_ICD_FILENAMES UNSET and this "
+    "suite runs there — so an empty list is an ICD/loader visibility problem, "
+    "not a device-name filter: check "
+    "iree.runtime.get_driver('vulkan').query_available_devices() and which "
+    "ICDs the loader can see (VK_ICD_FILENAMES). The 'llvmpipe' device-name "
+    "denylist in iree_hal_vulkan_is_device_visible() (a hard-coded list with "
+    "no flag or env override) and the renamed-ICD VK_ICD_FILENAMES workaround "
+    "it required (pinning the variable at a lavapipe ICD copy whose device "
+    "name IREE accepts — machine-local, never a repo path) apply to iree 3.11 "
+    "and earlier ONLY: historical guidance on the pin."
 )
 
 
@@ -247,14 +267,15 @@ def _probe_vulkan_devices():
     """Enumerate vulkan devices in a CHILD process, hard-timed.
 
     IN-PROCESS IS NOT SAFE ON EVERY HOST: with ``VK_ICD_FILENAMES`` unset, a
-    host whose vendor ICD is wedged makes the Vulkan loader dlopen that ICD
-    and ``query_available_devices()`` HANG — it neither returns nor raises
-    (Known Issue 16b in ``evoxc/backends/adapters/CONTEXT.md``: "wrap any
-    Vulkan/DRM probe in ``timeout``"). A hung probe is neither a skip nor a
-    failure, so the guard runs it in a subprocess and skips when the timeout
-    fires. Once the probe HAS succeeded the loader is proven healthy and the
-    in-process calls the rest of this module (and the adapter itself) makes
-    are safe.
+    host whose vendor ICD is wedged can make the Vulkan loader dlopen that ICD,
+    after which ``query_available_devices()`` HANGS — it neither returns nor
+    raises (Known Issue 16b in ``evoxc/backends/adapters/CONTEXT.md``: "wrap
+    any Vulkan/DRM probe in ``timeout``"). That is a RECORDED hazard, not an
+    always-observed one — with the pinned iree 3.13.0 this host enumerates in
+    well under a second — but a hung probe is neither a skip nor a failure, so
+    the guard runs it in a subprocess and skips when the timeout fires. Once
+    the probe HAS succeeded the loader is proven healthy and the in-process
+    calls the rest of this module (and the adapter itself) makes are safe.
 
     Returns ``(infos, reason)``: ``infos`` is the enumerated device-info list
     (empty when no device is usable) and ``reason`` describes a failure or a
@@ -274,8 +295,8 @@ def _probe_vulkan_devices():
     except subprocess.TimeoutExpired:
         return [], (
             f"the probe did not finish within {_PROBE_TIMEOUT_S:g}s — the "
-            "Vulkan loader is HUNG, which is what this host does when "
-            "VK_ICD_FILENAMES lets it dlopen a wedged vendor ICD"
+            "Vulkan loader is HUNG; a wedged vendor ICD can do that whether or "
+            "not VK_ICD_FILENAMES is set (a recorded hazard, Known Issue 16b)"
         )
     payload = None
     for line in reversed(proc.stdout.splitlines()):
