@@ -25,8 +25,8 @@ Every kernel pays Python overhead proportional to op count, and the op count of 
 
 ## Measured (TensorNEAT generation graphs, `run_benchmark.py --impl new --backend numpy`)
 
-`xor_p500` 140.1 → 125.2 ms/gen (−10.7 %, same-moment control), `custom_pagie_p500` unchanged within noise (~979 ms/gen — that cell is numpy-compute-bound at ~78 µs/op, so its kernel Python share is ~1 %).
-Per-change on `xor_p500`: elementwise hot-path alone −8 %, plus indexing/reductions/sorting −3 % more.
+`xor_p500` 140.14 → 124.04 ms/gen (−11.5 %, same-moment pristine-tree control, `--repeats 2`, 30 generations), `custom_pagie_p500` 978.82 → 954.10 ms/gen (−2.5 %, inside that cell's ±6 % cross-run drift — it is numpy-compute-bound at ~78 µs/op, so its kernel Python share is ~1 %).
+Per-change on `xor_p500`: elementwise hot-path alone −8 %, plus indexing/reductions/sorting −3 % more; quality curves bit-identical, peak RSS and compile time unchanged.
 These are the numbers behind the code shape above; re-measure with the external TensorNEAT harness rather than trusting them after unrelated changes.
 
 ## Routing table
