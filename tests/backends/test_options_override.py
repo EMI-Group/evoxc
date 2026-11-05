@@ -565,6 +565,41 @@ def test_iree_resolve_compile_args_cuda_skips_llvmcpu_defaults():
     ]
 
 
+def test_iree_resolve_compile_args_rocm_target_flag_spelling(monkeypatch):
+    """A rocm compile derives ``--iree-rocm-target=<arch>`` — never a hip flag.
+
+    IREE's ROCm HAL has no target auto-detection, so the adapter injects the
+    detected arch itself (``_detect_rocm_target`` -> ``gfxNNN``). The
+    ``--iree-rocm-target`` spelling is the supported one: iree-base-compiler
+    3.13.0 (the pinned release) still documents exactly that flag for the
+    ROCm/AMDGPU code-object target and has NO ``--iree-hip-target`` flag at
+    all, so a rename to the ``hip`` spelling would simply not compile.
+    Detection is monkeypatched, so this pin needs neither a GPU nor the ROCm
+    toolchain.
+    """
+    probes = []
+
+    def _detect():
+        probes.append("detect")
+        return "gfx942"
+
+    monkeypatch.setattr(iree_adapt, "_detect_rocm_target", _detect)
+    args = iree_adapt._resolve_iree_compile_args(("rocm",), None)
+    assert probes, "the rocm arch detection must be consulted"
+    assert args == [
+        "--iree-input-demote-f64-to-f32=false",
+        "--iree-rocm-target=gfx942",
+    ]
+    assert iree_adapt._IREE_DEFAULT_ROCM_ARGS_NAME == "--iree-rocm-target"
+    # Exactly one target flag, spelled the documented way; no hip spelling.
+    assert [a for a in args if a.partition("=")[0] == "--iree-rocm-target"] == [
+        "--iree-rocm-target=gfx942"
+    ]
+    assert [a for a in args if a.partition("=")[0] == "--iree-hip-target"] == []
+    # The llvm-cpu portability flags are llvm-cpu-only: they must not leak in.
+    assert not [a for a in args if a.startswith("--iree-llvmcpu-")]
+
+
 def test_iree_resolve_compile_args_user_flag_drops_default_by_name():
     """A user flag whose NAME matches a default drops the default — the user
     wins (never both)."""

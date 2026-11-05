@@ -1,11 +1,16 @@
 """iree while-init constant-rewrite parity + SEGV regression suite (fix 71d721e/ecb2e82).
 
-iree 3.11.0 SEGVs (SIGSEGV, ``CompilerToolError "Error code: -11"``) inside
-``IREE::Stream::AffinityAnalysis::run()`` on dense rank>=1 ``stablehlo.constant``
-values used as while-loop INIT operands — the upstream AffinityAnalysis bug
-behind the real evox NSGA2 ``non_dominate_rank`` loop crashing iree-compile
-~9/10 on llvm-cpu and ~3/5 on cuda (root-cause + trigger analysis in
-``evoxc/backends/stablehlo/CONTEXT.md`` Known Issues).
+On the previously pinned iree 3.11.0 this shape SEGV'd (SIGSEGV,
+``CompilerToolError "Error code: -11"``) inside
+``IREE::Stream::AffinityAnalysis::run()`` on dense rank>=1
+``stablehlo.constant`` values used as while-loop INIT operands — the upstream
+AffinityAnalysis bug behind the real evox NSGA2 ``non_dominate_rank`` loop
+crashing iree-compile ~9/10 on llvm-cpu and ~3/5 on cuda (root-cause + trigger
+analysis in ``evoxc/backends/stablehlo/CONTEXT.md`` Known Issues). This repo
+now pins ``iree-base-compiler``/``iree-base-runtime`` ``>=3.13.0,<3.14``, where
+that compiler crash is fixed: the un-rewritten shape compiles deterministically
+and runs bit-exact (pinned in section 3 below), so the pin is no longer a
+"do not compile this" guard but a working-path regression test.
 
 The exporter workaround (default ON, opt out with
 ``lower(..., while_init_rewrite=False)``): every all-zero rank>=1 constant
@@ -15,20 +20,23 @@ over a NON-constant pre-loop value + a dtype-changing ``convert`` (+ a
 pattern (never ``x - x`` / broadcast-of-scalar-0: iree's canonicalizer folds
 both back into constants). ``_find_while_zero_source`` prefers the REDUCE
 path (an input-derived bool/int value ONE axis larger, reduced along the
-extra axis — the ONLY class validated safe at real-graph scale).
+extra axis — the ONLY class validated safe at real-graph scale). The rewrite
+stays the DEFAULT: it is the validated-safe emission on every pinned iree
+release, and the graph it produces is unchanged.
 
 Pinned here:
 
 * the computed-zeros chain appears in the exported MLIR and the while INIT
   position no longer holds the all-zero constant (MLIR-position assertions),
-* the small graph compiles 10/10 on iree-llvm-cpu with zero SEGVs and runs
-  bit-exact vs the numpy backend,
+* the small graph compiles 10/10 on iree-llvm-cpu and runs bit-exact vs the
+  numpy backend,
 * the REAL-graph shape — the evox ``non_dominate_rank`` loop: input-derived
   (n, n) i1 dominance matrix + intra-body reduction + bool→int32 cast chain,
   n=32 — compiles and runs bit-exact on llvm-cpu,
 * ``while_init_rewrite=False`` opts out: the while init IS the all-zero
-  constant again (MLIR-text assertion only — that shape is the upstream SEGV
-  and is deliberately NEVER compiled here).
+  constant again (MLIR-text assertion), and — the iree 3.13.0 behavior change
+  — that opt-out shape now COMPILES (repeated, to catch nondeterminism) and
+  runs bit-exact vs the numpy backend on iree-llvm-cpu.
 """
 
 import numpy as np
@@ -232,9 +240,10 @@ def test_small_graph_rewrite_chain_in_mlir():
 
 
 def test_small_graph_compile_10x_no_segv():
-    """The SEGV regression pin: 10 consecutive iree-llvm-cpu compiles of the
+    """The compile-stability pin: 10 consecutive iree-llvm-cpu compiles of the
     const-init while loop with the rewrite ON must all succeed (the upstream
-    AffinityAnalysis SEGV crashed ~9/10 on the un-rewritten shape)."""
+    AffinityAnalysis SEGV crashed ~9/10 on the un-rewritten shape on the
+    previously pinned iree 3.11.0)."""
     graph = evoxc.trace(_tiny_ndr_while, _TINY_SPEC)
     for _ in range(10):
         lowered = evoxc.lower(graph, backend="iree")
@@ -268,8 +277,10 @@ def test_real_graph_style_llvm_cpu_bit_exact():
 
 def test_opt_out_while_init_rewrite_false():
     """``while_init_rewrite=False`` must be accepted by ``lower()`` and
-    restore the constant init — asserted on MLIR text ONLY (the opt-out shape
-    is the upstream SEGV trigger and is deliberately never compiled)."""
+    restore the constant init (MLIR-text assertion).
+
+    Compiling this shape is pinned separately in section 3 (it used to be the
+    upstream SEGV; iree 3.13.0 handles it)."""
     graph = evoxc.trace(_non_dominate_rank, _REAL_SPEC)
     lowered = evoxc.lower(graph, backend="iree", while_init_rewrite=False)
     mlir = lowered.payload["mlir_text"]
@@ -282,3 +293,50 @@ def test_opt_out_while_init_rewrite_false():
     lowered_on = evoxc.lower(graph, backend="iree")
     mlir_on = lowered_on.payload["mlir_text"]
     assert '"stablehlo.reduce"' in _init_def_line(mlir_on)
+
+
+# ---------------------------------------------------------------------------
+# 3. the opt-out shape (constant while-init) now compiles and runs
+# ---------------------------------------------------------------------------
+
+#: Compile repeats for the opt-out pin. The 3.11.0 upstream bug crashed
+#: ~9/10 compiles of the real-graph shape, so a handful of repeats is what
+#: catches a nondeterministic regression without slowing the suite down.
+_OPT_OUT_REPEATS = 5
+
+
+def test_opt_out_shape_compiles_repeatedly_llvm_cpu():
+    """iree 3.13.0: the UN-REWRITTEN constant while-init compiles, every time.
+
+    This is the shape the exporter rewrite exists to avoid — on iree 3.11.0
+    it SEGV'd iree-compile (``AffinityAnalysis`` recursion) ~9/10 on llvm-cpu.
+    Now it compiles deterministically, so the pin is repeated
+    ``_OPT_OUT_REPEATS`` times: any nondeterministic compiler crash would
+    surface as a raised error here (the 3.11 failure mode was a SIGSEGV in
+    the compiler subprocess, which the adapter reports as ``BackendError``).
+    """
+    graph = evoxc.trace(_tiny_ndr_while, _TINY_SPEC)
+    for _ in range(_OPT_OUT_REPEATS):
+        lowered = evoxc.lower(graph, backend="iree", while_init_rewrite=False)
+        evoxc.compile(lowered)  # a compiler crash surfaces as a raised error
+
+
+def test_opt_out_shape_runs_bit_exact_llvm_cpu():
+    """... and the compiled opt-out executable matches numpy bit-for-bit.
+
+    Same graph, same option, through the full pipeline: the while init IS the
+    all-zero dense constant, and the rank result still equals the numpy
+    interpreter (and the independent front-peeling reference).
+    """
+    graph = evoxc.trace(_non_dominate_rank, _REAL_SPEC)
+    artifact = evoxc.compile(
+        evoxc.lower(graph, backend="iree", while_init_rewrite=False)
+    )
+    exe = evoxc.load(artifact, backend="iree")
+    got = evoxc.run(exe, _X32)
+    want = evoxc.evaluate(_non_dominate_rank, _X32)  # numpy interpreter
+    assert np.array_equal(_np(want), _np_non_dominate_rank(_X32))
+    _assert_exact(got, want)
+    # The compiled opt-out artifact is the same program as the default-ON one.
+    default_exe = evoxc.build(_non_dominate_rank, _REAL_SPEC, backend="iree")
+    _assert_exact(got, evoxc.run(default_exe, _X32))

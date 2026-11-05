@@ -316,6 +316,44 @@ def test_evoxc_extras_are_exactly_the_six_without_hf():
     assert "hf" not in extras, "`evoxc` must not carry an `hf` extra: it lives on `evoxc-hf`"
 
 
+#: The ADOPTED IREE compiler/runtime pair. Compiler and runtime versions must
+#: MATCH (IREE rejects cross-version artifacts at load), so both IREE
+#: distributions are pinned to one range — and both compiler extras (`iree`
+#: and `compilers`) must carry that same pair. An accidental revert of the
+#: adopted release fails loudly here. These are the only versions encoded.
+IREE_REQUIREMENTS = frozenset(
+    {
+        "iree-base-compiler>=3.13.0,<3.14",
+        "iree-base-runtime>=3.13.0,<3.14",
+    }
+)
+
+
+def _iree_requirements(extra: str) -> set[str]:
+    """The `iree-base-*` requirement strings of ONE `evoxc` extra."""
+    requirements = _pyproject()["project"]["optional-dependencies"][extra]
+    return {
+        requirement.split(";", 1)[0].strip()
+        for requirement in requirements
+        if _requirement_name(requirement).startswith("iree-base-")
+    }
+
+
+def test_iree_extras_pin_the_adopted_compiler_and_runtime_pair():
+    """The `iree` and `compilers` extras carry the SAME adopted IREE versions.
+
+    Both the compiler and the runtime distribution must be named (an extra
+    that installs only one half cannot compile+load an artifact) and the two
+    extras must never drift apart, so the version-pin guard compares each
+    extra's `iree-base-*` requirements against the same expected pair.
+    """
+    iree = _iree_requirements("iree")
+    compilers = _iree_requirements("compilers")
+    assert iree == set(IREE_REQUIREMENTS), f"the `iree` extra pins {sorted(iree)}"
+    assert compilers == set(IREE_REQUIREMENTS), f"the `compilers` extra pins {sorted(compilers)}"
+    assert iree == compilers, "the two compiler extras must stay identical on IREE"
+
+
 def test_member_requires_evoxc_and_keeps_the_hf_oracles_optional():
     project = _member_pyproject()["project"]
     base = {_requirement_name(dep) for dep in project["dependencies"]}
