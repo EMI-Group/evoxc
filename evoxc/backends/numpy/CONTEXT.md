@@ -70,7 +70,7 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 - The pipeline wrapper's plan caching (input/output plans, `_prepare_flat_inputs`/`_unflatten_outputs`) belongs to `evoxc/pipeline.py`, not to this backend: the numpy backend's own per-call work is the per-op loop above, so a merged `batch_functions` graph's numpy runtime is `emitted_ops` × (Python dispatch overhead + numpy work on row-stacked arrays).
 - Recorded measurements live in sibling nodes, not here: numpy merged-graph per-program-row / per-call runtimes (including the `bands` matrix) are in `../../transforms/CONTEXT.md`, and the leaf-driven `evoxc.run` wrapper cost is in `../../CONTEXT.md` "Notes for agents".
 
-**Measured interpreter passover** — TensorNEAT generation graphs through this backend (`run_benchmark.py --impl new --backend numpy --generations 30 --warmup 3`, one fresh process per run, same box, `ms/gen` = the run's median):
+**Measured interpreter passover** — TensorNEAT generation graphs through this backend (`run_benchmark.py --impl new --backend numpy --generations 30 --warmup 3`, one fresh process per run, same box, `ms/gen` = the run's median, `repeats=1`; the two-repeat protocol reproduces the same picture: `xor_p500` 172.4 → 135.7 and `custom_pagie_p500` 1031.5 → 968.1):
 
 | cell | executed ops/gen | ms/gen before | ms/gen after | peak RSS before → after |
 |---|---|---|---|---|
