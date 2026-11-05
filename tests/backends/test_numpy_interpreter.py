@@ -21,6 +21,13 @@ Conventions:
 
 Callbacks/collectives/control-flow/stablehlo/symbolic-dims/persistence are
 covered by the other files in this directory — not duplicated here.
+
+The closing section (``TestExecutionPlanCache``) takes the one exception: it
+pins the interpreter's own execution-plan contract — one cached ``_BlockPlan``
+per block (a while body executed N times plans once), liveness release of dead
+SSA values, the static-result fast-path flag, and the BYTE-IDENTICAL
+kernel-result error wording on both the static fast path and the symbolic
+(``Dim``) validation path.
 """
 
 from __future__ import annotations
@@ -1314,3 +1321,257 @@ class TestPipelineShorthand:
         assert all(isinstance(r, evoxc.Tensor) for r in out)
         np.testing.assert_array_equal(as_np(out)[0], x)
         np.testing.assert_array_equal(as_np(out)[1], -x)
+
+
+# ---------------------------------------------------------------------------
+# Execution-plan internals: one plan per block, liveness release, and the
+# unchanged result-validation wording on BOTH validation paths
+#
+# ``evoxc/backends/numpy/interpreter.py`` builds ONE ``_BlockPlan`` per block
+# on first execution (the kernel resolved once at plan build, the flat-store
+# operand/result ids, the liveness free list, and the static-result fast path
+# ``(dtype, shape)``) and keeps it in ``Interpreter._plans`` for the
+# executable's lifetime; values are stored in ONE flat ``value.id -> Tensor``
+# dict and a value whose last use has passed is released. These pins are the
+# OBSERVABLE consequences of that design (a loop body executed N times
+# materialises one plan; dead values disappear while returned values and
+# block arguments survive) plus the byte-identical kernel-result error text —
+# they never assert a private data structure beyond ``_build_plan``,
+# ``_plans``, ``_values`` and ``_run_block``.
+# ---------------------------------------------------------------------------
+
+
+class TestExecutionPlanCache:
+    """One cached plan per block; liveness release; unchanged error wording."""
+
+    @staticmethod
+    def _interpreter(exe):
+        """The numpy backend executable's ``Interpreter`` (its plan cache)."""
+        return exe.backend_executable._interpreter
+
+    def test_while_body_plan_is_built_once_for_n_iterations(self, monkeypatch):
+        """A while body executed N times builds its plan exactly ONCE."""
+        import evoxc.numpy as enp
+
+        from evoxc.backends.numpy import interpreter as interpreter_mod
+
+        @evoxc.defn
+        def fn(x, n):
+            def cond_fn(state):
+                i, _ = state
+                return i < n
+
+            def body_fn(state):
+                i, acc = state
+                return (i + 1, acc + x)
+
+            _, out = evoxc.while_loop(
+                cond_fn, body_fn, (enp.zeros((), evoxc.int64), x)
+            )
+            return out
+
+        built = []
+        real_build = interpreter_mod._build_plan
+
+        def counting_build(block):
+            plan = real_build(block)
+            built.append((block, plan))
+            return plan
+
+        monkeypatch.setattr(interpreter_mod, "_build_plan", counting_build)
+
+        exe = evoxc.build(
+            fn,
+            evoxc.TensorSpec((3,), evoxc.float32),
+            evoxc.TensorSpec((), evoxc.int64),
+        )
+        interp = self._interpreter(exe)
+        assert interp._plans == {}  # nothing is planned before the first run
+        assert built == []
+
+        x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        for iterations in (3, 7):
+            out = evoxc.run(exe, x, np.array(iterations, dtype=np.int64))
+            # The loop really ran `iterations` times (not once, not skipped):
+            # the carried accumulator starts at ``x``, so it ends at
+            # ``(iterations + 1) * x``.
+            assert_close(out.numpy(), x * float(iterations + 1))
+
+        # The module has THREE blocks (entry, cond region, body region), so
+        # exactly three plans exist however many iterations/executions ran.
+        assert len(built) == 3
+        assert len({id(block) for block, _ in built}) == 3
+        assert len(interp._plans) == 3
+        assert set(interp._plans.values()) == {plan for _, plan in built}
+
+        # A third run reuses every plan — no re-planning per execution.
+        evoxc.run(exe, x, np.array(1, dtype=np.int64))
+        assert len(built) == 3
+
+    def test_dead_values_are_released_at_last_use(self, monkeypatch):
+        """A dead SSA value is gone after its last use; returned values stay."""
+        from evoxc.backends.numpy.interpreter import Interpreter, entry_function
+
+        @evoxc.defn
+        def fn(x):
+            y = evoxc.multiply(x, x)  # dead after `add`
+            z = evoxc.add(y, y)  # dead after the second `multiply` ...
+            w = evoxc.multiply(z, z)  # ... but ALSO returned, so it stays
+            return w, z
+
+        exe = evoxc.build(fn, evoxc.TensorSpec((3,), evoxc.int32))
+        interp = self._interpreter(exe)
+        entry = entry_function(interp.module).entry_block
+        x_id = entry.arguments[0].id
+        y_id, z_id, w_id = (op.results[0].id for op in entry.ops[:3])
+        assert [op.name for op in entry.ops] == ["multiply", "add", "multiply", "return"]
+
+        snapshots = []
+        real_run_block = Interpreter._run_block
+
+        def capturing_run_block(interp_self, block, arg_tensors):
+            values = real_run_block(interp_self, block, arg_tensors)
+            if block is entry_function(interp_self.module).entry_block:
+                # Still inside ``run`` (the store is cleared in its finally),
+                # so this is the block's FINAL live set.
+                snapshots.append(dict(interp_self._values))
+            return values
+
+        monkeypatch.setattr(Interpreter, "_run_block", capturing_run_block)
+
+        x = np.array([1, 2, 3], dtype=np.int32)
+        w, z = evoxc.run(exe, x)
+        assert_close(w.numpy(), (x * x + x * x) ** 2)
+        assert_close(z.numpy(), x * x + x * x)
+
+        assert len(snapshots) == 1
+        live = set(snapshots[0])
+        # Dead after its last use: released from the flat store.
+        assert y_id not in live
+        # Returned values: still resolvable at the terminator.
+        assert z_id in live and w_id in live
+        # Block arguments are never released by the plan (they are not
+        # defined in the block).
+        assert x_id in live
+        # Exact live set — no over- or under-release.
+        assert live == {x_id, z_id, w_id}
+        # A run ends with an empty store (the next run rebuilds it in order).
+        assert interp._values == {}
+
+    @pytest.mark.parametrize(
+        "shape,expect_fast",
+        [((2, 3), True), ((evoxc.dim("B"), 3), False)],
+        ids=["static-result", "symbolic-result"],
+    )
+    def test_static_result_fast_path_is_recorded_on_the_plan(
+        self, shape, expect_fast
+    ):
+        """The plan's last step carries the fast-path flag and expected tuple."""
+
+        @evoxc.defn
+        def fn(x):
+            return evoxc.multiply(x, x)
+
+        exe = evoxc.build(fn, evoxc.TensorSpec(shape, evoxc.float32))
+        interp = self._interpreter(exe)
+        evoxc.run(exe, np.zeros((2, 3), dtype=np.float32))
+        # ``multiply(x, x)`` is a single-block module: exactly one plan.
+        assert len(interp._plans) == 1
+        plan = next(iter(interp._plans.values()))
+        assert len(plan.steps) == 1
+        op, kernel, operand_ids, result_ids, free_ids, fast, one = plan.steps[0]
+        assert op.name == "multiply"
+        assert callable(kernel)
+        assert len(operand_ids) == 2 and len(result_ids) == 1
+        assert plan.return_ids == result_ids
+        assert fast is expect_fast
+        if expect_fast:
+            # Fully static result: the expected (dtype, shape) is precomputed
+            # once at plan time and compared with a single tuple compare.
+            assert one[0] == np.dtype("float32")
+            assert one[1] == (2, 3)
+        else:
+            # Symbolic / None / multi-result: always the full symbolic path.
+            assert one is None
+
+    @pytest.mark.parametrize("result_path", ["static", "symbolic"])
+    @pytest.mark.parametrize(
+        "case",
+        ["wrong_rank", "wrong_dim", "wrong_dtype", "wrong_result_count"],
+        ids=["wrong_rank", "wrong_dim", "wrong_dtype", "wrong_result_count"],
+    )
+    def test_kernel_result_mismatch_wording_is_unchanged(
+        self, monkeypatch, result_path, case
+    ):
+        """Forced kernel mismatches raise the byte-identical historical text.
+
+        A ``static`` result takes the plan's one-tuple-compare fast path (and
+        falls back to the shared validator), a ``symbolic`` (``Dim``) result
+        goes straight to the symbolic validator — both must produce the SAME
+        message, built by the same helper (``_mismatch_error``).
+        """
+        from evoxc.backends.numpy import kernels
+
+        @evoxc.defn
+        def fn(x):
+            return evoxc.multiply(x, x)
+
+        def wrong_rank(operand):
+            return evoxc.core.Tensor(np.zeros((6,), dtype=operand.dtype))
+
+        def wrong_dim(operand):
+            return evoxc.core.Tensor(np.zeros((2, 4), dtype=operand.dtype))
+
+        def wrong_dtype(operand):
+            return evoxc.core.Tensor(np.zeros(operand.shape, dtype=np.int32))
+
+        def wrong_result_count(operand):
+            good = evoxc.core.Tensor(
+                np.zeros(operand.shape, dtype=operand.dtype)
+            )
+            return (good, good)
+
+        builders = {
+            "wrong_rank": wrong_rank,
+            "wrong_dim": wrong_dim,
+            "wrong_dtype": wrong_dtype,
+            "wrong_result_count": wrong_result_count,
+        }
+        spec = (
+            evoxc.TensorSpec((2, 3), evoxc.float32)
+            if result_path == "static"
+            else evoxc.TensorSpec((evoxc.dim("B"), 3), evoxc.float32)
+        )
+        exe = evoxc.build(fn, spec)
+
+        def bad_kernel(ctx, op, operands):
+            return builders[case](operands[0])
+
+        monkeypatch.setitem(kernels.KERNEL_TABLE, "multiply", bad_kernel)
+        error_type = (
+            evoxc.ShapeError if case in ("wrong_rank", "wrong_dim")
+            else evoxc.BackendError
+        )
+        with pytest.raises(error_type) as excinfo:
+            evoxc.run(exe, np.zeros((2, 3), dtype=np.float32))
+
+        expected = {
+            "wrong_rank": (
+                "kernel for op 'multiply' produced result 0 with shape (6,), "
+                "expected (2, 3) — rank mismatch"
+            ),
+            "wrong_dim": (
+                "kernel for op 'multiply' produced result 0 with shape (2, 4), "
+                "expected (2, 3) — dim 1: got 4, expected 3"
+            ),
+            "wrong_dtype": (
+                "kernel for op 'multiply' produced result 0 with dtype int32, "
+                "expected float32 — kernels must never silently coerce dtypes"
+            ),
+            "wrong_result_count": (
+                "kernel for op 'multiply' produced 2 result(s), expected 1"
+            ),
+        }[case]
+        # Byte-identical on both validation paths (static fast path and the
+        # symbolic path share one message builder).
+        assert str(excinfo.value) == expected

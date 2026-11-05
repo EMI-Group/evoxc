@@ -12,7 +12,10 @@ Covered here (all newly v1 — see ``evoxc/backends/stablehlo/ops.py``):
   checks are tolerance-based for normal and the split_n chain),
 * the shift primitives (``bitwise_left_shift`` / ``bitwise_right_shift``),
 * ``evoxc.scan`` (desugars at trace time into while + gather + scatter — all
-  v1, so scan graphs compile and run on iree-llvm-cpu).
+  v1, so scan graphs compile and run on iree-llvm-cpu),
+* ``evoxc.remainder`` (section 8) — numpy FLOORMOD through the exporter's
+  inline ``fmod`` correction (unsigned dtypes take the bare-remainder
+  shortcut), with the emission goldens in ``test_stablehlo_remainder.py``.
 
 Every graph is built with ``evoxc.build(..., backend="iree")`` (llvm-cpu),
 run, and compared against ``evoxc.evaluate`` (the numpy reference backend) —
@@ -731,3 +734,223 @@ def test_sort_permutation_top_level():
     ref = _sort_perm_ref(SV, SW, steps=1)
     _parity(_sort_perm_top, *SORT_PERM_SPECS, args=(SV, SW),
             exact=True, ref=ref)
+
+
+# ---------------------------------------------------------------------------
+# 8. remainder — numpy floormod through the inline StableHLO correction
+#
+# ``stablehlo.remainder`` is C ``fmod`` (result sign follows the DIVIDEND)
+# while evoxc's ``remainder`` contract is numpy's FLOORMOD (sign follows the
+# DIVISOR), so the exporter emits the correction inline
+# (``fmod``; ``(fmod != 0) & ((fmod < 0) != (b < 0))``; ``select(fmod + b)``)
+# and UNSIGNED dtypes as a bare remainder. The goldens live in
+# ``test_stablehlo_remainder.py``; this section pins the NUMBERS through a
+# real compiler: mixed signs, exact divisions, zero fmod, int64 magnitudes
+# around ±2**62, broadcasting, a rank-0 divisor, ±inf divisors and NaN, plus
+# the composition inside ``cond`` / ``while_loop`` regions.
+#
+# Signed ZEROS may differ: an exact division whose numpy result is ``-0.0``
+# (e.g. ``0.0 % -3.0`` — the sign follows the divisor) emits the fmod
+# ``+0.0``. The values are numerically equal, so the comparisons below never
+# assert ``np.signbit``.
+# ---------------------------------------------------------------------------
+
+
+def _remainder_graph(a, b):
+    """``a % b`` — the frontend op whose export is under test."""
+    return evoxc.remainder(a, b)
+
+
+def _ref_remainder(a, b):
+    """numpy reference (the documented floormod semantics)."""
+    return np.remainder(a, b)
+
+
+#: int/float remaining cases: exact value equality, NaN-aware for the float
+#: rows (``evaluate``/numpy is the reference, ``ref`` is an independent
+#: ``np.remainder`` computed here).
+REMAINDER_CASES = [
+    (
+        "int32_mixed_signs_exact_and_zero_fmod",
+        (evoxc.TensorSpec((8,), evoxc.int32), evoxc.TensorSpec((8,), evoxc.int32)),
+        (
+            np.array([7, -7, 7, -7, 6, -6, 0, 9], dtype=np.int32),
+            np.array([3, 3, -3, -3, 3, -3, 5, 9], dtype=np.int32),
+        ),
+    ),
+    (
+        "int64_mixed_signs_large_magnitudes",
+        (evoxc.TensorSpec((5,), evoxc.int64), evoxc.TensorSpec((5,), evoxc.int64)),
+        (
+            np.array([2 ** 62, -(2 ** 62), 2 ** 62 - 1, -(2 ** 62) + 1, 7],
+                     dtype=np.int64),
+            np.array([3, 3, -(2 ** 61), 2 ** 61, -3], dtype=np.int64),
+        ),
+    ),
+    (
+        "int32_broadcast_2x3_mod_3",
+        (evoxc.TensorSpec((2, 3), evoxc.int32), evoxc.TensorSpec((3,), evoxc.int32)),
+        (
+            np.array([[-7, 6, -7], [8, -9, 10]], dtype=np.int32),
+            np.array([3, -3, 4], dtype=np.int32),
+        ),
+    ),
+    (
+        "int64_rank0_divisor",
+        (evoxc.TensorSpec((2, 3), evoxc.int64), evoxc.TensorSpec((), evoxc.int64)),
+        (
+            np.array([[-5, 6, -7], [8, -9, 10]], dtype=np.int64),
+            np.array(-3, dtype=np.int64),
+        ),
+    ),
+    (
+        "float32_mixed_signs_fractional_inf_divisor_nan",
+        (evoxc.TensorSpec((8,), evoxc.float32), evoxc.TensorSpec((8,), evoxc.float32)),
+        (
+            np.array([5.5, -5.5, 5.5, -5.5, np.nan, 5.0, -5.0, -2.5],
+                     dtype=np.float32),
+            np.array([2.0, 2.0, -2.0, -2.0, 3.0, np.inf, np.inf, 3.0],
+                     dtype=np.float32),
+        ),
+    ),
+    (
+        "float64_mixed_signs_fractional",
+        (evoxc.TensorSpec((4,), evoxc.float64), evoxc.TensorSpec((4,), evoxc.float64)),
+        (
+            np.array([7.25, -7.25, 7.25, -7.25], dtype=np.float64),
+            np.array([2.5, 2.5, -2.5, -2.5], dtype=np.float64),
+        ),
+    ),
+]
+
+
+def _assert_remainder_exact(got, want, *, nan_aware):
+    """Exact value equality (NaN-aware for float rows; ignore sign of zero)."""
+    g, w = _np(got), np.asarray(want)
+    assert g.dtype == w.dtype, f"dtype {g.dtype} != {w.dtype}"
+    assert g.shape == w.shape, f"shape {g.shape} != {w.shape}"
+    if nan_aware:
+        np.testing.assert_allclose(g, w, rtol=0, atol=0, equal_nan=True)
+    else:
+        np.testing.assert_array_equal(g, w)
+
+
+@pytest.mark.parametrize(
+    "case_id,specs,args",
+    [(case_id, specs, args) for case_id, specs, args in REMAINDER_CASES],
+    ids=[case[0] for case in REMAINDER_CASES],
+)
+def test_remainder_iree_parity(case_id, specs, args):
+    """Bit-exact iree vs the numpy backend AND vs ``np.remainder``."""
+    nan_aware = args[0].dtype.kind == "f"
+    ref = _ref_remainder(*args)
+    want = evoxc.evaluate(_remainder_graph, *args)
+    _assert_remainder_exact(want, ref, nan_aware=nan_aware)
+    exe = evoxc.build(_remainder_graph, *specs, backend="iree")
+    got = evoxc.run(exe, *args)
+    _assert_remainder_exact(got, ref, nan_aware=nan_aware)
+    _assert_remainder_exact(got, _np(want), nan_aware=nan_aware)
+
+
+def test_remainder_signed_zero_is_only_a_sign_difference():
+    """``0.0 % -3.0``: values match, only the zero's SIGN may differ."""
+    a = np.array([0.0, -0.0, 0.0], dtype=np.float32)
+    b = np.array([-3.0, 3.0, -3.0], dtype=np.float32)
+    ref = _ref_remainder(a, b)
+    assert np.signbit(ref).tolist() == [True, False, True]  # numpy's floormod
+    specs = (
+        evoxc.TensorSpec((3,), evoxc.float32),
+        evoxc.TensorSpec((3,), evoxc.float32),
+    )
+    exe = evoxc.build(_remainder_graph, *specs, backend="iree")
+    got = _np(evoxc.run(exe, a, b))
+    # The VALUES agree exactly — ``np.testing.assert_array_equal`` treats
+    # -0.0 == 0.0 as equal, which is the documented tolerance here.
+    np.testing.assert_array_equal(got, ref)
+    assert np.all(got == 0.0)
+
+
+# --- remainder inside control-flow regions ---------------------------------
+
+
+def _remainder_in_cond(pred, a, b):
+    """Both branches compute a remainder (the else branch negates the divisor,
+    so the floormod sign convention decides the result)."""
+
+    def then_fn(a, b):
+        return evoxc.remainder(a, b)
+
+    def else_fn(a, b):
+        return evoxc.remainder(a, evoxc.negate(b))
+
+    return evoxc.cond(pred, then_fn, else_fn, a, b)
+
+
+def test_remainder_inside_cond():
+    """The correction inside BOTH arms of an ``if`` (runtime predicate)."""
+    a = np.array([7, -7, 7, -7], dtype=np.int64)
+    b = np.array([3, 3, -3, -3], dtype=np.int64)
+    specs = (
+        evoxc.TensorSpec((), evoxc.bool_),
+        evoxc.TensorSpec(a.shape, evoxc.int64),
+        evoxc.TensorSpec(b.shape, evoxc.int64),
+    )
+    exe = evoxc.build(_remainder_in_cond, *specs, backend="iree")
+    for pred in (True, False):
+        ref = _ref_remainder(a, b if pred else -b)
+        want = evoxc.evaluate(_remainder_in_cond, np.array(pred), a, b)
+        np.testing.assert_array_equal(_np(want), ref)
+        got = _np(evoxc.run(exe, np.array(pred), a, b))
+        np.testing.assert_array_equal(got, ref)
+        np.testing.assert_array_equal(got, _np(want))
+
+
+#: Trip count for the while-loop remainder case.
+REMAINDER_ITERS = 4
+
+
+def _remainder_in_while(v, d):
+    """Apply ``acc = (acc * 3 + 5) % d`` ``REMAINDER_ITERS`` times."""
+
+    def cond_fn(state):
+        i, _ = state
+        return i < evoxc.constant(
+            evoxc.tensor(np.array(REMAINDER_ITERS, dtype=np.int64))
+        )
+
+    def body_fn(state):
+        i, acc = state
+        return (i + 1, evoxc.remainder(acc * 3 + 5, d))
+
+    _, out = evoxc.while_loop(
+        cond_fn, body_fn, (enp.zeros((), evoxc.int64), v)
+    )
+    return out
+
+
+def _ref_remainder_while(v, d, iters=REMAINDER_ITERS):
+    acc = np.asarray(v)
+    for _ in range(iters):
+        acc = np.remainder(acc * 3 + 5, d)
+    return acc
+
+
+def test_remainder_inside_while_loop():
+    """The correction inside a ``stablehlo.while`` body, recomputed per iteration."""
+    v = np.array([7, -7, 30, -30], dtype=np.int64)
+    d = np.array([3, 3, -7, -7], dtype=np.int64)
+    specs = (
+        evoxc.TensorSpec(v.shape, evoxc.int64),
+        evoxc.TensorSpec(d.shape, evoxc.int64),
+    )
+    ref = _ref_remainder_while(v, d)
+    # Anti-vacuity: the loop really changes the value (mixed signs, non-zero
+    # at every step) — a 1-iteration or no-op body could not produce this.
+    assert not np.array_equal(ref, np.remainder(v, d))
+    assert np.any(ref < 0) and np.any(ref > 0)
+    want = evoxc.evaluate(_remainder_in_while, v, d)
+    np.testing.assert_array_equal(_np(want), ref)
+    exe = evoxc.build(_remainder_in_while, *specs, backend="iree")
+    got = _np(evoxc.run(exe, v, d))
+    np.testing.assert_array_equal(got, ref)
+    np.testing.assert_array_equal(got, _np(want))

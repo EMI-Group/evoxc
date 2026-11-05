@@ -22,6 +22,10 @@ Mirrors ``evoxc/core/tensor.py``. Contract points under test:
   implicit device-to-host transfer).
 - Structural equality (dtype + shape + device + elementwise values),
   ``!=`` inverts it, and tensors are unhashable.
+- One SHARED host device instance: every ndarray-backed tensor (and every
+  concrete creator over host data) reports the SAME module-level
+  ``Device('cpu', 0)`` object — identity, not just equality — while a
+  device-payload tensor keeps the payload's OWN device object.
 - DLPack is zero-copy in both directions. Note (numpy >= 2.0): the
   documented ``np.from_dlpack`` input is an *object exposing* ``__dlpack__``
   (e.g. the tensor itself), not a raw PyCapsule — a capsule has no
@@ -701,3 +705,70 @@ class TestTorchInterop:
         assert rt.dtype == np.dtype(dtype_name)
         np.testing.assert_array_equal(rt.data, tt.numpy())
         assert np.shares_memory(rt.data, tt.numpy())  # zero-copy import
+
+
+# ---------------------------------------------------------------------------
+# One shared host Device instance on the ndarray fast path
+# ---------------------------------------------------------------------------
+
+
+class TestSharedHostDevice:
+    """Every host-backed ``Tensor`` points at the ONE shared cpu:0 instance.
+
+    ``evoxc/core/tensor.py`` holds a single module-level immutable
+    ``_CPU0 = Device("cpu", 0)`` so the ndarray path pays no ``Device``
+    construction per tensor. ``Device`` is a frozen dataclass, so equality
+    and hash semantics are unchanged — only object IDENTITY is pinned here.
+    Device-payload tensors are NOT touched: they keep the payload's own
+    ``.device`` object (placement comes from the payload, never relabeled).
+    """
+
+    def test_ndarray_backed_tensors_share_one_device_instance(self):
+        from evoxc.core.tensor import _CPU0
+
+        first = Tensor(np.zeros((2, 3), dtype=np.float32))
+        second = Tensor(np.ones((5,), dtype=np.int64))
+        assert first.device is second.device is _CPU0
+        # Equality/hash semantics are unchanged by the sharing.
+        assert first.device == Device("cpu", 0)
+        assert hash(first.device) == hash(Device("cpu", 0))
+        assert first.device is not Device("cpu", 0)  # a fresh instance differs
+
+    def test_concrete_creators_share_the_same_instance(self):
+        from evoxc.core.tensor import _CPU0
+
+        host = np.arange(6, dtype=np.float32)
+        for created in (
+            zeros((2, 3)),
+            ones((2, 3)),
+            full((2, 3), 2.0),
+            empty((2, 3)),
+            from_numpy(host),
+            tensor(host),
+        ):
+            assert created.device is _CPU0, created
+
+    def test_device_payload_keeps_its_own_device_object(self):
+        # A payload on a CPU-kind device keeps the payload's OWN instance
+        # (equal to the shared host device, but not the same object) — the
+        # tensor is never relabeled onto the module-level instance.
+        payload_device = Device("cpu", 0)
+        assert payload_device is not Device("cpu", 0)  # equality, not identity
+        payload = _DummyDevicePayload((2, 3), "float32", device=payload_device)
+        t = Tensor(payload)
+        assert t.device is payload_device
+        assert t.device == Device("cpu", 0)
+        # ... and it is not the instance an ndarray-backed tensor reports.
+        assert t.device is not Tensor(np.zeros((2, 3), dtype=np.float32)).device
+
+    def test_same_device_to_returns_self_on_the_shared_instance(self):
+        t = Tensor(np.zeros((2, 3), dtype=np.float32))
+        assert t.to(Device("cpu", 0)) is t
+        assert t.to(t.device) is t  # the shared instance itself
+        # A payload tensor on its own (equal) device object: still self.
+        payload = _DummyDevicePayload(
+            (2, 3), "float32", device=Device("cpu", 0)
+        )
+        pt = Tensor(payload)
+        assert pt.to(Device("cpu", 0)) is pt
+        assert payload.to_host_calls == 0  # no copy on a same-device transfer
