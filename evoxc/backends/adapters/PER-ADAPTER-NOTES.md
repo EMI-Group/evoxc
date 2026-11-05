@@ -139,8 +139,60 @@ What works:
 - Remove the `while`: the same math unrolled at trace time compiles 5/5. A plain 3–6-carry elementwise+reduce+select while (no reshape-broadcast / multi-index body) also compiles reliably.
 - A bounded retry loop: 5–13 attempts of ~0.3 s each recovers, and the recovered artifact loads, runs on llvm-cpu and matches the numpy backend bit-exactly (all outputs max_abs_diff 0.0). Retry is a smoke/CI workaround, not a fix.
 
-Per-version verdicts: 3.9.0 compiles the NSGA2/MOEAD-class tell graphs 12/12 clean with full numpy parity (user-pinnable for MO compile work) but its cuda runtime crashes ~9/10 on SO step graphs (Known Issue 11) and it still SIGSEGVs on NSGA3-class graphs. 3.12.0rc fixes the compiler but its runtime is unusable for these graphs. Cross-version loading is not a workaround (the bytecode version is rejected).
-Conclusion: MO/while-heavy graphs are upstream-blocked on 3.10/3.11 and out of scope — use the numpy backend or the xla route; the `iree`/`compilers` extras pin `>=3.11.0,<3.12` for both compiler and runtime, which must match.
+Per-version verdicts (each row a measurement record at that release): 3.9.0 compiles the NSGA2/MOEAD-class tell graphs 12/12 clean with full numpy parity (user-pinnable for MO compile work) but its cuda runtime crashes ~9/10 on SO step graphs (Known Issue 11) and it still SIGSEGVs on NSGA3-class graphs. 3.11.0 SIGSEGVs on the T1/T2 shapes and on the MO-class 3-carry + `select` shape (~85–100 % of runs, nondeterministic). 3.12.0rc fixes the compiler but its runtime is unusable for these graphs. 3.13.0 is the ADOPTED pin (the `iree`/`compilers` extras pin `>=3.13.0,<3.14` for both compiler and runtime, which must match) and neither MO-class shape nor a `while` inside `cond` crashes there — see the 3.13.0 section below. Cross-version loading is not a workaround (the bytecode version is rejected).
+Conclusion: on the adopted 3.13.0 pin MO/while-heavy graphs are no longer compiler-blocked for the shapes retested here (llvm-cpu + rocm; CUDA unverified), while the historical 3.10/3.11 releases stay blocked — on those, use the numpy backend or the xla route.
+
+## IREE 3.13.0 — the adopted pin: loop/scan/cond-while/MO retest, measured cells, readback
+
+Provenance: `evoxc/bench/probe_iree313_rocm.py`, raw records `evoxc/bench/iree313_rocm_results.json`, narrated findings `evoxc/bench/iree313_rocm_findings.md` (`--seed 0 --reps 10 --warmup 3`, one process per graph so a compiler SIGSEGV is recorded verbatim and never retried away, one timing process at a time).
+Environment: AMD Instinct MI300X VF (gfx942, ROCm 7.1.0), NO NVIDIA GPU, **iree-base-compiler 3.13.0 + iree-base-runtime 3.13.0**, numpy 2.5.2, Python 3.14.8; the GPU is shared with sibling work, so timings are indicative (median AND best of 10 are recorded) while the parity and compile-crash counts are the load-bearing results.
+Every cell ran with DEFAULT adapter options — no retry loop, no unrolling, no `while_init_rewrite` override, no `opt_level`, no `dispatch_formation`.
+
+### Retest of the four 3.11 defect classes
+
+| 3.11 defect | 3.11 symptom | 3.13.0 measurement (this host) | verdict |
+|---|---|---|---|
+| `while_loop` carrying an INT32 counter, carries initialized from a graph constant | run-time ABORT in the HIP HAL: `hip/event_semaphore.c:786 … hal.fence.await` | rocm: compiles in 720 ms, runs, warm 1.177 ms, parity 1.2e-07 (counter exact); llvm-cpu: 0.269 ms, 6.1e-05 | runs device-resident on the HIP HAL |
+| `evoxc.scan` (constant carry init — the shape every `scan` desugars to) | run-time ABORT: `stream_command_buffer.c:452 … hal.device.queue.alloca`, or the same `hal.fence.await` (two signatures, one graph) | rocm: compiles in 457 ms, runs, warm 3.472 ms median / 2.371 best, parity 1.2e-07; llvm-cpu: 0.682 ms, 7.6e-06 | runs device-resident |
+| `while_loop` nested in `evoxc.cond` | `iree-compile` SIGSEGV, `Error code: -11` (compile-time crash, no runtime number existed) | 5/5 clean compiles on llvm-cpu (592–699 ms) and 5/5 on rocm (583–685 ms); the artifact runs and both branches match the numpy oracle (`pred=True` 1.2e-07, `pred=False` bit-exact) | 0 crashes in 10 compiles |
+| MO/NSGA2-class `while` (input-derived `(n, n)` i1 dominance matrix, in-body reductions, bool→i32 cast chain, 3 carries + `select`) | `iree-compile` SIGSEGV inside `IREE::Stream::AffinityAnalysis::run()`, ~85–100 % of runs on BOTH targets | 10/10 clean compiles on llvm-cpu (364–471 ms) and 10/10 on rocm (399–542 ms); the artifact also RUNS on rocm (`rank` bit-exact vs the front-peeling oracle, warm 1.660 ms) | 0 crashes in 20 compiles, plus a running artifact 3.11 never reached |
+
+0 crashes in 30 compiles across both targets, every repeat in its own process — 3.11's ~85–100 % MO-class crash rate makes a 10/10 on one target decisive, and 10/10 on both plus a running artifact is unambiguous.
+Device residency is unchanged and explicit: every rocm output leaf reports `Device(kind='rocm', index=0)`, `.numpy()` there raises `core.DeviceError` with the `t.to(core.Device("cpu", 0)).numpy()` remedy, and the probe's readback is that explicit `.to(cpu)`; llvm-cpu outputs are host `Device('cpu', 0)`.
+Parity is against a hand-written numpy ORACLE per cell (independent of the evoxc numpy backend): integer outputs (the i32 counter, `rank`) are exact in every cell, and the residual fp32 deltas are reduction-order differences (`so_step`'s population leaf is bit-exact while its two reductions differ by 6.1e-05).
+
+### Measured cells
+
+| cell | rocm warm ms (median / best) | llvm-cpu warm ms (median / best) | rocm parity | llvm-cpu parity |
+|---|---|---|---|---|
+| `elementwise` (`sum(relu(x @ w + b))`, x `(256,128)`, w `(128,64)`) | **0.098 / 0.090** | 0.164 / 0.152 | bit-exact | 9.8e-04 |
+| `while_i32_counter` (5 iterations, `(i32, f32, f32(256,))` carries) | 1.177 / 1.134 | 0.269 / 0.263 | 1.2e-07 | 6.1e-05 |
+| `scan` (32 steps over a `(128,)` carry from a constant init) | 3.472 / 2.371 | 0.682 / 0.660 | 1.2e-07 | 7.6e-06 |
+| `so_step` (4 iterations of a 10000×100 population step) | **1.387 / 1.271** | 3.502 / 3.335 | 6.1e-05 | 6.1e-05 |
+| `cond_while` (`cond(pred, while×3, negate)` on `(64,)`) | 0.864 / 0.849 | 0.161 / 0.154 | 8.9e-08 | 1.2e-07 |
+| `mo_class` (`non_dominate_rank`, n=32, 2 objectives) | 1.660 / 1.562 | 0.402 / 0.367 | bit-exact | bit-exact |
+
+Timing = `evoxc.run` + `Executable.synchronize()`, median and best of 10 samples after 3 warmups, shared host/GPU.
+Reading them honestly: rocm wins only where the work per invoke leaves the launch/fence floor (`elementwise` 0.098 vs 0.164 ms; `so_step` 1.387 vs 3.502 ms, ~6 data-parallel 1M-element ops × 4 iterations) and loses on the tiny-invoke chains (`while_i32_counter`, `scan` over 32 sequential 128-element steps, `cond_while`, `mo_class`), where llvm-cpu runs the whole graph in one local-task dispatch — launch-cost artifacts, not throughput claims.
+rocm `load` is ~250 ms per process (first HAL-device creation) against ~40 ms on llvm-cpu: per-process, not per-call.
+
+### Readback cost on the adopted pin
+
+Every host materialization now goes through the adapter-owned readback (mechanism, upstream root cause and the full buffer-size table: Known Issue 21 in `./CONTEXT.md`), so no 3.11 `DeviceArray.to_host()` figure applies: 16 MB rocm 0.37 → 1.51 ms, llvm-cpu 0.001 → 0.003 ms (zero-copy mapping either way; the delta is two nanobind compatibility queries per call), and 16 MB vulkan 2.44 ms where the runtime path was unusable.
+Small buffers are unaffected or faster (96 B rocm 43.6 → 37.6 µs, 4 KB rocm 44.4 → 39.3 µs).
+
+### Flag/API drift and compiler-default changes
+
+- No flag the adapter emits was removed or deprecated: `--iree-rocm-target=<arch>` is still the supported ROCm spelling (3.13 has no `--iree-hip-target`), `--iree-opt-level=3` is still rejected (O0–O3 only), the `iree.runtime` API the adapter uses is unchanged, and the default paths emit zero deprecation warnings.
+- `--iree-dispatch-creation-enable-aggressive-fusion`'s OWN default became optimization-level-dependent (false at O0, true at O2+), so the adapter's derived flag produces a byte-identical vmfb at `opt_level="O2"`/`"O3"` while `dispatch_formation="default"` still means "evoxc derives no flag".
+- The 3.11-era exporter workarounds stay in place and are observed unnecessary-but-harmless on this release for the retested shapes (`while_init_rewrite` default ON, `sort_emission="auto"` — see `../stablehlo/CONTEXT.md`).
+- A fully input-INDEPENDENT counted `while` (constant carry + constant bound + constant-only body) fails to COMPILE on 3.13 with `maximum iteration count exceeded in fixed point pipeline` — a clean compiler error, no crash; an input-consuming body or a static Python `int` bound compiles.
+
+### Not validated on 3.13.0
+
+- **CUDA**: this host has no NVIDIA GPU, so every cuda claim in these notes stays a 3.11 record (Known Issues 8f/9/11 included) and is never promoted to 3.13.
+- **Multi-rank / collectives**, **cross-version artifact interop** (a 3.11-compiled artifact on the 3.13 runtime was not tried) and the **xla / tvm legs** (no PJRT plugin exercise, TVM compile-only on ROCm).
+- **Vulkan**: no GPU-Vulkan device on that box (the lavapipe/renamed-ICD recipe is Known Issue 16, and the readback row above comes from the separate Vulkan readback measurement).
 
 ## Known Issue 11 — iree 3.9.0 cuda runtime SIGSEGV on SO step graphs (historical)
 
