@@ -110,7 +110,7 @@ Kernel-side hot-path rules and their own numbers live in `./kernels/CONTEXT.md`;
 | `./inline.py` | thin re-export of the shared `../inline.py` (`clone_ops_into` — portable block_call splicing with fresh ids + Use bookkeeping + output-type guards; `drop_op_uses` — required before `Block.erase` under strict `ir.verify`; plus `inline_portables`/`iter_ops`/`iter_block_ops`) |
 | `./collectives.py` | `CollectiveExecutor` alias of `dist.context.CollectiveExecutor` (CANONICAL home), `SingleRankCollectiveExecutor` (identity default) |
 | `./shapes.py` | `evaluate_dim_expr` / `evaluate_shape` — runtime `Dim`/`DimExpr` evaluation (shape-rule reuse) |
-| `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` (idempotent) — the kernel contract is documented in this module's docstring and is binding for all category modules |
+| `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` (idempotent) — the kernel contract is documented in this module's docstring and is binding for all category modules; the layer's hot-path rules and measured numbers are in `./kernels/CONTEXT.md` |
 | `./kernels/elementwise.py` | add/subtract/multiply/divide/power/remainder/maximum/minimum/abs/negate/square/sqrt/exp/log/log1p/sin/cos/tan/tanh/sigmoid/relu/gelu/erf/sign/bitwise_*/logical_*/cast/equal/not_equal/less/less_equal/greater/greater_equal/select/broadcast/stop_gradient |
 | `./kernels/reductions.py` | reduce_* family (reduce_sum/reduce_max/reduce_min/reduce_mean/reduce_prod), argmax/argmin, cumprod (cumsum moved out to indexing.py) |
 | `./kernels/indexing.py` | reshape/transpose/slice/gather/scatter/concatenate/pad/tril/triu/cumsum |
