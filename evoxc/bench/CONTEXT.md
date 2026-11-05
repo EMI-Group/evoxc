@@ -20,6 +20,8 @@ A committed artefact is history — a new measurement is a new file or a re-run 
 ## Measured conclusion
 
 The iree compile option `dispatch_formation="aggressive"` (→ `--iree-dispatch-creation-enable-aggressive-fusion`) is the only dispatch-formation knob that moves the count — 596 → 548 dispatches and −7…−9 % warm on rocm merged-population graphs (−5 % compile at pop 4000) with no llvm-cpu gain — so it ships OPT-IN and is enabled per-call on rocm.
+On iree-base 3.13.0 / ROCm 7.1 / gfx942 all four 3.11 loop defects are gone on `llvm-cpu` and `rocm`: the INT32-counter `while_loop` and `evoxc.scan` run on the HIP HAL with fp32-level parity, and `while`-in-`cond` plus the MO/NSGA2 `non_dominate_rank` shape compile 30/30 in separate processes (3.11: HIP `event_semaphore.c:786` ABORT at run, and `AffinityAnalysis` SIGSEGV in ~85–100 % of compiles) — the MO artifact now also executes on rocm, bit-exact.
+Those 3.13 timings are indicative only (the GPU is shared, one sequential process per cell, 10 samples) and cover no CUDA, Vulkan, multi-rank or cross-version-interop claim.
 
 ## Constraints
 
