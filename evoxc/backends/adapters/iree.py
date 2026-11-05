@@ -301,6 +301,10 @@ _IREE_DEFAULT_COMPILE_ARGS = ("--iree-input-demote-f64-to-f32=false",)
 #                                       to; the dynamically-linked dylib
 #                                       resolves them from system libc/libm
 #                                       at load
+# Both defaults are still present in iree-base-compiler 3.13.0 (re-verified:
+# an f64 log/cos/sqrt graph compiles and runs beside them with an f64 result
+# and zero error, so the demote-f64 opt-out and the dynamic link are still
+# load-bearing exactly as described).
 _IREE_DEFAULT_LLVMCPU_ARGS = (
     "--iree-llvmcpu-target-cpu=generic",
     "--iree-llvmcpu-link-embedded=false",
@@ -308,11 +312,15 @@ _IREE_DEFAULT_LLVMCPU_ARGS = (
 # rocm-only default — added ONLY when "rocm" is among the requested targets:
 #   --iree-rocm-target=<arch>   the AMDGPU target arch of the ROCm code
 #                               object. IREE's ROCm HAL has NO target
-#                               auto-detection (verified on iree-base-compiler
-#                               3.11.0: compiling with
+#                               auto-detection (re-verified on
+#                               iree-base-compiler 3.13.0: compiling with
 #                               target_backends=["rocm"] and no target flag
-#                               fails, and --iree-hal-target-device=rocm does
-#                               NOT supply it), so the arch MUST be named.
+#                               still fails with "ROCM target not set; did you
+#                               forget to pass '--iree-rocm-target'?", and
+#                               --iree-hal-target-device=rocm does NOT supply
+#                               it; `iree-compile --help` still lists
+#                               --iree-rocm-target and has NO --iree-hip-target),
+#                               so the arch MUST be named.
 #                               evoxc resolves the arch at compile time from the
 #                               installed ROCm tooling (amdgpu-arch /
 #                               rocm_agent_enumerator — see
@@ -335,7 +343,17 @@ _IREE_DEFAULT_ROCM_ARGS_NAME = "--iree-rocm-target"
 # Measured effect on ``evoxc.batch_functions`` merged-population graphs (pop
 # 1000 / rows 1024, rocm): 596 -> 548 IREE dispatches (-8.1 %), warm per-call
 # 2.439 -> 2.220 ms (-9.0 %), compile wall time unchanged (11.69 -> 11.40 s)
-# and identical numerics.
+# and identical numerics — all measured on iree-base-compiler 3.11.0.
+# iree-base-compiler 3.13.0 CHANGED that flag's own default: its help now
+# states "At optimization level O0 the default is false / At optimization
+# level O2 the default is true", and measured on 3.13.0 the emitted vmfb is
+# BYTE-IDENTICAL with and without the derived flag at ``opt_level="O2"``/
+# ``"O3"`` (rocm and llvm-cpu). So on 3.13 the option only CHANGES compilation
+# at O0/O1 or with ``opt_level`` unset — ``dispatch_formation="default"`` means
+# "evoxc derives NO flag" (byte-identical ARGS, as documented), NOT "aggressive
+# fusion is off": the compiler's own level-dependent default applies. evoxc
+# deliberately never emits the flag in its ``=false`` form (it does not
+# override the compiler's optimization defaults).
 _DISPATCH_FORMATION_MODES: dict[str, tuple[str, ...]] = {
     "default": (),
     "aggressive": ("--iree-dispatch-creation-enable-aggressive-fusion",),
@@ -1476,8 +1494,9 @@ class IreeBackend(CompilerBackend):
 
             level = normalize_opt_level(raw_opt_level)
             # iree-compile accepts ONLY the "O" form (verified empirically on
-            # iree-base-compiler 3.11.0: '--iree-opt-level=3' fails with
-            # "'3' value not a valid optimization level, use O0/O1/O2/O3").
+            # iree-base-compiler 3.11.0 and re-verified on 3.13.0:
+            # '--iree-opt-level=3' fails with "'3' value not a valid
+            # optimization level, use O0/O1/O2/O3").
             opt_level_args = (f"--iree-opt-level=O{level}",)
         raw_vulkan_target = (options or {}).get("vulkan_target")
         if raw_vulkan_target is None:
@@ -3312,7 +3331,30 @@ class IreeDevicePayload:
         return self._dtype
 
     def to_host(self) -> np.ndarray:
-        """Materialize a host copy of the device buffer (lazy D2H)."""
+        """Materialize a host copy of the device buffer (lazy D2H).
+
+        This is a thin delegation to ``DeviceArray.to_host()`` — the adapter
+        owns NO device->host copy of its own, deliberately, so a readback is
+        always the runtime's own (correct, zero-copy-when-mappable) path.
+
+        KNOWN UPSTREAM REGRESSION in iree-base-runtime 3.13.0 (rocm/cuda are
+        unaffected; observed on the Vulkan HAL): ``to_host()`` prefers
+        ``allocator.import_host_allocation`` whenever
+        ``query_buffer_compatibility`` reports ``IMPORTABLE``, and the Vulkan
+        allocator then rejects the very buffer it advertised with
+        ``ValueError: could not import host allocation:
+        .../hal/drivers/vulkan/allocator.c:1985: INVALID_ARGUMENT; host
+        allocation import pointer does not satisfy Vulkan
+        minImportedHostPointerAlignment 4096``
+        (``iree/runtime/array_interop.py::_copy_to_host``). Reproduced with
+        plain iree and no evoxc in the process, while the manual staging path
+        (a ``HOST_LOCAL | DEVICE_VISIBLE`` destination + ``queue_copy`` +
+        ``map()``) reads the same buffer back correctly — so this is the
+        runtime's fast path, not the adapter's. Reported, not worked around: a
+        silent fallback copy here would hide an upstream defect and change
+        what ``.to(cpu)``/``.numpy()`` mean. cuda/rocm readbacks use the same
+        delegation and are unaffected.
+        """
         return self._array.to_host()
 
     def __dlpack_device__(self) -> tuple[int, int]:
