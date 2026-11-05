@@ -1,0 +1,3174 @@
+{
+ "_meta": {
+  "probe": "evoxc/bench/probe_iree313_rocm.py",
+  "purpose": "re-validate on iree-base 3.13.0 the loop/scan/while-in-cond/MO-class shapes recorded as broken on 3.11.0 (adapters CONTEXT Known Issues 8f/10, PER-ADAPTER-NOTES Known Issue 10)",
+  "date": "2026-11-05",
+  "host": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1 / Linux-6.8.0-146-generic-x86_64-with-glibc2.39 / x86_64 (20 cpus)",
+  "gpu": "AMD Instinct MI300X VF (iree hip device_id 1)",
+  "gfx_arch": "gfx942",
+  "rocm": "7.1.0",
+  "iree_base_compiler": "3.13.0",
+  "iree_base_runtime": "3.13.0",
+  "numpy": "2.5.2",
+  "evoxc": "0.1.0",
+  "python": "3.14.8",
+  "seed": 0,
+  "command": "python evoxc/bench/probe_iree313_rocm.py --targets llvm-cpu,rocm --seed 0 --reps 10 --warmup 3 --out evoxc/bench/iree313_rocm_results.json",
+  "cells": [
+   "elementwise",
+   "while_i32_counter",
+   "scan",
+   "so_step",
+   "cond_while",
+   "mo_class"
+  ],
+  "targets": [
+   "llvm-cpu",
+   "rocm"
+  ],
+  "shared_host_caveat": "the ROCm GPU is SHARED with other work on this box: timings are a single sequential process per cell (never two timers at once) but must be read as indicative, not isolated-hardware numbers; correctness/compile-crash results are unaffected",
+  "timing": "each sample = evoxc.run + Executable.synchronize(); warm = median and best of 10 samples after 3 warmups",
+  "parity": "per leaf, max |got - ref| and max |got - ref| / max|ref| against a hand-written numpy oracle (independent of the evoxc numpy backend); 'all_bit_exact' over every leaf",
+  "compile_repeats": "the two compile-crash cells are compiled compile_repeats times per target in SEPARATE processes; a non-zero exit is recorded verbatim (-11 = SIGSEGV, -6 = SIGABRT), never retried away",
+  "env": {
+   "EVOXC_DISABLE_LOCATIONS": "1"
+  },
+  "host_caveat_note": "one timing process at a time; EVOXC_DISABLE_LOCATIONS=1"
+ },
+ "runs": {
+  "llvm-cpu|elementwise": {
+   "target": "llvm-cpu",
+   "cell": "elementwise",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 513.4731259895489,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "elementwise",
+     "target": "llvm-cpu",
+     "graph": "y = relu(x @ w + b); sum(y)  x(256, 128) w(128, 64) b(64,)",
+     "device": "Device(kind='cpu', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 0.347452936694026,
+     "lower_ms": 28.77758303657174
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 276.2681540334597
+    },
+    {
+     "phase": "load",
+     "load_ms": 41.03500104974955
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 0.0009765625,
+        "scale": 7214.20703125,
+        "max_rel_err": 1.353665753934971e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 0.0009765625,
+      "max_rel_err": 1.353665753934971e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.16415049321949482,
+     "warm_ms_best": 0.15187589451670647,
+     "warm_samples": [
+      0.21435192320495844,
+      0.16848498489707708,
+      0.15692005399614573,
+      0.16214605420827866,
+      0.1640029950067401,
+      0.17333694268018007,
+      0.18627697136253119,
+      0.16065104864537716,
+      0.15187589451670647,
+      0.16429799143224955
+     ],
+     "warmup_samples": [
+      0.3092290135100484,
+      0.20690402016043663,
+      0.21643599029630423
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 0.347452936694026,
+    "lower_ms": 28.77758303657174
+   },
+   "compile": {
+    "compile_ms": 276.2681540334597
+   },
+   "load": {
+    "load_ms": 41.03500104974955
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 0.0009765625,
+       "scale": 7214.20703125,
+       "max_rel_err": 1.353665753934971e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 0.0009765625,
+     "max_rel_err": 1.353665753934971e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.16415049321949482,
+    "warm_ms_best": 0.15187589451670647,
+    "warm_samples": [
+     0.21435192320495844,
+     0.16848498489707708,
+     0.15692005399614573,
+     0.16214605420827866,
+     0.1640029950067401,
+     0.17333694268018007,
+     0.18627697136253119,
+     0.16065104864537716,
+     0.15187589451670647,
+     0.16429799143224955
+    ],
+    "warmup_samples": [
+     0.3092290135100484,
+     0.20690402016043663,
+     0.21643599029630423
+    ]
+   }
+  },
+  "llvm-cpu|while_i32_counter": {
+   "target": "llvm-cpu",
+   "cell": "while_i32_counter",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 828.6605599569157,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "while_i32_counter",
+     "target": "llvm-cpu",
+     "graph": "while_loop, 5 iters, carries (i32 counter init from a graph constant, f32 scalar acc, f32 (256,)) -- cond less(i32, literal)",
+     "device": "Device(kind='cpu', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 0.625789980404079,
+     "lower_ms": 28.88734405860305
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 599.3870589882135
+    },
+    {
+     "phase": "load",
+     "load_ms": 42.956574936397374
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)",
+       "Device(kind='cpu', index=0)",
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [],
+        "dtype": "int32",
+        "max_abs_err": 0.0,
+        "scale": 5.0,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 6.103515625e-05,
+        "scale": 212.08941650390625,
+        "max_rel_err": 2.877803016110229e-07,
+        "bit_exact": false
+       },
+       {
+        "shape": [
+         256
+        ],
+        "dtype": "float32",
+        "max_abs_err": 1.4901161193847656e-07,
+        "scale": 0.6483044624328613,
+        "max_rel_err": 2.2984819721784386e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 6.103515625e-05,
+      "max_rel_err": 2.877803016110229e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.2691700356081128,
+     "warm_ms_best": 0.26315206196159124,
+     "warm_samples": [
+      0.30192395206540823,
+      0.27472805231809616,
+      0.2696070587262511,
+      0.267499010078609,
+      0.26315206196159124,
+      0.2753990702331066,
+      0.2666480140760541,
+      0.27925102040171623,
+      0.26630808133631945,
+      0.2687330124899745
+     ],
+     "warmup_samples": [
+      0.37488003727048635,
+      0.3119449829682708,
+      0.28762000147253275
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 0.625789980404079,
+    "lower_ms": 28.88734405860305
+   },
+   "compile": {
+    "compile_ms": 599.3870589882135
+   },
+   "load": {
+    "load_ms": 42.956574936397374
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)",
+      "Device(kind='cpu', index=0)",
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [],
+       "dtype": "int32",
+       "max_abs_err": 0.0,
+       "scale": 5.0,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 6.103515625e-05,
+       "scale": 212.08941650390625,
+       "max_rel_err": 2.877803016110229e-07,
+       "bit_exact": false
+      },
+      {
+       "shape": [
+        256
+       ],
+       "dtype": "float32",
+       "max_abs_err": 1.4901161193847656e-07,
+       "scale": 0.6483044624328613,
+       "max_rel_err": 2.2984819721784386e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 6.103515625e-05,
+     "max_rel_err": 2.877803016110229e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.2691700356081128,
+    "warm_ms_best": 0.26315206196159124,
+    "warm_samples": [
+     0.30192395206540823,
+     0.27472805231809616,
+     0.2696070587262511,
+     0.267499010078609,
+     0.26315206196159124,
+     0.2753990702331066,
+     0.2666480140760541,
+     0.27925102040171623,
+     0.26630808133631945,
+     0.2687330124899745
+    ],
+    "warmup_samples": [
+     0.37488003727048635,
+     0.3119449829682708,
+     0.28762000147253275
+    ]
+   }
+  },
+  "llvm-cpu|scan": {
+   "target": "llvm-cpu",
+   "cell": "scan",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 687.6302850432694,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "scan",
+     "target": "llvm-cpu",
+     "graph": "scan over 32 steps of a (128,) carry (constant init), stacked per-step sums",
+     "device": "Device(kind='cpu', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 1.1451869504526258,
+     "lower_ms": 29.464546008966863
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 383.1874430179596
+    },
+    {
+     "phase": "load",
+     "load_ms": 48.33271401003003
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)",
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         128
+        ],
+        "dtype": "float32",
+        "max_abs_err": 1.564621925354004e-07,
+        "scale": 0.99587082862854,
+        "max_rel_err": 1.5711093049173028e-07,
+        "bit_exact": false
+       },
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 7.62939453125e-06,
+        "scale": 44.59663772583008,
+        "max_rel_err": 1.7107555457776373e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 7.62939453125e-06,
+      "max_rel_err": 1.7107555457776373e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.6817109533585608,
+     "warm_ms_best": 0.6596929160878062,
+     "warm_samples": [
+      0.6674618925899267,
+      0.6596929160878062,
+      0.6885860348120332,
+      0.6867029005661607,
+      0.6922530010342598,
+      0.7104759570211172,
+      0.6728980224579573,
+      0.6914969999343157,
+      0.6767190061509609,
+      0.6644460372626781
+     ],
+     "warmup_samples": [
+      0.7956030312925577,
+      0.7095169275999069,
+      0.6767119048163295
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 1.1451869504526258,
+    "lower_ms": 29.464546008966863
+   },
+   "compile": {
+    "compile_ms": 383.1874430179596
+   },
+   "load": {
+    "load_ms": 48.33271401003003
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)",
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        128
+       ],
+       "dtype": "float32",
+       "max_abs_err": 1.564621925354004e-07,
+       "scale": 0.99587082862854,
+       "max_rel_err": 1.5711093049173028e-07,
+       "bit_exact": false
+      },
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 7.62939453125e-06,
+       "scale": 44.59663772583008,
+       "max_rel_err": 1.7107555457776373e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 7.62939453125e-06,
+     "max_rel_err": 1.7107555457776373e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.6817109533585608,
+    "warm_ms_best": 0.6596929160878062,
+    "warm_samples": [
+     0.6674618925899267,
+     0.6596929160878062,
+     0.6885860348120332,
+     0.6867029005661607,
+     0.6922530010342598,
+     0.7104759570211172,
+     0.6728980224579573,
+     0.6914969999343157,
+     0.6767190061509609,
+     0.6644460372626781
+    ],
+    "warmup_samples": [
+     0.7956030312925577,
+     0.7095169275999069,
+     0.6767119048163295
+    ]
+   }
+  },
+  "llvm-cpu|so_step": {
+   "target": "llvm-cpu",
+   "cell": "so_step",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1157.863265951164,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "so_step",
+     "target": "llvm-cpu",
+     "graph": "while_loop, 4 iters over a (10000, 100) f32 population: row scores -> rank-0 argmin -> gather(best row) -> masked mean shift, carries (i32 counter, population, f32 accumulator)",
+     "device": "Device(kind='cpu', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 1.2919759610667825,
+     "lower_ms": 27.98626001458615
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 759.8172309808433
+    },
+    {
+     "phase": "load",
+     "load_ms": 40.401439066044986
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)",
+       "Device(kind='cpu', index=0)",
+       "Device(kind='cpu', index=0)",
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [],
+        "dtype": "int32",
+        "max_abs_err": 0.0,
+        "scale": 4.0,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [
+         10000,
+         100
+        ],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 4.6643290519714355,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 3.0517578125e-05,
+        "scale": 208.89349365234375,
+        "max_rel_err": 1.4609156844200062e-07,
+        "bit_exact": false
+       },
+       {
+        "shape": [
+         10000
+        ],
+        "dtype": "float32",
+        "max_abs_err": 6.103515625e-05,
+        "scale": 149.6089324951172,
+        "max_rel_err": 4.079646531265238e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 6.103515625e-05,
+      "max_rel_err": 4.079646531265238e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 3.5017504706047475,
+     "warm_ms_best": 3.33462399430573,
+     "warm_samples": [
+      3.48444702103734,
+      3.5153869539499283,
+      3.488113987259567,
+      3.540306002832949,
+      3.384339972399175,
+      3.33462399430573,
+      4.944753018207848,
+      3.533293027430773,
+      3.733212943188846,
+      3.3729550195857882
+     ],
+     "warmup_samples": [
+      4.223607014864683,
+      3.452901029959321,
+      3.858732059597969
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 1.2919759610667825,
+    "lower_ms": 27.98626001458615
+   },
+   "compile": {
+    "compile_ms": 759.8172309808433
+   },
+   "load": {
+    "load_ms": 40.401439066044986
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)",
+      "Device(kind='cpu', index=0)",
+      "Device(kind='cpu', index=0)",
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [],
+       "dtype": "int32",
+       "max_abs_err": 0.0,
+       "scale": 4.0,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [
+        10000,
+        100
+       ],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 4.6643290519714355,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 3.0517578125e-05,
+       "scale": 208.89349365234375,
+       "max_rel_err": 1.4609156844200062e-07,
+       "bit_exact": false
+      },
+      {
+       "shape": [
+        10000
+       ],
+       "dtype": "float32",
+       "max_abs_err": 6.103515625e-05,
+       "scale": 149.6089324951172,
+       "max_rel_err": 4.079646531265238e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 6.103515625e-05,
+     "max_rel_err": 4.079646531265238e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 3.5017504706047475,
+    "warm_ms_best": 3.33462399430573,
+    "warm_samples": [
+     3.48444702103734,
+     3.5153869539499283,
+     3.488113987259567,
+     3.540306002832949,
+     3.384339972399175,
+     3.33462399430573,
+     4.944753018207848,
+     3.533293027430773,
+     3.733212943188846,
+     3.3729550195857882
+    ],
+    "warmup_samples": [
+     4.223607014864683,
+     3.452901029959321,
+     3.858732059597969
+    ]
+   }
+  },
+  "llvm-cpu|cond_while": {
+   "target": "llvm-cpu",
+   "cell": "cond_while",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 856.3072950346395,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "cond_while",
+     "target": "llvm-cpu",
+     "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+     "device": "Device(kind='cpu', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 0.6654640892520547,
+     "lower_ms": 28.51117099635303
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 569.3446319783106
+    },
+    {
+     "phase": "load",
+     "load_ms": 43.86540700215846
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         64
+        ],
+        "dtype": "float32",
+        "max_abs_err": 1.1920928955078125e-07,
+        "scale": 0.7995198369026184,
+        "max_rel_err": 1.491011029977746e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 1.1920928955078125e-07,
+      "max_rel_err": 1.491011029977746e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "alt",
+     "label": "predFalse",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         64
+        ],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 2.9134414196014404,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       }
+      ],
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0,
+      "all_bit_exact": true
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.1607774756848812,
+     "warm_ms_best": 0.1543370308354497,
+     "warm_samples": [
+      0.1717439154163003,
+      0.16025500372052193,
+      0.18241105135530233,
+      0.1612999476492405,
+      0.1571299508213997,
+      0.1640251139178872,
+      0.2082070568576455,
+      0.1544520491734147,
+      0.1585549907758832,
+      0.1543370308354497
+     ],
+     "warmup_samples": [
+      0.19231904298067093,
+      0.1668889308348298,
+      0.19981106743216515
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 0.6654640892520547,
+    "lower_ms": 28.51117099635303
+   },
+   "compile": {
+    "compile_ms": 569.3446319783106
+   },
+   "load": {
+    "load_ms": 43.86540700215846
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        64
+       ],
+       "dtype": "float32",
+       "max_abs_err": 1.1920928955078125e-07,
+       "scale": 0.7995198369026184,
+       "max_rel_err": 1.491011029977746e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 1.1920928955078125e-07,
+     "max_rel_err": 1.491011029977746e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.1607774756848812,
+    "warm_ms_best": 0.1543370308354497,
+    "warm_samples": [
+     0.1717439154163003,
+     0.16025500372052193,
+     0.18241105135530233,
+     0.1612999476492405,
+     0.1571299508213997,
+     0.1640251139178872,
+     0.2082070568576455,
+     0.1544520491734147,
+     0.1585549907758832,
+     0.1543370308354497
+    ],
+    "warmup_samples": [
+     0.19231904298067093,
+     0.1668889308348298,
+     0.19981106743216515
+    ]
+   },
+   "alt": {
+    "label": "predFalse",
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        64
+       ],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 2.9134414196014404,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      }
+     ],
+     "max_abs_err": 0.0,
+     "max_rel_err": 0.0,
+     "all_bit_exact": true
+    }
+   },
+   "compile_repeats": {
+    "n": 5,
+    "ok": 5,
+    "crashed": 0,
+    "signals": [],
+    "compile_ms": [
+     632.150357007049,
+     651.1672759661451,
+     592.028763028793,
+     630.564703955315,
+     698.7890619784594
+    ],
+    "records": [
+     {
+      "target": "llvm-cpu",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 806.7944640060887,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "llvm-cpu",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6854679668322206,
+        "lower_ms": 28.571564937010407
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 632.150357007049
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6854679668322206,
+       "lower_ms": 28.571564937010407
+      },
+      "compile": {
+       "compile_ms": 632.150357007049
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 908.0392429605126,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "llvm-cpu",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.5762750515714288,
+        "lower_ms": 32.413128996267915
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 651.1672759661451
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.5762750515714288,
+       "lower_ms": 32.413128996267915
+      },
+      "compile": {
+       "compile_ms": 651.1672759661451
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 762.6061449991539,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "llvm-cpu",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6235169712454081,
+        "lower_ms": 27.94238703791052
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 592.028763028793
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6235169712454081,
+       "lower_ms": 27.94238703791052
+      },
+      "compile": {
+       "compile_ms": 592.028763028793
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 861.6696499520913,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "llvm-cpu",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6323669804260135,
+        "lower_ms": 27.76281302794814
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 630.564703955315
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6323669804260135,
+       "lower_ms": 27.76281302794814
+      },
+      "compile": {
+       "compile_ms": 630.564703955315
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 931.3418930396438,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "llvm-cpu",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6066320929676294,
+        "lower_ms": 27.60159398894757
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 698.7890619784594
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6066320929676294,
+       "lower_ms": 27.60159398894757
+      },
+      "compile": {
+       "compile_ms": 698.7890619784594
+      }
+     }
+    ]
+   }
+  },
+  "llvm-cpu|mo_class": {
+   "target": "llvm-cpu",
+   "cell": "mo_class",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 708.8941680267453,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "mo_class",
+     "target": "llvm-cpu",
+     "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+     "device": "Device(kind='cpu', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 1.2052450329065323,
+     "lower_ms": 28.235961915925145
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 403.4533239901066
+    },
+    {
+     "phase": "load",
+     "load_ms": 47.12654696777463
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='cpu', index=0)"
+      ],
+      "device_kinds": [
+       "cpu"
+      ],
+      "numpy_refused": false
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         32
+        ],
+        "dtype": "int32",
+        "max_abs_err": 0.0,
+        "scale": 6.0,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       }
+      ],
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0,
+      "all_bit_exact": true
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.40164595702663064,
+     "warm_ms_best": 0.3666760167106986,
+     "warm_samples": [
+      0.3996079321950674,
+      0.39357400964945555,
+      0.4036839818581939,
+      0.4317540442571044,
+      0.4177049268037081,
+      0.4158539231866598,
+      0.3696599742397666,
+      0.3666760167106986,
+      0.41918898932635784,
+      0.3805489977821708
+     ],
+     "warmup_samples": [
+      0.5331489956006408,
+      0.46398595441132784,
+      0.4284410970285535
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 1.2052450329065323,
+    "lower_ms": 28.235961915925145
+   },
+   "compile": {
+    "compile_ms": 403.4533239901066
+   },
+   "load": {
+    "load_ms": 47.12654696777463
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='cpu', index=0)"
+     ],
+     "device_kinds": [
+      "cpu"
+     ],
+     "numpy_refused": false
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        32
+       ],
+       "dtype": "int32",
+       "max_abs_err": 0.0,
+       "scale": 6.0,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      }
+     ],
+     "max_abs_err": 0.0,
+     "max_rel_err": 0.0,
+     "all_bit_exact": true
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.40164595702663064,
+    "warm_ms_best": 0.3666760167106986,
+    "warm_samples": [
+     0.3996079321950674,
+     0.39357400964945555,
+     0.4036839818581939,
+     0.4317540442571044,
+     0.4177049268037081,
+     0.4158539231866598,
+     0.3696599742397666,
+     0.3666760167106986,
+     0.41918898932635784,
+     0.3805489977821708
+    ],
+    "warmup_samples": [
+     0.5331489956006408,
+     0.46398595441132784,
+     0.4284410970285535
+    ]
+   },
+   "compile_repeats": {
+    "n": 10,
+    "ok": 10,
+    "crashed": 0,
+    "signals": [],
+    "compile_ms": [
+     366.1854889942333,
+     401.2809010455385,
+     431.19237408973277,
+     470.565396011807,
+     416.0847649909556,
+     424.0043299505487,
+     400.80118202604353,
+     363.5067179566249,
+     406.5781639656052,
+     401.42771298997104
+    ],
+    "records": [
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 548.27337898314,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2354030041024089,
+        "lower_ms": 29.489360051229596
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 366.1854889942333
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2354030041024089,
+       "lower_ms": 29.489360051229596
+      },
+      "compile": {
+       "compile_ms": 366.1854889942333
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 640.5439960071817,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2952350080013275,
+        "lower_ms": 28.571901959367096
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 401.2809010455385
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2952350080013275,
+       "lower_ms": 28.571901959367096
+      },
+      "compile": {
+       "compile_ms": 401.2809010455385
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 668.4206159552559,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.217779004946351,
+        "lower_ms": 29.360310989432037
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 431.19237408973277
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.217779004946351,
+       "lower_ms": 29.360310989432037
+      },
+      "compile": {
+       "compile_ms": 431.19237408973277
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 721.2396629620343,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.268142950721085,
+        "lower_ms": 29.88520299550146
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 470.565396011807
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.268142950721085,
+       "lower_ms": 29.88520299550146
+      },
+      "compile": {
+       "compile_ms": 470.565396011807
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 636.4658368984237,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.477729994803667,
+        "lower_ms": 33.494460047222674
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 416.0847649909556
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.477729994803667,
+       "lower_ms": 33.494460047222674
+      },
+      "compile": {
+       "compile_ms": 416.0847649909556
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 614.4797309534624,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.3146990677341819,
+        "lower_ms": 31.223860918544233
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 424.0043299505487
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.3146990677341819,
+       "lower_ms": 31.223860918544233
+      },
+      "compile": {
+       "compile_ms": 424.0043299505487
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 583.0991389229894,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2443329906091094,
+        "lower_ms": 30.783048016019166
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 400.80118202604353
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2443329906091094,
+       "lower_ms": 30.783048016019166
+      },
+      "compile": {
+       "compile_ms": 400.80118202604353
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 603.5868780454621,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2287640711292624,
+        "lower_ms": 32.02783199958503
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 363.5067179566249
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2287640711292624,
+       "lower_ms": 32.02783199958503
+      },
+      "compile": {
+       "compile_ms": 363.5067179566249
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 642.2027880325913,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.1896459618583322,
+        "lower_ms": 28.753950027748942
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 406.5781639656052
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.1896459618583322,
+       "lower_ms": 28.753950027748942
+      },
+      "compile": {
+       "compile_ms": 406.5781639656052
+      }
+     },
+     {
+      "target": "llvm-cpu",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 642.8420420270413,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "llvm-cpu",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='cpu', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2443499872460961,
+        "lower_ms": 29.964957968331873
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 401.42771298997104
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2443499872460961,
+       "lower_ms": 29.964957968331873
+      },
+      "compile": {
+       "compile_ms": 401.42771298997104
+      }
+     }
+    ]
+   }
+  },
+  "rocm|elementwise": {
+   "target": "rocm",
+   "cell": "elementwise",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1185.601343982853,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "elementwise",
+     "target": "rocm",
+     "graph": "y = relu(x @ w + b); sum(y)  x(256, 128) w(128, 64) b(64,)",
+     "device": "Device(kind='rocm', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 0.36182894837111235,
+     "lower_ms": 29.240358970128
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 490.102945943363
+    },
+    {
+     "phase": "load",
+     "load_ms": 256.1200959607959
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 7214.20703125,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       }
+      ],
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0,
+      "all_bit_exact": true
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.09800144471228123,
+     "warm_ms_best": 0.08975295349955559,
+     "warm_samples": [
+      0.1300449948757887,
+      0.09738991502672434,
+      0.09410607162863016,
+      0.09861297439783812,
+      0.09279209189116955,
+      2.674601972103119,
+      0.1099450746551156,
+      0.11307501699775457,
+      0.08975295349955559,
+      0.09023596066981554
+     ],
+     "warmup_samples": [
+      0.16548798885196447,
+      0.10788301005959511,
+      0.11721299961209297
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 0.36182894837111235,
+    "lower_ms": 29.240358970128
+   },
+   "compile": {
+    "compile_ms": 490.102945943363
+   },
+   "load": {
+    "load_ms": 256.1200959607959
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 7214.20703125,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      }
+     ],
+     "max_abs_err": 0.0,
+     "max_rel_err": 0.0,
+     "all_bit_exact": true
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.09800144471228123,
+    "warm_ms_best": 0.08975295349955559,
+    "warm_samples": [
+     0.1300449948757887,
+     0.09738991502672434,
+     0.09410607162863016,
+     0.09861297439783812,
+     0.09279209189116955,
+     2.674601972103119,
+     0.1099450746551156,
+     0.11307501699775457,
+     0.08975295349955559,
+     0.09023596066981554
+    ],
+    "warmup_samples": [
+     0.16548798885196447,
+     0.10788301005959511,
+     0.11721299961209297
+    ]
+   }
+  },
+  "rocm|while_i32_counter": {
+   "target": "rocm",
+   "cell": "while_i32_counter",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1351.5399389434606,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "while_i32_counter",
+     "target": "rocm",
+     "graph": "while_loop, 5 iters, carries (i32 counter init from a graph constant, f32 scalar acc, f32 (256,)) -- cond less(i32, literal)",
+     "device": "Device(kind='rocm', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 0.6255789194256067,
+     "lower_ms": 29.145933920517564
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 720.0927949743345
+    },
+    {
+     "phase": "load",
+     "load_ms": 267.8303400753066
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)",
+       "Device(kind='rocm', index=0)",
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [],
+        "dtype": "int32",
+        "max_abs_err": 0.0,
+        "scale": 5.0,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 212.08941650390625,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [
+         256
+        ],
+        "dtype": "float32",
+        "max_abs_err": 1.1920928955078125e-07,
+        "scale": 0.6483044624328613,
+        "max_rel_err": 1.838785577742751e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 1.1920928955078125e-07,
+      "max_rel_err": 1.838785577742751e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 1.177349011413753,
+     "warm_ms_best": 1.1343260994181037,
+     "warm_samples": [
+      1.1881180107593536,
+      1.1343260994181037,
+      1.2301219394430518,
+      1.4235669514164329,
+      1.1665800120681524,
+      1.1530870106071234,
+      1.1941579869017005,
+      1.3122520176693797,
+      1.162540982477367,
+      1.1394900502637029
+     ],
+     "warmup_samples": [
+      1.2010500067844987,
+      1.193410949781537,
+      1.2878370471298695
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 0.6255789194256067,
+    "lower_ms": 29.145933920517564
+   },
+   "compile": {
+    "compile_ms": 720.0927949743345
+   },
+   "load": {
+    "load_ms": 267.8303400753066
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)",
+      "Device(kind='rocm', index=0)",
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [],
+       "dtype": "int32",
+       "max_abs_err": 0.0,
+       "scale": 5.0,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 212.08941650390625,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [
+        256
+       ],
+       "dtype": "float32",
+       "max_abs_err": 1.1920928955078125e-07,
+       "scale": 0.6483044624328613,
+       "max_rel_err": 1.838785577742751e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 1.1920928955078125e-07,
+     "max_rel_err": 1.838785577742751e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 1.177349011413753,
+    "warm_ms_best": 1.1343260994181037,
+    "warm_samples": [
+     1.1881180107593536,
+     1.1343260994181037,
+     1.2301219394430518,
+     1.4235669514164329,
+     1.1665800120681524,
+     1.1530870106071234,
+     1.1941579869017005,
+     1.3122520176693797,
+     1.162540982477367,
+     1.1394900502637029
+    ],
+    "warmup_samples": [
+     1.2010500067844987,
+     1.193410949781537,
+     1.2878370471298695
+    ]
+   }
+  },
+  "rocm|scan": {
+   "target": "rocm",
+   "cell": "scan",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1148.9713529590517,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "scan",
+     "target": "rocm",
+     "graph": "scan over 32 steps of a (128,) carry (constant init), stacked per-step sums",
+     "device": "Device(kind='rocm', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 1.1582729639485478,
+     "lower_ms": 29.72263004630804
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 456.9912740262225
+    },
+    {
+     "phase": "load",
+     "load_ms": 269.0370579948649
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)",
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         128
+        ],
+        "dtype": "float32",
+        "max_abs_err": 1.1920928955078125e-07,
+        "scale": 0.99587082862854,
+        "max_rel_err": 1.1970356608893736e-07,
+        "bit_exact": false
+       },
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 44.59663772583008,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       }
+      ],
+      "max_abs_err": 1.1920928955078125e-07,
+      "max_rel_err": 1.1970356608893736e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 3.472386975772679,
+     "warm_ms_best": 2.370725036598742,
+     "warm_samples": [
+      2.6280859019607306,
+      3.4426399506628513,
+      2.618849975988269,
+      3.5021340008825064,
+      4.332354990765452,
+      4.718751995824277,
+      4.728515981696546,
+      2.4514050455763936,
+      5.049254046753049,
+      2.370725036598742
+     ],
+     "warmup_samples": [
+      2.695932984352112,
+      2.670370042324066,
+      3.643839037977159
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 1.1582729639485478,
+    "lower_ms": 29.72263004630804
+   },
+   "compile": {
+    "compile_ms": 456.9912740262225
+   },
+   "load": {
+    "load_ms": 269.0370579948649
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)",
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        128
+       ],
+       "dtype": "float32",
+       "max_abs_err": 1.1920928955078125e-07,
+       "scale": 0.99587082862854,
+       "max_rel_err": 1.1970356608893736e-07,
+       "bit_exact": false
+      },
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 44.59663772583008,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      }
+     ],
+     "max_abs_err": 1.1920928955078125e-07,
+     "max_rel_err": 1.1970356608893736e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 3.472386975772679,
+    "warm_ms_best": 2.370725036598742,
+    "warm_samples": [
+     2.6280859019607306,
+     3.4426399506628513,
+     2.618849975988269,
+     3.5021340008825064,
+     4.332354990765452,
+     4.718751995824277,
+     4.728515981696546,
+     2.4514050455763936,
+     5.049254046753049,
+     2.370725036598742
+    ],
+    "warmup_samples": [
+     2.695932984352112,
+     2.670370042324066,
+     3.643839037977159
+    ]
+   }
+  },
+  "rocm|so_step": {
+   "target": "rocm",
+   "cell": "so_step",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1571.317316032946,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "so_step",
+     "target": "rocm",
+     "graph": "while_loop, 4 iters over a (10000, 100) f32 population: row scores -> rank-0 argmin -> gather(best row) -> masked mean shift, carries (i32 counter, population, f32 accumulator)",
+     "device": "Device(kind='rocm', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 1.3365349732339382,
+     "lower_ms": 30.67008696962148
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 813.3463179692626
+    },
+    {
+     "phase": "load",
+     "load_ms": 265.88268496561795
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)",
+       "Device(kind='rocm', index=0)",
+       "Device(kind='rocm', index=0)",
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [],
+        "dtype": "int32",
+        "max_abs_err": 0.0,
+        "scale": 4.0,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [
+         10000,
+         100
+        ],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 4.6643290519714355,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       },
+       {
+        "shape": [],
+        "dtype": "float32",
+        "max_abs_err": 3.0517578125e-05,
+        "scale": 208.89349365234375,
+        "max_rel_err": 1.4609156844200062e-07,
+        "bit_exact": false
+       },
+       {
+        "shape": [
+         10000
+        ],
+        "dtype": "float32",
+        "max_abs_err": 6.103515625e-05,
+        "scale": 149.6089324951172,
+        "max_rel_err": 4.079646531265238e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 6.103515625e-05,
+      "max_rel_err": 4.079646531265238e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 1.3865225482732058,
+     "warm_ms_best": 1.2711889576166868,
+     "warm_samples": [
+      1.5757799847051501,
+      1.3683030847460032,
+      1.838493044488132,
+      1.8009869381785393,
+      1.292772009037435,
+      1.360205002129078,
+      1.4047420118004084,
+      1.2711889576166868,
+      1.2738810619339347,
+      1.521885977126658
+     ],
+     "warmup_samples": [
+      1.958050997927785,
+      1.359469024464488,
+      1.4827350387349725
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 1.3365349732339382,
+    "lower_ms": 30.67008696962148
+   },
+   "compile": {
+    "compile_ms": 813.3463179692626
+   },
+   "load": {
+    "load_ms": 265.88268496561795
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)",
+      "Device(kind='rocm', index=0)",
+      "Device(kind='rocm', index=0)",
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [],
+       "dtype": "int32",
+       "max_abs_err": 0.0,
+       "scale": 4.0,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [
+        10000,
+        100
+       ],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 4.6643290519714355,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      },
+      {
+       "shape": [],
+       "dtype": "float32",
+       "max_abs_err": 3.0517578125e-05,
+       "scale": 208.89349365234375,
+       "max_rel_err": 1.4609156844200062e-07,
+       "bit_exact": false
+      },
+      {
+       "shape": [
+        10000
+       ],
+       "dtype": "float32",
+       "max_abs_err": 6.103515625e-05,
+       "scale": 149.6089324951172,
+       "max_rel_err": 4.079646531265238e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 6.103515625e-05,
+     "max_rel_err": 4.079646531265238e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 1.3865225482732058,
+    "warm_ms_best": 1.2711889576166868,
+    "warm_samples": [
+     1.5757799847051501,
+     1.3683030847460032,
+     1.838493044488132,
+     1.8009869381785393,
+     1.292772009037435,
+     1.360205002129078,
+     1.4047420118004084,
+     1.2711889576166868,
+     1.2738810619339347,
+     1.521885977126658
+    ],
+    "warmup_samples": [
+     1.958050997927785,
+     1.359469024464488,
+     1.4827350387349725
+    ]
+   }
+  },
+  "rocm|cond_while": {
+   "target": "rocm",
+   "cell": "cond_while",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1384.7123029408976,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "cond_while",
+     "target": "rocm",
+     "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+     "device": "Device(kind='rocm', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 0.6606740644201636,
+     "lower_ms": 28.405233984813094
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 720.4070850275457
+    },
+    {
+     "phase": "load",
+     "load_ms": 250.82888000179082
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         64
+        ],
+        "dtype": "float32",
+        "max_abs_err": 8.940696716308594e-08,
+        "scale": 0.7995198369026184,
+        "max_rel_err": 1.1182582724833094e-07,
+        "bit_exact": false
+       }
+      ],
+      "max_abs_err": 8.940696716308594e-08,
+      "max_rel_err": 1.1182582724833094e-07,
+      "all_bit_exact": false
+     }
+    },
+    {
+     "phase": "alt",
+     "label": "predFalse",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         64
+        ],
+        "dtype": "float32",
+        "max_abs_err": 0.0,
+        "scale": 2.9134414196014404,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       }
+      ],
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0,
+      "all_bit_exact": true
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 0.8640915038995445,
+     "warm_ms_best": 0.8492410415783525,
+     "warm_samples": [
+      0.888023991137743,
+      0.8675559656694531,
+      0.8808959973976016,
+      0.8699561003595591,
+      0.8578980341553688,
+      0.8615299593657255,
+      0.8492410415783525,
+      0.8503040298819542,
+      0.8569350466132164,
+      0.8666530484333634
+     ],
+     "warmup_samples": [
+      0.9448450291529298,
+      0.9294130140915513,
+      0.901956926099956
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 0.6606740644201636,
+    "lower_ms": 28.405233984813094
+   },
+   "compile": {
+    "compile_ms": 720.4070850275457
+   },
+   "load": {
+    "load_ms": 250.82888000179082
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        64
+       ],
+       "dtype": "float32",
+       "max_abs_err": 8.940696716308594e-08,
+       "scale": 0.7995198369026184,
+       "max_rel_err": 1.1182582724833094e-07,
+       "bit_exact": false
+      }
+     ],
+     "max_abs_err": 8.940696716308594e-08,
+     "max_rel_err": 1.1182582724833094e-07,
+     "all_bit_exact": false
+    }
+   },
+   "timing": {
+    "warm_ms_median": 0.8640915038995445,
+    "warm_ms_best": 0.8492410415783525,
+    "warm_samples": [
+     0.888023991137743,
+     0.8675559656694531,
+     0.8808959973976016,
+     0.8699561003595591,
+     0.8578980341553688,
+     0.8615299593657255,
+     0.8492410415783525,
+     0.8503040298819542,
+     0.8569350466132164,
+     0.8666530484333634
+    ],
+    "warmup_samples": [
+     0.9448450291529298,
+     0.9294130140915513,
+     0.901956926099956
+    ]
+   },
+   "alt": {
+    "label": "predFalse",
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        64
+       ],
+       "dtype": "float32",
+       "max_abs_err": 0.0,
+       "scale": 2.9134414196014404,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      }
+     ],
+     "max_abs_err": 0.0,
+     "max_rel_err": 0.0,
+     "all_bit_exact": true
+    }
+   },
+   "compile_repeats": {
+    "n": 5,
+    "ok": 5,
+    "crashed": 0,
+    "signals": [],
+    "compile_ms": [
+     685.0783759728074,
+     610.1320290472358,
+     595.1909720897675,
+     598.6457950202748,
+     582.948385970667
+    ],
+    "records": [
+     {
+      "target": "rocm",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 931.5203620353714,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "rocm",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6560930050909519,
+        "lower_ms": 28.4491500351578
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 685.0783759728074
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6560930050909519,
+       "lower_ms": 28.4491500351578
+      },
+      "compile": {
+       "compile_ms": 685.0783759728074
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 845.4026159597561,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "rocm",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6774339126423001,
+        "lower_ms": 28.269688016735017
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 610.1320290472358
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6774339126423001,
+       "lower_ms": 28.269688016735017
+      },
+      "compile": {
+       "compile_ms": 610.1320290472358
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 909.5363029045984,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "rocm",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6680770311504602,
+        "lower_ms": 28.385029057972133
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 595.1909720897675
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6680770311504602,
+       "lower_ms": 28.385029057972133
+      },
+      "compile": {
+       "compile_ms": 595.1909720897675
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 836.0570570221171,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "rocm",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.649966998025775,
+        "lower_ms": 29.444603016600013
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 598.6457950202748
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.649966998025775,
+       "lower_ms": 29.444603016600013
+      },
+      "compile": {
+       "compile_ms": 598.6457950202748
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "cond_while",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 849.767648964189,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "cond_while",
+        "target": "rocm",
+        "graph": "cond(pred, while_loop x3 over (64,), negate) -- a while nested in a cond region",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 0.6775520741939545,
+        "lower_ms": 28.07857492007315
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 582.948385970667
+       }
+      ],
+      "lower": {
+       "trace_ms": 0.6775520741939545,
+       "lower_ms": 28.07857492007315
+      },
+      "compile": {
+       "compile_ms": 582.948385970667
+      }
+     }
+    ]
+   }
+  },
+  "rocm|mo_class": {
+   "target": "rocm",
+   "cell": "mo_class",
+   "compile_only": false,
+   "returncode": 0,
+   "exit_signal": null,
+   "crashed": false,
+   "wall_ms": 1057.4923849198967,
+   "phases": [
+    {
+     "phase": "start",
+     "cell": "mo_class",
+     "target": "rocm",
+     "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+     "device": "Device(kind='rocm', index=0)"
+    },
+    {
+     "phase": "lower",
+     "trace_ms": 1.2447870103642344,
+     "lower_ms": 30.848514987155795
+    },
+    {
+     "phase": "compile",
+     "compile_ms": 436.0147319966927
+    },
+    {
+     "phase": "load",
+     "load_ms": 251.63591210730374
+    },
+    {
+     "phase": "run",
+     "residency": {
+      "output_devices": [
+       "Device(kind='rocm', index=0)"
+      ],
+      "device_kinds": [
+       "rocm"
+      ],
+      "numpy_refused": true,
+      "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+     },
+     "parity": {
+      "leaves": [
+       {
+        "shape": [
+         32
+        ],
+        "dtype": "int32",
+        "max_abs_err": 0.0,
+        "scale": 6.0,
+        "max_rel_err": 0.0,
+        "bit_exact": true
+       }
+      ],
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0,
+      "all_bit_exact": true
+     }
+    },
+    {
+     "phase": "timing",
+     "warm_ms_median": 1.6598920337855816,
+     "warm_ms_best": 1.562194898724556,
+     "warm_samples": [
+      2.86697200499475,
+      1.562194898724556,
+      1.6360720619559288,
+      1.8445809837430716,
+      1.7379430355504155,
+      1.798124983906746,
+      1.5877149999141693,
+      1.570092048496008,
+      1.6026039374992251,
+      1.6837120056152344
+     ],
+     "warmup_samples": [
+      3.4978019539266825,
+      1.6414470737800002,
+      1.689483062364161
+     ]
+    }
+   ],
+   "lower": {
+    "trace_ms": 1.2447870103642344,
+    "lower_ms": 30.848514987155795
+   },
+   "compile": {
+    "compile_ms": 436.0147319966927
+   },
+   "load": {
+    "load_ms": 251.63591210730374
+   },
+   "run": {
+    "residency": {
+     "output_devices": [
+      "Device(kind='rocm', index=0)"
+     ],
+     "device_kinds": [
+      "rocm"
+     ],
+     "numpy_refused": true,
+     "numpy_refusal": "DeviceError: Tensor.numpy() needs host memory, but this tensor lives on Device(kind='rocm', index=0): there is no implicit device-to-host transfer. Transfer explicitly first, e.g. t.to(core.Device('cpu', 0)).numpy()."
+    },
+    "parity": {
+     "leaves": [
+      {
+       "shape": [
+        32
+       ],
+       "dtype": "int32",
+       "max_abs_err": 0.0,
+       "scale": 6.0,
+       "max_rel_err": 0.0,
+       "bit_exact": true
+      }
+     ],
+     "max_abs_err": 0.0,
+     "max_rel_err": 0.0,
+     "all_bit_exact": true
+    }
+   },
+   "timing": {
+    "warm_ms_median": 1.6598920337855816,
+    "warm_ms_best": 1.562194898724556,
+    "warm_samples": [
+     2.86697200499475,
+     1.562194898724556,
+     1.6360720619559288,
+     1.8445809837430716,
+     1.7379430355504155,
+     1.798124983906746,
+     1.5877149999141693,
+     1.570092048496008,
+     1.6026039374992251,
+     1.6837120056152344
+    ],
+    "warmup_samples": [
+     3.4978019539266825,
+     1.6414470737800002,
+     1.689483062364161
+    ]
+   },
+   "compile_repeats": {
+    "n": 10,
+    "ok": 10,
+    "crashed": 0,
+    "signals": [],
+    "compile_ms": [
+     487.34269000124186,
+     431.28771998453885,
+     399.43563006818295,
+     539.5702170208097,
+     531.0719859553501,
+     506.21494301594794,
+     541.6513429954648,
+     469.12732103373855,
+     481.9996489677578,
+     475.40210105944425
+    ],
+    "records": [
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 726.4415069948882,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.1708660749718547,
+        "lower_ms": 28.331410023383796
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 487.34269000124186
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.1708660749718547,
+       "lower_ms": 28.331410023383796
+      },
+      "compile": {
+       "compile_ms": 487.34269000124186
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 617.1522230142727,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2788160238415003,
+        "lower_ms": 29.537530965171754
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 431.28771998453885
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2788160238415003,
+       "lower_ms": 29.537530965171754
+      },
+      "compile": {
+       "compile_ms": 431.28771998453885
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 635.8541430672631,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2285109842196107,
+        "lower_ms": 28.79380399826914
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 399.43563006818295
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2285109842196107,
+       "lower_ms": 28.79380399826914
+      },
+      "compile": {
+       "compile_ms": 399.43563006818295
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 781.8596139550209,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.5402210410684347,
+        "lower_ms": 30.184748000465333
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 539.5702170208097
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.5402210410684347,
+       "lower_ms": 30.184748000465333
+      },
+      "compile": {
+       "compile_ms": 539.5702170208097
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 760.8074779855087,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.1824709363281727,
+        "lower_ms": 29.43003596737981
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 531.0719859553501
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.1824709363281727,
+       "lower_ms": 29.43003596737981
+      },
+      "compile": {
+       "compile_ms": 531.0719859553501
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 723.8269050139934,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2398670660331845,
+        "lower_ms": 29.54590308945626
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 506.21494301594794
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2398670660331845,
+       "lower_ms": 29.54590308945626
+      },
+      "compile": {
+       "compile_ms": 506.21494301594794
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 732.4867839924991,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2557549634948373,
+        "lower_ms": 29.224563972093165
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 541.6513429954648
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2557549634948373,
+       "lower_ms": 29.224563972093165
+      },
+      "compile": {
+       "compile_ms": 541.6513429954648
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 650.6754399742931,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2341489782556891,
+        "lower_ms": 30.07377393078059
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 469.12732103373855
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2341489782556891,
+       "lower_ms": 30.07377393078059
+      },
+      "compile": {
+       "compile_ms": 469.12732103373855
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 669.3794439779595,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.3093590969219804,
+        "lower_ms": 29.58689199294895
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 481.9996489677578
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.3093590969219804,
+       "lower_ms": 29.58689199294895
+      },
+      "compile": {
+       "compile_ms": 481.9996489677578
+      }
+     },
+     {
+      "target": "rocm",
+      "cell": "mo_class",
+      "compile_only": true,
+      "returncode": 0,
+      "exit_signal": null,
+      "crashed": false,
+      "wall_ms": 713.3244159631431,
+      "phases": [
+       {
+        "phase": "start",
+        "cell": "mo_class",
+        "target": "rocm",
+        "graph": "non_dominate_rank n=32: input-derived (32, 32) i1 dominance matrix, in-body reductions, bool->i32 cast chain, 3 carried values (count, rank, current), select in the body",
+        "device": "Device(kind='rocm', index=0)"
+       },
+       {
+        "phase": "lower",
+        "trace_ms": 1.2572879204526544,
+        "lower_ms": 28.81315804552287
+       },
+       {
+        "phase": "compile",
+        "compile_ms": 475.40210105944425
+       }
+      ],
+      "lower": {
+       "trace_ms": 1.2572879204526544,
+       "lower_ms": 28.81315804552287
+      },
+      "compile": {
+       "compile_ms": 475.40210105944425
+      }
+     }
+    ]
+   }
+  }
+ }
+}
