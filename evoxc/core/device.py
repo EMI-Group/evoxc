@@ -149,10 +149,12 @@ def _vulkan_devices() -> List[Device]:
     mask a caller-visible failure, because the query's only output is a count.
 
     Hint (runtime fact, not an evoxc policy — no paths are hard-coded here):
-    IREE 3.11 hard-codes a device-NAME denylist that hides Mesa's software
-    Vulkan rasterizer ``lavapipe`` (its device name starts with ``llvmpipe``),
-    so a software-Vulkan host honestly enumerates ``[]`` unless
-    ``VK_ICD_FILENAMES`` selects a differently-named ICD manifest.
+    the pinned ``iree-base`` 3.13.0 enumerates Mesa's software Vulkan
+    rasterizer ``lavapipe`` (its device name starts with ``llvmpipe``)
+    unconditionally, so a software-Vulkan host genuinely enumerates it with
+    ``VK_ICD_FILENAMES`` unset. Only iree 3.11 and earlier hard-coded a
+    device-NAME denylist that hid it (there, enumerating required
+    ``VK_ICD_FILENAMES`` pointing at a differently-named ICD manifest).
     """
     count: Optional[int] = None
     try:

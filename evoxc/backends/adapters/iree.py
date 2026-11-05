@@ -722,12 +722,16 @@ def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> An
     sufficient check).
 
     Zero enumerated devices, or an index outside the enumerated range, raises
-    an actionable ``core.BackendError``: IREE 3.11 HIDES software-rasterizer
-    devices whose name begins with ``llvmpipe``, so a host whose only Vulkan
-    device is one must point ``VK_ICD_FILENAMES`` at an ICD whose device name
-    IREE accepts (never a hard-coded path here — the hint names the variable
-    only). A ``create_device`` failure is surfaced as ``core.BackendError``
-    naming the requested device, never a raw iree exception.
+    an actionable ``core.BackendError``. On the pinned ``iree-base`` 3.13.0 no
+    device is hidden by name anymore, so an EMPTY enumeration means no usable
+    Vulkan device/ICD is visible to the loader in this process (check
+    ``iree.runtime.get_driver("vulkan").query_available_devices()`` and the
+    ``VK_ICD_FILENAMES`` ICD-visibility environment). The ``llvmpipe``
+    device-name denylist exists only in iree 3.11 and earlier, where a
+    lavapipe-only host needed ``VK_ICD_FILENAMES`` pointed at a renamed ICD
+    (never a hard-coded path here — the hint names the variable only). A
+    ``create_device`` failure is surfaced as ``core.BackendError`` naming the
+    requested device, never a raw iree exception.
     """
     import iree.runtime as rt
 
@@ -740,13 +744,18 @@ def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> An
             raise core.BackendError(
                 f"IREE's vulkan driver enumerated no devices (requested "
                 f"device {device!r}, index {index}): no Vulkan device is "
-                f"visible to IREE in this process. IREE 3.11 hides software-"
-                f"rasterizer devices by name (its vulkan driver drops every "
-                f"device whose name begins with 'llvmpipe'), so a host whose "
-                f"only Vulkan device is one must select an ICD whose device "
-                f"name IREE accepts via the VK_ICD_FILENAMES environment "
-                f"variable. Check what IREE sees with "
-                f'iree.runtime.get_driver("vulkan").query_available_devices()'
+                f"visible to IREE in this process. On the pinned "
+                f"iree-base-runtime 3.13.0 the driver no longer hides "
+                f"software devices by name, so an empty enumeration means no "
+                f"usable Vulkan device/ICD is visible to the loader here — "
+                f"check what IREE sees with "
+                f'iree.runtime.get_driver("vulkan").query_available_devices() '
+                f"and check ICD visibility in the VK_ICD_FILENAMES environment "
+                f"variable (unset lets the system loader discover the "
+                f"installed ICDs). The 'llvmpipe' device-name denylist applies "
+                f"only to iree 3.11 and earlier, where a host whose only "
+                f"Vulkan device is Mesa lavapipe had to point VK_ICD_FILENAMES "
+                f"at an ICD whose device name IREE accepts (a renamed ICD)."
             )
         if index < 0 or index >= len(infos):
             raise core.BackendError(
