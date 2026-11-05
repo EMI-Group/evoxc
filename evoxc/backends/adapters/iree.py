@@ -2363,7 +2363,7 @@ def _readback_device_array(array: Any, dtype: Any = None) -> np.ndarray:
     THE device->host readback: every host materialization of an iree buffer
     the adapter hands out (``IreeDevicePayload.to_host`` and its
     ``__array__``) routes through here. The adapter OWNS the copy — it never
-    calls ``DeviceArray.to_host()``, whose iree-base-runtime 3.13.0 fast path
+    calls ``DeviceArray.to_host()`` on an iree buffer, whose 3.13.0 fast path
     (``allocator.import_host_allocation``, taken whenever
     ``query_buffer_compatibility`` reports ``IMPORTABLE``) is unusable on the
     vulkan HAL: the vulkan allocator rejects the very buffer it advertised
@@ -2398,12 +2398,12 @@ def _readback_device_array(array: Any, dtype: Any = None) -> np.ndarray:
     view = getattr(array, "_buffer_view", None)
     hal_device = getattr(array, "_device", None)
     if view is None or hal_device is None:
-        raise core.DeviceError(
-            "the iree adapter's host readback needs the runtime's HAL buffer "
-            f"view and device, which this {type(array).__name__} does not "
-            "expose: install 'iree-base-runtime' >= 3.13 and read the tensor "
-            "back with t.to(core.Device('cpu', 0))."
-        )
+        # Not an iree runtime buffer but a duck-typed payload that only
+        # satisfies the PUBLIC protocol: let it perform its own copy. Every
+        # ``DeviceArray`` exposes the private view, so a real iree readback
+        # never takes this branch (a shape fallback, not a version check).
+        result = np.asarray(array.to_host())
+        return result if dtype is None else result.__array__(dtype)
     source = view.get_buffer()
     raw_dtype = _hal_element_dtype(view.element_type)
     shape = tuple(view.shape)
