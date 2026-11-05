@@ -114,8 +114,9 @@ imported at module top level, so ``import evoxc`` stays light):
   handle, already resident on the device. Run outputs are wrapped into
   ``core.Tensor(IreeDevicePayload(...))`` — device-resident tensors whose
   host copy is materialized LAZILY and EXPLICITLY: ``.numpy()`` performs the
-  fresh host copy (``DeviceArray.to_host()``) for CPU-kind outputs, while
-  non-cpu outputs are read back via the explicit
+  adapter's own readback (``_readback_device_array`` — a zero-copy mapping
+  on llvm-cpu, an explicit staging-buffer ``queue_copy`` on device memory)
+  for CPU-kind outputs, while non-cpu outputs are read back via the explicit
   ``t.to(core.Device('cpu', 0)).numpy()`` transfer (no implicit
   device-to-host transfer), so the hot run() path performs no host
   round-trip. Same-device DeviceArray inputs are handed to the invoke
@@ -1990,9 +1991,10 @@ class IreeExecutable(CompilerExecutable):
        DEVICE-RESIDENT tensor: ``.data`` is the payload (the DeviceArray
        already on the device), ``.device`` is this executable's
        ``core.Device`` (``Device("cpu", 0)`` for the default CPU device).
-       Host materialization is explicit: CPU-kind outputs get a LAZY fresh
-       host copy in ``.numpy()`` (``DeviceArray.to_host()`` — on
-       ``local-task`` the mapping is zero-copy for mappable buffers), while
+       Host materialization is explicit: CPU-kind outputs get a LAZY host
+       copy in ``.numpy()`` (``_readback_device_array`` — a zero-copy
+       mapping on ``local-task``, a staging-buffer ``queue_copy`` on device
+       memory), while
        non-cpu outputs raise ``DeviceError`` in ``.numpy()`` and are read
        back via ``t.to(core.Device('cpu', 0)).numpy()`` — the run() hot
        path never touches host memory either way.
@@ -2279,6 +2281,159 @@ def _wait_copy_semaphore(sem: Any) -> None:
     import iree.runtime as rt
 
     rt.HalFence.create_at(sem, 1).wait()
+
+
+def _buffer_is_host_mappable(buffer: Any) -> bool:
+    """True when ``buffer``'s memory can be read back by mapping it directly.
+
+    The predicate iree's own runtime uses for its mapped readback path: the
+    memory must be ``HOST_VISIBLE`` AND the buffer must have been allocated
+    with ``BufferUsage.MAPPING_SCOPED`` in its allowed usage. The
+    ``local-task`` (llvm-cpu) allocator satisfies both, so an llvm-cpu
+    readback stays a zero-copy mapping. A GPU allocation does not: a
+    cuda/rocm ``DEVICE_LOCAL`` buffer is not host-visible, and the vulkan
+    HAL's buffers are host-visible but carry no ``MAPPING_SCOPED`` usage —
+    both take the explicit ``queue_copy`` staging path in
+    ``_readback_device_array``.
+    """
+    import iree.runtime as rt
+
+    memory_type = int(buffer.memory_type())
+    allowed_usage = int(buffer.allowed_usage())
+    host_visible = int(rt.MemoryType.HOST_VISIBLE)
+    mapping_scoped = int(rt.BufferUsage.MAPPING_SCOPED)
+    return (memory_type & host_visible) == host_visible and (
+        allowed_usage & mapping_scoped
+    ) == mapping_scoped
+
+
+#: Reusable D2H staging buffers, held PER THREAD (see
+#: ``_readback_staging_buffer``): ``nbytes -> (HAL device, buffer)``.
+_READBACK_STAGING = threading.local()
+
+#: Bound on the per-thread staging cache (distinct byte lengths).
+_READBACK_STAGING_MAX = 4
+
+
+def _readback_staging_buffer(hal_device: Any, nbytes: int) -> Any:
+    """Return a reusable ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer.
+
+    ``_readback_device_array`` copies a device buffer into host staging
+    memory and maps it. Allocating that staging buffer per call is CORRECT
+    but expensive on the hip HAL: a host-visible allocation measures ~0.3
+    ms/MB (5 ms for 16 MB) against a ~0.35 ms queue_copy of the same 16 MB —
+    the allocation, not the transfer, would dominate every large rocm
+    readback (measured on IREE 3.13.0 / MI300X).
+
+    The buffer is safe to reuse: a readback is fully synchronous (the copy's
+    completion semaphore is awaited and the scoped mapping is released before
+    this helper returns), and every use overwrites the whole range.
+
+    THREAD-LOCAL because a HAL buffer and the device that owns it are both
+    thread-affine (the ``evoxc.io`` worker reads back separately) — the same
+    rationale as ``_rocm_source_buffer`` on the upload side. The owning HAL
+    device is checked by IDENTITY, so a thread that talks to two devices
+    never reuses across them. Bounded at ``_READBACK_STAGING_MAX`` distinct
+    sizes; clearing the cache is performance-only, never a correctness
+    change.
+    """
+    import iree.runtime as rt
+
+    cache = getattr(_READBACK_STAGING, "buffers", None)
+    if cache is None:
+        cache = {}
+        _READBACK_STAGING.buffers = cache
+    entry = cache.get(nbytes)
+    if entry is not None and entry[0] is hal_device:
+        return entry[1]
+    buffer = hal_device.allocator.allocate_buffer(
+        int(rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE),
+        int(rt.BufferUsage.TRANSFER_TARGET | rt.BufferUsage.MAPPING_SCOPED),
+        nbytes,
+    )
+    if len(cache) >= _READBACK_STAGING_MAX:
+        cache.clear()
+    cache[nbytes] = (hal_device, buffer)
+    return buffer
+
+
+def _readback_device_array(array: Any, dtype: Any = None) -> np.ndarray:
+    """Materialize a host ``np.ndarray`` from an iree runtime buffer (explicit D2H).
+
+    THE device->host readback: every host materialization of an iree buffer
+    the adapter hands out (``IreeDevicePayload.to_host`` and its
+    ``__array__``) routes through here. The adapter OWNS the copy — it never
+    calls ``DeviceArray.to_host()``, whose iree-base-runtime 3.13.0 fast path
+    (``allocator.import_host_allocation``, taken whenever
+    ``query_buffer_compatibility`` reports ``IMPORTABLE``) is unusable on the
+    vulkan HAL: the vulkan allocator rejects the very buffer it advertised
+    with ``... INVALID_ARGUMENT; host allocation import pointer does not
+    satisfy Vulkan minImportedHostPointerAlignment 4096``. Reported upstream;
+    this module needs no fallback and no version branch — it performs the
+    transfer with HAL primitives that are version-independent.
+
+    Two paths, chosen by ``_buffer_is_host_mappable``:
+
+    * MAPPABLE (llvm-cpu / host-local allocations): the buffer view is
+      mapped and returned as a ZERO-COPY numpy array — no allocation, no
+      ``queue_copy``, no copy, exactly the cost the runtime's own mapped
+      path had. The mapping stays alive through the returned array's base
+      chain (numpy keeps the exporter of the mapping's buffer alive).
+    * NOT MAPPABLE (cuda/rocm/vulkan device memory): a
+      ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer of the buffer's byte
+      length (reused per thread, see ``_readback_staging_buffer``) receives
+      the device buffer through ``queue_copy``, the copy's completion
+      semaphore is awaited via the shared query-first
+      ``_wait_copy_semaphore``, the staging buffer is mapped and copied out,
+      and the scoped mapping is released. No host-memory IMPORT is attempted
+      (that is the primitive that fails on vulkan).
+
+    ``dtype`` is the caller's requested output dtype (``None`` keeps the
+    buffer's own dtype); a payload whose dtype is an OVERRIDE of the buffer's
+    element type (e.g. bool results) is converted to the override first, so
+    the returned array always carries the dtype the payload reports.
+    """
+    import numpy as np
+
+    view = getattr(array, "_buffer_view", None)
+    hal_device = getattr(array, "_device", None)
+    if view is None or hal_device is None:
+        raise core.DeviceError(
+            "the iree adapter's host readback needs the runtime's HAL buffer "
+            f"view and device, which this {type(array).__name__} does not "
+            "expose: install 'iree-base-runtime' >= 3.13 and read the tensor "
+            "back with t.to(core.Device('cpu', 0))."
+        )
+    source = view.get_buffer()
+    raw_dtype = _hal_element_dtype(view.element_type)
+    shape = tuple(view.shape)
+    nbytes = int(source.byte_length())
+    if _buffer_is_host_mappable(source):
+        result = view.map().asarray(shape, raw_dtype)
+    elif nbytes == 0:
+        result = np.empty(shape, raw_dtype)
+    else:
+        import iree.runtime as rt
+
+        staging = _readback_staging_buffer(hal_device, nbytes)
+        sem = hal_device.create_semaphore(0)
+        hal_device.queue_copy(
+            source,
+            staging,
+            wait_semaphores=rt.HalFence.create_at(sem, 0),
+            signal_semaphores=rt.HalFence.create_at(sem, 1),
+        )
+        _wait_copy_semaphore(sem)
+        # Copy OUT of the mapped staging buffer: the mapping must not outlive
+        # this call (the buffer is reused, and a scoped mapping is released
+        # with it) — so the result is a real copy, never an alias.
+        result = np.array(staging.map().asarray(shape, raw_dtype), copy=True)
+    override = getattr(array, "_override_dtype", None)
+    if override is not None and np.dtype(override) != np.dtype(raw_dtype):
+        result = result.astype(override)
+    if dtype is not None:
+        result = result.__array__(dtype)
+    return result
 
 
 def _staged_input(
@@ -3266,11 +3421,13 @@ class IreeDevicePayload:
     Payload protocol (see ``evoxc/core/tensor.py``): ``.shape`` (tuple of
     ints), ``.dtype`` (numpy-normalizable — DeviceArray is override-aware,
     e.g. bool results), optional ``.device`` (the core.Device), and
-    ``to_host() -> np.ndarray`` tried first by ``Tensor.numpy()`` (with
-    ``np.asarray`` as the fallback, via ``__array__``). On ``local-task``
-    (llvm-cpu) buffers the to_host mapping is zero-copy for mappable memory;
-    on cuda/rocm/vulkan it is a fresh D2H copy per call (the explicit
-    ``t.to(Device("cpu", 0))`` download path — no per-kind code needed).
+    ``.to_host() -> np.ndarray`` tried first by ``Tensor.numpy()`` (with
+    ``np.asarray`` as the fallback, via ``__array__``). Both go through the
+    adapter's own readback (``_readback_device_array``): on ``local-task``
+    (llvm-cpu) buffers the readback is a ZERO-COPY mapping, while on
+    cuda/rocm/vulkan it is an explicit staging-buffer ``queue_copy`` — a
+    fresh D2H copy per call, the explicit ``t.to(Device("cpu", 0))`` download
+    path with no per-kind code.
     """
 
     __slots__ = ("_array", "_shape", "_dtype", "device")
@@ -3333,29 +3490,31 @@ class IreeDevicePayload:
     def to_host(self) -> np.ndarray:
         """Materialize a host copy of the device buffer (lazy D2H).
 
-        This is a thin delegation to ``DeviceArray.to_host()`` — the adapter
-        owns NO device->host copy of its own, deliberately, so a readback is
-        always the runtime's own (correct, zero-copy-when-mappable) path.
+        The adapter OWNS this copy: it goes through
+        ``_readback_device_array``, never through ``DeviceArray.to_host()``.
 
-        KNOWN UPSTREAM REGRESSION in iree-base-runtime 3.13.0 (rocm/cuda are
-        unaffected; observed on the Vulkan HAL): ``to_host()`` prefers
-        ``allocator.import_host_allocation`` whenever
-        ``query_buffer_compatibility`` reports ``IMPORTABLE``, and the Vulkan
-        allocator then rejects the very buffer it advertised with
+        Why not the runtime's helper: iree-base-runtime 3.13.0's
+        ``_copy_to_host`` prefers ``allocator.import_host_allocation``
+        whenever ``query_buffer_compatibility`` reports ``IMPORTABLE``, and the
+        vulkan allocator then rejects the very buffer it advertised with
         ``ValueError: could not import host allocation:
         .../hal/drivers/vulkan/allocator.c:1985: INVALID_ARGUMENT; host
         allocation import pointer does not satisfy Vulkan
-        minImportedHostPointerAlignment 4096``
-        (``iree/runtime/array_interop.py::_copy_to_host``). Reproduced with
-        plain iree and no evoxc in the process, while the manual staging path
-        (a ``HOST_LOCAL | DEVICE_VISIBLE`` destination + ``queue_copy`` +
-        ``map()``) reads the same buffer back correctly — so this is the
-        runtime's fast path, not the adapter's. Reported, not worked around: a
-        silent fallback copy here would hide an upstream defect and change
-        what ``.to(cpu)``/``.numpy()`` mean. cuda/rocm readbacks use the same
-        delegation and are unaffected.
+        minImportedHostPointerAlignment 4096`` (reproduced with plain iree and
+        no evoxc in the process). The explicit path here uses HAL primitives
+        that are unaffected — a ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer
+        + ``queue_copy`` + the mapping — so ONE implementation serves every
+        device kind with no version check and no fallback, and an upstream fix
+        costs this adapter nothing.
+
+        Cost per kind: an llvm-cpu (``local-task``) buffer is MAPPED and
+        returned zero-copy (no allocation, no copy — the same cost the
+        runtime's mapped fast path had), while cuda/rocm/vulkan device memory
+        pays one staging allocation + ``queue_copy`` + copy-out per call. The
+        returned array is always a fresh host array for those kinds; it never
+        aliases the device buffer.
         """
-        return self._array.to_host()
+        return _readback_device_array(self._array)
 
     def __dlpack_device__(self) -> tuple[int, int]:
         """Report the DLPack ``(device_type, device_id)`` of this buffer.
@@ -3462,10 +3621,12 @@ class IreeDevicePayload:
         """``np.asarray`` fallback for host materialization.
 
         ``core.Tensor`` prefers ``to_host()``; this keeps
-        ``np.asarray(payload)`` correct for direct payload users too (a
-        fresh host copy per call, like ``to_host``).
+        ``np.asarray(payload)`` correct for direct payload users too — the
+        same adapter-owned readback (``_readback_device_array``), so a
+        mappable llvm-cpu buffer stays zero-copy and device memory pays one
+        explicit D2H copy per call.
         """
-        return self._array.to_host().__array__(dtype)
+        return _readback_device_array(self._array, dtype=dtype)
 
 
 # Backward-compat alias: the payload was private (``_IreeDevicePayload``)
@@ -3533,10 +3694,13 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
        the plain ``rt.asdevicearray`` copy.
     5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
 
-    The DOWNLOAD direction needs no code here: ``t.to(Device("cpu", 0))`` on
-    a vulkan-resident tensor goes through the payload host-copy path
-    (``IreeDevicePayload.to_host()``) exactly like cuda/rocm, and
-    ``.numpy()`` on a non-cpu payload raises ``core.DeviceError`` as usual.
+    The DOWNLOAD direction needs no kind-specific code here: ``t.to(cpu)`` on
+    a vulkan-resident tensor goes through the payload's host copy
+    (``IreeDevicePayload.to_host()`` -> the adapter's own
+    ``_readback_device_array``: an explicit staging-buffer ``queue_copy`` on
+    device memory, a zero-copy mapping on llvm-cpu) exactly like cuda/rocm,
+    and ``.numpy()`` on a non-cpu payload raises ``core.DeviceError`` as
+    usual.
 
     Failures surface as ``core.DeviceError`` / ``core.BackendError`` with an
     actionable message — never a raw iree exception.
