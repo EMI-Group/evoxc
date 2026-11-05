@@ -89,7 +89,7 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      # This downloads a large toolchain (IREE base compiler/runtime 3.11.x +
+      # This downloads a large toolchain (IREE base compiler/runtime 3.13.x +
       # apache-tvm + jaxlib), which is the point: it is the ONLY job that
       # exercises the IREE/TVM adapter legs for real. The XLA adapter legs
       # self-skip here — they need a user-provided PJRT plugin

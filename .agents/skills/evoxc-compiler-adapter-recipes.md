@@ -152,14 +152,19 @@ cuda may share the same `create_device` cost but that is unvalidated and deliber
 
 ## iree version matrix & cuda-runtime history (upstream — do not re-investigate)
 
-- Extras pin `iree-base-compiler>=3.11.0,<3.12` + `iree-base-runtime>=3.11.0,<3.12`; compiler and runtime
-  must MATCH. Rationale lives in the pyproject comment. 3.11.x is the healthy release for the path that
-  matters now (SO algorithms running DEVICE-RESIDENT on cuda with many sequential `evoxc.run` calls: crash
-  repro 4/4 clean, evox SO harness smoke 6 cases / 0 crashes).
+- Extras pin `iree-base-compiler>=3.13.0,<3.14` + `iree-base-runtime>=3.13.0,<3.14`; compiler and runtime
+  must MATCH and artifacts are version-specific. Rationale lives in the pyproject comment. 3.13.0 is the
+  release validated on this host for the paths that matter now — llvm-cpu end-to-end and ROCm/HIP
+  DEVICE-RESIDENT on the MI300X (gfx942 / ROCm 7.1): elementwise+reduce, an int32-counter `while_loop`,
+  `scan`, `while`-in-`cond`, SO-shaped steps and the MO/NSGA2-class `non_dominate_rank` while, all with
+  numpy parity and 0 crashes in 30 compiles (`evoxc/bench/iree313_rocm_findings.md`). The 3.13 CUDA leg was
+  NOT re-exercised (no NVIDIA GPU on this box), so every CUDA claim below stays a 3.11 measurement.
 - `iree-base-compiler` 3.10.0 and 3.11.0 SIGSEGV (exit -11) in `IREE::Stream::AffinityAnalysis::run()`
   (unbounded `Explorer::walkTransitiveUses → updateFromUse → updateElement → updateValue` recursion) on
-  while-heavy MO graphs (≥3 loop-carried values + `select` in a body; SO graphs compile fine). No evoxc
-  control dodges it (`sort_emission`, `while_init_rewrite`, `opt_level`, `iree_compile_args` all tested).
+  while-heavy MO graphs (≥3 loop-carried values + `select` in a body; SO graphs compile fine) — NOT
+  reproducible on 3.13.0 (10/10 compiles on llvm-cpu and 10/10 on rocm, and the artifact runs on rocm
+  bit-exactly). No evoxc control dodged it on 3.10/3.11 (`sort_emission`, `while_init_rewrite`, `opt_level`,
+  `iree_compile_args` all tested).
 - 3.9.0 compiles NSGA2/MOEAD-class tell graphs 12/12 clean with full numpy parity (user-pinnable for
   compiler-only MO work) — BUT its cuda RUNTIME SIGSEGVs ~9/10 on SO step graphs at the first `evoxc.run`
   (any scale; error-path use-after-free/race in `iree._runtime_libs._runtime*.so`), and it still SIGSEGVs on
@@ -171,7 +176,8 @@ cuda may share the same `create_device` cost but that is unvalidated and deliber
   (`transient_buffer.c:80 FAILED_PRECONDITION … hal.fence.await`) and `local-sync` fails MOEAD
   (`ref is null` at `hal.buffer_view.create`). Cross-version loading is not a workaround (3.9.0 bytecode v15
   rejected by the 3.11 verifier / 3.12 runtime).
-- MO/while-heavy compile class stays upstream-blocked → use the numpy backend or the xla route.
+- MO/while-heavy compile class was upstream-blocked on 3.10/3.11 (there, use the numpy backend or the xla
+  route); on the pinned 3.13.0 it compiles and runs — see the first bullet of this section.
 - Legacy releases: also validated on 20241104.1068 (old `iree-compiler`/`iree-runtime` names).
 
 ## Adapter gotchas / environment (detail)
@@ -186,6 +192,15 @@ cuda may share the same `create_device` cost but that is unvalidated and deliber
   verifier `ValueError` into an actionable `BackendError` (original as `__cause__`).
 - **nanobind refleak noise:** `iree-base-runtime` 3.x prints "nanobind: leaked N instances/functions/keep_alive
   records …" to stderr at interpreter shutdown — upstream diagnostics, harmless, not a test failure.
+- **Device→host readback is ADAPTER-OWNED on 3.13** — never reintroduce `DeviceArray.to_host()`: 3.13's
+  `_copy_to_host` prefers `allocator.import_host_allocation` whenever the compatibility flags say
+  `IMPORTABLE`, and the Vulkan allocator then rejects the buffer it advertised
+  (`allocator.c:1985 INVALID_ARGUMENT; host allocation import pointer does not satisfy Vulkan
+  minImportedHostPointerAlignment 4096`). `iree.py::_readback_device_array` maps host-mappable buffers
+  zero-copy (llvm-cpu, 16 MB 0.001 → 0.003 ms) and stages device buffers through a thread-local
+  `HOST_LOCAL|DEVICE_VISIBLE` buffer + `queue_copy` + `map` (16 MB rocm 0.37 → 1.51 ms — a real DMA
+  copy-out; small rocm readbacks are slightly faster, 4 KB 44.4 → 39.3 µs). Detail: adapter CONTEXT
+  Known Issue 21.
 - **CUDA HAL thread-affinity:** any allocating HAL op from a thread with no prior CUDA activity fails with
   `CUDA_ERROR_INVALID_CONTEXT` (`to_host()`, `asdevicearray`, module invoke), even when the HAL device was
   created by another thread — the allocator requires a CUDA context CURRENT on the calling thread
@@ -244,7 +259,7 @@ Committed adapter tests live in the SIBLING `tests/backends/` (test-related writ
   injected-error ⇒ BackendError, version gate, missing-plugin message.
 - TVM: numpy parity (matmul+relu+reduce_sum static; dynamic-shape graph with scalar broadcast at sizes 3 and 7),
   artifact save/load round-trip, jax-blocked run (`sys.modules["jax"] = None` ⇒ full pipeline still works).
-- Full suite status snapshot (this machine, iree 3.11.0 + tvm 0.26 + jaxlib installed, torch absent): see the
+- Full suite status snapshot (this machine, iree-base 3.13.0 + tvm 0.26 + jaxlib installed, torch absent): see the
   repo root `CONTEXT.md` for the current counts. NOTE: with pytest 9.1.1, `-q` (the pyproject `addopts`)
   suppresses the final "N passed" line — run with `-v` or `-o addopts=` to see it.
 - Under the current explicit-placement semantics, GPU tests written for the OLD host-input semantics fail with

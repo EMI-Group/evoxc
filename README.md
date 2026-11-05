@@ -389,7 +389,7 @@ Committed results, raw records and the probe scripts live in [`evoxc/bench/`](ev
 The same graph runs on CPU, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV — what changes is a `backend=` and a `device=`, never a rewrite. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`, and `evoxc.devices()` enumerates what this host actually has.
 
 - **numpy interpreter** — the default backend and the always-available CPU fallback: no compiler, no codegen, every symbolic shape. `pip install evoxc` (numpy only) is the whole install.
-- **IREE** — llvm-cpu, NVIDIA CUDA, AMD ROCm/HIP and Vulkan-SPIRV, all validated end-to-end (the Vulkan path on Mesa lavapipe, a software device). `pip install evoxc[iree]`.
+- **IREE** — llvm-cpu, NVIDIA CUDA, AMD ROCm/HIP and Vulkan-SPIRV, all validated end-to-end (the Vulkan path on Mesa lavapipe, a software device). The `evoxc[iree]` pin is `iree-base` 3.13.0, on which the llvm-cpu and ROCm/HIP legs were re-validated device-resident — `while_loop`, `scan`, `while` nested in `cond` and the MO/NSGA2-class `non_dominate_rank` loop now compile and run with bit-exact integers, and the compile-crash class of 3.10/3.11 is gone (0 crashes in 30 compiles; records in [`evoxc/bench/iree313_rocm_findings.md`](evoxc/bench/iree313_rocm_findings.md)). CUDA was validated on the 3.11 release and is not re-exercised on 3.13 here (no NVIDIA GPU on the validating host). `pip install evoxc[iree]`.
 - **XLA** — the PJRT C API driven directly over a **user-provided** plugin `.so` (`EVOXC_PJRT_PLUGIN` or `plugin_path`): CUDA and ROCm validated against real plugins, CPU plumbing validated with a compiled test plugin. No `jax`/`jaxlib`.
 - **TVM** — CPU end-to-end; ROCm compile-only, because the wheel is built `USE_ROCM=OFF`. `pip install evoxc[tvm]`.
 
@@ -466,7 +466,7 @@ pytest
 | `dev` | `pytest` | the test suite |
 | `interop` | `torch` | DLPack interop tests |
 | `bench` | `torch` | `evoxc.bench`'s PyTorch comparison column |
-| `iree` | `iree-base-compiler` + `iree-base-runtime` (3.11.x) | the IREE adapter on llvm-cpu / cuda / rocm / vulkan |
+| `iree` | `iree-base-compiler` + `iree-base-runtime` (3.13.x) | the IREE adapter on llvm-cpu / cuda / rocm / vulkan |
 | `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib only for its bundled MLIR bindings; `jax` is never imported) |
 | `compilers` | IREE + TVM | both adapters at once |
 | *(xla)* | **no extra** | the XLA adapter loads a user-provided PJRT C API plugin `.so` (`EVOXC_PJRT_PLUGIN` or `plugin_path`) |

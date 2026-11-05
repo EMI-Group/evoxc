@@ -1,6 +1,6 @@
 ---
 name: evoxc-vulkan-device-recipe
-description: Machine-local recipe for validating evoxc's first-class "vulkan" device kind (IREE Vulkan/SPIR-V HAL) — throwaway 3.11 iree venv, the lavapipe software-device denylist workaround (renamed ICD), target-profile compile notes, and the run/env verification probes. Use when implementing or testing anything on Device("vulkan", N), or when a vulkan build/run fails on a machine with no usable Vulkan GPU. Companion to evoxc/backends/adapters/CONTEXT.md (Known Issue 16).
+description: Machine-local recipe for validating evoxc's first-class "vulkan" device kind (IREE Vulkan/SPIR-V HAL) — throwaway 3.13 iree venv, the lavapipe software-device renamed-ICD recipe (a 3.11 denylist workaround, still useful to pin the loader away from a wedged radeon ICD), target-profile compile notes, and the run/env verification probes. Use when implementing or testing anything on Device("vulkan", N), or when a vulkan build/run fails on a machine with no usable Vulkan GPU. Companion to evoxc/backends/adapters/CONTEXT.md (Known Issues 16 and 21).
 ---
 # evoxc "vulkan" device recipe (machine-local)
 
@@ -14,17 +14,17 @@ description: Machine-local recipe for validating evoxc's first-class "vulkan" de
 ```bash
 uv venv $TMPDIR/vk-venv --python 3.14
 uv pip install --python $TMPDIR/vk-venv/bin/python \
-  "iree-base-compiler>=3.11,<3.12" "iree-base-runtime>=3.11,<3.12" numpy pytest
+  "iree-base-compiler>=3.13,<3.14" "iree-base-runtime>=3.13,<3.14" numpy pytest
 export PYTHONPATH=$PWD        # evoxc from the checkout — never install evoxc, never a venv inside the repo
 ```
 `iree-base-compiler` and `iree-base-runtime` MUST be the same series (compiled artifacts are version-specific).
 
 ## Software-device gotcha (no usable GPU Vulkan)
-IREE 3.11 hard-codes a device-NAME denylist (`strstr(name,"llvmpipe")==name` → hidden) with **no env override**, and Mesa lavapipe's name starts with `llvmpipe`. Workaround, machine-local scratch:
+IREE 3.11 hard-coded a device-NAME denylist (`strstr(name,"llvmpipe")==name` → hidden) with **no env override**, and Mesa lavapipe's name starts with `llvmpipe`. **IREE 3.13 (the pinned release) no longer hides lavapipe**: `query_available_devices()` enumerates the software device with `VK_ICD_FILENAMES` unset, so the rename below is only a 3.11 fallback. The renamed-ICD recipe is still worth keeping on this host for a different reason — it pins the loader to lavapipe instead of the wedged radeon ICD. Machine-local scratch:
 1. Copy lavapipe's `libvulkan_lvp.so` + its ICD json into `$TMPDIR/vk-lvp/`.
 2. Byte-patch the device-name string `llvmpipe` → `lavapipe` in the copied `.so` (same length, so a plain in-place patch works).
 3. Point the ICD json's `library_path` at the patched `.so`; export `VK_ICD_FILENAMES=$TMPDIR/vk-lvp/lavapipe_icd.json`.
-**ALWAYS export it** — unset, the loader may dlopen a radeon ICD and HANG; wrap any Vulkan/DRM probe in `timeout`.
+**ALWAYS export it** — unset, the loader may dlopen a radeon ICD and HANG (this happens regardless of the denylist); wrap any Vulkan/DRM probe in `timeout`.
 lavapipe is `deviceType=CPU`: provenance is "software Vulkan on the CPU", never a GPU number.
 
 ## Verify
@@ -42,9 +42,10 @@ End-to-end proof: build → run → outputs are device-resident `IreeDevicePaylo
 
 ## Run time
 `Device("vulkan", N)` maps through `query_available_devices()[N]` — vulkan HAL device ids are queried per-process UUID hashes, NOT the cuda/rocm `index + 1` ordinal. One HAL device is cached per `(index, runtime_args)` in a thread-local cache shared by `load()` and `Tensor.to` (HAL devices are thread-affine).
+Device→host readback is ADAPTER-OWNED (iree 3.13's `DeviceArray.to_host()` is broken on the Vulkan HAL — `allocator.c:1985 INVALID_ARGUMENT; … minImportedHostPointerAlignment 4096`): `.to(cpu)`, and `.numpy()` on a cpu-kind output, go through `iree.py::_readback_device_array`, which maps host-mappable buffers zero-copy and otherwise stages through an explicit `queue_copy`. On this host a 16 MB vulkan readback via the staging path measured 2.44 ms (adapter CONTEXT Known Issue 21).
 
 ## This box's host verdict
 The AMD MI300X cannot run Vulkan at all: RADV policy-rejects CDNA3, AMDVLK has no CDNA path, and the amdgpu DRM device is wedged in a stuck reset (which also takes hip/ROCm and cuda down with it). So vulkan work here = lavapipe software path only; full evidence in `bench_logs/vulkan_findings.md`.
 
 ## Pointers
-Adapter known issues (16 = vulkan denylist / hang / profile budget): `evoxc/backends/adapters/CONTEXT.md`. Binding public contract: `evoxc/CONTEXT.md` → "Device kinds (binding)". Longer CPU/GPU run recipes: skill `evoxc-compiler-adapter-recipes`.
+Adapter known issues (16 = vulkan device visibility / hang / profile budget; 21 = the adapter-owned device→host readback): `evoxc/backends/adapters/CONTEXT.md`. Binding public contract: `evoxc/CONTEXT.md` → "Device kinds (binding)". Longer CPU/GPU run recipes: skill `evoxc-compiler-adapter-recipes`.

@@ -68,27 +68,37 @@ dev = ["pytest>=7"]
 # are deprecated and STALE (last release 20241104.1068, Nov 2024); the
 # current names are `iree-base-compiler`/`iree-base-runtime` (Python
 # namespaces unchanged: iree.compiler / iree.runtime). 2.9.0 is the first
-# release under the new names. Pin 3.11.x (>=3.11.0,<3.12): iree 3.11.0 was
-# EMPIRICALLY validated on this repo's SO-algorithm CUDA path (fresh-process
-# crash repro 3/3 clean at ~1000x50/~10000x100 device-resident same-device
-# runs — the 3.9.0 class of upstream init-state finalization segfaults is
-# GONE — plus a 6-case evox SO harness smoke run in ONE process with 0
-# crashes: 5/6 cases device-resident at 0.6-3.4 ms/step with parity ok, the
-# 6th (CMAES/Sphere/10000x100) completed but at 5628 ms/step with parity
-# rel 0.185 (ok=False) — a slow-path anomaly flagged for follow-up, not a
-# crash; see the SO-harness records archived in the separate `evoxc-bench`
-# repository and evoxc/backends/adapters/CONTEXT.md Known Issue #10).
-# WARNING (unchanged): iree 3.10.0/3.11.0 still ship an
-# upstream COMPILER bug (unbounded Stream AffinityAnalysis DFX recursion →
-# iree-compile SIGSEGV on while-loop-heavy programs: stablehlo.while with
-# >=3 loop-carried values + select in the body — the MO/NSGA2-class); the
-# MO-on-iree path is upstream-blocked and OUT OF SCOPE (xla remains the
-# recommended compiled backend for MO per the evox benchmark notes; a user
-# needing iree for MO-only compile work may pin 3.9.0 explicitly — artifacts
-# are version-specific and compiler/runtime must match, so version selection
-# is a user decision; evoxc's validated/default path is 3.11.x). Compiler and
-# runtime versions must MATCH (cross-version artifacts are rejected at load)
-# — see Known Issue #10 in evoxc/backends/adapters/CONTEXT.md.
+# release under the new names. Pin 3.13.x (>=3.13.0,<3.14): 3.13.0 is the
+# release evoxc's default paths are validated on — llvm-cpu end-to-end and
+# ROCm/HIP device-resident on an AMD Instinct MI300X (gfx942, ROCm 7.1.0),
+# covering elementwise+reduce, an int32-counter while_loop, scan, a while
+# nested in cond, SO-algorithm-shaped steps and the MO/NSGA2-class
+# non_dominate_rank while, all device-resident with numpy parity (integers
+# bit-exact, fp32 reduction-order deltas <= 1e-4 abs). Evidence:
+# evoxc/bench/iree313_rocm_findings.md (with its probe and JSON records) and
+# evoxc/backends/adapters/CONTEXT.md Known Issues #10 and #21.
+# The previous pin was 3.11.x, which shipped two upstream defects: the
+# ROCm/HIP HAL aborted at run on loop-carried int32 while/scan graphs (raw
+# hip/event_semaphore.c:786: ABORTED ... hal.fence.await), and iree-compile
+# 3.10.0/3.11.0 SIGSEGV'd NONDETERMINISTICALLY in
+# IREE::Stream::AffinityAnalysis::run() on stablehlo.while-heavy programs
+# (>=3 loop-carried values + select in the body — the MO/NSGA2 class), so a
+# single successful compile proved nothing. Neither defect reproduces on
+# 3.13.0: those while/scan/MO-class shapes compile and run, 0 crashes in 30
+# compiles (while-in-cond 5/5 on llvm-cpu and 5/5 on rocm, MO class 10/10 and
+# 10/10), and the MO artifact now executes on ROCm bit-exactly, so the
+# MO/while-heavy path is no longer upstream-blocked on iree (xla remains an
+# equally supported compiled backend, not a required one).
+# Scope of that re-validation: llvm-cpu and ROCm only. The 3.13.0 CUDA leg
+# was NOT re-exercised (the validating host has no NVIDIA GPU), so every CUDA
+# statement in this repository stays scoped to the iree 3.11 release it was
+# measured on; multi-rank/collectives, cross-version artifact interop, the
+# xla/tvm legs and the HF/benchmark campaigns were likewise not re-run.
+# Compiler and runtime versions must MATCH and artifacts are version-specific
+# (cross-version artifacts are rejected at load on a bytecode-version
+# mismatch); a user who needs another release may pin it explicitly in their
+# own environment — version selection is a user decision. See Known Issue #10
+# in evoxc/backends/adapters/CONTEXT.md.
 iree = ["iree-base-compiler>=3.13.0,<3.14", "iree-base-runtime>=3.13.0,<3.14"]
 # tvm needs apache-tvm (StableHLO frontend + Relax VM) and jaxlib — jaxlib
 # ONLY for its bundled LLVM MLIR python bindings (the vendored
