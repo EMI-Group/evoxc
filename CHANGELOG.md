@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Changed
+- The numpy reference interpreter no longer pays a full operand/validation walk per op: each block executes a cached dispatch plan (kernel resolved once, operand/result value ids, a static-result shape+dtype fast path) over one flat SSA-id value store, dead intermediates are released at their last use, and the kernels keep only the error path for broadcast validation. On the TensorNEAT 0.2.0 workload this is −30 % (`xor_p500`), −58 % (`cartpole_p100`) and −8 % (`custom_pagie_p500`, which is numpy-compute-bound) ms/generation, with bit-identical fitness trajectories, lower peak RSS and unchanged executed op counts.
+- ndarray-backed `core.Tensor` construction shares one immutable `Device("cpu", 0)` instance (0.55 → 0.18 µs per tensor); no public API change.
+### Fixed
+- `evoxc.remainder` now gives the same values on every backend: its contract is numpy floormod (result takes the sign of the divisor), which the numpy kernel already implemented, and the StableHLO export now emits `stablehlo.remainder` (fmod) plus the inline sign correction instead of bare fmod, so negative operands agree between the numpy interpreter and iree. The op docs state floormod semantics correctly.
+### Added
+- Regression tests for the interpreter's dispatch plan and dead-value release, for the floormod `remainder` export (goldens, `BackendError` for dtypes numpy has no remainder for, iree llvm-cpu parity) and for the shared host `Device` instance.
 ## [0.1.0] - 2026-10-29
 
 First release: the explicit `trace → Graph → lower → LoweredProgram → compile →
