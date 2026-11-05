@@ -57,6 +57,14 @@ __all__ = [
 ]
 
 
+#: The one shared host device instance used on the ndarray fast path.
+#: ``Device`` is a frozen dataclass (immutable and hashable), so every
+#: ndarray-backed tensor can point at this single instance instead of paying
+#: a ``Device("cpu", 0)`` construction per tensor; equality/hash semantics are
+#: unchanged (``Device("cpu", 0) == _CPU0``).
+_CPU0 = Device("cpu", 0)
+
+
 def _default_dtype(inferred: Any) -> np.dtype:
     """The concrete-creator default-dtype rule for Python array-like data.
 
@@ -282,7 +290,7 @@ class Tensor:
         if isinstance(data, np.ndarray):
             # R1 physical truth: ndarray-backed data IS host memory, so the
             # tensor can only live on Device('cpu', 0).
-            if device is not None and device != Device("cpu", 0):
+            if device is not None and device != _CPU0:
                 raise DeviceError(
                     f"Tensor data is host (numpy) memory and physically "
                     f"lives on Device('cpu', 0), not on {device!r}: a "
@@ -293,7 +301,7 @@ class Tensor:
                     "transfer."
                 )
             self.data = data
-            self.device = Device("cpu", 0)
+            self.device = _CPU0
             return
         # Device payload (duck-typed protocol): must at least describe
         # itself (shape/dtype). Host materialization (to_host or
@@ -343,7 +351,10 @@ class Tensor:
     @property
     def dtype(self) -> np.dtype:
         """The tensor dtype (a :class:`numpy.dtype`)."""
-        return _dtype(self.data.dtype)
+        dt = self.data.dtype
+        if isinstance(dt, np.dtype):
+            return dt
+        return _dtype(dt)
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -700,7 +711,7 @@ def from_dlpack(obj: Any) -> Tensor:
         raise DeviceError(
             f"Failed to consume the DLPack capsule from {type(obj).__name__}: {exc}"
         ) from exc
-    return Tensor(array, device=Device("cpu", 0))
+    return Tensor(array, device=_CPU0)
 
 
 def _check_creator_device(creator: str, device: Optional[Device]) -> None:
@@ -713,7 +724,7 @@ def _check_creator_device(creator: str, device: Optional[Device]) -> None:
     ``Tensor.__init__``'s message leak through. Placing data on another
     device is an explicit post-creation ``Tensor.to(...)`` transfer.
     """
-    if device is None or device == Device("cpu", 0):
+    if device is None or device == _CPU0:
         return
     raise DeviceError(
         f"evoxc.{creator}(...) creates host (numpy) memory, which can only "
