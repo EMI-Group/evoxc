@@ -45,7 +45,7 @@ End-to-end proof: build → run → outputs are device-resident `IreeDevicePaylo
 Device→host readback is ADAPTER-OWNED (iree 3.13's `DeviceArray.to_host()` is broken on the Vulkan HAL — `allocator.c:1985 INVALID_ARGUMENT; … minImportedHostPointerAlignment 4096`): `.to(cpu)`, and `.numpy()` on a cpu-kind output, go through `iree.py::_readback_device_array`, which maps host-mappable buffers zero-copy and otherwise stages through an explicit `queue_copy`. On this host a 16 MB vulkan readback via the staging path measured 2.44 ms (adapter CONTEXT Known Issue 21).
 
 ## This box's host verdict
-The AMD MI300X cannot run Vulkan at all: RADV policy-rejects CDNA3, AMDVLK has no CDNA path, and the amdgpu DRM device is wedged in a stuck reset (which also takes hip/ROCm and cuda down with it). So vulkan work here = lavapipe software path only; full evidence in `bench_logs/vulkan_findings.md`.
+The AMD MI300X cannot run Vulkan at all: RADV policy-rejects CDNA3, AMDVLK has no CDNA path, and the amdgpu DRM device is wedged in a stuck reset. That DRM wedge is VULKAN-ONLY — the ROCm/HIP leg is validated device-resident on this same host (Known Issue 16 / `evoxc/bench/iree313_rocm_findings.md`), and CUDA is simply absent (no NVIDIA GPU). So vulkan work here = lavapipe software path only; full evidence in `bench_logs/vulkan_findings.md`.
 
 ## Pointers
 Adapter known issues (16 = vulkan device visibility / hang / profile budget; 21 = the adapter-owned device→host readback): `evoxc/backends/adapters/CONTEXT.md`. Binding public contract: `evoxc/CONTEXT.md` → "Device kinds (binding)". Longer CPU/GPU run recipes: skill `evoxc-compiler-adapter-recipes`.

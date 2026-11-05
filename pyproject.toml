@@ -74,7 +74,8 @@ dev = ["pytest>=7"]
 # covering elementwise+reduce, an int32-counter while_loop, scan, a while
 # nested in cond, SO-algorithm-shaped steps and the MO/NSGA2-class
 # non_dominate_rank while, all device-resident with numpy parity (integers
-# bit-exact, fp32 reduction-order deltas <= 1e-4 abs). Evidence:
+# bit-exact, fp32 leaves within reduction-order rounding — relative error
+# <= 1e-6, absolute deltas scaling with the operand magnitude). Evidence:
 # evoxc/bench/iree313_rocm_findings.md (with its probe and JSON records) and
 # evoxc/backends/adapters/CONTEXT.md Known Issues #10 and #21.
 # The previous pin was 3.11.x, which shipped two upstream defects: the
