@@ -48,7 +48,7 @@ Execution model (binding, parent CONTEXT.md):
 - ``bindings: dict[str, int]`` — symbolic-dim bindings for the current
   execution (extended positionally by ``run_region`` from region-arg shapes).
 - ``rank_context: RankContext`` — the effective execution context (from
-  ``exec_context.get_rank_context()``, honoring the per-per-``run`` override).
+  ``exec_context.get_rank_context()``, honoring the per-``run`` override).
 - ``module: ir.Module`` — the module being executed.
 - ``run_region(region, arg_tensors) -> list[Tensor]`` — binds the region's
   entry-block arguments to tensors, extends ``bindings``, and executes the
@@ -357,8 +357,17 @@ def _build_plan(block: ir.Block) -> _BlockPlan:
     release candidates — enclosing-block values stay until their own block's
     plan releases them.
     """
-    terminator = block.terminator
-    body = block.ops[:-1] if terminator is not None else list(block.ops)
+    ops = block.ops
+    # The FIRST ``return`` op ends the block — exactly the op the historical
+    # loop stopped at (ops after it are never executed; a verified module
+    # never has any, and a block with no ``return`` at all is handled below).
+    terminator = None
+    body: List[ir.Op] = []
+    for op in ops:
+        if op.name == "return":
+            terminator = op
+            break
+        body.append(op)
 
     last_use: Dict[int, int] = {}
     for index, op in enumerate(body):
