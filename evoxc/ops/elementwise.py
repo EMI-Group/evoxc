@@ -248,9 +248,10 @@ def power(x, y) -> "core.SymbolicTensor":
 
 
 def remainder(x, y) -> "core.SymbolicTensor":
-    """Elementwise remainder of division (numpy ``remainder`` semantics:
-    result has the sign of the dividend). Dtype/shape rules identical to
-    :func:`add`."""
+    """Elementwise remainder of division: numpy ``remainder`` is floormod —
+    the result has the sign of the DIVISOR and satisfies
+    ``x == (x // y) * y + x % y`` (Python ``%`` semantics). Dtype/shape
+    rules identical to :func:`add`."""
     return _binary("remainder", x, y)
 
 
