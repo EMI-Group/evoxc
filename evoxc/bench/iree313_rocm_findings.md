@@ -113,9 +113,11 @@ and `.numpy()` allowed, as documented.
   record, **not** re-validated: Known Issue 8f's CUDA-HAL while shapes (`while_fib` SIGSEGV,
   `while_cond_combo` ABORT), 8g (2-operand-sort bufferization), 9 (cuda `eigh`/NSGA2 O2/O3 codegen).
   Nothing here should be read as "fixed on CUDA".
-- **No Vulkan.** There is no usable Vulkan device on this box (Mesa RADV policy-rejects CDNA3,
-  AMDVLK/PAL has no `FAMILY_AI` IP level, software lavapipe is denylisted by IREE 3.11/3.13 without
-  an ICD rename); no vulkan cell was attempted.
+- **No Vulkan cell.** No GPU-Vulkan driver serves this box's GPU (Mesa RADV policy-rejects CDNA3,
+  AMDVLK/PAL has no `FAMILY_AI` IP level), so nothing here is a Vulkan execution result; the software
+  path IS visible on the adopted runtime — iree-base 3.13.0 enumerates this host's Mesa lavapipe with
+  `VK_ICD_FILENAMES` UNSET, the 3.11 `llvmpipe` device-name denylist having been dropped (Known Issue
+  16a) — but no vulkan cell was attempted (see "Vulkan device visibility" below).
 - **No multi-rank / collectives** (single rank, no runtime channels) and **no cross-version
   interop** (a 3.11-compiled artifact loaded on the 3.13 runtime was not tried — every cell here is a
   fresh compile on 3.13.0).
@@ -131,6 +133,37 @@ and `.numpy()` allowed, as documented.
 - **The other 3.11 Known Issues were not re-measured** (2 `rng_bit_generator`/PHILOX legalization,
   13 rank-0-result reduction cost + `split_reduction`, 19 the 16-binding HIP/CUDA wall, …) — they
   remain as recorded in `../../backends/adapters/CONTEXT.md`.
+
+## Vulkan device visibility (checked — a visibility probe, not an execution cell)
+
+On the adopted runtime the software device needs NO ICD override: iree-base 3.13.0 enumerates this
+host's Mesa lavapipe with `VK_ICD_FILENAMES` unset, because the 3.11 device-NAME denylist that hid
+names starting `llvmpipe` is gone (Known Issue 16a).
+`evoxc/bench/probe_vulkan_device_visibility.py` enumerates in a CHILD process under `--timeout`
+(a wedged vendor ICD makes this host's Vulkan loader hang, so an in-process probe is unsafe) on two
+legs — `VK_ICD_FILENAMES` unset, and pinned at a renamed-ICD copy of lavapipe:
+
+```bash
+env -u VK_ICD_FILENAMES python evoxc/bench/probe_vulkan_device_visibility.py \
+    --icd "$TMPDIR/vk-lvp/lavapipe_icd.json"          # the renamed-ICD leg is the 3.11 fallback
+```
+
+Verbatim (iree-base-runtime 3.13.0, Python 3.14.8, this box) — UNSET first, renamed ICD second:
+
+```
+{"devices": [{"device_id": 1, "name": "llvmpipe (LLVM 20.1.2, 256 bits) (llvmpipe Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2))", "path": "GPU-6d65736132352e322e382d3075627500"}], "icd_env": null, "iree_base_runtime": "3.13.0", "returncode": 0, "timed_out": false}
+{"devices": [{"device_id": 1, "name": "lavapipe (LLVM 20.1.2, 256 bits) (lavapipe Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2))", "path": "GPU-6d65736132352e322e382d3075627500"}], "icd_env": "$TMPDIR/vk-lvp/lavapipe_icd.json", "iree_base_runtime": "3.13.0", "returncode": 0, "timed_out": false}
+```
+
+Both legs return the SAME device (`device_id` 1, identical `path` hash) — only the name prefix differs,
+so on 3.13.0 the rename buys nothing but a different device name.
+`tests/backends/test_iree_vulkan_device_resident.py` confirms it end to end: **6/6 passed in 1.3 s with
+`VK_ICD_FILENAMES` unset** (its guard enumerates through this same child probe).
+The renamed-ICD recipe therefore stays only as a 3.11-era fallback and as a way to pin this host's
+loader away from its wedged radeon ICD; the child+timeout pattern stays mandatory because that loader
+hang is a real hazard on this box (the unset leg simply did not hang on this run).
+lavapipe is `deviceType=CPU`, so a future vulkan cell here would be a correctness target, never a
+performance one (Known Issues 16a/16c/16e, `../../backends/adapters/CONTEXT.md`).
 
 ## Verdict
 
