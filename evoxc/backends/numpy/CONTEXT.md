@@ -70,15 +70,21 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 - The pipeline wrapper's plan caching (input/output plans, `_prepare_flat_inputs`/`_unflatten_outputs`) belongs to `evoxc/pipeline.py`, not to this backend: the numpy backend's own per-call work is the per-op loop above, so a merged `batch_functions` graph's numpy runtime is `emitted_ops` × (Python dispatch overhead + numpy work on row-stacked arrays).
 - Recorded measurements live in sibling nodes, not here: numpy merged-graph per-program-row / per-call runtimes (including the `bands` matrix) are in `../../transforms/CONTEXT.md`, and the leaf-driven `evoxc.run` wrapper cost is in `../../CONTEXT.md` "Notes for agents".
 
-**Measured interpreter passover** — TensorNEAT generation graphs through this backend (`run_benchmark.py --impl new --backend numpy --generations 30 --warmup 3`, one fresh process per run, same box, `ms/gen` = the run's median, `repeats=1`; the two-repeat protocol reproduces the same picture: `xor_p500` 172.4 → 135.7 and `custom_pagie_p500` 1031.5 → 968.1):
+## Measured cost (TensorNEAT generation graphs)
 
-| cell | executed ops/gen | ms/gen before | ms/gen after | peak RSS before → after |
-|---|---|---|---|---|
-| `xor_p500` | 8548 | 167.8 | 136.5 | 235 → 120 MB |
-| `custom_pagie_p500` | 12521 | 978.4 | 940.7 | 1248 → 877 MB |
+Protocol: external TensorNEAT harness (`run_benchmark.py --impl new --backend numpy --generations 30 --warmup 3 --repeats 2`), one fresh process per cell, alternating pristine and current tree in one session so drift cancels (`ms/gen` = the run's mean; the two means per side are the two interleaved rounds).
 
-Per-change deltas on `xor_p500` / `custom_pagie_p500` (same protocol, one repeat each): base `167.8 / 978.4`; plan + flat store + static validation but NO dead-value release `152.6 / 1129.0` (releasing is what keeps `pagie`'s live set — and therefore its RSS, 2.6 GB there — bounded); plan + flat store + release but the static fast path forced off `154.4 / 1026.5`; all three `136.5 / 940.7`.
-Kernel BODIES remain the dominant cost (a separate pass owns `./kernels/`), and `core.Tensor.__init__` is the largest single non-loop Python term on this path (≈8.7 k constructions per `xor_p500` generation) — it belongs to `../core/`.
+| cell | executed ops/gen | ms/gen pristine | ms/gen current | peak RSS pristine → current | compile pristine → current |
+|---|---|---|---|---|---|
+| `xor_p500` | 8548 | 179.6 / 175.8 | **127.7 / 122.6** | 235.5 → **120.0 MB** | 0.551 → 0.463 s |
+| `custom_pagie_p500` | 12521 | 1045.2 / 1032.0 | **959.8 / 952.6** | 1247.5 → **877.3 MB** | 1.693 → 1.534 s |
+
+Both cells' per-generation fitness curves are bit-identical to the pristine tree (all four runs; the harness mixes no timing into the search), so the win is pure overhead removal.
+Per-change deltas (`xor_p500` / `custom_pagie_p500`, one repeat each): base `167.8 / 978.4`; plan + flat store + static result validation but NO dead-value release `152.6 / 1129.0` — the release is what keeps `pagie`'s live set (2.6 GB without it) and therefore its RSS bounded, so it is a performance component, not hygiene; plan + flat store + release but the static fast path forced off `154.4 / 1026.5`; all three plus the kernel hot-path pass `122–125 / 953–958`.
+Where the remaining time goes (`xor_p500`, cProfile per generation; the profiler inflates the unprofiled 123 ms to ~169 ms): numpy compute dominates — elementwise kernels ≈26 ms, `argsort` 22, `take` 15, `select` 14, `ufunc.reduce` 7, `dot` 6, `astype` 6 — then the interpreter loop `_run_block` ≈14 ms, and `core.Tensor.__init__` + `core.Device.__post_init__` ≈8 ms for ≈8.7 k tensor constructions.
+`custom_pagie_p500` is numpy-compute-bound at ≈78 µs/op (populations are large; the kernel Python share is ≈1 %), so its wall time is dominated by array work, not by this package's Python.
+Per-op attribution must wrap `KERNEL_TABLE` entries (plans resolve kernels at build time, so wrapping `kernels.dispatch` no longer observes anything) and a `perf_counter` wrapper itself costs ≈1 µs/op — subtract it before believing a per-op delta.
+Kernel-side hot-path rules and their own numbers live in `./kernels/CONTEXT.md`; re-measure with the external harness after unrelated changes rather than quoting these as a standing property.
 
 ## Error behavior (binding)
 
