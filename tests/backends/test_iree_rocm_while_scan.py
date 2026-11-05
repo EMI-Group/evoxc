@@ -6,8 +6,9 @@ while invoking native function hal.fence.await`` — for a ``while_loop`` whose
 carry is initialized from a graph CONSTANT (``evoxc.enp.zeros``, the same
 class ``evoxc.scan`` desugars to), and a trivial ``evoxc.scan`` graph SIGSEGV'd
 the process outright (``stream_command_buffer.c:452 INVALID_ARGUMENT`` /
-``hal.device.queue.alloca`` / the same fence abort). Those observations are the
-ROCm half of ``/root/tensorneat``'s ``repro_minimal.py`` + ``ROCM_FINDINGS.md``.
+``hal.device.queue.alloca`` / the same fence abort). Those observations come
+from the TensorNEAT ROCm spike's ``repro_minimal.py`` + ``ROCM_FINDINGS.md``
+(archived outside this repository).
 
 ``iree-base-compiler`` / ``iree-base-runtime`` 3.13.0 fixes that class: the
 shapes below compile and RUN device-resident on the AMD GPU, so this suite
