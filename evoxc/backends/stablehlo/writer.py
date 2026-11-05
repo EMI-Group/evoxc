@@ -4755,9 +4755,125 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         if name == "stop_gradient":
             self._names[id(op.result)] = self._name(op.operands[0])
             return ""
+        if name == "remainder":
+            return self._emit_remainder(op)
         if name == "reduce_mean":
             return self._emit_reduce_mean(op)
         raise self._unsupported(op)
+
+    def _emit_remainder(self, op: Op) -> str:
+        """numpy ``remainder`` is FLOORMOD, not StableHLO's fmod.
+
+        ``stablehlo.remainder`` is C ``fmod``: its result carries the sign
+        of the DIVIDEND. evoxc's frontend contract (the op name, Python ``%``,
+        ``evoxc.numpy.remainder`` and the numpy reference backend's
+        ``np.remainder``) is floormod, whose result carries the sign of the
+        DIVISOR. The two agree on an exact division and whenever the operand
+        signs agree; the standard fmod→floormod correction is emitted inline:
+
+            fmod   = stablehlo.remainder a, b
+            adjust = (fmod != 0) & ((fmod < 0) != (b < 0))
+            result = select(adjust, fmod + b, fmod)
+
+        Both operands are shape/dtype-equalized to the result exactly like
+        any elementwise op (``_equalize_operand`` + ``stablehlo.convert``,
+        so numpy broadcasting — scalar operands included — works, and a
+        dynamic result dim sources its runtime dims from the dynamic-
+        broadcast path). ``fmod + b`` cannot overflow an integer result:
+        ``|fmod| < |b|``, so the adjusted value lies strictly between ``0``
+        and ``b``; the comparison is on ``0`` and on the already-equalized
+        divisor, never on a product of the operands (whose product could
+        overflow int64).
+
+        Edge behavior: NaN always propagates unchanged (``fmod`` is NaN and
+        any selected ``NaN + b`` is NaN too); an infinite divisor yields the
+        dividend adjusted into the divisor's half-line, matching numpy; a
+        zero divisor is NaN for floats (matching numpy) and is UB in
+        StableHLO for integers (numpy returns 0 with a RuntimeWarning —
+        unrepresentable, the emitted text is unchanged). Signed ZEROS can
+        differ: an exact division whose numpy result is ``-0.0`` (e.g.
+        ``0.0 % -3.0``, sign follows the divisor) emits the fmod ``+0.0`` —
+        numerically equal, so parity checks on values pass.
+
+        Per-dtype:
+          * signed integer / floating-point — the full correction.
+          * unsigned integer — numpy remainder on unsigned operands is
+            already non-negative (it IS fmod), so only
+            ``stablehlo.remainder`` is emitted (the correction is provably
+            inert). ``stablehlo.compare LT`` on unsigned is a plain
+            unsigned compare, so the shortcut is an op-count choice.
+          * bool / complex / any other kind — numpy has no remainder ufunc
+            (and complex only admits EQ/NE compares), so an explicit
+            ``BackendError`` names the dtype rather than emitting invalid
+            MLIR.
+        """
+        result_type = op.result.type
+        result_shape = tuple(result_type.shape)
+        result_dtype = np.dtype(result_type.dtype)
+        if result_dtype.kind not in ("i", "u", "f"):
+            raise BackendError(
+                f"stablehlo export: op 'remainder'{self._loc(op)} over dtype "
+                f"{result_dtype!r} is not supported — numpy has no remainder "
+                "for this dtype and the floormod composition needs a signed "
+                "integer or floating-point element type"
+            )
+        result_name = self._bind_value(op.result)
+        result_text = self._vt(result_type)
+        shape_source = (
+            None
+            if _shape_is_static(result_shape)
+            else self._shape_source(op.operands, result_shape)
+        )
+        lines: list[str] = []
+        names = []
+        for operand in op.operands:
+            name, extra = self._equalize_operand(operand, result_shape, shape_source)
+            lines.extend(extra)
+            names.append(name)
+        for i, operand in enumerate(op.operands):
+            if np.dtype(operand.type.dtype) != result_dtype:
+                converted = self._new_name()
+                lines.append(
+                    f"{converted} = stablehlo.convert {names[i]} : "
+                    f"({self._type_str(operand.type.dtype, result_shape)}) -> "
+                    f"{self._type_str(result_dtype, result_shape)}"
+                )
+                names[i] = converted
+        if result_dtype.kind == "u":
+            # Unsigned remainder is fmod already — emit it alone.
+            lines.append(
+                f"{result_name} = stablehlo.remainder {names[0]}, {names[1]} : "
+                f"{result_text}"
+            )
+            return "\n".join(lines)
+        fmod = self._new_name()
+        lines.append(
+            f"{fmod} = stablehlo.remainder {names[0]}, {names[1]} : {result_text}"
+        )
+        zero_name, zero_lines = self._scalar_constant_for(
+            result_dtype,
+            0,
+            result_shape,
+            shape_source=(names[0], result_dtype, result_shape),
+        )
+        lines.extend(zero_lines)
+        bool_dtype = np.dtype("bool")
+        nonzero = self._cmp(fmod, zero_name, "NE", result_dtype, result_shape, lines)
+        neg_fmod = self._cmp(fmod, zero_name, "LT", result_dtype, result_shape, lines)
+        neg_divisor = self._cmp(
+            names[1], zero_name, "LT", result_dtype, result_shape, lines
+        )
+        differs = self._ew(
+            "xor", neg_fmod, neg_divisor, bool_dtype, result_shape, lines
+        )
+        adjust = self._ew("and", nonzero, differs, bool_dtype, result_shape, lines)
+        adjusted = self._ew("add", fmod, names[1], result_dtype, result_shape, lines)
+        lines.append(
+            f"{result_name} = stablehlo.select {adjust}, {adjusted}, {fmod} : "
+            f"({self._type_str(bool_dtype, result_shape)}, "
+            f"{result_text}, {result_text}) -> {result_text}"
+        )
+        return "\n".join(lines)
 
     # --- Block/region emission ---
 
