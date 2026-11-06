@@ -59,6 +59,7 @@ ALSO replaces ``sys.path`` with only its own temporary directory — a
 ``syspath_prepend`` would not be enough, because candidates are ordered by
 path string, not by ``sys.path`` position.
 """
+
 from __future__ import annotations
 import os
 import shutil
@@ -69,10 +70,13 @@ import pytest
 import evoxc
 from evoxc.backends.adapters import xla_util
 from tests.backends.test_pjrt_ctypes_plugin import _build_plugin
+
 #: The two environment variables the discovery chain reads (aliased so a typo
 #: in this file cannot silently point a test at the wrong variable).
 PLUGIN_ENV = xla_util._ENV_PLUGIN
 DISCOVERY_ENV = xla_util._ENV_PLUGIN_DISCOVERY
+
+
 # ---------------------------------------------------------------------------
 # fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -83,6 +87,8 @@ def fake_plugin(tmp_path_factory):
         tmp_path_factory.mktemp("discovery_fake_plugin"),
         "fake_pjrt_plugin.so",
     )
+
+
 @pytest.fixture(scope="module")
 def rocm_platform_plugin(tmp_path_factory):
     """A fake reporting the LISTED platform ``rocm`` (serves rocm/hip)."""
@@ -91,6 +97,8 @@ def rocm_platform_plugin(tmp_path_factory):
         "fake_pjrt_plugin_rocm.so",
         defines=("EVOXC_FAKE_PJRT_PLATFORM=rocm",),
     )
+
+
 @pytest.fixture(scope="module")
 def cpu_platform_plugin(tmp_path_factory):
     """A fake reporting the LISTED platform ``cpu`` (serves cpu only)."""
@@ -99,6 +107,8 @@ def cpu_platform_plugin(tmp_path_factory):
         "fake_pjrt_plugin_cpu.so",
         defines=("EVOXC_FAKE_PJRT_PLATFORM=cpu",),
     )
+
+
 @pytest.fixture(autouse=True)
 def isolated_discovery(monkeypatch):
     """Make every test independent of an ambient plugin install.
@@ -113,6 +123,8 @@ def isolated_discovery(monkeypatch):
     xla_util._reset_plugin_discovery_cache()
     yield
     xla_util._reset_plugin_discovery_cache()
+
+
 def _patch_search_path(monkeypatch, *directories):
     """Point the ``jax_plugins`` scan at EXACTLY these ``sys.path`` entries.
     Replaces ``sys.path`` (never prepends): candidates are sorted by path
@@ -120,10 +132,14 @@ def _patch_search_path(monkeypatch, *directories):
     win. Does NOT touch the discovery cache (tests that pin the cache use it).
     """
     monkeypatch.setattr(sys, "path", [str(directory) for directory in directories])
+
+
 def _use_search_path(monkeypatch, *directories):
     """``_patch_search_path`` + a cache reset (a fresh scan of that path)."""
     _patch_search_path(monkeypatch, *directories)
     xla_util._reset_plugin_discovery_cache()
+
+
 def _install_jax_plugin(root, platform_dir, name, source_so):
     """Copy a built fake plugin to ``<root>/jax_plugins/<platform_dir>/<name>``."""
     plugin_dir = Path(root) / "jax_plugins" / platform_dir
@@ -131,9 +147,13 @@ def _install_jax_plugin(root, platform_dir, name, source_so):
     target = plugin_dir / name
     shutil.copyfile(source_so, target)
     return target
+
+
 def _raising_scan(*args, **kwargs):
     """A ``_jax_plugins_candidates`` stand-in proving the scan never ran."""
     raise AssertionError("the jax_plugins scan must not run in this configuration")
+
+
 def _build_without_entry_point(directory, so_name):
     """Build a shared object that does NOT export the PJRT entry point.
     Used for the "a ``.so`` that is not a PJRT plugin is skipped" leg; skips
@@ -141,13 +161,14 @@ def _build_without_entry_point(directory, so_name):
     """
     cc = shutil.which("gcc") or shutil.which("cc")
     if cc is None:
-        pytest.skip("no C compiler (gcc/cc) available — cannot build a "
-                    "non-PJRT shared object")
+        pytest.skip(
+            "no C compiler (gcc/cc) available — cannot build a "
+            "non-PJRT shared object"
+        )
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / f"{so_name}.c"
-    source.write_text("int not_a_pjrt_symbol(void) { return 0; }\n",
-                      encoding="utf-8")
+    source.write_text("int not_a_pjrt_symbol(void) { return 0; }\n", encoding="utf-8")
     target = directory / so_name
     proc = subprocess.run(
         [cc, "-shared", "-fPIC", "-std=c99", "-O1", str(source), "-o", str(target)],
@@ -158,17 +179,19 @@ def _build_without_entry_point(directory, so_name):
     if proc.returncode != 0:
         pytest.skip(f"building a non-PJRT shared object failed: {proc.stderr}")
     return target
+
+
 def _missing_plugin_error():
     """Context manager: the actionable "no plugin found" ``BackendError``."""
     return pytest.raises(evoxc.BackendError, match="requires a PJRT C API plugin")
+
+
 # ---------------------------------------------------------------------------
 # (1) the scan finds an installed ``jax_plugins`` plugin
 # ---------------------------------------------------------------------------
 def test_scan_finds_plugin_under_jax_plugins(tmp_path, monkeypatch, fake_plugin):
     """``<sys.path>/jax_plugins/<platform>/*.so`` is found and made absolute."""
-    installed = _install_jax_plugin(
-        tmp_path, "xla_fake", "foo_plugin.so", fake_plugin
-    )
+    installed = _install_jax_plugin(tmp_path, "xla_fake", "foo_plugin.so", fake_plugin)
     _use_search_path(monkeypatch, tmp_path)
     assert xla_util._jax_plugins_candidates() == [os.path.realpath(installed)]
     found = xla_util._find_plugin_path()
@@ -177,6 +200,8 @@ def test_scan_finds_plugin_under_jax_plugins(tmp_path, monkeypatch, fake_plugin)
     # The discovered path is a usable plugin (the fake's own identity).
     plugin = xla_util._load_plugin()
     assert plugin.path == found
+
+
 # ---------------------------------------------------------------------------
 # (2) precedence: plugin_path > EVOXC_PJRT_PLUGIN > fixed paths > scan
 # ---------------------------------------------------------------------------
@@ -202,6 +227,8 @@ def test_plugin_path_beats_env_beats_scan(tmp_path, monkeypatch, fake_plugin):
     # (3) with neither, the scan supplies the path.
     monkeypatch.delenv(PLUGIN_ENV)
     assert xla_util._find_plugin_path() == os.path.realpath(scanned)
+
+
 def test_env_alone_never_consults_the_scan(tmp_path, monkeypatch, fake_plugin):
     """A resolved ``EVOXC_PJRT_PLUGIN`` short-circuits the ``jax_plugins`` scan."""
     _install_jax_plugin(tmp_path, "xla_fake", "foo_plugin.so", fake_plugin)
@@ -209,6 +236,8 @@ def test_env_alone_never_consults_the_scan(tmp_path, monkeypatch, fake_plugin):
     monkeypatch.setattr(xla_util, "_jax_plugins_candidates", _raising_scan)
     monkeypatch.setenv(PLUGIN_ENV, str(fake_plugin))
     assert xla_util._find_plugin_path() == os.path.abspath(fake_plugin)
+
+
 def test_fixed_well_known_path_is_used_before_the_scan(
     tmp_path, monkeypatch, fake_plugin
 ):
@@ -228,6 +257,8 @@ def test_fixed_well_known_path_is_used_before_the_scan(
     assert xla_util._find_plugin_path() == os.path.realpath(
         tmp_path / "jax_plugins" / "xla_fake" / "foo_plugin.so"
     )
+
+
 def test_broken_plugin_path_option_raises_and_never_falls_back(
     tmp_path, monkeypatch, fake_plugin
 ):
@@ -242,6 +273,8 @@ def test_broken_plugin_path_option_raises_and_never_falls_back(
     assert "options['plugin_path']" in message
     assert repr(str(missing)) in message
     assert "is not a file" in message
+
+
 def test_broken_env_plugin_raises_and_never_falls_back(
     tmp_path, monkeypatch, fake_plugin
 ):
@@ -256,27 +289,25 @@ def test_broken_env_plugin_raises_and_never_falls_back(
     message = str(excinfo.value)
     assert PLUGIN_ENV in message
     assert repr(str(missing)) in message
+
+
 # ---------------------------------------------------------------------------
 # (3) candidate hygiene: entry-point probe, dlopen failure, dedupe, ordering
 # ---------------------------------------------------------------------------
-def test_candidate_without_entry_point_is_skipped(
-    tmp_path, monkeypatch, fake_plugin
-):
+def test_candidate_without_entry_point_is_skipped(tmp_path, monkeypatch, fake_plugin):
     """A dlopen-able ``.so`` without ``GetPjRtApi`` is probed and skipped."""
     root = tmp_path / "root"
     # Alphabetically FIRST, so the valid plugin can only win by the probe.
-    dummy = _build_without_entry_point(
-        root / "jax_plugins" / "xla_a", "aaa.so"
-    )
-    valid = _install_jax_plugin(
-        root, "xla_b", "zzz_plugin.so", fake_plugin
-    )
+    dummy = _build_without_entry_point(root / "jax_plugins" / "xla_a", "aaa.so")
+    valid = _install_jax_plugin(root, "xla_b", "zzz_plugin.so", fake_plugin)
     _use_search_path(monkeypatch, root)
     candidates = xla_util._jax_plugins_candidates()
     assert candidates == [os.path.realpath(dummy), os.path.realpath(valid)]
     assert xla_util._probe_plugin(str(dummy)) is False
     assert xla_util._probe_plugin(str(valid)) is True
     assert xla_util._find_plugin_path() == os.path.realpath(valid)
+
+
 def test_plain_text_file_named_so_is_skipped(tmp_path, monkeypatch):
     """A failed ``dlopen`` skips the candidate instead of raising."""
     plugin_dir = tmp_path / "root" / "jax_plugins" / "xla_fake"
@@ -289,6 +320,8 @@ def test_plain_text_file_named_so_is_skipped(tmp_path, monkeypatch):
     with _missing_plugin_error() as excinfo:
         xla_util._find_plugin_path()
     assert excinfo.value.args[0] == xla_util._PLUGIN_MISSING_MESSAGE
+
+
 def test_search_path_and_candidate_dedup(tmp_path, monkeypatch, fake_plugin):
     """Duplicate ``sys.path`` entries and a symlinked plugin yield ONE candidate."""
     root = tmp_path / "root"
@@ -308,19 +341,19 @@ def test_search_path_and_candidate_dedup(tmp_path, monkeypatch, fake_plugin):
     )
     assert xla_util._jax_plugins_candidates() == [os.path.realpath(installed)]
     assert xla_util._find_plugin_path() == os.path.realpath(installed)
-def test_scan_skips_empty_and_nondirectory_entries(
-    tmp_path, monkeypatch, fake_plugin
-):
+
+
+def test_scan_skips_empty_and_nondirectory_entries(tmp_path, monkeypatch, fake_plugin):
     """`""` (the cwd) and file entries are skipped; a real dir still scans."""
     root = tmp_path / "root"
     installed = _install_jax_plugin(root, "xla_fake", "foo_plugin.so", fake_plugin)
     plain_file = tmp_path / "not_a_directory"
     plain_file.write_text("x\n", encoding="utf-8")
-    monkeypatch.setattr(
-        sys, "path", ["", str(plain_file), str(root)]
-    )
+    monkeypatch.setattr(sys, "path", ["", str(plain_file), str(root)])
     xla_util._reset_plugin_discovery_cache()
     assert xla_util._jax_plugins_candidates() == [os.path.realpath(installed)]
+
+
 def test_two_valid_platform_plugins_pick_the_sorted_first(
     tmp_path, monkeypatch, fake_plugin
 ):
@@ -337,6 +370,8 @@ def test_two_valid_platform_plugins_pick_the_sorted_first(
         os.path.realpath(root / "jax_plugins" / "xla_rocm7" / "b_plugin.so"),
     ]
     assert xla_util._find_plugin_path() == os.path.realpath(cpu_first)
+
+
 # ---------------------------------------------------------------------------
 # (4) caching: the scan runs once per process (a path OR a "found nothing")
 # ---------------------------------------------------------------------------
@@ -356,6 +391,8 @@ def test_successful_scan_is_cached(tmp_path, monkeypatch, fake_plugin):
     xla_util._reset_plugin_discovery_cache()
     with _missing_plugin_error():
         xla_util._find_plugin_path()
+
+
 def test_empty_scan_is_cached_too(tmp_path, monkeypatch, fake_plugin):
     """A "scanned, found nothing" outcome is cached as ``None``."""
     empty = tmp_path / "empty"
@@ -376,6 +413,8 @@ def test_empty_scan_is_cached_too(tmp_path, monkeypatch, fake_plugin):
     assert xla_util._find_plugin_path() == os.path.realpath(
         root / "jax_plugins" / "xla_fake" / "foo_plugin.so"
     )
+
+
 def test_probe_results_are_cached_per_realpath(tmp_path, monkeypatch, fake_plugin):
     """Probe outcomes are memoized by realpath (a second probe does no dlopen)."""
     plugin_dir = tmp_path / "root" / "jax_plugins" / "xla_fake"
@@ -393,6 +432,8 @@ def test_probe_results_are_cached_per_realpath(tmp_path, monkeypatch, fake_plugi
     assert xla_util._probe_plugin(str(installed)) is True
     assert xla_util._plugin_probe_cache[real] is True
     assert real in xla_util._plugin_handles
+
+
 # ---------------------------------------------------------------------------
 # (5) EVOXC_PJRT_PLUGIN_DISCOVERY: opt-out and its validation
 # ---------------------------------------------------------------------------
@@ -414,6 +455,8 @@ def test_discovery_disabled_skips_the_scan(tmp_path, monkeypatch, fake_plugin, r
     monkeypatch.setattr(xla_util, "_jax_plugins_candidates", scan)
     monkeypatch.setenv(DISCOVERY_ENV, "1")
     assert xla_util._find_plugin_path() == os.path.realpath(installed)
+
+
 def test_discovery_disabled_still_honours_explicit_sources(
     tmp_path, monkeypatch, fake_plugin
 ):
@@ -426,6 +469,8 @@ def test_discovery_disabled_still_honours_explicit_sources(
     ) == os.path.abspath(fake_plugin)
     monkeypatch.setenv(PLUGIN_ENV, str(fake_plugin))
     assert xla_util._find_plugin_path() == os.path.abspath(fake_plugin)
+
+
 def test_empty_discovery_value_behaves_as_unset(tmp_path, monkeypatch, fake_plugin):
     """``EVOXC_PJRT_PLUGIN_DISCOVERY=""`` = unset -> the scan runs."""
     root = tmp_path / "root"
@@ -434,6 +479,8 @@ def test_empty_discovery_value_behaves_as_unset(tmp_path, monkeypatch, fake_plug
     monkeypatch.setenv(DISCOVERY_ENV, "")
     assert xla_util._plugin_discovery_enabled() is True
     assert xla_util._find_plugin_path() == os.path.realpath(installed)
+
+
 def test_malformed_discovery_value_is_loud(tmp_path, monkeypatch, fake_plugin):
     """An unrecognised value raises, naming the var, the value and the set."""
     root = tmp_path / "root"
@@ -448,11 +495,13 @@ def test_malformed_discovery_value_is_loud(tmp_path, monkeypatch, fake_plugin):
     assert "'maybe'" in message
     accepted = sorted(xla_util._DISCOVERY_FALSEY | xla_util._DISCOVERY_TRUTHY)
     assert accepted.__repr__() in message
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        (None, True),   # unset
-        ("", True),     # empty = unset
+        (None, True),  # unset
+        ("", True),  # empty = unset
         ("   ", True),  # whitespace-only = unset
         ("1", True),
         ("true", True),
@@ -471,6 +520,8 @@ def test_plugin_discovery_enabled_truth_table(raw, expected, monkeypatch):
     else:
         monkeypatch.setenv(DISCOVERY_ENV, raw)
     assert xla_util._plugin_discovery_enabled() is expected
+
+
 # ---------------------------------------------------------------------------
 # (6) discovery never imports jax / jaxlib
 # ---------------------------------------------------------------------------
@@ -487,6 +538,8 @@ def test_discovery_does_not_import_jax(tmp_path, monkeypatch, fake_plugin):
     assert xla_util._find_plugin_path() == os.path.realpath(installed)
     for name in ("jax", "jaxlib", "jax_plugins"):
         assert name not in sys.modules, f"discovery imported {name!r}"
+
+
 # ---------------------------------------------------------------------------
 # (7) the missing-plugin message is actionable (all four steps named)
 # ---------------------------------------------------------------------------
@@ -507,23 +560,31 @@ def test_missing_plugin_message_names_every_step(tmp_path, monkeypatch):
     ):
         assert token in message, f"{token!r} missing from: {message}"
     assert message == xla_util._PLUGIN_MISSING_MESSAGE
+
+
 # ---------------------------------------------------------------------------
 # (8) the reported platform must physically serve the loaded device kind
 # ---------------------------------------------------------------------------
 #: One compiled artifact per fake plugin (the compile stage runs once).
 _ARTIFACTS: dict[str, "evoxc.backends.CompiledArtifact"] = {}
+
+
 def _artifact_for(plugin_path):
     """``lower`` + ``compile`` a tiny ``add(x, x)`` graph against one plugin."""
     key = str(plugin_path)
     artifact = _ARTIFACTS.get(key)
     if artifact is None:
+
         def fn(x):
             return evoxc.add(x, x)
+
         graph = evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
         lowered = evoxc.lower(graph, backend="xla")
         artifact = evoxc.compile(lowered, backend="xla", plugin_path=key)
         _ARTIFACTS[key] = artifact
     return artifact
+
+
 @pytest.fixture
 def xla_backend(monkeypatch, request):
     """The registered xla adapter, with ``EVOXC_PJRT_PLUGIN`` set to a fake.
@@ -533,6 +594,8 @@ def xla_backend(monkeypatch, request):
     plugin = request.getfixturevalue(request.param)
     monkeypatch.setenv(PLUGIN_ENV, str(plugin))
     return evoxc.backends.get("xla"), plugin
+
+
 @pytest.mark.parametrize("xla_backend", ["rocm_platform_plugin"], indirect=True)
 def test_rocm_platform_rejects_cpu_device(xla_backend):
     """A ``rocm`` plugin cannot back a CPU executable (honest placement)."""
@@ -544,6 +607,8 @@ def test_rocm_platform_rejects_cpu_device(xla_backend):
     assert "reports platform 'rocm'" in message
     assert "cannot serve" in message
     assert "Device(kind='cpu'" in message
+
+
 @pytest.mark.parametrize("xla_backend", ["rocm_platform_plugin"], indirect=True)
 def test_rocm_platform_rejects_the_default_cpu_device(xla_backend):
     """``device=None`` means ``Device('cpu', 0)`` — and is rejected too."""
@@ -554,6 +619,8 @@ def test_rocm_platform_rejects_the_default_cpu_device(xla_backend):
     message = str(excinfo.value)
     assert "reports platform 'rocm'" in message
     assert "cannot serve" in message
+
+
 @pytest.mark.parametrize("xla_backend", ["rocm_platform_plugin"], indirect=True)
 def test_rocm_platform_accepts_its_own_device(xla_backend):
     """Positive control: the plugin's own kind loads (device-resident)."""
@@ -565,6 +632,8 @@ def test_rocm_platform_accepts_its_own_device(xla_backend):
         assert executable.device == evoxc.core.Device("rocm", 0)
     finally:
         executable.close()
+
+
 @pytest.mark.parametrize("xla_backend", ["rocm_platform_plugin"], indirect=True)
 def test_rocm_platform_rejects_cuda_device(xla_backend):
     """A ``rocm`` plugin does not serve ``Device('cuda', 0)`` either."""
@@ -575,6 +644,8 @@ def test_rocm_platform_rejects_cuda_device(xla_backend):
     message = str(excinfo.value)
     assert "reports platform 'rocm'" in message
     assert "('rocm', 'hip')" in message
+
+
 @pytest.mark.parametrize("xla_backend", ["cpu_platform_plugin"], indirect=True)
 def test_cpu_platform_rejects_accelerator_device(xla_backend):
     """A ``cpu`` plugin cannot back a device-resident accelerator executable."""
@@ -591,6 +662,8 @@ def test_cpu_platform_rejects_accelerator_device(xla_backend):
         assert executable.device == evoxc.core.Device("cpu", 0)
     finally:
         executable.close()
+
+
 @pytest.mark.parametrize("xla_backend", ["fake_plugin"], indirect=True)
 def test_unlisted_platform_stays_permissive(xla_backend):
     """The fake's ``fake`` platform is unlisted -> any modelled kind loads."""
@@ -603,6 +676,8 @@ def test_unlisted_platform_stays_permissive(xla_backend):
             assert executable.device == device
         finally:
             executable.close()
+
+
 @pytest.mark.parametrize(
     "xla_backend",
     ["fake_plugin", "rocm_platform_plugin", "cpu_platform_plugin"],
