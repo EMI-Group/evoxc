@@ -18,6 +18,9 @@ the per-call ``evoxc.pipeline._resolve_backend_device`` snapshots (env defaults
 ``EVOXC_BACKEND``/``EVOXC_DEVICE``/``EVOXC_TARGET_BACKENDS`` are read at call time
 and participate in the key), and options participate CANONICALIZED (see
 ``_canonicalize_options``) so semantically-equal option sets key identically.
+The miss path is ``trace -> lower -> compile -> load`` with the same resolved
+(env-aware) options forwarded to all three option-taking stages, exactly as
+``evoxc.build`` does.
 
 Meta-loop contract (binding): the per-iteration "program" argument MUST be a
 static Python value — its static content is exactly what the memoized key
@@ -324,13 +327,14 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
                           canonical-options),
                       compute_fn=lambda: build(fn, *specs, **opts))
 
-    ...where the miss path expands like ``evoxc.build``'s stages, with
-    ``load`` taking no options (see the options bullet below)::
+    ...where the miss path expands exactly like ``evoxc.build``'s stages —
+    ``trace -> lower -> compile -> load`` with the same resolved options
+    forwarded to all three option-taking stages::
 
         graph = evoxc.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
         artifact = compile(lowered, **options)
-        exe = load(artifact, backend=backend, device=device)   # no options
+        exe = load(artifact, backend=backend, device=device, **options)
 
     Semantics (binding):
 
@@ -350,11 +354,11 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
       (``EVOXC_OPT_LEVEL``, ``EVOXC_IREE_*``, ``EVOXC_XLA_*``, ``EVOXC_TVM_*``) are
       NOT part of the key — clear the cache or pass a fresh ``CompileCache``
       when changing them (documented limitation).
-    * Options are forwarded to ``lower`` and ``compile`` (this miss path's
-      ``load`` receives none, unlike ``evoxc.build`` — a load-stage option
-      such as the xla ``plugin_path`` needs ``evoxc.build`` or the explicit
-      pipeline); the key uses a canonicalized copy so semantically-equal
-      option sets key identically.
+    * Options are forwarded to ``lower``, ``compile`` and ``load`` exactly
+      as in ``evoxc.build`` (each stage takes the keys it knows — so a
+      load-stage option such as the xla ``plugin_path`` reaches ``load``);
+      the key uses a canonicalized copy so semantically-equal option sets
+      key identically.
     * Errors: fn validation, backend/device resolution, cache-type checks
       and cache-key encodability all fire BEFORE any cache access; a
       program that fails to trace/lower/compile/load raises per stage —
@@ -418,13 +422,19 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
     )
 
     def _compute():
-        # The exact build composition (mirror evoxc.build's call shapes: load
-        # gets NO options). Per-stage exceptions propagate untouched —
-        # never cached, never an eager fallback (binding).
+        # The exact build composition (mirror evoxc.build's call shapes,
+        # including the same resolved options on the load hop). Per-stage
+        # exceptions propagate untouched — never cached, never an eager
+        # fallback (binding).
         graph = trace_fn(fn, *specs)
         lowered = lower(graph, backend=resolved_backend, **resolved_options)
         artifact = compile(lowered, **resolved_options)
-        return load(artifact, backend=resolved_backend, device=resolved_device)
+        return load(
+            artifact,
+            backend=resolved_backend,
+            device=resolved_device,
+            **resolved_options,
+        )
 
     # keepalive=fn pins the traced callable strongly inside the entry, so
     # an id(fn)-keyed entry can never alias a later object reusing the id
