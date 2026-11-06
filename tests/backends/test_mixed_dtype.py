@@ -20,23 +20,34 @@ absence never affects the others:
 * ``tvm``: ``pytest.importorskip("tvm")`` + ``pytest.importorskip("jaxlib")``
   (jaxlib only for its bundled MLIR bindings — the jax frontend is never
   imported, same gate as ``test_adapter_tvm.py``).
-* ``xla``: requires a USER-PROVIDED PJRT C API plugin (a ``.so`` exporting
-  ``GetPjRtApi``; there is no pip-installable dependency). The gate is a
+* ``xla``: requires a PJRT C API plugin (a ``.so`` exporting ``GetPjRtApi``).
+  There is no hard pip dependency: the adapter auto-discovers an installed
+  ``jax_plugins/*/*.so`` (``pip install jax-rocm7-pjrt`` /
+  ``jax-cuda12-pjrt``; opt out with ``EVOXC_PJRT_PLUGIN_DISCOVERY=0``) after
+  ``EVOXC_PJRT_PLUGIN`` and the well-known paths, so the gate is a
   ``xla.register()`` probe that skips with an actionable message when no
-  plugin is configured — set ``EVOXC_PJRT_PLUGIN=/path/to/
+  plugin is available — set ``EVOXC_PJRT_PLUGIN=/path/to/
   pjrt_c_api_cpu_plugin.so`` or pass ``plugin_path=...`` to the compile
-  options — and runs for real when a plugin is available (same contract as
-  ``test_adapter_xla.py``, but per-test instead of module-level).
+  options — and runs for real when one is (same contract as
+  ``test_adapter_xla.py``, but per-test instead of module-level). The
+  discovered plugin may be an ACCELERATOR plugin, so the xla leg derives its
+  run device from the plugin platform (``tests/backends/_xla_plugin_probe.py``:
+  ``rocm``/``hip`` -> ``Device("rocm", 0)``, ``cuda`` -> ``Device("cuda", 0)``,
+  else ``Device("cpu", 0)``), builds/loads with ``device=<that device>``,
+  places its inputs with ``Tensor.to`` and reads its output back through
+  ``.to(cpu)``.
 
 Compilers run for real, so the 2s-per-file convention does not apply; the
 module keeps the compile count low via one compile per distinct graph (six
-per backend, 18 worst case; 12 in this environment where xla skips).
+per backend, 18 when every adapter is available).
 """
 
 import numpy as np
 import pytest
 
 import evoxc
+
+from tests.backends import _xla_plugin_probe as probe
 
 BACKENDS = ("iree", "tvm", "xla")
 
@@ -50,7 +61,12 @@ ATOL = 1e-5
 
 
 def _require_backend(backend):
-    """Skip (per-test) when ``backend``'s dependencies are unavailable."""
+    """Skip (per-test) when ``backend``'s dependencies are unavailable.
+
+    Returns the device the backend must run on (``None`` = the backend's own
+    default): ``xla`` may have auto-discovered an ACCELERATOR plugin, so its
+    device is derived from the plugin platform.
+    """
     if backend == "iree":
         pytest.importorskip("iree.compiler")
         pytest.importorskip("iree.runtime")
@@ -58,27 +74,34 @@ def _require_backend(backend):
         pytest.importorskip("tvm")
         pytest.importorskip("jaxlib")
     elif backend == "xla":
-        from evoxc.backends.adapters import xla
-
-        try:
-            xla.register()
-        except evoxc.BackendError as exc:
-            pytest.skip(
-                "the xla adapter requires a user-provided PJRT C API plugin "
-                "(.so exporting GetPjRtApi); set "
-                "EVOXC_PJRT_PLUGIN=/path/to/pjrt_c_api_cpu_plugin.so or pass "
-                f"plugin_path=... to the compile options. Details: {exc}"
-            )
+        # The gate is the adapter's own availability probe: a core.BackendError
+        # means no usable PJRT plugin (on this box or any other); any other
+        # error is a real failure. require_plugin() also returns the derived
+        # run device (core.Device('cpu', 0) for a CPU plugin).
+        return probe.require_plugin()
     else:
         raise AssertionError(f"unknown backend {backend!r}")
+    return None
 
 
 def _run_backend_and_numpy(fn, specs, args, backend):
-    """Build+run ``fn`` on ``backend`` (CPU) and evaluate the numpy reference.
+    """Build+run ``fn`` on ``backend`` and evaluate the numpy reference.
 
-    Returns ``(actual, expected)`` as ``evoxc.Tensor``s; the device defaults
-    to CPU for both backends. Callers run the parity assertions.
+    Returns ``(actual, expected)`` as ``evoxc.Tensor``s. The numpy reference
+    runs on the host. ``iree``/``tvm`` keep the historical CPU path (host
+    inputs, their own run outputs). ``xla`` runs on the device derived from
+    its resolved plugin: on a CPU plugin nothing changes, on an accelerator
+    plugin the inputs are placed with ``Tensor.to(device)`` and the output is
+    read back explicitly (``.to(cpu)``) into a host tensor, so the callers'
+    ``.numpy()`` works either way.
     """
+    if backend == "xla":
+        device = _require_backend(backend)
+        expected = evoxc.evaluate(fn, *args)  # default numpy reference
+        exe = evoxc.build(fn, *specs, backend=backend, device=device)
+        out = evoxc.run(exe, *probe.place_args(args))
+        return evoxc.tensor(probe.to_host(out)), expected
+
     expected = evoxc.evaluate(fn, *args)  # default numpy reference
     exe = evoxc.build(fn, *specs, backend=backend)
     actual = evoxc.run(exe, *args)
