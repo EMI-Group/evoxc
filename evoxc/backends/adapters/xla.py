@@ -288,12 +288,15 @@ class XlaBackend(CompilerBackend):
     def check_available(cls) -> None:
         """Probe the PJRT plugin dependency; raise ``core.BackendError`` if absent.
 
-        The OPTION-LESS probe — used by ``register()`` and by callers with
-        no stage context (a classmethod gets no options). The pipeline
-        stages do NOT go through it: ``compile`` and ``load`` each call
-        ``_load_plugin(options)`` directly, so ``plugin_path`` is honored
-        with the documented precedence (``plugin_path`` -> env -> fixed
-        paths -> the ``jax_plugins`` scan) instead of being bypassed.
+        The OPTION-LESS preflight — for callers with no stage context (a
+        classmethod gets no options), e.g. a startup check or a test-suite
+        gate. ``register()`` does NOT run it: this adapter registers
+        unconditionally, because ``plugin_path`` is a per-call option a
+        classmethod probe cannot see. The pipeline stages do not go through
+        it either: ``compile`` and ``load`` each call ``_load_plugin(options)``
+        directly, so ``plugin_path`` is honored with the documented
+        precedence (``plugin_path`` -> env -> fixed paths -> the
+        ``jax_plugins`` scan) instead of being bypassed.
 
         Checks (1) the vendored ctypes bindings module integrity
         (``_verify_bindings``), (2) plugin discovery — ``plugin_path`` is
@@ -1441,18 +1444,23 @@ def upload_tensor(tensor: core.Tensor, device: core.Device) -> core.Tensor:
 
 
 def register() -> None:
-    """Probe the plugin and register the backend (idempotent).
+    """Register the backend UNCONDITIONALLY (idempotent) — no plugin probe.
 
     Called by ``evoxc.backends.registry.get("xla")`` on first use (and by
-    persisted-artifact loads). Raises ``core.BackendError`` with an
-    actionable message (the four discovery steps — ``plugin_path`` is not
-    available to a classmethod probe, so ``EVOXC_PJRT_PLUGIN``, the fixed
-    well-known paths and the installed ``jax_plugins/*/*.so`` scan — plus how
-    to install/build a plugin) when no usable PJRT plugin is available. An
-    installed JAX PJRT plugin (``pip install jax-rocm7-pjrt`` /
-    ``jax-cuda12-pjrt``) is found without any path or env variable; the
-    plugin is dlopen-ed, never imported as a binding package. Does nothing
-    observable when already registered.
+    persisted-artifact loads). This adapter's dependency is a per-call,
+    user-provided artifact rather than a pip package, so availability is
+    never a registration concern: a classmethod probe cannot see the
+    ``plugin_path`` option, and refusing to register here would make that
+    option unusable (the documented precedence ``plugin_path`` >
+    ``EVOXC_PJRT_PLUGIN`` > fixed well-known paths > the installed
+    ``jax_plugins/*/*.so`` scan only exists where the options are).
+    The probe therefore happens where the options do — ``compile`` and
+    ``load`` each call ``_load_plugin(options)`` and raise the actionable
+    ``core.BackendError`` (the four discovery steps plus how to
+    install/build a plugin) when nothing usable is found — and the explicit
+    option-less preflight stays available as ``XlaBackend.check_available()``.
+    Registration is a registry insert only: no plugin is dlopen-ed, no
+    client is created, and no binding package is imported.
 
     Registers this adapter's ``upload_tensor`` under the PER-BACKEND slots
     (every kind in ``_NON_CPU_KINDS`` — ``"cuda"``/``"rocm"``/``"hip"`` —
@@ -1464,7 +1472,6 @@ def register() -> None:
     flat DEFAULT slot and other backends' per-backend slots are never
     overwritten, so activation order cannot clobber any backend's provider).
     """
-    XlaBackend.check_available()
     _registry_register(xla_backend)
     for _kind in _NON_CPU_KINDS:
         core.register_backend_device_transfer_provider(

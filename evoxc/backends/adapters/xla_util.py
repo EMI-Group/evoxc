@@ -1227,7 +1227,9 @@ class _LoadedExecutable(_Handle):
         anything on FAILURE — a stray non-NULL handle the plugin may have
         written is destroyed best-effort there (inside its own
         ``try``/``except`` so a cleanup failure can never mask the original
-        execute error) and the slot is cleared. ``None`` (the default)
+        execute error), the slot is cleared, and every reused output slot of
+        the scaffolding is zeroed so no later call can wrap a stale pointer.
+        ``None`` (the default)
         leaves ``device_complete_events`` NULL: the byte-identical,
         zero-plugin-cost enqueue behavior of every earlier version.
         """
@@ -1258,37 +1260,37 @@ class _LoadedExecutable(_Handle):
             args.device_complete_events = ctypes.cast(
                 event_slots, ctypes.POINTER(ctypes.c_void_p)
             )
-            try:
-                self.plugin._check(
-                    self.plugin.api.PJRT_LoadedExecutable_Execute(
-                        ctypes.byref(args)
-                    ),
-                    "PJRT_LoadedExecutable_Execute",
-                )
-            except BaseException:
-                # FAILURE: the caller gets nothing. Destroy a stray non-NULL
-                # handle the plugin may have written BEST-EFFORT — the
-                # cleanup is guarded so it can never mask the execute error.
-                stray = event_slots[0]
-                if stray:
-                    try:
-                        self.plugin.destroy_event(stray)
-                    except BaseException:
-                        pass
-                event_slots[0] = None
-                args.device_complete_events = None
-                raise
+        else:
+            args.device_complete_events = None
+        try:
+            self.plugin._check(
+                self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
+                "PJRT_LoadedExecutable_Execute",
+            )
+        except BaseException:
+            # FAILURE: the caller gets nothing. Destroy a stray non-NULL
+            # handle the plugin may have written BEST-EFFORT — the cleanup
+            # is guarded so it can never mask the execute error.
+            stray = event_slots[0]
+            if stray:
+                try:
+                    self.plugin.destroy_event(stray)
+                except BaseException:
+                    pass
+            event_slots[0] = None
+            args.device_complete_events = None
+            # The scaffolding is REUSED across calls, and this execute may
+            # have written some output slots before failing: zero every one
+            # so a later call can never wrap a stale pointer as a _Buffer.
+            for i in range(num_outputs):
+                out_ptrs[i] = None
+            raise
+        if events is not None:
             # Hand the raw value over AS-IS (None/0 = the plugin returned no
             # event), then clear the slot: the handle now belongs to the
             # caller, never to this scaffolding.
             events.append(event_slots[0])
             event_slots[0] = None
-        else:
-            args.device_complete_events = None
-            self.plugin._check(
-                self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
-                "PJRT_LoadedExecutable_Execute",
-            )
         plugin = self.plugin
         outputs: list[_Buffer] = [None] * num_outputs
         if metas is None:

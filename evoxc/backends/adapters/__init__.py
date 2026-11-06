@@ -33,10 +33,16 @@ Adapter-module contract (binding for adapter authors):
   ``check_available``, ``compile``, ``load``) and
   ``evoxc.backends.compiler.CompilerExecutable`` (``backend_name``, ``run``).
 - Each module exposes a module-level ``register()`` function that (a)
-  checks the compiler dependency's availability — raising
-  ``core.BackendError`` with a pip-install hint (e.g. ``pip install
-  evoxc[iree]``) when missing — and (b) calls
-  ``evoxc.backends.registry.register(instance)`` (idempotent).
+  establishes the compiler dependency's availability and (b) calls
+  ``evoxc.backends.registry.register(instance)`` (idempotent). The check is
+  the adapter's own: iree/tvm probe their pip-installable packages and raise
+  ``core.BackendError`` with an install hint (e.g. ``pip install
+  evoxc[iree]``) when missing, while xla registers UNCONDITIONALLY because
+  its dependency is a per-call user-provided plugin ``.so`` (``plugin_path``
+  / ``EVOXC_PJRT_PLUGIN`` / a discovered ``jax_plugins`` plugin) that only
+  ``compile``/``load`` can resolve — those stages raise the actionable
+  plugin error, and ``check_available()`` is the explicit option-less
+  preflight.
 - Heavy-import rule (binding): imports of the compiler dependencies
   (iree/jaxlib/tvm/…) live ONLY inside function bodies, NEVER at module top
   level — ``import evoxc`` and ``import evoxc.backends`` must never import an
