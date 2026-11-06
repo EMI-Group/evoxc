@@ -143,7 +143,12 @@ class _RecordingIreeStub(evoxc.backends.Backend):
             payload=art.payload,
         )
 
-    def load(self, artifact, device=None):
+    def load(self, artifact, device=None, options=None):
+        # ``options`` mirrors the ``Backend.load(artifact, device, options)``
+        # contract (``evoxc.build`` forwards its resolved option set to every
+        # stage; each stage uses the keys it understands and ignores the
+        # rest). This stub records compile options only, so the load-stage
+        # dict is accepted and ignored here.
         if device is not None and device.kind != "cpu":
             class _FakeExecutable:
                 functions = ("main",)

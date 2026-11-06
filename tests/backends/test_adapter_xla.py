@@ -69,29 +69,21 @@ NAME = "xla"
 
 # Real-plugin presence gate (module level): the adapter requires a PJRT C API
 # plugin (.so exporting GetPjRtApi) — there is no hard pip dependency (an
-# installed ``jax_plugins`` plugin is auto-discovered). ``register()`` runs the
-# adapter's own probe (bindings integrity + plugin discovery + ABI version
-# gate + a live client create/destroy round-trip) and raises
-# ``evoxc.BackendError`` when no plugin is available; skip the whole module in
-# that case with an actionable hint.
+# installed ``jax_plugins`` plugin is auto-discovered). ``register()`` is
+# UNCONDITIONAL now (``plugin_path`` is a per-call option a classmethod probe
+# cannot see), so it no longer detects a missing plugin; the shared probe's
+# ``require_plugin()`` does — it returns the derived run device and skips ONLY
+# on the adapter's genuine no-plugin ``BackendError``, propagating every other
+# error. It is written for per-test use, so re-raise its skip at module level
+# (``pytest.skip`` outside a test needs ``allow_module_level=True``).
+# The derived run device: ``Device("cpu", 0)`` for a CPU plugin, the plugin's
+# own device for an accelerator one — every leg below then places inputs
+# explicitly and reads outputs back through ``.to(cpu)``.
 try:
-    xla.register()
-except evoxc.BackendError as exc:
-    pytest.skip(
-        "the xla adapter requires a PJRT C API plugin (.so exporting "
-        "GetPjRtApi) and none is available; set "
-        "EVOXC_PJRT_PLUGIN=/path/to/pjrt_c_api_cpu_plugin.so, pass "
-        "plugin_path=... to the compile options, or install a JAX plugin "
-        "(pip install jax-rocm7-pjrt / jax-cuda12-pjrt). Details: "
-        f"{exc}",
-        allow_module_level=True,
-    )
+    RUN_DEVICE = probe.require_plugin()
+except pytest.skip.Exception as skipped:
+    pytest.skip(str(skipped), allow_module_level=True)
 
-#: The device the resolved plugin physically serves (derived once per
-#: process — see the module docstring). Accelerator on a GPU plugin: every
-#: leg below then places inputs explicitly and reads outputs back through
-#: ``.to(cpu)``.
-RUN_DEVICE = probe.run_device()
 IS_ACCELERATOR = probe.is_accelerator()
 
 

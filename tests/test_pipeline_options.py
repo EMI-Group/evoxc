@@ -930,13 +930,21 @@ def test_full_path_explicit_vulkan_target_beats_env(
 
 
 def test_full_path_env_runtime_args_reaches_load(monkeypatch, iree_stub_registered):
-    """EVOXC_IREE_RUNTIME_ARGS reaches the load stage: ``evoxc.load`` applies the
-    env internally, so even the ``build`` sugar (which passes no explicit
-    load options) delivers the env-supplied load option."""
+    """EVOXC_IREE_RUNTIME_ARGS reaches the load stage: ``evoxc.build`` forwards
+    its resolved option set to EVERY hop (as its docstring documents) and
+    ``evoxc.load`` applies the load-stage env internally, so the env-supplied
+    runtime args arrive at ``load``."""
     monkeypatch.setenv("EVOXC_IREE_RUNTIME_ARGS", "--cuda_async_allocations=false")
     exe = evoxc.build(_linear, *_LINEAR_SPECS, backend="iree")
-    assert _RecordingIreeStub.recorded_load_options[-1] == {
-        "iree_runtime_args": ["--cuda_async_allocations=false"]
+    recorded = _RecordingIreeStub.recorded_load_options[-1]
+    # The load-relevant key is the env-supplied one ...
+    assert recorded["iree_runtime_args"] == ["--cuda_async_allocations=false"]
+    # ... and the rest of the dict is exactly the resolved forward set (the
+    # compile-only ``target_backends`` a load stage accepts and ignores): no
+    # other env option is invented or leaked.
+    assert recorded == {
+        "target_backends": ["llvm-cpu"],
+        "iree_runtime_args": ["--cuda_async_allocations=false"],
     }
     assert exe.device == core.Device("cpu", 0)
     _assert_no_new_iree_import()
@@ -961,14 +969,18 @@ def test_load_stage_explicit_runtime_args_beat_env(monkeypatch, iree_stub_regist
 
 
 def test_full_path_no_env_stages_stay_clean(monkeypatch, iree_stub_registered):
-    """With no option env vars, the compile/load stages receive no option
-    keys (the device-based target_backends inference is separate, documented
-    env-defaults behavior)."""
+    """With no option env vars, compile/load receive exactly the resolved
+    forward set and nothing env-derived (the device-based target_backends
+    inference is separate, documented env-defaults behavior; ``evoxc.build``
+    forwards it to every hop, and a load stage accepts-and-ignores the
+    compile-only key)."""
     exe = evoxc.build(_linear, *_LINEAR_SPECS, backend="iree")
     compile_recorded = _RecordingIreeStub.recorded_compile_options[-1]
     assert "iree_compile_args" not in compile_recorded
     assert compile_recorded == {"target_backends": ["llvm-cpu"]}
-    assert _RecordingIreeStub.recorded_load_options[-1] == {}
+    load_recorded = _RecordingIreeStub.recorded_load_options[-1]
+    assert load_recorded == {"target_backends": ["llvm-cpu"]}
+    assert "iree_runtime_args" not in load_recorded
     assert exe.device == core.Device("cpu", 0)
     _assert_no_new_iree_import()
 

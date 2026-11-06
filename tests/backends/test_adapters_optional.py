@@ -28,9 +28,13 @@ a strict in-process / subprocess split:
 Expected adapter behaviors pinned here (once ``evoxc/backends/adapters/``
 lands): a missing third-party dependency makes ``get(<adapter>)`` raise
 ``evoxc.BackendError`` carrying an actionable install/config hint (the
-``evoxc[...]`` extra name for pip-installable deps, the plugin discovery /
-build guidance for xla); a present dependency makes ``get`` lazily import
-the adapter module and register its backend.
+``evoxc[...]`` extra name for pip-installable deps); for xla — whose
+dependency is a per-call plugin artifact and whose ``register()`` is
+therefore UNCONDITIONAL — the same actionable guidance comes from the
+explicit option-less preflight ``XlaBackend.check_available()`` (the pipeline
+stages raise it from ``compile``/``load``, where they can see the options); a
+present dependency makes ``get`` lazily import the adapter module and
+register its backend.
 """
 
 import os
@@ -113,17 +117,28 @@ def test_import_evoxc_does_not_import_adapter_deps():
 # ---------------------------------------------------------------------------
 
 #: (adapter name, blocked module, install-hint fragments the message must
-#: contain at least one of)
+#: contain at least one of, the expression that must raise ``BackendError``)
 MISSING_DEP_CASES = [
-    ("iree", "iree", ("evoxc[iree]", "iree-base-compiler")),
-    # xla has NO hard pip dependency: blocking "jaxlib" is harmless (the
-    # adapter never imports it) and pins the case to the plugin-missing path,
-    # whose actionable message must carry the plugin configuration/build
-    # guidance. The subprocess also switches the jax_plugins auto-discovery
-    # scan off, so "missing" really means missing on a box that HAS an
-    # installed JAX plugin.
-    ("xla", "jaxlib", ("EVOXC_PJRT_PLUGIN", "plugin_path", "bazel build")),
-    ("tvm", "tvm", ("evoxc[tvm]", "apache-tvm")),
+    # A pip-installable dependency: the adapter's ``register()`` probes it,
+    # so the plain backend lookup already raises.
+    ("iree", "iree", ("evoxc[iree]", "iree-base-compiler"), "backends.get('iree')"),
+    # xla has NO hard pip dependency AND its ``register()`` is UNCONDITIONAL:
+    # its dependency is a per-call ``plugin_path``/env/discovered plugin ``.so``,
+    # which a classmethod probe cannot see, so ``backends.get('xla')`` SUCCEEDS
+    # with no plugin. The actionable message therefore comes from the explicit
+    # option-less availability preflight ``XlaBackend.check_available()`` — the
+    # same one ``compile``/``load`` raise from, where they DO see the options.
+    # Blocking "jaxlib" is harmless (the adapter never imports it — it
+    # dlopen()s the plugin) and pins the case to the plugin-missing path. The
+    # subprocess also switches the jax_plugins auto-discovery scan off, so
+    # "missing" really means missing on a box that HAS an installed JAX plugin.
+    (
+        "xla",
+        "jaxlib",
+        ("EVOXC_PJRT_PLUGIN", "plugin_path", "bazel build"),
+        "_xla.XlaBackend.check_available()",
+    ),
+    ("tvm", "tvm", ("evoxc[tvm]", "apache-tvm"), "backends.get('tvm')"),
 ]
 
 _MISSING_DEP_SCRIPT = """\
@@ -146,6 +161,7 @@ importlib.util.find_spec = _blocked_find_spec
 
 import evoxc
 from evoxc import backends
+from evoxc.backends.adapters import xla as _xla
 
 # Determinism for the xla case: plugin discovery must not accidentally
 # succeed from the ambient environment (EVOXC_PJRT_PLUGIN), from the
@@ -158,27 +174,29 @@ _xla_util._DEFAULT_PLUGIN_PATHS = ()
 _xla_util._reset_plugin_discovery_cache()
 
 try:
-    backends.get({name!r})
+    {probe}
 except evoxc.BackendError as e:
     msg = str(e)
     print(msg)
     hints = {hints}
     assert any(h in msg for h in hints), "missing install hint in: " + msg
 else:
-    raise SystemExit("get({name!r}) did not raise BackendError")
+    raise SystemExit("the availability probe did not raise BackendError")
 """
 
 
 @pytest.mark.parametrize(
-    "adapter, blocked_module, hints",
+    "adapter, blocked_module, hints, probe",
     MISSING_DEP_CASES,
     ids=[case[0] for case in MISSING_DEP_CASES],
 )
 def test_missing_dep_raises_backend_error_with_install_hint(
-    adapter, blocked_module, hints
+    adapter, blocked_module, hints, probe
 ):
     proc = _run_subprocess(
-        _MISSING_DEP_SCRIPT.format(blocked=blocked_module, name=adapter, hints=hints)
+        _MISSING_DEP_SCRIPT.format(
+            blocked=blocked_module, probe=probe, hints=hints
+        )
     )
     # The subprocess prints the actual error message; its zero exit already
     # proves it was an ``evoxc.BackendError`` carrying an install hint (the
