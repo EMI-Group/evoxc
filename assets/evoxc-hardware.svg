@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 552" width="1200" height="552" role="img" aria-labelledby="evoxcHardwareTitle" aria-describedby="evoxcHardwareDesc">
   <title id="evoxcHardwareTitle">evoxc — EvoX Compiler: hardware support</title>
-  <desc id="evoxcHardwareDesc">Hardware support in evoxc — EvoX Compiler: one traced graph goes through evoxc.trace, evoxc.lower, evoxc.compile, evoxc.load and evoxc.run onto the numpy interpreter (cpu only, the default backend) or onto a compiler adapter — IREE reaching llvm-cpu, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV; XLA reaching CUDA and ROCm through a user-provided PJRT plugin, and CPU only through a compiled test plugin (dashed); TVM reaching CPU end-to-end, with ROCm compile-only (dashed). Placement is physical: Tensor.to(device) is the only transfer primitive and run outputs stay on the device they ran on.</desc>
+  <desc id="evoxcHardwareDesc">Hardware support in evoxc — EvoX Compiler: one traced graph goes through evoxc.trace, evoxc.lower, evoxc.compile, evoxc.load and evoxc.run onto the numpy interpreter (cpu only, the default backend) or onto a compiler adapter — IREE reaching llvm-cpu, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV; XLA reaching CUDA and ROCm through a PJRT plugin it discovers (a pip-installed jax_plugins plugin, or an explicit plugin path), and CPU only through a compiled test plugin (dashed); TVM reaching CPU end-to-end, with ROCm compile-only (dashed). Placement is physical: Tensor.to(device) is the only transfer primitive and run outputs stay on the device they ran on.</desc>
 
   <defs>
     <marker id="evoxcHardwareArrowViolet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
@@ -89,7 +89,7 @@
   <rect x="316" y="282" width="20" height="3" rx="1.5" fill="#f0b429"/>
   <text x="316" y="307" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#e6edf3">XLA</text>
   <text x="316" y="324" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8b949e">cuda &#183; rocm</text>
-  <text x="316" y="337" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">user-provided PJRT plugin .so</text>
+  <text x="316" y="337" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10" fill="#8b949e">auto-discovered PJRT plugin .so</text>
 
   <!-- TVM -->
   <rect x="300" y="360" width="240" height="76" rx="12" fill="#161b22" stroke="#f0b429" stroke-width="1.5"/>

@@ -50,7 +50,7 @@ evoxc splits that stack along one hard line. Above it is the **frontend**, which
 | load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called | move your data onto the device, or recompile for another target |
 | run | `evoxc.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in | copy results to the host, cast, reshard, or insert communication |
 
-**Two backends below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a user-provided plugin `.so`) and **TVM** (StableHLO frontend + Relax VM).
+**Two backends below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
 
 **Layer discipline** — a strict one-way import DAG, so every problem has one owner:
 
@@ -89,7 +89,7 @@ exe = evoxc.build(f, spec_x, spec_w, device="cpu")          # trace → lower �
 y   = evoxc.evaluate(f, evoxc.ones((4, 8)), evoxc.ones((8, 4))) # derive specs → build → run
 ```
 
-Same graph, real compiler (`pip install evoxc[iree]`, or `evoxc[tvm]`, or a PJRT plugin `.so` for `xla`):
+Same graph, real compiler (`pip install evoxc[iree]`, or `evoxc[tvm]`, or `pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt` for `xla`):
 
 ```python
 exe = evoxc.build(f, spec_x, spec_w, backend="iree", device=evoxc.Device("cuda", 0),
@@ -377,20 +377,20 @@ Committed results, raw records and the probe scripts live in [`evoxc/bench/`](ev
 | **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
 | **StableHLO export** | nothing — `evoxc.backends.stablehlo.export(graph)` | MLIR text emission; also the lowering input for every compiler | n/a (text) |
 | **IREE** | `pip install evoxc[iree]`, `lower(..., backend="iree")` | IREE compile + HAL runtime, external-kernel host dispatch, device-resident payloads | llvm-cpu, CUDA, ROCm, Vulkan-SPIRV |
-| **XLA** | `EVOXC_PJRT_PLUGIN=/path/to/xla_plugin.so`, `backend="xla"` | PJRT C API via ctypes on a user-provided plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
+| **XLA** | `backend="xla"` — no path plumbing: it discovers an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`), else `EVOXC_PJRT_PLUGIN` / `plugin_path` | PJRT C API via ctypes over an auto-discovered plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
 | **TVM** | `pip install evoxc[tvm]`, `backend="tvm"` | StableHLO frontend + Relax VM (jaxlib only for its MLIR bindings) | CPU end-to-end; ROCm compile-only |
 
 **`opt_level`** is a first-class compile option (`"O0"`–`"O3"`, `"0"`–`"3"`, ints), one spelling, env `EVOXC_OPT_LEVEL`, per-adapter mapping — and an explicit raw compiler flag with the same name always wins over the derived one, never both. **`Capabilities`** lets an adapter state what it can and cannot do (custom calls, blocks, native RNG algorithms, …), so callers read the limits instead of finding them by crashing. And **a backend that cannot do something raises an explicit `BackendError` naming the op** and suggesting the remedy — never a silent fallback. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`; `evoxc.devices()` enumerates what this host actually has.
 
 ## Hardware support
 
-<img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through IREE (llvm-cpu, NVIDIA CUDA, AMD ROCm, Vulkan-SPIRV), XLA via a user-provided PJRT plugin (NVIDIA CUDA and AMD ROCm; cpu only through a compiled test plugin) or TVM (cpu end-to-end, AMD ROCm compile-only)." width="100%">
+<img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through IREE (llvm-cpu, NVIDIA CUDA, AMD ROCm, Vulkan-SPIRV), XLA through a PJRT plugin it discovers (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`; NVIDIA CUDA and AMD ROCm; cpu only through a compiled test plugin) or TVM (cpu end-to-end, AMD ROCm compile-only)." width="100%">
 
 The same graph runs on CPU, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV — what changes is a `backend=` and a `device=`, never a rewrite. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`, and `evoxc.devices()` enumerates what this host actually has.
 
 - **numpy interpreter** — the default backend and the always-available CPU fallback: no compiler, no codegen, every symbolic shape. `pip install evoxc` (numpy only) is the whole install.
 - **IREE** — llvm-cpu, NVIDIA CUDA, AMD ROCm/HIP and Vulkan-SPIRV, all validated end-to-end (the Vulkan path on Mesa lavapipe, a software device). The `evoxc[iree]` pin is `iree-base` 3.13.0, on which the llvm-cpu and ROCm/HIP legs were re-validated device-resident — `while_loop`, `scan`, `while` nested in `cond` and the MO/NSGA2-class `non_dominate_rank` loop now compile and run with bit-exact integers, and the compile-crash class of 3.10/3.11 is gone (0 crashes in 30 compiles; records in [`evoxc/bench/iree313_rocm_findings.md`](evoxc/bench/iree313_rocm_findings.md)). CUDA was validated on the 3.11 release and is not re-exercised on 3.13 here (no NVIDIA GPU on the validating host). `pip install evoxc[iree]`.
-- **XLA** — the PJRT C API driven directly over a **user-provided** plugin `.so` (`EVOXC_PJRT_PLUGIN` or `plugin_path`): CUDA and ROCm validated against real plugins, CPU plumbing validated with a compiled test plugin. No `jax`/`jaxlib`.
+- **XLA** — the PJRT C API driven directly over a plugin `.so` the adapter **discovers**: the `plugin_path` option, `EVOXC_PJRT_PLUGIN`, the fixed well-known paths, then an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`; `jax-rocm7-pjrt==0.10.2` validated on ROCm with no env var and no path), so a pip-installed plugin needs no wiring — `EVOXC_PJRT_PLUGIN_DISCOVERY=0` opts out of that last step. The plugin's platform must physically serve the requested device kind, so accelerator use is `backend="xla", device="rocm"` (or `"cuda"`) with explicit placement, and a ROCm/CUDA plugin against `Device("cpu", 0)` is refused. CUDA and ROCm validated against real plugins, CPU plumbing validated with a compiled test plugin. No `jax`/`jaxlib`.
 - **TVM** — CPU end-to-end; ROCm compile-only, because the wheel is built `USE_ROCM=OFF`. `pip install evoxc[tvm]`.
 
 Placement is physical and explicit: `Tensor.to(device)` is the only transfer primitive, `run` outputs stay on the device they ran on, host inputs to a non-cpu executable are a `DeviceError` at the run boundary, and `.numpy()` on a non-cpu tensor raises `DeviceError` (`.to(cpu)` first). No API moves your data behind your back.
@@ -469,7 +469,7 @@ pytest
 | `iree` | `iree-base-compiler` + `iree-base-runtime` (3.13.x) | the IREE adapter on llvm-cpu / cuda / rocm / vulkan |
 | `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib only for its bundled MLIR bindings; `jax` is never imported) |
 | `compilers` | IREE + TVM | both adapters at once |
-| *(xla)* | **no extra** | the XLA adapter loads a user-provided PJRT C API plugin `.so` (`EVOXC_PJRT_PLUGIN` or `plugin_path`) |
+| *(xla)* | **no extra** | the XLA adapter auto-discovers a PJRT C API plugin `.so` — an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`) or an explicit `plugin_path`/`EVOXC_PJRT_PLUGIN` |
 
 `torch` and `transformers` are **not** an `evoxc` extra any more — the HuggingFace reference oracles live on the `evoxc-hf` distribution: `pip install "evoxc-hf[hf]"`. `evoxc`'s hard dependency stays numpy-only.
 
