@@ -11,15 +11,29 @@ current-state contract; this skill holds the bulky how-to and the numbers behind
 
 ## XLA run environment (real PJRT plugins)
 
+### Plugin discovery (no path needed for a pip-installed plugin)
+
+The adapter resolves the plugin itself, in this order: `plugin_path` option → `EVOXC_PJRT_PLUGIN` env →
+fixed well-known paths → a scan of every `sys.path` entry for `jax_plugins/<platform>/<name>_plugin.so`,
+probed with `ctypes.CDLL(...)` + a `GetPjRtApi` symbol lookup (nothing is imported; probe + scan are cached
+per process). So `pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt` is enough — the recipes below only need
+`EVOXC_PJRT_PLUGIN` when PINNING a different plugin than the one the scan would pick (the scan sorts
+candidates by path, so `jax_plugins/xla_cpu/…` wins over `xla_cuda12`/`xla_rocm7`), or when a machine has
+several. `EVOXC_PJRT_PLUGIN_DISCOVERY=0` turns the scan off (any other unrecognized spelling is a loud
+`BackendError`). A quick check: `python -c "from evoxc.backends.adapters import xla_util;
+print(xla_util._find_plugin_path())"`. The plugin's platform must serve the requested device kind, so a
+ROCm/CUDA plugin is refused for `Device("cpu", 0)`/`device=None` — accelerator runs name their device.
+
 ### CUDA plugin (`jax_cuda12_pjrt` 0.10.2, `xla_cuda_plugin.so`)
 
 ```
-EVOXC_PJRT_PLUGIN=<venv>/site-packages/jax_plugins/xla_cuda12/xla_cuda_plugin.so
 LD_PRELOAD=/…/cudnn-xla/lib/libcudnn.so.9     # set at process start (see below)
 XLA_FLAGS=--xla_gpu_cuda_data_dir=<dir with nvvm/libdevice/libdevice.10.bc>
 CUDA_VISIBLE_DEVICES=<free gpu>               # adapter executes on the client's addressable device 0
 PATH=<...>                                     # must contain ptxas
 ```
+
+(`EVOXC_PJRT_PLUGIN=<venv>/site-packages/jax_plugins/xla_cuda12/xla_cuda_plugin.so` only to pin it explicitly.)
 
 - **cuDNN:** the plugin is compiled against cuDNN 9.8.0 but its `DT_RPATH` points at the venv's pip cuDNN
   9.1.0; RPATH beats `LD_LIBRARY_PATH` for the plugin's own `dlopen("libcudnn.so.9")`, so only `LD_PRELOAD`
@@ -31,14 +45,17 @@ PATH=<...>                                     # must contain ptxas
 - Artifact stays device-agnostic (`target="cpu"`); the device is chosen at `load()` (`Device("cuda", N)`
   resolves the client's addressable device N with explicit out-of-range/unknown-kind errors).
 
-### ROCm plugin (`jax-rocm7-pjrt` 0.11.2, `jax_plugins/xla_rocm7/xla_rocm_plugin.so`)
+### ROCm plugin (`jax-rocm7-pjrt` 0.10.2 validated for auto-discovery, 0.11.2 probe record)
 
 ```
-EVOXC_PJRT_PLUGIN=<venv>/site-packages/jax_plugins/xla_rocm7/xla_rocm_plugin.so
+pip install 'jax-rocm7-pjrt==0.10.2'    # installs jax_plugins/xla_rocm7/xla_rocm_plugin.so — discovered
 ```
 The wheel resolves libhsa/librocm via its own `DT_RPATH` — no `LD_LIBRARY_PATH`; no `XLA_FLAGS`/libdevice needed.
 `platform_name="rocm"`; `Device("rocm", N)` / `Device("hip", N)` build+load+run device-resident, `Device("cuda", N)`
-is honestly rejected. Host-staged path (`device` omitted) unchanged (fp32 parity ~1e-7).
+is honestly rejected. With 0.10.2 no env var and no `plugin_path` are needed
+(`evoxc.build(fn, *specs, backend="xla", device="rocm")` + `run` on placed inputs: elementwise+reduce,
+`while_loop` and `scan` graphs all match the numpy interpreter at fp32 1e-5, outputs stay on
+`Device('rocm', 0)`).
 
 ### Plugin exit-time abort (defect — do not fix)
 
