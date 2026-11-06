@@ -295,7 +295,10 @@ class TvmBackend(CompilerBackend):
         )
 
     def load(
-        self, artifact: CompiledArtifact, device: Device | None = None
+        self,
+        artifact: CompiledArtifact,
+        device: Device | None = None,
+        options: dict | None = None,
     ) -> "TvmExecutable":
         """Reconstruct a TvmExecutable from an artifact. Never recompiles.
 
@@ -308,6 +311,12 @@ class TvmBackend(CompilerBackend):
            ``core.PersistenceError`` — never silently recompile).
         4. Decode the base64 host library to a temp file and reload via
            ``tvm.runtime.load_module`` -> ``VirtualMachine``.
+
+        ``options``: the tvm adapter declares no load-stage option, so a
+        forwarded dict (``evoxc.build`` passes ONE dict to every stage) is
+        accepted and ignored — the compile-stage ``tvm_target`` /
+        ``tvm_pass_configs`` / ``opt_level`` keys were already consumed by
+        ``compile``, and a key valid for NO stage is rejected at ``lower``.
         """
         if artifact.backend != "tvm":
             raise core.PersistenceError(

@@ -548,13 +548,22 @@ class CompilerBackend(Backend):
         ...
 
     @abstractmethod
-    def load(self, artifact: CompiledArtifact, device: Device | None = None) -> Executable:
+    def load(
+        self,
+        artifact: CompiledArtifact,
+        device: Device | None = None,
+        options: dict | None = None,
+    ) -> Executable:
         """Reconstruct an adapter executable from an artifact.
 
         Adapter implementations validate ``artifact.backend`` / device /
         ABI (mismatch => ``core.PersistenceError`` — or
         ``core.BackendError`` for unsupported devices) and build the
         executable. ``load`` NEVER re-traces, re-lowers, or re-compiles.
+
+        ``options``: the adapter's load-stage option dict, already filtered by
+        the pipeline to the keys it declares in ``KNOWN_OPTIONS`` — an adapter
+        with no load-stage option (tvm) accepts and ignores it.
         """
         ...
 

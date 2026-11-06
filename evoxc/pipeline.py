@@ -1598,7 +1598,7 @@ def build(fn, *specs, backend=None, device=None, **options):
     graph = trace_fn(fn, *specs)
     lowered = lower(graph, backend=backend, **options)
     artifact = compile(lowered, **options)
-    return load(artifact, backend=backend, device=device)
+    return load(artifact, backend=backend, device=device, **options)
 
 
 def evaluate(fn, *args, backend=None, device=None, **options):

@@ -324,7 +324,8 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
                           canonical-options),
                       compute_fn=lambda: build(fn, *specs, **opts))
 
-    ...where the miss path expands exactly like ``evoxc.build``::
+    ...where the miss path expands like ``evoxc.build``'s stages, with
+    ``load`` taking no options (see the options bullet below)::
 
         graph = evoxc.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
@@ -349,9 +350,11 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
       (``EVOXC_OPT_LEVEL``, ``EVOXC_IREE_*``, ``EVOXC_XLA_*``, ``EVOXC_TVM_*``) are
       NOT part of the key — clear the cache or pass a fresh ``CompileCache``
       when changing them (documented limitation).
-    * Options are forwarded to ``lower`` and ``compile`` exactly as in
-      ``evoxc.build`` (``load`` gets none); the key uses a canonicalized copy
-      so semantically-equal option sets key identically.
+    * Options are forwarded to ``lower`` and ``compile`` (this miss path's
+      ``load`` receives none, unlike ``evoxc.build`` — a load-stage option
+      such as the xla ``plugin_path`` needs ``evoxc.build`` or the explicit
+      pipeline); the key uses a canonicalized copy so semantically-equal
+      option sets key identically.
     * Errors: fn validation, backend/device resolution, cache-type checks
       and cache-key encodability all fire BEFORE any cache access; a
       program that fails to trace/lower/compile/load raises per stage —

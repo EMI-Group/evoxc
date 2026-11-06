@@ -207,7 +207,12 @@ class NumpyBackend(Backend):
             runtime_dependencies=runtime_dependencies,
         )
 
-    def load(self, artifact: CompiledArtifact, device: Device | None = None) -> "NumpyExecutable":
+    def load(
+        self,
+        artifact: CompiledArtifact,
+        device: Device | None = None,
+        options: dict | None = None,
+    ) -> "NumpyExecutable":
         """Reconstruct a NumpyExecutable from an artifact. Never re-compiles.
 
         1. Validate ``artifact.backend == "numpy"`` — mismatch =>
@@ -223,6 +228,12 @@ class NumpyBackend(Backend):
            LAZILY at run time (kernels must be re-registered in the process
            before RUN, not before load).
         4. Build a ``NumpyExecutable``.
+
+        ``options``: accepted and DELIBERATELY unvalidated/ignored, exactly as
+        in ``run`` — a shared option dict forwarded by ``evoxc.build`` carries
+        compiler-stage keys (``target_backends``, ``iree_compile_args``, …)
+        that mean nothing here, and the reference interpreter never rejects
+        them. There is no numpy load-stage option.
 
         NEVER re-traces / re-lowers / re-compiles — load-time mismatches fail
         clearly (see the root error strategy).
