@@ -164,6 +164,25 @@ def _check_kind_served(
         )
 
 
+def _verify_bindings() -> None:
+    """Check the vendored PJRT ctypes bindings; raise ``core.BackendError``.
+
+    The cheap, OPTION-FREE half of the availability probe: the
+    ``_pjrt_c_api`` module laid out its ``PJRT_Api`` table at import time
+    (so a broken vendored translation is caught here), and the struct must
+    have a non-zero layout. Plugin discovery/ABI gating is the caller's
+    job, because only the caller knows its options: ``check_available()``
+    runs the option-less chain (a classmethod gets no options), while
+    ``XlaBackend.load`` passes its OWN options to ``_load_plugin``.
+    """
+    _pjrt.verify_api  # bindings module integrity (import-time layout)
+    if _pjrt.sizeof(_pjrt.PJRT_Api) <= 0:
+        raise core.BackendError(
+            "the vendored PJRT C API bindings are broken: PJRT_Api has "
+            "no layout"
+        )
+
+
 class XlaBackend(CompilerBackend):
     """XLA-via-PJRT backend: StableHLO MLIR -> XLA CPU executable.
 
@@ -269,11 +288,18 @@ class XlaBackend(CompilerBackend):
     def check_available(cls) -> None:
         """Probe the PJRT plugin dependency; raise ``core.BackendError`` if absent.
 
-        Checks (1) the vendored ctypes bindings module integrity, (2)
-        plugin discovery — ``plugin_path`` is not available here (a
-        classmethod), so discovery runs the ``EVOXC_PJRT_PLUGIN`` -> fixed
-        well-known paths -> installed ``jax_plugins/*/*.so`` chain — plus
-        ``GetPjRtApi`` and the ABI version gate, and (3) a live
+        The OPTION-LESS probe — used by ``register()`` and by callers with
+        no stage context (a classmethod gets no options). The pipeline
+        stages do NOT go through it: ``compile`` and ``load`` each call
+        ``_load_plugin(options)`` directly, so ``plugin_path`` is honored
+        with the documented precedence (``plugin_path`` -> env -> fixed
+        paths -> the ``jax_plugins`` scan) instead of being bypassed.
+
+        Checks (1) the vendored ctypes bindings module integrity
+        (``_verify_bindings``), (2) plugin discovery — ``plugin_path`` is
+        not available here, so discovery runs the ``EVOXC_PJRT_PLUGIN`` ->
+        fixed well-known paths -> installed ``jax_plugins/*/*.so`` chain —
+        plus ``GetPjRtApi`` and the ABI version gate, and (3) a live
         ``PJRT_Client_Create``/``PJRT_Client_Destroy`` round-trip through the
         process-global shared client (``acquire_client`` /
         ``release_client`` — creates the client when no one else holds it,
@@ -283,12 +309,7 @@ class XlaBackend(CompilerBackend):
         plugins, ``bazel build
         //xla/pjrt/c:pjrt_c_api_cpu_plugin``) — never a bare ImportError.
         """
-        _pjrt.verify_api  # bindings module integrity (import-time layout)
-        if _pjrt.sizeof(_pjrt.PJRT_Api) <= 0:
-            raise core.BackendError(
-                "the vendored PJRT C API bindings are broken: PJRT_Api has "
-                "no layout"
-            )
+        _verify_bindings()
         plugin = _load_plugin()  # discovery + GetPjRtApi + version gate
         client = acquire_client(plugin)  # live create/destroy round-trip
         release_client(plugin)
@@ -472,8 +493,8 @@ class XlaBackend(CompilerBackend):
         """Reconstruct an ``XlaExecutable`` from a serialized artifact.
 
         Validates the recorded backend (``core.PersistenceError`` naming
-        both on mismatch), the plugin (``check_available``), the device
-        (None or a ``core.Device``; non-``Device`` ->
+        both on mismatch), the vendored bindings (``_verify_bindings``) and
+        the device (None or a ``core.Device``; non-``Device`` ->
         ``core.DeviceError``), and the payload format. Device model
         (explicit placement — mirroring the iree adapter):
 
@@ -501,16 +522,20 @@ class XlaBackend(CompilerBackend):
 
         The base64 executable is deserialized with
         ``PJRT_Executable_DeserializeAndLoad`` on the process-global shared
-        client for the (re-discovered) plugin (one refcounted client per
-        plugin path — ``acquire_client``/``release_client``; the executable
-        releases its reference in ``close()``) — the ``plugin_path`` load
-        option is honored for discovery, then ``EVOXC_PJRT_PLUGIN``, the
-        fixed well-known paths and finally the installed
-        ``jax_plugins/*/*.so`` scan. Options are validated against
-        ``KNOWN_OPTIONS`` (unknown keys => ``core.BackendError``). NEVER
-        re-traces, re-lowers, or re-compiles; a deserialization failure
-        (environment/ABI mismatch) raises ``core.PersistenceError`` — no
-        silent recompilation.
+        client for the discovered plugin (one refcounted client per plugin
+        path — ``acquire_client``/``release_client``; the executable
+        releases its reference in ``close()``). The plugin is resolved ONCE,
+        WITH THIS STAGE'S OPTIONS (``_load_plugin(options)``), honoring the
+        documented precedence — the ``plugin_path`` load option, then
+        ``EVOXC_PJRT_PLUGIN``, the fixed well-known paths and finally the
+        installed ``jax_plugins/*/*.so`` scan — and the immediately
+        following ``acquire_client`` IS the live round-trip (there is no
+        separate option-less ``check_available`` probe first, so a
+        ``plugin_path``-only setup works and no throwaway client is
+        created). Options are validated against ``KNOWN_OPTIONS`` (unknown
+        keys => ``core.BackendError``). NEVER re-traces, re-lowers, or
+        re-compiles; a deserialization failure (environment/ABI mismatch)
+        raises ``core.PersistenceError`` — no silent recompilation.
         """
         if artifact.backend != self.name:
             raise core.PersistenceError(
@@ -520,7 +545,7 @@ class XlaBackend(CompilerBackend):
         from ..options import validate_options
 
         validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
-        self.check_available()
+        _verify_bindings()
         if device is not None:
             if not isinstance(device, core.Device):
                 raise core.DeviceError(
