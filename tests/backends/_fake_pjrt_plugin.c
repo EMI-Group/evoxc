@@ -39,6 +39,12 @@
  *   EVOXC_FAKE_PJRT_FAIL_AFTER_DEVICE_EVENT=<any> (env): write a real
  *       device-complete event and THEN fail the execute (the driver's
  *       stray-handle cleanup path)
+ *   EVOXC_FAKE_PJRT_FAIL_AFTER_OUTPUTS=<n>|all (env): write REAL output
+ *       buffers into the first N caller slots (a non-numeric value = every
+ *       output) and THEN fail the execute — the driver's failed-execute
+ *       output-slot cleanup path (a reused scaffolding must never wrap a
+ *       stale pointer). Combined with a requested device-complete event it
+ *       exercises both cleanups in one call.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -898,6 +904,31 @@ static PJRT_Error* fake_PJRT_LoadedExecutable_Execute(
   /* output_lists[0] is a PJRT_Buffer* whose VALUE is the caller-allocated
    * array of num_outputs PJRT_Buffer* (see the header's contract). */
   PJRT_Buffer** out = (PJRT_Buffer**)args->output_lists[0];
+  /* FAIL-AFTER-OUTPUTS knob: fill the first N caller slots with REAL output
+   * buffers and THEN return an error, so the caller's REUSED scaffolding
+   * holds live pointers on the failure path — the driver must zero them
+   * before the next call. The buffers are deliberately NOT freed here: a
+   * driver that kept a stale slot would then surface as a use-after-free
+   * (crash) instead of a clean assertion, so a regression fails loudly. */
+  {
+    const char* fail_after_outputs = getenv("EVOXC_FAKE_PJRT_FAIL_AFTER_OUTPUTS");
+    if (fail_after_outputs && *fail_after_outputs) {
+      char* end = NULL;
+      long n = strtol(fail_after_outputs, &end, 10);
+      if (end == fail_after_outputs || (end && *end != '\0') || n < 0)
+        n = (long)args->executable->exe->num_outputs; /* non-numeric = all */
+      if (n > (long)args->executable->exe->num_outputs)
+        n = (long)args->executable->exe->num_outputs;
+      for (long i = 0; i < n; i++) {
+        fake_output* o = &args->executable->exe->outputs[i];
+        PJRT_Buffer* buffer = NULL;
+        err = make_buffer(o->type, o->dims, o->num_dims, NULL, 1, &buffer);
+        if (err) return err;
+        out[i] = buffer;
+      }
+      return make_error("injected fake failure after writing output buffers");
+    }
+  }
   for (size_t i = 0; i < args->executable->exe->num_outputs; i++) {
     fake_output* o = &args->executable->exe->outputs[i];
     PJRT_Buffer* buffer = NULL;
