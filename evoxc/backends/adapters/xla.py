@@ -1,10 +1,10 @@
-"""XLA adapter via PJRT — drives a user-provided PJRT C API plugin.
+"""XLA adapter via PJRT — drives a PJRT C API plugin discovered at runtime.
 
 This module implements the ``"xla"`` optional compiler backend for the
 shared pluggable-compiler framework (``evoxc.backends.compiler``). It
 consumes the StableHLO MLIR text produced by the shared
-``CompilerBackend.lower`` and compiles it by driving a **user-provided PJRT
-C API plugin** (``.so`` exporting ``GetPjRtApi``) through pure-stdlib
+``CompilerBackend.lower`` and compiles it by driving a **PJRT C API plugin
+discovered at runtime** (``.so`` exporting ``GetPjRtApi``) through pure-stdlib
 ``ctypes``. No Python frontend and no native binding package is imported
 anywhere in this adapter — the plugin ABI translation lives in
 ``_pjrt_c_api.py`` (vendored from the canonical OpenXLA header; see its

@@ -2,9 +2,12 @@
 
 Everything in this module is imported from ``xla.py`` ONLY (it is not part
 of any public surface). This module replaces the former native-binding
-plumbing with a pure-stdlib ctypes driver over a user-provided PJRT C API
-plugin (``_pjrt_c_api.py`` holds the vendored ABI translation; the header
-provenance and the version-gate contract are documented there).
+plumbing with a pure-stdlib ctypes driver over a PJRT C API plugin the
+adapter DISCOVERS at runtime (an installed ``jax_plugins`` plugin,
+``EVOXC_PJRT_PLUGIN`` or ``plugin_path`` — see the discovery list below);
+no binding package is imported (``_pjrt_c_api.py`` holds the vendored ABI
+translation; the header provenance and the version-gate contract are
+documented there).
 
 Plugin flow (the header ``xla/pjrt/c/pjrt_c_api.h`` is the contract):
 

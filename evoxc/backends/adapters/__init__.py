@@ -11,15 +11,17 @@ a separate module subclassing the shared ``evoxc.backends.compiler``
   and every GPU-class kind runs device-resident (explicit placement via
   ``Tensor.to``, no implicit host↔device staging). Singleton
   ``iree_backend``.
-- ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): drives a USER-PROVIDED
-  PJRT C API plugin (a ``.so`` exporting ``GetPjRtApi``) through
+- ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): drives a PJRT C API
+  plugin DISCOVERED at runtime (a ``.so`` exporting ``GetPjRtApi``) through
   pure-stdlib ctypes — the vendored ABI translation lives in
   ``_pjrt_c_api.py`` (provenance + version gate documented there) and the
-  driver in ``xla_util.py``. The plugin is configured via
-  ``options["plugin_path"]`` or the ``EVOXC_PJRT_PLUGIN`` environment
-  variable; build one from OpenXLA (``bazel build
-  //xla/pjrt/c:pjrt_c_api_cpu_plugin``) — never pip-installed. The ``jax``
-  package is never imported. Singleton ``xla_backend``.
+  driver in ``xla_util.py``. The plugin is either an installed JAX PJRT
+  plugin following the ``jax_plugins/<platform>/<name>_plugin.so``
+  convention (e.g. ``pip install jax-rocm7-pjrt`` / ``jax-cuda12-pjrt``), a
+  ``options["plugin_path"]`` or ``EVOXC_PJRT_PLUGIN`` path, or a source
+  build from OpenXLA (``bazel build
+  //xla/pjrt/c:pjrt_c_api_cpu_plugin``); it is dlopen-ed, never imported as
+  a Python package (no jax/jaxlib). Singleton ``xla_backend``.
 - ``tvm.py`` — TVM adapter (IMPLEMENTED): ``tvm.relax.frontend.stablehlo``
   importer + Relax VM execution (llvm target); vendored-translator
   compatibility shim in ``tvm_util.py`` (jaxlib is used ONLY for its
