@@ -22,6 +22,14 @@
  * Test-only knobs (via -D at build time, and env vars at run time):
  *   -DEVOXC_FAKE_PJRT_STRUCT_SIZE=N   override PJRT_Api.struct_size (ABI gate)
  *   -DEVOXC_FAKE_PJRT_MAJOR_VERSION=N override pjrt_api_version.major_version
+ *   -DEVOXC_FAKE_PJRT_PLATFORM=<name> the platform name this fake REPORTS via
+ *       PJRT_Client_PlatformName (a bare token, no quotes — default `fake`).
+ *       The xla adapter picks its device-kind support from that name
+ *       (_PLATFORM_KINDS in xla.py: "cpu" -> CPU only, "rocm" -> rocm/hip,
+ *       "cuda" -> cuda, an unlisted name is permissive), so a build-time
+ *       platform is how the adapter's honest placement check is exercised
+ *       without real hardware. The reported platform VERSION
+ *       ("fake-cpu 0.0.1") is unaffected.
  *   EVOXC_FAKE_PJRT_FAIL_STEP=<entry point name>  (env): make that call fail
  *   EVOXC_FAKE_PJRT_FAIL_MESSAGE=<text>           (env): the error message
  *   EVOXC_FAKE_PJRT_NO_DEVICE_EVENT=<any>         (env): leave the
@@ -708,11 +716,24 @@ static PJRT_Error* fake_PJRT_Client_Destroy(PJRT_Client_Destroy_Args* args) {
   return maybe_fail("PJRT_Client_Destroy");
 }
 
+/* Platform name reported through PJRT_Client_PlatformName. The xla adapter
+ * derives device-kind support from it (see -DEVOXC_FAKE_PJRT_PLATFORM above):
+ * the knob takes a BARE TOKEN (`-D...=rocm`, no quotes) which is stringified
+ * here, and the default keeps every pre-existing test byte-for-byte
+ * unchanged. */
+#ifndef EVOXC_FAKE_PJRT_PLATFORM
+#define EVOXC_FAKE_PJRT_PLATFORM fake
+#endif
+#define EVOXC_FAKE_PJRT_STR_(token) #token
+#define EVOXC_FAKE_PJRT_STR(token) EVOXC_FAKE_PJRT_STR_(token)
+#define EVOXC_FAKE_PJRT_PLATFORM_NAME \
+  EVOXC_FAKE_PJRT_STR(EVOXC_FAKE_PJRT_PLATFORM)
+
 static PJRT_Error* fake_PJRT_Client_PlatformName(PJRT_Client_PlatformName_Args* args) {
   PJRT_Error* err = maybe_fail("PJRT_Client_PlatformName");
   if (err) return err;
-  args->platform_name = "fake";
-  args->platform_name_size = 4;
+  args->platform_name = EVOXC_FAKE_PJRT_PLATFORM_NAME;
+  args->platform_name_size = strlen(EVOXC_FAKE_PJRT_PLATFORM_NAME);
   return NULL;
 }
 

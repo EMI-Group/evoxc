@@ -2,21 +2,34 @@
 
 Contract under test: the shared ``CompilerBackend`` framework
 (``evoxc/backends/compiler.py``) plus the XLA adapter's REAL
-lower/compile/load/run through a USER-PROVIDED PJRT C API plugin (a ``.so``
-exporting ``GetPjRtApi``, configured via the ``EVOXC_PJRT_PLUGIN`` environment
-variable or the ``plugin_path`` compile option; the adapter drives it via
-ctypes — NOT the ``jax`` package). One contract, three dependencies: this
-file, ``test_adapter_iree.py`` and ``test_adapter_tvm.py`` are structurally
-identical and share the graph builders, tolerances and parity helper in
-``tests/backends/_adapter_utils``.
+lower/compile/load/run through a PJRT C API plugin (a ``.so`` exporting
+``GetPjRtApi``, passed with the ``plugin_path`` compile option, named by the
+``EVOXC_PJRT_PLUGIN`` environment variable, or auto-discovered; the adapter
+drives it via ctypes — NOT the ``jax`` package). One contract, three
+dependencies: this file, ``test_adapter_iree.py`` and
+``test_adapter_tvm.py`` are structurally identical and share the graph
+builders, tolerances and parity helper in ``tests/backends/_adapter_utils``.
 
-The plugin is a real external artifact (build one from OpenXLA with ``bazel
-build //xla/pjrt/c:pjrt_c_api_cpu_plugin``; there is no pip-installable
-plugin). When none is configured the module SKIPS at import time with an
-actionable message — the same contract is exercised without a real XLA
-build by ``test_pjrt_ctypes_plugin.py`` against a fake plugin built from C
-at test time. Set ``EVOXC_PJRT_PLUGIN`` (or pass ``plugin_path=...``) to run
-these tests for real.
+The plugin is a real external artifact, resolved at run time in the order
+``plugin_path`` -> ``EVOXC_PJRT_PLUGIN`` -> the fixed well-known paths -> an
+installed ``jax_plugins/*/*.so`` (auto-discovery; ``pip install
+jax-rocm7-pjrt`` / ``jax-cuda12-pjrt``; opt out with
+``EVOXC_PJRT_PLUGIN_DISCOVERY=0``), and it may be an ACCELERATOR plugin.
+When none is resolvable the module SKIPS at import time with an actionable
+message — the same contract is exercised without a real XLA build by
+``test_pjrt_ctypes_plugin.py`` against a fake plugin built from C at test
+time.
+
+**Derived run device.** ``RUN_DEVICE`` is read once per process from the
+resolved plugin's platform (``tests/backends/_xla_plugin_probe.py``:
+``rocm``/``hip`` -> ``Device("rocm", 0)``, ``cuda`` -> ``Device("cuda", 0)``,
+anything else incl. ``cpu`` -> ``Device("cpu", 0)``) and every stage that
+takes a device uses it. On an accelerator that means the explicit placement
+rules of the other device-resident suites: build/load with
+``device=RUN_DEVICE``, hand ``run`` tensors placed with ``Tensor.to``, and
+read outputs back through ``.to(Device("cpu", 0)).numpy()`` — all via the
+probe's ``place_args``/``to_host``/``parity`` helpers. On a ``cpu`` platform
+nothing changes: host inputs and a direct ``.numpy()``.
 
 Pinned here:
 
@@ -50,25 +63,36 @@ import evoxc
 from evoxc.backends.adapters import xla
 
 from tests.backends import _adapter_utils as u
+from tests.backends import _xla_plugin_probe as probe
 
 NAME = "xla"
 
-# Real-plugin presence gate (module level): the adapter requires a
-# user-provided PJRT C API plugin (.so exporting GetPjRtApi) — there is no
-# pip-installable dependency. ``register()`` runs the adapter's own probe
-# (bindings integrity + plugin discovery + ABI version gate + a live client
-# create/destroy round-trip) and raises ``evoxc.BackendError`` when no plugin
-# is available; skip the whole module in that case with an actionable hint.
+# Real-plugin presence gate (module level): the adapter requires a PJRT C API
+# plugin (.so exporting GetPjRtApi) — there is no hard pip dependency (an
+# installed ``jax_plugins`` plugin is auto-discovered). ``register()`` runs the
+# adapter's own probe (bindings integrity + plugin discovery + ABI version
+# gate + a live client create/destroy round-trip) and raises
+# ``evoxc.BackendError`` when no plugin is available; skip the whole module in
+# that case with an actionable hint.
 try:
     xla.register()
 except evoxc.BackendError as exc:
     pytest.skip(
-        "the xla adapter requires a user-provided PJRT C API plugin (.so "
-        "exporting GetPjRtApi); set EVOXC_PJRT_PLUGIN=/path/to/"
-        "pjrt_c_api_cpu_plugin.so or pass plugin_path=... to the compile "
-        f"options. Details: {exc}",
+        "the xla adapter requires a PJRT C API plugin (.so exporting "
+        "GetPjRtApi) and none is available; set "
+        "EVOXC_PJRT_PLUGIN=/path/to/pjrt_c_api_cpu_plugin.so, pass "
+        "plugin_path=... to the compile options, or install a JAX plugin "
+        "(pip install jax-rocm7-pjrt / jax-cuda12-pjrt). Details: "
+        f"{exc}",
         allow_module_level=True,
     )
+
+#: The device the resolved plugin physically serves (derived once per
+#: process — see the module docstring). Accelerator on a GPU plugin: every
+#: leg below then places inputs explicitly and reads outputs back through
+#: ``.to(cpu)``.
+RUN_DEVICE = probe.run_device()
+IS_ACCELERATOR = probe.is_accelerator()
 
 
 # ---------------------------------------------------------------------------
@@ -114,26 +138,30 @@ def test_registered_singleton(adapter_backend):
 def test_matmul_relu_sum_parity(adapter_artifact):
     fn, specs = u.matmul_relu_sum()
     a, b = u.matmul_relu_sum_args()
-    exe = evoxc.load(adapter_artifact)
-    u.assert_parity(fn, (a, b), exe)
+    exe = evoxc.load(adapter_artifact, device=RUN_DEVICE)
+    probe.parity(fn, (a, b), exe)
 
 
 def test_reshape_broadcast_transpose_parity_via_build_name(adapter_backend):
     fn, specs = u.reshape_broadcast_transpose()
     x = u.standard_normal((4, 8))
-    exe = evoxc.build(fn, *specs, backend=NAME)
-    u.assert_parity(fn, (x,), exe)
+    exe = evoxc.build(fn, *specs, backend=NAME, device=RUN_DEVICE)
+    probe.parity(fn, (x,), exe)
 
 
 def test_evaluate_with_backend_name(adapter_backend):
     fn, specs = u.matmul_relu_sum()
     a, b = u.matmul_relu_sum_args()
     expected = evoxc.evaluate(fn, a, b)  # default numpy reference
-    actual = evoxc.evaluate(fn, a, b, backend=NAME)
+    # ``evaluate`` derives specs from its ARGUMENTS and hands those very
+    # arguments to ``run``, so an accelerator run needs them placed first.
+    actual = evoxc.evaluate(
+        fn, *probe.place_args((a, b)), backend=NAME, device=RUN_DEVICE
+    )
     assert isinstance(actual, evoxc.Tensor)
     assert actual.dtype == expected.dtype
     np.testing.assert_allclose(
-        actual.numpy(), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
+        probe.to_host(actual), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
     )
 
 
@@ -154,16 +182,19 @@ def test_symbolic_dims(adapter_backend):
         return
 
     numpy_exe = evoxc.build(fn, *specs)  # default numpy reference
-    adapter_exe = evoxc.build(fn, *specs, backend=NAME)
+    adapter_exe = evoxc.build(fn, *specs, backend=NAME, device=RUN_DEVICE)
     for x in (
         np.array([1.0, 2.0, 3.0], dtype=np.float32),
         np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32),
     ):
         expected = evoxc.run(numpy_exe, x)
-        actual = evoxc.run(adapter_exe, x)
+        actual = evoxc.run(adapter_exe, *probe.place_args((x,)))
         assert actual.dtype == expected.dtype
         np.testing.assert_allclose(
-            actual.numpy(), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
+            probe.to_host(actual),
+            expected.numpy(),
+            rtol=u.FP32_RTOL,
+            atol=u.FP32_ATOL,
         )
 
 
@@ -204,19 +235,21 @@ def test_artifact_save_load_roundtrip(tmp_path, adapter_backend, adapter_artifac
     loaded = evoxc.backends.CompiledArtifact.load(path)
     assert loaded.backend == NAME
 
-    # Backend-level reload: raw run over flat evoxc.Tensor inputs.
-    raw = adapter_backend.load(loaded)
+    # Backend-level reload: raw run over flat evoxc.Tensor inputs (placed
+    # explicitly on the derived device — the executable is device-resident
+    # there, so a host input would raise core.DeviceError).
+    raw = adapter_backend.load(loaded, device=RUN_DEVICE)
     fn, specs = u.matmul_relu_sum()
     a, b = u.matmul_relu_sum_args()
     expected = evoxc.evaluate(fn, a, b)
-    (out,) = raw.run([evoxc.tensor(a), evoxc.tensor(b)])
+    (out,) = raw.run(probe.place_args((a, b)))
     np.testing.assert_allclose(
-        out.numpy(), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
+        probe.to_host(out), expected.numpy(), rtol=u.FP32_RTOL, atol=u.FP32_ATOL
     )
 
     # Pipeline-level reload runs through the structured signature.
-    exe = evoxc.load(loaded)
-    u.assert_parity(fn, (a, b), exe)
+    exe = evoxc.load(loaded, device=RUN_DEVICE)
+    probe.parity(fn, (a, b), exe)
 
 
 def test_backend_name_mismatch_on_load(adapter_backend, adapter_artifact):
@@ -245,10 +278,16 @@ def test_backend_name_mismatch_on_load(adapter_backend, adapter_artifact):
 
 
 def test_executable_attributes(adapter_artifact):
-    exe = evoxc.load(adapter_artifact)
+    exe = evoxc.load(adapter_artifact, device=RUN_DEVICE)
     assert isinstance(exe.functions, tuple)
     assert "main" in exe.functions
-    assert exe.device is None or exe.device == evoxc.Device("cpu", 0)
+    # The recorded device is the one derived from the resolved plugin — cpu:0
+    # on a CPU plugin, the accelerator device on a rocm/cuda one.
+    assert exe.device == RUN_DEVICE
+    if not IS_ACCELERATOR:
+        # The historical default still holds on a CPU platform: no explicit
+        # load device means Device('cpu', 0).
+        assert evoxc.load(adapter_artifact).device == evoxc.Device("cpu", 0)
 
 
 # ---------------------------------------------------------------------------

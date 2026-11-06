@@ -941,13 +941,29 @@ def _xla_lowered():
 
 def test_xla_plugin_discovery_requires_env_or_option(monkeypatch, fake_pjrt_plugin):
     """No plugin configured -> BackendError naming EVOXC_PJRT_PLUGIN; the
-    ``plugin_path`` option is honored for discovery."""
+    ``plugin_path`` option is honored for discovery.
+
+    "No plugin configured" must mean none on EVERY box: the adapter now also
+    scans ``<sys.path>/jax_plugins/*/*.so``, so an installed JAX plugin
+    (``pip install jax-rocm7-pjrt`` / ``jax-cuda12-pjrt``) would otherwise be
+    discovered and this assertion would silently depend on the host's
+    site-packages. Discovery is switched off here for that reason, and the
+    scan cache is cleared before AND after so no cached outcome (found or
+    not-found) leaks into a sibling test.
+    """
     monkeypatch.delenv("EVOXC_PJRT_PLUGIN", raising=False)
     monkeypatch.setattr(xla_util, "_DEFAULT_PLUGIN_PATHS", ())
-    with pytest.raises(core.BackendError, match="EVOXC_PJRT_PLUGIN"):
-        xla_util._find_plugin_path(None)
-    plugin = xla_util._load_plugin({"plugin_path": str(fake_pjrt_plugin)})
-    assert plugin.api is not None
+    monkeypatch.setenv(xla_util._ENV_PLUGIN_DISCOVERY, "0")
+    xla_util._reset_plugin_discovery_cache()
+    try:
+        with pytest.raises(core.BackendError, match="EVOXC_PJRT_PLUGIN"):
+            xla_util._find_plugin_path(None)
+        plugin = xla_util._load_plugin({"plugin_path": str(fake_pjrt_plugin)})
+        assert plugin.api is not None
+    finally:
+        # Runs while the opt-out is still installed; monkeypatch restores the
+        # environment afterwards, and the next scan starts from a clean cache.
+        xla_util._reset_plugin_discovery_cache()
 
 
 def test_xla_compile_load_options_end_to_end(monkeypatch, fake_pjrt_plugin):

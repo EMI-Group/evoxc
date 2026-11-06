@@ -3,16 +3,18 @@
 The three adapter modules under ``evoxc/backends/adapters/`` are OPTIONAL: their
 third-party dependencies are never hard requirements of evoxc, and importing
 ``evoxc`` must never import them. Dependency shape per adapter: iree needs the
-``iree-base-compiler`` / ``iree-base-runtime`` pip packages; xla needs a
-USER-PROVIDED PJRT C API plugin ``.so`` (exporting ``GetPjRtApi`` — built
-from OpenXLA, e.g. ``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin``; NOT
-pip-installable; configured via ``EVOXC_PJRT_PLUGIN`` or the ``plugin_path``
-compile option); tvm needs ``apache-tvm`` + ``jaxlib`` (jaxlib only for its
-bundled MLIR python bindings). This file runs ALWAYS — no adapter dependency
-is required to collect or run it — and every test is ORDER-INDEPENDENT: it
-passes regardless of pytest file ordering and regardless of whether other
-files in the same session already imported or registered adapters. That is
-achieved by a strict in-process / subprocess split:
+``iree-base-compiler`` / ``iree-base-runtime`` pip packages; xla needs a PJRT
+C API plugin ``.so`` (exporting ``GetPjRtApi`` — resolved from
+``EVOXC_PJRT_PLUGIN``, the ``plugin_path`` compile option, the fixed
+well-known paths, or an installed ``jax_plugins/*/*.so`` such as
+``pip install jax-rocm7-pjrt`` / ``jax-cuda12-pjrt``; never a hard dependency
+of evoxc, and the adapter dlopen()s the plugin, it never imports jax); tvm
+needs ``apache-tvm`` + ``jaxlib`` (jaxlib only for its bundled MLIR python
+bindings). This file runs ALWAYS — no adapter dependency is required to
+collect or run it — and every test is ORDER-INDEPENDENT: it passes
+regardless of pytest file ordering and regardless of whether other files in
+the same session already imported or registered adapters. That is achieved by
+a strict in-process / subprocess split:
 
 * Environment-sensitive assertions (``sys.modules`` hygiene, lazy adapter
   import, install hints) run in a FRESH SUBPROCESS (``_run_subprocess``)
@@ -114,9 +116,12 @@ def test_import_evoxc_does_not_import_adapter_deps():
 #: contain at least one of)
 MISSING_DEP_CASES = [
     ("iree", "iree", ("evoxc[iree]", "iree-base-compiler")),
-    # xla has NO pip dependency: blocking "jaxlib" is harmless (the adapter
-    # never imports it) and pins the case to the plugin-missing path, whose
-    # actionable message must carry the plugin configuration/build guidance.
+    # xla has NO hard pip dependency: blocking "jaxlib" is harmless (the
+    # adapter never imports it) and pins the case to the plugin-missing path,
+    # whose actionable message must carry the plugin configuration/build
+    # guidance. The subprocess also switches the jax_plugins auto-discovery
+    # scan off, so "missing" really means missing on a box that HAS an
+    # installed JAX plugin.
     ("xla", "jaxlib", ("EVOXC_PJRT_PLUGIN", "plugin_path", "bazel build")),
     ("tvm", "tvm", ("evoxc[tvm]", "apache-tvm")),
 ]
@@ -143,11 +148,14 @@ import evoxc
 from evoxc import backends
 
 # Determinism for the xla case: plugin discovery must not accidentally
-# succeed from the ambient environment (EVOXC_PJRT_PLUGIN) or from the
-# well-known search paths — the case under test is "no plugin anywhere".
+# succeed from the ambient environment (EVOXC_PJRT_PLUGIN), from the
+# well-known search paths, or from an installed jax_plugins plugin — the case
+# under test is "no plugin anywhere", on every box.
 os.environ.pop("EVOXC_PJRT_PLUGIN", None)
+os.environ["EVOXC_PJRT_PLUGIN_DISCOVERY"] = "0"
 from evoxc.backends.adapters import xla_util as _xla_util
 _xla_util._DEFAULT_PLUGIN_PATHS = ()
+_xla_util._reset_plugin_discovery_cache()
 
 try:
     backends.get({name!r})
