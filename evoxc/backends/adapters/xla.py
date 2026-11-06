@@ -14,10 +14,18 @@ docstring for provenance) and the driver in ``xla_util.py``. The full flow:
   compile-options dict, e.g. ``evoxc.compile(lowered, backend="xla",
   plugin_path="/path/to/pjrt_c_api_cpu_plugin.so")``), (b) the
   ``EVOXC_PJRT_PLUGIN`` environment variable, (c) well-known paths
-  (``/usr/local/lib``, ``/usr/lib``, ``$HOME/.local/lib``, ``./``).
-  Missing plugin -> ``core.BackendError`` with build instructions
-  (``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin`` from OpenXLA) — the
-  plugin binary is provided BY THE USER, never pip-installed.
+  (``/usr/local/lib``, ``/usr/lib``, ``$HOME/.local/lib``, ``./``),
+  (d) an INSTALLED JAX PJRT plugin following the
+  ``jax_plugins/<platform>/<name>_plugin.so`` convention
+  (``pip install jax-rocm7-pjrt`` / ``jax-cuda12-pjrt``): every ``sys.path``
+  entry is globbed for ``jax_plugins/*/*.so``, each candidate is probed with
+  ``ctypes.CDLL`` + a ``GetPjRtApi`` symbol lookup, and the first hit wins —
+  probe results and the scan outcome are cached per process, and
+  ``EVOXC_PJRT_PLUGIN_DISCOVERY=0`` disables step (d). No path plumbing and
+  no env var are needed on a box with an installed plugin; ``jax``/``jaxlib``
+  are NEVER imported (the plugin is only dlopen-ed). Missing plugin ->
+  ``core.BackendError`` listing all four steps plus how to install/build one
+  (``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin`` from OpenXLA).
 - **Compilation**: ``PJRT_Client_Create`` (empty options) ->
   ``PJRT_Client_Compile`` with ``PJRT_Program{code=mlir_text,
   format="mlir"}`` — the plugin accepts StableHLO MLIR text directly (the
@@ -114,14 +122,14 @@ _ARTIFACT_FORMAT = "xla-serialized-executable"
 _NON_CPU_KINDS: tuple[str, ...] = ("cuda", "rocm", "hip")
 
 #: PJRT plugin platform name -> the device kinds it physically serves. A
-#: platform NOT listed is PERMISSIVE (presumed to serve whatever non-cpu kind
-#: the user named) — keeps the test-only fake plugin (platform "fake") working
-#: with Device("cuda", 0) and lets future platforms work unchanged.
+#: platform NOT listed is PERMISSIVE (presumed to serve whatever kind the
+#: user named) — keeps the test-only fake plugin (platform "fake") working
+#: with both CPU and cuda devices and lets future platforms work unchanged.
 _PLATFORM_KINDS: dict[str, tuple[str, ...]] = {
     "cuda": ("cuda",),
     "rocm": ("rocm", "hip"),
     "hip": ("rocm", "hip"),
-    "cpu": (),
+    "cpu": ("cpu",),
 }
 
 
@@ -130,27 +138,30 @@ def _check_kind_served(
 ) -> None:
     """Reject device kinds the adapter (or the active plugin) cannot serve.
 
-    A kind outside ``_NON_CPU_KINDS`` raises a ``core.BackendError`` containing
-    ``supports CPU`` (the pre-ROCm wording). When ``platform_name`` is given, a
-    listed platform must physically serve the requested kind (honest
-    rejection: ``Device("cuda", 0)`` on a ROCm plugin would mislabel where the
-    data lives).
+    A kind that is neither ``"cpu"`` nor one of ``_NON_CPU_KINDS`` raises a
+    ``core.BackendError`` containing ``supports CPU`` (the pre-ROCm wording).
+    When ``platform_name`` is given, a listed platform must physically serve
+    the requested kind (honest rejection: an auto-discovered ROCm/CUDA plugin
+    would run on the GPU while the executable claims CPU, and
+    ``Device("cuda", 0)`` on a ROCm plugin would mislabel where the data
+    lives). An unlisted platform is permissive.
     """
-    if device.kind not in _NON_CPU_KINDS:
+    if device.kind != "cpu" and device.kind not in _NON_CPU_KINDS:
         raise core.BackendError(
             "the xla adapter supports CPU ('cpu') and accelerator "
             f"('cuda'/'rocm', alias 'hip') devices, got {device!r} — a "
             "'vulkan' device is served by the iree backend instead"
         )
-    if platform_name is not None:
-        served = _PLATFORM_KINDS.get(platform_name.lower())
-        if served is not None and device.kind not in served:
-            raise core.BackendError(
-                f"the xla PJRT plugin reports platform {platform_name!r}, "
-                f"which serves device kind(s) {served or ()!r}; it cannot "
-                f"serve {device!r} — the device kind must match where the "
-                "data physically lives"
-            )
+    if platform_name is None:
+        return
+    served = _PLATFORM_KINDS.get(platform_name.lower())
+    if served is not None and device.kind not in served:
+        raise core.BackendError(
+            f"the xla PJRT plugin reports platform {platform_name!r}, "
+            f"which serves device kind(s) {served or ()!r}; it cannot "
+            f"serve {device!r} — the device kind must match where the "
+            "data physically lives"
+        )
 
 
 class XlaBackend(CompilerBackend):
@@ -259,14 +270,17 @@ class XlaBackend(CompilerBackend):
         """Probe the PJRT plugin dependency; raise ``core.BackendError`` if absent.
 
         Checks (1) the vendored ctypes bindings module integrity, (2)
-        plugin discovery + ``GetPjRtApi`` + the ABI version gate, and (3)
-        a live ``PJRT_Client_Create``/``PJRT_Client_Destroy`` round-trip
-        through the process-global shared client (``acquire_client`` /
+        plugin discovery — ``plugin_path`` is not available here (a
+        classmethod), so discovery runs the ``EVOXC_PJRT_PLUGIN`` -> fixed
+        well-known paths -> installed ``jax_plugins/*/*.so`` chain — plus
+        ``GetPjRtApi`` and the ABI version gate, and (3) a live
+        ``PJRT_Client_Create``/``PJRT_Client_Destroy`` round-trip through the
+        process-global shared client (``acquire_client`` /
         ``release_client`` — creates the client when no one else holds it,
         destroys it when the probe is the only user).
         Raises ``core.BackendError`` naming the missing piece and how to
-        provide/build a plugin (``EVOXC_PJRT_PLUGIN`` /
-        ``options["plugin_path"]``, ``bazel build
+        obtain a plugin (the four discovery steps, the pip-installable JAX
+        plugins, ``bazel build
         //xla/pjrt/c:pjrt_c_api_cpu_plugin``) — never a bare ImportError.
         """
         _pjrt.verify_api  # bindings module integrity (import-time layout)
@@ -296,10 +310,12 @@ class XlaBackend(CompilerBackend):
            raises ``core.BackendError`` naming the spec — XLA dynamic
            shapes are limited; the adapter never silently miscompiles
            them.
-        3. Load the PJRT plugin (discovery order in the module docstring;
-           ``options["plugin_path"]`` takes precedence) and compile the
-           MLIR text directly via ``PJRT_Client_Compile`` (the plugin
-           accepts StableHLO MLIR text — no MLIR parsing in-process).
+        3. Load the PJRT plugin (the four-step discovery order —
+           ``options["plugin_path"]``, ``EVOXC_PJRT_PLUGIN``, fixed
+           well-known paths, then the installed ``jax_plugins/*/*.so`` scan;
+           see the module docstring) and compile the MLIR text directly via
+           ``PJRT_Client_Compile`` (the plugin accepts StableHLO MLIR text —
+           no MLIR parsing in-process, no jax/jaxlib import).
         4. Serialize the loaded executable (``PJRT_Executable_Serialize``)
            into a JSON-safe payload:
            ``{"format": "xla-serialized-executable", "mlir_text": ...,
@@ -465,7 +481,12 @@ class XlaBackend(CompilerBackend):
           host inputs via ``PJRT_Client_BufferFromHostBuffer`` and copies
           outputs back via ``PJRT_Buffer_ToHostBuffer`` (the historical
           behavior, unchanged). A non-zero cpu index is a
-          ``core.DeviceError`` (only ``Device('cpu', 0)`` exists).
+          ``core.DeviceError`` (only ``Device('cpu', 0)`` exists). Because
+          an installed plugin is now auto-discovered, the plugin's platform
+          is validated HERE too: a ``rocm``/``cuda`` plugin with
+          ``Device('cpu', 0)`` is a ``core.BackendError`` (it would run on
+          the accelerator while the executable claimed CPU — a silent
+          placement lie). An unlisted platform is permissive.
         - ``Device("cuda", N)`` / ``Device("rocm", N)`` (alias
           ``"hip"``): a device-resident executable on the
           client's addressable device N (``core.BackendError`` naming the
@@ -483,12 +504,13 @@ class XlaBackend(CompilerBackend):
         client for the (re-discovered) plugin (one refcounted client per
         plugin path — ``acquire_client``/``release_client``; the executable
         releases its reference in ``close()``) — the ``plugin_path`` load
-        option is honored for discovery (falls back to ``EVOXC_PJRT_PLUGIN`` /
-        well-known paths). Options are validated against ``KNOWN_OPTIONS``
-        (unknown keys => ``core.BackendError``). NEVER re-traces, re-lowers,
-        or re-compiles; a deserialization failure (environment/ABI
-        mismatch) raises ``core.PersistenceError`` — no silent
-        recompilation.
+        option is honored for discovery, then ``EVOXC_PJRT_PLUGIN``, the
+        fixed well-known paths and finally the installed
+        ``jax_plugins/*/*.so`` scan. Options are validated against
+        ``KNOWN_OPTIONS`` (unknown keys => ``core.BackendError``). NEVER
+        re-traces, re-lowers, or re-compiles; a deserialization failure
+        (environment/ABI mismatch) raises ``core.PersistenceError`` — no
+        silent recompilation.
         """
         if artifact.backend != self.name:
             raise core.PersistenceError(
@@ -511,12 +533,12 @@ class XlaBackend(CompilerBackend):
                     f"executable always runs on the host, got {device!r}"
                 )
             if device.kind != "cpu":
-                # Non-cpu kinds (cuda/rocm/hip) are validated against the
-                # accepted accelerator set here (WITHOUT a platform name —
-                # the client is not acquired yet); a bad kind like "gpu"
-                # raises the "supports CPU" BackendError. The
-                # platform-consistency check runs below once the client
-                # exists.
+                # Adapter-level kind check (WITHOUT a platform name — the
+                # client is not acquired yet): a kind that is neither "cpu"
+                # nor an accelerator (e.g. "gpu"/"vulkan") raises the
+                # "supports CPU" BackendError before any plugin work. The
+                # platform-consistency check for BOTH paths runs below once
+                # the client exists.
                 _check_kind_served(device)
         effective_device = (
             device if device is not None else core.Device("cpu", 0)
@@ -546,12 +568,16 @@ class XlaBackend(CompilerBackend):
             # Resolve the raw PJRT_Device* for device-resident runs
             # (None for CPU — execute stays on the compile-time device).
             execute_device: int | None = None
+            # Honest device-kind validation on BOTH paths: the plugin's
+            # platform must physically serve the requested kind. Without it a
+            # Device("cuda", 0) on a ROCm plugin would be mislabelled, and —
+            # now that an installed plugin is auto-discovered — a ROCm/CUDA
+            # plugin with Device("cpu", 0) would run on the GPU while the
+            # executable and its Tensors claim CPU. An unlisted platform
+            # (e.g. the test-only "fake") stays permissive.
+            platform_name = client.platform_info()[0]
+            _check_kind_served(effective_device, platform_name)
             if device_index is not None:
-                # Honest device-kind validation: the plugin's platform must
-                # physically serve the requested kind (e.g. a Device("cuda",
-                # 0) on a ROCm plugin is rejected rather than mislabelled).
-                platform_name = client.platform_info()[0]
-                _check_kind_served(effective_device, platform_name)
                 devices = client.addressable_devices()
                 if device_index >= len(devices):
                     raise core.BackendError(
@@ -1224,7 +1250,11 @@ class XlaDevicePayload:
 
     Users may isinstance-check this public class exactly like
     ``IreeDevicePayload``. Buffers are never aliased by ``core.Tensor``
-    wrappers; each run produces fresh payloads.
+    wrappers; each run produces fresh payloads. Both producers reach the
+    plugin through the option-less discovery chain (``EVOXC_PJRT_PLUGIN``,
+    the fixed well-known paths, then the installed ``jax_plugins/*/*.so``
+    scan), and the plugin's platform must physically serve ``.device``'s
+    kind.
     """
 
     __slots__ = (
@@ -1325,8 +1355,10 @@ def upload_tensor(tensor: core.Tensor, device: core.Device) -> core.Tensor:
       addressable-device count (``core.BackendError`` naming the count
       otherwise), and the plugin platform must physically serve the
       requested kind (``core.BackendError`` otherwise — e.g. ``"cuda"`` on
-      a ROCm plugin) — the plugin is discovered via ``EVOXC_PJRT_PLUGIN`` /
-      well-known paths (``Tensor.to`` passes no options);
+      a ROCm plugin). ``Tensor.to`` passes no options, so the plugin comes
+      from the option-less discovery chain: ``EVOXC_PJRT_PLUGIN``, the fixed
+      well-known paths, then the installed ``jax_plugins/*/*.so`` scan — an
+      installed JAX plugin needs no hand-wiring here either;
     - the upload is ONE-SHOT: ``PJRT_Client_BufferFromHostBuffer`` on the
       shared client (fresh buffer, no cache), returning a fresh
       device-resident ``core.Tensor`` wrapping an ``XlaDevicePayload``.
@@ -1388,11 +1420,14 @@ def register() -> None:
 
     Called by ``evoxc.backends.registry.get("xla")`` on first use (and by
     persisted-artifact loads). Raises ``core.BackendError`` with an
-    actionable message (plugin discovery order + how to build a plugin
-    from OpenXLA) when no usable PJRT plugin is available — there is no
-    pip-installable dependency; the user provides the plugin binary via
-    ``options["plugin_path"]`` or the ``EVOXC_PJRT_PLUGIN`` environment
-    variable. Does nothing observable when already registered.
+    actionable message (the four discovery steps — ``plugin_path`` is not
+    available to a classmethod probe, so ``EVOXC_PJRT_PLUGIN``, the fixed
+    well-known paths and the installed ``jax_plugins/*/*.so`` scan — plus how
+    to install/build a plugin) when no usable PJRT plugin is available. An
+    installed JAX PJRT plugin (``pip install jax-rocm7-pjrt`` /
+    ``jax-cuda12-pjrt``) is found without any path or env variable; the
+    plugin is dlopen-ed, never imported as a binding package. Does nothing
+    observable when already registered.
 
     Registers this adapter's ``upload_tensor`` under the PER-BACKEND slots
     (every kind in ``_NON_CPU_KINDS`` — ``"cuda"``/``"rocm"``/``"hip"`` —

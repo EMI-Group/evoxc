@@ -8,14 +8,21 @@ provenance and the version-gate contract are documented there).
 
 Plugin flow (the header ``xla/pjrt/c/pjrt_c_api.h`` is the contract):
 
-1. **Discovery.** The plugin .so is NOT shipped with this package (there is
-   no standalone XLA PJRT plugin distribution on PyPI). The user provides
-   it; resolution order: (a) ``options["plugin_path"]`` (the backend
-   compile-options dict, e.g. ``evoxc.compile(lowered, backend="xla",
+1. **Discovery.** The plugin .so is not shipped with this package.
+   Resolution order: (a) ``options["plugin_path"]`` (the backend
+   options dict, e.g. ``evoxc.compile(lowered, backend="xla",
    plugin_path="/path/to/pjrt_c_api_cpu_plugin.so")``), (b) the
    ``EVOXC_PJRT_PLUGIN`` environment variable, (c) a small set of well-known
    paths (``/usr/local/lib``, ``/usr/lib``, ``$HOME/.local/lib``, the
-   current directory). None found -> ``core.BackendError`` with build
+   current directory), (d) an INSTALLED JAX PJRT plugin following the
+   ``jax_plugins/<platform>/<name>_plugin.so`` convention (e.g.
+   ``pip install jax-rocm7-pjrt`` / ``jax-cuda12-pjrt``): every ``sys.path``
+   entry is globbed for ``jax_plugins/*/*.so``, candidates are probed with
+   ``ctypes.CDLL`` + a ``GetPjRtApi`` / ``GetPjrtApi`` symbol lookup, and
+   the first one that exports the entry point wins (probe results and the
+   scan outcome are cached per process; ``EVOXC_PJRT_PLUGIN_DISCOVERY=0``
+   disables step (d)). ``jax``/``jaxlib`` are NEVER imported — the plugin is
+   only ``dlopen``-ed. None found -> ``core.BackendError`` with build
    instructions (``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin`` from
    OpenXLA, or any XLA build exporting ``GetPjRtApi``).
 2. **Load.** ``ctypes.CDLL(path)`` -> ``GetPjRtApi()`` -> version gate
@@ -76,7 +83,9 @@ function bodies.
 from __future__ import annotations
 
 import ctypes
+import glob
 import os
+import sys
 import threading
 from typing import Any
 
@@ -91,6 +100,11 @@ __all__ = [
     "_find_plugin_path",
     "_load_plugin",
     "_DEFAULT_PLUGIN_PATHS",
+    "_ENV_PLUGIN",
+    "_ENV_PLUGIN_DISCOVERY",
+    "_jax_plugins_candidates",
+    "_discover_jax_plugin",
+    "_reset_plugin_discovery_cache",
     "acquire_client",
     "release_client",
     "release_payload",
@@ -108,18 +122,23 @@ _DEFAULT_PLUGIN_PATHS = (
 
 #: Environment variable naming the plugin .so path.
 _ENV_PLUGIN = "EVOXC_PJRT_PLUGIN"
+#: Environment variable switching the ``jax_plugins`` convention scan off.
+_ENV_PLUGIN_DISCOVERY = "EVOXC_PJRT_PLUGIN_DISCOVERY"
 
 _PLUGIN_MISSING_MESSAGE = (
     "the xla adapter requires a PJRT C API plugin library (.so exporting "
-    "GetPjRtApi) and none was found. Provide one via the backend compile "
-    "options (evoxc.compile(lowered, backend='xla', "
-    "plugin_path='/path/to/pjrt_c_api_cpu_plugin.so')) or the "
-    f"{_ENV_PLUGIN} environment variable; well-known paths searched: "
+    "GetPjRtApi) and none was found. Discovery order: (1) the backend "
+    "option plugin_path (evoxc.compile(lowered, backend='xla', "
+    "plugin_path='/path/to/pjrt_c_api_cpu_plugin.so')), (2) the "
+    f"{_ENV_PLUGIN} environment variable, (3) well-known paths ("
     + ", ".join(_DEFAULT_PLUGIN_PATHS)
-    + ". Build one from OpenXLA with `bazel build "
-    "//xla/pjrt/c:pjrt_c_api_cpu_plugin` (or use any XLA build exporting "
-    "GetPjRtApi). There is no pip-installable plugin; this adapter never "
-    "imports a native binding package."
+    + "), (4) an installed JAX plugin under "
+    "<site-packages>/jax_plugins/<platform>/<name>_plugin.so — install one "
+    "with `pip install jax-rocm7-pjrt` or `pip install jax-cuda12-pjrt`, "
+    f"or disable that scan with {_ENV_PLUGIN_DISCOVERY}=0. To build one "
+    "from OpenXLA use `bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin` (or "
+    "any XLA build exporting GetPjRtApi). This adapter never imports "
+    "jax/jaxlib — it only dlopen()s the plugin."
 )
 
 #: dtype name (numpy) -> PJRT_Buffer_Type. Covers ALL 14 evoxc dtypes,
@@ -401,9 +420,147 @@ _initialized_plugins: set[str] = set()
 #: reentrant anyway, so a nested load on the same thread can never hang on it.
 _initialized_lock = threading.RLock()
 
+# --- installed-plugin discovery (the ``jax_plugins`` convention) ------------
+#
+# JAX PJRT plugins install as ``<site-packages>/jax_plugins/<platform>/
+# <name>_plugin.so`` (``jax-rocm7-pjrt`` -> ``jax_plugins/xla_rocm7/
+# xla_rocm_plugin.so``, ``jax-cuda12-pjrt`` -> ``jax_plugins/xla_cuda12/...``).
+# That convention is discoverable without naming a path and without importing
+# jax/jaxlib: glob ``jax_plugins/*/*.so`` under every ``sys.path`` entry and
+# keep the first file that dlopen()s AND exports the PJRT entry point. Probe
+# results and the scan outcome are cached for the process, so repeated
+# compile/load/check_available calls never re-glob or re-dlopen.
+
+#: realpath -> True/False (cdll + GetPjRtApi symbol probe outcome).
+_plugin_probe_cache: dict[str, bool] = {}
+#: probe path -> CDLL handle, kept alive for the process (a collected handle
+#: is never reused, but keeping it makes a later dlopen a no-op reload).
+_plugin_handles: dict[str, Any] = {}
+#: Scan outcome; absent = not scanned yet, None = scanned none found.
+_discovery_cache: dict[str, str | None] = {}
+
+#: Accepted spellings of ``EVOXC_PJRT_PLUGIN_DISCOVERY``.
+_DISCOVERY_FALSEY = frozenset({"0", "false", "no", "off"})
+_DISCOVERY_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+#: PJRT entry-point export names (the C symbol, plus the plugins' lowercase
+#: ``t`` spelling — see ``_pjrt_c_api.load_plugin_library``).
+_PLUGIN_ENTRY_SYMBOLS = ("GetPjRtApi", "GetPjrtApi")
+
+
+def _plugin_discovery_enabled() -> bool:
+    """Whether step (d) — the ``jax_plugins`` scan — is enabled.
+
+    Unset / empty means enabled; ``0``/``false``/``no``/``off`` (case-
+    insensitive, whitespace-stripped) disables it; any other non-empty value
+    raises ``core.BackendError`` naming the variable and the accepted forms.
+    """
+    raw = os.environ.get(_ENV_PLUGIN_DISCOVERY)
+    if raw is None:
+        return True
+    value = raw.strip().lower()
+    if not value or value in _DISCOVERY_TRUTHY:
+        return True
+    if value in _DISCOVERY_FALSEY:
+        return False
+    raise core.BackendError(
+        f"the {_ENV_PLUGIN_DISCOVERY} environment variable must be one of "
+        f"{sorted(_DISCOVERY_FALSEY | _DISCOVERY_TRUTHY)!r} (or unset), got "
+        f"{raw!r}"
+    )
+
+
+def _jax_plugins_candidates() -> list[str]:
+    """Every ``jax_plugins/*/*.so`` under a ``sys.path`` entry (sorted, unique).
+
+    Entries are deduped by ``os.path.realpath`` (a venv often lists the same
+    directory twice) and the candidates are deduped by realpath and sorted by
+    path string, so the winner is deterministic
+    (``jax_plugins/xla_cpu/...`` before ``xla_cuda12``/``xla_rocm7``).
+    """
+    seen_dirs: set[str] = set()
+    candidates: dict[str, None] = {}
+    for entry in list(sys.path):
+        if not entry:
+            continue  # "" is the cwd — never a plugin install root
+        directory = os.path.realpath(entry)
+        if directory in seen_dirs:
+            continue
+        seen_dirs.add(directory)
+        plugins_dir = os.path.join(directory, "jax_plugins")
+        if not os.path.isdir(plugins_dir):
+            continue
+        for path in glob.glob(os.path.join(plugins_dir, "*", "*.so")):
+            candidates.setdefault(os.path.realpath(path), None)
+    return sorted(candidates)
+
+
+def _probe_plugin(path: str) -> bool:
+    """Cheaply test whether ``path`` is a PJRT plugin (cached per realpath).
+
+    A failed dlopen (``OSError`` — e.g. a CUDA plugin on a box without
+    libcuda) or a missing entry-point symbol is NOT an error here: the
+    candidate is simply skipped, so one broken plugin never masks a usable
+    one.
+    """
+    real = os.path.realpath(path)
+    cached = _plugin_probe_cache.get(real)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        library = ctypes.CDLL(real)
+    except OSError:
+        library = None
+    if library is not None:
+        for symbol in _PLUGIN_ENTRY_SYMBOLS:
+            if getattr(library, symbol, None) is not None:
+                ok = True
+                break
+        if ok:
+            _plugin_handles[real] = library
+    _plugin_probe_cache[real] = ok
+    return ok
+
+
+def _discover_jax_plugin() -> str | None:
+    """The first installed ``jax_plugins`` plugin exporting the PJRT API.
+
+    Returns an absolute path, or ``None`` when the scan is disabled by
+    ``EVOXC_PJRT_PLUGIN_DISCOVERY`` or finds nothing. The outcome is cached
+    for the process (a benign race: the scan is deterministic).
+    """
+    if not _plugin_discovery_enabled():
+        return None
+    if "scan" in _discovery_cache:
+        return _discovery_cache["scan"]
+    found: str | None = None
+    for candidate in _jax_plugins_candidates():
+        if _probe_plugin(candidate):
+            found = os.path.abspath(candidate)
+            break
+    _discovery_cache["scan"] = found
+    return found
+
+
+def _reset_plugin_discovery_cache() -> None:
+    """Forget cached probe results and the scan outcome (tests/monkeypatch).
+
+    Probed ``CDLL`` handles stay alive in ``_plugin_handles`` (unloading a
+    plugin library in-process is unsafe).
+    """
+    _plugin_probe_cache.clear()
+    _discovery_cache.clear()
+
 
 def _find_plugin_path(options: dict | None = None) -> str:
-    """Resolve the PJRT plugin .so path (discovery order in the docstring)."""
+    """Resolve the PJRT plugin .so path.
+
+    Order (details in the module docstring): ``options['plugin_path']`` ->
+    ``EVOXC_PJRT_PLUGIN`` -> the fixed ``_DEFAULT_PLUGIN_PATHS`` -> an
+    installed ``jax_plugins/*/*.so`` exporting ``GetPjRtApi``
+    (``_discover_jax_plugin``, opt out with ``EVOXC_PJRT_PLUGIN_DISCOVERY=0``).
+    """
     if isinstance(options, dict) and options.get("plugin_path"):
         candidate = options["plugin_path"]
         source = "options['plugin_path']"
@@ -420,6 +577,9 @@ def _find_plugin_path(options: dict | None = None) -> str:
     for candidate in _DEFAULT_PLUGIN_PATHS:
         if os.path.isfile(candidate):
             return os.path.abspath(candidate)
+    discovered = _discover_jax_plugin()
+    if discovered is not None:
+        return discovered
     raise core.BackendError(_PLUGIN_MISSING_MESSAGE)
 
 
