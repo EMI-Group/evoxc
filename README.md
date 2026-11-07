@@ -13,18 +13,24 @@
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
-<p><a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#batch-transformation--one-graph-for-a-whole-population">Batch</a> · <a href="#backends">Backends</a> · <a href="#hardware-support">Hardware</a> · <a href="#how-evoxc-compares">Compared</a> · <a href="#install">Install</a></p>
+<p><a href="https://github.com/EMI-Group/evox">EvoX</a> · <a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#batch-transformation--one-graph-for-a-whole-population">Batch</a> · <a href="#backends">Backends</a> · <a href="#hardware-support">Hardware</a> · <a href="#how-evoxc-compares">Compared</a> · <a href="#install">Install</a></p>
 </div>
 
-**evoxc** is the **EvoX Compiler**: a Python-embedded tensor graph compiler and runtime whose input language is an explicit SSA tensor graph. You build the graph, and evoxc owns the frontend (trace → transform → EvoXIR → StableHLO export) and the explicit staging pipeline around it — `lower`, `compile`, `load`, `run`. External ML compilers own the optimization, scheduling, memory planning and code generation. With no compiler installed it still runs — on a reference numpy interpreter.
+**evoxc (EvoX Compiler)** is a Python tensor graph compiler and runtime for building, transforming, and executing numerical programs. It provides explicit computation graphs, composable vectorization and automatic differentiation, and StableHLO integration with IREE, XLA, and TVM. A NumPy interpreter lets you get started without a compiler toolchain.
+
+Part of the [EvoX ecosystem](https://github.com/EMI-Group/evox), evoxc provides the compilation and execution foundation for the experimental [EvoX 2.0 alpha](https://github.com/EMI-Group/evox/tree/evoxc-exp). Its graph transformations support population-based workloads, including batched evaluation and combining multiple candidate programs into a single graph. evoxc can also be used independently for numerical computing.
+
+evoxc owns graph construction, transformations, and the explicit trace → lower → compile → load → run pipeline. External compilers handle optimization and code generation. EvoX 1.x continues to use PyTorch; the evoxc-based integration is developed in the experimental 2.0 line.
 
 ---
 
 ## Why evoxc exists
 
-A modern numerical framework fuses five different things into one opaque stack: a tensor language, a tracer, a compiler, a scheduler and an allocator. The result is convenient, and the program stops being an object you can hold — it is re-derived on every call, re-specialized when a Python value changes, re-captured when a guard fails, and the compiler quietly owns semantics the author never wrote down: implicit tracing, hidden caches, automatic resharding, eager/graph mode switches.
+Evolutionary computation repeatedly evaluates populations of candidates and updates their state. These workloads benefit from batching evaluations and reusing an executable across iterations, with state kept on the execution device. When the candidates are programs, as in genetic programming and algorithm synthesis, evaluating them separately can also repeat compilation and dispatch work.
 
-evoxc splits that stack along one hard line. Above it is the **frontend**, which evoxc owns: the tensor-graph language in which the program is an explicit, inspectable, persistable, transformable SSA graph, and the staging contract that carries it to a compiler — every step a public function with a public object for its result. Below it are **external compilers** — IREE, XLA via PJRT, TVM — which receive StableHLO and own how the computation is optimized, scheduled, allocated and generated. evoxc owns the frontend, the IR and the staging contract, never kernel scheduling or code generation; nothing below the line may change what the program means.
+evoxc makes these computations explicit tensor graphs that you can inspect, transform, save, and execute. `vmap` batches a computation over inputs, while [`batch_functions`](#batch-transformation--one-graph-for-a-whole-population) combines compatible candidate programs into a single graph. The explicit pipeline lets an application build an executable once and reuse it throughout a search loop.
+
+The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, and the staging contract — every stage is a public function with a public result object. **External compilers** — IREE, XLA via PJRT, and TVM — receive StableHLO and handle optimization, scheduling, memory planning, and code generation. This separation lets applications choose a backend while keeping the graph's meaning explicit.
 
 ## Four words
 
