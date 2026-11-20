@@ -252,6 +252,11 @@ conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
   `expand_dims`. Step 0 runs pre-loop via a static `slice` at index 0;
   `length == 0` raises `TraceError` (v1).
 
+`scan` invokes its user function twice during tracing: step zero directly at the enclosing insertion point (`control_flow.py:835–837`) and once inside the generated while body (`control_flow.py:897–909`), including when `length == 1`.
+Step-zero indexing uses `gather` with a constant-zero index (`control_flow.py:824–832`), not `slice`.
+The initial-to-step-zero carry check compares structure and allowed leaf kinds, while subsequent while-body checking compares against `carry0`, so the original init-to-first-result dtype/shape/static equality is not comprehensively enforced (`control_flow.py:839–854`, `945`).
+`_run_in_region` invokes its `after` callback after exiting its own `with_builder`, while the insertion-point region remains pushed until `finally` (`control_flow.py:240–248`); current finish callbacks use their explicit builder rather than relying on that inner active-builder scope.
+
 `scan` v1 scope: STATIC length only (an explicit static `int`, or derived
 from xs's static leading dim). An explicit static `length` SMALLER than a
 statically-known leading dim is allowed and runs a PREFIX scan over the
