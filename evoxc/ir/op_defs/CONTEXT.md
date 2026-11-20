@@ -34,6 +34,9 @@ Most built-in hooks are imported from `../inference.py`; the zero-result return 
 A native core must preserve custom Python-hook support or explicitly constrain which definitions it can process rather than assuming every registered definition has native semantics.
 Cross-language representations need explicit encodings for required-versus-null defaults, scalar-versus-interval arities, unbounded interval endpoints, unknown result counts, dtype names, symbolic shapes, ndarray constants, and structured `ATTR_ANY` payloads.
 Builder normalization and verification behavior live in the parent IR node, not in these dataclasses or the registry.
+`OpDef` contains no batching, JVP, VJP, lowering, or execution implementation fields, so registry ownership alone does not move transform or backend semantics into a native core.
+Built-in callback identity is not one-to-one with op identity: every binary elementwise definition, including divide and logical ops, shares `infer_elementwise_binary`, most unary definitions share `infer_elementwise_unary`, and cumulative sum uses `infer_identity`.
+A native transform must preserve the existing IR-level callback contract rather than infer frontend dtype behavior or derivative/batching rules from categories, descriptions, or callback identity.
 
 ## Routing Table
 
