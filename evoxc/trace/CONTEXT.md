@@ -168,6 +168,16 @@ numpy arrays are accepted at run time and wrapped via `core.from_numpy`
 `evoxc.evaluate`'s spec derivation), distinct from an ndarray STATIC leaf,
 which specializes the graph and never enters the IR.
 
+## Compiler-core boundary and static ownership
+
+`Graph` combines a numerical `ir.Module` with a Python-facing structured-call adapter, rather than being a language-neutral compiler input by itself.
+`Graph.signature_info()` exports encoded TreeSpecs and static values alongside flat tensor specs, so its full signature is not just a flat numerical ABI.
+`Graph.verify()` verifies only the IR module; the constructor assigns metadata without checking agreement between trees, static records, and module arguments/results.
+`_static_record` stores the original static object by reference, and `_reconstruct_args` passes that same object to the traced function; accepted mutable ndarray static leaves are not defensively copied, despite the snapshot terminology elsewhere in this file.
+`StaticValue.kind` uses Python `type(value).__qualname__`, and static equality uses Python equality or `np.array_equal`, so these specialization guards belong to the Python frontend rather than a portable compiler schema.
+The callables used by `cond`, `while_loop`, and `scan`, including `_run_in_region`'s `after` callbacks, execute during tracing to build regions and are not runtime callback implementations.
+A language-neutral compiler seam can consume the module, flat tensor argument/result types, and source locations while leaving pytree reconstruction, Python static guards, callable execution, and Python persistence metadata in a frontend-owned wrapper.
+
 ## Graph layout
 
 Entry `ir.Function` "main": block args = tensor inputs in `tensor_specs`
