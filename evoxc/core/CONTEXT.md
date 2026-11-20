@@ -70,6 +70,16 @@ Cross-references: `../ops/` registers operator handlers + the constant builder i
 
 **Implementation phase complete** — every value-model behavior is implemented and validated (`py_compile` clean, `import evoxc` clean, inline validation of dim evaluation/comparisons, pytree round-trips, all concrete creators incl. DLPack zero-copy round-trip, device enumeration/split/replicate, symbolic dispatch audit). No `NotImplementedError` stubs remain in `evoxc/core/*.py`. Current `Tensor` state: both payload kinds are supported (ndarray — zero-copy `.numpy()`/DLPack/structural `__eq__`, always `Device("cpu", 0)`; duck-typed device payload — `device=` must equal `payload.device` when both present, explicit `to()` transfers, kind-aware `.numpy()`/DLPack: CPU-kind lazy fresh-copy vs non-CPU-kind `DeviceError`, metadata-only `__eq__`); the device-transfer provider registry is populated by `evoxc.backends` at import time (kind `"cuda"` flat DEFAULT slot → lazy iree thunk delegating to the adapter's `upload_tensor`) and per-backend slots are filled by each adapter's `register()` under its own `(kind, backend)` name (55a1d2c — order-independent; `evoxc.backends.registry.get` records the preferred transfer backend per kind).
 
+## Portable representation boundaries
+
+`dtype()` accepts the full range of dtype names/types NumPy accepts, not just the exported numerical constants, so accepting a dtype in core does not establish compiler support for it (`dtypes.py:58-93`).
+`Dim` equality includes both name and optional size, while expression evaluation binds by name and an explicit binding overrides the recorded size (`dim.py:42-73,173-186`).
+Shape arithmetic builds unsimplified structural expression trees and evaluates with Python arbitrary-precision integers, floor division and divisor-sign modulo, rather than a constraint solver or bounded machine-integer arithmetic (`dim.py:96-170,203-270`).
+`TensorSpec` validates shape-entry classes but does not reject negative dimensions, bool-as-int entries, or validate its device/name fields, and `Dim` has no constructor validation for name/size (`spec.py:47-56`, `dim.py:173-200`).
+`TreeSpec` carries live Python classes, arbitrary custom context and reconstruction callbacks resolved through a process-global MRO-based registry, so its in-memory representation is frontend-specific rather than a language-neutral signature schema (`tree.py:51-75,167-198`).
+Tree flattening treats dataclasses from modules whose first path component is `evoxc` as leaves, whereas user dataclasses become containers, making frontend leaf classification dependent on Python module identity (`tree.py:183-198`).
+`Device` construction validates a nonempty string and nonnegative Python int but does not restrict kinds to the documented backend-supported set (`device.py:54-58`).
+
 ## Notes for agents
 
 - **numpy-2.x DLPack gotcha**: numpy >= 2.0 requires the keyword-only `max_version` argument on `ndarray.__dlpack__` (numpy < 2.0 rejects it). `Tensor.__dlpack__` therefore tries the plain `self.data.__dlpack__(stream=stream)` call first and retries with `max_version=(1, 0)` on `TypeError`. Do not "simplify" this back to a single call — that breaks on one numpy generation or the other.
