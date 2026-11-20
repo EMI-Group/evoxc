@@ -168,6 +168,15 @@ numpy arrays are accepted at run time and wrapped via `core.from_numpy`
 `evoxc.evaluate`'s spec derivation), distinct from an ndarray STATIC leaf,
 which specializes the graph and never enters the IR.
 
+## Callable protocols and nested tracing
+
+`trace.py:301–316` only unwraps `Defn` or truthy `__evoxc_defn__` objects with a non-None `.fn`; it does not consult `__evoxc_trace_graph__`, validate callability up front, or recognize a returned `Graph` specially.
+`Defn.__call__` always raises, including inside an active trace, and control-flow callbacks are invoked directly without Defn unwrapping.
+An ordinary Python helper called with symbolic arguments naturally appends ops into the current builder, but this is Python execution rather than an explicit graph-inlining protocol in trace/.
+A nested explicit `trace(helper, *specs)` creates an independent session/module/builder and temporarily shadows the parent builder; `with_builder` restores the parent on exception as well as success.
+Nested explicit traces reject symbolic arguments as specs, and `_classify_outputs` records symbolic `.value` references without checking that they belong to its session/module, so cross-session symbolic capture must not be mistaken for supported graph inlining.
+The builder ContextVar isolates stack values, not the mutable Builder objects referenced by inherited async contexts, so concurrent construction through an inherited builder is not made safe by immutable stack tuples alone.
+
 ## Compiler-core boundary and static ownership
 
 `Graph` combines a numerical `ir.Module` with a Python-facing structured-call adapter, rather than being a language-neutral compiler input by itself.
