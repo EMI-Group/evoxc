@@ -215,6 +215,12 @@ Every pipeline stage — `lower`, `compile`, `load`, `run` (plus the `build`/`ev
 | `./numpy/` | Reference numpy CPU interpreter: `NumpyBackend`, `NumpyExecutable`, `interpreter.py` (execution loop + KernelContext), `exec_context.py` (per-run RankContext), `inline.py` (thin re-export of `../inline.py`), `kernels/` (per-category kernels), `shapes.py` (DimExpr evaluation), `collectives.py` (default executor; canonical hook lives in `evoxc.dist.context`); internals → `./numpy/CONTEXT.md` |
 | `./stablehlo/` | StableHLO MLIR export utility: `__init__.py` (`export`), `ops.py` (mapping table data), `writer.py` (MLIR text emission), `constants.py` (constant payload text — bulk `dense<[...]>` rendering + the `_fmt_float`/IEEE-hex primitives + the bounded large-payload text memo), `eigh_batched.py` (batched `eigh` composition), `split_reduce.py` (two-stage split reductions), `random_export.py` (algorithm-aware RNG expansions). Authoritative detail → `./stablehlo/CONTEXT.md`; measurements → `./stablehlo/EMISSION-NOTES.md` |
 
+## Native-host integration boundary
+
+The backend ABC, executable protocol, signatures and artifact containers are Python interfaces, not an exported evoxc C ABI or Rust API.
+A non-Python consumer can target the shared StableHLO text or backend-native artifact boundary, but must separately implement tensor ownership, placement, synchronization, signature validation and any structured/static I/O reconstruction (`program.py` encodes signatures using the evoxc persistence codec).
+StableHLO construction dependency and serialization boundaries are documented in `./stablehlo/CONTEXT.md`, and the actual native-versus-Python adapter seams and DLPack gaps are documented in `./adapters/CONTEXT.md`.
+
 ## Notes for agents
 
 - **Implementation status: complete.** All behavioral bodies in `backend.py`, `program.py`, `compiler.py`, `inline.py`, `registry.py`, `numpy/`, `stablehlo/`, and `adapters/` (iree/xla/tvm) are implemented; no `NotImplementedError` stubs remain in this node (the abstract `compile`/`load`/`run` methods of `CompilerBackend`/`CompilerExecutable` are adapter contracts, by design; `check_available` is a concrete default no-op).
