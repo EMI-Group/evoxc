@@ -79,6 +79,12 @@ Shape arithmetic builds unsimplified structural expression trees and evaluates w
 `TreeSpec` carries live Python classes, arbitrary custom context and reconstruction callbacks resolved through a process-global MRO-based registry, so its in-memory representation is frontend-specific rather than a language-neutral signature schema (`tree.py:51-75,167-198`).
 Tree flattening treats dataclasses from modules whose first path component is `evoxc` as leaves, whereas user dataclasses become containers, making frontend leaf classification dependent on Python module identity (`tree.py:183-198`).
 `Device` construction validates a nonempty string and nonnegative Python int but does not restrict kinds to the documented backend-supported set (`device.py:54-58`).
+`SymbolicTensor` checks only that its duck-typed value has an `id` attribute, accepts independently supplied dtype/shape, and delegates `.id` on every access, without checking graph ownership or agreement with value metadata (`symbolic.py:153-183`).
+Operator registration checks only callability, permits arbitrary kind keys and replacement, and invokes Python handlers at every overloaded operation, including graph-building `__eq__` (`symbolic.py:62-97,187-245`).
+Pytree flattening does not classify leaves as static versus tensor inputs: all unrecognized objects become leaves, and specialization is an upper-layer responsibility (`tree.py:167-233`).
+Custom pytree registration takes precedence over every built-in node classification, records the first registered MRO base rather than necessarily the concrete subclass, and reconstruction consults the live registry rather than snapshotting its callbacks (`tree.py:167-178,292-297`).
+A user-module subclass of an evoxc dataclass is classified by its own module and can therefore become a container even when the base class is a leaf (`tree.py:183-198`).
+Frozen `TreeSpec` instances contain mutable lists and arbitrary Python metadata, so frozen does not imply transitively immutable or universally hashable (`tree.py:56-75,196-198,206-230`).
 
 ## Notes for agents
 
