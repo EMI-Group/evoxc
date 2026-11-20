@@ -168,6 +168,15 @@ numpy arrays are accepted at run time and wrapped via `core.from_numpy`
 `evoxc.evaluate`'s spec derivation), distinct from an ndarray STATIC leaf,
 which specializes the graph and never enters the IR.
 
+## Callable protocols and nested tracing
+
+`trace.py:301–316` only unwraps `Defn` or truthy `__evoxc_defn__` objects with a non-None `.fn`; it does not consult `__evoxc_trace_graph__`, validate callability up front, or recognize a returned `Graph` specially.
+`Defn.__call__` always raises, including inside an active trace, and control-flow callbacks are invoked directly without Defn unwrapping.
+An ordinary Python helper called with symbolic arguments naturally appends ops into the current builder, but this is Python execution rather than an explicit graph-inlining protocol in trace/.
+A nested explicit `trace(helper, *specs)` creates an independent session/module/builder and temporarily shadows the parent builder; `with_builder` restores the parent on exception as well as success.
+Nested explicit traces reject symbolic arguments as specs, and `_classify_outputs` records symbolic `.value` references without checking that they belong to its session/module, so cross-session symbolic capture must not be mistaken for supported graph inlining.
+The builder ContextVar isolates stack values, not the mutable Builder objects referenced by inherited async contexts, so concurrent construction through an inherited builder is not made safe by immutable stack tuples alone.
+
 ## Compiler-core boundary and static ownership
 
 `Graph` combines a numerical `ir.Module` with a Python-facing structured-call adapter, rather than being a language-neutral compiler input by itself.
@@ -240,8 +249,14 @@ conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
   `reshape` (leading 1-dim), `broadcast` + `scatter` (fixed-size stacking —
   a grow-by-`concatenate` stack would change the carried type per
   iteration, which a typed `while` op cannot carry). The registry has NO
-  `expand_dims`. Step 0 runs pre-loop via a static `slice` at index 0;
+  `expand_dims`.
+  Step 0 runs pre-loop via `gather` with a constant-zero index;
   `length == 0` raises `TraceError` (v1).
+
+`scan` invokes its user function twice during tracing: step zero directly at the enclosing insertion point (`control_flow.py:835–837`) and once inside the generated while body (`control_flow.py:897–909`), including when `length == 1`.
+Step-zero indexing uses `gather` with a constant-zero index (`control_flow.py:824–832`), not `slice`.
+The initial-to-step-zero carry check compares structure and allowed leaf kinds, while subsequent while-body checking compares against `carry0`, so the original init-to-first-result dtype/shape/static equality is not comprehensively enforced (`control_flow.py:839–854`, `945`).
+`_run_in_region` invokes its `after` callback after exiting its own `with_builder`, while the insertion-point region remains pushed until `finally` (`control_flow.py:240–248`); current finish callbacks use their explicit builder rather than relying on that inner active-builder scope.
 
 `scan` v1 scope: STATIC length only (an explicit static `int`, or derived
 from xs's static leading dim). An explicit static `length` SMALLER than a
@@ -260,19 +275,9 @@ The supported pattern for "one dict of N named weight tensors → one graph": pa
 - Static leaves may sit beside tensors in the SAME dict: each `_is_static_value` leaf (None/bool/int/float/complex/str/Enum/np.dtype/slice/`core.Dim`/`core.DimExpr`/`core.Device`/np.ndarray) is recorded in `static_values` and re-validated (kind + value) on every run — it specializes the graph, never occupies a block arg. A small config object must be a user dataclass with all-static fields (it is then descended field-wise), not an opaque object (opaque objects → `TraceError`).
 - Symbolic dims: `evoxc.dim("batch")` / `Dim(name, size)` / `DimExpr` arithmetic, freely mixed with int and `None` dims inside one shape. `Dim` equality is `(name, size)` structural, so separately constructed same-name `Dim`s unify — reuse of one object is NOT required. Caveat: run-time shape checking is PER-LEAF and stateless (`graph._check_shape`, `pipeline._validate_tensor_meta`) — there is no dim-binding environment in v1, so the same `Dim("B")` across two inputs is NOT cross-checked, and `Dim(name)`-without-size / `None` dims accept ANY size. Tying dims together is only enforced by trace-time shape inference in `ir`.
 
-## Caching & performance (what the 2025-08 cleanup did, where the time goes)
+## Caching & performance
 
-Measured after the cleanup (same machine, `$TMPDIR/evoxc_trace_bench.py`):
-chain (~100-op elementwise+reduce defn) 47.4 ms/trace (was 48.7), MLP
-5-input 1.33 ms/trace (was 1.35), control-flow while+cond 3.30 ms/trace
-(was 3.32). Modest — expected, because tracing is NOT the bottleneck.
-
-Where tracing time actually goes (~89% on the chain benchmark):
-`inspect.stack()` inside `evoxc/ops/_utils.py::get_location` (~0.48 ms per
-op). OUT OF SCOPE for this module — it is ops' source-location capture. The
-escape hatch `EVOXC_DISABLE_LOCATIONS=1` exists (set it to skip location
-capture entirely); a `sys._getframe`-based walk or a per-trace location
-cache would remove most of it — flagged to the package root.
+Source-location capture for frontend ops is owned by `../ops/CONTEXT.md`, not by trace/; use that context for its current implementation and measured cost.
 
 Caching that EXISTS in this module (all semantic-neutral dedup):
 - `_classify_operands` (`cond`): every container operand is flattened
@@ -345,9 +350,6 @@ editing messages, keep the wording of existing paths intact.
 
 - **Trace-tree dict sorting is NOT wrapped, unlike `core.flatten`.** `_tree.py::_flatten_into` step 7 does a bare `keys = sorted(obj)` (no try/except), whereas `core.tree._flatten_into` and `pipeline._fast_structure_walk` wrap the same call into `flatten: cannot sort dict keys of mixed types (types: [...])`. Consequence: a dict with unorderable mixed-type keys (e.g. `{"a": spec, 1: spec}`) passed as a TRACE input (or as a `cond`/`while_loop`/`scan` operand, since control flow uses the same walker) raises the raw Python `TypeError` from `sorted` with no guidance. Keys of one sortable type are fine — they need NOT be strings (`int` keys work), they just must be mutually orderable.
 - **`_is_static_value` numpy-scalar asymmetry** (`_tree.py`): `np.float64`/`np.float32`-family values that are real Python `float`/`complex`/`str` subclasses (e.g. `np.float64`, `np.complex128`, `np.str_`) PASS the `isinstance(obj, (float, complex, str))` checks and count as static, while `np.int32`/`np.int64`/`np.uint*`/`np.bool_` (not Python `int`/`bool` subclasses) and `np.float32` are REJECTED — pinned by `tests/ops/test_getitem.py::test_numpy_scalar_key_unsupported_v1` and `tests/trace/test_static_snapshot.py::test_non_static_specs_are_rejected` ("is neither a core.TensorSpec nor a static"). `np.ndarray` leaves ARE static (accepted class — snapshotted at trace time, validated with `_static_equal`/`np.array_equal` semantics at run time in `Graph.flatten_inputs` and in the cond/while static cross-checks; pinned by `tests/trace/test_static_snapshot.py::test_ndarray_static_arg_accepted_and_preserved` + `tests/ops/test_getitem.py::test_ndarray_static_arg_accepted_and_preserved`); ndarrays still become TENSOR inputs via `TensorSpec` or `evoxc.evaluate` (which derives specs from them) — the two paths are distinct.
-- **`get_location` is ~89% of trace time** (`evoxc/ops/_utils.py`,
-  `inspect.stack()` per op). Escape hatch: `EVOXC_DISABLE_LOCATIONS=1`. Fix
-  belongs in ops/ (see "Caching & performance").
 - **`Graph.input_specs` is a TreeSpec, not "specs".** The name predates the
   input_tree concept; it is kept for API stability. New code should read
   `tensor_specs` + `static_values` for leaf-level data.

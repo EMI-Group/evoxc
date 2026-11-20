@@ -243,6 +243,14 @@ The merger keys SSA references by Python object identity (`id(value)`), not the 
 `autodiff._sweep` similarly invokes live Python derivative registries inside `trace.with_builder`, and the absence of a JVP entry may trigger a VJP-derived secondary reverse sweep rather than an error.
 The public mutable rule dictionaries permit direct replacement as well as registration functions, so a separately cached rule table cannot assume builtin entries remain unchanged.
 A Python-independent implementation of planning is separable from emission, but current emission and derivative rules depend on Python frontend shape/dtype inference and the active-builder protocol.
+`TransformCallable.__call__` only rejects concrete `core.Tensor` leaves before invoking its stored build closure; it has no active-trace check, symbolic-input adaptation, graph inlining, or transform-plan representation.
+Only `vmap._vmap_fn` explicitly composes another `TransformCallable` by invoking it on stripped specs; `grad._grad_fn`, `jvp._jvp_fn`, and `vjp._vjp_fn` instead unconditionally pass their wrapped object to `trace`.
+The callable `vmap` path discards mapped concrete extents when stripping specs and introduces fresh symbolic batch dims during rewriting rather than specializing the resulting graph to those extents.
+Mapped tensor leaves under registered pytree nodes are the exception to stripping: their specs are left unchanged, and node-level output static remapping is a separate live Python callback seam.
+The AD sweep requires rules for every non-constant source op before rebuilding, even when its dual is zero or its result is irrelevant to the selected gradient; it has no source-level dead-code or activity analysis.
+The AD sweep rebuilds only `module.main.entry_block`, creates primal ops without copying regions, and does not use batching's single-function/single-block/region guards, so registering a derivative rule alone is insufficient to support a region-bearing op.
+`vjp(..., cotangents=None)` adds an explicit scalar cotangent input, whereas `grad` and an explicit per-output `None` cotangent seed an in-graph scalar one.
+Source-derived validation gaps needing dedicated tests include callable `vmap` of a scalar-per-row input (stripping yields rank zero, then `vectorize._normalize_axes` rejects axis zero) and repeated VJP return operands (the reverse-sweep seed loop assigns rather than accumulates cotangents for aliased outputs).
 
 ## Notes for agents
 
