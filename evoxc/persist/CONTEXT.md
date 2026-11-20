@@ -104,6 +104,20 @@ agents).
   an existence check only. `clear()` wipes the whole cache directory.
 - NO global cache anywhere — always an explicit user object.
 
+## Cross-language boundary and wire-format caveats
+
+The container framing and tagged primitive/Dim/DimExpr/Device/TensorSpec records are implementable outside Python, but the full codec is a Python object reconstruction format rather than a language-neutral compiler schema.
+TreeSpec decoding imports artifact-named Python modules through `_resolve_treetype`, and custom codecs depend on process-local registration with no independent codec version or capability manifest.
+Array envelopes contain base64 NPY bytes plus `dtype.str` and shape, so consumers need explicit NPY/endian/layout support; equal logical arrays with different C/Fortran layout or byte order need not have equal encoded bytes or cache keys.
+`dtype.str` does not preserve structured dtype field definitions, making this general NumPy dtype family unsuitable for assuming lossless round trips through this codec.
+Container loading accepts only the current format version, has no migration path, does not compare the header's format_version with the binary version, and hashes only payload bytes rather than backend/signature metadata.
+A syntactically valid metadata mutation is therefore not detected by the payload checksum, which is corruption detection rather than authentication.
+`compute_key` canonicalizes encoded dict item ordering, but a top-level dict passed as `key_components` contributes its keys only, not its values; pass a containing sequence such as `[options_dict]` when values must affect the key.
+The cache's canonical JSON is Python `json.dumps` with compact separators and ASCII escaping rather than a standardized cross-language canonicalization scheme, and arbitrary Python integers, float formatting, signed zero, Unicode and NPY serialization require explicit cross-language rules.
+Container payload encoding preserves dict insertion order inside envelope item lists, unlike cache-key canonicalization, so payload checksums are not semantic content hashes.
+`register_codec` documents a one-argument encoder, but `_encode` calls every registered encoder with `(value, path)`, so external extension implementations must currently honor that actual calling convention.
+Loaders read the whole file and recursively decode without application-level file-size, nesting-depth or allocation budgets; importing TreeSpec modules and invoking custom decoders means this is not a safe untrusted-data boundary.
+
 ## Error behavior (binding)
 
 All failures raise `PersistenceError` (from core): bad magic, newer format
