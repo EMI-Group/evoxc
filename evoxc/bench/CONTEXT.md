@@ -2,7 +2,7 @@
 
 ## Intent
 
-The in-repo home for measured bench records and the one-off probe scripts that produced them.
+The in-repo home for measured benchmark and hardware-validation records and the reproducible evidence probes that produced them.
 It is evidence, not library code: nothing here is imported by `evoxc` or collected by pytest, and every probe is run explicitly.
 A committed artefact is history — a new measurement is a new file or a re-run with the seed recorded in the artefact itself.
 
@@ -18,13 +18,17 @@ A committed artefact is history — a new measurement is a new file or a re-run 
 | `iree313_rocm_findings.md` | The narrated 3.11-vs-3.13 defect table (while / scan / while-in-cond / MO-class), the measured cells and parity, the Vulkan device-visibility check (`VK_ICD_FILENAMES` unset on 3.13 enumerates lavapipe), and the explicit list of what the run did NOT validate (no CUDA, no Vulkan EXECUTION cell, no multi-rank, no cross-version interop, not a performance campaign). |
 | `probe_vulkan_device_visibility.py` | Deterministic (no RNG, no timing) Vulkan enumeration probe: calls `iree.runtime.get_driver("vulkan").query_available_devices()` in a CHILD process under `--timeout` — once with `VK_ICD_FILENAMES` unset and once with `--icd <renamed lavapipe json>` — and prints the device-info dicts as JSON (a timeout/hang is recorded as data, never retried). Reproduces the findings note's visibility table. |
 
+| `probe_intel_vulkan.py` | Deterministic (no RNG or timing) real-Intel ANV correctness/residency probe, run as `python -m evoxc.bench.probe_intel_vulkan` with the adapter context's scoped ICD/loader recipe; five same-device elementwise/reduction/matmul iterations, explicit readback and host-transfer guards. |
+| `intel_vulkan_findings.md` | Panther Lake `8086:b0a0`, Mesa 26.3.0 ANV and pinned IREE 3.13.0 evidence, measured errors and scope boundaries; links to the single maintained reproduction recipe in the adapter context. |
 ## Measured conclusion
 
 The iree compile option `dispatch_formation="aggressive"` (→ `--iree-dispatch-creation-enable-aggressive-fusion`) is the only dispatch-formation knob that moves the count — 596 → 548 dispatches and −7…−9 % warm on rocm merged-population graphs (−5 % compile at pop 4000) with no llvm-cpu gain — so it ships OPT-IN and is enabled per-call on rocm.
 On iree-base 3.13.0 / ROCm 7.1 / gfx942 all four 3.11 loop defects are gone on `llvm-cpu` and `rocm`: the INT32-counter `while_loop` and `evoxc.scan` run on the HIP HAL with fp32-level parity, and `while`-in-`cond` plus the MO/NSGA2 `non_dominate_rank` shape compile 30/30 in separate processes (3.11: HIP `event_semaphore.c:786` ABORT at run, and `AffinityAnalysis` SIGSEGV in ~85–100 % of compiles) — the MO artifact now also executes on rocm, bit-exact.
 Those 3.13 timings are indicative only (the GPU is shared, one sequential process per cell, 10 samples) and cover no CUDA, Vulkan, multi-rank or cross-version-interop claim.
-Vulkan device visibility is checked but no vulkan CELL was run: on the adopted 3.13.0 the host's Mesa lavapipe enumerates with `VK_ICD_FILENAMES` unset (same `device_id`/`path` as the renamed-ICD leg, only the name prefix differs), so the rename is a 3.11-era fallback and a loader-pinning recipe, not a requirement.
+In the ROCm 3.13 campaign Vulkan device visibility was checked but no vulkan CELL was run: on the adopted 3.13.0 the host's Mesa lavapipe enumerates with `VK_ICD_FILENAMES` unset (same `device_id`/`path` as the renamed-ICD leg, only the name prefix differs), so the rename is a 3.11-era fallback and a loader-pinning recipe, not a requirement.
 
+The separate Intel Panther Lake ANV validation passed five small-graph same-device iterations with zero `asdevicearray` calls, 17 guards and maximum matmul absolute error `1.91e-6`; the existing Vulkan suites passed 101/101 without skips.
+This is correctness/residency coverage only, not general GPU support, performance or model readiness, and does not replace the historical lavapipe evidence.
 ## Constraints
 
 - Never run a probe while another benchmark is timing the GPU: one timing process at a time, `EVOXC_DISABLE_LOCATIONS=1` as recorded.

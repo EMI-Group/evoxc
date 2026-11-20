@@ -77,7 +77,7 @@ The TVM adapter rejects non-CPU execution in `tvm.py::load` and constructs CPU r
 Real local Intel Panther Lake execution is validated with the pinned IREE 3.13.0 compiler/runtime, Python 3.14.10 and numpy 2.5.2 through ANV Mesa 26.3.0; this is a short correctness/residency validation, not a performance or general Intel-model coverage claim.
 The accessible xe render node `/dev/dri/renderD128` reports PCI vendor/device `0x8086:0xb0a0`.
 With the Intel ICD selected, enumeration returns exactly `Intel(R) Graphics (PTL) (Intel open-source Mesa driver Mesa 26.3.0)`, path `GPU-8680a0b0000000000002000000000000`, so this result is physical Intel hardware rather than lavapipe.
-`probe_intel_vulkan.py` is a focused evidence tool (`python -m evoxc.backends.adapters.probe_intel_vulkan`), not imported by evoxc or collected by pytest.
+`../../bench/probe_intel_vulkan.py` is a focused evidence tool (`python -m evoxc.bench.probe_intel_vulkan`), not imported by evoxc or collected by pytest; the concise evidence record is `../../bench/intel_vulkan_findings.md`.
 It builds one three-output graph using `(4,6)` f32 state and `(6,5)` f32 weights, executes elementwise state updates, row reduction and matmul for five same-device iterations, and checks every output via explicit `.to(cpu).numpy()` against numpy at `rtol=atol=1e-5`.
 The probe passes with zero `asdevicearray` calls during the loop, 17 successful placement/readback guards (two host-input refusals and fifteen device `.numpy()` refusals), and maximum absolute errors of `4.77e-7` (state), `0` (reduction), `1.91e-6` (matmul).
 The existing sibling suites `test_iree_vulkan_device_resident.py`, `test_iree_vulkan_acquisition.py` and `test_vulkan_target.py` pass **101/101, no skips**, including all six real-device residency tests, with the same Intel-scoped environment.
@@ -90,13 +90,13 @@ LIBS=/nix/store/1l0a4cq8ahhpgwx0byq2zcsi316mlzm1-vulkan-loader-1.4.363.0/lib
 LIBS=$LIBS:/nix/store/0vqb1mcas5j8dv6bhbrshinlgsg6bvgi-gcc-15.3.0-lib/lib
 LIBS=$LIBS:/nix/store/fkcbg2c1w29jr5yp9awai9w3v1wvxdk9-zlib-1.3.2/lib
 timeout 60s env VK_ICD_FILENAMES="$ICD" LD_LIBRARY_PATH="$LIBS" uv run --locked --extra iree python -c 'import iree.runtime as rt; print(rt.get_driver("vulkan").query_available_devices())'
-timeout 60s env VK_ICD_FILENAMES="$ICD" LD_LIBRARY_PATH="$LIBS" uv run --locked --extra iree python -m evoxc.backends.adapters.probe_intel_vulkan
+timeout 60s env VK_ICD_FILENAMES="$ICD" LD_LIBRARY_PATH="$LIBS" uv run --locked --extra iree python -m evoxc.bench.probe_intel_vulkan
 timeout 60s env VK_ICD_FILENAMES="$ICD" LD_LIBRARY_PATH="$LIBS" uv run --locked --extra iree --extra dev pytest -o addopts='' -q tests/backends/test_iree_vulkan_device_resident.py tests/backends/test_iree_vulkan_acquisition.py tests/backends/test_vulkan_target.py
 ```
 The selected ICD names `/nix/store/x6c8ff2w13g4s2xr5bw2algpn7sb2k2f-mesa-26.3.0/lib/libvulkan_intel.so`.
 The wheel imports need both `libstdc++.so.6` and x86-64 `libz.so.1` in addition to the Vulkan loader on this NixOS host; selecting the first arbitrary zlib store path can instead select an ELF32 library and fail import.
 These paths are subprocess-only loader setup, not evoxc defaults, and the successful probe needs no `vulkan_target` override (the small graph fits IREE's default profile).
-Root/package hardware summaries and the sibling Vulkan test module's host-specific lavapipe-only prose are outside this node and need an owner update before claiming the repository-wide documentation reflects this Intel validation.
+The root hardware summaries and the sibling Vulkan test module's host-specific lavapipe-only prose need an owner update before claiming the repository-wide documentation reflects this Intel validation.
 
 ## Adapter designs
 

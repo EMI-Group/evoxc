@@ -1,7 +1,8 @@
 """Short real-Intel Vulkan validation; run with ``python -m`` under a timeout.
 
 Select the Intel ANV ICD and wheel loader dependencies in the subprocess
-environment (see CONTEXT.md); this probe never changes the environment or ICD.
+environment (see ../backends/adapters/CONTEXT.md, Intel reproduction recipe);
+this probe never changes the environment or ICD.
 It is evidence tooling, not imported by evoxc and not a benchmark.
 """
 from __future__ import annotations

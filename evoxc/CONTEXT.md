@@ -73,8 +73,12 @@ Staging stays honest and kind-neutral: vulkan runs are DEVICE-RESIDENT exactly l
 `Tensor.to(Device("vulkan", N))` goes through a vulkan device-transfer provider the iree adapter registers in BOTH the per-backend and the flat DEFAULT slot; vulkan deliberately does NOT use the CUDA pinned/DMA staging tier (its ordering guarantee is a CUDA-driver property, unverified elsewhere) and takes the plain `asdevicearray` host→device copy instead.
 `evoxc.devices("vulkan")` enumerates the IREE Vulkan HAL devices (lazy iree import; returns `[]` — never raises, never invents a device — when iree is absent, the driver cannot initialize, or no device is visible).
 `evoxc.devices()` (kind `None`) deliberately lists `cpu + cuda + rocm` only: enumerating vulkan would instantiate the IREE Vulkan runtime and the system Vulkan loader, and on a software-Vulkan host it would report a CPU rasterizer as an accelerator — ask for `devices("vulkan")` explicitly.
-Software-Vulkan hosts: the adopted `iree-base` 3.13.0 enumerates a Mesa lavapipe (`llvmpipe…`) software device unconditionally — the 3.11-and-earlier device-NAME denylist is gone, so `query_available_devices()` returns it with `VK_ICD_FILENAMES` unset.
-Pinning `VK_ICD_FILENAMES` at a renamed lavapipe ICD is now a 3.11-era fallback and a loader-pinning aid (it keeps a host whose vendor ICD is wedged off that ICD), not a requirement for seeing the software device — recipe, the default-profile budget and this host's GPU-Vulkan verdict: `./backends/adapters/CONTEXT.md` (Known Issue 16) + `../bench_logs/vulkan_findings.md`.
+Recorded hardware Vulkan coverage is a short Intel Panther Lake (`8086:b0a0`) correctness/residency run through Mesa 26.3.0 ANV, pinned IREE 3.13.0 and Python 3.14: five same-device elementwise/reduction/matmul iterations, zero `asdevicearray` calls, 17 placement/readback guards and maximum matmul absolute error `1.91e-6`, plus 101/101 existing Vulkan tests with no skips.
+This establishes neither general Intel/GPU coverage, performance nor model readiness; no runtime blocker was found for the measured small graph, and default-profile/large-model limitations still apply.
+Evidence: `./bench/intel_vulkan_findings.md` and `./bench/probe_intel_vulkan.py`; the subprocess-scoped ICD/loader reproduction recipe is in `./backends/adapters/CONTEXT.md` (Intel GPU section).
+The separate historical MI300X-host software-Vulkan validation used lavapipe: the adopted `iree-base` 3.13.0 enumerates a Mesa lavapipe (`llvmpipe…`) software device unconditionally — the 3.11-and-earlier device-NAME denylist is gone, so `query_available_devices()` returns it with `VK_ICD_FILENAMES` unset.
+Pinning `VK_ICD_FILENAMES` at a renamed lavapipe ICD is a 3.11-era fallback and a loader-pinning aid (it keeps that host's wedged vendor ICD out of the loader), not a requirement for seeing the software device.
+The historical default-profile budget and MI300X GPU-Vulkan limitations remain documented in `./backends/adapters/CONTEXT.md` (Known Issue 16).
 
 ## Value model (owned by `core`)
 
@@ -163,15 +167,14 @@ Formats are versioned via constants (`EVOXC_FORMAT_VERSION`). Artifacts are self
 | `./persist/` | Save/load container format, explicit cache |
 | `./io.py` | Explicit async host-data IO sugar: `prefetch`/`sink`/`AsyncCopy`/`wait_all` over `Tensor.to` (see "evoxc.io") |
 | `./build_cache.py` | Memoized build sugar: `build_cached` + `CompileCache` LRU (see "Memoized build sugar") |
-| `./bench/` | Conformance & benchmark harness for example evoxc programs (numpy + optional lazy torch references) |
+| `./bench/` | Committed benchmark and hardware-validation evidence plus reproducible probes (not imported by evoxc); the wider harness is archived in the separate evoxc-bench repository |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related writes to root — it owns the per-suite inventory and test-count registry).
 
-## evoxc.bench — conformance & benchmark harness (user-facing tool)
+## evoxc.bench — committed evidence
 
-`evoxc.bench` is a standalone harness subpackage, deliberately NOT re-exported on the top-level `evoxc` namespace (use `import evoxc.bench`). It runs curated example `@evoxc.defn` graphs through the explicit pipeline (`evoxc.build` + `evoxc.run`, default numpy backend) and compares results against pure-numpy references — and, optionally, PyTorch references.
-Public API: `conformance(examples=None, *, use_torch=None, tolerance=None, rtol=1e-5, atol=1e-5, seed=0) -> ConformanceReport`, `benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2, seed=0) -> BenchmarkReport`, `list_examples()`, `list_tags()`, `get_example(name)`, the report types (`ExampleResult`, `ConformanceReport`, `BenchmarkReport`, `print_report`), and the CLI `python -m evoxc.bench`. Examples live in `./bench/examples/` in three groups (`op` / `block` / `e2e`) with per-example numpy references, optional lazily-built torch references, sub-group `tags`, and an optional Python-level `runner` for multi-run procedures (e2e training loops); the `--examples` filter accepts names, categories AND tags (precedence: category → exact name → tag). Registry and harness contract: `./bench/CONTEXT.md`.
-**torch-optionality (binding):** `import evoxc` / `import evoxc.bench` MUST always succeed without torch — torch never appears at module scope anywhere in this subpackage (same discipline as `./backends/adapters/`); it is probed/imported lazily inside function bodies (`./bench/_torch.py`). When absent, torch comparisons are skipped (`torch_pass=None`/`torch_available=False` in auto mode), and `use_torch=True` raises a clear `ImportError` mentioning `pip install evoxc[bench]` — never a raw `ModuleNotFoundError`.
+`./bench/` holds explicit-run benchmark and hardware-validation probes and their records, not a runtime API or a pytest suite.
+Its contents and reproduction constraints are owned by `./bench/CONTEXT.md`; the wider conformance/benchmark harness is archived in the separate evoxc-bench repository.
 
 ## evoxc.io — explicit async host-data IO (user-facing module)
 
@@ -260,17 +263,10 @@ out_torch = torch.from_dlpack(out)            # the export side, also zero-copy
 pytest, CPU only; unit tests per module in `../tests/<module>/`, plus the staging/design-principle compliance suite `../tests/test_spec_compliance.py` (closure-capture errors, `SymbolicTensor` purity, bind-as-sugar, vmap≡vectorize sugar, collective local shapes, serialization round-trips, explicit placement, DLPack interop via `importorskip`).
 The per-suite inventory (file list, test counts, known skips/gates) is owned by `../tests/CONTEXT.md`.
 
-## Full-model forward (Llama / GPT-2 transformers) — readiness map
+## Model readiness — owning contexts
 
-One-graph full transformer forward is feasible on **iree** (llvm-cpu/cuda/rocm); `xla` needs fully static shapes + `dot_precision="HIGHEST"` (TF32); **tvm cannot run it** (single-function/single-output, no `gather`/control flow).
-
-- **Absent — must be composed:** `rsqrt` (use `divide(1.0, sqrt(x))` or `power(x, -0.5)`), `softmax`, `layer_norm`, `rms_norm`, `log_softmax`, `iota`, `einsum`, `silu`, `logistic`. Mask primitive is `evoxc.select(pred, a, b)` (`where` exists only as `evoxc.numpy.where`); index generation is `evoxc.arange` (Constant op, static bounds only). Canonical compositions: `ops/CONTEXT.md`.
-- **`evoxc.gelu` is the exact erf form** (not HF's tanh approximation) — and `erf`/`gelu` are both exporter `DEFERRED_OPS`, so a GPT-2-style GELU FFN cannot be lowered on any compiler adapter; use the tanh-approx formula (`tanh`/`power` export) or stay on numpy. Llama SiLU is fine (`sigmoid` → `stablehlo.logistic`).
-- **Also deferred** (`backends/stablehlo/ops.py`): `cumsum`, `cumprod`, `tril`, `triu`, `flip`, `roll`, `nan_to_num`, `diagonal`, `solve`, linalg factorizations, `runtime_call`/`external_call`/`block_call`, all `sparse_*`. Build causal masks from `arange` compares broadcast together — never an `(S,S)` `evoxc.constant` (`_constant_text` inlines the payload).
-- **`gather` IS exportable** (single-axis; static operand + index SHAPES, runtime index VALUES) ⇒ `evoxc.gather(embed_table, ids, axis=0)` works on iree. `evoxc.slice` requires static lengths — there is no dynamic slice.
-- **Batched `dot` works**: `(B,H,S,D) × (B,H,D,S)` with matched static batch dims emits one `dot_general`; contracting dims are fixed to lhs-last × rhs-second-last. Symbolic reshape / symbolic batch *broadcast* defer, so attention head reshapes need static shapes.
-- **Weights**: pass `{"w1": TensorSpec((in, out), float32), ...}` as ONE positional defn arg (dict pytree; keys sorted, order-insensitive, no input-count limit). Cost ≈2–3.5 µs/leaf per `run` (400 leaves ≈ 1 ms), and non-cpu executables require pre-placed device tensors. Never `evoxc.constant` a weight (export inlines the payload).
-- **Unmeasured**: compile-time / vmfb scaling for thousands of ops + 100+ inputs (largest validated graph ≈11 inputs). Capture weights inside `while` bodies rather than carrying them (iree `AffinityAnalysis` SEGV at ≥3–4 carries with `select`).
+Model compositions, exporter deferrals and adapter-specific limitations are owned by `./ops/CONTEXT.md`, `./backends/stablehlo/CONTEXT.md` and `./backends/adapters/CONTEXT.md` rather than duplicated here.
+Full-model measured coverage belongs to `../evoxc_hf/CONTEXT.md`; the small Intel Vulkan probe establishes no transformer/model-readiness claim.
 
 ## Notes for agents
 
