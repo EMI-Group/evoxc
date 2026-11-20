@@ -284,6 +284,10 @@ over canonical JSON (`sort_keys`, compact separators) of everything else.
 
 IR objects are mutable Python dataclasses with direct parent/owner links, operand references and use lists, and verification checks Python class membership plus object identity, not only numeric ids.
 `Value.replace_all_uses_with` and `Op._replace_operand` mutate existing objects and use lists, so an alternative storage implementation must preserve observable wrapper identity and mutation semantics or introduce an explicit snapshot boundary.
+Builder is the standard construction path, not an encapsulation boundary: dataclass fields remain public, `Block.append`/`insert` only set the parent, `Block.erase` only removes the op and clears its parent without unlinking operand uses, and RAUW performs no same-module or type checks.
+Module ids are unique only within a module and have no generation or provenance component, so cross-module cloning/inlining must allocate destination ids and remap operands, results, region arguments and parent/use links rather than splice source objects.
+The IR layer exposes no generic clone/inlining or validated-handle API.
+Explicit `result_types` bypass Builder inference but not verifier inference, and a custom `shape_fn=None` definition without a recognized op-specific rule is rejected by verification even if explicit result types were supplied.
 `ValueType` directly normalizes through `np.dtype`, shape arithmetic uses core `Dim`/`DimExpr`, promotion uses `np.result_type`, and `_reduce_dtype` probes numpy reductions on a one-element ndarray.
 Builder and verifier both execute registered Python `shape_fn` callbacks, and verifier memoization assumes those callbacks are pure functions of operand types and attributes.
 The IR serialization payload is independent of the outer persistence container but depends on the process registry for schema-directed encoding/decoding and subsequent verification; it does not carry executable op definitions.
