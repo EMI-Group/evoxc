@@ -19,6 +19,9 @@ The shared backend-option framework — `KNOWN_OPTIONS` union validation, the `E
 - Calls `module.verify()` FIRST — failures surface as `core.VerificationError`; MLIR is never emitted from invalid IR.
 - `_emit_verified(module, options=None)` is the PRIVATE already-verified entry point `CompilerBackend.lower()` uses (not in `__all__`): it takes a `Module` the caller has verified and provably not mutated, emits through the same `Writer` (byte-identical text to `export`), and re-checks only the type so a wrong call raises the same `TypeError` class; `export()` stays the entry point for graphs, unverified modules and the freshly built external-call segment modules.
 - Returns StableHLO MLIR text (`str`) — compiler input for external tools.
+- Construction is pure Python string emission using EvoXIR, numpy and stdlib, with no MLIR Python bindings, native MLIR object handles, parser or StableHLO verifier in this package.
+- The verify-first contract checks EvoXIR through `evoxc.ir.verify`, not the generated MLIR through an MLIR/StableHLO verifier; downstream consumers still parse and validate the emitted text.
+- This exporter provides no MLIR bytecode or version-targeted StableHLO portable-artifact serialization API and exposes no C ABI or Rust binding; language-neutral integration is through its returned MLIR text, while native construction or portable serialization would require a separately validated toolchain integration.
 - A deferred or unmapped op ⇒ `core.BackendError` NAMING THE OP, with a message suggesting decomposition or a future adapter; never a silent skip, never partial output.
 - Export-only: not registered as a Backend; performs no lower/compile/load/run.
 - `options` is a plain dict: unrecognized keys are ignored, recognized keys are VALUE-validated with a loud `core.BackendError` naming the option, the offending value and the accepted forms.
