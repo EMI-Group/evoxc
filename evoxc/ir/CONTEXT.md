@@ -364,7 +364,7 @@ terminators). CPU only.
   in `inference.py` + `op_defs/` (the numpy backend kernel must agree on
   either form).
 - Builder attribute schema is stricter than inference in two places:
-  `pad.padding_config` (ATTR_NESTED_INTS) requires `(lo, hi)` PAIR entries
+  `pad.padding_config` (ATTR_NESTED_INTS) requires nonempty integer sequence entries of any length
   (bare int entries fail `VerificationError`, though `infer_pad` accepts
   them); `slice.limit_indices` is schema-required and can be neither `None`
   nor contain `None` entries (the None-limit branch of `infer_slice` is
