@@ -316,6 +316,15 @@ The maximum binding count rises 6 → 9 (pop 1000) / 6 → 10 (pop 4000): still 
 - **Function count:** tvm requires EXACTLY ONE `func.func` (`tvm_util.precheck_module`, `BackendError` naming the count) and rejects a multi-operand `func.return` (the vendored importer keeps only the first output). iree compiles whatever the module contains, but `IreeExecutable._entry_function` (`iree.py:2140`) resolves `"main"` first and otherwise requires exactly ONE recorded entry function. xla records `entry_functions` in the artifact but never consults it — PJRT compiles/executes the module's own entry.
 - **tvm's op whitelist lacks `stablehlo.iota`** (so exporter compositions built on iota — `diag`/`eye`/`linspace`/count-sort/`eigh` — hit the compile-time gate), plus no `gather`/`scatter`/`if`/`while`/`remainder`/`conv`/`reduce_window`/`sort`. An embedding-gather transformer forward is therefore rejected on tvm before translation.
 
+## Native-host portability boundary
+
+Only XLA currently drives a native C ABI directly: `_pjrt_c_api.py` defines the PJRT function table and argument structs and `xla_util.py` calls it through ctypes, making a Rust host a direct driver translation rather than a compiler rewrite.
+IREE currently uses Python compiler/runtime bindings, including private `DeviceArray._buffer_view`, `_device` and `_override_dtype` fields for metadata, readback and DLPack; its VMFB bytes are the natural native-runtime handoff, but this repository implements no IREE C-ABI host.
+TVM compilation currently depends on Python Relax translation/build plus monkey-patched `StableHLOImporter` and private jaxlib `_jax_mlir_ext` dialect registration, so replacing `_mlir_bindings` alone does not remove Python.
+TVM's exported `.so` is loaded as a TVM runtime module and wrapped in a VM, not invoked as a standalone tensor-function C ABI.
+`XlaDevicePayload` exposes host readback but no DLPack protocol, whereas `IreeDevicePayload` exports/imports through IREE Python HAL capsule methods; backend buffer residency does not imply generic cross-backend DLPack interchange.
+Native IREE runtime bindings, native TVM VM/FFI hosting and native DLPack ownership bridges are plausible integration paths, not implemented or validated interfaces in this tree.
+
 ## Dependency surface
 
 - **xla adapter:** ZERO pip dependencies. A PJRT plugin `.so` (exporting `GetPjRtApi`) is required at compile/load time, discovered via `options["plugin_path"]` → `EVOXC_PJRT_PLUGIN` → the fixed well-known paths → an installed `jax_plugins/<platform>/<name>_plugin.so` (opt out with `EVOXC_PJRT_PLUGIN_DISCOVERY=0`). Bindings provenance (header URL + commit) is recorded in `_pjrt_c_api.py` and in the artifact `runtime_dependencies`.
