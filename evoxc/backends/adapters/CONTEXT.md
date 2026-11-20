@@ -65,6 +65,16 @@ The shared mechanism — per-stage `KNOWN_OPTIONS`, union-of-stages key validati
 Env spellings exist only for the backend-agnostic reserved lower options `eigh_algorithm` (`EVOXC_EIGH_ALGORITHM`) and `split_reduction` (`EVOXC_SPLIT_REDUCTION`), registered for all three adapters at the lower stage.
 A NEW exporter option requires three touches: add it to `_exporter_options`, declare it in each adapter's `KNOWN_OPTIONS["lower"]` (all three declare `rng_bit_generator`/`dot_precision`/`eigh_algorithm`/`split_reduction`; iree additionally `sort_emission`/`while_init_rewrite`), and consume it in the stablehlo Writer (sibling node).
 
+## Intel GPU route and portability boundaries
+
+Intel GPUs use the existing vendor-neutral IREE `vulkan-spirv` compile target and `Device("vulkan", index)` runtime path, not a new Intel device kind.
+`iree.py::_acquire_vulkan_device` enumerates the selected Vulkan ICD and contains no vendor-name filter, while `_resolve_compile_options` accepts Vulkan and forwards arbitrary target-profile values to IREE without Intel-specific validation.
+An Intel execution claim requires checking the enumerated device name and ICD provenance because lavapipe can also occupy a Vulkan enumeration index.
+For NixOS hosts the Intel ANV ICD can live under `/run/opengl-driver/share/vulkan/icd.d/intel_icd.x86_64.json` rather than `/usr/share/vulkan/icd.d`, and the Vulkan loader library may require an explicit library search path for Python-wheel runtimes.
+The xla adapter currently has no Intel/SYCL/XPU device kind (`_NON_CPU_KINDS` is cuda/rocm/hip), and an unrecognized PJRT platform is permissive in `_check_kind_served`, so loading an Intel plugin as CPU is not a valid honest-placement workaround.
+The TVM adapter rejects non-CPU execution in `tvm.py::load` and constructs CPU runtime tensors and VMs in `tvm_util.py`, so an OpenCL-capable TVM build alone does not enable Intel GPU execution through this adapter.
+Existing Vulkan suites are vendor-neutral correctness and residency coverage, but the recorded Vulkan execution evidence in this context is lavapipe rather than Intel hardware.
+
 ## Adapter designs
 
 ### IREE (`iree.py`) — llvm-cpu, CUDA, ROCm/HIP and Vulkan/SPIR-V
