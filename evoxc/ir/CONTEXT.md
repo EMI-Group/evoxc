@@ -280,6 +280,17 @@ ids, operands referenced by id; dims encode as `{"int": n}` | `{"dim": name}`
 constant payloads as base64 `np.save` bytes in the `constants` table; sha256
 over canonical JSON (`sort_keys`, compact separators) of everything else.
 
+## Cross-language boundary facts
+
+IR objects are mutable Python dataclasses with direct parent/owner links, operand references and use lists, and verification checks Python class membership plus object identity, not only numeric ids.
+`Value.replace_all_uses_with` and `Op._replace_operand` mutate existing objects and use lists, so an alternative storage implementation must preserve observable wrapper identity and mutation semantics or introduce an explicit snapshot boundary.
+`ValueType` directly normalizes through `np.dtype`, shape arithmetic uses core `Dim`/`DimExpr`, promotion uses `np.result_type`, and `_reduce_dtype` probes numpy reductions on a one-element ndarray.
+Builder and verifier both execute registered Python `shape_fn` callbacks, and verifier memoization assumes those callbacks are pure functions of operand types and attributes.
+The IR serialization payload is independent of the outer persistence container but depends on the process registry for schema-directed encoding/decoding and subsequent verification; it does not carry executable op definitions.
+Generic serialization stringifies dictionary keys, uses reserved marker dictionaries, and restores generic `ValueType` attributes as plain dictionaries except for schema-handled `result_specs`, so arbitrary `ATTR_ANY` objects do not imply portable lossless serialization.
+Constant bytes use base64 NPY with `allow_pickle=False`, while integrity hashing uses Python `json.dumps(sort_keys=True, separators=(",", ":"))`; another language must match its escaping and numeric spelling to preserve hashes.
+See `./op_defs/CONTEXT.md` for the registry extension boundary and its Python-specific callback/default behavior.
+
 ## pretty_print
 
 Readable SSA text, one op per line: `%0 = evoxc.add(%arg0, %arg1) :
