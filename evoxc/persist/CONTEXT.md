@@ -166,7 +166,7 @@ atomicity, recompute-on-corrupt) by the pytest suite in `../../tests/persist/`
 - **General-purpose payload container, NOT a weight-file reader.** The
   container is untyped: `payload_type` is any non-empty caller string (no
   registration/enum — `"widgets"` in tests, `"evoxc.graph"` in trace), and
-  `payload_fields` is ANY codec-encodable value, so a
+  `save_object` accepts any codec-encodable `payload_fields`, but `load_object` requires the decoded top-level payload to be a dict, so a
   `dict[str, np.ndarray]` (100–400 named weight arrays) saves + loads
   directly today (`{"arrays": {"weights": ..., ...}}` is exercised in
   `../../tests/persist/test_container.py:34`). Cost: JSON + base64 npy in one
