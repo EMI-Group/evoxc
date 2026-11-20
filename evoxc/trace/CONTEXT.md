@@ -249,7 +249,8 @@ conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
   `reshape` (leading 1-dim), `broadcast` + `scatter` (fixed-size stacking —
   a grow-by-`concatenate` stack would change the carried type per
   iteration, which a typed `while` op cannot carry). The registry has NO
-  `expand_dims`. Step 0 runs pre-loop via a static `slice` at index 0;
+  `expand_dims`.
+  Step 0 runs pre-loop via `gather` with a constant-zero index;
   `length == 0` raises `TraceError` (v1).
 
 `scan` invokes its user function twice during tracing: step zero directly at the enclosing insertion point (`control_flow.py:835–837`) and once inside the generated while body (`control_flow.py:897–909`), including when `length == 1`.
