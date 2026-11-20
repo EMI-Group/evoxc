@@ -269,19 +269,9 @@ The supported pattern for "one dict of N named weight tensors → one graph": pa
 - Static leaves may sit beside tensors in the SAME dict: each `_is_static_value` leaf (None/bool/int/float/complex/str/Enum/np.dtype/slice/`core.Dim`/`core.DimExpr`/`core.Device`/np.ndarray) is recorded in `static_values` and re-validated (kind + value) on every run — it specializes the graph, never occupies a block arg. A small config object must be a user dataclass with all-static fields (it is then descended field-wise), not an opaque object (opaque objects → `TraceError`).
 - Symbolic dims: `evoxc.dim("batch")` / `Dim(name, size)` / `DimExpr` arithmetic, freely mixed with int and `None` dims inside one shape. `Dim` equality is `(name, size)` structural, so separately constructed same-name `Dim`s unify — reuse of one object is NOT required. Caveat: run-time shape checking is PER-LEAF and stateless (`graph._check_shape`, `pipeline._validate_tensor_meta`) — there is no dim-binding environment in v1, so the same `Dim("B")` across two inputs is NOT cross-checked, and `Dim(name)`-without-size / `None` dims accept ANY size. Tying dims together is only enforced by trace-time shape inference in `ir`.
 
-## Caching & performance (what the 2025-08 cleanup did, where the time goes)
+## Caching & performance
 
-Measured after the cleanup (same machine, `$TMPDIR/evoxc_trace_bench.py`):
-chain (~100-op elementwise+reduce defn) 47.4 ms/trace (was 48.7), MLP
-5-input 1.33 ms/trace (was 1.35), control-flow while+cond 3.30 ms/trace
-(was 3.32). Modest — expected, because tracing is NOT the bottleneck.
-
-Where tracing time actually goes (~89% on the chain benchmark):
-`inspect.stack()` inside `evoxc/ops/_utils.py::get_location` (~0.48 ms per
-op). OUT OF SCOPE for this module — it is ops' source-location capture. The
-escape hatch `EVOXC_DISABLE_LOCATIONS=1` exists (set it to skip location
-capture entirely); a `sys._getframe`-based walk or a per-trace location
-cache would remove most of it — flagged to the package root.
+Source-location capture for frontend ops is owned by `../ops/CONTEXT.md`, not by trace/; use that context for its current implementation and measured cost.
 
 Caching that EXISTS in this module (all semantic-neutral dedup):
 - `_classify_operands` (`cond`): every container operand is flattened
