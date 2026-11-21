@@ -826,7 +826,16 @@ const POOL_MAX_ENTRIES: usize = 64;
 /// order-dependent.  Keeping a few spares per size costs a bounded amount of
 /// memory (<= `POOL_MAX_PER_SIZE` x the size class) and makes the steady state
 /// allocation-free.
-const POOL_MAX_PER_SIZE: usize = 4;
+///
+/// The cap must never be enforced by FREEING the incoming stock.  A graph that
+/// keeps N + 1 buffers of one size live at once would then drop one per run and
+/// re-allocate it on the next run, and whether `malloc` serves that megabyte
+/// from its own free lists or with a fresh `mmap` + zero-fill depends on the
+/// unrelated allocations earlier in the process -- exactly the order-dependent
+/// behaviour this pool exists to remove.  A full size class therefore evicts its
+/// OWN oldest stock and retains the newest, so a running workload always has
+/// `POOL_MAX_PER_SIZE` of its own buffers and never a malloc round trip.
+const POOL_MAX_PER_SIZE: usize = 8;
 
 /// TEMPORARY DIAGNOSTIC counters (hits, misses, pushes, evictions, refusals).
 pub mod pool_stats {
@@ -910,9 +919,14 @@ impl StoragePool {
         let dtype = storage.dtype();
         let len = storage.len();
         if self.count_of(dtype, len) >= POOL_MAX_PER_SIZE {
-            // A spare of this size is already retained; this one is freed.
-            pool_stats::bump(pool_stats::REFUSE);
-            return false;
+            // A full size class keeps its newest stocks: evict this class's own
+            // oldest spare rather than freeing the incoming one, so a workload
+            // that keeps one more buffer of this size in flight than it retains
+            // never pays a malloc round trip per run.
+            if !self.evict_same_size(dtype, len) {
+                pool_stats::bump(pool_stats::REFUSE);
+                return false;
+            }
         }
         while self.entries.len() >= POOL_MAX_ENTRIES || self.bytes + bytes > POOL_MAX_BYTES {
             if !self.evict_for(dtype, len) {
@@ -939,6 +953,22 @@ impl StoragePool {
             .count()
     }
 
+    /// Evict the least recently used entry of exactly `dtype` and `len`, so the
+    /// incoming stock can take its place.  False when the class is empty.
+    fn evict_same_size(&mut self, dtype: DType, len: usize) -> bool {
+        let victim = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.storage.dtype() == dtype && entry.storage.len() == len)
+            .min_by_key(|(_, entry)| entry.last_use)
+            .map(|(index, _)| index);
+        let Some(index) = victim else { return false };
+        pool_stats::bump(pool_stats::EVICT);
+        let entry = self.entries.swap_remove(index);
+        self.bytes -= entry.storage.bytes();
+        true
+    }
     /// Evict the least recently used entry that is NOT of the incoming size
     /// class (falling back to the plain LRU entry when every entry is).
     fn evict_for(&mut self, dtype: DType, len: usize) -> bool {
@@ -1498,8 +1528,38 @@ mod tests {
                 retained += 1;
             }
         }
-        assert_eq!(retained, POOL_MAX_PER_SIZE, "one size class keeps at most its cap");
+        assert_eq!(retained, POOL_MAX_PER_SIZE * 3, "a full class evicts its own oldest stock");
+        let kept = STORAGE_POOL.with(|pool| pool.borrow().count_of(DType::Float32, count));
+        assert_eq!(kept, POOL_MAX_PER_SIZE, "one size class keeps at most its cap");
         reset_pool();
+    }
+
+    #[test]
+    fn a_full_size_class_keeps_its_newest_stocks() {
+        // The class is at its cap; pushing a fourth stock evicts the OLDEST of
+        // that class (never frees the incoming one, never touches another
+        // size), so a workload that keeps one buffer more in flight than it
+        // retains never pays a malloc round trip per run.
+        reset_pool();
+        let count = (1 << 16) / std::mem::size_of::<f32>();
+        let mut pool = StoragePool::new();
+        let mut stock = pool_stock_f32(count / 2, 9.0);
+        assert!(pool.push(&mut stock), "another size class is retained");
+        for value in 0..POOL_MAX_PER_SIZE {
+            let mut stock = pool_stock_f32(count, value as f32);
+            assert!(pool.push(&mut stock), "stock {value} fits its own class");
+        }
+        let mut extra = pool_stock_f32(count, 42.0);
+        assert!(pool.push(&mut extra), "a full class makes room instead of freeing");
+        assert_eq!(pool.count_of(DType::Float32, count), POOL_MAX_PER_SIZE);
+        assert_eq!(pool.count_of(DType::Float32, count / 2), 1, "another size class is untouched");
+        // The newest stock is the one the next take serves (LIFO), so the
+        // evicted entry is the oldest: the values prove which survived.
+        let taken = pool.take(DType::Float32, count).unwrap();
+        match &taken {
+            Storage::F32(values) => assert_eq!(values[0], 42.0, "the newest stock is served first"),
+            _ => panic!("expected f32 storage"),
+        }
     }
 
     #[test]
