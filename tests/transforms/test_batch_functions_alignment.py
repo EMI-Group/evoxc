@@ -174,9 +174,9 @@ def op_variant_graphs(spec):
 #: flat merge): ``alignment -> (emitted ops, select ops)``. Op/select counts are
 #: static IR properties (never timings), so they are pinned exactly.
 BRANCHY_COUNTS = {
-    "occurrence": (22, 3),
-    "variant": (9, 0),
-    "auto": (9, 0),
+    "occurrence": (19, 3),
+    "variant": (7, 0),
+    "auto": (7, 0),
 }
 #: Same population WITHOUT the shared downstream `sum` (`multiply` is then the
 #: output, so one op fewer on every mode; the select cascade is unchanged).
@@ -245,10 +245,7 @@ def test_variant_and_auto_produce_a_valid_graph(alignment):
     report = graph.batch_report
     assert isinstance(report, evoxc.BatchReport)
     assert report.n_functions == len(graphs)
-    # The rank-0 function-axis bridge keeps two scaffold `reshape` ops in the
-    # merged entry block while discounting them from the report's emitted-op
-    # count, so the graph count exceeds the report by exactly those two.
-    assert report.emitted_ops == emitted_count(graph) - 2
+    assert report.emitted_ops == emitted_count(graph)
     assert counts(graph) == BRANCHY_COUNTS[alignment]
     # ONE class per variant at the two branch skeletons, no mixed class left to
     # mux: the switched records are gone entirely in the aligned modes.
@@ -264,7 +261,7 @@ def test_variant_and_auto_reports_agree_where_the_dags_coincide():
     assert variant.batch_report.switched == auto.batch_report.switched == ()
 # --- C. Measured op / select counts of the branchy population
 def test_branchy_population_op_and_select_counts():
-    """`occurrence` 22 ops / 3 selects vs `variant` & `auto` 9 ops / 0 selects."""
+    """`occurrence` 19 ops / 3 selects vs `variant` & `auto` 7 ops / 0 selects."""
     graphs = branchy_graphs()
     merged_graphs = {
         mode: merged(graphs, switch_ops=True, alignment=mode)
@@ -523,8 +520,7 @@ def test_alignment_is_inert_without_switch_ops():
     for mode in ALIGNMENT_MODES:
         graph = merged(graphs, alignment=mode)  # switch_ops defaults to None
         texts[mode] = stablehlo.export(graph)
-        # Rank-0 function-axis bridge: 7 emitted ops + 2 scaffold reshapes.
-        assert counts(graph) == (9, 0)
+        assert counts(graph) == (7, 0)
     assert len(set(texts.values())) == 1
     # The aligned labels differ from the SWITCHED occurrence DAG, proving the
     # inertness assertion above is not comparing an unrelated baseline.
