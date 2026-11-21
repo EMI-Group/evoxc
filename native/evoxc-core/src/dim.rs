@@ -218,16 +218,19 @@ impl Dim {
     }
 
     /// `d + amount` with Python operator semantics: ints stay ints.
+    #[allow(clippy::should_implement_trait)] // named builder family; the `std::ops` traits are not prelude-imported
     pub fn add(self, other: Dim) -> Dim {
         fold(DimOp::Add, self, other)
     }
 
     /// `d - amount` with Python operator semantics.
+    #[allow(clippy::should_implement_trait)] // named builder family; the `std::ops` traits are not prelude-imported
     pub fn sub(self, other: Dim) -> Dim {
         fold(DimOp::Sub, self, other)
     }
 
     /// `d * factor` with Python operator semantics.
+    #[allow(clippy::should_implement_trait)] // named builder family; the `std::ops` traits are not prelude-imported
     pub fn mul(self, other: Dim) -> Dim {
         fold(DimOp::Mul, self, other)
     }

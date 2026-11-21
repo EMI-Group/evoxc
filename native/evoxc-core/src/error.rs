@@ -38,6 +38,11 @@ impl ErrorKind {
         }
     }
 
+    /// Map a public Python error class name back to its family.
+    ///
+    /// A pure lookup, so it returns `Option` rather than the `Err` type
+    /// `std::str::FromStr` would demand; the name mirrors the Python side.
+    #[allow(clippy::should_implement_trait)] // lookup with no parse-error type to define
     pub fn from_str(name: &str) -> Option<ErrorKind> {
         Some(match name {
             "TraceError" => ErrorKind::Trace,

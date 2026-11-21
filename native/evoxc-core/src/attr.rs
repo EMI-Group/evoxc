@@ -93,21 +93,21 @@ impl AttrValue {
         if matches!(self, AttrValue::Null) {
             return true;
         }
-        match (ty, self) {
-            (attr_type::BOOL, AttrValue::Bool(_)) => true,
-            (attr_type::INT, AttrValue::Int(_)) => true,
-            (attr_type::FLOAT, AttrValue::Float(_)) => true,
-            (attr_type::STR, AttrValue::Str(_)) => true,
-            (attr_type::DTYPE, AttrValue::DType(_)) => true,
-            (attr_type::INTS, AttrValue::Ints(_)) => true,
-            (attr_type::FLOATS, AttrValue::Floats(_)) => true,
-            (attr_type::STRS, AttrValue::Strs(_)) => true,
-            (attr_type::NESTED_INTS, AttrValue::NestedInts(_)) => true,
-            (attr_type::SHAPE, AttrValue::Shape(_)) => true,
-            (attr_type::NDARRAY, AttrValue::Array(_)) => true,
-            (attr_type::ANY, _) => true,
-            _ => false,
-        }
+        matches!(
+            (ty, self),
+            (attr_type::BOOL, AttrValue::Bool(_))
+                | (attr_type::INT, AttrValue::Int(_))
+                | (attr_type::FLOAT, AttrValue::Float(_))
+                | (attr_type::STR, AttrValue::Str(_))
+                | (attr_type::DTYPE, AttrValue::DType(_))
+                | (attr_type::INTS, AttrValue::Ints(_))
+                | (attr_type::FLOATS, AttrValue::Floats(_))
+                | (attr_type::STRS, AttrValue::Strs(_))
+                | (attr_type::NESTED_INTS, AttrValue::NestedInts(_))
+                | (attr_type::SHAPE, AttrValue::Shape(_))
+                | (attr_type::NDARRAY, AttrValue::Array(_))
+                | (attr_type::ANY, _)
+        )
     }
 
     pub fn type_name(&self) -> &'static str {

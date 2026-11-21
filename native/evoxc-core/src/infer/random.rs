@@ -316,7 +316,7 @@ mod tests {
         ] {
             let out = infer_with(
                 "random_key_mix",
-                &[key.clone()],
+                std::slice::from_ref(&key),
                 json!({"algorithm": algorithm, "salt": 0}),
             )
             .unwrap();

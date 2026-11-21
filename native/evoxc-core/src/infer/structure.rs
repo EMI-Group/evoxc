@@ -897,13 +897,16 @@ mod tests {
     fn sorting_and_axis_compositions_mirror_the_operand_type() {
         let value = ft(&[b(), i(3)]);
         let sort = json!({ "axis": 0, "descending": true, "stable": true });
-        assert_eq!(one("sort", &[value.clone()], sort).unwrap(), value);
-        assert_eq!(one("flip", &[value.clone()], json!({ "axes": [0] })).unwrap(), value);
-        assert_eq!(one("roll", &[value.clone()], json!({ "shift": [1], "axis": 0 })).unwrap(), value);
+        assert_eq!(one("sort", std::slice::from_ref(&value), sort).unwrap(), value);
+        assert_eq!(one("flip", std::slice::from_ref(&value), json!({ "axes": [0] })).unwrap(), value);
+        assert_eq!(
+            one("roll", std::slice::from_ref(&value), json!({ "shift": [1], "axis": 0 })).unwrap(),
+            value
+        );
         // axes = None is the numpy default (no attribute supplied at all).
-        assert_eq!(one("flip", &[value.clone()], json!({})).unwrap(), value);
+        assert_eq!(one("flip", std::slice::from_ref(&value), json!({})).unwrap(), value);
 
-        let indices = one("argsort", &[value.clone()], json!({})).unwrap();
+        let indices = one("argsort", std::slice::from_ref(&value), json!({})).unwrap();
         assert_eq!((indices.dtype, indices.shape), (DType::Int64, value.shape));
     }
 

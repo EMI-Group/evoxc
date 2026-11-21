@@ -84,14 +84,14 @@ pub mod effect {
 
 impl OpSchema {
     pub fn check_arity(&self, count: usize) -> bool {
-        count >= self.arity_min && self.arity_max.map_or(true, |hi| count <= hi)
+        count >= self.arity_min && self.arity_max.is_none_or(|hi| count <= hi)
     }
 
     pub fn check_result_count(&self, count: usize) -> bool {
         if !self.result_count_known {
             return true;
         }
-        count >= self.result_min && self.result_max.map_or(true, |hi| count <= hi)
+        count >= self.result_min && self.result_max.is_none_or(|hi| count <= hi)
     }
 
     pub fn attr(&self, name: &str) -> Option<&'static AttrSchema> {
