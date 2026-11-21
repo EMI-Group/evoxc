@@ -666,6 +666,15 @@ mod tests {
     }
 
     #[test]
+    fn registers_exactly_the_structure_ops() {
+        let mut map = KernelMap::new();
+        register(&mut map);
+        let mut names: Vec<&str> = map.keys().copied().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["diag", "flip", "pad", "roll", "tile"]);
+    }
+
+    #[test]
     fn tile_with_equal_reps_repeats_both_axes() {
         let input = i32_buffer(&[2, 3], &[0, 1, 2, 3, 4, 5]);
         let spec = op("tile", DType::Int32, &[4, 6], vec![("reps", ints(&[2, 2]))]);
