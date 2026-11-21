@@ -51,6 +51,7 @@ __all__ = [
     "engine_available",
     "engine_module",
     "engine_version",
+    "encode_module",
     "compile_module",
     "program_entry",
     "program_run",
@@ -203,23 +204,42 @@ def _translate(module, exc: BaseException) -> None:
 # ---------------------------------------------------------------------------
 
 
-def compile_module(module) -> Any:
+def encode_module(module) -> dict:
+    """Encode an ``ir.Module`` into the ``evoxc-native-ir`` envelope dict.
+
+    Wraps ``evoxc._native_codec.encode_module`` — the envelope the transform
+    entry points already use, which verifies the module before emitting (a
+    ``core.VerificationError`` surfaces as-is). Encoding is pure: the same
+    module always yields an equivalent envelope, so a caller may compute it
+    once and hand it to :func:`compile_module` to avoid a second encode.
+    """
+    from evoxc import _native_codec
+
+    return _native_codec.encode_module(module)
+
+
+def compile_module(module, envelope: Mapping | None = None) -> Any:
     """Compile an ``ir.Module`` into a native ``NativeProgram``.
 
-    Encodes the module with ``evoxc._native_codec.encode_module`` (the
-    ``evoxc-native-ir`` envelope the transform entry points already use — it
-    verifies the module before emitting) and calls ``native_compile``. A
-    ``NativeError`` is translated onto the ``evoxc.core`` family; the result
-    is validated against the ``NativeProgram`` surface the backend relies on.
+    Encodes the module with :func:`encode_module` (the ``evoxc-native-ir``
+    envelope the transform entry points already use — it verifies the module
+    before emitting) and calls ``native_compile``. A ``NativeError`` is
+    translated onto the ``evoxc.core`` family; the result is validated against
+    the ``NativeProgram`` surface the backend relies on.
+
+    ``envelope``: an ALREADY-ENCODED envelope for ``module``, used verbatim
+    instead of re-encoding. The caller owns the invariant that the envelope
+    belongs to this module (the backend only forwards one it attached to the
+    very payload object it staged) — a stale envelope would compile a
+    different graph, so never pass one across a payload change.
 
     ``lower()`` calls this as its capability probe (the engine is the
     authority on which ops it implements) and ``load()`` calls it to build
     the runnable program; both get the same explicit errors.
     """
-    from evoxc import _native_codec
-
     native = engine_module()
-    envelope = _native_codec.encode_module(module)
+    if envelope is None:
+        envelope = encode_module(module)
     try:
         program = native.native_compile(envelope)
     except Exception as exc:  # noqa: BLE001 — translated only for NativeError
