@@ -20,12 +20,11 @@ Modes
                    output).  Python's public ``vmap`` only supports {0, None};
                    a non-leading ``1``/``-1``/per-output entry is compared
                    against a NUMPY oracle applied to the ``out_axes=0`` result
-                   (``np.moveaxis`` for a mapped output, ``expand_dims`` +
-                   broadcast for an unmapped one).  If the native engine still
-                   defers non-leading axes, the mode is reported as DEFERRED
-                   (both engines must then raise ``TransformError``) — the same
-                   mode becomes a full comparison automatically once the
-                   engine accepts it.
+                   (``np.moveaxis`` for a mapped output, size-one-axis
+                   insertion + broadcast for an unmapped one).  The native
+                   engine implements every non-leading entry, so those runs are
+                   full comparisons; should it ever defer one, the mode is
+                   reported as DEFERRED instead (documented, not a silent pass).
 ``grad``           ``argnums`` over the flattened tensor inputs
 ``jvp``            ``tangent_inputs`` = input indices with an explicit tangent
 ``vjp``            ``cotangent_inputs`` = output indices with an explicit
@@ -169,9 +168,20 @@ def vmap_mode(in_axes: Sequence, out_axes: Any = 0) -> Mode:
             if is_mapped:
                 moved[index] = np.moveaxis(array, 0, entry)
             else:
-                expanded = np.expand_dims(array, entry)
+                # The base result already carries the size-one leading axis the
+                # `out_axes=0` masked build inserts for an unmapped output: drop
+                # it and re-apply the rearrangement to the output's own rank —
+                # insert a size-one axis at the (normalized) entry and broadcast
+                # that axis to the pass's batch extent (`0` keeps the leading
+                # size-one axis, exactly like the documented engine behaviour).
+                base = np.squeeze(array, axis=0)
+                rank = base.ndim
+                axis = entry + rank if entry < 0 else entry
+                if axis == 0:
+                    continue
+                expanded = np.expand_dims(base, axis)
                 target = list(expanded.shape)
-                target[entry] = batch
+                target[axis] = batch
                 moved[index] = np.broadcast_to(expanded, target).copy()
         return moved
 
@@ -385,7 +395,6 @@ CASES: list[Case] = [
         (
             vectorize_mode((0,)),
             grad_mode((0,)),
-            vmap_mode((0,), 1),
         ),
         seed=10,
     ),
@@ -553,6 +562,7 @@ CASES: list[Case] = [
             vmap_mode((0, None), (0, 0)),
             vmap_mode((0, None), (1, 0)),
             vmap_mode((0, None), (0, None)),
+            vmap_mode((0, None), (1, 1)),
         ),
         seed=28,
     ),
@@ -567,7 +577,7 @@ CASES: list[Case] = [
         "two_input_broadcast",
         lambda a, b: evoxc.sum(a * b + b),
         (_spec((2, 1)), _spec((3,))),
-        (vectorize_mode((0, None)), vmap_mode((0, None), 1)),
+        (vectorize_mode((0, None)),),
         seed=30,
     ),
     Case(
@@ -766,6 +776,10 @@ def _square_graph(x):
     return evoxc.sum(x * x)
 
 
+def _sum_graph(x):
+    return evoxc.sum(x)
+
+
 DEFERRALS: list[Deferral] = [
     Deferral(
         "vectorize_control_flow_cond",
@@ -798,6 +812,17 @@ DEFERRALS: list[Deferral] = [
         lambda g: evoxc.vmap(g, (0,), None),
         "vmap",
         {"axes": [0], "out_axes": None},
+    ),
+    # The vectorized output is rank 1 `(batch,)`, so it has no valid
+    # non-leading axis: Python defers every non-zero entry and the native
+    # engine rejects the out-of-range entry.
+    Deferral(
+        "vmap_invalid_out_axes_on_rank_one_output",
+        _sum_graph,
+        (_spec((4,)),),
+        lambda g: evoxc.vmap(g, (0,), 1),
+        "vmap",
+        {"axes": [0], "out_axes": 1},
     ),
     Deferral(
         "vectorize_non_leading_in_axes",
