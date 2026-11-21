@@ -141,15 +141,27 @@ def rebuild_graph(
             f"{len(source_graph.tensor_specs)} tensor inputs"
         )
 
+    batch_name = transform.get("batch_dim")
+    batch_dim = None
+    if batch_name:
+        # The envelope round trip rebuilds every `Dim` from its name, so the
+        # decoded types hold DISTINCT-but-equal `Dim` objects. One pass = ONE
+        # batch dim (object identity is the documented contract — `_collect_
+        # batch_dims`/`_leading_batch_count` rely on it), so unify them.
+        batch_dim = _unify_batch_dim(block, batch_name)
+
+    # Mapped input specs are DERIVED from the source specs, not re-built from
+    # the decoded types: the source spec's shape objects (e.g. a symbolic row
+    # `Dim("B")`) are the graph's, so they must survive by identity, and every
+    # mapped spec must share ONE batch `Dim` object (a per-spec decode would
+    # give distinct-but-equal dims).
     new_specs = []
-    for old_spec, argument, new_id in zip(
-        source_graph.tensor_specs, block.arguments, input_ids
-    ):
+    for old_spec, argument in zip(source_graph.tensor_specs, block.arguments):
         value_type = argument.type
-        if len(value_type.shape) == len(old_spec.shape) + 1:
+        if batch_dim is not None and len(value_type.shape) == len(old_spec.shape) + 1:
             new_specs.append(
                 core.TensorSpec(
-                    shape=tuple(value_type.shape),
+                    shape=(batch_dim,) + tuple(old_spec.shape),
                     dtype=old_spec.dtype,
                     device=old_spec.device,
                     name=old_spec.name,
@@ -168,15 +180,10 @@ def rebuild_graph(
             source_locations[new_id] = location
 
     batch_name = transform.get("batch_dim")
-    if batch_name:
-        # The envelope round trip rebuilds every `Dim` from its name, so the
-        # decoded types hold DISTINCT-but-equal `Dim` objects. One pass = ONE
-        # batch dim (object identity is the documented contract — `_collect_
-        # batch_dims`/`_leading_batch_count` rely on it), so unify them.
-        _unify_batch_dim(block, batch_name)
     if output_tree is None:
         if batch_name:
-            batch_dim = _find_batch_dim(block, batch_name)
+            if batch_dim is None:
+                batch_dim = _find_batch_dim(block, batch_name)
             output_tree, remapped_statics = batching._remap_output_aux(
                 source_graph, batch_dim
             )
@@ -200,8 +207,12 @@ def rebuild_graph(
     )
 
 
-def _unify_batch_dim(block: "ir.Block", batch_name: str) -> None:
-    """Give every `Dim(batch_name)` in the module the SAME `Dim` object."""
+def _unify_batch_dim(block: "ir.Block", batch_name: str) -> Optional["core.Dim"]:
+    """Give every `Dim(batch_name)` in the module the SAME `Dim` object.
+
+    Returns that canonical object (the first mapped argument's leading dim),
+    or None when the module carries no such dim (an all-unmapped pass).
+    """
     canonical = None
     for argument in block.arguments:
         for entry in argument.type.shape:
@@ -211,7 +222,7 @@ def _unify_batch_dim(block: "ir.Block", batch_name: str) -> None:
         if canonical is not None:
             break
     if canonical is None:
-        return
+        return None
 
     def _values():
         yield from block.arguments
@@ -237,6 +248,7 @@ def _unify_batch_dim(block: "ir.Block", batch_name: str) -> None:
                 value_type.shape = new_shape
             except Exception:  # frozen ValueType
                 object.__setattr__(value_type, "shape", new_shape)
+    return canonical
 
 
 def _find_batch_dim(block: "ir.Block", batch_name: str) -> "core.Dim":

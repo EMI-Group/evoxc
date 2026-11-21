@@ -51,7 +51,7 @@ mapped dim."""
 #: Reserved name pattern of the fresh batch dims `vectorize_graph` introduces
 #: (ONE shared `Dim` per pass, named from the active pass depth — `"batch"`
 #: at depth 0, `"batch_1"` at depth 1, ... — see
-#: `batching._batched_input_specs`). These are the ONLY dims mapped-output
+#: `batching._batch_dim`). These are the ONLY dims mapped-output
 #: detection keys on (by identity); the `_\d+` suffix stays accepted for dims
 #: named `batch_1` in pre-existing or user-built graphs.
 _BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
@@ -240,7 +240,7 @@ def _derive_unvectorized_args_and_entries(args, in_axes, what="vmap"):
     # node's indices/values leaves) keep their shape UNCHANGED when mapped:
     # their leading dim is NOT a batch dim (sparse COO indices are
     # (None, ndim) — dim 0 is the runtime-dynamic nnz). The batch dim is
-    # prepended later by vectorize (`_batched_input_specs`), and the
+    # prepended later by vectorize (`_batch_dim`), and the
     # output-side dense_shape remap is `register_batched_aux_remap`'s job.
     under_registered = _registered_node_tensor_positions(
         args_spec, tensor_positions
@@ -384,4 +384,9 @@ def _normalize_out_axes(graph: Graph, out_axes):
             )
     # No rank range-check for outputs: entry 0 on a rank-0 unmapped output is
     # the legal size-one-axis insertion, not an error.
-    return _normalize_axis_entries(entries, tensor_positions, None, "vmap")
+    normalized = _normalize_axis_entries(entries, tensor_positions, None, "vmap")
+    # One entry per TENSOR output (the native engine's `out_axes` contract),
+    # not per output-tree leaf: a registered pytree output node (e.g. a
+    # sparse-tensor node) contributes several leaves but ONE tensor output per
+    # returned operand.
+    return [normalized[position] for position in sorted(tensor_positions)]
