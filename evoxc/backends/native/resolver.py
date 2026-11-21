@@ -29,7 +29,9 @@ a graph that runs on one runs on the other:
   (e.g. ``numpy``) raises ``core.BackendError`` naming block and backend
   (never a silent cross-backend fallback). ``static_args`` is the
   ``block_call`` op's JSON-able static-kwarg dict; the engine passes it as the
-  third argument (see this directory's CONTEXT.md — the FFI contract).
+  third argument (see this directory's CONTEXT.md — the FFI contract), and an
+  engine build that omits it is an explicit ``core.BackendError`` naming the
+  block whenever the impl provably requires the block's declared attributes.
 - ``call_external``: ``evoxc.external.get_external_kernel_entry(name,
   "native")`` — the per-backend ``native`` slot with the default (``None``)
   slot fallback. The registry is never serialized, so a graph/artifact
@@ -51,6 +53,7 @@ bodies).
 """
 from __future__ import annotations
 
+import inspect
 from typing import Any, Mapping
 
 import numpy as np
@@ -145,6 +148,48 @@ def _static_args(static_args: Any) -> dict:
     return dict(static_args)
 
 
+def _declared_attribute_names(block: Any) -> tuple[str, ...]:
+    """The static-attribute names a block DECLARES (schema order)."""
+    schema = getattr(block, "attribute_schema", None)
+    if not isinstance(schema, Mapping):
+        return ()
+    return tuple(schema)
+
+
+def _impl_needs_static_args(impl: Any, block: Any, operands: int) -> bool:
+    """True only when ``impl`` provably cannot run without the declared kwargs.
+
+    An engine build that calls ``call_block(name, args)`` without the third
+    ``static_args`` argument would otherwise make the impl raise a bare
+    ``TypeError``/``KeyError`` about a missing kwarg, which reads like a user
+    bug rather than FFI drift. Only the UNAMBIGUOUS case is reported: the impl
+    binds the operands positionally once the block's DECLARED attribute names
+    are supplied as keywords, and does not bind them without. An impl whose
+    signature cannot be introspected (builtins, C callables), one that accepts
+    ``**kwargs``, or a block that declares no attributes is never reported —
+    nothing is guessed and no legitimate call is rejected.
+    """
+    names = _declared_attribute_names(block)
+    if not names:
+        return False
+    try:
+        signature = inspect.signature(impl)
+    except (TypeError, ValueError):  # non-introspectable callable
+        return False
+    placeholders = [None] * operands
+    try:
+        signature.bind(*placeholders)
+    except TypeError:
+        pass
+    else:
+        return False  # callable with the operands alone
+    try:
+        signature.bind(*placeholders, **dict.fromkeys(names))
+    except TypeError:
+        return False  # not explained by the declared attributes
+    return True
+
+
 class NativeCallbackResolver:
     """Resolves the Rust CPU engine's Python callback boundaries.
 
@@ -160,9 +205,9 @@ class NativeCallbackResolver:
         """Dispatch a ``block_call`` op to the block's registered ``native`` impl.
 
         ``static_args`` (the op's static-kwarg dict) must be supplied by the
-        engine as the third argument; blocks that declare static kwargs get an
-        explicit ``core.BackendError`` when it is missing rather than silently
-        calling the impl without them.
+        engine as the third argument; blocks whose impl requires the declared
+        static kwargs get an explicit ``core.BackendError`` naming the block
+        when it is missing rather than a bare ``TypeError`` from the impl.
         """
         label = _label("block_call", name)
         if not isinstance(name, str) or not name:
@@ -173,7 +218,7 @@ class NativeCallbackResolver:
         from evoxc.block import registry as block_registry
 
         try:
-            block_registry.get_block(name)
+            block = block_registry.get_block(name)
         except BlockError as exc:
             raise core.BackendError(
                 f"op 'block_call': unknown block {name!r} — declare it with "
@@ -191,6 +236,15 @@ class NativeCallbackResolver:
             )
         kwargs = _static_args(static_args)
         arrays = _to_arrays(args, label)
+        if static_args is None and _impl_needs_static_args(impl, block, len(arrays)):
+            declared = list(_declared_attribute_names(block))
+            raise core.BackendError(
+                f"{label}: the native engine called call_block without its "
+                "third static_args argument, but the impl requires the "
+                f"block's declared attributes {declared} — block static "
+                "kwargs travel as call_block(name, args, static_args); "
+                "rebuild the extension from a matching native/ tree"
+            )
         result = impl(*arrays, **kwargs)
         return _returns(result, label)
 
