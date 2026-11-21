@@ -131,9 +131,14 @@ pub fn rule_key(name: &str, attrs: &Attrs) -> String {
 }
 
 /// Keys whose rules may come from the host bridge instead of the builtin
-/// registry: `block:*`, `external:*` and `sparse_*`.
+/// registry: `block:*`, `external:*` and every sparse op — the `sparse_*`
+/// family plus `dense_dot_sparse`, the one sparse op whose IR name carries no
+/// `sparse_` prefix.
 pub fn extension_eligible(key: &str) -> bool {
-    key.starts_with("block:") || key.starts_with("external:") || key.starts_with("sparse_")
+    key.starts_with("block:")
+        || key.starts_with("external:")
+        || key.starts_with("sparse_")
+        || key == "dense_dot_sparse"
 }
 
 /// Register every builtin batching rule.
@@ -175,7 +180,7 @@ pub fn missing_rule_error(key: &str, attrs: &Attrs) -> Error {
 }
 
 /// Rewrite one op: registry rule first, then the host bridge for
-/// `block:*` / `external:*` / `sparse_*`, else `TransformError`.
+/// `block:*` / `external:*` / every sparse op, else `TransformError`.
 pub fn dispatch(
     env: &TransformEnv<'_>,
     ctx: &mut RuleCtx<'_>,
