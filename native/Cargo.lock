@@ -13,6 +13,7 @@ name = "evoxc-compiler"
 version = "0.1.0"
 dependencies = [
  "evoxc-core",
+ "serde_json",
 ]
 
 [[package]]
