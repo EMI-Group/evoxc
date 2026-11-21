@@ -135,6 +135,11 @@ v1 deferrals, all explicit: sparse ops (numpy-only by contract), non-CPU devices
 Callback boundaries (`block_call` / `external_call` / `runtime_call`) reach Python through `NativeCallbackResolver` — `call_block(name, args, static_args=None)` / `call_external(name, args)` / `call_runtime(name, args)` returning host numpy arrays; `static_args` is the `block_call` op's static-kwarg dict and MUST be passed by the engine (see `./native/CONTEXT.md`).
 The FFI contract, the resolver protocol, the staging order and the in-process compile-reuse rule are owned by `./native/CONTEXT.md`.
 
+**Native staging cost (measured, single-decode staging):** the backend mirrors numpy's pattern — `lower()` attaches the live module, the payload object, the collected custom-op names, the encoded `evoxc-native-ir` envelope and the compiled program as private non-persisted hints, and `compile()`/`load()` reuse each only under a payload-identity check (`getattr(x, "_native_payload", None) is x.payload`), so a full in-process chain performs `decode 0, encode 1, compile 1` and a disk-loaded program/artifact performs exactly one of each; persisted container bytes are unchanged.
+On the reference host (16 cpus, loadavg ≈4) a 100-op `tanh` chain on `(64,)` f32 stages in `lower+compile+load` 1.47/1.50 ms (was 3.46/3.49; numpy control 0.79/0.81) and a 2000-op graph in 28.3/28.9 ms (was 65.9/67.8; numpy 15.4/15.7).
+Warm `run`: 100-op 32 µs vs numpy 88 µs, 1-op 7.5 µs vs numpy 6.1 µs (the raw `NativeProgram.run` alone is ≈3.55 µs).
+The remainder is deliberately NOT removed: `lower()` still pays one `graph.verify`, `encode_module`'s pre-emit verify, the Rust `native_compile` and `ir.serialize_module`'s verify — at 2000 ops ≈29 ms total, all in `evoxc/ir`, `evoxc/_native_codec` and `native/`. Breakdown and the per-stage table: `./native/CONTEXT.md` ("Single-decode staging", "Staging cost").
+
 ## Lower-stage cost model
 Scope: `CompilerBackend.lower()` — `NumpyBackend.lower` keeps its unconditional post-inline `graph.verify()` and serializes the module instead of exporting text.
 
