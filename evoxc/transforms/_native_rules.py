@@ -104,12 +104,12 @@ def _derivative_response(request: Mapping[str, Any], kind: str):
     # Known native protocol gap (see the module docstring): the request does
     # not carry the tangent/cotangent SSA values, so an inlined subgraph
     # cannot bind them. Returning None makes the engine raise its explicit
-    # non-differentiable `TransformError`. Forward-compatible: a request that
-    # ever carries `tangent_values` / `cotangent_values` is served below.
-    values_key = "tangent_values" if kind == "jvp" else "cotangent_values"
-    if not request.get(values_key):
-        return None
-    return _bound_derivative_response(request, kind, values_key)  # pragma: no cover
+    # AD fallback instead (`_native_ad._needs_python_ad`).
+    # Serving them here needs the native change recorded in CONTEXT.md
+    # ("Native delegation"): `tangent_values` / `cotangent_values` fields on
+    # `ExtensionRequest`, appended to `extension_arguments` after the
+    # operands and results.
+    return None
 
 
 # --- scratch module / proxy op ---------------------------------------------

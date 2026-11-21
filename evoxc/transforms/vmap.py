@@ -48,13 +48,6 @@ function exactly once) and vectorizes the returned Graph with the outer
 axes, then rearranges outputs per out_axes — each level adds one leading
 mapped dim."""
 
-#: Reserved name pattern of the fresh batch dims `vectorize_graph` introduces
-#: (ONE shared `Dim` per pass, named from the active pass depth — `"batch"`
-#: at depth 0, `"batch_1"` at depth 1, ... — see
-#: `batching._batch_dim`). These are the ONLY dims mapped-output
-#: detection keys on (by identity); the `_\d+` suffix stays accepted for dims
-#: named `batch_1` in pre-existing or user-built graphs.
-_BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
 
 
 def vmap(fn_or_graph, in_axes=0, out_axes=0):
@@ -268,19 +261,26 @@ def _derive_unvectorized_args_and_entries(args, in_axes, what="vmap"):
 
 # --- output-axis rearrangement ----------------------------------------------
 
+#: Reserved name pattern of the fresh batch dims a vectorize pass introduces
+#: (`batch` at depth 0, `batch_1` at depth 1, ...).
+_BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
+
 
 def _collect_batch_dims(graph: Graph):
-    """The fresh batch `Dim` objects this vectorization introduced.
+    """The fresh batch `Dim` objects one vectorization pass introduced.
 
-    `vectorize_graph` prepends ONE fresh symbolic batch `Dim` (named from the
-    active pass depth — `"batch"` at depth 0, `"batch_1"` at depth 1, ...)
-    shared by all mapped input specs of the pass (unmapped specs are reused
-    unchanged), so the batch dims of THIS vectorization are exactly the
-    leading entries of the input specs whose names follow that reserved
-    pattern. Collected as objects — nested vmap levels create their OWN fresh
-    Dims with level-distinct names, and only the current level's objects must
-    count (output detection compares by identity, `is`). An empty list (no
-    mapped inputs) makes every output unmapped.
+    A pass prepends ONE fresh symbolic batch `Dim` to every mapped input spec
+    (unmapped specs are reused unchanged), named from the pass depth, so the
+    batch dims of a graph are exactly the leading entries of its input specs
+    whose names follow `_BATCH_DIM_NAME`. They are returned as OBJECTS: nested
+    vmap levels create their own level-distinct `Dim`s and only the current
+    level's objects count (mapped detection compares by identity). An empty
+    list (no mapped inputs) makes every output unmapped.
+
+    Consumed by the native parity oracle
+    (`native/evoxc-compiler/tests/parity_transform/run_parity.py`), which uses
+    it to decide where the batch axis of each output sits; the engine itself
+    takes the mapped/output-axis structure from the native transform metadata.
     """
     batch_dims = []
     for spec in graph.tensor_specs:
@@ -326,6 +326,7 @@ def _leading_batch_count(shape, batch_dims) -> int:
         else:
             break
     return count
+
 
 
 def _normalize_out_axes(graph: Graph, out_axes):

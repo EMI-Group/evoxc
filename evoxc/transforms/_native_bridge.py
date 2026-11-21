@@ -146,8 +146,8 @@ def rebuild_graph(
     if batch_name:
         # The envelope round trip rebuilds every `Dim` from its name, so the
         # decoded types hold DISTINCT-but-equal `Dim` objects. One pass = ONE
-        # batch dim (object identity is the documented contract — `_collect_
-        # batch_dims`/`_leading_batch_count` rely on it), so unify them.
+        # batch dim (object identity is the documented contract — mapped-output
+        # detection compares the batch `Dim` by identity), so unify them.
         batch_dim = _unify_batch_dim(block, batch_name)
 
     # Mapped input specs are DERIVED from the source specs, not re-built from
