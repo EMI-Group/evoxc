@@ -19,7 +19,11 @@ pub mod attr;
 pub mod dim;
 pub mod dtype;
 pub mod dtype_table;
+pub mod envelope;
 pub mod error;
+pub mod graph;
+pub mod infer;
+pub mod verify;
 pub mod schema;
 pub mod schema_table;
 pub mod value_type;
@@ -28,6 +32,10 @@ pub mod wire;
 pub use attr::{ArrayPayload, AttrValue, Attrs};
 pub use dim::{Dim, DimExpr, DimOp, NamedDim};
 pub use dtype::DType;
+pub use graph::{
+    Block, BlockId, Function, Location, Op, OpId, Program, Region, Use, Value, ValueId,
+    ValueOwner,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use schema::{AttrSchema, OpSchema};
 pub use value_type::{Shape, ValueType};
