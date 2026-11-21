@@ -86,14 +86,7 @@ User-visible summary: row i evaluates program i; identical programs produce one 
 Measured guidance: banding wins only on DIVERGENT populations (`bands="auto"` picks the argmin on GP-shaped trees, 2.6–10.7× under flat; `identical` resolves to flat and any `K>1` is a loss), `switch_ops` should not be combined with banding, and the data-supported rule is `bands="auto"` on CPU and `bands=16` (or `bands=None`) on an accelerator.
 A banded merge glues the per-band outputs with ONE variadic `concatenate`: IREE fuses the pieces into one dispatch whose binding count grows with K, and the HIP/CUDA HAL caps a dispatch at 16 bindings (llvm-cpu 64), so a caller must cap K (`15` on cuda/rocm, `31` on cpu; the merge cannot see the device).
 
-### Rank-0 function-axis bridge (`_native_batch.py`)
-
-The public contract makes `out_axes=0` on a rank-0 unmapped output legal (broadcast to the function axis), but the native merge range-checks every mapped `out_axes` entry against the DECLARED per-function rank and rejects `0` on a rank-0 output.
-The seam therefore retries in two tiers, both adding the function axis as an ORDINARY op after the merge (never per program):
-1. cheap tier — pass the programs untouched and ask for an UNMAPPED output (`out_axes=None`), then add the axis with ONE post-merge `broadcast` to `(N,)`; a `bands != None` merge skips this tier (a banded merge rejects `out_axes=None`);
-2. wrapped tier — express each program's output as a rank-1 `(1,)` value by inserting a `reshape` before that program's `return` in a DECODED COPY (the caller's modules are never mutated), merge, then strip the shared wrapper residual or insert one unwrap `reshape` to `(N,)`.
-Only the one native "requires the output to be unmapped" rejection triggers the retry; every other `TransformError` reaches the caller.
-The wrapper classes are scaffold, so the reported `value_classes` / `shared_classes` / `emitted_ops` are discounted by one per rank-0 leaf.
+The native merge owns rank-0 mapped outputs directly: a mapped `out_axes=0` on a rank-0 per-function output becomes rank 1 in the merged graph (the static function axis is prepended), so the façade is a single `_merge` call for every population.
 
 ## API surface (public — re-exported from `__init__.py`)
 
@@ -146,16 +139,15 @@ The `constant` op is handled structurally by the machinery (fixed data ⇒ zero 
 ## Measured cost (whole-graph AD on this host)
 
 Measured with `perf_counter`, min/median of 7 reps, at loadavg ≈ 7, on a scalar rank-0 program (a chain of `sin(y) * 1.0001`, so 3 ops per iteration).
-750-op graph (trace 5.88/6.23 ms): `grad` 14.48/15.97 ms, `vjp` 13.93/14.98 ms, against the retained Python reference sweep `autodiff.reverse_sweep` at 16.01/16.24 ms — 0.90× `grad`, 0.87× `vjp`.
-2250-op graph (trace 18.26/18.56 ms): `grad` 52.71/59.22 ms, `vjp` 52.64/53.11 ms, against the reference sweep at 50.31/52.22 ms — 1.05× both.
-Envelope cost on the same graphs: `encode_module` 2.75/2.78 ms (750 ops) and 10.39/10.51 ms (2250 ops); validated `decode_module` 5.83/5.99 ms and 20.48/20.81 ms; trusted `decode_native_module` 2.39/2.44 ms and 8.52/10.10 ms (≈2.4× faster than the validated decoder), which is the seam that closed the gap.
-The reference sweep is the retained `autodiff.forward_sweep` / `autodiff.reverse_sweep` library, not a production path, and the whole-graph `grad`/`vjp` path is within 1.1× of it at both sizes.
+750-op graph (trace 5.88/6.23 ms): `grad` 14.48/15.97 ms, `vjp` 13.93/14.98 ms.
+2250-op graph (trace 18.26/18.56 ms): `grad` 52.71/59.22 ms, `vjp` 52.64/53.11 ms.
+Envelope cost on the same graphs: `encode_module` 2.75/2.78 ms (750 ops) and 10.39/10.51 ms (2250 ops); validated `decode_module` 5.83/5.99 ms and 20.48/20.81 ms; trusted `decode_native_module` 2.39/2.44 ms and 8.52/10.10 ms (≈2.4× faster than the validated decoder), which is the seam that keeps the native round trip cheap.
 
 ## Retained Python modules
 
-- `autodiff.py` — the rule library: `jvp_rules` / `vjp_rules` and `register_*`, `ZeroTangent`, `_jvp_from_vjp`, `_materialize`, `_accumulate` / `_combine`, and the retained reference sweeps `forward_sweep` / `reverse_sweep` (no production caller; kept as the executable reference of the sweep semantics for the rules and for direct use). No transform entry point delegates to them.
-- `batching.py` — the shared per-op batching-rule registry and helpers, not a rewrite engine: `batching_rules` / `register_batching_rule` / `get` / `require` / `_resolve_batching_rule` / `_rule_key`, `_tensor_input_axes`, `_validate_rule_result`, `_remap_output_aux`, the batched-aux remap registry (`register_batched_aux_remap`, `_lookup_batched_aux_remap`), the batch-depth context (`_batch_dim`, `with_batch_depth`), `_entry_function` and `block_call_pass_through_rule`. Consumers: `_native_rules`, `_native_bridge`, `vmap`, `batch_functions`, `rules`, `../block/rules.py`, `../external_rules.py`.
-- `rules.py` — the builtin Python rule TABLES (batching, JVP, VJP for the standard op set) registered at import: the design record of how each builtin op batches/differentiates, the rule source the retained sweeps would use, and the availability table `batch_functions._check_ops` consults. The native engine's builtin rules are compiled in and never read these dicts.
+- `autodiff.py` — the rule registries and shared helpers: `jvp_rules` / `vjp_rules` with `register_jvp_rule` / `register_vjp_rule` / `get_jvp_rule` / `get_vjp_rule` / `require_vjp_rule`, `ZeroTangent`, `_jvp_from_vjp`, `_rule_name` / `_rule_display` / `_rule_hint`, `_combine`, `_sym` / `_is_real`. Holds no sweep: every `grad`/`jvp`/`vjp` rewrite is native.
+- `batching.py` — the shared per-op batching-rule registry and helpers, not a rewrite engine: `batching_rules` / `register_batching_rule` / `_rule_key`, `_tensor_input_axes`, `_validate_rule_result`, `_remap_output_aux`, the batched-aux remap registry (`register_batched_aux_remap`, `_lookup_batched_aux_remap`), the batch-depth context (`_batch_dim`, `with_batch_depth`), `_entry_function` and `block_call_pass_through_rule`. Consumers: `_native_rules`, `_native_bridge`, `vmap`, `batch_functions`, `rules`, `../block/rules.py`, `../external_rules.py`.
+- `rules.py` — the builtin Python rule TABLES (batching, JVP, VJP for the standard op set) registered at import: the availability table `batch_functions._check_ops` consults and the Python mirror of the native engine's compiled-in builtin rules. A builtin rule gap must be closed natively AND mirrored here.
 
 ## Spec-callable convention (design decision)
 
@@ -186,13 +178,13 @@ Therefore a callable/`Defn` input returns a `TransformCallable`: `tf(*specs) -> 
 | `grad.py` | public `grad` + scalar-output/argnum/dtype validation; hosts the shared AD frontend helpers (`_return_values`, `_single_scalar_output`, `_normalize_argnums`, `_normalize_extra_pytree`) |
 | `jvp.py`, `vjp.py` | public `jvp`/`vjp` + tangent/cotangent tree validation and normalization; delegate the sweep |
 | `_native_bridge.py` | native call path and `Graph` rebuild: `call_native`, `input_axes_config`, `rebuild_graph`, batch-`Dim` unification, `vectorize_graph`, `vmap_graph` |
-| `_native_rules.py` | extension-rule bridge: batching + JVP/VJP responses (scratch module, proxy op, dual binding, materialization), schema-driven attribute decoding, rule-failure capture |
+| `_native_rules.py` | extension-rule bridge: batching + JVP/VJP responses (scratch module, proxy op, dual binding, nullable output ids), schema-driven attribute decoding, rule-failure capture |
 | `_native_ad.py` | AD delegation: `grad_graph`, `sweep_graph`, input/output tree construction |
-| `_native_batch.py` | `batch_functions` façade over `evoxc._native.batch_functions`: report decoding and the rank-0 function-axis bridge |
+| `_native_batch.py` | `batch_functions` façade over `evoxc._native.batch_functions`: config type check, report decoding, single native merge call |
 | `_report.py` | `BatchReport` / `SwitchRecord` + `REPORT_KEYS` and `report_from_native` |
 | `batch_functions.py` | public `batch_functions` + all frontend validation (fns/axes/out_axes/switch_ops/bands/alignment), cross-function contract, batchability gate, callable path, merged `Graph` rebuild |
 | `batching.py` | shared batching-rule registry + helpers (`_rule_key`, `_tensor_input_axes`, `_validate_rule_result`, `_remap_output_aux`, aux-remap registry, batch depth, `_entry_function`, block pass-through rule) |
-| `autodiff.py` | AD rule registries, `ZeroTangent`, `_jvp_from_vjp`, `_materialize`, retained reference sweeps |
+| `autodiff.py` | AD rule registries, `ZeroTangent`, `_jvp_from_vjp`, rule-display/hint helpers |
 | `rules.py` | builtin Python rule tables (batching + JVP + VJP) registered at import |
 | `_metadata.py` | `MappedAxes`, `UNMAPPED`, `ValueEnv` |
 | `_wrappers.py` | `TransformCallable` (spec → Graph convention) |
