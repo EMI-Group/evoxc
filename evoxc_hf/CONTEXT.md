@@ -23,7 +23,7 @@ Whole-graph StableHLO export is pinned without any compiler (`tests/test_export.
 - **Independent, self-contained distribution**: `evoxc-hf` publishes on its own (`uv build --project evoxc_hf`) and is never bundled into the `evoxc` wheel or sdist (pinned by the root `../tests/test_packaging.py`); it depends on `evoxc` like any third-party package, and `evoxc` never imports it.
 - **src layout**: `./src/evoxc_hf/` holds all 13 modules plus `models/`, while `./tests/` and this `./CONTEXT.md` stay at the top level of this directory — `uv_build` rejects `module-root = ".."`, so a subproject whose repository root is the `evoxc` project cannot use a flat layout.
 - **Build backend**: `./pyproject.toml` is a `uv_build` project — `module-root = "src"`, `module-name = "evoxc_hf"`, static `version = "0.1.0"`, `requires-python = ">=3.11"`, PEP 639 `license = "Apache-2.0"` with `license-files = ["LICENSE"]`.
-- **Hard dependencies: `evoxc>=0.1.0` + `numpy>=1.24`, nothing else.** The readers are `numpy` + `struct` + `json` + `zipfile`/`pickle`, and `torch`/`transformers`/`safetensors`/`iree` are **never** imported at module scope (pinned in a subprocess by `tests/test_public_api.py`).
+- **Hard dependencies: `evoxc>=0.1.0` + `numpy>=1.24`, nothing else.** The readers are `numpy` + `struct` + `json` + `zipfile`/`pickle` plus the public `evoxc.formats` safetensors reader, and `torch`/`transformers`/`safetensors`/`iree` are **never** imported at module scope (pinned in a subprocess by `tests/test_public_api.py`).
 - **The extras live here**: `hf = ["torch>=2.0", "transformers>=4.40"]` and `dev = ["pytest>=7"]`, where `hf` is **reference oracles only, never runtime requirements** — the real HuggingFace implementation this one is validated and benchmarked against, and `import evoxc_hf` works without either.
 - **The compiled path is an evoxc extra, not this package's**: `pip install "evoxc[iree]"` (or `evoxc[tvm]`, or a user-provided PJRT plugin `.so` for `xla`) enables it; `pip install evoxc-hf` alone gives the numpy interpreter.
 - **Workspace member**: the root `../pyproject.toml` — the `evoxc` project, owned outside this node — declares `[tool.uv.workspace] members = ["evoxc_hf"]` and carries no `hf` extra, and this project's `[tool.uv.sources] evoxc = { workspace = true }` resolves `evoxc` from that root project rather than PyPI; `uv build` does not resolve `[tool.uv.sources]`, so a missing workspace root blocks `uv lock`/`uv sync` but never a build.
@@ -141,7 +141,7 @@ GPT-2 normalises its compact keys (`n_embd`/`n_head`/`n_layer`/`n_vocab`/`n_posi
 Validation raises `HFConfigError` for head-count divisibility, non-positive/non-int sizes and unknown `model_type` (listing the supported set), and `HFUnsupportedError` for non-empty `rope_scaling` or any Qwen3 sliding-window request — truthy `use_sliding_window`, a `layer_types` entry other than `"full_attention"`, or a positive `sliding_window` without `use_sliding_window: false`.
 `ModelConfig` values are **static graph specialisation values**: one config = one graph, and `digest` is directly usable as a cache key (configs differing only in harmless extra HF fields digest equal).
 
-### `src/evoxc_hf/weights.py` — checkpoint readers (numpy + stdlib only, no key mapping)
+### `src/evoxc_hf/weights.py` — checkpoint readers (numpy + stdlib + `evoxc.formats`, no key mapping)
 
 ```python
 read_safetensors(path) / read_torch_bin(path) / load_checkpoint(model_dir_or_file) -> dict[str, np.ndarray]
@@ -149,7 +149,7 @@ widen_to_float32(arr) -> np.ndarray
 state_dict_parameter_count(state_dict) -> int
 ```
 
-- **safetensors**: 8-byte LE u64 header length + JSON header + raw buffer; `__metadata__` skipped; dtype/shape/offsets validated against the buffer; sharded checkpoints merged through the index `weight_map`.
+- **safetensors**: parsing/validation is delegated to the public `evoxc.formats.load_safetensors` reader (the repository's ONE safetensors implementation) — `read_safetensors` is only this package's policy on top of it: the dtype policy below, one owning writable array per tensor (the reader's zero-copy views alias the mapped file and are READ-ONLY, so the copy is explicit at this boundary), and `evoxc.core.PersistenceError` wrapped verbatim into `HFWeightError`; the reader's canonical tags the package cannot use (`F8_E4M3`/`F8_E5M2`, surfaced as raw `uint8` words) are rejected there by name; sharded checkpoints merged through the index `weight_map`.
 - **torch**: zip format (`*/data.pkl` + `*/data/<storage-key>`) vs legacy format (magic → protocol 1001 → `sys_info` → pickled state dict → storage-key list → per key an **int64 element count followed by raw bytes**), chosen by `zipfile.is_zipfile`, never by name; views/offsets/strides (negative included) resolved; `{"state_dict": {...}}` unwrapped.
 - **Security boundary**: `_RestrictedUnpickler` allows only `collections.OrderedDict`, the three `torch._utils` rebuild helpers, storage classes from its dtype table, inert placeholders and `copyreg` reconstructors — any other global raises `HFWeightError` instead of executing code (no `allow_pickle`, no torch import).
 - **Dtype policy**: float32 preserved, float16/bfloat16 widened to float32 (bfloat16 via `u16 << 16`), float64/integer/bool kept; every array is writable and C-contiguous.
@@ -350,7 +350,7 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 | `./src/evoxc_hf/program.py` | Compute half: `forward_fn` (+ memoisation/specialisation stamp), `param_specs`, `reference_logits`, `resolve_seq_len`, `DEFAULT_SEQ_LEN`. |
 | `./src/evoxc_hf/pipeline.py` | Staging: `build`, `run`, `predict`, `place_params`, `place_ids`, `resolve_build_options`, the `DEFAULT_*` option constants and the default backend/option matrix. |
 | `./src/evoxc_hf/config.py` | HF `config.json` → `ModelConfig`, `digest`, `FAMILY_BY_MODEL_TYPE`. |
-| `./src/evoxc_hf/weights.py` | Checkpoint reading: safetensors, torch zip/legacy, sharded indices, dtype policy, restricted unpickler (no key mapping). |
+| `./src/evoxc_hf/weights.py` | Checkpoint reading: safetensors (delegated to `evoxc.formats.load_safetensors` + this package's dtype/ownership policy), torch zip/legacy, sharded indices, dtype policy, restricted unpickler (no key mapping). |
 | `./src/evoxc_hf/ops.py` | Graph idioms (norms/activations/softmax/mask/RoPE/head layout) + `ACTIVATIONS`/`EXPORT_UNSAFE_ACTIVATIONS`. |
 | `./src/evoxc_hf/reference.py` | Independent pure-numpy oracle primitives (no `evoxc` import) — the thing graphs are validated against. |
 | `./src/evoxc_hf/families.py` | `FamilySpec`, the `FAMILIES` registry, `get_family`, `family_for_model_type`, `resolve_family`. |
