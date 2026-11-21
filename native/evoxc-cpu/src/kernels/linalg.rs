@@ -365,27 +365,33 @@ fn dot_gemm(
 }
 
 /// Multiply-adds (`m * k * n * output blocks`) from which the plain matmul is
-/// worth splitting across threads.  A thread spawn costs ~10 us on this class of
-/// host, so below one 128^3 matmul's worth of work the spawn is more than the
-/// work it removes and the call stays on one thread: `gemm_threads` asks for
-/// [`GEMM_PARALLEL_WORK_PER_THREAD`] per thread, which makes this threshold the
-/// point where a second thread appears.
-const GEMM_PARALLEL_MIN_WORK: usize = 1 << 22;
+/// worth splitting across threads.  Measured on a 16-cpu hybrid host (6
+/// performance + 8 efficiency + 2 low-power cores) with the row split below:
+/// a 256^3 matmul (2^24) is a wash at the median (0.34 ms threaded vs 0.36 ms on
+/// one thread) and a 512^3 (2^27) is 1.1-1.9x faster threaded (1.5-2.6 ms vs
+/// 2.8-4.3 ms), so this floor sits above the 256^3 shape: below it the spawn
+/// (measured ~15 us per thread) is not repaid.
+const GEMM_PARALLEL_MIN_WORK: usize = 1 << 25;
+/// Multiply-adds one batch element must reach before the batch is worth
+/// splitting.  A batch of many small matmuls (measured: eight 128^3 blocks,
+/// 2^21 each) is 1.1-4x SLOWER threaded than serial at every thread count,
+/// because a straggler strip landing on an efficiency or low-power core sets the
+/// wall time while the total work is only one stripped gemm's worth.
+const GEMM_PARALLEL_MIN_BLOCK_WORK: usize = 1 << 23;
 /// Multiply-adds one thread should own before another thread is worth spawning.
-const GEMM_PARALLEL_WORK_PER_THREAD: usize = 1 << 21;
-/// Thread cap below [`GEMM_WIDE_WORK`].  Measured on a 16-cpu hybrid host (6
-/// performance + 8 efficiency + 2 low-power cores): a 256^3 or 384^3 matmul is
-/// fastest at 8 threads, and 12/16 threads lose ~25 % because the extra strips
-/// land on efficiency cores and each thread re-packs the whole B panel.  The
-/// same cap rationale as the flat elementwise maps' 4-thread limit in
-/// `buffer.rs`, scaled up for a compute-bound (rather than bandwidth-bound)
-/// kernel.
+const GEMM_PARALLEL_WORK_PER_THREAD: usize = 1 << 23;
+/// Thread cap below [`GEMM_WIDE_WORK`].  Measured on the same hybrid host: a
+/// 512^3 matmul is fastest at 8 threads (1.53-2.54 ms) and loses at 16
+/// (2.21-2.89 ms), because the extra strips land on efficiency cores and every
+/// thread re-packs the whole B panel.  The same cap rationale as the flat
+/// elementwise maps' 4-thread limit in `buffer.rs`, scaled up for a
+/// compute-bound (rather than bandwidth-bound) kernel.
 const GEMM_PARALLEL_MAX_THREADS: usize = 8;
-/// Work from which every available cpu may be used: a 512^3 matmul (exactly this
-/// many multiply-adds) is the size where 16 threads first beat 8 (measured
-/// 2.43 ms vs 2.50 ms, and 4.26 ms vs 5.78 ms at 1024^3), because the per-thread
-/// packing and spawn costs are amortized by then.
-const GEMM_WIDE_WORK: usize = 1 << 27;
+/// Work from which every available cpu may be used: a 1024^3 matmul (this many
+/// multiply-adds) is where 16 threads first beat 8 (measured 13.0-13.3 ms vs
+/// 14.3-14.5 ms), because the per-thread packing and spawn costs are amortized
+/// by then.
+const GEMM_WIDE_WORK: usize = 1 << 30;
 
 /// The host's usable parallelism, probed once.
 fn parallel_cpus() -> usize {
@@ -397,12 +403,17 @@ fn parallel_cpus() -> usize {
     })
 }
 
-/// How many threads a plain matmul with `work` multiply-adds over `blocks`
-/// batch elements of `rows` rows should use.  `1` means "stay on the calling
-/// thread" (small matmuls, and every host with no usable parallelism); the
-/// result never exceeds the number of row strips the output can be cut into,
-/// because a strip is never split across threads.
+/// How many threads a plain matmul with `work` multiply-adds per batch element
+/// (`m * k * n`) over `blocks` batch elements of `rows` rows should use.  `1`
+/// means "stay on the calling thread" (small matmuls, a batch of small
+/// matmuls, and every host with no usable parallelism); the result never exceeds
+/// the number of row strips the output can be cut into, because a strip is never
+/// split across threads.
 fn gemm_threads(work: usize, blocks: usize, rows: usize) -> usize {
+    if work < GEMM_PARALLEL_MIN_BLOCK_WORK {
+        return 1;
+    }
+    let work = work.saturating_mul(blocks);
     if work < GEMM_PARALLEL_MIN_WORK {
         return 1;
     }
@@ -429,7 +440,7 @@ fn gemm_run<T: Gemm>(
     out_shape: &[usize],
 ) -> Result<Option<Buffer>> {
     let blocks = util::numel(&g.batch);
-    let threads = gemm_threads(g.m * g.k * g.n * blocks, blocks, g.m);
+    let threads = gemm_threads(g.m * g.k * g.n, blocks, g.m);
     gemm_run_threads(a, b, g, dtype, out_shape, threads)
 }
 
@@ -1801,19 +1812,22 @@ mod tests {
         // calling thread even on a 16-cpu host.
         assert_eq!(gemm_threads(64 * 64 * 64, 1, 64), 1);
         assert_eq!(gemm_threads(96 * 96 * 96, 1, 96), 1);
-        assert_eq!(gemm_threads(GEMM_PARALLEL_MIN_WORK - 1, 1, 256), 1);
-        // 256^3 is the measured sweet spot and does thread on a multi-cpu host.
-        let threads = gemm_threads(256 * 256 * 256, 1, 256);
+        // A 256^3 matmul is under the total-work floor: it measures a wash at
+        // the median, so it must stay single-threaded.
+        assert_eq!(gemm_threads(256 * 256 * 256, 1, 256), 1);
+        assert_eq!(gemm_threads(GEMM_PARALLEL_MIN_WORK - 1, 1, 1024), 1);
+        // A 512^3 matmul is the measured sweet spot and does thread.
+        let threads = gemm_threads(512 * 512 * 512, 1, 512);
         assert_eq!(
             threads > 1,
             parallel_cpus() > 1,
-            "256^3 must thread iff the host has more than one cpu"
+            "512^3 must thread iff the host has more than one cpu"
         );
         assert!(threads <= parallel_cpus(), "never more threads than cpus");
-        assert!(threads <= 256, "never more threads than output rows");
+        assert!(threads <= 512, "never more threads than output rows");
         if parallel_cpus() >= GEMM_PARALLEL_MAX_THREADS {
-            // Below a 512^3 matmul the measured optimum is the 8-thread cap.
-            assert_eq!(threads, GEMM_PARALLEL_MAX_THREADS, "256^3 sits at the cap");
+            // Below a 1024^3 matmul the measured optimum is the 8-thread cap.
+            assert_eq!(threads, GEMM_PARALLEL_MAX_THREADS, "512^3 sits at the cap");
             // ... while a 1024^3 matmul may use the whole machine.
             assert_eq!(
                 gemm_threads(1024 * 1024 * 1024, 1, 1024),
@@ -1821,13 +1835,19 @@ mod tests {
                 "1024^3 may use every cpu"
             );
         }
+        // A batch of many small blocks stays on one thread however much total
+        // work it adds up to: eight 128^3 matmuls are slower threaded.
+        assert_eq!(gemm_threads(128 * 128 * 128, 8, 128), 1);
+        assert_eq!(gemm_threads(128 * 128 * 128, 64, 128), 1);
+        // ... while eight 256^3 blocks (2^27 of work, 2^24 per block) do thread.
+        assert_eq!(gemm_threads(256 * 256 * 256, 8, 256), threads);
         // Never more threads than row strips: one row cannot be shared, and a
         // single batch block caps the split at its rows.
         assert_eq!(gemm_threads(4096 * 4096, 1, 1), 1);
         assert_eq!(gemm_threads(1 << 30, 1, 3), 3);
-        // The work-per-thread target decides the count from 384^3 upward, so a
-        // bigger matmul never asks for fewer threads.
-        assert!(gemm_threads(512 * 512 * 512, 1, 512) >= gemm_threads(256 * 256 * 256, 1, 256));
+        // The work-per-thread target decides the count, so a bigger matmul never
+        // asks for fewer threads.
+        assert!(gemm_threads(768 * 768 * 768, 1, 768) >= threads);
     }
 
     #[test]
