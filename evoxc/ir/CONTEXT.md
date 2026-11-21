@@ -10,7 +10,8 @@ directory owns the IR data model, the op-definition registry (full canonical
 v1 op set, 119 ops), the `Builder` (op-construction API), `verify`
 (structural/type/attribute validation), serialization (the self-describing IR
 payload — core of the `.evoxcgraph` format; the outer container lives in
-`../persist`), and `pretty_print`.
+`../persist`), the trusted fast decode of an in-process `evoxc-native-ir`
+envelope, and `pretty_print`.
 
 **Import rule (binding):** `ir` imports ONLY `evoxc.core` (Dim/DimExpr, errors),
 stdlib, and numpy (constant payloads). Nothing else from evoxc. `ops`, `trace`,
@@ -280,6 +281,31 @@ ids, operands referenced by id; dims encode as `{"int": n}` | `{"dim": name}`
 constant payloads as base64 `np.save` bytes in the `constants` table; sha256
 over canonical JSON (`sort_keys`, compact separators) of everything else.
 
+## Trusted fast decode (`_native_decode.py`)
+
+`./_native_decode.py` is the private TRUSTED decode path for an `evoxc-native-ir` v1 envelope produced IN-PROCESS by the native extension from a module this runtime encoded moments earlier — that module is known valid, so the generic `_require_*` structural validation, the sha256 and the post-decode `ir.verify` are all skipped.
+`build_module_fast(body)` is its only export (`__all__`) and the hot-path sibling of `serialize._build_module`; both produce structurally identical modules — original op/value ids, attributes, types, locations, parents, ordered complete `uses`, and id counters advanced past every decoded id.
+It imports `serialize`'s shared pieces instead of duplicating them: `_attr_schema`, `_decode_attrs_with_schema`, `_decode_location`, `_decode_generic`, `_fast_forward_counters`, the frozen `_VALUE_TYPE_CACHE` and `_npy._dtype_from_name`.
+Construction is four phases over the flat ops table: (1) every `Op`/`Value` built positionally (no generic validation walk) with its attributes and location; (2) function signature, entry-block arguments and op ordering (`op.parent` wiring, `Block.ops.append`); (3) nested op regions (control-flow bodies) through `_build_region_fast`; (4) operands plus `Use(op, index)` records APPENDED directly.
+`_build_region_fast` mirrors the block path's `id`-or-`int(ref)` op-entry fallback, so a `cond`/`while_loop`/`scan` graph decodes exactly like a flat one.
+`Value.add_use`'s dedup index is skipped on purpose: a trusted envelope has no duplicate use records, so the append is the whole bookkeeping.
+Attributes still decode through the schema-aware `_decode_attrs_with_schema`, so an unknown attribute still raises `VerificationError`; only the generic structural checks are gone.
+An empty attribute dict takes a fast `{}` path, and a missing `constants` table falls back to a shared empty dict (the native envelope inlines every ndarray payload).
+Memoization: a per-decode `id()`-keyed `type_memo` over `_decode_type_fast` (envelope type dicts are shared objects out of the native writer, so identity is the correct key), which in turn keys the frozen `_VALUE_TYPE_CACHE` on `(dtype name, decoded dims)` — the SAME cache the validated decoder fills.
+`_DIM_CACHE`/`_DIMEXPR_CACHE` at module level reuse frozen `Dim`/`DimExpr` instances, plus a per-decode location memo and a per-decode attribute-schema memo.
+The module-level tables are capped at 4096 entries so they stay bounded across decodes; the per-decode memos die with their decode.
+`ir.verify` is deliberately NOT run on a trusted decode: verification is linear in use count but not free (see "Verification cost model"), and the envelope cannot be invalid unless the native writer is broken.
+The wire format is unchanged — still `evoxc-native-ir` v1 (`ENVELOPE_FORMAT = 1` in `../_native_codec.py`), same `module`/`functions`/`ops` body, value ids and dim encodings.
+`evoxc._native_codec.decode_native_module(envelope, *, verify_module=None)` is the ONE entry point for trusted envelopes: it checks the discriminator/version via `_validated_envelope_body` (which keeps only `module`/`functions`/`ops`) and hands the body to `build_module_fast`.
+`evoxc._native.transform` (all five builtin transforms) and `evoxc._native.batch_functions` decode through it.
+`decode_module` remains the VALIDATED decoder — discriminator/version check, then `serialize._deserialize_envelope_body` (`_build_module` + `ir.verify`) — for any envelope of uncertain provenance: files, caches, tests, and `transforms._native_batch`'s re-encoded rank-0 copy.
+`EVOXC_NATIVE_DECODE_CHECK=1` (read ONCE at `_native_codec` import; `""`/`"0"`/`"false"`/`"False"` leave it off) is the dev-only cross-check: the fast-decoded module is run through `ir.verify`, so the trusted path can be audited without paying verification in the hot path.
+It does not re-decode through the validated path or diff the two modules — `ir.verify` on the fast result is the whole check, raising the same `VerificationError` a bad module would.
+The cross-check therefore costs the fast decode plus one `ir.verify` pass (≈4 µs/op at a few thousand ops, rising with size).
+Cost, measured at the native AD seam and recorded with the fast-decoder work (reproducible via `git log --grep 'fast decode'`): the trusted decode is linear at ≈4.9 µs/op — 3.7 ms at 753 ops and 11.2 ms at 2 253 ops, re-measured at 3.4 ms / 2 008 ops and 11.8 ms / 6 008 ops.
+The validated decoder costs ≈20–21 µs/op on the same graphs (15.4 ms at 753 ops, 47.6 ms at 2 253 ops), so the trusted path is ≈4.2–4.3× faster.
+That validated cost is dominated by `_build_module`'s generic validation walk plus `ir.verify`: `../../native/CONTEXT.md` records 20.3 ms of a 34.6 ms native-`grad` path at 752 ops for the validated decode alone, which is why the same end-to-end `grad`/`vjp` hop is ≈17 ms over the trusted path versus ≈29 ms when the seam decodes validated.
+
 ## Cross-language boundary facts
 
 IR objects are mutable Python dataclasses with direct parent/owner links, operand references and use lists, and verification checks Python class membership plus object identity, not only numeric ids.
@@ -306,8 +332,9 @@ in `printer.py`.
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
 - Implementation status: data structures, registry, shape-inference hooks
-  (`inference.py`, 56 hooks), `pretty_print`, `verify`, the `Builder`, and
-  serialization (`serialize_module`/`deserialize_module`) are implemented.
+  (`inference.py`, 56 hooks), `pretty_print`, `verify`, the `Builder`,
+  serialization (`serialize_module`/`deserialize_module`) and the private
+  trusted native decode (`_native_decode.build_module_fast`) are implemented.
 - Shape-inference conventions (binding for `verify` agreement): broadcasting
   resolves symbolic conflicts as `DimExpr("max", a, b)` (left dim first);
   `None` dims are runtime-dynamic and yield `None`; element-count checks
@@ -317,6 +344,10 @@ in `printer.py`.
   `reduce_*` OpDefs carry a `reduce_op` attribute: 'sum'|'max'|'min'|'mean'|
   'prod').
 - Files < ~1000 lines; op_defs split by category (done).
+- `_native_decode.build_module_fast` must stay structurally in lockstep with
+  `serialize._build_module`: a change to the envelope layout, the phase order or
+  the `Use` wiring lands in BOTH, and an `EVOXC_NATIVE_DECODE_CHECK=1` run is
+  the audit that catches divergence.
 - Unknown op name in `opdef()` → `KeyError`; duplicate registration →
   `ValueError`; version/format mismatch on deserialize → `PersistenceError`;
   structural violations → `VerificationError`.
@@ -343,7 +374,8 @@ in `printer.py`.
 | `./op_defs/sparse.py` | Sparse op defs: 16 ops (from_dense/to_dense, coo/csr/csc conversions, negate, add, multiply, multiply_dense, reduce_sum, transpose, reshape, concatenate, dot variants), all pure |
 | `./builder.py` | Op-construction API (implemented) |
 | `./verify.py` | Structural/type/attribute verification (implemented) |
-| `./serialize.py` | IR payload serialization: self-describing payload, sha256 integrity, round-trip rebuild with original ids (implemented); private `_serialize_module`/`_deserialize_envelope_body` serve the native envelope with inline arrays and no hash |
+| `./serialize.py` | IR payload serialization: self-describing payload, sha256 integrity, round-trip rebuild with original ids (implemented); private `_serialize_module`/`_deserialize_envelope_body` serve the native envelope with inline arrays and no hash, and its schema/decode helpers (`_attr_schema`, `_decode_attrs_with_schema`, `_decode_location`, `_decode_generic`, `_fast_forward_counters`, `_VALUE_TYPE_CACHE`) are shared with the trusted fast decoder |
+| `./_native_decode.py` | Private TRUSTED fast decode of the in-process `evoxc-native-ir` v1 envelope (`build_module_fast`): positional IR construction, direct `Use` appends, memoized types/dims/locations/schemas, no generic validation and no `ir.verify` (see "Trusted fast decode") |
 | `./_npy.py` | Private ndarray containers: the `np.save` writer/parser for the constants table, the raw little-endian inline form of the native envelope, and the shared dtype memo tables |
 | `./printer.py` | SSA text printing (implemented) |
 
@@ -360,6 +392,9 @@ cases); `verify()` invariants
 (shapes with symbolic dims, constants as base64 npy, tamper detection, version
 rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
 terminators). CPU only.
+The trusted decode has no dedicated unit suite here: it is exercised through the
+extension-gated native transform/`batch_functions` legs, and
+`EVOXC_NATIVE_DECODE_CHECK=1` turns on its `ir.verify` audit.
 
 ## Known Issues
 - **Count of record is 119 ops; `__init__.py`'s module docstring still says "97 ops"** (stale). Verified split: elementwise 38 + comparison 6, structure 13, reduction 9, sorting 2, linalg 12, control 8 + terminator 1, collective 8, sparse 16, random 6 — 11 categories, `{o.category for o in ir.all_opdefs()}`. Use `ir.op_names()`/`ir.all_opdefs()` rather than the docstring.
@@ -394,4 +429,6 @@ shape-inference hooks (`inference.py`, 56 hooks), `pretty_print`, `verify`
 dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
 and serialization (`serialize_module`/`deserialize_module` — payload schema,
 integrity hash, round-trip rebuild with original ids and fast-forwarded
-counters) are implemented.
+counters) plus the private trusted native decode
+(`_native_decode.build_module_fast` — positional rebuild of a trusted
+`evoxc-native-ir` v1 body, no validation and no `ir.verify`) are implemented.
