@@ -9,7 +9,9 @@
 //! * `version() -> str` and `__version__`
 //! * `infer(op_name, operand_types, attributes, result_types=None, module=None)`
 //! * `transform(kind, module, config)` — `evoxc-compiler`'s five transforms
+//! * `batch_functions(programs, config)` — `evoxc-compiler`'s population merge
 //! * `NativeError` with `.kind` / `.message`
+mod batch_ops;
 mod convert;
 mod error;
 mod module_ops;
@@ -64,6 +66,21 @@ fn transform(
 ) -> PyResult<Py<PyAny>> {
     module_ops::transform(py, kind, module, config)
 }
+/// Native population merge (`evoxc.batch_functions`'s engine).
+///
+/// Takes one `evoxc-native-ir` envelope per function of the population plus the
+/// merge config (`axes`, `out_axes`, `switch_ops`, `bands`, `alignment`, and the
+/// optional `extension_rule` callable), and returns the merged envelope with a
+/// top-level `"batch_report"` object (the 12-key `BatchReport` payload).  The
+/// engine lives in `evoxc-compiler::batch_functions`.
+#[pyfunction]
+fn batch_functions(
+    py: Python<'_>,
+    programs: &Bound<'_, PyAny>,
+    config: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    batch_ops::batch_functions(py, programs, config)
+}
 #[pymodule]
 fn _evoxc_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
@@ -76,5 +93,6 @@ fn _evoxc_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(version, module)?)?;
     module.add_function(wrap_pyfunction!(infer, module)?)?;
     module.add_function(wrap_pyfunction!(transform, module)?)?;
+    module.add_function(wrap_pyfunction!(batch_functions, module)?)?;
     Ok(())
 }

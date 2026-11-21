@@ -19,6 +19,9 @@
 //!
 //! Every decode failure is a `TransformError` naming the offending config key
 //! (or response field) — a typo is never silently ignored.
+use evoxc_compiler::batch_functions::{
+    Alignment, Bands, BatchFunctionsConfig, MergeGroupSpec, SwitchOps,
+};
 use evoxc_compiler::{ExtensionRequest, ExtensionResponse, OutAxes, TransformConfig};
 use evoxc_core::error::{Error, Result};
 use evoxc_core::graph::ValueId;
@@ -32,6 +35,16 @@ pub const CONFIG_KEYS: [&str; 7] = [
     "argnums",
     "tangent_inputs",
     "cotangent_inputs",
+    "extension_rule",
+];
+
+/// The accepted keys of the Python-side `batch_functions` config dict.
+pub const BATCH_CONFIG_KEYS: [&str; 6] = [
+    "axes",
+    "out_axes",
+    "switch_ops",
+    "bands",
+    "alignment",
     "extension_rule",
 ];
 
@@ -226,6 +239,200 @@ pub fn int_list_from_json(json: &Json, field: &str) -> Result<Vec<usize>> {
             Error::transform(format!("{field}[{index}]: {value} is not a non-negative index"))
         })?;
         out.push(value);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// `batch_functions` config decoding
+// ---------------------------------------------------------------------------
+
+/// One normalized `axes` / `out_axes` option.
+///
+/// The Python entry point takes a pytree, but the FFI only sees the programs,
+/// so the binding flattens the option to one entry per TENSOR leaf.  A bare
+/// `int` / `None` is broadcast to every leaf (matching the Python "bare option"
+/// reading), while a list is used positionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxisList {
+    /// One entry repeated for every tensor leaf (`None` = unmapped).
+    All(Option<i64>),
+    /// One entry per tensor leaf, in order.
+    PerLeaf(Vec<Option<i64>>),
+}
+
+impl AxisList {
+    /// Resolve to the engine's `Vec<Option<i64>>` for `n` tensor leaves.
+    ///
+    /// An empty per-leaf list means "the default": the engine fills every
+    /// missing trailing entry with `Some(0)`.
+    pub fn resolve(&self, n: usize) -> Vec<Option<i64>> {
+        match self {
+            AxisList::All(entry) => vec![*entry; n],
+            AxisList::PerLeaf(entries) => entries.clone(),
+        }
+    }
+}
+
+/// Parse a `batch_functions` `axes` / `out_axes` value: `int | null | list`.
+pub fn batch_axes_from_json(json: &Json, field: &str) -> Result<AxisList> {
+    match json {
+        Json::Null => Ok(AxisList::All(None)),
+        Json::Array(items) => Ok(AxisList::PerLeaf(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| axis_from_json(item, &format!("{field}[{index}]")))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        Json::Bool(_) => Err(Error::transform(format!(
+            "{field}: an axis option must be an int, None or a per-leaf list, got a bool"
+        ))),
+        other => other.as_i64().map(|axis| AxisList::All(Some(axis))).ok_or_else(|| {
+            Error::transform(format!(
+                "{field}: an axis option must be an int, None or a per-leaf list, got {}",
+                json_kind(other)
+            ))
+        }),
+    }
+}
+
+/// Parse `switch_ops`: `null`/`false` (none), `true` (the default groups) or a
+/// list of merge groups (a category name, or a list of op names).
+pub fn switch_ops_from_json(json: &Json) -> Result<SwitchOps> {
+    match json {
+        Json::Null => Ok(SwitchOps::None),
+        Json::Bool(false) => Ok(SwitchOps::None),
+        Json::Bool(true) => Ok(SwitchOps::Default),
+        Json::Array(items) => {
+            let mut specs = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                match item {
+                    Json::String(category) => {
+                        specs.push(MergeGroupSpec::Category(category.clone()));
+                    }
+                    Json::Array(names) => {
+                        let mut ops = Vec::with_capacity(names.len());
+                        for (position, name) in names.iter().enumerate() {
+                            match name {
+                                Json::String(name) => ops.push(name.clone()),
+                                other => {
+                                    return Err(Error::transform(format!(
+                                        "config.switch_ops[{index}][{position}]: an op name must \
+                                         be a string, got {}",
+                                        json_kind(other)
+                                    )))
+                                }
+                            }
+                        }
+                        specs.push(MergeGroupSpec::Ops(ops));
+                    }
+                    other => {
+                        return Err(Error::transform(format!(
+                            "config.switch_ops[{index}]: a merge group must be a category name \
+                             (str) or a list of op names, got {}",
+                            json_kind(other)
+                        )))
+                    }
+                }
+            }
+            Ok(SwitchOps::Groups(specs))
+        }
+        other => Err(Error::transform(format!(
+            "config.switch_ops: expected None, a bool or a list of merge groups, got {}",
+            json_kind(other)
+        ))),
+    }
+}
+
+/// Parse `bands`: `null` (flat), an int `K`, or `"auto"`.
+pub fn bands_from_json(json: &Json) -> Result<Bands> {
+    match json {
+        Json::Null => Ok(Bands::Flat),
+        Json::Bool(_) => Err(Error::transform(
+            "batch_functions: bands must be None, an int K with 1 <= K <= N, or 'auto' — \
+             booleans are not accepted",
+        )),
+        Json::Number(number) => {
+            let raw = number.as_i64().ok_or_else(|| {
+                Error::transform(format!("config.bands: expected an integer, got {number}"))
+            })?;
+            // `K < 1` is the same out-of-range diagnostic the engine emits for
+            // `K > N`; `usize::try_from` would otherwise wrap/reject opaquely.
+            if raw < 1 {
+                return Err(Error::transform(format!(
+                    "batch_functions: bands={raw} is out of range for the function population — \
+                     the band count K must satisfy 1 <= K <= N; use bands=None for the flat merge"
+                )));
+            }
+            let k = usize::try_from(raw).map_err(|_| {
+                Error::transform(format!(
+                    "batch_functions: bands={raw} does not fit the platform band count"
+                ))
+            })?;
+            Ok(Bands::Explicit(k))
+        }
+        Json::String(text) => {
+            if text == "auto" {
+                Ok(Bands::Auto)
+            } else {
+                Err(Error::transform(format!(
+                    "batch_functions: unknown bands value {text:?}; accepted values are None \
+                     (flat merge), an int K with 1 <= K <= N, or 'auto'"
+                )))
+            }
+        }
+        other => Err(Error::transform(format!(
+            "config.bands: expected None, an int or 'auto', got {}",
+            json_kind(other)
+        ))),
+    }
+}
+/// Parse `alignment`: `null` (the default) or one of the accepted spellings.
+///
+/// The spelling is normalized the way the Python frontend does it — trimmed and
+/// case-insensitive — so `"Variant"` and `" variant "` mean `variant`.
+pub fn alignment_from_json(json: &Json) -> Result<Alignment> {
+    match json {
+        Json::Null => Ok(Alignment::Variant),
+        Json::String(text) => Alignment::parse(&text.trim().to_ascii_lowercase()),
+        other => Err(Error::transform(format!(
+            "config.alignment: expected a str or None, got {}",
+            json_kind(other)
+        ))),
+    }
+}
+/// Decode the `batch_functions` config JSON into the engine's typed config.
+///
+/// `n_inputs` / `n_outputs` are the entry function's tensor-leaf counts; they
+/// expand a bare `axes` / `out_axes` value to one entry per leaf.  `map` never
+/// contains `extension_rule` (a Python callable is not JSON): `batch_ops`
+/// handles that key itself, so this decoder accepts exactly the five data keys.
+pub fn parse_batch_config(
+    map: &Map<String, Json>,
+    n_inputs: usize,
+    n_outputs: usize,
+) -> Result<BatchFunctionsConfig> {
+    let mut out = BatchFunctionsConfig::default();
+    for (key, value) in map {
+        match key.as_str() {
+            "axes" => {
+                out.axes = batch_axes_from_json(value, "config.axes")?.resolve(n_inputs);
+            }
+            "out_axes" => {
+                out.out_axes =
+                    batch_axes_from_json(value, "config.out_axes")?.resolve(n_outputs);
+            }
+            "switch_ops" => out.switch_ops = switch_ops_from_json(value)?,
+            "bands" => out.bands = bands_from_json(value)?,
+            "alignment" => out.alignment = alignment_from_json(value)?,
+            other => {
+                return Err(Error::transform(format!(
+                    "batch_functions: unknown config key {other:?}; accepted keys are {}",
+                    BATCH_CONFIG_KEYS.join(", ")
+                )))
+            }
+        }
     }
     Ok(out)
 }
@@ -666,5 +873,106 @@ mod tests {
                 "extension_rule",
             ]
         );
+        assert_eq!(
+            BATCH_CONFIG_KEYS,
+            [
+                "axes",
+                "out_axes",
+                "switch_ops",
+                "bands",
+                "alignment",
+                "extension_rule",
+            ]
+        );
+    }
+
+    // --- `batch_functions` config ------------------------------------------
+    #[test]
+    fn batch_axes_accept_bare_and_per_leaf_forms() {
+        assert_eq!(batch_axes_from_json(&Json::Null, "config.axes").unwrap(), AxisList::All(None));
+        assert_eq!(
+            batch_axes_from_json(&json!(0), "config.axes").unwrap(),
+            AxisList::All(Some(0))
+        );
+        assert_eq!(
+            batch_axes_from_json(&json!([0, null, 1]), "config.axes").unwrap(),
+            AxisList::PerLeaf(vec![Some(0), None, Some(1)])
+        );
+        // A bare option expands to every leaf; a per-leaf list is positional.
+        assert_eq!(AxisList::All(None).resolve(3), vec![None, None, None]);
+        assert_eq!(
+            AxisList::PerLeaf(vec![Some(0)]).resolve(3),
+            vec![Some(0)]
+        );
+        let err = batch_axes_from_json(&json!(true), "config.axes").unwrap_err();
+        assert_eq!(err.kind_str(), "TransformError");
+        assert!(err.message.contains("bool"));
+        let err = batch_axes_from_json(&json!([0, "x"]), "config.axes").unwrap_err();
+        assert!(err.message.contains("config.axes[1]"));
+    }
+
+    #[test]
+    fn batch_switch_ops_accepts_every_spelling() {
+        assert_eq!(switch_ops_from_json(&Json::Null).unwrap(), SwitchOps::None);
+        assert_eq!(switch_ops_from_json(&json!(false)).unwrap(), SwitchOps::None);
+        assert_eq!(switch_ops_from_json(&json!(true)).unwrap(), SwitchOps::Default);
+        assert_eq!(
+            switch_ops_from_json(&json!(["elementwise", ["add", "subtract"]])).unwrap(),
+            SwitchOps::Groups(vec![
+                MergeGroupSpec::Category("elementwise".to_string()),
+                MergeGroupSpec::Ops(vec!["add".to_string(), "subtract".to_string()]),
+            ])
+        );
+        let err = switch_ops_from_json(&json!("elementwise")).unwrap_err();
+        assert_eq!(err.kind_str(), "TransformError");
+        let err = switch_ops_from_json(&json!([[3]])).unwrap_err();
+        assert!(err.message.contains("config.switch_ops[0][0]"));
+    }
+
+    #[test]
+    fn batch_bands_and_alignment_round_trip() {
+        assert_eq!(bands_from_json(&Json::Null).unwrap(), Bands::Flat);
+        assert_eq!(bands_from_json(&json!(1)).unwrap(), Bands::Explicit(1));
+        assert_eq!(bands_from_json(&json!(4)).unwrap(), Bands::Explicit(4));
+        assert_eq!(bands_from_json(&json!("auto")).unwrap(), Bands::Auto);
+        let err = bands_from_json(&json!(0)).unwrap_err();
+        assert_eq!(err.kind_str(), "TransformError");
+        assert!(err.message.contains("out of range"));
+        let err = bands_from_json(&json!("nope")).unwrap_err();
+        assert!(err.message.contains("unknown bands value"));
+        let err = bands_from_json(&json!(true)).unwrap_err();
+        assert!(err.message.contains("booleans are not accepted"));
+
+        assert_eq!(alignment_from_json(&Json::Null).unwrap(), Alignment::Variant);
+        for spelling in ["variant", "occurrence", "auto", " Variant ", "AUTO"] {
+            assert!(alignment_from_json(&json!(spelling)).is_ok(), "{spelling}");
+        }
+        let err = alignment_from_json(&json!("nope")).unwrap_err();
+        assert_eq!(err.kind_str(), "TransformError");
+        let err = alignment_from_json(&json!(2)).unwrap_err();
+        assert!(err.message.contains("config.alignment"));
+    }
+
+    #[test]
+    fn batch_config_expands_and_rejects_unknown_keys() {
+        let mut map = Map::new();
+        map.insert("axes".to_string(), json!([0, null]));
+        map.insert("out_axes".to_string(), json!(null));
+        map.insert("switch_ops".to_string(), json!(true));
+        map.insert("bands".to_string(), json!("auto"));
+        map.insert("alignment".to_string(), json!("occurrence"));
+        let config = parse_batch_config(&map, 2, 1).unwrap();
+        assert_eq!(config.axes, vec![Some(0), None]);
+        assert_eq!(config.out_axes, vec![None]);
+        assert_eq!(config.switch_ops, SwitchOps::Default);
+        assert_eq!(config.bands, Bands::Auto);
+        assert_eq!(config.alignment, Alignment::Occurrence);
+
+        let mut bad = Map::new();
+        bad.insert("junk".to_string(), json!(1));
+        let err = parse_batch_config(&bad, 1, 1).unwrap_err();
+        assert_eq!(err.kind_str(), "TransformError");
+        assert!(err.message.contains("unknown config key"));
+        assert!(err.message.contains("extension_rule"));
     }
 }
