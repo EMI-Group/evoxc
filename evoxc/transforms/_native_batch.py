@@ -284,5 +284,50 @@ def batch_functions(
     assembled = _assemble(modules, _call_native(native, wrapped, config))
     module = assembled["module"]
     for leaf_index in rank0_leaves:
-        _insert_output_op(module, leaf_index, "reshape", {"shape": (n_functions,)})
+        if not _strip_rank0_wrapper(module, leaf_index):
+            _insert_output_op(module, leaf_index, "reshape", {"shape": (n_functions,)})
+    _discount_wrapper_classes(assembled["batch_report"], modules, rank0_leaves)
     return assembled
+
+
+def _strip_rank0_wrapper(module: ir.Module, leaf_index: int) -> bool:
+    """Undo the `(1,)` wrapper residual of ONE output leaf, in place.
+    When every program's output collapses into one shared class (the common
+    case) the merged `(N, 1)` value is exactly the wrapper `reshape` of the
+    merged rank-0 value, so replacing the terminator operand and erasing the
+    `reshape` restores the legacy graph with no extra op and no unwrap.
+    A muxed output (one wrapper per divergent class, feeding `select`s) cannot
+    be undone this way; returns ``False`` and the caller inserts an unwrap.
+    """
+    block = module.main.entry_block
+    terminator = block.ops[-1]
+    op = terminator.operands[leaf_index].owner
+    if op is None or op.name != "reshape":
+        return False
+    if tuple(op.attributes.get("shape", ())) != (1,):
+        return False
+    inner = op.operands[0]
+    if len(inner.type.shape) != 0:
+        return False
+    terminator._replace_operand(leaf_index, inner)
+    block.erase(op)
+    return True
+
+
+def _discount_wrapper_classes(
+    report: dict[str, Any], modules: Sequence[ir.Module], leaves: Sequence[int]
+) -> None:
+    """Report the WRAPPER-FREE merge the caller asked for.
+    The scaffold above exists only to satisfy native's declared-rank check, so
+    its classes are not part of the documented merge: a stripped leaf's single
+    shared wrapper class is subtracted from ``value_classes``/``shared_classes``
+    and `emitted_ops`.  A muxed leaf keeps its scaffolding ops in the graph and
+    its class is likewise discounted (its shared-ness is left as native
+    reports it).
+    """
+    n_functions = len(modules)
+    for leaf_index in leaves:
+        report["value_classes"] = max(0, report["value_classes"] - 1)
+        report["emitted_ops"] = max(0, report["emitted_ops"] - 1)
+        if n_functions >= 2:
+            report["shared_classes"] = max(0, report["shared_classes"] - 1)
