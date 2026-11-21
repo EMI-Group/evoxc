@@ -283,16 +283,26 @@ impl RowKey for f64 {
 // nearly every comparison.
 //
 // Measured in the engine (`NativeProgram.run` of a one-op graph, ns per segment,
-// min/median of 30 iterations, one shape per process, min over three runs):
+// min of 30 iterations after 10 warmups, one shape per process, loadavg ~1.3;
+// the 12- and 16-key rows were already on the network when the baseline ran, so
+// they are the unchanged control):
 //
-// | (rows, extent) | `sort_unstable` | network | argsort `sort_unstable` | argsort network |
-// | (131072, 8)    | 74.1 / 75.4     | 29.2 / 29.6 | 141.4 / 143.0 | 76.8 / 79.6 |
-// | (65536, 16)    | 158.5           | 48.5 / 51.3 | 177.7 / 180.0 | 138.3 / 144.0 |
+// | (rows, extent)  | sort  `sort_unstable` | sort  network | argsort `sort_unstable` | argsort network |
+// | (262144, 2)     | 14.2  |  8.5 | 27.9 | 22.6 |
+// | (262144, 4)     | 32.7  | 14.3 | 64.8 | 46.1 |
+// | (131072, 6)     | 59.7  | 20.9 | 99.6 | 65.1 |
+// | (131072, 8)     | 74.1  | 25.3 | 141.4 | 92.8 |
+// | (131072, 10)    | 94.0  | 45.4 | 179.9 | 128.4 |
+// | (131072, 11)    | 105.0 | 47.0 | 189.8 | 130.6 |
+// | (131072, 12)    |  --   | 48.8 |  --  | 140.2 |
+// | (65536, 16)     | 158.5 | 48.2 | 177.7 | 175.5 |
 //
-// i.e. 2.5x at extent 8 and 3.3x at 16 (`sort(65536, 16)`: 10.39 ms = 158
-// ns/segment before the network, 3.20 ms = 48.8 ns after).  A standalone
-// keys-only harness reports a much smaller gap because its own per-row overhead
-// dilutes it — the engine measurement is what the coverage decision follows.
+// So `sort` gains 1.7x at 2 keys, 2.3x at 4, 2.9x at 6 and 8, 2.2x at 11 and
+// 3.3x at 16 (`sort(65536, 16)`: 10.39 ms = 158 ns/segment before the network,
+// 3.20 ms = 48.2 ns after); `argsort` gains 1.2-1.5x until its i64 result buffer
+// dominates at 16 keys.  A standalone keys-only harness reports a much smaller
+// gap because its own per-row overhead dilutes it — the engine measurement is
+// what the coverage decision follows.
 //
 // Two limits decide the coverage:
 //
