@@ -37,10 +37,11 @@ by the 2025-08 cleanup refactor):
   `output_tree` (`core.TreeSpec`), `static_values` /
   `output_static_values` (tuples of `StaticValue` records: index, path,
   value, kind), `source_locations` (dict: input value ids →
-  `ir.Location`). Methods: `print()`, `verify()`, `save(path)` /
+  `ir.Location`). Methods: `print()`, `text()`, `verify()`, `save(path)` /
   `load(path)` (classmethod; lazy-import `evoxc.persist`),
   `flatten_inputs(args) -> list[core.Tensor]`, `validate_inputs(args)`
-  (alias), `unflatten_outputs(flat) -> structured`, `signature_info()`.
+  (alias), `unflatten_outputs(flat) -> structured`, `signature_info()`,
+  `summary()`, `digest()` (see "Inspection" below).
   Constructor accepts a prebuilt module + trees (transforms build Graphs
   directly).
 - `current_builder() -> ir.Builder` — innermost active builder; raises
@@ -51,6 +52,16 @@ by the 2025-08 cleanup refactor):
 - `while_loop(cond_fn, body_fn, init) -> outputs`
 - `scan(f, init, xs, length=None) -> (carry, stacked_outputs)`
 - `StaticValue` — frozen dataclass record for static leaves.
+
+## Inspection (pure, side-effect-free)
+
+`Graph` and `Defn` expose read-only inspection; none of it traces, compiles, mutates the IR, or touches a cache.
+
+- `repr(graph)` — one line: total op count across every nesting level (nested `if`/`while` bodies, hence `cond`/`while_loop`/`scan`, included), function count, tensor-input count, static-value count, tensor-output leaf count, plus a `batch report` marker when `batch_functions` attached `graph.batch_report`. Keeps the pinned substrings `<n> tensor inputs` / `<n> static values`.
+- `graph.summary() -> dict` — a JSON-safe structural summary with exact keys: `functions` (list of names), `op_count` (all nesting levels), `op_counts_by_category` (sorted dict; `ir.has_opdef`-guarded `ir.opdef(op.name).category`, unregistered names bucketed under `"unknown"`), `tensor_inputs` / `tensor_outputs` (lists of `{"path": list, "shape": [str(dim)…], "dtype": str}` in `tensor_specs` / `return`-leaf order, paths from the input/output trees), `static_values` (list of `{"path", "kind", "value_repr"}` with `repr(value)` truncated to 80 chars), `source_location_count`, `has_batch_report`, `digest`.
+- `graph.digest() -> str` — SHA-256 hex over the canonical JSON (`sort_keys=True`, compact separators, length-prefixed) of `ir.serialize_module(self.module)` plus `signature_info()`. Process-stable and identifying graph STRUCTURE + I/O signature only: `source_locations` (out-of-process unstable) and `batch_report` are excluded.
+- `graph.text() -> str` — `ir.pretty_print(self.module)`; the same string `print()` writes to stdout (`print()` itself is unchanged).
+- `repr(defn)` — `<Defn <qualname> (<__module__>)>` (module dropped when absent), metadata-only; keeps the qualname substring.
 
 ## Module layout & routing table
 
