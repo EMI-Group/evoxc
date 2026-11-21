@@ -4,13 +4,23 @@ The default backend, ``numpy_backend`` (a ``NumpyBackend`` instance), is
 registered by ``evoxc.backends.numpy`` at import time. ``evoxc.lower``/``compile``/
 ``load`` default to it (defaulting is pipeline's job, not the registry's).
 
-Optional compiler adapters (IREE / XLA / TVM — see ``adapters/``) are NOT
-imported here or at ``evoxc``/``evoxc.backends`` import time. ``get(name)``
-auto-activates them ON FIRST USE: on a registry miss it imports the adapter
-module named by ``OPTIONAL_ADAPTERS`` and calls its ``register()`` (which
-probes the compiler dependency — a missing dependency raises
-``core.BackendError`` with a pip-install hint, propagated unchanged), then
+Optional adapters are NOT imported here or at ``evoxc``/``evoxc.backends``
+import time. ``get(name)`` auto-activates them ON FIRST USE: on a registry
+miss it imports the adapter module named by ``OPTIONAL_ADAPTERS`` and calls
+its ``register()`` (which probes its dependency — a missing dependency raises
+``core.BackendError`` with an actionable hint, propagated unchanged), then
 retries the lookup.
+
+Optional adapters:
+
+- ``iree`` / ``xla`` / ``tvm`` — the StableHLO-consuming compiler adapters
+  (``adapters/``); iree/tvm probe their pip package at ``register()``, xla's
+  probe is a per-call PJRT plugin.
+- ``native`` — the in-process Rust CPU execution engine (``native/``); its
+  ``register()`` probes the ``evoxc._evoxc_native`` extension for the
+  ``native_compile`` entry point (built from the ``native/`` Cargo workspace
+  by ``scripts/build-native.sh``) and raises ``core.BackendError`` with build
+  instructions when it is absent — never a silent fallback to numpy.
 """
 from __future__ import annotations
 
@@ -25,7 +35,7 @@ __all__ = ["register", "get", "OPTIONAL_ADAPTERS"]
 
 _registry: dict[str, Backend] = {}
 
-#: Optional compiler adapters: backend name -> adapter module path.
+#: Optional adapters: backend name -> adapter module path.
 #: Modules implement a ``register()`` function that checks the compiler
 #: dependency and calls ``registry.register(instance)`` (idempotent). They
 #: are imported ONLY inside ``get()`` — never at package import time.
@@ -33,6 +43,7 @@ OPTIONAL_ADAPTERS: dict[str, str] = {
     "iree": "evoxc.backends.adapters.iree",
     "xla": "evoxc.backends.adapters.xla",
     "tvm": "evoxc.backends.adapters.tvm",
+    "native": "evoxc.backends.native",
 }
 
 
