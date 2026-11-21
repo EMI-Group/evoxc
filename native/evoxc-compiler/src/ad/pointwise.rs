@@ -26,7 +26,7 @@ fn constant(ctx: &mut RuleCtx<'_>, dtype: DType, value: f64) -> Result<ValueId> 
 /// `_gelu_coeff`: `0.5·(1 + erf(x/√2)) + (x/√(2π))·exp(−x²/2)`.
 fn gelu_coeff(ctx: &mut RuleCtx<'_>, a: ValueId) -> Result<ValueId> {
     let dtype = ctx.dtype(a)?;
-    let inv_sqrt2 = constant(ctx, dtype, 0.707_106_781_186_547_6)?;
+    let inv_sqrt2 = constant(ctx, dtype, std::f64::consts::FRAC_1_SQRT_2)?;
     let u = ctx.binary("multiply", a, inv_sqrt2)?;
     let erf_u = ctx.unary("erf", u)?;
     let one = constant(ctx, dtype, 1.0)?;
@@ -96,7 +96,7 @@ fn unary_coefficient(
         }
         "gelu" => gelu_coeff(ctx, a),
         "erf" => {
-            let coefficient = constant(ctx, dtype, 1.128_379_167_095_512_6)?;
+            let coefficient = constant(ctx, dtype, std::f64::consts::FRAC_2_SQRT_PI)?;
             let squared = ctx.unary("square", a)?;
             let negated = ctx.unary("negate", squared)?;
             let exponential = ctx.unary("exp", negated)?;

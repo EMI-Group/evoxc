@@ -454,7 +454,7 @@ mod tests {
                         AttrValue::Any(json!([{"dtype": "float32", "shape": [{"int": 3}, {"int": 2}]}])),
                     ),
                 ]),
-                Some(&[result_ty.clone()]),
+                Some(std::slice::from_ref(&result_ty)),
                 None,
             )
             .unwrap()[0];

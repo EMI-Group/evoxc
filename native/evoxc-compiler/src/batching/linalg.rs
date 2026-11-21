@@ -525,7 +525,9 @@ mod tests {
         for (name, k) in [("tril", 1i64), ("triu", -1)] {
             let mut builder = Builder::new("main");
             let value = batched(&[Dim::named("batch"), Dim::Int(3), Dim::Int(3)]);
-            builder.open_function("main", &[value.clone()]).unwrap();
+            builder
+                .open_function("main", std::slice::from_ref(&value))
+                .unwrap();
             let args = builder.block_arguments().unwrap();
             let source = rule_op(
                 name,
@@ -560,7 +562,9 @@ mod tests {
     fn cumsum_batching_shifts_the_scan_axis() {
         let mut builder = Builder::new("main");
         let value = batched(&[Dim::named("batch"), Dim::Int(4)]);
-        builder.open_function("main", &[value.clone()]).unwrap();
+        builder
+            .open_function("main", std::slice::from_ref(&value))
+            .unwrap();
         let args = builder.block_arguments().unwrap();
         let source = rule_op(
             "cumsum",

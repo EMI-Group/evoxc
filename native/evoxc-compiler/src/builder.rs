@@ -530,7 +530,7 @@ mod tests {
         // sub: (x: f32[2,3]) -> return add(x, constant(1))
         let a = f32_matrix(2, 3);
         let mut sub = Builder::new("rule");
-        sub.open_function("rule", &[a.clone()]).unwrap();
+        sub.open_function("rule", std::slice::from_ref(&a)).unwrap();
         let sub_args = sub.block_arguments().unwrap();
         let one = sub
             .constant(scalar_payload(DType::parse("float32").unwrap(), 1.0).unwrap())
@@ -575,7 +575,7 @@ mod tests {
     fn inline_rejects_wrong_arity_and_unknown_entry() {
         let a = f32_matrix(2, 3);
         let mut sub = Builder::new("rule");
-        sub.open_function("rule", &[a.clone()]).unwrap();
+        sub.open_function("rule", std::slice::from_ref(&a)).unwrap();
         let args = sub.block_arguments().unwrap();
         sub.set_terminator(&args, None).unwrap();
         let sub_program = sub.finish();

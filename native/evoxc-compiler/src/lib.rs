@@ -452,17 +452,19 @@ mod tests {
     #[test]
     fn builtin_registry_is_populated() {
         let registry = builtin_registry();
-        assert!(registry.batching.len() > 0);
-        assert!(registry.jvp.len() > 0);
-        assert!(registry.vjp.len() > 0);
+        assert!(!registry.batching.is_empty());
+        assert!(!registry.jvp.is_empty());
+        assert!(!registry.vjp.is_empty());
     }
 
     #[test]
     fn empty_program_is_rejected_by_every_kind() {
         let program = Program::new("main");
-        let mut config = TransformConfig::default();
-        config.tangent_inputs = Some(Vec::new());
-        config.cotangent_inputs = Some(Vec::new());
+        let config = TransformConfig {
+            tangent_inputs: Some(Vec::new()),
+            cotangent_inputs: Some(Vec::new()),
+            ..Default::default()
+        };
         for kind in [TransformKind::Vectorize, TransformKind::Vmap, TransformKind::Grad] {
             let err = transform(kind, &program, &config, None).unwrap_err();
             assert_eq!(err.kind_str(), "TransformError", "{}", kind.as_str());
