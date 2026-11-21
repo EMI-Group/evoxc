@@ -15,7 +15,7 @@ values:
 Request keys (`native/CONTEXT.md` "Extension-rule bridge"): ``kind``
 (``"batching"`` | ``"jvp"`` | ``"vjp"``), ``op_name``, ``rule_key``,
 ``attributes``, ``operand_types``, ``result_types``, ``axes``, ``tangents``,
-``cotangent_type``.
+``tangent_values`` (jvp), ``cotangent_type``, ``cotangent_values`` (vjp).
 
 Eligible `rule_key`s only (`block:*`, `external:*`, `sparse_*`, ...): the
 registry lookup mirrors `batching._resolve_batching_rule` — the key the engine
@@ -28,25 +28,30 @@ supplies), and the proxy op carries the original name/attributes plus
 detached result values of the request's result types (rules read
 `op.results[0].type`, `op.name`, `op.attributes`).
 
-AD kinds: the request carries only tangent FLAGS / a cotangent TYPE — the
-actual tangent/cotangent SSA values are not passed and cannot be bound into
-the inlined subgraph — so this bridge returns ``None`` for them (the engine
-then raises its explicit non-differentiable error). It is forward-compatible:
-if a request ever carries ``tangent_values`` / ``cotangent_values`` (lists of
-value ids aligned with the operands / results), those are bound as trailing
-block arguments and the rule is invoked faithfully.
+AD kinds are served the same way. Native passes the dual SSA values
+themselves — ``tangent_values`` (one entry per operand, operand order) for
+``jvp`` and ``cotangent_values`` (one entry per result, result order) for
+``vjp`` — so the scratch function's block arguments are, in order: the op's
+operands (n), its result proxies (r), then the NON-ZERO duals in list order.
+A dual argument's type is its operand's (jvp) / result's (vjp) type; a zero
+slot contributes no argument and is bound as `autodiff.ZeroTangent`.
+The response's ``output_ids`` must have exactly ``n`` entries for jvp /
+``r`` entries for vjp — native maps every one to a real value — so a zero
+tangent/cotangent is MATERIALIZED as a zeros value of the corresponding
+operand/result type.
 """
 
 from __future__ import annotations
 
 import base64
+import threading
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from evoxc import _native_codec, core, ir
 from evoxc.trace import with_builder
-from evoxc.transforms import batching
+from evoxc.transforms import autodiff, batching
 from evoxc.transforms._metadata import UNMAPPED, MappedAxes
 
 #: Attribute schema tags (see `evoxc/ir/op_defs/__init__.py`).
@@ -56,15 +61,38 @@ _ATTR_NDARRAY = "ndarray"
 _ATTR_SHAPE = "shape"
 _TUPLE_TAG = "__evoxc_tuple__"
 
+#: The exception a Python rule raised during the current native transform call.
+#: The engine re-types every bridge failure as a `TransformError` (its message
+#: text is preserved but a rule's own error class is not), so `call_native`
+#: restores this original afterwards — a portable-decomposition failure keeps
+#: raising `BlockError`, exactly as it did when the rule ran in Python.
+_RULE_FAILURE = threading.local()
+
+
+def reset_rule_failure() -> None:
+    """Forget the previous call's rule failure (called before a native call)."""
+    _RULE_FAILURE.error = None
+
+
+def take_rule_failure() -> Optional[BaseException]:
+    """Return (and clear) the exception the last native call's rules raised."""
+    error = getattr(_RULE_FAILURE, "error", None)
+    _RULE_FAILURE.error = None
+    return error
+
 
 def extension_rule(request: Mapping[str, Any]):
     """The callback the native engine invokes; see the module docstring."""
-    kind = (request or {}).get("kind")
-    if kind == "batching":
-        return _batching_response(request)
-    if kind in ("jvp", "vjp"):
-        return _derivative_response(request, kind)
-    return None
+    try:
+        kind = (request or {}).get("kind")
+        if kind == "batching":
+            return _batching_response(request)
+        if kind in ("jvp", "vjp"):
+            return _derivative_response(request, kind)
+        return None
+    except BaseException as exc:  # re-raised: recorded for `take_rule_failure`
+        _RULE_FAILURE.error = exc
+        raise
 
 
 # --- batching ---------------------------------------------------------------
@@ -97,19 +125,117 @@ def _batching_response(request: Mapping[str, Any]):
     return response
 
 
-# --- derivative rules (forward-compatible) ---------------------------------
+# --- derivative rules -------------------------------------------------------
 
 
 def _derivative_response(request: Mapping[str, Any], kind: str):
-    # Known native protocol gap (see the module docstring): the request does
-    # not carry the tangent/cotangent SSA values, so an inlined subgraph
-    # cannot bind them. Returning None makes the engine raise its explicit
-    # AD fallback instead (`_native_ad._needs_python_ad`).
-    # Serving them here needs the native change recorded in CONTEXT.md
-    # ("Native delegation"): `tangent_values` / `cotangent_values` fields on
-    # `ExtensionRequest`, appended to `extension_arguments` after the
-    # operands and results.
-    return None
+    """Serve a Python JVP/VJP rule to the native AD engine.
+
+    ``jvp`` uses the registered JVP rule when there is one and otherwise
+    derives the JVP from the registered VJP rule (the adjoint trick in
+    `autodiff._jvp_from_vjp`); ``vjp`` requires a registered VJP rule. No rule
+    at all returns ``None`` so the engine raises its explicit
+    `TransformError`.
+    """
+    rule_key = request.get("rule_key") or ""
+    if kind == "jvp":
+        rule = autodiff.jvp_rules.get(rule_key)
+        if rule is None and rule_key not in autodiff.vjp_rules:
+            return None
+    else:
+        rule = autodiff.vjp_rules.get(rule_key)
+        if rule is None:
+            return None
+
+    op_name = request["op_name"]
+    operand_types = _types(request.get("operand_types"))
+    result_types = _types(request.get("result_types"))
+    # The duals are aligned with the operands (jvp) / results (vjp); a dual
+    # block argument carries the type of its primal and zero slots contribute
+    # no argument (native's `extension_arguments` order).
+    primal_types = operand_types if kind == "jvp" else result_types
+    dual_key = "tangent_values" if kind == "jvp" else "cotangent_values"
+    dual_ids = request.get(dual_key)
+    if dual_ids is None:
+        dual_ids = (None,) * len(primal_types)
+    dual_ids = tuple(dual_ids)
+    if len(dual_ids) != len(primal_types):
+        raise core.TransformError(
+            f"{kind} rule for op '{rule_key}': the native request carries "
+            f"{len(dual_ids)} dual value(s) for {len(primal_types)} "
+            f"{'operand' if kind == 'jvp' else 'result'}(s)"
+        )
+    dual_types = tuple(
+        primal_types[index]
+        for index, value in enumerate(dual_ids)
+        if value is not None
+    )
+
+    builder, block, proxy, dual_args = _derivative_scratch(
+        op_name, request, operand_types, result_types, dual_types
+    )
+    duals = _bind_duals(dual_ids, dual_args)
+    with with_builder(builder):
+        if kind == "jvp":
+            if rule is not None:
+                outputs = rule(proxy, duals)
+            else:
+                outputs = autodiff._jvp_from_vjp(proxy, duals, builder)
+        else:
+            outputs = rule(proxy, duals, proxy.operands)
+
+    primals = proxy.results if kind == "jvp" else proxy.operands
+    outputs = _validate_derivative_output(rule_key, kind, outputs, len(primals))
+    # Native maps every output id to a real dual value, so a zero
+    # tangent/cotangent must be materialized inside this subgraph.
+    with with_builder(builder):
+        values = tuple(
+            autodiff._materialize(entry, primal)
+            for entry, primal in zip(outputs, primals)
+        )
+    builder.set_terminator(block, "return", operands=values)
+    return {
+        "module": _native_codec.encode_module(builder.module),
+        "entry": builder.module.main.name,
+        "output_ids": [value.id for value in values],
+    }
+
+
+def _bind_duals(dual_ids: Sequence[Any], dual_args: Sequence["ir.Value"]) -> Tuple[Any, ...]:
+    """One entry per operand (jvp) / result (vjp): the dual value or `ZeroTangent`."""
+    duals = []
+    position = 0
+    for entry in dual_ids:
+        if entry is None:
+            duals.append(autodiff.ZeroTangent())
+        else:
+            duals.append(dual_args[position])
+            position += 1
+    return tuple(duals)
+
+
+def _validate_derivative_output(rule_key: str, kind: str, outputs, expected: int):
+    """Validate a rule's return with the sweep's (pinned) `TransformError` wording."""
+    noun, other = ("tangents", "result") if kind == "jvp" else ("cotangents", "operand")
+    if not isinstance(outputs, (tuple, list)):
+        raise core.TransformError(
+            f"{kind} rule for op '{rule_key}' did not return a tuple of "
+            f"{noun}, got {type(outputs).__name__}"
+        )
+    if len(outputs) != expected:
+        raise core.TransformError(
+            f"{kind} rule for op '{rule_key}' returned {len(outputs)} "
+            f"{noun}, expected {expected} (one per {other})"
+        )
+    entry_name = "tangent" if kind == "jvp" else "cotangent"
+    for entry in outputs:
+        if entry is not None and not isinstance(entry, (ir.Value, autodiff.ZeroTangent)):
+            raise core.TransformError(
+                f"{kind} rule for op '{rule_key}' returned an invalid "
+                f"{entry_name} entry {entry!r}: entries must be "
+                f"ir.Value | None | ZeroTangent"
+            )
+    return tuple(outputs)
 
 
 # --- scratch module / proxy op ---------------------------------------------
@@ -159,6 +285,35 @@ def _scratch(op_name, request, operand_types, result_types):
         results=results,
     )
     return builder, block, proxy
+
+
+def _derivative_scratch(op_name, request, operand_types, result_types, dual_types):
+    """A scratch module for one AD rule: operands, result proxies, then duals.
+
+    Block-argument order is exactly native's `extension_arguments`: the op's
+    rewritten operands (n), its result proxies (r), then the non-zero duals in
+    list order. The proxy op exposes the operands as `.operands` and the result
+    proxies as `.results` (rules read `.type` off both).
+    """
+    builder = ir.Builder()
+    builder.build_module(name=f"{op_name}__evoxc_rule")
+    function = builder.build_function(
+        name=f"{op_name}__evoxc_rule",
+        input_types=tuple(operand_types) + tuple(result_types) + tuple(dual_types),
+    )
+    block = function.entry_block
+    attributes = _decode_attributes(op_name, request.get("attributes") or {})
+    operand_count = len(operand_types)
+    result_count = len(result_types)
+    proxy = ir.Op(
+        name=op_name,
+        id=-1,
+        operands=tuple(block.arguments[:operand_count]),
+        attributes=attributes,
+        results=tuple(block.arguments[operand_count:operand_count + result_count]),
+    )
+    dual_args = tuple(block.arguments[operand_count + result_count:])
+    return builder, block, proxy, dual_args
 
 
 def _detached_value(value_type: "ir.ValueType", index: int) -> "ir.Value":

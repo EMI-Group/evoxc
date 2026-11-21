@@ -3,10 +3,9 @@
 The NATIVE (Rust) AD engine is the default authority for `grad`/`jvp`/`vjp`
 and for every builtin derivative rule. The op-name → rule-category tables below
 are kept as the design record of how each builtin op differentiates AND as the
-rule source for the documented Python fallback
-(`autodiff.forward_sweep` / `reverse_sweep`), which runs only for graphs whose
-derivative rules live in Python (`block:*`, `external:*`, `sparse_*`). They
-also back the public registration API the extension rule owners use
+rule source the retained Python sweeps (`autodiff.forward_sweep` /
+`reverse_sweep`, no longer on any production path) would use. They back the
+public registration API the extension rule owners use
 (`evoxc/block`, `evoxc/external_rules`, `evoxc/sparse`): `jvp_rules` /
 `vjp_rules`, `register_jvp_rule`, `register_vjp_rule`, `require_jvp_rule`,
 `require_vjp_rule`, `ZeroTangent`.

@@ -1,7 +1,10 @@
 """Shared automatic-differentiation machinery.
 
 Holds the JVP/VJP rule registries, the `ZeroTangent` sentinel, and the
-forward/backward graph sweeps that `jvp`, `vjp`, and `grad` build upon.
+RETAINED Python forward/backward graph sweeps (`forward_sweep` /
+`reverse_sweep`) — no longer on any production path: `jvp`/`vjp`/`grad` run on
+the native engine, which reaches these registries through the extension-rule
+bridge in `_native_rules.py`.
 All AD transforms are graph→graph: the result graphs contain only ordinary
 `evoxc.ops` ops (backends need no autodiff runtime support). Rule signatures are
 binding — see `./CONTEXT.md` "Rule-call signatures" and "AD semantics".

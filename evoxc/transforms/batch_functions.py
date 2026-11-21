@@ -11,7 +11,19 @@ a mapped (`axes` entry ``0``) input supplies row i of its leading axis, an
 unmapped (``None``) input is shared by every function, static leaves are shared
 (validated), and output row i is function i's output.
 
-Emission strategy (never a silent Python-loop fallback):
+The merge is the **native engine's** (`evoxc._evoxc_native.batch_functions`,
+reached through `_native_batch`); Python keeps ONLY the frontend work:
+
+* `fns` / `axes` / `out_axes` / `switch_ops` / `bands` / `alignment` validation
+  (all of it BEFORE any tracing or native call, with the pinned error wording);
+* the callable path (`TransformCallable`, strip → trace each function once);
+* the cross-function contract and the program-shape / output-pytree checks,
+  whose messages carry the pytree paths only Python knows;
+* `Graph` reconstruction from the decoded merged module (input specs, trees,
+  static values, input source locations) and `graph.batch_report` rehydration.
+
+The merge strategy itself lives in ``native/evoxc-compiler/src/batch_functions``
+(never a silent Python-loop fallback):
 
 * positions where all functions run the SAME op become ONE batched op (exactly
   `vectorize` speed — with identical programs the result contains no `select`
@@ -33,8 +45,8 @@ variant of the band instead of one per variant of the whole population, while
 work shared only across bands is recomputed per band and each band pays its
 input slicing.
 `bands=None` (the default) is the single-band flat merge and stays
-BYTE-IDENTICAL to the pre-`bands` output; see `_bands` for the partition rules
-and the static cost model behind `bands="auto"`.
+BYTE-IDENTICAL to the pre-`bands` output; the partition rules and the static
+cost model behind `bands="auto"` are the native engine's.
 
 `alignment=` chooses how a `switch_ops` position's class is picked — the only
 positions where two programs can place DIFFERENT ops at one skeleton.
@@ -45,36 +57,30 @@ over the occurrence-position class (sibling branches like `(x+1) * (x-1)` vs
 occurrence class, i.e. the byte-identical legacy output; `"auto"` is
 variant-first with the occurrence fallback plus a last-resort reuse of any other
 free class so it never creates more classes than `"occurrence"`.
-It is a PURE PERFORMANCE heuristic — see `_merge._align_class` — so every mode
-produces bit-identical numbers; constants are never aligned (they stack by
-occurrence, which is what folds N payloads into one stacked constant).
+It is a PURE PERFORMANCE heuristic, so every mode produces bit-identical
+numbers; constants are never aligned (they stack by occurrence, which is what
+folds N payloads into one stacked constant).
 
 The returned `Graph` carries `graph.batch_report` — a `BatchReport` describing
-what the merge did (`BatchReport` / `SwitchRecord` are re-exported here from
-`_emit`, where the report is assembled).
+what the merge did (`BatchReport` / `SwitchRecord` live in `_report` and are
+re-exported here; the native engine reports the numbers and this module
+rehydrates them into the dataclasses). `graph.source_locations` carries the
+contributing INPUT values' locations forward (the merged module's own ops carry
+the contributing ops' locations, stamped by the native engine).
 """
 
 from __future__ import annotations
 
 import collections.abc
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from evoxc import core
 from evoxc import ir
 from evoxc.trace import Graph, trace
 from evoxc.trace._tree import _iter_leaf_paths, _static_equal
 from evoxc.transforms import batching
-from evoxc.transforms import _bands
-from evoxc.transforms._emit import BatchReport, SwitchRecord, emit_merged_graph
-from evoxc.transforms._merge import (
-    DEFAULT_ALIGNMENT,
-    MergeDAG,
-    MergeGroup,
-    _opdef,
-    build_merge_dag,
-    normalize_alignment,
-    parse_switch_groups,
-)
+from evoxc.transforms import _native_batch, _native_rules
+from evoxc.transforms._report import BatchReport, SwitchRecord, report_from_native
 from evoxc.transforms._wrappers import TransformCallable
 from evoxc.transforms.vectorize import (
     _is_int,
@@ -84,6 +90,28 @@ from evoxc.transforms.vectorize import (
 from evoxc.transforms.vmap import _derive_unvectorized_args_and_entries
 
 __all__ = ["batch_functions", "BatchReport", "SwitchRecord"]
+
+#: The three accepted `alignment` spellings, in preference order.
+ALIGNMENT_VARIANT = "variant"
+ALIGNMENT_OCCURRENCE = "occurrence"
+ALIGNMENT_AUTO = "auto"
+ALIGNMENTS: Tuple[str, ...] = (
+    ALIGNMENT_VARIANT,
+    ALIGNMENT_OCCURRENCE,
+    ALIGNMENT_AUTO,
+)
+
+#: The default `alignment` policy (the `"variant"` heuristic — a pure
+#: performance choice; every mode is row-correct).
+DEFAULT_ALIGNMENT = ALIGNMENT_VARIANT
+
+#: The merge groups `switch_ops=True` opts into (IR category names).
+DEFAULT_SWITCH_CATEGORIES: Tuple[str, ...] = ("elementwise", "comparison")
+
+BAND_STRATEGY_FLAT = "flat"
+BAND_STRATEGY_EXPLICIT = "explicit"
+BAND_STRATEGY_AUTO = "auto"
+AUTO = "auto"
 
 _BATCH_FUNCTIONS_CALLABLE_DOC = """\
 `batch_functions(fns)` applied to a sequence of callables/`Defn`s returns a
@@ -151,11 +179,11 @@ def batch_functions(
             static cost model choose among the flat partition, the structural
             fingerprint partition (programs that would share every class) and
             the fingerprint partition with all singletons coalesced into one
-            trailing misc band (see `_bands`). Banding trades dispatches for
-            wasted work: a divergent position emits one op per DISTINCT variant
-            of its band instead of one per variant of the whole population, at
-            the cost of re-computing cross-band sharing plus one input slice
-            and (collectively) one output concatenation per band. `K=1` and an
+            trailing misc band. Banding trades dispatches for wasted work: a
+            divergent position emits one op per DISTINCT variant of its band
+            instead of one per variant of the whole population, at the cost of
+            re-computing cross-band sharing plus one input slice and
+            (collectively) one output concatenation per band. `K=1` and an
             auto-resolved single band emit the flat graph. Validated here, so a
             bad value raises before any tracing (callable path included).
             v1 restriction: `bands` other than `None` requires `out_axes=0` for
@@ -218,9 +246,9 @@ def batch_functions(
     # `bands` and `alignment` are validated BEFORE any tracing (the callable
     # path included), so a bad band count or alignment spelling can never leave
     # half-traced programs behind.
-    _bands.normalize_bands(bands, len(items))
-    alignment = normalize_alignment(alignment)
-    groups = parse_switch_groups(switch_ops)
+    _normalize_bands(bands, len(items))
+    alignment = _normalize_alignment(alignment)
+    switch_spec = _normalize_switch_ops(switch_ops)
     if kind == "graph":
         try:
             normalized = _normalize_axes(items[0], axes)
@@ -231,11 +259,11 @@ def batch_functions(
         entries = batching._tensor_input_axes(items[0], normalized)
         out_entries = _normalize_out_axes(items[0], out_axes)
         return _merge_graphs(
-            items, entries, out_entries, groups, bands, alignment
+            items, entries, out_entries, switch_spec, bands, alignment
         )
     return TransformCallable(
         build=lambda *args: _batch_callables(
-            items, args, axes, out_axes, groups, bands, alignment
+            items, args, axes, out_axes, switch_spec, bands, alignment
         ),
         kind="batch_functions",
         doc=_BATCH_FUNCTIONS_CALLABLE_DOC,
@@ -246,7 +274,7 @@ def batch_functions(
 
 
 def _batch_callables(
-    fns, args, axes, out_axes, groups, bands=None, alignment=DEFAULT_ALIGNMENT
+    fns, args, axes, out_axes, switch_spec, bands=None, alignment=DEFAULT_ALIGNMENT
 ) -> Graph:
     """`TransformCallable` body: strip → trace every fn once → merge.
 
@@ -261,7 +289,9 @@ def _batch_callables(
     )
     graphs = [trace(fn, *stripped) for fn in fns]
     out_entries = _normalize_out_axes(graphs[0], out_axes)
-    return _merge_graphs(graphs, entries, out_entries, groups, bands, alignment)
+    return _merge_graphs(
+        graphs, entries, out_entries, switch_spec, bands, alignment
+    )
 
 
 # --- fns validation ---------------------------------------------------------
@@ -309,7 +339,214 @@ def _validate_fns(fns) -> Tuple[List[Any], str]:
     return items, "callable"
 
 
+# --- `bands` / `alignment` / `switch_ops` validation (before any tracing) ----
+
+
+def _normalize_bands(bands: Any, n: int) -> Tuple[str, Optional[int]]:
+    """Normalize `bands` into ``(strategy, K)``.
+
+    Args:
+        bands: `None` (flat), an `int` ``K`` with ``1 <= K <= n`` (K contiguous
+            bands), or the string ``"auto"``.
+        n: The population size (``len(fns)``).
+
+    Returns:
+        ``("flat", None)``, ``("explicit", K)`` or ``("auto", None)``.
+
+    Raises:
+        TypeError: `bands` is a `bool` (a `bool` is an `int` subclass — never a
+            band count), or neither `None`/`int`/`str`.
+        core.TransformError: an unknown string, or a K outside ``1..n``.
+    """
+    if bands is None:
+        return BAND_STRATEGY_FLAT, None
+    if isinstance(bands, bool):
+        raise TypeError(
+            "batch_functions: bands must be None, an int K with 1 <= K <= N, "
+            f"or {AUTO!r} — booleans are not accepted (got {bands!r}); pass an "
+            "int band count or "
+            f"{AUTO!r}"
+        )
+    if isinstance(bands, int):
+        if bands < 1 or bands > n:
+            raise core.TransformError(
+                f"batch_functions: bands={bands} is out of range for {n} "
+                "function(s) — the band count K must satisfy 1 <= K <= N; use "
+                "bands=None for the flat merge"
+            )
+        return BAND_STRATEGY_EXPLICIT, bands
+    if isinstance(bands, str):
+        if bands == AUTO:
+            return BAND_STRATEGY_AUTO, None
+        raise core.TransformError(
+            f"batch_functions: unknown bands value {bands!r}; accepted values "
+            f"are None (flat merge), an int K with 1 <= K <= N, or {AUTO!r}"
+        )
+    raise TypeError(
+        "batch_functions: bands must be None, an int K with 1 <= K <= N, or "
+        f"{AUTO!r}, got {type(bands).__name__}"
+    )
+
+
+def _check_banded_out_entries(out_entries: Sequence[Optional[int]]) -> None:
+    """Reject ``out_axes=None`` on a banded merge (a v1 restriction).
+
+    A band produces a per-band value for every tensor output; those per-band
+    values are concatenated along the function axis, so every output leaf must
+    carry the function axis.
+
+    Raises:
+        core.TransformError: any tensor output leaf has an `out_axes` entry of
+            `None`.
+    """
+    for leaf_index, entry in enumerate(out_entries):
+        if entry is None:
+            raise core.TransformError(
+                "batch_functions: out_axes=None is not supported with bands= "
+                "(a per-band value cannot be a single unmapped output) — v1 "
+                "restriction of the banded merge; use out_axes=0 for every "
+                f"tensor output, or bands=None (offending output leaf: "
+                f"{leaf_index})"
+            )
+
+
+def _normalize_alignment(alignment: Any) -> str:
+    """Normalize `alignment` into one of `ALIGNMENTS` (case-insensitive,
+    whitespace-stripped), rejecting anything else LOUDLY.
+
+    Raises:
+        TypeError: `alignment` is not a string.
+        core.TransformError: `alignment` is not an accepted spelling.
+    """
+    if not isinstance(alignment, str):
+        raise TypeError(
+            "batch_functions: alignment must be a string, one of "
+            f"{list(ALIGNMENTS)}; got {type(alignment).__name__}"
+        )
+    normalized = alignment.strip().lower()
+    if normalized not in ALIGNMENTS:
+        raise core.TransformError(
+            f"batch_functions: unknown alignment {alignment!r}; accepted forms "
+            f"are {list(ALIGNMENTS)}"
+        )
+    return normalized
+
+
+def _op_categories() -> frozenset:
+    """The set of IR op category names (`{o.category for o in all_opdefs()}`)."""
+    return frozenset(definition.category for definition in ir.all_opdefs())
+
+
+def _validate_switch_category(category: str) -> str:
+    """Validate one category merge group against the IR op registry."""
+    if not isinstance(category, str) or not category:
+        raise TypeError(
+            "batch_functions: switch_ops category entries must be non-empty "
+            f"strings, got {category!r}"
+        )
+    valid = _op_categories()
+    if category not in valid:
+        raise core.TransformError(
+            f"batch_functions: unknown switch_ops category {category!r}; "
+            f"valid categories are {sorted(valid)}"
+        )
+    return category
+
+
+def _validate_switch_names(names) -> List[str]:
+    """Validate one explicit op-name merge group against the IR registry."""
+    try:
+        items = list(names)
+    except TypeError as exc:
+        raise TypeError(
+            "batch_functions: a switch_ops entry must be a category name "
+            "(str) or an iterable of op names, got "
+            f"{type(names).__name__}"
+        ) from exc
+    if not items:
+        raise core.TransformError(
+            "batch_functions: empty switch_ops merge group — an explicit "
+            "group must name at least one op"
+        )
+    for name in items:
+        if not isinstance(name, str):
+            raise TypeError(
+                "batch_functions: switch_ops op-name entries must be strings, "
+                f"got {name!r}"
+            )
+        if not ir.has_opdef(name):
+            raise core.TransformError(
+                f"batch_functions: unknown op name {name!r} in a switch_ops "
+                "merge group; names must be canonical IR op names "
+                "(see ir.op_names())"
+            )
+    return items
+
+
+def _normalize_switch_ops(switch_ops) -> Any:
+    """Validate `switch_ops` and return the native config form.
+
+    * ``None`` / ``False`` → `None` (no merge groups, no op switching);
+    * ``True`` → `True` (the default groups, one per
+      `DEFAULT_SWITCH_CATEGORIES` entry — ``elementwise`` and ``comparison``);
+    * any other iterable (a `str`/`bytes` is rejected) → a `list` of merge
+      groups, each a validated category name (`str`) or a validated `list` of
+      IR op names — exactly the shape the native engine's config accepts.
+
+    Raises:
+        TypeError: `switch_ops` is a str/bytes or not iterable, or an element
+            is neither a str nor an iterable of str.
+        core.TransformError: an unknown category, an empty/unknown op-name
+            group.
+    """
+    if switch_ops is None or switch_ops is False:
+        return None
+    if switch_ops is True:
+        return True
+    if isinstance(switch_ops, (str, bytes, bytearray)):
+        raise TypeError(
+            "batch_functions: switch_ops must be None, False, True, or an "
+            "iterable of merge groups (category names / iterables of op "
+            f"names); got {type(switch_ops).__name__}"
+        )
+    try:
+        items = list(switch_ops)
+    except TypeError as exc:
+        raise TypeError(
+            "batch_functions: switch_ops must be None, False, True, or an "
+            "iterable of merge groups (category names / iterables of op "
+            f"names); got {type(switch_ops).__name__}"
+        ) from exc
+    groups: List[Any] = []
+    for item in items:
+        if isinstance(item, str):
+            groups.append(_validate_switch_category(item))
+        elif isinstance(item, (bytes, bytearray)):
+            raise TypeError(
+                "batch_functions: switch_ops entries must be a category name "
+                f"(str) or an iterable of op names, got {type(item).__name__}"
+            )
+        else:
+            groups.append(_validate_switch_names(item))
+    return groups
+
+
 # --- cross-function contract validation -------------------------------------
+
+
+#: Memo of ``op name -> ir.OpDef`` — avoids the per-op lazy `evoxc.ir.op_defs`
+#: import inside ``Op.opdef``/``Op.is_terminator``. Op defs are registered once
+#: at `evoxc.ir` import time and never re-registered, so the mapping is
+#: immutable.
+_OPDEF_CACHE: Dict[str, Any] = {}
+
+
+def _opdef(name: str) -> Any:
+    """The registered `ir.OpDef` for `name`, memoized (raises `KeyError` if absent)."""
+    definition = _OPDEF_CACHE.get(name)
+    if definition is None:
+        definition = _OPDEF_CACHE[name] = ir.opdef(name)
+    return definition
 
 
 def _program_function(graph: Graph, index: int) -> ir.Function:
@@ -466,6 +703,12 @@ def _check_ops(graphs: Sequence[Graph]) -> None:
     works) is a v1 deferral of `batch_functions` — an explicit
     `core.TransformError` naming the op and the function index, never a silent
     Python-loop fallback.
+
+    The native engine runs the same check with the same wording; it stays here
+    because it must fire BEFORE the banded-`out_axes` restriction (the standard
+    merge validation always wins over a band-strategy restriction), and because
+    it names the Python-registered rules the engine only sees through the
+    extension bridge.
     """
     for index, graph in enumerate(graphs):
         block = graph.module.functions[0].entry_block
@@ -580,26 +823,28 @@ def _merge_graphs(
     graphs: Sequence[Graph],
     entries: Sequence[Optional[int]],
     out_entries: Sequence[Optional[int]],
-    groups: Sequence[MergeGroup],
+    switch_spec: Any,
     bands: Any = None,
     alignment: str = DEFAULT_ALIGNMENT,
 ) -> Graph:
-    """Validate the merge and build the merged graph (the two-phase core).
+    """Validate the merge, run the native merge, rebuild the merged `Graph`.
 
     Validation runs FIRST and in the documented order (program shape, the
-    cross-function contract, per-op batchability, output pytree nodes), so a
-    banded merge reports exactly the errors a flat one would.
+    cross-function contract, per-op batchability, output pytree nodes), then the
+    banded-`out_axes` restriction, so every rejection is the Python-side one
+    with its pinned message — before the native engine is asked to do anything.
 
-    Then the partition is resolved: ``bands=None`` is the flat emitter;
-    ``bands=K`` is `_bands.even_partition`; ``bands="auto"`` is
-    `_bands.plan_auto_partition` under the static cost model. A SINGLE-band
-    partition (`K=1`, or an auto resolution that keeps every function together)
-    delegates to the flat emitter too, so its graph is byte-identical to
-    `bands=None` — only the report's band fields differ.
-
-    `alignment` is the canonical `_merge` spelling; it reaches EVERY class DAG
-    this merge builds (the flat one, the per-band ones, and the cost model's
-    per-band DAGs, so `bands="auto"` estimates the graph it actually emits).
+    The engine (`evoxc._evoxc_native.batch_functions`, through
+    `_native_batch.batch_functions`) receives the encoded programs plus the
+    already-normalized config (``axes`` / ``out_axes`` one entry per tensor
+    leaf, the validated ``switch_ops`` spec, ``bands``, the canonical
+    ``alignment`` and the Python extension-rule bridge) and returns the merged
+    module plus its 12-key report. Python then rebuilds the `Graph`: input specs
+    are function 0's (a MAPPED leaf gains a STATIC leading ``int`` function
+    axis, never a symbolic `Dim`; an UNMAPPED leaf reuses its source spec
+    object), output tree / static values are function 0's, input source
+    locations are carried positionally, and `batch_report` is rehydrated into
+    the public dataclasses.
     """
     for index, graph in enumerate(graphs):
         _program_function(graph, index)
@@ -607,38 +852,97 @@ def _merge_graphs(
     _check_ops(graphs)
     _check_output_nodes(graphs)
     n_functions = len(graphs)
-    strategy, band_count = _bands.normalize_bands(bands, n_functions)
-    if strategy == _bands.BAND_STRATEGY_FLAT:
-        dag: MergeDAG = build_merge_dag(graphs, groups, alignment)
-        return emit_merged_graph(graphs, dag, entries, out_entries, groups)
-    # A per-band value cannot be a single unmapped output; checked before the
-    # partition so `bands=1` obeys the same contract as any other band count.
-    _bands.check_banded_out_entries(out_entries)
-    cost_estimate = flat_cost_estimate = None
-    if strategy == _bands.BAND_STRATEGY_AUTO:
-        partition, cost_estimate, flat_cost_estimate = _bands.plan_auto_partition(
-            graphs, entries, groups, alignment
+    strategy, _band_count = _normalize_bands(bands, n_functions)
+    if strategy != BAND_STRATEGY_FLAT:
+        # A per-band value cannot be a single unmapped output; checked after
+        # the standard merge validation and before the partition, so `bands=1`
+        # obeys the same contract as any other band count.
+        _check_banded_out_entries(out_entries)
+
+    config: Dict[str, Any] = {
+        "axes": list(entries),
+        "out_axes": list(out_entries),
+        "switch_ops": switch_spec,
+        "bands": bands,
+        "alignment": alignment,
+        "extension_rule": _native_rules.extension_rule,
+    }
+    result = _native_batch.batch_functions(
+        [graph.module for graph in graphs], config
+    )
+    module = result["module"]
+    report = report_from_native(result["batch_report"])
+    if report.n_functions != n_functions:
+        raise core.TransformError(
+            "native batch_functions: the report describes "
+            f"{report.n_functions} function(s) but {n_functions} were merged"
         )
-    else:
-        partition = _bands.even_partition(n_functions, band_count)
-    if len(partition) == 1:
-        dag = build_merge_dag(graphs, groups, alignment)
-        graph = emit_merged_graph(graphs, dag, entries, out_entries, groups)
-        report = graph.batch_report
-        report.bands = 1
-        report.band_sizes = (n_functions,)
-        report.band_strategy = strategy
-        report.cost_estimate = cost_estimate
-        report.flat_cost_estimate = flat_cost_estimate
-        return graph
-    return _bands.emit_banded_graph(
-        graphs,
-        partition,
-        entries,
-        out_entries,
-        groups,
-        strategy,
-        cost_estimate,
-        flat_cost_estimate,
-        alignment,
+    graph = _rebuild_merged_graph(
+        graphs[0], module, entries, n_functions, result.get("input_ids")
+    )
+    graph.batch_report = report
+    return graph
+
+
+def _rebuild_merged_graph(
+    graph0: Graph,
+    module: ir.Module,
+    entries: Sequence[Optional[int]],
+    n_functions: int,
+    input_ids: Optional[Sequence[int]] = None,
+) -> Graph:
+    """Wrap the decoded merged module back into a `Graph`.
+
+    Input specs are derived from function 0's specs (never re-built from the
+    decoded types, so symbolic row dims and spec identity survive): a mapped
+    leaf gains a STATIC leading ``n_functions`` dim, an unmapped leaf reuses the
+    source spec object unchanged (dtype/device/name preserved throughout).
+    Input source locations are carried positionally onto the merged block
+    arguments (``input_ids`` when the engine reports them, otherwise the
+    decoded block arguments — the merged block args ARE the tensor inputs, in
+    order).
+    """
+    function = module.main
+    block = function.entry_block
+    if len(block.arguments) != len(graph0.tensor_specs):
+        raise core.TransformError(
+            "native batch_functions: the merged function has "
+            f"{len(block.arguments)} block args but the input graph has "
+            f"{len(graph0.tensor_specs)} tensor inputs"
+        )
+    new_specs: List[core.TensorSpec] = []
+    for spec, entry in zip(graph0.tensor_specs, entries):
+        if entry is None:
+            new_specs.append(spec)
+            continue
+        new_specs.append(
+            core.TensorSpec(
+                shape=(n_functions, *spec.shape),
+                dtype=spec.dtype,
+                device=spec.device,
+                name=spec.name,
+            )
+        )
+    if input_ids is None:
+        input_ids = [argument.id for argument in block.arguments]
+    elif len(input_ids) != len(block.arguments):
+        raise core.TransformError(
+            "native batch_functions: the merge metadata names "
+            f"{len(input_ids)} input ids but the merged function has "
+            f"{len(block.arguments)} block args"
+        )
+    source_locations: Dict[int, Any] = {}
+    source_block = graph0.module.main.entry_block
+    for old_argument, new_id in zip(source_block.arguments, input_ids):
+        location = graph0.source_locations.get(old_argument.id)
+        if location is not None:
+            source_locations[new_id] = location
+    return Graph(
+        module,
+        graph0.input_specs,
+        new_specs,
+        graph0.output_tree,
+        graph0.static_values,
+        graph0.output_static_values,
+        source_locations,
     )
