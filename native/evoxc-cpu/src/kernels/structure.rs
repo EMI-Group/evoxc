@@ -836,6 +836,79 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_axis_rep_repeats_the_whole_operand() {
+        // The whole-source repeat path: `(2, 3)` tiled `(2, 1)` is the operand
+        // copied whole twice -- every block of 6 output elements is the operand.
+        let input = i32_buffer(&[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let spec = op("tile", DType::Int32, &[4, 3], vec![("reps", ints(&[2, 1]))]);
+        let out = run(&spec, &input, &[4, 3]);
+        assert_eq!(
+            out.storage,
+            Storage::I32(vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5])
+        );
+        // The GP-shaped case: `(64, 64)` -> `(4096, 64)`, 1 MiB, which is big
+        // enough for the copy to go wide (two threads).  Every element must be
+        // the operand's `i % 4096`, bit for bit.
+        let values: Vec<f32> = (0..4096).map(|index| index as f32 * -0.25).collect();
+        let input = buffer(DType::Float32, &[64, 64], Storage::F32(values.clone()));
+        let spec = op(
+            "tile",
+            DType::Float32,
+            &[4096, 64],
+            vec![("reps", ints(&[64, 1]))],
+        );
+        let out = run(&spec, &input, &[4096, 64]);
+        match &out.storage {
+            Storage::F32(got) => {
+                assert_eq!(got.len(), 4096 * 64);
+                for (index, value) in got.iter().enumerate() {
+                    assert_eq!(
+                        value.to_bits(),
+                        values[index % 4096].to_bits(),
+                        "element {index}"
+                    );
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tile_repeating_two_axes_takes_the_block_path_and_stays_exact() {
+        // Not a whole-source repeat (axis 1 repeats too), so the block copy --
+        // not the repeat fast path -- produces the result, and it must agree
+        // with the general index map element for element.
+        let values: Vec<i32> = (0..12).collect();
+        let input = i32_buffer(&[3, 4], &values);
+        let out_shape = [6usize, 8];
+        let reps = [2usize, 2];
+        let spec = op(
+            "tile",
+            DType::Int32,
+            &out_shape,
+            vec![("reps", ints(&[2, 2]))],
+        );
+        assert!(tile_whole_repeat("tile", &input, &out_shape, &reps)
+            .expect("the fast-path probe succeeds")
+            .is_none());
+        let out = run(&spec, &input, &out_shape);
+        let map = tile_map("tile", &input.shape, &out_shape, &reps).unwrap();
+        match &out.storage {
+            Storage::I32(got) => {
+                assert_eq!(got.len(), map.len());
+                for (index, offset) in map.iter().enumerate() {
+                    assert_eq!(
+                        got[index],
+                        values[offset.expect("tile maps every element")],
+                        "element {index}"
+                    );
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
     fn tile_rejects_a_negative_rep() {
         let input = i32_buffer(&[2], &[0, 1]);
         let spec = op("tile", DType::Int32, &[2], vec![("reps", ints(&[1, -1]))]);
