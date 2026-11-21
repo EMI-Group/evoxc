@@ -75,6 +75,22 @@ fn exp_exp_program() -> Program {
     })
 }
 
+/// `sum(x)` over a rank-1 input — a rank-0 per-function output.
+fn scalar_sum_program() -> Program {
+    build(DType::parse("float32").expect("float32"), &[3], |builder, args| {
+        let attrs = evoxc_core::attr::Attrs::from_pairs([
+            ("axes", evoxc_core::attr::AttrValue::Ints(vec![0])),
+            ("reduce_op", evoxc_core::attr::AttrValue::Str("sum".to_string())),
+        ]);
+        builder.emit_typed_one("reduce_sum", &[args[0]], &attrs)
+    })
+}
+/// A program with a rank-0 INPUT and a rank-0 output (`sin(x)`).
+fn scalar_input_program() -> Program {
+    build(DType::parse("float32").expect("float32"), &[], |builder, args| {
+        builder.unary("sin", args[0])
+    })
+}
 fn sort_program() -> Program {
     build(DType::parse("float32").expect("float32"), &[3], |builder, args| {
         let attrs = evoxc_core::attr::Attrs::new();
@@ -131,6 +147,12 @@ fn merge(programs: &[Program], config: &BatchFunctionsConfig) -> BatchOutput {
     let out = batch_functions(programs, config).expect("merge succeeds");
     assert_verifies(&out);
     out
+}
+/// Merge with an explicit one-entry `out_axes` list.
+fn merge_with_out_axes(programs: &[Program], axis: Option<i64>) -> BatchOutput {
+    let mut config = config();
+    config.out_axes = vec![axis];
+    merge(programs, &config)
 }
 
 fn merge_error(programs: &[Program], config: &BatchFunctionsConfig) -> Error {
@@ -515,6 +537,75 @@ fn axis_entries_out_of_range_are_rejected() {
     config.axes = vec![Some(1)];
     let error = merge_error(&[square(), square()], &config);
     assert_transform_error(&error, "mapped axis 1 for tensor leaf 0 is out of range");
+}
+#[test]
+fn rank_zero_input_axes_zero_is_still_out_of_range() {
+    let mut config = config();
+    config.axes = vec![Some(0)];
+    let error = merge_error(&[scalar_input_program(), scalar_input_program()], &config);
+    assert_transform_error(
+        &error,
+        "mapped axis 0 for tensor leaf 0 is out of range for a tensor of rank 0",
+    );
+}
+#[test]
+fn rank_zero_output_accepts_out_axes_zero() {
+    let out = merge_with_out_axes(&[scalar_sum_program(), scalar_sum_program()], Some(0));
+    let outputs = out
+        .program
+        .computed_output_types(&out.program.functions[0])
+        .expect("outputs");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, vec![Dim::Int(2)], "the static function axis is the leading dim");
+    assert_eq!(outputs[0].dtype, DType::parse("float32").expect("float32"));
+    assert_eq!(out.report.output_muxes, 0);
+    assert_eq!(out.report.emitted_ops, 1);
+}
+#[test]
+fn rank_zero_output_accepts_out_axes_zero_when_banded() {
+    let mut config = config();
+    config.out_axes = vec![Some(0)];
+    config.bands = Bands::Explicit(2);
+    let out = merge(&[scalar_sum_program(), scalar_sum_program()], &config);
+    assert_eq!(out.report.band_strategy, "explicit");
+    assert_eq!(out.report.band_sizes, vec![1, 1]);
+    let outputs = out
+        .program
+        .computed_output_types(&out.program.functions[0])
+        .expect("outputs");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, vec![Dim::Int(2)]);
+    assert_eq!(outputs[0].dtype, DType::parse("float32").expect("float32"));
+}
+#[test]
+fn rank_zero_output_rejects_out_axes_one() {
+    let mut config = config();
+    config.out_axes = vec![Some(1)];
+    let error = merge_error(&[scalar_sum_program(), scalar_sum_program()], &config);
+    assert_transform_error(
+        &error,
+        "mapped axis 1 for tensor leaf 0 is out of range for a tensor of rank 0",
+    );
+}
+#[test]
+fn rank_zero_output_rejects_out_axes_minus_one() {
+    let mut config = config();
+    config.out_axes = vec![Some(-1)];
+    let error = merge_error(&[scalar_sum_program(), scalar_sum_program()], &config);
+    assert_transform_error(
+        &error,
+        "mapped axis -1 for tensor leaf 0 is out of range for a tensor of rank 0",
+    );
+}
+#[test]
+fn rank_one_output_still_rejects_out_axes_one() {
+    let mut config = config();
+    config.out_axes = vec![Some(1)];
+    let error = merge_error(&[square(), square()], &config);
+    assert_transform_error(
+        &error,
+        "mapped axis 1 for tensor leaf 0 is out of range for a tensor of rank 1",
+    );
 }
 
 #[test]
