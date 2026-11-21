@@ -298,7 +298,7 @@ The module-level tables are capped at 4096 entries so they stay bounded across d
 The wire format is unchanged — still `evoxc-native-ir` v1 (`ENVELOPE_FORMAT = 1` in `../_native_codec.py`), same `module`/`functions`/`ops` body, value ids and dim encodings.
 `evoxc._native_codec.decode_native_module(envelope, *, verify_module=None)` is the ONE entry point for trusted envelopes: it checks the discriminator/version via `_validated_envelope_body` (which keeps only `module`/`functions`/`ops`) and hands the body to `build_module_fast`.
 `evoxc._native.transform` (all five builtin transforms) and `evoxc._native.batch_functions` decode through it.
-`decode_module` remains the VALIDATED decoder — discriminator/version check, then `serialize._deserialize_envelope_body` (`_build_module` + `ir.verify`) — for any envelope of uncertain provenance: files, caches, tests, and `transforms._native_batch`'s re-encoded rank-0 copy.
+`decode_module` remains the VALIDATED decoder — discriminator/version check, then `serialize._deserialize_envelope_body` (`_build_module` + `ir.verify`) — for any envelope of uncertain provenance: files, caches, and tests.
 `EVOXC_NATIVE_DECODE_CHECK=1` (read ONCE at `_native_codec` import; `""`/`"0"`/`"false"`/`"False"` leave it off) is the dev-only cross-check: the fast-decoded module is run through `ir.verify`, so the trusted path can be audited without paying verification in the hot path.
 It does not re-decode through the validated path or diff the two modules — `ir.verify` on the fast result is the whole check, raising the same `VerificationError` a bad module would.
 The cross-check therefore costs the fast decode plus one `ir.verify` pass (≈4 µs/op at a few thousand ops, rising with size).
