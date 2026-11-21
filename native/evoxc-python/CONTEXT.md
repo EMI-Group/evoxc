@@ -88,6 +88,21 @@ The config dict accepts exactly the keys of `native/CONTEXT.md`; an unknown key 
 
 All JSON-shaped decoding lives in `src/transform_config.rs` and is unit-tested without an interpreter; only the dict/pair walk and the callable handle touch Python.
 
+## `batch_functions` is wired to `evoxc-compiler`
+
+`batch_ops::batch_functions` is the population-merge sibling of `transform`: `programs` is a list/tuple of `evoxc-native-ir` envelopes (one per function, decoded by `evoxc_core::envelope::decode` with a `programs[i]` context), the config dict is decoded with `transform_config::parse_batch_config`, and `evoxc_compiler::batch_functions::batch_functions_with_env` runs inside `Python::detach` with the SAME extension-rule bridge `transform` builds (`extension_rule_from_value` + `PyExtensionRule`), so `sparse_*` / `block:*` / `external:*` rules participate exactly as in a transform.
+The result is `{"module": <merged evoxc-native-ir envelope>, "batch_report": <BatchReport::to_json()>}` — the shape `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` drives (`convert.from_native(result["module"])`, `_normalize_report(result["batch_report"])`).
+The `BatchReport` object has exactly the 12 documented keys: `n_functions`, `value_classes`, `shared_classes`, `switched` (group/variants/rows_per_variant), `stacked_constants`, `output_muxes`, `emitted_ops`, `bands`, `band_sizes`, `band_strategy`, `cost_estimate`, `flat_cost_estimate`.
+
+Config keys (an unknown key is a `TransformError` naming it and the accepted set; `extension_rule` accepts a callable or `None`):
+
+* `axes` / `out_axes` — `int | null` (broadcast to every tensor leaf) or a list of `int | null` (one entry per tensor input / output leaf, in order). Absent or an empty list means the engine default (`Some(0)`, the leading function axis); an explicit `null` means "unmapped". Both expand to the engine's `Vec<Option<i64>>` using the entry function's leaf counts; non-leading entries fall through to the engine's own `TransformError`.
+* `switch_ops` — `null`/`false` (none), `true` (the default `elementwise` + `comparison` groups) or a list of merge groups (a category-name string, or a list of op-name strings). Unknown categories/op names are the engine's `TransformError`.
+* `bands` — `null` (flat), an int `K >= 1` (`explicit`; `K > N` is the engine's out-of-range `TransformError`), or `"auto"`; a bool is a `TransformError`.
+* `alignment` — `null` (the `variant` default) or `"variant" | "occurrence" | "auto"`, normalized trimmed + case-insensitive like the Python frontend; anything else is a `TransformError`.
+
+The five data keys are decoded interpreter-free by `transform_config::{batch_axes_from_json, switch_ops_from_json, bands_from_json, alignment_from_json, parse_batch_config}` (unit-tested without Python); `batch_ops` only walks the Python dict, converts each value to JSON and extracts the callable.
+
 ## Extension-rule bridge
 
 `PyExtensionRule` implements `evoxc_compiler::ExtensionRule` over the `Py<PyAny>` callable.
