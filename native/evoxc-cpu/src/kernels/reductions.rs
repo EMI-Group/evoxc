@@ -809,22 +809,74 @@ fn arg_better<T: ArgOrd>(best: T, candidate: T, want_max: bool) -> bool {
     }
 }
 
-/// Index of the winning position in one contiguous run (one output).
+/// Run length from which [`arg_run`] uses the branchy scan.
 ///
-/// The replacement is written as two selects rather than a branch: whether a
-/// value improves is DATA-dependent, so a branch mispredicts on roughly half the
-/// elements of a random run, which is what made `argmax` several times slower
-/// than numpy's compare-and-select loop.
+/// Which scan wins is length-dependent, measured on this host (262144 f32
+/// elements, `argmax`, warm): a short run is better served by the branch-free
+/// scan (its bookkeeping is cheaper than the mispredicts a per-row scan pays),
+/// while on a long single run the improving branch is almost never taken once
+/// the running extreme settles, so it predicts perfectly and the branchy scan
+/// skips the bookkeeping instead.  Both scans return identical indices — they
+/// are two spellings of the same rule, and a test pins them against each other.
+const ARG_BRANCHY_MIN_RUN: usize = 1024;
+
+/// Index of the winning position in one contiguous run (one output).
 #[inline]
 fn arg_run<T: ArgOrd>(values: &[T], want_max: bool) -> usize {
+    if values.len() >= ARG_BRANCHY_MIN_RUN {
+        arg_run_branchy(values, want_max)
+    } else {
+        arg_run_branchless(values, want_max)
+    }
+}
+
+/// The plain sequential scan: numpy's rule spelled as branches (a NaN best is
+/// never replaced — so it keeps the FIRST NaN — a NaN candidate always wins, and
+/// otherwise only a strict improvement replaces, so a tie keeps the FIRST
+/// occurrence).
+#[inline]
+fn arg_run_branchy<T: ArgOrd>(values: &[T], want_max: bool) -> usize {
     let mut best = values[0];
     let mut best_index = 0usize;
     for (position, candidate) in values.iter().enumerate().skip(1) {
-        let replace = arg_better(best, *candidate, want_max);
-        best = if replace { *candidate } else { best };
-        best_index = if replace { position } else { best_index };
+        if arg_better(best, *candidate, want_max) {
+            best = *candidate;
+            best_index = position;
+        }
     }
     best_index
+}
+
+/// The same rule with no data-dependent branch: the value scan ignores NaN (a
+/// NaN comparison is false either way, which is exactly "never improves") and the
+/// first NaN is tracked beside it, so the answer is the first NaN's position when
+/// the run holds one and otherwise the leftmost strict extreme.  For the
+/// integer/bool dtypes `arg_nan` is a constant `false`, so that bookkeeping
+/// compiles away.
+#[inline]
+fn arg_run_branchless<T: ArgOrd>(values: &[T], want_max: bool) -> usize {
+    let mut best = values[0];
+    let mut best_index = 0usize;
+    // `usize::MAX` = "no NaN seen yet".
+    let mut nan_index = usize::MAX;
+    for (position, candidate) in values.iter().enumerate().skip(1) {
+        let first_nan = candidate.arg_nan() && nan_index == usize::MAX;
+        nan_index = if first_nan { position } else { nan_index };
+        let improves = if want_max {
+            candidate.arg_gt(best)
+        } else {
+            best.arg_gt(*candidate)
+        };
+        best = if improves { *candidate } else { best };
+        best_index = if improves { position } else { best_index };
+    }
+    if values[0].arg_nan() {
+        0
+    } else if nan_index != usize::MAX {
+        nan_index
+    } else {
+        best_index
+    }
 }
 
 /// One group reducing into `inner` output lanes, one step per reduced position
@@ -1698,5 +1750,44 @@ mod tests {
         let input = buffer(DType::Float32, &[1, 4], Storage::F32(values));
         let op = arg_op("argmax", Some(1), false, &[1]);
         assert_eq!(arg_reduce(&op, &input, &[1]).unwrap()[0].storage, Storage::I64(vec![3]));
+    }
+
+    #[test]
+    fn the_two_arg_scans_agree_on_short_and_long_runs() {
+        // The length-dispatched scans are two spellings of numpy's rule; both
+        // must equal the offset-table reference at every length, with a NaN
+        // anywhere and with ties (the data repeats every 5 values).
+        for len in [2usize, 5, 8, 64, 1023, 1024, 1500, 4096] {
+            let mut cases: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(len / 2), Some(len - 1)];
+            cases.dedup();
+            for nan_at in cases {
+                let mut values: Vec<f32> = (0..len).map(|index| ((index * 17 % 5) as f32) * 0.5).collect();
+                if let Some(position) = nan_at {
+                    values[position] = f32::NAN;
+                }
+                let reference_mask = vec![true];
+                for want_max in [true, false] {
+                    let want = reference_arg(&values, &[len], &reference_mask, want_max)[0];
+                    for (label, got) in [
+                        ("branchy", arg_run_branchy(&values, want_max)),
+                        ("branchless", arg_run_branchless(&values, want_max)),
+                        ("dispatched", arg_run(&values, want_max)),
+                    ] {
+                        assert_eq!(
+                            got as i64, want,
+                            "{label} scan: len {len} nan_at {nan_at:?} want_max {want_max}"
+                        );
+                    }
+                }
+            }
+        }
+        // Integer runs have no NaN at all; both scans must still agree.
+        let values: Vec<i64> = (0..2000).map(|index| (index * 7 % 13) - 6).collect();
+        for want_max in [true, false] {
+            assert_eq!(
+                arg_run_branchy(&values, want_max),
+                arg_run_branchless(&values, want_max)
+            );
+        }
     }
 }
