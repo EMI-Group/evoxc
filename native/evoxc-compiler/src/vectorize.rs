@@ -347,7 +347,10 @@ mod tests {
             .iter()
             .map(|(_, op)| op.name.as_str())
             .collect();
-        assert_eq!(names, vec!["reshape", "add", "return"]);
+        // Both operands already agree per row ((3) vs (3)), so the pointwise
+        // rule aligns nothing: a `batch x 3` add broadcasts against `3` with no
+        // reshape (parity with the Python `_pointwise_batching` rule).
+        assert_eq!(names, vec!["add", "return"]);
     }
 
     #[test]
@@ -378,7 +381,7 @@ mod tests {
         let env = TransformEnv::builtin();
         let err = vectorize_graph(&program, &TransformConfig::default(), &env).unwrap_err();
         assert!(err.message.contains("config.axes is required"));
-        let err = vectorize_graph(&program, &axes(&[(0, Some(1))]), &env).unwrap_err();
+        let err = vectorize_graph(&program, &axes(&[(0, Some(1)), (1, None)]), &env).unwrap_err();
         assert!(err.message.contains("must be 0 (the leading axis) or None"));
         let mut config = axes(&[(0, None), (1, None)]);
         config.axes = vec![(ValueId(99), Some(0))];

@@ -200,7 +200,7 @@ impl Builder {
                 )));
             }
         }
-        let filled = attrs.with_defaults(schema)?;
+        let filled = defaulted(schema, attrs)?;
         validate_attrs(&filled, schema)?;
         let operand_types = self.value_types(operands)?;
         let types = match result_types {
@@ -399,9 +399,33 @@ impl Builder {
     }
 }
 
+/// `attrs` plus the schema's defaults for every absent optional attribute.
+///
+/// A `null` default means "no value": the attribute stays ABSENT, exactly like
+/// the Python registry's `default=None` (which never fills the attribute), and
+/// core's inference already reads an absent optional attribute as `None` /
+/// "reverse" / "every dimension".  `Attrs::with_defaults` cannot be used
+/// directly because `AttrValue::from_json` refuses to build the `null` for a
+/// declared `ints` / `shape` / `nested_ints` attribute
+/// (`transpose.permutation`, `slice.strides`, `conv.strides`, …).
+fn defaulted(schema: &'static OpSchema, attrs: &Attrs) -> Result<Attrs> {
+    let mut filled = attrs.clone();
+    for declared in schema.attrs {
+        if filled.contains(declared.name) {
+            continue;
+        }
+        if declared.default_json == Some("null") {
+            continue;
+        }
+        if let Some(value) = declared.default_value()? {
+            filled.insert(declared.name, value);
+        }
+    }
+    Ok(filled)
+}
+
 /// `{"a", "b"}` — the declared attribute names of a schema, for messages.
-pub fn declared_attrs(schema: &OpSchema) -> String {
-    let mut names: Vec<String> = schema.attrs.iter().map(|attr| format!("\"{}\"", attr.name)).collect();
+pub fn declared_attrs(schema: &OpSchema) -> String {    let mut names: Vec<String> = schema.attrs.iter().map(|attr| format!("\"{}\"", attr.name)).collect();
     names.sort();
     format!("[{}]", names.join(", "))
 }
@@ -441,7 +465,10 @@ mod tests {
         let args = builder.block_arguments().unwrap();
         let sum = builder.binary("add", args[0], args[1]).unwrap();
         assert_eq!(builder.value_type(sum).unwrap(), a);
-        let axes = Attrs::from_pairs([("axes", AttrValue::Ints(vec![1]))]);
+        let axes = Attrs::from_pairs([
+            ("axes", AttrValue::Ints(vec![1])),
+            ("reduce_op", AttrValue::Str("sum".to_string())),
+        ]);
         let reduced = builder
             .emit_typed_one("reduce_sum", &[sum], &axes)
             .unwrap();
@@ -481,7 +508,12 @@ mod tests {
         let mut builder = Builder::new("main");
         builder.open_function("main", &[a]).unwrap();
         let args = builder.block_arguments().unwrap();
-        let attrs = Attrs::from_pairs([("axes", AttrValue::Ints(vec![0]))]);
+        // `reduce_op` is a required IR attribute (the frontend always passes
+        // it); `keepdims` is optional and comes from the schema default.
+        let attrs = Attrs::from_pairs([
+            ("axes", AttrValue::Ints(vec![0])),
+            ("reduce_op", AttrValue::Str("sum".to_string())),
+        ]);
         let out = builder.emit_typed_one("reduce_sum", &args, &attrs).unwrap();
         let op_id = *builder.block_op_ids().unwrap().last().unwrap();
         let op = builder.program().op(op_id).unwrap();
@@ -489,7 +521,10 @@ mod tests {
         assert_eq!(op.attributes.str("reduce_op").unwrap(), "sum");
         assert_eq!(out.0, op.results[0].0);
         builder.set_terminator(&[out], None).unwrap();
-        let err = builder.emit("add", &args, &Attrs::new(), None, None).unwrap_err();
+        // a well-formed op is still refused once the block has a terminator
+        let err = builder
+            .emit("add", &[args[0], args[0]], &Attrs::new(), None, None)
+            .unwrap_err();
         assert!(err.message.contains("already has a terminator"));
         assert!(builder.set_terminator(&[out], None).is_err());
     }
@@ -530,19 +565,34 @@ mod tests {
         let sub_program = sub.finish();
 
         let mut builder = Builder::new("main");
-        builder.open_function("main", &[a.clone()]).unwrap();
+        // A leading dummy input keeps the two id spaces apart, so the
+        // remapping below is observable (both programs number from 0).
+        builder
+            .open_function("main", &[f32_matrix(8, 8), a.clone()])
+            .unwrap();
         let args = builder.block_arguments().unwrap();
         let mapping = builder
-            .inline_function(&sub_program, "rule", &args)
+            .inline_function(&sub_program, "rule", &[args[1]])
             .unwrap();
-        assert_eq!(mapping.len(), 2);
+        // the entry block argument, the inlined `constant` and the inlined `add`
+        assert_eq!(mapping.len(), 3);
+        // the sub graph's entry argument is bound to the supplied main value
+        assert_eq!(mapping[&sub_args[0]], args[1]);
         assert_ne!(mapping[&sub_args[0]], sub_args[0]);
-        builder
-            .set_terminator(&[mapping[&sum]], None)
-            .unwrap();
+        builder.set_terminator(&[mapping[&sum]], None).unwrap();
         let program = builder.finish();
         // add + constant were appended before the return.
         assert_eq!(program.ops.len(), 3);
+        // the inlined `add` was rewritten onto the main program's values
+        let add = program
+            .ops
+            .iter()
+            .map(|(_, op)| op)
+            .find(|op| op.name == "add")
+            .expect("the sub graph's add was inlined");
+        assert_eq!(add.operands[0], args[1]);
+        assert_ne!(add.operands[1], add.operands[0]);
+        assert_ne!(add.results[0], sum);
         assert_eq!(program.computed_output_types(&program.functions[0]).unwrap()[0], a);
     }
 

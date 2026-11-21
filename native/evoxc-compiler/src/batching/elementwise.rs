@@ -151,6 +151,8 @@ mod tests {
             .iter()
             .map(|(_, op)| op.name.clone())
             .collect();
-        assert_eq!(names, vec!["reshape", "add"]);
+        // (batch, 3) against (3): the row ranks already match, so the pointwise
+        // rule aligns nothing and emits only the rebuilt op.
+        assert_eq!(names, vec!["add"]);
     }
 }

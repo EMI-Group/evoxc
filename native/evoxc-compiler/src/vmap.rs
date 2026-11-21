@@ -119,9 +119,11 @@ mod tests {
 
     fn env() -> TransformEnv<'static> {
         let mut registry = Registry::new();
-        registry
-            .batching
-            .register("add", crate::batching::elementwise::pointwise_rule);
+        for name in ["add", "multiply"] {
+            registry
+                .batching
+                .register(name, crate::batching::elementwise::pointwise_rule);
+        }
         // leak is fine in a test process: the env borrows the registry
         let registry = Box::leak(Box::new(registry));
         TransformEnv::with_registry(registry)

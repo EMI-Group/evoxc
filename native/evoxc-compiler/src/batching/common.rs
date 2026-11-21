@@ -17,27 +17,47 @@ pub fn dtype(name: &str) -> DType {
 
 /// The product of `dims` as one `Dim`; `None` when any dim is runtime-dynamic
 /// (the frontend's `_fold_product`).
+///
+/// The fold starts from the first dim (never from a synthetic `1`), so a
+/// single named dim folds to itself instead of `1 * dim`; an empty shape folds
+/// to `1`.
 pub fn fold_product(dims: &[Dim]) -> Option<Dim> {
-    let mut product = Dim::Int(1);
+    let mut product: Option<Dim> = None;
     for dim in dims {
         if matches!(dim, Dim::Dynamic) {
             return None;
         }
-        product = product.mul(dim.clone());
+        product = Some(match product {
+            None => dim.clone(),
+            Some(accumulated) => accumulated.mul(dim.clone()),
+        });
     }
-    Some(product)
+    Some(product.unwrap_or(Dim::Int(1)))
 }
 
 /// True when this dim is the pass's unmaterialized batch `Dim`.
+///
+/// A broadcast against a size-one dim keeps the batch extent
+/// (`max(batch, 1) == batch`), so such a `Max` expression still names the
+/// batch dim; a `Max` against any other size is left unrecognized because
+/// nothing statically proves the batch dim survives it.
 pub fn is_batch_dim(dim: &Dim, batch_dim: &str) -> bool {
     match dim {
         Dim::Named(named) => named.name == batch_dim && named.size.is_none(),
         Dim::Expr(expr) => match expr.op {
-            DimOp::Max => is_batch_dim(&expr.left, batch_dim) && is_batch_dim(&expr.right, batch_dim),
+            DimOp::Max => {
+                (is_batch_dim(&expr.left, batch_dim) && is_size_one(&expr.right))
+                    || (is_batch_dim(&expr.right, batch_dim) && is_size_one(&expr.left))
+            }
             _ => false,
         },
         _ => false,
     }
+}
+
+/// True for the literal dim `1` (a broadcast-compatible placeholder).
+fn is_size_one(dim: &Dim) -> bool {
+    matches!(dim, Dim::Int(1))
 }
 
 /// The number of leading dims that are the pass's batch `Dim`.

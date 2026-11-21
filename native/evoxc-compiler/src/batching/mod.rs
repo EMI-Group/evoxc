@@ -396,21 +396,28 @@ mod tests {
         ) -> Result<Option<ExtensionResponse>> {
             assert_eq!(request.kind, ExtensionKind::Batching);
             assert_eq!(request.rule_key, "external:double");
-            assert_eq!(request.axes, Some(vec![Some(0)]));
-            // subgraph: (x) -> return add(x, x)
+            // one axis entry per operand
+            assert_eq!(request.axes, Some(vec![Some(0), Some(0)]));
+            // subgraph: (x, y) -> return add(x, y); the entry function takes the
+            // op's rewritten operands, in order
             let mut sub = Builder::new("rule");
-            sub.open_function("rule", &[request.operand_types[0].clone()])
+            sub.open_function("rule", &request.operand_types.clone())
                 .unwrap();
             let args = sub.block_arguments().unwrap();
-            let sum = sub.binary("add", args[0], args[0]).unwrap();
+            let sum = sub.binary("add", args[0], args[1]).unwrap();
             sub.set_terminator(&[sum], None).unwrap();
             let program = sub.finish();
             let entry = program.functions[0].name.clone();
-            Ok(Some(ExtensionResponse::new(
-                evoxc_core::envelope::encode(&program),
-                entry,
-                vec![sum],
-            )))
+            Ok(Some(
+                ExtensionResponse::new(
+                    evoxc_core::envelope::encode(&program),
+                    entry,
+                    vec![sum],
+                )
+                // the rule declares the spliced output carries the mapped
+                // leading axis
+                .with_output_axes(vec![Some(0)]),
+            ))
         }
     }
 
@@ -491,8 +498,8 @@ mod tests {
             attributes: Attrs::from_pairs([("name", AttrValue::Str("k".into()))]),
             original_operand_types: vec![f32_matrix(1, 1)],
             original_result_types: vec![f32_matrix(1, 1)],
-            operands: Vec::new(),
-            operand_types: Vec::new(),
+            operands: vec![ValueId(0)],
+            operand_types: vec![f32_matrix(1, 1)],
             results: Vec::new(),
             result_types: Vec::new(),
             location: None,
