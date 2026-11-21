@@ -255,6 +255,11 @@ def build_gguf_detailed(
             when there are no tensors, the metadata-only layout).
         trailing: bytes appended after the data section.
     """
+    metadata = list(metadata)
+    if alignment is not None and not any(
+        key == "general.alignment" for key, _type, _value in metadata
+    ):
+        metadata.append(("general.alignment", UINT32, int(alignment)))
     tensor_count = len(tensors) if declared_tensor_count is None else declared_tensor_count
     kv_count = len(metadata) if declared_kv_count is None else declared_kv_count
     header = b"GGUF" + struct.pack("<I", version)
@@ -459,20 +464,19 @@ def _deq_q2_k(block: bytes):
 
 
 def _q3_scale(raw: bytes, index: int) -> int:
-    """Unpack one 6-bit signed-ish Q3_K scale (stored value is biased by 32)."""
-    if index < 4:
-        low = raw[index] & 0x0F
-        high = raw[8] >> 0
-    elif index < 8:
-        low = raw[index] & 0x0F
-        high = raw[9] >> 2
-    elif index < 12:
-        low = raw[index - 8] >> 4
-        high = raw[10] >> 4
+    """Unpack one 6-bit Q3_K scale (stored value is biased by 32).
+
+    Layout: bytes 0..7 hold the 16 low nibbles (byte j = scales j and j+8),
+    bytes 8..11 hold the high 2 bits bit-sliced, so tmp byte k carries scales
+    k, k+4, k+8 and k+12 (bits 0-1, 2-3, 4-5, 6-7 respectively).
+    """
+    group, offset = divmod(index, 4)  # which 2-bit field / which tmp byte
+    if group < 2:
+        low = raw[4 * group + offset] & 0x0F
     else:
-        low = raw[index - 8] >> 4
-        high = raw[11] >> 6
-    return (low | ((high & 0x03) << 4)) - 32
+        low = raw[4 * (group - 2) + offset] >> 4
+    high = (raw[8 + offset] >> (2 * group)) & 0x03
+    return (low | (high << 4)) - 32
 
 
 def _deq_q3_k(block: bytes):

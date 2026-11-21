@@ -340,6 +340,23 @@ class TestContainerLayout:
             assert f.tensor("w").numpy().shape == (2, 2)
             np.testing.assert_array_equal(f.tensor("w").numpy(), values)
 
+    def test_zero_length_extents_may_share_a_range(self, tmp_path):
+        # The overlap rule applies to non-empty extents only, so two empty
+        # tensors may both claim [0, 0].
+        blob = build_safetensors(
+            [
+                {"name": "a", "dtype": "F32", "shape": [0], "data": b"",
+                 "data_offsets": [0, 0]},
+                {"name": "b", "dtype": "F32", "shape": [0, 0], "data": b"",
+                 "data_offsets": [0, 0]},
+            ]
+        )
+        path = tmp_path / "empty.safetensors"
+        path.write_bytes(blob)
+        with load_safetensors(path) as f:
+            assert f.tensor_names() == ["a", "b"]
+            assert f.tensor("b").numpy().shape == (0, 0)
+
     def test_header_order_is_preserved(self, tmp_path):
         blob = build_safetensors(
             [
