@@ -60,7 +60,7 @@ fn sole_operand(op: &RuleOp) -> Result<ValueId> {
 
 /// One `MappedAxes` per operand (`TransformError` when the metadata does not
 /// align with the operands).
-fn operand_axes<'a>(op: &RuleOp, axes: &'a [MappedAxes], index: usize) -> Result<MappedAxes> {
+fn operand_axes(op: &RuleOp, axes: &[MappedAxes], index: usize) -> Result<MappedAxes> {
     axes.get(index).copied().ok_or_else(|| {
         Error::transform(format!(
             "vectorize: rule metadata mismatch for op '{}': {} operand axes for {} operand(s)",

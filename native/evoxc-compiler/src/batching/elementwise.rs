@@ -98,7 +98,7 @@ pub fn reduction_rule(
             let reduced = arg_reduce(ctx, &op.name, flattened, Some(count as i64), false)?;
             if keepdims {
                 let mut target: Vec<Dim> = batched[..count.min(batched.len())].to_vec();
-                target.extend(std::iter::repeat(Dim::Int(1)).take(old_shape.len()));
+                target.extend(std::iter::repeat_n(Dim::Int(1), old_shape.len()));
                 ctx.reshape(reduced, &target)?
             } else {
                 reduced
@@ -387,7 +387,9 @@ mod tests {
         for keepdims in [true, false] {
             let mut builder = Builder::new("main");
             let batched = batched_ty(DType::Float32, &[3, 4]);
-            builder.open_function("main", &[batched.clone()]).unwrap();
+            builder
+                .open_function("main", std::slice::from_ref(&batched))
+                .unwrap();
             let args = builder.block_arguments().unwrap();
             // reduce_sum(x (3, 4), axes=[0], keepdims=?) — batched operand
             // (batch, 3, 4): axis 0 shifts to axis 1 and the batch axis is kept.
@@ -424,7 +426,9 @@ mod tests {
         for keepdims in [true, false] {
             let mut builder = Builder::new("main");
             let batched = batched_ty(DType::Float32, &[3, 4]);
-            builder.open_function("main", &[batched.clone()]).unwrap();
+            builder
+                .open_function("main", std::slice::from_ref(&batched))
+                .unwrap();
             let args = builder.block_arguments().unwrap();
             let source = unary_source(
                 "reduce_mean",
@@ -454,7 +458,9 @@ mod tests {
     fn argmax_with_axis_none_flattens_per_row_and_restores_keepdims() {
         let mut builder = Builder::new("main");
         let batched = batched_ty(DType::Float32, &[3, 4]);
-        builder.open_function("main", &[batched.clone()]).unwrap();
+        builder
+            .open_function("main", std::slice::from_ref(&batched))
+            .unwrap();
         let args = builder.block_arguments().unwrap();
         let source = unary_source(
             "argmax",
@@ -487,7 +493,7 @@ mod tests {
             other => panic!("reshape target must be the flattened per-row shape, got {other:?}"),
         }
         assert_eq!(ops[1].1.opt_i64("axis").unwrap(), Some(1));
-        assert_eq!(ops[1].1.bool("keepdims").unwrap(), false);
+        assert!(!ops[1].1.bool("keepdims").unwrap());
         match ops[2].1.get("shape") {
             Some(AttrValue::Shape(shape)) => assert_eq!(
                 shape,
@@ -501,7 +507,9 @@ mod tests {
     fn argmax_with_an_axis_shifts_it_and_keeps_the_operand_axes() {
         let mut builder = Builder::new("main");
         let batched = batched_ty(DType::Float32, &[3, 4]);
-        builder.open_function("main", &[batched.clone()]).unwrap();
+        builder
+            .open_function("main", std::slice::from_ref(&batched))
+            .unwrap();
         let args = builder.block_arguments().unwrap();
         let source = unary_source(
             "argmin",
@@ -587,7 +595,9 @@ mod tests {
             DType::Float32,
             vec![Dim::named("batch"), Dim::Dynamic, Dim::Int(4)],
         );
-        builder.open_function("main", &[batched.clone()]).unwrap();
+        builder
+            .open_function("main", std::slice::from_ref(&batched))
+            .unwrap();
         let args = builder.block_arguments().unwrap();
         let original = evoxc_core::value_type::ValueType::new(
             DType::Float32,
