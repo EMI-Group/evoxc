@@ -19,41 +19,84 @@
 //!
 //! Conversion never mutates its inputs and never allocates a Python string per
 //! element: paths are built in one reused `String`.
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::{Map, Number, Value as Json};
+
 use crate::error;
+
 /// Decode one Python value into envelope JSON, tagging messages with `root`.
 pub fn json_from_py(value: &Bound<'_, PyAny>, root: &str) -> PyResult<Json> {
     let mut path = String::with_capacity(root.len() + 16);
     path.push_str(root);
     encode_value(value, &mut path)
 }
+
 /// Encode one envelope JSON value into a fresh Python object.
+///
+/// Strings (dict keys and values) are interned for the duration of one call:
+/// an envelope repeats a few dozen spellings (`"id"`, `"dtype"`, `"float32"`,
+/// every op name) across thousands of nodes, and reusing the `str` object also
+/// lets `PyDict_SetItem` reuse the hash cached on those objects.
 pub fn py_from_json<'py>(py: Python<'py>, value: &Json) -> PyResult<Bound<'py, PyAny>> {
+    let mut interner = PyInterner::new();
+    py_from_json_inner(py, value, &mut interner)
+}
+
+/// Per-call `str` interner (see [`py_from_json`]).
+struct PyInterner<'py> {
+    strings: HashMap<Box<str>, Bound<'py, PyString>>,
+}
+
+impl<'py> PyInterner<'py> {
+    fn new() -> PyInterner<'py> {
+        PyInterner {
+            strings: HashMap::new(),
+        }
+    }
+
+    fn string(&mut self, py: Python<'py>, text: &str) -> Bound<'py, PyString> {
+        if let Some(hit) = self.strings.get(text) {
+            return hit.clone();
+        }
+        let value = PyString::new(py, text);
+        self.strings.insert(text.into(), value.clone());
+        value
+    }
+}
+
+fn py_from_json_inner<'py>(
+    py: Python<'py>,
+    value: &Json,
+    interner: &mut PyInterner<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
     Ok(match value {
         Json::Null => py.None().into_bound(py),
         Json::Bool(flag) => PyBool::new(py, *flag).to_owned().into_any(),
         Json::Number(number) => number_to_py(py, number),
-        Json::String(text) => PyString::new(py, text).into_any(),
+        Json::String(text) => interner.string(py, text).into_any(),
         Json::Array(items) => {
-            let list = PyList::empty(py);
+            let mut converted = Vec::with_capacity(items.len());
             for item in items {
-                list.append(py_from_json(py, item)?)?;
+                converted.push(py_from_json_inner(py, item, interner)?);
             }
-            list.into_any()
+            PyList::new(py, converted)?.into_any()
         }
         Json::Object(map) => {
             let dict = PyDict::new(py);
             for (key, item) in map {
-                dict.set_item(key, py_from_json(py, item)?)?;
+                let key = interner.string(py, key);
+                dict.set_item(&key, py_from_json_inner(py, item, interner)?)?;
             }
             dict.into_any()
         }
     })
 }
+
 /// Numbers keep their JSON integer-ness: an `i64`/`u64` becomes a Python `int`,
 /// anything else a `float`.  (Python `bool` is never reached — it is checked
 /// before `int` on the way in and encoded as JSON `true`/`false`.)
@@ -67,6 +110,7 @@ fn number_to_py<'py>(py: Python<'py>, number: &Number) -> Bound<'py, PyAny> {
     let float = number.as_f64().unwrap_or(f64::NAN);
     never(float.into_pyobject(py)).into_any()
 }
+
 /// `Result<T, Infallible>` carries no failure; spelling that out keeps the
 /// conversion free of `unwrap`/`expect` (the crate never panics on user input).
 fn never<T>(value: Result<T, Infallible>) -> T {
@@ -75,42 +119,14 @@ fn never<T>(value: Result<T, Infallible>) -> T {
         Err(never) => match never {},
     }
 }
+
 fn encode_value(value: &Bound<'_, PyAny>, path: &mut String) -> PyResult<Json> {
     if value.is_none() {
         return Ok(Json::Null);
     }
-    // `bool` is an `int` subclass in Python: test it first or `True` becomes 1.
-    if value.is_instance_of::<PyBool>() {
-        let flag: bool = value.extract()?;
-        return Ok(Json::Bool(flag));
-    }
-    if value.is_instance_of::<PyInt>() {
-        if let Ok(int) = value.extract::<i64>() {
-            return Ok(Json::from(int));
-        }
-        if let Ok(uint) = value.extract::<u64>() {
-            return Ok(Json::from(uint));
-        }
-        return Err(error::type_error(format!(
-            "{path}: integer {} does not fit the envelope's 64-bit number range",
-            python_text(value)
-        )));
-    }
-    if value.is_instance_of::<PyFloat>() {
-        let float: f64 = value.extract()?;
-        return Number::from_f64(float).map(Json::Number).ok_or_else(|| {
-            error::type_error(format!(
-                "{path}: {float} is not a finite JSON number (NaN and infinity have no \
-                 envelope form; pass them as an ndarray attribute payload instead)"
-            ))
-        });
-    }
-    if let Ok(text) = value.cast::<PyString>() {
-        let text = text.to_str().map_err(|err| {
-            error::object_error(value.py(), err, &format!("{path}: undecodable string"))
-        })?;
-        return Ok(Json::String(text.to_string()));
-    }
+    // Exact/`Py*_Check` casts (subclasses accepted, as before).  Dicts, lists,
+    // tuples and strings are tried first: the envelope is almost entirely made
+    // of them, and a cast is a cheaper check than the generic `is_instance_of`.
     if let Ok(dict) = value.cast::<PyDict>() {
         let mut map = Map::new();
         for (key, item) in dict.iter() {
@@ -132,39 +148,82 @@ fn encode_value(value: &Bound<'_, PyAny>, path: &mut String) -> PyResult<Json> {
         return Ok(Json::Object(map));
     }
     if let Ok(list) = value.cast::<PyList>() {
-        return encode_sequence(list.iter().collect(), path).map(Json::Array);
+        let mut out = Vec::with_capacity(list.len());
+        encode_items(list.iter(), path, &mut out)?;
+        return Ok(Json::Array(out));
     }
     if let Ok(tuple) = value.cast::<PyTuple>() {
-        return encode_sequence(tuple.iter().collect(), path).map(Json::Array);
+        let mut out = Vec::with_capacity(tuple.len());
+        encode_items(tuple.iter(), path, &mut out)?;
+        return Ok(Json::Array(out));
+    }
+    if let Ok(text) = value.cast::<PyString>() {
+        let text = text.to_str().map_err(|err| {
+            error::object_error(value.py(), err, &format!("{path}: undecodable string"))
+        })?;
+        return Ok(Json::String(text.to_string()));
+    }
+    // `bool` is an `int` subclass in Python: test it first or `True` becomes 1.
+    if value.cast::<PyBool>().is_ok() {
+        let flag: bool = value.extract()?;
+        return Ok(Json::Bool(flag));
+    }
+    if value.cast::<PyInt>().is_ok() {
+        if let Ok(int) = value.extract::<i64>() {
+            return Ok(Json::from(int));
+        }
+        if let Ok(uint) = value.extract::<u64>() {
+            return Ok(Json::from(uint));
+        }
+        return Err(error::type_error(format!(
+            "{path}: integer {} does not fit the envelope's 64-bit number range",
+            python_text(value)
+        )));
+    }
+    if value.cast::<PyFloat>().is_ok() {
+        let float: f64 = value.extract()?;
+        return Number::from_f64(float).map(Json::Number).ok_or_else(|| {
+            error::type_error(format!(
+                "{path}: {float} is not a finite JSON number (NaN and infinity have no \
+                 envelope form; pass them as an ndarray attribute payload instead)"
+            ))
+        });
     }
     Err(error::type_error(format!(
         "{path}: expected dict, list, tuple, str, bool, int, float or None, got {}",
         type_name(value)
     )))
 }
-fn encode_sequence(items: Vec<Bound<'_, PyAny>>, path: &mut String) -> PyResult<Vec<Json>> {
-    let mut out = Vec::with_capacity(items.len());
-    for (index, item) in items.iter().enumerate() {
+
+fn encode_items<'py>(
+    items: impl Iterator<Item = Bound<'py, PyAny>>,
+    path: &mut String,
+    out: &mut Vec<Json>,
+) -> PyResult<()> {
+    for (index, item) in items.enumerate() {
         let mark = path.len();
         let _ = write!(path, "[{index}]");
-        let encoded = encode_value(item, path);
+        let encoded = encode_value(&item, path);
         path.truncate(mark);
         out.push(encoded?);
     }
-    Ok(out)
+    Ok(())
 }
+
 fn type_name(value: &Bound<'_, PyAny>) -> String {
     match value.get_type().name() {
         Ok(name) => name.to_string_lossy().into_owned(),
         Err(_) => String::from("<unknown type>"),
     }
 }
+
 fn python_text(value: &Bound<'_, PyAny>) -> String {
     match value.str() {
         Ok(text) => text.to_string_lossy().into_owned(),
         Err(_) => String::from("<unprintable>"),
     }
 }
+
 #[cfg(all(test, feature = "auto-init"))]
 mod tests {
     use super::*;

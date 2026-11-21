@@ -17,8 +17,6 @@
 //! `serde_json`'s ordered map, so `encode(decode(encode(decode(e))))` is
 //! byte-identical to `encode(decode(e))`.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use serde_json::{Map, Value as Json};
 
 use crate::attr::{AttrValue, Attrs};
@@ -118,18 +116,33 @@ pub fn validate_attrs(attrs: &Attrs, op: &'static OpSchema) -> Result<()> {
 // Small JSON helpers
 // ---------------------------------------------------------------------------
 
-fn json_object<'a>(value: &'a Json, what: &str) -> Result<&'a Map<String, Json>> {
+/// A lazily rendered error-context ("op 'add' result 2", "functions[3]", ...).
+///
+/// Diagnostics are the only place a decode path needs these strings, so the
+/// hot path passes a closure and pays the allocation only when an error is
+/// actually raised. The rendered text is byte-identical to the eager form the
+/// helpers used before.
+pub type Ctx<'a> = &'a dyn Fn() -> String;
+
+/// A context for a fixed, already-known spelling.
+fn ctx(text: &'static str) -> impl Fn() -> String {
+    move || text.to_string()
+}
+
+fn json_object<'a>(value: &'a Json, what: Ctx<'_>) -> Result<&'a Map<String, Json>> {
     value.as_object().ok_or_else(|| {
         Error::verification(format!(
-            "malformed IR payload: {what} must be a dict, got {value}"
+            "malformed IR payload: {} must be a dict, got {value}",
+            what()
         ))
     })
 }
 
-fn field<'a>(map: &'a Map<String, Json>, key: &str, where_: &str) -> Result<&'a Json> {
+fn field<'a>(map: &'a Map<String, Json>, key: &str, where_: Ctx<'_>) -> Result<&'a Json> {
     map.get(key).ok_or_else(|| {
         Error::verification(format!(
-            "malformed IR payload: '{key}' is missing from {where_}"
+            "malformed IR payload: '{key}' is missing from {}",
+            where_()
         ))
     })
 }
@@ -137,36 +150,39 @@ fn field<'a>(map: &'a Map<String, Json>, key: &str, where_: &str) -> Result<&'a 
 fn field_list<'a>(
     map: &'a Map<String, Json>,
     key: &str,
-    where_: &str,
+    where_: Ctx<'_>,
 ) -> Result<&'a Vec<Json>> {
     field(map, key, where_)?.as_array().ok_or_else(|| {
         Error::verification(format!(
-            "malformed IR payload: '{key}' in {where_} must be a list"
+            "malformed IR payload: '{key}' in {} must be a list",
+            where_()
         ))
     })
 }
 
-fn field_str(map: &Map<String, Json>, key: &str, where_: &str) -> Result<String> {
+fn field_str(map: &Map<String, Json>, key: &str, where_: Ctx<'_>) -> Result<String> {
     field(map, key, where_)?.as_str().map(str::to_string).ok_or_else(|| {
         Error::verification(format!(
-            "malformed IR payload: '{key}' in {where_} must be a str"
+            "malformed IR payload: '{key}' in {} must be a str",
+            where_()
         ))
     })
 }
 
-fn field_id(map: &Map<String, Json>, key: &str, where_: &str) -> Result<u32> {
+fn field_id(map: &Map<String, Json>, key: &str, where_: Ctx<'_>) -> Result<u32> {
     let value = field(map, key, where_)?;
-    id_from_json(value, &format!("'{key}' in {where_}"))
+    id_from_json(value, &|| format!("'{key}' in {}", where_()))
 }
 
-fn id_from_json(value: &Json, what: &str) -> Result<u32> {
+fn id_from_json(value: &Json, what: Ctx<'_>) -> Result<u32> {
     value
         .as_i64()
         .filter(|number| *number >= 0 && *number <= u32::MAX as i64)
         .map(|number| number as u32)
         .ok_or_else(|| {
             Error::verification(format!(
-                "malformed IR payload: {what} must be a non-negative int, got {value}"
+                "malformed IR payload: {} must be a non-negative int, got {value}",
+                what()
             ))
         })
 }
@@ -272,8 +288,8 @@ pub fn decode(envelope: &Json) -> Result<Program> {
         )));
     }
 
-    let module = json_object(field(top, "module", "the envelope")?, "'module'")?;
-    let name = field_str(module, "name", "module")?;
+    let module = json_object(field(top, "module", &ctx("the envelope"))?, &ctx("'module'"))?;
+    let name = field_str(module, "name", &ctx("module"))?;
     let metadata = match module.get("metadata") {
         None | Some(Json::Null) => Json::Object(Map::new()),
         Some(Json::Object(map)) => Json::Object(map.clone()),
@@ -284,49 +300,88 @@ pub fn decode(envelope: &Json) -> Result<Program> {
         }
     };
 
-    let functions = field_list(top, "functions", "the envelope")?;
-    let ops = field_list(top, "ops", "the envelope")?;
+    let functions = field_list(top, "functions", &ctx("the envelope"))?;
+    let ops = field_list(top, "ops", &ctx("the envelope"))?;
 
-    // First pass over the module-wide op table: collect every entry by id.
-    let mut ops_json: BTreeMap<u32, &Json> = BTreeMap::new();
-    for (index, entry) in ops.iter().enumerate() {
-        let entry_where = format!("ops[{index}]");
-        let object = json_object(entry, &entry_where)?;
-        let id = field_id(object, "id", &entry_where)?;
-        if ops_json.insert(id, entry).is_some() {
-            return Err(Error::verification(format!(
-                "module {name:?}: duplicate op id {id} in the module ops table"
-            )));
-        }
-    }
+    // One pass over the module-wide op table: validate every id and sort the
+    // entries by id, so lookups are a binary search over one flat vector (no
+    // per-node tree allocation and no second map).
+    let table = OpTable::build(ops, &name)?;
+    let mut program = Program::new(name);
+    program.metadata = metadata;
+    program.reserve_tables(table.len(), table.result_values);
 
     let mut decoder = Decoder {
-        program: Program::new(name),
-        ops_json,
-        referenced: BTreeSet::new(),
-        in_progress: BTreeSet::new(),
+        program,
+        referenced: vec![false; table.len()],
+        in_progress: vec![false; table.len()],
+        table,
     };
-    decoder.program.metadata = metadata;
     for (index, entry) in functions.iter().enumerate() {
         decoder.decode_function(entry, index)?;
     }
     decoder.finish()
 }
 
+/// The flat module-wide op table: entries sorted by id (ascending).
+///
+/// Wire ids are module-unique but need not be dense, so the table sorts once
+/// and then binary-searches; `referenced` / `in_progress` are parallel bits
+/// indexed by position in this vector.
+struct OpTable<'a> {
+    entries: Vec<(u32, &'a Json)>,
+    /// Total number of declared result values (a capacity hint for `Program`).
+    result_values: usize,
+}
+
+impl<'a> OpTable<'a> {
+    fn build(ops: &'a [Json], module_name: &str) -> Result<OpTable<'a>> {
+        let mut entries: Vec<(u32, &'a Json)> = Vec::with_capacity(ops.len());
+        let mut result_values = 0usize;
+        for (index, entry) in ops.iter().enumerate() {
+            let entry_where = || format!("ops[{index}]");
+            let object = json_object(entry, &entry_where)?;
+            let id = field_id(object, "id", &entry_where)?;
+            if let Some(results) = object.get("results").and_then(Json::as_array) {
+                result_values += results.len();
+            }
+            entries.push((id, entry));
+        }
+        entries.sort_unstable_by_key(|entry| entry.0);
+        for pair in entries.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(Error::verification(format!(
+                    "module {module_name:?}: duplicate op id {} in the module ops table",
+                    pair[0].0
+                )));
+            }
+        }
+        Ok(OpTable { entries, result_values })
+    }
+
+    fn index(&self, id: u32) -> Option<usize> {
+        self.entries.binary_search_by_key(&id, |entry| entry.0).ok()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Decode state for one envelope.
 struct Decoder<'a> {
     program: Program,
-    /// The flat module-wide op table, keyed by op id.
-    ops_json: BTreeMap<u32, &'a Json>,
-    /// Op ids already claimed by a block op entry.
-    referenced: BTreeSet<u32>,
-    /// Op ids currently being decoded (region cycle detection).
-    in_progress: BTreeSet<u32>,
+    /// The flat module-wide op table, sorted by op id.
+    table: OpTable<'a>,
+    /// Table positions already claimed by a block op entry.
+    referenced: Vec<bool>,
+    /// Table positions currently being decoded (region cycle detection).
+    in_progress: Vec<bool>,
 }
 
 impl<'a> Decoder<'a> {
     fn decode_function(&mut self, data: &'a Json, index: usize) -> Result<()> {
-        let entry_where = format!("functions[{index}]");
+        let entry_where = || format!("functions[{index}]");
         let map = json_object(data, &entry_where)?;
         let name = field_str(map, "name", &entry_where)?;
         let input_types = wire::value_types_from_json(field(map, "input_types", &entry_where)?)?;
@@ -335,7 +390,10 @@ impl<'a> Decoder<'a> {
             None | Some(Json::Null) => Json::Object(Map::new()),
             Some(value) => value.clone(),
         };
-        let body = self.decode_region(field(map, "block", &entry_where)?, &format!("function '{name}'"))?;
+        let body = {
+            let body_where = || format!("function '{name}'");
+            self.decode_region(field(map, "block", &entry_where)?, &body_where)?
+        };
         self.program.add_function(Function {
             name,
             input_types,
@@ -347,20 +405,23 @@ impl<'a> Decoder<'a> {
     }
 
     /// Decode one region: a single-block encoding, or `{"blocks": [...]}`.
-    fn decode_region(&mut self, data: &'a Json, where_: &str) -> Result<Region> {
+    fn decode_region(&mut self, data: &'a Json, where_: Ctx<'_>) -> Result<Region> {
         let mut region = Region::new();
         if let Json::Object(map) = data {
             if let Some(blocks) = map.get("blocks") {
                 let blocks = blocks.as_array().ok_or_else(|| {
                     Error::verification(format!(
-                        "{where_}: region 'blocks' must be a list of blocks"
+                        "{}: region 'blocks' must be a list of blocks",
+                        where_()
                     ))
                 })?;
                 if blocks.is_empty() {
                     return Err(Error::verification(format!(
-                        "{where_}: region 'blocks' must be a non-empty list"
+                        "{}: region 'blocks' must be a non-empty list",
+                        where_()
                     )));
                 }
+                region.blocks.reserve(blocks.len());
                 for block in blocks {
                     let id = self.decode_block(block, where_)?;
                     region.append(id);
@@ -374,14 +435,16 @@ impl<'a> Decoder<'a> {
     }
 
     /// Decode one block (arguments + references into the flat op table).
-    fn decode_block(&mut self, data: &'a Json, where_: &str) -> Result<BlockId> {
-        let map = json_object(data, &format!("{where_} block"))?;
+    fn decode_block(&mut self, data: &'a Json, where_: Ctx<'_>) -> Result<BlockId> {
+        let block_where = || format!("{} block", where_());
+        let map = json_object(data, &block_where)?;
         let block_id = self.program.new_block_id();
         let mut block = Block::new(block_id);
 
-        let arguments = field_list(map, "arguments", &format!("{where_} block"))?;
+        let arguments = field_list(map, "arguments", &block_where)?;
+        block.arguments.reserve(arguments.len());
         for (index, entry) in arguments.iter().enumerate() {
-            let entry_where = format!("{where_} argument {index}");
+            let entry_where = || format!("{} argument {index}", where_());
             let entry = json_object(entry, &entry_where)?;
             let id = ValueId(field_id(entry, "id", &entry_where)?);
             let ty = wire::value_type_from_json(field(entry, "type", &entry_where)?)?;
@@ -396,39 +459,46 @@ impl<'a> Decoder<'a> {
             block.arguments.push(id);
         }
 
-        let ops = field_list(map, "ops", &format!("{where_} block"))?;
+        let ops = field_list(map, "ops", &block_where)?;
+        block.ops.reserve(ops.len());
+        let op_entry_where = || format!("{} block op entry", where_());
         for entry in ops {
-            let entry = json_object(entry, &format!("{where_} block op entry"))?;
-            let ref_value = field(entry, "ref", &format!("{where_} block op entry"))?;
+            let entry = json_object(entry, &op_entry_where)?;
+            let ref_value = field(entry, "ref", &op_entry_where)?;
             let ref_text = ref_value.as_str().ok_or_else(|| {
                 Error::verification(format!(
-                    "{where_}: op ref must be a string of the op id, got {ref_value}"
+                    "{}: op ref must be a string of the op id, got {ref_value}",
+                    where_()
                 ))
             })?;
             let op_id: u32 = ref_text.parse().map_err(|_| {
                 Error::verification(format!(
-                    "{where_}: op ref {ref_text:?} is not an integer op id"
+                    "{}: op ref {ref_text:?} is not an integer op id",
+                    where_()
                 ))
             })?;
             if let Some(declared) = entry.get("id") {
-                let declared = id_from_json(declared, &format!("{where_} block op entry id"))?;
+                let declared_where = || format!("{} block op entry id", where_());
+                let declared = id_from_json(declared, &declared_where)?;
                 if declared != op_id {
                     return Err(Error::verification(format!(
-                        "{where_}: op entry id {declared} does not match its ref {ref_text:?}"
+                        "{}: op entry id {declared} does not match its ref {ref_text:?}",
+                        where_()
                     )));
                 }
             }
-            if !self.ops_json.contains_key(&op_id) {
+            let Some(op_index) = self.table.index(op_id) else {
                 return Err(Error::verification(format!(
-                    "{where_}: op ref {ref_text:?} does not reference an op in the ops table"
+                    "{}: op ref {ref_text:?} does not reference an op in the ops table",
+                    where_()
                 )));
-            }
-            if !self.referenced.insert(op_id) {
+            };
+            if std::mem::replace(&mut self.referenced[op_index], true) {
                 return Err(Error::verification(format!(
                     "op {op_id} is referenced by more than one block entry"
                 )));
             }
-            self.decode_op(op_id)?;
+            self.decode_op(op_index)?;
             block.ops.push(OpId(op_id));
         }
 
@@ -452,25 +522,22 @@ impl<'a> Decoder<'a> {
     }
 
     /// Decode one op from the flat table (idempotent, with cycle detection).
-    fn decode_op(&mut self, id: u32) -> Result<()> {
+    fn decode_op(&mut self, index: usize) -> Result<()> {
+        let (id, entry) = self.table.entries[index];
         if self.program.ops.contains(id) {
             return Ok(());
         }
-        let entry = self.ops_json.get(&id).copied().ok_or_else(|| {
-            Error::verification(format!(
-                "op {id} is referenced by a block but absent from the module ops table"
-            ))
-        })?;
-        let map = json_object(entry, &format!("op {id}"))?;
-        let name = field_str(map, "name", &format!("op {id}"))?;
+        let op_where = || format!("op {id}");
+        let map = json_object(entry, &op_where)?;
+        let name = field_str(map, "name", &op_where)?;
         let schema = schema::require(&name)?;
-        if !self.in_progress.insert(id) {
+        if std::mem::replace(&mut self.in_progress[index], true) {
             return Err(Error::verification(format!(
                 "op {id} ('{name}') is referenced from inside its own region (region cycle)"
             )));
         }
         let decoded = self.decode_op_body(id, &name, schema, map);
-        self.in_progress.remove(&id);
+        self.in_progress[index] = false;
         decoded
     }
 
@@ -481,11 +548,13 @@ impl<'a> Decoder<'a> {
         schema: &'static OpSchema,
         map: &'a Map<String, Json>,
     ) -> Result<()> {
-        let where_ = format!("op '{name}'");
+        let where_ = || format!("op '{name}'");
         let mut op = Op::new(OpId(id), name);
 
-        for (index, entry) in field_list(map, "results", &where_)?.iter().enumerate() {
-            let entry_where = format!("{where_} result {index}");
+        let results = field_list(map, "results", &where_)?;
+        op.results.reserve(results.len());
+        for (index, entry) in results.iter().enumerate() {
+            let entry_where = || format!("op '{name}' result {index}");
             let entry = json_object(entry, &entry_where)?;
             let value_id = ValueId(field_id(entry, "id", &entry_where)?);
             let ty = wire::value_type_from_json(field(entry, "type", &entry_where)?)?;
@@ -505,7 +574,8 @@ impl<'a> Decoder<'a> {
             Some(Json::Object(attributes)) => attrs_from_json(attributes, schema)?,
             Some(other) => {
                 return Err(Error::verification(format!(
-                    "{where_}: attributes must be a dict, got {other}"
+                    "{}: attributes must be a dict, got {other}",
+                    where_()
                 )))
             }
         };
@@ -515,22 +585,26 @@ impl<'a> Decoder<'a> {
         match map.get("regions") {
             None | Some(Json::Null) => {}
             Some(Json::Array(regions)) => {
+                op.regions.reserve(regions.len());
                 for (index, region) in regions.iter().enumerate() {
-                    let region_where = format!("{where_} region {index}");
+                    let region_where = || format!("op '{name}' region {index}");
                     let decoded = self.decode_region(region, &region_where)?;
                     op.regions.push(decoded);
                 }
             }
             Some(other) => {
                 return Err(Error::verification(format!(
-                    "{where_}: 'regions' must be a list of region encodings, got {other}"
+                    "{}: 'regions' must be a list of region encodings, got {other}",
+                    where_()
                 )))
             }
         }
 
-        for (index, operand) in field_list(map, "operands", &where_)?.iter().enumerate() {
-            op.operands
-                .push(ValueId(id_from_json(operand, &format!("{where_} operand {index}"))?));
+        let operands = field_list(map, "operands", &where_)?;
+        op.operands.reserve(operands.len());
+        for (index, operand) in operands.iter().enumerate() {
+            let operand_where = || format!("op '{name}' operand {index}");
+            op.operands.push(ValueId(id_from_json(operand, &operand_where)?));
         }
 
         self.program.add_op(op)?;
@@ -539,7 +613,7 @@ impl<'a> Decoder<'a> {
 
     /// Cross-checks that need the whole module, then hands back the program.
     fn finish(mut self) -> Result<Program> {
-        for id in self.ops_json.keys() {
+        for (id, _) in &self.table.entries {
             if !self.program.ops.contains(*id) {
                 return Err(Error::verification(format!(
                     "module {:?}: op {id} is present in the module ops table but no block references it",
@@ -657,9 +731,9 @@ fn encode_region(program: &Program, region: &Region) -> Json {
 
 fn encode_block(program: &Program, id: BlockId) -> Json {
     let mut map = Map::new();
-    let (arguments, ops) = match program.blocks.get(id.0) {
-        Some(block) => (block.arguments.clone(), block.ops.clone()),
-        None => (Vec::new(), Vec::new()),
+    let (arguments, ops): (&[ValueId], &[OpId]) = match program.blocks.get(id.0) {
+        Some(block) => (&block.arguments, &block.ops),
+        None => (&[], &[]),
     };
     map.insert(
         "arguments".to_string(),

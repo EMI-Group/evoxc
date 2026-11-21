@@ -118,6 +118,12 @@ impl<T> Table<T> {
         self.slots.get_mut(index).and_then(|slot| slot.take())
     }
 
+    /// Reserve room for `additional` more slots (dense ids near the high-water
+    /// mark make this a plain `Vec::reserve`).
+    pub fn reserve(&mut self, additional: usize) {
+        self.slots.reserve(additional);
+    }
+
     /// Number of occupied slots.
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
@@ -463,6 +469,14 @@ impl Program {
     /// Highest occupied op id, if any.
     pub fn max_op_id(&self) -> Option<u32> {
         self.ops.max_id()
+    }
+
+    /// Pre-size the two dense tables a wire decode fills (a capacity hint; a
+    /// decode of `ops` entries with `values` declared results avoids the
+    /// repeated regrowth of both `Vec`s).
+    pub fn reserve_tables(&mut self, ops: usize, values: usize) {
+        self.ops.reserve(ops);
+        self.values.reserve(values);
     }
 
     /// Raise the allocators above every id already present (decode path).
