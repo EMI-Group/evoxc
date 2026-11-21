@@ -49,54 +49,97 @@ Never replace this with a hand-written kind/width lattice.
 
 ## Wire format: the envelope
 
-`transform` and `infer` exchange **one JSON-able Python dict** (the envelope) per call — never per-node callbacks.
-The envelope mirrors the `evoxc-ir` payload documented in `../evoxc/ir/serialize.py` with one deliberate change: constant payloads are **raw little-endian bytes**, not `np.save` blobs.
+The codec exchanges **one JSON-able Python dict** (the envelope) per call — never per-node callbacks: `transform` and every `batch_functions` program take one, and `infer` takes one as its optional callee-signature `module`.
+`evoxc-core::envelope` (`decode`/`encode`) is the authority; `evoxc-core/src/wire.rs` owns the dim/shape/type/array conversions and `evoxc-core/src/attr.rs` the typed attribute maps.
+The shape mirrors the stored `evoxc-ir` payload of `../evoxc/ir/serialize.py` (`"format": "evoxc-ir"`, a `constants` table of `np.save` bytes, a canonical `sha256`) with three deliberate differences: the discriminator is `"evoxc-native-ir"`, array payloads are inline raw little-endian bytes, and there is neither a `constants` table nor a `sha256` (the envelope is an in-process value, not a stored file).
+The top level is a FLAT module: one `functions` array plus one module-wide `ops` table, and blocks/regions reference ops by id.
 
-```
+```text
 {
-  "format": "evoxc-native-ir",
-  "version": 1,
-  "module": {"name": str, "metadata": {json}},
-  "functions": [Function, ...],
-  "ops": [Op, ...],
+  "format": "evoxc-native-ir",                    # required, exact string
+  "version": 1,                                   # required, exact JSON integer 1
+  "module": {"name": str, "metadata": {json}},    # name required; metadata optional (missing/null -> {})
+  "functions": [Function, ...],                   # required; vector order is function order
+  "ops": [Op, ...],                               # required; ONE flat module-wide op table, any order
 }
 
 Function = {
-  "name": str,
-  "input_types":  [Type, ...],
-  "output_types": [Type, ...],       # informational; validated against the "return" operands
-  "metadata": {json},
-  "block": {"arguments": [{"id": int, "type": Type}, ...],
-            "ops": [{"id": int, "ref": str}, ...]},   # ref = decimal op id (string is authoritative)
+  "name": str,                                    # required, unique in the module
+  "input_types":  [Type, ...],                    # required
+  "output_types": [Type, ...],                    # required; informational, cross-checked against the "return" operands
+  "metadata": {json},                             # optional; missing/null -> {}; any JSON value is kept verbatim
+  "block": Region,                                # required body region
 }
 
-Op = {"id": int,
-      "name": str,
-      "operands": [value_id, ...],
-      "results": [{"id": value_id, "type": Type}, ...],
-      "attributes": {json},
-      "regions": [Region, ...],
-      "location": {"file": str, "line": int, "col": int, "code_snippet": str | null} | null}
+Block = {
+  "arguments": [{"id": value_id, "type": Type}, ...],   # required
+  "ops": [{"id": op_id, "ref": str(op_id)}, ...],       # required; the decimal STRING ref is authoritative
+}
 
-Region = Block | {"blocks": [Block, ...]}     # single-block regions encode as the Block
+Op = {
+  "id": op_id,                                    # required, non-negative u32, module-unique
+  "name": str,                                    # required, must exist in the generated op schema registry
+  "operands": [value_id, ...],                    # required
+  "results": [{"id": value_id, "type": Type}, ...],     # required
+  "attributes": {json},                           # optional; missing/null -> {}; schema-validated, defaults NOT filled
+  "regions": [Region, ...],                       # optional; missing/null -> no regions
+  "location": {"file": str, "line": int, "col": int, "code_snippet": str | null} | null,   # optional
+}
 
-Type = {"dtype": str, "shape": [Dim, ...]}     # dtype = numpy dtype.name
+Region = Block | {"blocks": [Block, ...]}   # a single-block region IS the block object; {"blocks": [...]} is the non-empty multi-block form
+
+Type = {"dtype": str, "shape": [Dim, ...]}  # dtype = numpy dtype.name (the 14 evoxc dtypes); an absent shape is rank 0
 
 Dim = {"int": n}
-    | {"dim": name, "size": n?}                 # symbolic Dim, optional known size
-    | {"expr": {"op": "add"|"sub"|"mul"|"floordiv"|"mod"|"min"|"max",
-                "args": [Dim, Dim]}}
-    | null                                      # runtime-dynamic dimension
+    | {"dim": name} | {"dim": name, "size": n}      # named symbolic dim, optional known size
+    | {"expr": {"op": "add"|"sub"|"mul"|"floordiv"|"mod"|"min"|"max", "args": [Dim, Dim]}}
+    | null                                          # runtime-dynamic dimension
 ```
 
-Value ids are module-unique and **preserved** by a transform where the value survives (rewritten values get fresh ids; branch (block-argument) ids stay block-local).
-Op ids are module-unique; a transform renumbers new ops from a fresh counter above the maximum input id.
-`attributes` are plain JSON values; array-valued attributes (notably `constant.value`) encode as
-`{"__evoxc_ndarray__": {"dtype": str, "shape": [int, ...], "data_b64": str}}` where `data_b64` is base64 of the array's **C-order raw little-endian bytes** for that dtype.
-Tuples that must survive the round trip encode as `{"__evoxc_tuple__": [...]}`; `result_specs` on `runtime_call` / `block_call` / `external_call` is a list of `Type` dicts.
-A returned envelope has the same shape plus an optional top-level `"transform"` object with the transform's result metadata (`"output_ids"`, `"input_ids"`, `"kind"`).
+**Discriminator and top level.** `decode` requires a JSON object whose `format` is exactly `"evoxc-native-ir"` and whose `version` is exactly the JSON integer `1`.
+A missing or different `format`/`version` (a wrong string, a JSON float, any other number) is a `PersistenceError` naming what was seen.
+`module` must be an object with a string `name`; its `metadata` is optional (missing or `null` → `{}`) and a non-object value is a `VerificationError`.
+`functions` and `ops` must both be present and be lists.
+Extra keys are ignored at every level (top level, module, function, op, location, array payload), so a payload carrying a foreign key still decodes.
+Nothing requires a function to exist: an empty module (empty `functions` and `ops`) decodes.
 
-Serialization must be deterministic (stable key order for maps, stable op order) so a decode→encode round trip is byte-identical for the same input.
+**The flat op table.** Every op lives in the single module-wide `ops` array; a block's op entries reference it by the decimal-string `ref` (authoritative), and an optional numeric `id` must equal it.
+Decode sorts the table by op id once and binary-searches it, so array order carries no meaning and ids need not be dense.
+A duplicate op id, an unparseable `ref`, a `ref` with no table entry, a second block entry referencing the same op, and a table entry no block references are each a `VerificationError`.
+Regions are decoded lazily through that same table, so an op is built at most once and an op reachable from inside its own region is a `VerificationError` (region cycle).
+An op `name` missing from the schema registry is a `VerificationError`.
+
+**Functions and blocks.** Function names are unique in the module, and `input_types`/`output_types` are required lists of `Type`.
+`output_types` is informational only, but at the end of decode it must equal the types of the entry block's `return` operands; a body without a `return` terminator or a mismatch is a `VerificationError` naming the function.
+A block's `arguments` (`{"id", "type"}`) and each op's `results` are the ONLY value definitions, and every duplicate value id is a `VerificationError`.
+Block ids never appear on the wire: decode allocates a fresh `BlockId` per decoded block in decode order, and a region is the ordered list of its blocks (entry first).
+Every operand must resolve to a defined value once the whole module is decoded, otherwise a `VerificationError` naming the op and the value.
+Decode never re-infers: `results[].type` is taken verbatim from the wire, so a `while`/`if` result type is whatever the payload says.
+
+**Types and dims.** `Type` is `{"dtype", "shape"}` with `dtype` a required numpy `dtype.name` string for one of the 14 evoxc dtypes (an unknown name is a `DTypeError`) and `shape` optional (absent = rank 0).
+A dim is `{"int": n}`, `{"dim": name}` optionally with `"size": n`, `{"expr": {"op", "args": [left, right]}}` (exactly two args; an unknown op name is a `ShapeError`), or `null` for a runtime-dynamic dim.
+A non-object/non-null dim, and a dim object with none of `int`/`dim`/`expr`, are `VerificationError`s.
+Symbolic identity is structural: `{"dim": "B"}` and `{"dim": "B", "size": 4}` are different dims, and decode cross-checks a named dim against nothing.
+
+**Attributes and payloads.** `attributes` values are typed by the op's schema: an unknown attribute name, a missing required attribute, or a value that does not match the declared tag is a `VerificationError`.
+The declared tags are `bool`, `int`, `float`, `str`, `dtype`, `ints`, `floats`, `strs`, `nested_ints`, `shape`, `ndarray` and `any`; the per-tag decode rules live in `./evoxc-core/CONTEXT.md` "Envelope contract".
+JSON `null` is legal for every declared tag and decodes to an explicit null value that re-encodes as `null`.
+Defaults are NOT filled during decode: an absent optional attribute stays absent and the builder/inference layer fills it.
+An `ndarray` payload is `{"__evoxc_ndarray__": {"dtype": str, "shape": [int, ...], "data_b64": str}}` where `data_b64` is base64 of the array's **C-order raw little-endian bytes** for that dtype; the tag is optional on decode (a bare `{"dtype", "shape", "data_b64"}` object decodes identically) and is always emitted on encode.
+A payload shape accepts plain JSON ints or `{"int": n}` entries; a symbolic or `null` dim and a negative extent are `ShapeError`s, and a byte count that does not equal element count × dtype itemsize (or invalid base64) is a `VerificationError`.
+A tuple is `{"__evoxc_tuple__": [...]}`: it decodes by the DECLARED tag (sequence tags take its members elementwise, `any` keeps the tuple and re-emits the marker, a scalar tag rejects it), and typed sequences re-encode as plain lists so the marker survives only under `any`.
+`result_specs` on `runtime_call` / `block_call` / `external_call` is a required `any` attribute carried as a list of `Type` dicts.
+
+**Ids.** Op ids and value ids are module-unique, appear exactly as written, and are never renumbered by the codec; decode reseeds the allocators above the highest op/value/block id it saw so later construction cannot collide.
+A transform never mutates its input module: it builds a fresh `Program` (or, for `vmap`, resumes the `vectorize` output) and allocates every value and op id from that program's own allocator, so a transformed or merged envelope shares no ids with its inputs (`"transform".output_ids` / `"input_ids"` name the new ones).
+Output ids are therefore allocated from 0 upward for a fresh module (`vectorize`, `grad`, `jvp`, `vjp`, and the `batch_functions` merge) and continue above the `vectorize` output's maximum for `vmap`.
+Block ids are internal in both directions.
+
+**Determinism and limits.** Encode is a pure function of the `Program`: ops are emitted ascending by id, functions in vector order, region blocks in block order, and every object is a `serde_json::Map` (a `BTreeMap` — the crate enables no `preserve_order`), so keys serialize in ascending key order and nothing depends on insertion order.
+A second `encode(decode(e))` is byte-identical to the first (test-asserted), as is encoding the same `Program` twice.
+`encode` is infallible: a value id missing from the arena is emitted as `"type": null` and fails on the next decode, which is the one malformed payload it can produce.
+Decode validates structure and ids only — no arity, region-count, SSA-dominance or result-type/schema agreement check, and no call to `verify` — so a decoded-but-nonsensical module is `verify`'s job.
+A returned transform envelope has the same shape plus a top-level `"transform"` object (`"kind"`, `"output_ids"`, `"input_ids"`, `"batch_dim"` — `null` for the AD transforms) added by the binding after encoding; `decode` ignores it.
 
 ## FFI surface (`evoxc._evoxc_native`)
 
