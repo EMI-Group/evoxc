@@ -51,7 +51,7 @@ The JSON walk (`decode_module_json`/`signature_program`/`signature_entry`) is in
 
 ## GIL discipline
 
-`infer` and `transform` in `src/module_ops.rs` convert while holding the GIL, run all native work inside `Python::detach` (pyo3 0.30's name for the old `allow_threads`), then re-acquire the GIL for encoding.
+`infer`, `transform` and `batch_functions` convert while holding the GIL, run all native work inside `Python::detach` (pyo3 0.30's name for the old `allow_threads`), then re-acquire the GIL for encoding.
 The closure captures only `Send` data: the decoded `Program`, the typed `TransformConfig`, and (when the config supplied one) a `PyExtensionRule` holding the `Py<PyAny>` callable — `Py<T>` is `Send + Sync`, and the bridge re-attaches with `Python::attach` instead of carrying the `Python` token across the boundary.
 No `Bound<PyAny>` crosses into native code and no native type is captured from a Python reference across the boundary.
 
