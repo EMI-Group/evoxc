@@ -24,7 +24,7 @@ The built cdylib is `libevoxc_python.so`, installed by `scripts/build-native.sh`
 
 ## The `infer` module argument
 
-`infer`'s `module` supplies the callee signatures `call` resolves against (`evoxc_core::infer_op` reads `module.function(callee)?.output_types`), and it is decoded by `module_ops::decode_module` into a `Program`. Two shapes are accepted:
+`infer`'s `module` supplies the callee signatures `call` resolves against (`evoxc_core::infer_op` reads `module.function(callee)?.output_types`), and it is decoded by `infer_context::decode_module` into a `Program`. Two shapes are accepted:
 
 * **A full `evoxc-native-ir` envelope** — recognized by its `"format"` key and decoded by `evoxc_core::envelope::decode`, unchanged (`PersistenceError`/`VerificationError` diagnostics keep their `module:` context).
 * **A signature-only context** — a dict whose `"functions"` is a list of function signatures; one body-less `Function` per entry is synthesized into a `Program` named `"signature-context"`, so every downstream `call` path is untouched:
