@@ -9,7 +9,7 @@
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
   <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, IREE, XLA, TVM"></a>
-  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7511%20passing-4c9a72?style=flat-square" alt="tests: 7511 passing"></a>
+  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7729%20passing-4c9a72?style=flat-square" alt="tests: 7729 passing"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
