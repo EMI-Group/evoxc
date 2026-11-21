@@ -518,6 +518,13 @@ fn normalise_out_axes(programs: &[Program], entries: &[Option<i64>]) -> Result<V
     for (index, entry) in axes.iter_mut().enumerate() {
         let Some(axis) = *entry else { continue };
         let rank = out_types[index].rank() as i64;
+        // A mapped rank-0 per-function output becomes rank 1 in the merged
+        // graph (the merge prepends the static function axis), so the mapped
+        // entry 0 is the leading axis and is accepted.
+        if rank == 0 && axis == 0 {
+            *entry = Some(0);
+            continue;
+        }
         if axis < -rank || axis >= rank {
             return Err(Error::transform(format!(
                 "batch_functions: mapped axis {axis} for tensor leaf {index} is out of range for \

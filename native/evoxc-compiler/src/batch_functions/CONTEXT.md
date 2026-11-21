@@ -40,6 +40,9 @@ pub fn batch_functions_with_env(programs: &[Program], config: &BatchFunctionsCon
 
 `batch_functions` uses `TransformEnv::builtin()`.
 The config carries already-normalized per-leaf entries: parsing a pytree / JSON / `switch_ops` spellings belongs to the FFI layer.
+Every mapped `out_axes` entry is validated against the PER-FUNCTION output rank, except that a rank-0 output accepts the mapped entry `0`.
+That exception exists because the merged value carries the static function axis as its leading dim, so the rank-0 per-function output is rank 1 (`(N,)`) in the merged graph.
+Every other out-of-range entry (including `1` and `-1` on a rank-0 output) is an explicit `TransformError`.
 This crate still validates lengths, entries in `{0, None}`, band counts and group spellings so a direct Rust caller cannot bypass them.
 
 `BatchReport` has exactly the 12 Python keys, same names, nested `SwitchRecord`s:
@@ -125,7 +128,7 @@ Every deferral is a `TransformError` with the Python message text (naming the op
 
 * an op with no rule: `batch_functions: cannot batch op '<op>' from function <i>: no batching rule registered for key '<key>' — v1 deferral of batch_functions (...) ...`; rule availability = registry hit, or `batching::extension_eligible(key)` when an extension bridge is present (`sparse_*` / `dense_dot_sparse` / `block:*` / `external:*`).
 * region-bearing control flow: the exact `region-bearing control-flow ops (cond/while_loop/scan) are not supported by batch_functions in v1` message.
-* non-leading axes entries (`{0, None}` only) and `out_axes=None` on a mapped/muxed output.
+* non-leading axes entries (`{0, None}` only) and `out_axes=None` on a mapped/muxed output; a rank-0 per-function output nevertheless accepts the mapped `out_axes` entry `0` (its merged value is rank 1), while `axes=0` on a rank-0 INPUT stays out of range.
 * `Bands != Flat` with an `out_axes=None` output.
 * a switch group's candidates with non-leading batch axes, conflicting result types, or a shape one select cannot mux.
 * program-shape violations (not exactly one function, not one entry block, no `return`, block-arg/input-type mismatch) and cross-program signature mismatches (input/output count, dtype -> `DTypeError`, shape -> `ShapeError`).
