@@ -32,21 +32,23 @@ evoxc learns from Nx (explicit numerical language, `block`, `vectorize`, `runtim
 ## Architecture overview
 
 ```
-                         evoxc  (package)
+                    evoxc  (package: Python frontend)
         tensor-graph frontend (ops core, numpy namespace, trace, block)
-        graph transforms (transforms: vectorize/vmap/grad/jvp/vjp)
-        explicit collectives (dist)
+        function-side sugar (vmap/grad builders), explicit collectives (dist)
                          │
                          ▼
                       EvoXIR (ir)
                          │
-              ┌──────────┼───────────┐
-              ▼          ▼           ▼
-          StableHLO     native     (future: Relax/TVM, PJRT/XLA)
-          (export)      numpy interpreter backend
+        ┌────────────────┴──────────────────┐
+        ▼                                   ▼
+  native Rust core (in-process)      backends (Python)
+  schemas · promotion · inference    StableHLO export · numpy interpreter
+  vectorize/vmap · AD · batch_       iree / xla / tvm adapters
+  functions  →  evoxc._evoxc_native
 ────────────────── runtime boundary ──────────────────
                      Tensor  +  DLPack
 ```
+Builtin graph transformations are one Rust implementation, reached through the `evoxc._evoxc_native` PyO3 extension (built by maturin, shipped in the `evoxc` wheel).
 
 **Pipeline objects (public types):** `Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor`. Each is a distinct public type; functions never silently consume an earlier-stage object and perform missing steps.
 
