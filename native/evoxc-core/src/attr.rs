@@ -156,9 +156,17 @@ impl AttrValue {
                 .as_bool()
                 .map(AttrValue::Bool)
                 .ok_or_else(|| Error::verification(format!("expected a bool, got {value}"))),
+            // Try the unsigned reading first: `as_i64` returns `None` for any
+            // integer above `i64::MAX` (the frontend stamps `random_key_mix`'s
+            // splitmix64 salt `0x9E3779B97F4A7C15` as a plain Python int), and
+            // the two's-complement cast keeps the bit pattern the engine reads
+            // back with `as u64`.  Non-negative values within `i64` range are
+            // unchanged by the cast, and negatives fall through to `as_i64` so
+            // they stay signed and exact.
             attr_type::INT => value
-                .as_i64()
-                .map(AttrValue::Int)
+                .as_u64()
+                .map(|unsigned| AttrValue::Int(unsigned as i64))
+                .or_else(|| value.as_i64().map(AttrValue::Int))
                 .ok_or_else(|| Error::verification(format!("expected an int, got {value}"))),
             attr_type::FLOAT => value
                 .as_f64()
@@ -784,6 +792,55 @@ mod tests {
         let json = serde_json::json!({"axis": null, "keepdims": false});
         let attrs = Attrs::from_json_map(json.as_object().unwrap(), op).unwrap();
         assert_eq!(attrs.opt_i64("axis").unwrap(), None);
+    }
+    #[test]
+    fn int_attribute_decodes_unsigned_values_above_i64_max() {
+        // The frontend stamps `random_key_mix`'s splitmix64 golden salt
+        // (0x9E3779B97F4A7C15 = 11400714819323198485) as a plain Python int,
+        // so it arrives as an unsigned JSON integer above `i64::MAX`.  The
+        // decode narrows the two's-complement bit pattern, which the engine
+        // reads back with an `as u64` cast.
+        let salt: u64 = 0x9E37_79B9_7F4A_7C15;
+        assert_eq!(salt, 11_400_714_819_323_198_485);
+        let json = serde_json::json!(salt);
+        let decoded = AttrValue::from_json(attr_type::INT, &json).unwrap();
+        assert_eq!(decoded, AttrValue::Int(salt as i64));
+        // Bit-for-bit when read back as an unsigned 64-bit value.
+        assert_eq!(decoded.as_i64().unwrap() as u64, salt);
+        // The wire form stays an integer and decode(encode(x)) == x holds.
+        let encoded = decoded.to_json();
+        assert!(encoded.is_i64(), "int attributes encode as signed JSON ints");
+        assert_eq!(encoded, serde_json::json!(salt as i64));
+        assert_eq!(AttrValue::from_json(attr_type::INT, &encoded).unwrap(), decoded);
+        // The same path through the schema (the shape the bug hit).
+        let op = require("random_key_mix").unwrap();
+        let attrs_json = serde_json::json!({"algorithm": "splitmix64", "salt": salt});
+        let attrs = Attrs::from_json_map(attrs_json.as_object().unwrap(), op).unwrap();
+        assert_eq!(attrs.i64("salt").unwrap() as u64, salt);
+    }
+    #[test]
+    fn negative_int_attribute_still_decodes_and_roundtrips() {
+        for value in [-5i64, -1, i64::MIN] {
+            let json = serde_json::json!(value);
+            let decoded = AttrValue::from_json(attr_type::INT, &json).unwrap();
+            assert_eq!(decoded, AttrValue::Int(value));
+            assert_eq!(decoded.to_json(), json, "negative int must stay signed");
+            assert_eq!(AttrValue::from_json(attr_type::INT, &decoded.to_json()).unwrap(), decoded);
+        }
+        // Non-negative values within i64 range keep their exact value.
+        for value in [0i64, 3, i64::MAX] {
+            let decoded = AttrValue::from_json(attr_type::INT, &serde_json::json!(value)).unwrap();
+            assert_eq!(decoded, AttrValue::Int(value));
+            assert_eq!(decoded.to_json(), serde_json::json!(value));
+        }
+    }
+    #[test]
+    fn int_attribute_rejects_non_integers() {
+        for payload in [serde_json::json!(1.5), serde_json::json!(true), serde_json::json!("3")] {
+            let err = AttrValue::from_json(attr_type::INT, &payload).unwrap_err();
+            assert_eq!(err.kind_str(), "VerificationError", "{}", err.message);
+            assert!(err.message.contains("expected an int"), "{}", err.message);
+        }
     }
 
     #[test]

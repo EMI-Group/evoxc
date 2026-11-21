@@ -52,7 +52,7 @@ impl ScalarValue {
 }
 
 /// One concrete Rust scalar type backed by an evoxc dtype.
-pub trait Scalar: Copy + PartialEq + 'static {
+pub trait Scalar: Copy + PartialEq + 'static + Send + Sync {
     const DTYPE: DType;
     fn to_scalar(self) -> ScalarValue;
     fn from_scalar(value: ScalarValue) -> Self;
@@ -63,6 +63,10 @@ pub trait Scalar: Copy + PartialEq + 'static {
     }
     /// Wrap a finished output vector in the matching [`Storage`] variant.
     fn into_storage(values: Vec<Self>) -> Storage;
+    /// Move this dtype's vector out of `storage`, leaving an empty one behind
+    /// (`None` when the variant does not match) — how the result-storage pool
+    /// reclaims a finished result's allocation, see `buffer`'s pool note.
+    fn take_vec(storage: &mut Storage) -> Option<Vec<Self>>;
 }
 
 /// The arithmetic and transcendental operation set kernels use.
@@ -127,6 +131,12 @@ macro_rules! impl_int_scalar {
             }
             fn into_storage(values: Vec<Self>) -> Storage {
                 Storage::$variant(values)
+            }
+            fn take_vec(storage: &mut Storage) -> Option<Vec<Self>> {
+                match storage {
+                    Storage::$variant(values) => Some(std::mem::take(values)),
+                    _ => None,
+                }
             }
         }
         impl Num for $ty {
@@ -267,6 +277,12 @@ macro_rules! impl_uint_scalar {
             fn into_storage(values: Vec<Self>) -> Storage {
                 Storage::$variant(values)
             }
+            fn take_vec(storage: &mut Storage) -> Option<Vec<Self>> {
+                match storage {
+                    Storage::$variant(values) => Some(std::mem::take(values)),
+                    _ => None,
+                }
+            }
         }
         impl Num for $ty {
             fn add(self, other: Self) -> Self {
@@ -380,6 +396,12 @@ macro_rules! impl_float_scalar {
             }
             fn into_storage(values: Vec<Self>) -> Storage {
                 Storage::$variant(values)
+            }
+            fn take_vec(storage: &mut Storage) -> Option<Vec<Self>> {
+                match storage {
+                    Storage::$variant(values) => Some(std::mem::take(values)),
+                    _ => None,
+                }
             }
         }
         impl Num for $ty {
@@ -525,6 +547,12 @@ impl Scalar for f16 {
     fn into_storage(values: Vec<Self>) -> Storage {
         Storage::F16(values)
     }
+    fn take_vec(storage: &mut Storage) -> Option<Vec<Self>> {
+        match storage {
+            Storage::F16(values) => Some(std::mem::take(values)),
+            _ => None,
+        }
+    }
 }
 
 impl Num for f16 {
@@ -639,6 +667,12 @@ macro_rules! impl_complex_scalar {
             }
             fn into_storage(values: Vec<Self>) -> Storage {
                 Storage::$variant(values)
+            }
+            fn take_vec(storage: &mut Storage) -> Option<Vec<Self>> {
+                match storage {
+                    Storage::$variant(values) => Some(std::mem::take(values)),
+                    _ => None,
+                }
             }
         }
         impl Num for Complex<$real> {
@@ -757,6 +791,12 @@ impl Scalar for bool {
     }
     fn into_storage(values: Vec<Self>) -> Storage {
         Storage::Bool(values)
+    }
+    fn take_vec(storage: &mut Storage) -> Option<Vec<Self>> {
+        match storage {
+            Storage::Bool(values) => Some(std::mem::take(values)),
+            _ => None,
+        }
     }
 }
 
