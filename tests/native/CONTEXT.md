@@ -8,7 +8,7 @@ CPU only and self-contained: no test here requires the Rust crate or a built ext
 ## API under test
 
 - `evoxc._native_codec`: `ENVELOPE_FORMAT`, `encode_module`, `decode_module`, `encode_type`, `decode_type`.
-- `evoxc._native`: `available`, `require`, `version`, `infer`, `transform`, `NATIVE_LIB_ENV`, `EXTENSION_MODULE_NAME`.
+- `evoxc._native`: `available`, `require`, `version`, `infer`, `transform`, `batch_functions`, `batching_rule_keys`, `NATIVE_LIB_ENV`, `EXTENSION_MODULE_NAME`.
 
 ## Constraints
 
@@ -18,4 +18,4 @@ CPU only and self-contained: no test here requires the Rust crate or a built ext
 
 ## Status
 
-Delegation from `ir/inference.py` and the transforms to this seam lands in a later pass; these tests pin the seam itself.
+The transforms delegate to this seam (the engine is the single transform implementation), `batch_functions` consults `batching_rule_keys`, and trace-time inference still runs in Python (`ir/inference.py`); these tests pin the seam itself.
