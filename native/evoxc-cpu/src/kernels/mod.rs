@@ -31,6 +31,7 @@ pub mod elementwise;
 pub mod indexing;
 pub mod linalg;
 pub mod linalg_aux;
+mod pow;
 pub mod random;
 pub mod reductions;
 pub mod sorting;

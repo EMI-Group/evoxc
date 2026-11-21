@@ -41,6 +41,8 @@ Every dense IR op has a native kernel (94 of the 119 op defs; the rest are `retu
 | collective | `rank`, `world_size`, `all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast_collective`, `collective_permute` |
 | random | `random_key_mix`, `random_uniform`, `random_normal`, `random_randint`, `random_permutation`, `random_multinomial` |
 
+`dot` is numpy's `matmul` contraction: a rank-1 operand is promoted to a 1-row (resp. 1-column) matrix and the batch dims broadcast.
+Its plain matrix-matrix form in f32/f64 — both operands rank >= 2, C-contiguous batch blocks — runs through the `matrixmultiply` BLAS-3 kernel, one `sgemm`/`dgemm` call (alpha 1, beta 0) per batch element; every other dtype or shape keeps the general triple loop, so integer and complex results stay bit-exact and only the two IEEE float dtypes see a different (association-order) summation.
 Semantics are the numpy backend's, op by op: `remainder` is floormod (sign of the divisor), `round` is half-to-even, `maximum`/`minimum` propagate NaN and reject complex, comparisons produce bool and complex supports only `equal`/`not_equal`, `abs` on complex is the real magnitude, integer `divide`/`remainder` by zero and a negative integer exponent are explicit errors, integer arithmetic wraps like numpy.
 `if` takes a 0-d bool predicate in operand 0 and passes ALL operands as region arguments; `while` has regions `[cond, body]` with no iteration limit; `call` runs the callee's entry block.
 Result validation matches the numpy interpreter's messages ("kernel for op '{op}' produced result {i} with …"), a dtype mismatch is a `BackendError` and a shape mismatch a `ShapeError`.
@@ -49,36 +51,41 @@ Random is BIT-EXACT with `../evoxc/backends/numpy/kernels/random.py` for splitmi
 
 ## Performance (measured on this host, shared CPU)
 
-Intel Core Ultra 7 356H, 16 cpus, loadavg 4.3–6.4 during the runs, Python 3.14.10 / numpy 2.5.2.
+Intel Core Ultra 7 356H, 16 cpus, loadavg 2.7–3.6 during the recorded runs, Python 3.14.10 / numpy 2.5.2.
 Warm `run` = median of 25 iterations after 5 warmups; the numpy leg is `evoxc.build(fn, *specs, backend="numpy")` + `evoxc.run` (`evoxc.evaluate` re-traces per call). Reproduce with `.venv/bin/python native/tools/bench_cpu.py` (records `model name` and loadavg itself).
 
 | workload | ops | native compile (ms) | native run (ms) | numpy run (ms) | speedup |
 |---|---|---|---|---|---|
-| `ew_chain_1e6` (8 elementwise ops, 1e6 f32) | 14 | 0.062 | 41.83 | 3.00 | 0.07× |
-| `ew_transcendental_1e6` (`erf`/`gelu`/`tanh` chain) | 7 | 0.035 | 37.81 | 181.62 | 4.80× |
-| `dot_sum_256` (256² f32 `dot` + row sum) | 3 | 0.029 | 10.74 | 15.86 | 1.48× |
-| `gp_gather_4096` (GP-shaped gather/select chain) | 80 | 0.534 | 19.52 | 0.86 | 0.04× |
-| `chain_2000` (2000-op elementwise chain) | 2000 | 8.962 | 0.34 | 1.53 | 4.51× |
+| `ew_chain_1e6` (8 elementwise ops, 1e6 f32) | 14 | 0.062 | 9.75 | 2.89 | 0.30× |
+| `ew_transcendental_1e6` (`erf`/`gelu`/`tanh` chain) | 7 | 0.036 | 27.31 | 161.85 | 5.93× |
+| `dot_sum_256` (256² f32 `dot` + row sum) | 3 | 0.028 | 0.695 | 0.99 | 1.43× |
+| `gp_gather_4096` (GP-shaped gather/select chain) | 80 | 0.314 | 1.19 | 0.79 | 0.66× |
+| `chain_2000` (2000-op elementwise chain) | 2000 | 7.521 | 0.102 | 1.328 | 13.08× |
 
-Compile target: the ENGINE's plan compile for a 2000-op graph is **0.811 ms** (target ≤ ~2 ms — pass); the full `native_compile` is 8.962 ms, of which 8.15 ms is envelope decode + FFI crossings, and the Python trace + `encode_module` on the caller's side is ~31 ms.
+One recorded run (`loadavg 3.25, 2.75, 2.78`); four runs of this build spanned `ew_chain_1e6` 9.75–10.10 ms, `ew_transcendental_1e6` 27.02–27.36 ms, `dot_sum_256` 0.692–0.699 ms (median 0.695), `gp_gather_4096` 1.19–2.65 ms and `chain_2000` 0.098–0.135 ms, so treat single-row deltas under ~30 % as host noise.
+`dot_sum_256`'s numpy leg is the unstable one: 0.108–2.13 ms across runs for the same cell (BLAS thread contention on a loaded host).
+
+Compile target: the ENGINE's plan compile for a 2000-op graph is **0.758 ms** (target ≤ ~2 ms — pass); the full `native_compile` is 7.521 ms, of which ~6.8 ms is envelope decode + FFI crossings, and the Python trace + `encode_module` on the caller's side is ~27 ms.
 
 Reading of the numbers, which is load- and shape-dependent:
-- Native elementwise kernels cost ~3 ns/element and the call has a sizeable fixed cost, so on large flat elementwise arrays numpy's vectorized ufuncs win (0.07×); native wins where numpy's per-op dispatch dominates (`chain_2000` at 0.17 µs/op, 4.5×) and where numpy's composition is expensive (`erf`/`gelu`, 4.8×).
-- `dot` at 256² runs ~3 GFLOP/s single-threaded here; numpy's BLAS leg is unstable on this loaded host (0.11–15.9 ms across runs for the same cell — thread contention), so that row is indicative only.
+- The broadcast-free elementwise paths are auto-vectorized (one monomorphized map per op into a freshly built result), which puts the 1e6-element chain at ~1.2 ns/element-op and makes it memory-bound; numpy still wins on ONE large flat array (0.30×) because nothing fuses the whole chain into a single pass. `power` additionally dispatches on a scalar exponent once per call (`kernels/pow.rs`).
+- `dot` at 256² runs ~48 GFLOP/s single-threaded through the BLAS-3 kernel (2·256³ FLOP in ~0.70 ms — a 15× improvement over the ~3.2 GFLOP/s general triple loop it replaces), so its numpy comparison swings with the BLAS leg's contention rather than with the engine.
+- native wins where numpy's per-op dispatch dominates (`chain_2000` at 0.05 µs/op, 13×) and where numpy's composition is expensive (`erf`/`gelu`, 5.9×).
 - Per-op overhead, not per-element throughput, is the current strength; the gather-heavy row is numpy's best case (a single fancy-index ufunc) and native's worst.
 - Compiled plans are reusable across runs (`Arc<Plan>`), so a caller that keeps the plan pays only `run`.
 
 ## Constraints
 
-- Depends on `evoxc-core` only — never `evoxc-compiler`, `evoxc-runtime`, `evoxc-python` or PyO3. Third-party deps: `half` (f16), `num-complex` (complex), `libm` (`erf`, `ln_1p`), `nalgebra` (linalg), `serde_json` (`block_call.static_args`).
-- No `unsafe` anywhere in this crate; user errors are `Result` values — no `unwrap`/`expect` on user input, no panics on malformed graphs.
+- Depends on `evoxc-core` only — never `evoxc-compiler`, `evoxc-runtime`, `evoxc-python` or PyO3. Third-party deps: `half` (f16), `num-complex` (complex), `libm` (`erf`, `ln_1p`), `nalgebra` (linalg), `serde_json` (`block_call.static_args`) and `matrixmultiply` — the ONE performance dependency, a pure-Rust BLAS-3 microkernel used only by `dot`'s f32/f64 fast path (no threading feature, single-threaded by design).
+- No `unsafe` logic of our own: the crate's only `unsafe` is the two `matrixmultiply` kernel calls, one macro-generated call site per float dtype in `kernels/linalg.rs`, each carrying a `SAFETY` argument that the three slices are exactly `m·k`/`k·n`/`m·n` long and the output is a fresh allocation that aliases neither input.
+- User errors are `Result` values — no `unwrap`/`expect` on user input, no panics on malformed graphs; a shape or dtype the fast path does not cover falls back to the general kernel, never to an error.
 - Result types and shapes come from the graph; never re-infer, and always validate produced buffers against `OpSpec.result_types`.
-- One file per op category, each under ~1000 lines (test modules included; `kernels/indexing.rs`, `kernels/linalg.rs` and `kernels/random.rs` run over it because their per-op unit tests live inline).
+- One file per op category, each around ~1000 lines (test modules included; `kernels/indexing.rs`, `kernels/linalg.rs`, `kernels/random.rs` and `kernels/elementwise.rs` run over it because their per-op unit tests live inline). `power`'s scalar-exponent specialisation is the one split-out category module, `kernels/pow.rs`.
 - `cargo test -p evoxc-cpu` and `cargo clippy --workspace --all-targets --no-deps -- -D warnings` must stay clean.
 
 ## Test strategy
 
-- In-crate `#[cfg(test)]` per module: **158 lib tests** — kernel numerics (promotions, NaN/complex/rounding edge cases, error cases), symbolic-dim binding and the `DimExpr` failure modes, control flow (nested regions, multi-carry loops, recursion depth), the bit-exact random vectors for all three algorithms, collectives, plus the two registry-inventory tests that pin `unsupported_ops()` to empty.
+- In-crate `#[cfg(test)]` per module: **176 lib tests** — kernel numerics (promotions, NaN/complex/rounding edge cases, error cases), symbolic-dim binding and the `DimExpr` failure modes, control flow (nested regions, multi-carry loops, recursion depth), the bit-exact random vectors for all three algorithms, collectives, plus the two registry-inventory tests that pin `unsupported_ops()` to empty.
 - Python parity harness `../tools/parity_cpu.py` (needs `scripts/build-native.sh` first and a `.venv`): 63 cases over elementwise/reductions/indexing/linalg/control-flow/random/dynamic-shape graphs, comparing `NativeProgram` against the numpy backend — **63 passed, 0 failed**; exact for bool/int, `rtol 1e-5 / atol 1e-6` for f16/f32/c64 and `1e-12/1e-13` for f64/c128, with bit-exact RNG leaves (`PASS~` only for f32 `normal`, the documented 1-ulp Box–Muller window) and error parity when both sides raise.
 - `../tools/bench_cpu.py` reproduces the table above.
 - Tests never require a GPU, the network or Python (the Python harnesses are separate scripts, not cargo tests).
@@ -87,7 +94,8 @@ Reading of the numbers, which is load- and shape-dependent:
 
 - **`random_key_mix` salt above `i64::MAX`:** the frontend stamps the splitmix64 golden-ratio salt (`0x9E3779B97F4A7C15`) as a plain Python int, and `evoxc-core/src/attr.rs` decodes the `int` attribute tag through `serde_json::Value::as_i64`, so an unsigned salt that does not fit `i64` is rejected at envelope decode (`expected an int, got 11400714819323198485`). The engine casts the attribute with `as u64`, so a two's-complement value is bit-identical; the parity harness narrows the attribute. Fixing it belongs to `evoxc-core`'s attribute decoding, not here (out of this node's contract — report upstream).
 - **`sort`/`argsort` are always stable:** with `stable=false` and duplicate values, numpy's quicksort may return a different (equally valid) permutation. One stable code path; ties are order-stable rather than numpy-quicksort-order.
-- **Elementwise throughput is scalar:** one element at a time through the `Scalar`/`Num` generics (~3 ns/element on f32). Batch-wide fusion, SIMD or `rayon` are not wired; the win today is per-op overhead, not element throughput.
+- **Elementwise throughput is per-op auto-vectorized, not fused:** a broadcast-free operand (the common case) runs one monomorphized map per op into a freshly built result, so LLVM vectorizes the loop (~1.2 ns/element-op on f32 at 1e6 elements, memory-bound); a genuine broadcast keeps the general strided driver. There is no batch-wide fusion across ops and no `rayon`, so one large flat array still loses to numpy's single ufunc.
+- **`power` is specialised apart from the rest of the elementwise family:** `kernels/pow.rs` owns numpy's `npy_pow` arm table (`0`/`1`/`2`/`3`/`0.5`/`-1`/small-integer exponents, f32/f64 only, scalar exponent only) plus the negative-integer-exponent guard; `elementwise::binary` calls into it for the `power` kind and keeps the generic driver for everything else.
 - **Single-rank only:** the collectives are identity kernels guarded by `world_size == 1`; a rank/world-size context exists (`RunOptions`) but no multi-rank executor.
 - **Host callbacks are the caller's job:** `block_call`, `external_call` and `runtime_call` dispatch through the `Callbacks` trait; `run_program` refuses a callback-needing plan without one, and the FFI's `resolver` is `None` by default. Results returned by a callback are validated like any kernel result.
 - **f32 `normal` is not bit-exact by design:** it shares the numpy backend's Box–Muller fast path (within 1 ulp); every other random path (integer words, `uniform`, f64 `normal`) is bit-exact.
@@ -98,7 +106,7 @@ Reading of the numbers, which is load- and shape-dependent:
 
 | Path | Area |
 |---|---|
-| `./Cargo.toml` | Crate manifest: `evoxc-core` + `half` / `num-complex` / `libm` / `nalgebra` / `serde_json`. |
+| `./Cargo.toml` | Crate manifest: `evoxc-core` + `half` / `num-complex` / `libm` / `nalgebra` / `serde_json` / `matrixmultiply`. |
 | `./src/lib.rs` | Module wiring, `run_program` / `evaluate`, the callback-requirement pre-flight. |
 | `./src/plan.rs` | `compile(&Program) -> Plan`: `OpSpec`, `Step` (kernel, operand/result ids, liveness, static fast path), `BlockPlan`, `FunctionPlan`, `Plan::text()`, unsupported-op rejection. |
 | `./src/exec.rs` | `RunCtx` (flat store, region execution, dim binding, result validation), `Callbacks`, `RunOptions`, `Value`. |
@@ -106,7 +114,8 @@ Reading of the numbers, which is load- and shape-dependent:
 | `./src/scalar.rs` | `Scalar` / `Num` / `ScalarValue` and the per-dtype numpy-semantics impls. |
 | `./src/dims.rs` | Symbolic-dim binding and `DimExpr` evaluation (the `shapes.py` contract). |
 | `./src/kernels/mod.rs` | `DENSE_OPS`, the kernel registry, `unsupported_ops()`, the registry-inventory tests. |
-| `./src/kernels/{elementwise,reductions,sorting,indexing,structure,linalg,linalg_aux,random,control,collective}.rs` | Per-category kernels (each file owns its op set and its inline unit tests). |
-| `./src/kernels/util.rs` | Axis normalization, dtype/shape helpers, shared result-shape lookup. |
+| `./src/kernels/{elementwise,reductions,sorting,indexing,structure,linalg,linalg_aux,random,control,collective}.rs` | Per-category kernels (each file owns its op set and its inline unit tests). `linalg.rs` also holds `dot`'s `matrixmultiply` fast path and its guard. |
+| `./src/kernels/pow.rs` | `power`'s scalar-exponent specialisation (`PowBase`/`powi`/`PowScalar`/`pow_scalar`), the negative-integer-exponent guard and its unit tests; private to `kernels`. |
+| `./src/kernels/util.rs` | Axis normalization, dtype/shape helpers, shared result-shape lookup (genuinely shared vocabulary only). |
 | `../tools/parity_cpu.py` | Python parity harness against the numpy backend (63 cases). |
 | `../tools/bench_cpu.py` | Native-vs-numpy benchmark, the source of the table above. |

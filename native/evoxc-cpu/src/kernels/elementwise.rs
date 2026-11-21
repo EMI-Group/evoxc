@@ -6,6 +6,7 @@
 //! broadcast loop with no allocation beyond the result.  The two exception
 //! shapes are comparisons (computed in the promoted INPUT dtype, producing
 //! `bool`) and `abs` of a complex value (magnitude, a real result).
+//! `power`'s scalar-exponent specialisation lives in [`super::pow`].
 use evoxc_core::{AttrValue, DType, Error, Result};
 use half::f16;
 use num_complex::Complex;
@@ -15,6 +16,7 @@ use crate::buffer::{
     apply2, apply3, broadcast_shape, broadcast_to, map1, map2, map3, shape_text, Buffer, Storage,
 };
 use crate::exec::{single, RunCtx, Value};
+use crate::kernels::pow;
 use crate::kernels::util;
 use crate::kernels::KernelMap;
 use crate::plan::OpSpec;
@@ -152,7 +154,9 @@ fn binary_kernel(
     binary(spec, &operands[0], &operands[1])
 }
 
-fn binary(spec: &OpSpec, lhs: &Value, rhs: &Value) -> Result<Vec<Value>> {
+/// The `power` specialisation's tests live in [`super::pow`] and reach this
+/// entry point, so it is crate-visible.
+pub(crate) fn binary(spec: &OpSpec, lhs: &Value, rhs: &Value) -> Result<Vec<Value>> {
     // Shared, immutable values: `power(x, 1.0)` hands `lhs` back as its result
     // rather than copying it.
     let (a, b) = (&**lhs, &**rhs);
@@ -195,20 +199,15 @@ fn binary(spec: &OpSpec, lhs: &Value, rhs: &Value) -> Result<Vec<Value>> {
         reject_zero_divisor(name, right)?;
     }
     if compute.is_int() && kind == BinKind::Pow {
-        reject_negative_exponent(name, right)?;
+        pow::reject_negative_exponent(name, right)?;
     }
     if kind == BinKind::Pow {
-        // A size-one exponent is known once per call, so `power` can dispatch on
-        // its value instead of paying libm `powf` per element (numpy's `npy_pow`
-        // does the same).  `left_owned.is_none()` says the base is the caller's
-        // own buffer, which makes the exponent-1 identity free.
-        if let Some(fast) =
-            util::pow_scalar(&out_shape, left, right, left_owned.is_none())?
-        {
-            return match fast {
-                util::PowScalar::Reuse => Ok(vec![lhs.clone()]),
-                util::PowScalar::Built(buffer) => single(buffer),
-            };
+        // A size-one exponent is known once per call, so `power` dispatches on
+        // its value instead of paying libm `powf` per element; the whole
+        // specialisation (the `left_owned.is_none()` identity arm included) is
+        // in `kernels::pow`.
+        if let Some(out) = pow::scalar_power(&out_shape, left, right, left_owned.is_none(), lhs)? {
+            return Ok(out);
         }
     }
     with_same_type!(left, right, |x, y| {
@@ -242,21 +241,6 @@ fn reject_zero_divisor(name: &str, divisor: &Buffer) -> Result<()> {
     Ok(())
 }
 
-fn reject_negative_exponent(name: &str, exponent: &Buffer) -> Result<()> {
-    let negative = match &exponent.storage {
-        Storage::I8(v) => v.iter().any(|value| *value < 0),
-        Storage::I16(v) => v.iter().any(|value| *value < 0),
-        Storage::I32(v) => v.iter().any(|value| *value < 0),
-        Storage::I64(v) => v.iter().any(|value| *value < 0),
-        _ => false,
-    };
-    if negative {
-        return Err(Error::backend(format!(
-            "op '{name}': negative integer exponent is not supported"
-        )));
-    }
-    Ok(())
-}
 
 fn validate_binary(name: &str, kind: BinKind, dtype: DType) -> Result<()> {
     if dtype.is_complex() && (matches!(kind, BinKind::Max | BinKind::Min | BinKind::Rem) || is_bitwise(kind)) {
@@ -1325,134 +1309,4 @@ mod tests {
         );
     }
 
-    // -- `power` with a scalar exponent ------------------------------------
-
-    // -- `power` with a scalar exponent ------------------------------------
-
-    fn pow_spec(dtype: DType, shape: &[usize]) -> OpSpec {
-        spec("power", ValueType::of(dtype, shape.iter().map(|dim| Dim::int(*dim as i64))))
-    }
-
-    /// `power(x, exponent)` through the kernel; the exponent is a rank-0 buffer.
-    fn pow_f32(x: &[f32], exponent: f32) -> Vec<f32> {
-        let base = buffer(DType::Float32, &[x.len()], Storage::F32(x.to_vec()));
-        let exponent = buffer(DType::Float32, &[], Storage::F32(vec![exponent]));
-        let out = binary(&pow_spec(DType::Float32, &[x.len()]), &base, &exponent).unwrap();
-        match &out[0].storage {
-            Storage::F32(values) => values.clone(),
-            other => panic!("unexpected storage {other:?}"),
-        }
-    }
-
-    /// Bit-exact comparison (NaN payloads and signed zeros included).
-    fn assert_bits_f32(got: &[f32], expected: &[f32], what: &str) {
-        assert_eq!(got.len(), expected.len(), "{what}: length");
-        for (index, (have, want)) in got.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(want.to_bits(), have.to_bits(), "{what}: index {index}");
-        }
-    }
-
-    #[test]
-    fn power_integer_exponents_use_repeated_squaring() {
-        // An INTEGER exponent is cast to the float compute dtype first, so it
-        // reaches the same fast path: 0 -> ones, 1 -> the base itself (reused,
-        // not copied), 5 -> `x * x^2 * x^2` by repeated squaring.
-        let x = [1.0000001f32, -2.0, 3.0, 0.0];
-        let base = buffer(DType::Float32, &[x.len()], Storage::F32(x.to_vec()));
-        let op = pow_spec(DType::Float32, &[x.len()]);
-        let integer = |value: i32| buffer(DType::Int32, &[], Storage::I32(vec![value]));
-        let f32_values = |out: Vec<Value>| match &out[0].storage {
-            Storage::F32(values) => values.clone(),
-            other => panic!("unexpected storage {other:?}"),
-        };
-        assert_eq!(f32_values(binary(&op, &base, &integer(0)).unwrap()), vec![1.0; x.len()]);
-        let shared = std::rc::Rc::new(base.clone());
-        let out = super::binary(&op, &shared, &std::rc::Rc::new(integer(1))).unwrap();
-        assert!(std::rc::Rc::ptr_eq(&out[0], &shared));
-        assert_eq!(f32_values(out), x.to_vec());
-        let five = f32_values(binary(&op, &base, &integer(5)).unwrap());
-        for (index, value) in x.iter().enumerate() {
-            let exact = (value * value) * (value * value) * value;
-            assert_eq!(exact.to_bits(), five[index].to_bits(), "x ** 5: index {index}");
-            let reference = value.powf(5.0);
-            assert!(
-                (reference - five[index]).abs() <= reference.abs() * 2e-7,
-                "x ** 5 at index {index}: {reference} vs {}",
-                five[index]
-            );
-        }
-    }
-
-    #[test]
-    fn power_keeps_the_general_path_for_everything_else() {
-        // A fractional exponent: one `powf` per element.
-        let x = [2.0f32, 3.0, -2.0, 0.5];
-        assert_bits_f32(
-            &pow_f32(&x, 2.5),
-            &x.map(|value| value.powf(2.5)),
-            "x ** 2.5",
-        );
-        // A negative base with a fractional exponent stays NaN.
-        assert!(pow_f32(&[-2.0, -0.5], 0.5).iter().all(|value| value.is_nan()));
-        assert!(pow_f32(&[-2.0, -0.5], 2.5).iter().all(|value| value.is_nan()));
-
-        // A (2, 2) exponent against a (2,) base: no size-one exponent, so the
-        // general broadcast driver computes one `powf` per element.
-        let base = buffer(DType::Float32, &[2], Storage::F32(vec![2.0, 3.0]));
-        let exponent = buffer(
-            DType::Float32,
-            &[2, 2],
-            Storage::F32(vec![2.0, 3.0, 0.5, -1.0]),
-        );
-        let out = binary(&pow_spec(DType::Float32, &[2, 2]), &base, &exponent).unwrap();
-        match &out[0].storage {
-            Storage::F32(values) => assert_bits_f32(
-                values,
-                &[4.0, 27.0, std::f32::consts::SQRT_2, 1.0 / 3.0],
-                "broadcast exponent",
-            ),
-            other => panic!("unexpected storage {other:?}"),
-        }
-
-        // The scalar on the LEFT has no shortcut (`2 ** x` is not `x ** 2`).
-        let two = buffer(DType::Float32, &[], Storage::F32(vec![2.0]));
-        let base = buffer(DType::Float32, &[3], Storage::F32(vec![0.5, 3.0, -1.0]));
-        let out = binary(&pow_spec(DType::Float32, &[3]), &two, &base).unwrap();
-        match &out[0].storage {
-            Storage::F32(values) => assert_bits_f32(
-                values,
-                &[0.5f32, 3.0, -1.0].map(|value| 2.0f32.powf(value)),
-                "2 ** x",
-            ),
-            other => panic!("unexpected storage {other:?}"),
-        }
-
-        // A size-one exponent buffer that is not rank 0 takes the fast path.
-        let base = buffer(DType::Float32, &[2], Storage::F32(vec![1.0000001, -2.0]));
-        let one = buffer(DType::Float32, &[1], Storage::F32(vec![2.0]));
-        let out = binary(&pow_spec(DType::Float32, &[2]), &base, &one).unwrap();
-        match &out[0].storage {
-            Storage::F32(values) => assert_bits_f32(values, &[1.0000002, 4.0], "x ** [2.0]"),
-            other => panic!("unexpected storage {other:?}"),
-        }
-
-        // float16 is not specialised (numpy computes it in float32 and rounds
-        // back), so this stays the `powf` result; a cast base still produces a
-        // float result for the identity arm.
-        let near_one = f16::from_f32(1.0005);
-        let half = buffer(DType::Float16, &[2], Storage::F16(vec![f16::from_f32(3.0), near_one]));
-        let exponent = buffer(DType::Float16, &[], Storage::F16(vec![f16::from_f32(3.0)]));
-        let out = binary(&pow_spec(DType::Float16, &[2]), &half, &exponent).unwrap();
-        assert_eq!(
-            out[0].storage,
-            Storage::F16(vec![
-                f16::from_f32(3.0f32.powf(3.0)),
-                f16::from_f32(near_one.to_f32().powf(3.0)),
-            ])
-        );
-        let ints = buffer(DType::Int32, &[3], Storage::I32(vec![1, -2, 7]));
-        let exponent = buffer(DType::Float32, &[], Storage::F32(vec![1.0]));
-        let out = binary(&pow_spec(DType::Float32, &[3]), &ints, &exponent).unwrap();
-        assert_eq!(out[0].storage, Storage::F32(vec![1.0, -2.0, 7.0]));
-    }
 }

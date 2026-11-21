@@ -65,6 +65,7 @@ dependencies = [
  "evoxc-core",
  "half",
  "libm",
+ "matrixmultiply",
  "nalgebra",
  "num-complex",
  "serde_json",

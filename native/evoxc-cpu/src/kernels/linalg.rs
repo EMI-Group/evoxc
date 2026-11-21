@@ -25,7 +25,7 @@ use evoxc_core::{AttrValue, Attrs, DType, Error, Result};
 use num_complex::Complex;
 use serde_json::Value as Json;
 
-use crate::buffer::{broadcast_shape, broadcast_strides, shape_text, walk, Buffer};
+use crate::buffer::{broadcast_shape, broadcast_strides, shape_text, walk, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::util::c_strides;
@@ -195,13 +195,17 @@ fn dot_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result<
         b_strides: broadcast_strides(b_batch, &batch),
         batch,
     };
-    let buffer = with_same_type!(left, right, |left_values, right_values| dot_run(
-        left_values,
-        right_values,
-        &geometry,
-        dtype,
-        out_shape
-    ))?;
+    let buffer = if let Some(fast) = dot_gemm(&left, &right, &geometry, dtype, &out_shape)? {
+        fast
+    } else {
+        with_same_type!(left, right, |left_values, right_values| dot_run(
+            left_values,
+            right_values,
+            &geometry,
+            dtype,
+            out_shape
+        ))?
+    };
     single(buffer)
 }
 
@@ -233,6 +237,157 @@ fn dot_run<T: Num>(
         }
     });
     Buffer::new(dtype, out_shape, T::into_storage(out))
+}
+
+// -- the f32/f64 BLAS-3 fast path -------------------------------------------
+//
+// `dot`'s plain matrix-matrix form is the inner loop of every model forward and
+// of the GP/ES populations this engine runs, and the triple loop above is not
+// memory-blocked.  `matrixmultiply` is the crate's single performance
+// dependency: a pure-Rust BLAS-3 microkernel (packing + register blocking, SIMD
+// through autovectorization) with the same row-major `alpha * A * B + beta * C`
+// contract.  It is used ONLY for the plain form — both operands f32/f64, rank
+// >= 2, C-contiguous batch blocks — and every other shape/dtype keeps the
+// general kernel, so integer and complex results stay bit-exact.
+//
+// Association order inside the kernel differs from the triple loop (blocked
+// accumulation), which is why the fast path is restricted to the two IEEE float
+// dtypes: floating-point sums are order-dependent and that is expected, while
+// integer/complex arithmetic is never routed here.
+
+/// The float dtypes [`matrixmultiply`] provides a kernel for.  Only these two
+/// are implemented, so [`dot_gemm`]'s storage dispatch is the whole fast-path
+/// surface (no other dtype can reach [`gemm_run`]).
+trait Gemm: Num {
+    /// `c = a * b` for a row-major `m x k` `a`, `k x n` `b` and `m x n` `c`
+    /// (alpha `1`, beta `0`: `c`'s prior contents are irrelevant).
+    fn gemm_into(m: usize, k: usize, n: usize, a: &[Self], b: &[Self], c: &mut [Self]);
+}
+
+macro_rules! impl_gemm {
+    ($($ty:ty => $gemm:path),* $(,)?) => {$(
+        impl Gemm for $ty {
+            fn gemm_into(m: usize, k: usize, n: usize, a: &[Self], b: &[Self], c: &mut [Self]) {
+                // The slices are made exactly this long by `gemm_run`; a
+                // mismatch would be an engine bug, not a user error, so it is a
+                // debug-only assertion.
+                debug_assert!(
+                    a.len() == m * k && b.len() == k * n && c.len() == m * n,
+                    "dot: gemm slices must match the geometry"
+                );
+                // SAFETY: the kernel only touches `m * k`, `k * n` and `m * n`
+                // elements from the three pointers, and the borrowed slices are
+                // exactly that long, so every access stays inside them; the
+                // row-major strides (`k`/`n` between rows, `1` between columns)
+                // walk those same slices in bounds, and `c` is a fresh
+                // allocation that aliases neither input.
+                unsafe {
+                    $gemm(
+                        m,
+                        k,
+                        n,
+                        1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr(),
+                        n as isize,
+                        1,
+                        0.0,
+                        c.as_mut_ptr(),
+                        n as isize,
+                        1,
+                    );
+                }
+            }
+        }
+    )*};
+}
+
+impl_gemm!(f32 => matrixmultiply::sgemm, f64 => matrixmultiply::dgemm);
+
+/// True when the batch axes of one operand select CONTIGUOUS trailing blocks
+/// (`operand_batch ++ [rows, cols]` in C order): a broadcast axis carries the
+/// `0` stride [`broadcast_strides`] gives it (one shared block), every other
+/// axis the natural C-order stride.  `strides` are the BLOCK-unit strides
+/// `dot_run` indexes with (one unit = one `rows x cols` matrix), so the natural
+/// strides compared against are those of the operand's batch shape.
+fn blocks_contiguous(operand_batch: &[usize], batch: &[usize], strides: &[usize]) -> bool {
+    if operand_batch.len() > batch.len() || strides.len() != batch.len() {
+        return false;
+    }
+    // `batch` is `broadcast_shape`'s output, so the operand's batch shape is
+    // right-aligned against it (missing leading axes are size-one broadcasts).
+    let offset = batch.len() - operand_batch.len();
+    let mut natural = 1;
+    for axis in (0..batch.len()).rev() {
+        let extent = if axis >= offset { operand_batch[axis - offset] } else { 1 };
+        let expected = if extent == 1 { 0 } else { natural };
+        if strides[axis] != expected {
+            return false;
+        }
+        natural *= extent;
+    }
+    true
+}
+
+/// `dot` through the BLAS-3 kernel when the shape is the plain matrix-matrix
+/// one; `None` leaves the general kernel in charge (rank-1 operands, an empty
+/// contraction, a non-contiguous batch layout, or any dtype but f32/f64).
+fn dot_gemm(
+    left: &Buffer,
+    right: &Buffer,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+) -> Result<Option<Buffer>> {
+    if left.shape.len() < 2 || right.shape.len() < 2 || g.m == 0 || g.k == 0 || g.n == 0 {
+        return Ok(None);
+    }
+    let a_batch = &left.shape[..left.shape.len() - 2];
+    let b_batch = &right.shape[..right.shape.len() - 2];
+    if !blocks_contiguous(a_batch, &g.batch, &g.a_strides)
+        || !blocks_contiguous(b_batch, &g.batch, &g.b_strides)
+    {
+        return Ok(None);
+    }
+    match (dtype, &left.storage, &right.storage) {
+        (DType::Float32, Storage::F32(a), Storage::F32(b)) => gemm_run(a, b, g, dtype, out_shape),
+        (DType::Float64, Storage::F64(a), Storage::F64(b)) => gemm_run(a, b, g, dtype, out_shape),
+        _ => Ok(None),
+    }
+}
+
+/// One BLAS-3 call per batch element, writing straight into a freshly allocated
+/// result (every block is contiguous, so the kernel's out pointer is the block's
+/// own start).
+fn gemm_run<T: Gemm>(
+    a: &[T],
+    b: &[T],
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+) -> Result<Option<Buffer>> {
+    let block = g.m * g.n;
+    let a_block = g.m * g.k;
+    let b_block = g.k * g.n;
+    let mut out = vec![T::zero(); block * util::numel(&g.batch)];
+    let strides = [g.a_strides.clone(), g.b_strides.clone()];
+    let mut slot = 0usize;
+    walk(g.batch.len(), &g.batch, &strides, |offsets| {
+        let a_base = offsets[0] * a_block;
+        let b_base = offsets[1] * b_block;
+        T::gemm_into(
+            g.m,
+            g.k,
+            g.n,
+            &a[a_base..a_base + a_block],
+            &b[b_base..b_base + b_block],
+            &mut out[slot..slot + block],
+        );
+        slot += block;
+    });
+    Buffer::new(dtype, out_shape.to_vec(), T::into_storage(out)).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,6 +1324,242 @@ mod tests {
         let bad = value(DType::Int64, &[3, 1], Storage::I64(vec![1, 2, 3]));
         let err = dot_impl(&[a, bad], &op, vec![1, 1]).unwrap_err();
         assert!(err.message.contains("contracting dims 2 and 3"), "{}", err.message);
+    }
+
+    // --- dot: the f32/f64 BLAS-3 fast path ---------------------------------
+
+    /// The geometry `dot_impl` builds for two operands (natural C-order batch
+    /// blocks, so `blocks_contiguous` accepts it).
+    fn geometry(a: &Buffer, b: &Buffer) -> MatMul {
+        let (a_rank, b_rank) = (a.shape.len(), b.shape.len());
+        let (m, k) = (a.shape[a_rank - 2], a.shape[a_rank - 1]);
+        let n = b.shape[b_rank - 1];
+        let batch = broadcast_shape(&[&a.shape[..a_rank - 2], &b.shape[..b_rank - 2]]).unwrap();
+        MatMul {
+            m,
+            k,
+            n,
+            a_strides: broadcast_strides(&a.shape[..a_rank - 2], &batch),
+            b_strides: broadcast_strides(&b.shape[..b_rank - 2], &batch),
+            batch,
+        }
+    }
+
+    /// The GENERAL (pre-BLAS) kernel for the same operands — the reference the
+    /// fast path must agree with to within floating-point association.
+    fn general_dot(a: &Value, b: &Value, dtype: DType, out_shape: Vec<usize>) -> Buffer {
+        // A nested fn so `with_same_type!`'s dtype-mismatch `return` has a
+        // `Result` to return into.
+        fn run(a: &Buffer, b: &Buffer, g: &MatMul, dtype: DType, out: Vec<usize>) -> Result<Buffer> {
+            let left = a.cast(dtype)?;
+            let right = b.cast(dtype)?;
+            with_same_type!(left, right, |x, y| dot_run(x, y, g, dtype, out.clone()))
+        }
+        run(a, b, &geometry(a, b), dtype, out_shape).unwrap()
+    }
+
+    fn f32s(buffer: &Buffer) -> Vec<f32> {
+        match &buffer.storage {
+            Storage::F32(values) => values.clone(),
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// Relative comparison (`tolerance * max(|want|, 1)`), the documented budget
+    /// for the blocked accumulation order.
+    fn assert_relative(actual: &[f32], expected: &[f32], tolerance: f32, what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            let budget = tolerance * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= budget,
+                "{what}: index {index}: {got} vs {want} (budget {budget})"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_matrix_matrix_uses_blas_and_matches_hand_and_general() {
+        // 2x3 @ 3x2, hand-computed: [[58, 64], [139, 154]].
+        let a = value(DType::Float32, &[2, 3], Storage::F32(vec![1., 2., 3., 4., 5., 6.]));
+        let b = value(DType::Float32, &[3, 2], Storage::F32(vec![7., 8., 9., 10., 11., 12.]));
+        let op = spec("dot", DType::Float32, &[2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2]).unwrap();
+        assert_eq!(fast[0].shape, vec![2, 2]);
+        assert_relative(&f32s(&fast[0]), &[58., 64., 139., 154.], 1e-5, "f32 2x3 @ 3x2");
+        let general = general_dot(&a, &b, DType::Float32, vec![2, 2]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "f32 fast vs general");
+
+        // The same shape in f64 (1e-12 relative).
+        let a = value(DType::Float64, &[2, 3], Storage::F64(vec![1., 2., 3., 4., 5., 6.]));
+        let b = value(DType::Float64, &[3, 2], Storage::F64(vec![7., 8., 9., 10., 11., 12.]));
+        let op = spec("dot", DType::Float64, &[2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2]).unwrap();
+        assert_close(&floats(&fast[0]), &[58., 64., 139., 154.]);
+        let general = general_dot(&a, &b, DType::Float64, vec![2, 2]);
+        for (got, want) in floats(&fast[0]).iter().zip(floats(&general).iter()) {
+            assert!((got - want).abs() <= 1e-12 * want.abs().max(1.0), "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn dot_blas_handles_a_non_square_shape() {
+        // (3, 5) @ (5, 7) f32, both operands ramp-shaped.
+        let a_values: Vec<f32> = (0..15).map(|i| i as f32).collect();
+        let b_values: Vec<f32> = (0..35).map(|i| i as f32 * 0.5).collect();
+        let a = value(DType::Float32, &[3, 5], Storage::F32(a_values.clone()));
+        let b = value(DType::Float32, &[5, 7], Storage::F32(b_values.clone()));
+        let op = spec("dot", DType::Float32, &[3, 7], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![3, 7]).unwrap();
+        assert_eq!(fast[0].shape, vec![3, 7]);
+        // Hand-computed reference product (the definition, not a kernel).
+        let mut expected = vec![0.0f32; 3 * 7];
+        for row in 0..3 {
+            for column in 0..7 {
+                let mut acc = 0.0f32;
+                for inner in 0..5 {
+                    acc += a_values[row * 5 + inner] * b_values[inner * 7 + column];
+                }
+                expected[row * 7 + column] = acc;
+            }
+        }
+        assert_relative(&f32s(&fast[0]), &expected, 1e-5, "f32 3x5 @ 5x7");
+        let general = general_dot(&a, &b, DType::Float32, vec![3, 7]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "3x5 @ 5x7 fast vs general");
+    }
+
+    #[test]
+    fn dot_batched_3d_uses_blas_and_agrees_with_the_general_kernel() {
+        // Per-batch distinct operands: two independent 2x3 @ 3x2 products.
+        let a = value(
+            DType::Float32,
+            &[2, 2, 3],
+            Storage::F32(vec![1., 2., 3., 4., 5., 6., 6., 5., 4., 3., 2., 1.]),
+        );
+        let b = value(
+            DType::Float32,
+            &[2, 3, 2],
+            Storage::F32(vec![1., 0., 0., 1., 1., 1., 2., 0., 0., 2., 0., 0.]),
+        );
+        let op = spec("dot", DType::Float32, &[2, 2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2, 2]).unwrap();
+        let general = general_dot(&a, &b, DType::Float32, vec![2, 2, 2]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "batched 3-D");
+        // Batch 0 is [[1, 2, 3], [4, 5, 6]] @ [[1,0],[0,1],[1,1]] = [[4, 5], [10, 11]],
+        // batch 1 is [[6, 5, 4], [3, 2, 1]] @ 2-diagonal = [[12, 10], [6, 4]].
+        assert_relative(
+            &f32s(&fast[0]),
+            &[4., 5., 10., 11., 12., 10., 6., 4.],
+            1e-5,
+            "batched 3-D values",
+        );
+
+        // A broadcast batch (b has one shared matrix) also takes the fast path.
+        let shared = value(
+            DType::Float32,
+            &[1, 3, 2],
+            Storage::F32(vec![1., 0., 0., 1., 1., 1.]),
+        );
+        let op = spec("dot", DType::Float32, &[2, 2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), shared.clone()], &op, vec![2, 2, 2]).unwrap();
+        let general = general_dot(&a, &shared, DType::Float32, vec![2, 2, 2]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "broadcast batch");
+    }
+
+    #[test]
+    fn dot_integers_stay_bit_exact_on_the_general_path() {
+        // i32 wraps like numpy: 2^30 * 4 overflows back to 0.
+        let a = value(DType::Int32, &[1, 1], Storage::I32(vec![1 << 30]));
+        let b = value(DType::Int32, &[1, 1], Storage::I32(vec![4]));
+        let op = spec("dot", DType::Int32, &[1, 1], Attrs::new());
+        let out = dot_impl(&[a.clone(), b.clone()], &op, vec![1, 1]).unwrap();
+        assert_eq!(out[0].storage, Storage::I32(vec![0]));
+        assert_eq!(out[0].storage, general_dot(&a, &b, DType::Int32, vec![1, 1]).storage);
+        assert!(
+            dot_gemm(&a, &b, &geometry(&a, &b), DType::Int32, &[1, 1]).unwrap().is_none(),
+            "an integer dot must never reach the BLAS-3 kernel"
+        );
+
+        // i8 wraps too, and a complex dot is likewise declined.
+        let a = value(DType::Int8, &[2, 2], Storage::I8(vec![100, 100, 100, 100]));
+        let b = value(DType::Int8, &[2, 2], Storage::I8(vec![3, 0, 3, 0]));
+        let op = spec("dot", DType::Int8, &[2, 2], Attrs::new());
+        let out = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2]).unwrap();
+        // 2 * (100 * 3) = 600 wraps to 88 in i8.
+        assert_eq!(out[0].storage, Storage::I8(vec![88, 0, 88, 0]));
+        assert_eq!(out[0].storage, general_dot(&a, &b, DType::Int8, vec![2, 2]).storage);
+
+        let a = value(
+            DType::Complex64,
+            &[1, 1],
+            Storage::C64(vec![Complex::new(1.0, 2.0)]),
+        );
+        let b = value(
+            DType::Complex64,
+            &[1, 1],
+            Storage::C64(vec![Complex::new(3.0, -1.0)]),
+        );
+        assert!(
+            dot_gemm(&a, &b, &geometry(&a, &b), DType::Complex64, &[1, 1])
+                .unwrap()
+                .is_none(),
+            "a complex dot must never reach the BLAS-3 kernel"
+        );
+    }
+
+    #[test]
+    fn dot_rank_one_forms_stay_on_the_general_path() {
+        // vec . vec -> rank 0.
+        let a = value(DType::Float32, &[3], Storage::F32(vec![1., 2., 3.]));
+        let b = value(DType::Float32, &[3], Storage::F32(vec![4., 5., 6.]));
+        let op = spec("dot", DType::Float32, &[], Attrs::new());
+        let out = dot_impl(&[a.clone(), b.clone()], &op, Vec::new()).unwrap();
+        assert_eq!(out[0].shape, Vec::<usize>::new());
+        assert_eq!(f32s(&out[0]), vec![32.]);
+        let g = MatMul {
+            m: 1,
+            k: 3,
+            n: 1,
+            a_strides: Vec::new(),
+            b_strides: Vec::new(),
+            batch: Vec::new(),
+        };
+        assert!(dot_gemm(&a, &b, &g, DType::Float32, &[]).unwrap().is_none(), "rank-1");
+
+        // matrix (2, 3) x vector (3,) -> rank 1.
+        let a = value(DType::Float32, &[2, 3], Storage::F32(vec![1., 2., 3., 4., 5., 6.]));
+        let v = value(DType::Float32, &[3], Storage::F32(vec![1., 1., 1.]));
+        let op = spec("dot", DType::Float32, &[2], Attrs::new());
+        let out = dot_impl(&[a.clone(), v.clone()], &op, vec![2]).unwrap();
+        assert_eq!(out[0].shape, vec![2]);
+        assert_relative(&f32s(&out[0]), &[6., 15.], 1e-5, "matrix x vector");
+        let g = MatMul {
+            m: 2,
+            k: 3,
+            n: 1,
+            a_strides: Vec::new(),
+            b_strides: Vec::new(),
+            batch: Vec::new(),
+        };
+        assert!(dot_gemm(&a, &v, &g, DType::Float32, &[2]).unwrap().is_none(), "matrix x vector");
+    }
+
+    #[test]
+    fn blocks_contiguous_classifies_the_batch_layouts() {
+        // Natural C-order block-unit strides for a (2, 3) matrix batch.
+        assert!(blocks_contiguous(&[2, 3], &[2, 3], &[3, 1]));
+        // A broadcast axis carries stride 0 and reuses one block.
+        assert!(blocks_contiguous(&[2, 1], &[2, 3], &[1, 0]));
+        assert!(blocks_contiguous(&[1, 3], &[2, 3], &[0, 1]));
+        // A missing leading batch axis is a size-one broadcast.
+        assert!(blocks_contiguous(&[3], &[2, 3], &[0, 1]));
+        assert!(blocks_contiguous(&[], &[2, 3], &[0, 0]));
+        // A permuted (non-contiguous) layout is declined.
+        assert!(!blocks_contiguous(&[2, 3], &[2, 3], &[1, 3]));
+        assert!(!blocks_contiguous(&[2, 3], &[2, 3], &[4, 1]));
+        // A shape/strides disagreement is declined, never indexed.
+        assert!(!blocks_contiguous(&[2, 3, 4], &[2, 3], &[3, 1]));
+        assert!(!blocks_contiguous(&[2, 3], &[2, 3], &[3]));
     }
 
     // --- conv --------------------------------------------------------------

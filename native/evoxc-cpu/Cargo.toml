@@ -11,4 +11,6 @@ half = "2"
 num-complex = "0.4"
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 libm = "0.2"
+# The one performance dependency: a pure-Rust BLAS-3 microkernel (`dot`).
+matrixmultiply = "0.3"
 serde_json = "1"
