@@ -18,7 +18,7 @@ Request keys (`native/CONTEXT.md` "Extension-rule bridge"): ``kind``
 ``tangent_values`` (jvp), ``cotangent_type``, ``cotangent_values`` (vjp).
 
 Eligible `rule_key`s only (`block:*`, `external:*`, `sparse_*`, ...): the
-registry lookup mirrors `batching._resolve_batching_rule` — the key the engine
+registry lookup uses `batching.batching_rules` under the key the engine
 computed from the op name and its name/block-name attribute. Lookup is LATE
 (every call), so rules registered after import are picked up.
 
@@ -35,10 +35,12 @@ themselves — ``tangent_values`` (one entry per operand, operand order) for
 operands (n), its result proxies (r), then the NON-ZERO duals in list order.
 A dual argument's type is its operand's (jvp) / result's (vjp) type; a zero
 slot contributes no argument and is bound as `autodiff.ZeroTangent`.
-The response's ``output_ids`` must have exactly ``n`` entries for jvp /
-``r`` entries for vjp — native maps every one to a real value — so a zero
-tangent/cotangent is MATERIALIZED as a zeros value of the corresponding
-operand/result type.
+The response's ``output_ids`` holds exactly one entry per operand (jvp) /
+result (vjp), in order, and is NULLABLE: a ``None``/`autodiff.ZeroTangent`
+entry is sent as ``None`` (native's structurally-zero dual), so the scratch
+subgraph returns only its real contributions and no zero-materialization op is
+emitted — native materializes zeros only where a zero dual reaches a graph
+output.
 """
 
 from __future__ import annotations
@@ -186,18 +188,19 @@ def _derivative_response(request: Mapping[str, Any], kind: str):
 
     primals = proxy.results if kind == "jvp" else proxy.operands
     outputs = _validate_derivative_output(rule_key, kind, outputs, len(primals))
-    # Native maps every output id to a real dual value, so a zero
-    # tangent/cotangent must be materialized inside this subgraph.
-    with with_builder(builder):
-        values = tuple(
-            autodiff._materialize(entry, primal)
-            for entry, primal in zip(outputs, primals)
-        )
-    builder.set_terminator(block, "return", operands=values)
+    # Only the real contributions enter the scratch block; a zero slot becomes
+    # a `None` output id (native's structurally-zero dual), so no zeros op is
+    # emitted here.
+    real = tuple(entry for entry in outputs if isinstance(entry, ir.Value))
+    builder.set_terminator(block, "return", operands=real)
     return {
         "module": _native_codec.encode_module(builder.module),
         "entry": builder.module.main.name,
-        "output_ids": [value.id for value in values],
+        "output_ids": [
+            None if entry is None or isinstance(entry, autodiff.ZeroTangent)
+            else entry.id
+            for entry in outputs
+        ],
     }
 
 
