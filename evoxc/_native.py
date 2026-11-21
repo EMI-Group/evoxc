@@ -16,11 +16,23 @@ the batching and AD engines). It is an **optional** acceleration seam:
   prerequisite), the expected ``evoxc/_evoxc_native.abi3.so`` file, and the
   ``EVOXC_NATIVE_LIB`` override, chaining the underlying loader error.
 
-The façade converts evoxc's own IR objects to and from the neutral envelope in
-:mod:`evoxc._native_codec` and maps the extension's ``NativeError.kind`` onto
-the public ``evoxc.core`` error family (message preserved verbatim). Nothing
-in evoxc delegates to this seam yet; ``ir/inference.py`` and ``transforms``
-will flip onto it in a later pass.
+The façade converts evoxc's own IR objects to and from the ``evoxc-native-ir``
+v1 envelope in :mod:`evoxc._native_codec` and maps the extension's
+``NativeError.kind`` onto the public ``evoxc.core`` error family (message
+preserved verbatim).
+
+Two entry points exist:
+
+* :func:`infer` — op result-type inference; operands and result types travel
+  as native type dicts, ``attributes`` pass through verbatim and the optional
+  ``module`` context is an ``ir.Module`` (or an already-encoded envelope) that
+  the native ``call`` inference resolves callees from.
+* :func:`transform` — one native graph transform (``vectorize``/``vmap``/
+  ``grad``/``jvp``/``vjp``). The module is encoded, the extension returns the
+  transformed envelope plus its top-level ``"transform"`` metadata, and the
+  façade returns ``{"module": ir.Module, "transform": {...}, **extras}``.
+
+Nothing else in evoxc delegates to this seam yet.
 """
 
 from __future__ import annotations
@@ -234,29 +246,23 @@ def _decode_types(payload: Any) -> list[ir.ValueType]:
     return [_native_codec.decode_type(entry) for entry in payload]
 
 
-def _encode_module_context(module: Mapping[str, Any] | None) -> dict | None:
-    """Encode the optional ``infer`` module context (function signatures)."""
+def _encode_module_context(module: ir.Module | Mapping[str, Any] | None) -> dict | None:
+    """Encode the optional ``infer`` module context.
+
+    Accepts an :class:`ir.Module` (encoded as an ``evoxc-native-ir`` envelope)
+    or an already-encoded envelope mapping (copied, passed through verbatim) —
+    the native ``call`` inference resolves the callee's signature from it.
+    """
     if module is None:
         return None
-    if not isinstance(module, Mapping):
-        raise TypeError(
-            f"infer: 'module' must be a mapping, got {type(module).__name__}"
-        )
-    functions = module.get("functions")
-    if functions is None:
+    if isinstance(module, ir.Module):
+        return _native_codec.encode_module(module)
+    if isinstance(module, Mapping):
         return dict(module)
-    encoded = []
-    for entry in functions:
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            raise TypeError(
-                "infer: 'module' functions must be (name, [ValueType, ...]) pairs, "
-                f"got {entry!r}"
-            )
-        name, value_types = entry
-        encoded.append((name, _encode_types(value_types)))
-    context = dict(module)  # preserve every other key untouched
-    context["functions"] = encoded
-    return context
+    raise TypeError(
+        "infer: 'module' must be an ir.Module or an already-encoded "
+        f"'evoxc-native-ir' envelope mapping, got {type(module).__name__}"
+    )
 
 
 def infer(
@@ -264,14 +270,15 @@ def infer(
     operand_types: Sequence[ir.ValueType],
     attributes: dict[str, Any],
     result_types: Sequence[ir.ValueType] | None = None,
-    module: Mapping[str, Any] | None = None,
+    module: ir.Module | Mapping[str, Any] | None = None,
 ) -> list[ir.ValueType]:
     """Infer result types through the native core.
 
-    Operands (and ``result_types`` when given) are encoded as neutral
-    ``ValueType`` dicts; ``attributes`` pass through verbatim. ``module`` may
-    supply ``{"functions": [(name, [ValueType, ...]), ...]}`` whose value types
-    are encoded (other keys pass through, ``None``/absent untouched).
+    Operands (and ``result_types`` when given) are encoded as native type dicts
+    (``{"dtype": name, "shape": [dim, ...]}``); ``attributes`` pass through
+    verbatim. ``module`` may supply the callee context ``call`` inference needs
+    — an :class:`ir.Module` (encoded as an ``evoxc-native-ir`` envelope) or an
+    already-encoded envelope mapping (``None``/absent leaves it out).
     """
     if not isinstance(op_name, str):
         raise TypeError(f"infer: 'op_name' must be a string, got {type(op_name).__name__}")
@@ -294,14 +301,58 @@ def infer(
     return _decode_types(raw)
 
 
+#: Required keys of the extension's top-level ``"transform"`` metadata object.
+_TRANSFORM_META_KEYS = ("kind", "output_ids", "input_ids", "batch_dim")
+
+
+def _decode_transform_meta(raw: Any) -> dict[str, Any]:
+    """Validate and copy the extension's top-level ``"transform"`` metadata."""
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "the native extension's transform result 'transform' must be a "
+            f"mapping, got {type(raw).__name__}"
+        )
+    meta = dict(raw)
+    for key in _TRANSFORM_META_KEYS:
+        if key not in meta:
+            raise TypeError(
+                f"the native extension's transform metadata is missing key {key!r}"
+            )
+    if not isinstance(meta["kind"], str):
+        raise TypeError(
+            "the native extension's transform metadata 'kind' must be a string, "
+            f"got {type(meta['kind']).__name__}"
+        )
+    for key in ("output_ids", "input_ids"):
+        ids = meta[key]
+        if not isinstance(ids, (list, tuple)) or not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in ids
+        ):
+            raise TypeError(
+                f"the native extension's transform metadata {key!r} must be a "
+                f"list of int ids, got {ids!r}"
+            )
+        meta[key] = [int(item) for item in ids]
+    batch_dim = meta["batch_dim"]
+    if batch_dim is not None and not isinstance(batch_dim, str):
+        raise TypeError(
+            "the native extension's transform metadata 'batch_dim' must be a "
+            f"string or None, got {type(batch_dim).__name__}"
+        )
+    return meta
+
+
 def transform(kind: str, module: ir.Module, config: dict[str, Any]) -> dict[str, Any]:
     """Run a native graph transform over ``module``.
 
     Encodes the module with :func:`evoxc._native_codec.encode_module`, calls
-    the extension, and decodes ``result["module"]`` (and ``output_types`` when
-    present) back to IR objects. Every other key/value — including a callable
-    ``config["extension_rule"]``, which is never encoded — is preserved
-    verbatim in a NEW dict.
+    the extension, and decodes the returned ``evoxc-native-ir`` envelope back
+    into an :class:`ir.Module`. The extension's top-level ``"transform"``
+    metadata (``kind``, ``output_ids``, ``input_ids``, ``batch_dim``) becomes
+    the ``"transform"`` entry; any other top-level key is preserved verbatim.
+
+    ``config`` passes through untouched — a callable
+    ``config["extension_rule"]`` is never encoded.
     """
     if not isinstance(kind, str):
         raise TypeError(f"transform: 'kind' must be a string, got {type(kind).__name__}")
@@ -326,14 +377,19 @@ def transform(kind: str, module: ir.Module, config: dict[str, Any]) -> dict[str,
             f"the native extension's transform returned {type(result).__name__} "
             "where a mapping was expected"
         )
-    output = dict(result)
-    if "module" in output:
-        if not isinstance(output["module"], Mapping):
-            raise TypeError(
-                "the native extension's transform result 'module' must be an "
-                f"envelope mapping, got {type(output['module']).__name__}"
-            )
-        output["module"] = _native_codec.decode_module(output["module"])
-    if output.get("output_types") is not None:
-        output["output_types"] = _decode_types(output["output_types"])
+    if "transform" not in result:
+        raise TypeError(
+            "the native extension's transform result is missing its 'transform' "
+            "metadata object"
+        )
+    extras = {
+        key: value
+        for key, value in result.items()
+        if key != "transform" and key not in _native_codec._ENVELOPE_KEYS
+    }
+    output = {
+        "module": _native_codec.decode_module(dict(result)),
+        "transform": _decode_transform_meta(result["transform"]),
+    }
+    output.update(extras)
     return output
