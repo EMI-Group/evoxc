@@ -2,7 +2,7 @@
 
 ## Intent
 
-`native/` is the Rust core of evoxc and the **single numerical authority** for builtin op schemas, dtype promotion, shape inference, graph transforms (`vectorize`, `vmap`, `jvp`, `vjp`, `grad`) and the runtime session/buffer model.
+`native/` is the Rust core of evoxc and the **single numerical authority** for builtin op schemas, dtype promotion, shape inference, graph transforms (`vectorize`, `vmap`, `jvp`, `vjp`, `grad`), the runtime session/buffer model and native CPU execution (`evoxc-cpu`: compile to a plan, run on typed host buffers).
 Python remains the frontend: it executes `defn` bodies and adapts Python objects, but it must never hold a second implementation of builtin inference or of a builtin transform rule.
 Language bindings (PyO3 now, others later) are not a second implementation of evoxc.
 The design rationale and the proposed end state are `../NATIVE_ARCHITECTURE_PROPOSAL.md`; this file is the binding contract for what exists here.
@@ -10,16 +10,17 @@ The implemented Python packages stay authoritative for behavior **until** a code
 
 ## Crate layout, ownership and dependency rules
 
-Cargo workspace at `./Cargo.toml`; crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-python`.
+Cargo workspace at `./Cargo.toml`; crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-cpu`, `evoxc-python`.
 
 ```
 evoxc-core      dtypes, dims, ValueType, attrs, op schemas, graph IR, envelope codec, inference
-    ↑                       ↑
-evoxc-compiler        evoxc-runtime
- builder, vectorize,      sessions, buffers, submissions,
- AD engines, rules        executables (skeleton)
-    ↑                       ↑
-    └──────── evoxc-python (PyO3) ────────┘
+   ↑             ↑                  ↑
+evoxc-compiler   evoxc-runtime      evoxc-cpu
+ builder,        sessions, buffers, the immutable plan + typed host
+ vectorize, AD,  submissions,       buffers + every dense kernel
+ batch_functions executables        (the native CPU execution engine)
+   ↑             ↑                  ↑
+   └─────────────┴──── evoxc-python (PyO3) ────┘
 ```
 
 Dependency rules (binding):
@@ -27,10 +28,12 @@ Dependency rules (binding):
 - `evoxc-core` depends on no other workspace crate and on **no Python**: allowed third-party deps are `serde`, `serde_json`, `base64` only.
 - `evoxc-compiler` depends on `evoxc-core` only.
 - `evoxc-runtime` depends on `evoxc-core` only and never on `evoxc-compiler` or PyO3.
-- `evoxc-python` is the only crate with `pyo3` (`features = ["extension-module", "abi3-py311"]`) and is the only crate that may know about Python objects.
-- Builtin inference, builtin batching rules and builtin AD rules live in Rust only; the Python graph path may not keep a parallel implementation for a capability the native path claims.
+- `evoxc-cpu` depends on `evoxc-core` only and never on `evoxc-compiler`, `evoxc-runtime` or PyO3: it compiles a `Program` into an immutable plan and runs it on typed host buffers, reusing `evoxc-core`'s types and never re-deriving inference.
+- `evoxc-python` is the only crate with `pyo3` (`features = ["extension-module", "abi3-py311"]`) and is the only crate that may know about Python objects; it may depend on every other crate (`evoxc-core`, `evoxc-compiler`, `evoxc-cpu`).
+- Builtin inference, builtin batching rules, builtin AD rules and the dense CPU kernels live in Rust only; the Python graph path may not keep a parallel implementation for a capability the native path claims, and the numpy interpreter in `../evoxc/backends/numpy/` is the reference behavior `evoxc-cpu` must match until the Python backend delegates to it.
 - An unimplemented capability fails explicitly (`TransformError` / `Unsupported` diagnostic naming the op), never through a silent Python fallback and never by guessing shapes.
 - No `unsafe` outside FFI glue; user errors are `Result` values, never panics (no `unwrap`/`expect` on user input).
+  The one sanctioned exception is `evoxc-cpu`'s two `matrixmultiply` `sgemm`/`dgemm` call sites (the crate's BLAS-3 microkernel is an `unsafe fn`; each site carries a `SAFETY` argument and no logic of our own is unsafe — see `./evoxc-cpu/CONTEXT.md`).
 
 ## Generated files are authoritative
 
@@ -159,6 +162,11 @@ The module init symbol is `PyInit__evoxc_native` (the Python module name is `_ev
   Config keys (Python spellings): `axes` (int | null | per-input list, default `0`), `out_axes` (int | null | per-output list, default `0`), `switch_ops` (`null` | bool | category/op group list), `bands` (`null` | int K>=1 | `"auto"`), `alignment` (`null` | `"variant"` | `"occurrence"` | `"auto"`); unknown keys/values are explicit errors.
   The merge runs with the same `extension_rule` bridge `transform` uses, so `block:*` / `external:*` / `sparse_*` populations merge; without a bridge they raise the documented pre-flight message.
 - `batching_rule_keys() -> list[str]` — read-only introspection: the sorted rule keys of the compiled-in builtin batching registry (`evoxc-compiler::batching::builtin_rule_keys`), i.e. exactly the ops the native engines can map, so a caller checks batchability against the engine instead of a Python-side mirror; host rules (`block:*` / `external:*` / `sparse_*`) are never listed.
+- `native_compile(envelope: dict) -> NativeProgram` — compiles one `evoxc-native-ir` module envelope (the same envelope `transform` consumes) into the native CPU engine's immutable plan (`evoxc-cpu`) and returns the program handle; errors are `NativeError` with kind `VerificationError`/`ShapeError`/`DTypeError`/`BackendError` (an op with no native kernel is named, at compile time).
+  - `NativeProgram.run(flat_inputs: list[numpy.ndarray], resolver=None) -> list[numpy.ndarray]` — one call over flat, C-contiguous inputs validated against the entry signature (dtype/shape; symbolic dims bound from the actual shapes); caller arrays are borrowed for the call and never mutated, outputs are fresh C-contiguous arrays. `resolver=None` with a graph that needs host callbacks is a `BackendError` at compile time; otherwise the resolver object's `call_block(name, args)` / `call_external(name, args)` / `call_runtime(name, args)` are invoked per boundary and return `list[numpy.ndarray]`.
+  - `NativeProgram.entry() -> str`, `.plan_text() -> str` (the human-readable dispatch plan), `.stats() -> dict` (`ops`, `dispatched_ops`, `blocks`, `plan_entries`, `compile_ms`, unsupported ops), `.output_types() -> list[dict]` (the wire `Type` encoding), `.required_ops() -> dict` (`{"blocks": [...], "external": [...], "runtime_calls": [...]}`).
+  - Deterministic and stateless: equal inputs give bit-identical outputs across runs; one compiled program is reusable across calls and threads-of-callers (the plan is immutable).
+  - Details and the buffer hand-off contract: `./evoxc-python/CONTEXT.md`; engine semantics and the support matrix: `./evoxc-cpu/CONTEXT.md`.
 - `NativeError` — exception base with `.kind` (`TraceError`, `ShapeError`, `TransformError`, `BackendError`, `PersistenceError`, `DeviceError`, `DTypeError`, `VerificationError`, `EVOXCError`) and `.message`.
   The binding maps the Rust `Error` variant to `kind`; Python code raises the corresponding public evoxc error class from `(kind, message)` so error text and family match the pure-Python paths.
 
@@ -236,15 +244,17 @@ No other Python callback may occur during a transform; the envelope/GIL crossing
 - `scripts/build-native.sh` is the end-to-end gate: it must build and its smoke test must print the version.
 - Tests must not require a GPU, the network, or the Python interpreter (except the generated-table freshness test, which skips without the venv).
 
-## Status (phase 1 — vertical slice complete)
+## Status (phase 1 — vertical slice complete; phase 2 — native CPU execution)
 
-Four crates implemented and green: `evoxc-core` (dtypes + generated promotion table, `Dim`/`DimExpr`, `ValueType`, `AttrValue`, generated 119-op schema table, graph IR, envelope codec, full per-category inference, `verify`), `evoxc-compiler` (`Builder`, `vectorize`/`vmap` with the full builtin batching-rule set, `jvp`/`vjp`/`grad` with the builtin derivative-rule set, extension-rule inlining including the dual SSA values, and the native `batch_functions` merge engine), `evoxc-runtime` (session/device/buffer/submission/executable skeleton), `evoxc-python` (`version`, `infer`, `transform`, `batch_functions`, `NativeError`).
+Five crates implemented and green: `evoxc-core` (dtypes + generated promotion table, `Dim`/`DimExpr`, `ValueType`, `AttrValue`, generated 119-op schema table, graph IR, envelope codec, full per-category inference, `verify`), `evoxc-compiler` (`Builder`, `vectorize`/`vmap` with the full builtin batching-rule set, `jvp`/`vjp`/`grad` with the builtin derivative-rule set, extension-rule inlining including the dual SSA values, and the native `batch_functions` merge engine), `evoxc-runtime` (session/device/buffer/submission/executable skeleton), `evoxc-cpu` (the native CPU execution engine: `compile(&Program) -> Plan`, the flat-store `RunCtx` interpreter, typed host buffers for all 14 dtypes, and a kernel for **every** dense op — vectorized flat elementwise/comparison paths with `power` specialisation, reductions, sorting, indexing/structure, linalg with a `matrixmultiply` BLAS-3 `dot`, deterministic factorizations, the 6 bit-exact `random_*` ops, single-rank collectives, and control flow with host callbacks), `evoxc-python` (`version`, `infer`, `transform`, `batch_functions`, `native_compile` + `NativeProgram`, `NativeError`).
 `scripts/build-native.sh` builds `evoxc-python` → `libevoxc_python.so`, installs `evoxc/_evoxc_native.abi3.so` and its smoke test prints the version.
-Rust workspace suite: **499 passed, 0 failed** (`evoxc-core` 224 + 2 parity, `evoxc-compiler` 134 in-file + 30 `batch_functions.rs` + 13 `batch_functions_bands.rs` + 6 `batch_functions_extension.rs` + the `batch_functions_parity` and `transform_parity` cargo gates, `evoxc-python` 27, `evoxc-runtime` 61); `cargo clippy --workspace --all-targets --no-deps -- -D warnings` is clean.
+Rust workspace suite: **680 passed, 0 failed** (`evoxc-core` 224 + 2 parity, `evoxc-compiler` 134 in-file + 30 `batch_functions.rs` + 13 `batch_functions_bands.rs` + 6 `batch_functions_extension.rs` + the `batch_functions_parity` and `transform_parity` cargo gates, `evoxc-cpu` 176, `evoxc-python` 32, `evoxc-runtime` 61); `cargo clippy --workspace --all-targets --no-deps -- -D warnings` is clean.
 The `tests/transforms` + `tests/ir` Python suites run against the rebuilt extension: 1333 passed, 3 skipped, 1 xfailed.
 Inference parity: **529 cases over 113 ops, 0 mismatches** through the FFI (`evoxc._evoxc_native.infer`), with every successful case re-derived live from `evoxc.ir.op_defs.opdef(name).shape_fn`.
 Transform parity: **61 cases × 122 mode-runs, 0 mismatches** (`vectorize`, `vmap` incl. non-leading `out_axes`, `grad`, `jvp`, `vjp`) comparing native-transformed graphs numerically against the Python transforms; 12 mode-runs are documented deferrals where both engines raise `TransformError`.
 `batch_functions` parity: **25 populations, 87 checks, 0 mismatches** through `evoxc._evoxc_native.batch_functions` against `evoxc.batch_functions` (structural envelope comparison with id remapping, leaf-by-leaf numpy numerics, the exact 12-key `batch_report`), including all six documented deferrals.
+CPU-engine parity (`../tools/parity_cpu.py` against the numpy backend): **63 cases, 0 mismatches** — elementwise 10, reductions 4, indexing/structure 14, linalg 13, control-flow 5, random 9 (bit-exact for all three algorithms; f32 `normal` within the documented 1-ulp window), dynamic shapes 8.
+Warm `run` and `native_compile` numbers, the support matrix and the CPU engine's known deferrals: `./evoxc-cpu/CONTEXT.md`; `../tools/bench_cpu.py` reproduces the table.
 Coverage: inference for elementwise/comparison/cast/select/broadcast, reshape/transpose/slice/gather/scatter/concatenate/pad/diagonal/tile/diag, reductions/argmax/argmin/sort/argsort, dot/conv/solve, linalg, random (algorithm-aware), collectives, all 16 sparse ops, and the op-specific cases (`constant`, `call`, `if`, `while`, `runtime_call`, `block_call`, `external_call`).
 Batching rules cover elementwise, reductions, structural, dot, linalg aux and constants; AD rules cover the pointwise/unary table, reductions, structural, dot/conv, tril/triu/cumsum/solve, zero rules and `stop_gradient`, with `conv` VJP and the other Python-side deferrals preserved as explicit errors.
 
@@ -256,7 +266,11 @@ Batching rules cover elementwise, reductions, structural, dot, linalg aux and co
 - Device kinds and placement semantics are owned by the Python contract (`../evoxc/CONTEXT.md` "Device kinds"); the runtime skeleton models `cpu` plus the generic device-kind string, never a second enumeration.
 - Build products (`native/target/`, `evoxc/_evoxc_native.abi3.so`) are gitignored; commit only sources and generated tables.
 - `source scripts/dev-env.sh` is required in every shell: it exports a writable `CARGO_HOME`, the Nix library paths, and `.venv/bin` on `PATH`.
-- Parity harnesses (rerunnable; all need `scripts/build-native.sh` first and a `.venv`): `native/evoxc-python/verify_infer_parity.py` (FFI inference over the committed fixture + the signature-only module forms), `native/evoxc-compiler/tests/parity_transform/run_parity.py` (numeric transform equivalence) and `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` (the `batch_functions` merge), the latter two also gated by `cargo test -p evoxc-compiler --test transform_parity` / `--test batch_functions_parity`.
+- Parity harnesses (rerunnable; all need `scripts/build-native.sh` first and a `.venv`): `native/evoxc-python/verify_infer_parity.py` (FFI inference over the committed fixture + the signature-only module forms), `native/evoxc-compiler/tests/parity_transform/run_parity.py` (numeric transform equivalence) and `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` (the `batch_functions` merge), the latter two also gated by `cargo test -p evoxc-compiler --test transform_parity` / `--test batch_functions_parity`; `native/tools/parity_cpu.py` compares `native_compile`+`run` against the numpy backend (63 cases) and `native/tools/bench_cpu.py` reproduces the measured CPU-engine table.
+- Known gap (CPU engine, upstream): the frontend stamps `random_key_mix`'s splitmix64 salt (`0x9E3779B97F4A7C15`) as a plain Python int, and `./evoxc-core/src/attr.rs` decodes the `int` attribute tag through `serde_json::Value::as_i64`, so an unsigned salt above `i64::MAX` is rejected at envelope decode; the engine casts with `as u64`, so the two's-complement value is bit-exact (the parity harness narrows it). Fix belongs to `evoxc-core` attribute decoding.
+- Known gap (CPU engine): `sort`/`argsort` take one always-stable code path, so with `stable=false` and duplicate values the permutation can differ from numpy's quicksort order (both valid).
+  Elementwise kernels are per-op auto-vectorized maps (no cross-op fusion, no `rayon`), so a single large flat array still loses to numpy's one fused ufunc (0.30× on a 14-op 1e6-f32 chain) while per-op overhead wins elsewhere (13× on a 2000-op chain); `power` is special-cased (`kernels/pow.rs`) and `dot` runs through `matrixmultiply` BLAS-3 (~48 GFLOP/s single-threaded, 1.4× numpy). Full table in `./evoxc-cpu/CONTEXT.md`.
+- Known gap (CPU FFI): a full `native_compile` of a 2000-op graph is ~9 ms while the engine's own plan compile is ~0.8 ms — the rest is envelope decode + FFI crossings. Closing it needs a caller that keeps the compiled plan (which `NativeProgram` already does) or a cheaper envelope path, not a kernel change.
 - Known gap: `vmap`/`vectorize` normalize an `out_axes` entry against the output rank `r`, so an unmapped output accepts insertion positions `0..r-1`; `out_axes == r` is an explicit `TransformError` (Python still defers non-leading entries entirely).
 - Known gap: transform deferrals inherited from the Python rules — `conv` VJP, `reduce_mean` over a symbolic reduced dim, multi-axis `gather` sweeps, multi-axis/symbolic slice/pad/concatenate VJPs, `solve` with `left_side=false`, mapped-kernel `conv`, `batch_group_count != 1` — all explicit `TransformError`s naming the op.
 - Known gap: the committed inference fixture records two layered divergences — `sparse_concatenate#2` (fixture records the bare `shape_fn`'s `ShapeError`; the real pipeline and native infer raise `VerificationError` on arity first) and `random_uniform#2` (the Python authority raises a plain `ValueError`, which has no public error family; native raises `VerificationError` with the identical message).
@@ -276,5 +290,6 @@ Batching rules cover elementwise, reductions, structural, dot, linalg aux and co
 | `./evoxc-core/` | Dtypes + promotion table, `Dim`/`DimExpr`, `ValueType`, `AttrValue`, op schemas, graph IR (`Program`/`Function`/`Block`/`Op`/`Value`), envelope codec, per-category shape inference. Owns `CONTEXT.md` with the inference contract. |
 | `./evoxc-compiler/` | Mutable `Builder` (schema validation + native inference), `vectorize`/`vmap` engine, builtin batching rules, AD engines (`jvp`/`vjp`/`grad`) and builtin derivative rules, extension-rule inlining, and the native `batch_functions` merge engine (`src/batch_functions/`: skeleton alignment, variant switching, muxing, bands cost model, `BatchReport`). Owns `CONTEXT.md` with the token/mappedness, sweep and merge contracts. |
 | `./evoxc-runtime/` | Session / device-context / buffer / submission / executable skeleton with real ownership invariants. Owns `CONTEXT.md`. |
-| `./evoxc-python/` | PyO3 module `evoxc._evoxc_native`: `version`, `infer` (envelope or signature-only context), `transform`, `batch_functions`, `NativeError`, envelope conversion, extension-rule callback plumbing. Owns `CONTEXT.md`. |
-| `./tools/` | Dev-only generators (`gen_opdefs.py`, `gen_dtype_promotion.py`) and parity helpers; never imported by the crates. |
+| `./evoxc-cpu/` | The native CPU execution engine: `compile(&Program) -> Plan` (resolved kernels, liveness, static-result fast path, unsupported-op rejection), the flat-store `RunCtx` interpreter (nested regions, symbolic-dim binding, host callbacks), typed host buffers for all 14 dtypes, and a kernel for every dense op incl. bit-exact `random_*` and single-rank collectives. Owns `CONTEXT.md` with the support matrix, the measured native-vs-numpy numbers and its known deferrals. |
+| `./evoxc-python/` | PyO3 module `evoxc._evoxc_native`: `version`, `infer` (envelope or signature-only context), `transform`, `batch_functions`, `native_compile` + `NativeProgram` (the CPU engine's FFI surface), `NativeError`, envelope conversion, extension-rule callback plumbing, the numpy buffer hand-off. Owns `CONTEXT.md`. |
+| `./tools/` | Dev-only generators (`gen_opdefs.py`, `gen_dtype_promotion.py`) and parity/bench helpers (`parity_cpu.py`, `bench_cpu.py`); never imported by the crates. |

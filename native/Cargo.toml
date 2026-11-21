@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["evoxc-core", "evoxc-compiler", "evoxc-runtime", "evoxc-python"]
+members = ["evoxc-core", "evoxc-compiler", "evoxc-runtime", "evoxc-cpu", "evoxc-python"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/EMI-Group/evoxc"
 evoxc-core = { path = "evoxc-core" }
 evoxc-compiler = { path = "evoxc-compiler" }
 evoxc-runtime = { path = "evoxc-runtime" }
+evoxc-cpu = { path = "evoxc-cpu" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
