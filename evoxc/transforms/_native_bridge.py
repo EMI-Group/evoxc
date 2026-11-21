@@ -168,6 +168,12 @@ def rebuild_graph(
             source_locations[new_id] = location
 
     batch_name = transform.get("batch_dim")
+    if batch_name:
+        # The envelope round trip rebuilds every `Dim` from its name, so the
+        # decoded types hold DISTINCT-but-equal `Dim` objects. One pass = ONE
+        # batch dim (object identity is the documented contract — `_collect_
+        # batch_dims`/`_leading_batch_count` rely on it), so unify them.
+        _unify_batch_dim(block, batch_name)
     if output_tree is None:
         if batch_name:
             batch_dim = _find_batch_dim(block, batch_name)
@@ -192,6 +198,45 @@ def rebuild_graph(
         output_static_values,
         source_locations,
     )
+
+
+def _unify_batch_dim(block: "ir.Block", batch_name: str) -> None:
+    """Give every `Dim(batch_name)` in the module the SAME `Dim` object."""
+    canonical = None
+    for argument in block.arguments:
+        for entry in argument.type.shape:
+            if isinstance(entry, core.Dim) and entry.name == batch_name:
+                canonical = entry
+                break
+        if canonical is not None:
+            break
+    if canonical is None:
+        return
+
+    def _values():
+        yield from block.arguments
+        for op in block.ops:
+            yield from op.results
+            for region in op.regions:
+                for inner in region.blocks:
+                    yield from inner.arguments
+                    for inner_op in inner.ops:
+                        yield from inner_op.results
+
+    for value in _values():
+        value_type = value.type
+        shape = getattr(value_type, "shape", None)
+        if not shape:
+            continue
+        new_shape = tuple(
+            canonical if isinstance(entry, core.Dim) and entry.name == batch_name else entry
+            for entry in shape
+        )
+        if any(a is not b for a, b in zip(new_shape, shape)):
+            try:
+                value_type.shape = new_shape
+            except Exception:  # frozen ValueType
+                object.__setattr__(value_type, "shape", new_shape)
 
 
 def _find_batch_dim(block: "ir.Block", batch_name: str) -> "core.Dim":
