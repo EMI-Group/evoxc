@@ -42,9 +42,10 @@
 //! Short segments do not go through `sort_unstable` at all: a Batcher odd-even
 //! network over the same packed keys orders them in straight-line `min`/`max`
 //! pairs whose indices are literal constants, so the whole network stays in
-//! registers (see "The short-segment sorting network": measured ~1.8x faster
-//! than `sort_unstable` at 16 keys and ~1.2x at 12, which is the whole window
-//! it wins in — below 12 `sort_unstable`'s insertion sort is ahead).
+//! registers (see "The short-segment sorting network": measured 1.7x faster
+//! than `sort_unstable` at 2 keys, 2.9x at 6-8 and 3.3x at 16, which is the
+//! whole window it wins in — past 16 keys the network needs in-place merges
+//! over a spilled array and loses).
 //!
 //! Dtype dispatch happens ONCE per call, the scratch buffers are sized once per
 //! call and reused across segments (stack-resident for extents up to
