@@ -54,7 +54,7 @@ The rule runs under `trace.with_builder`, its result is validated by `batching._
 JVP / VJP: the engine passes the dual SSA values themselves — `tangent_values` (one entry per op operand, operand order) and `cotangent_values` (one entry per op result, result order) — so the scratch block arguments are, in order: the operands (n), the result proxies (r), then the NON-ZERO duals in list order.
 A dual argument carries its primal's type; a zero slot contributes no argument and is bound as `autodiff.ZeroTangent`.
 `jvp` uses the registered JVP rule, else derives the tangent from the registered VJP rule through `autodiff._jvp_from_vjp`; `vjp` requires a registered VJP rule; neither present returns `None`.
-The response's `output_ids` must hold exactly one tangent per op RESULT (jvp) / one cotangent per op OPERAND (vjp), because the engine maps every one to a real dual value — so `autodiff._materialize` turns a `None`/`ZeroTangent` entry into an explicit zeros op of the matching primal type.
+The response's `output_ids` holds exactly one entry per op RESULT (jvp, tangents) / op OPERAND (vjp, cotangents), in order, and is NULLABLE: a `None`/`ZeroTangent` rule entry is sent as `None` (native's structurally-zero dual) and the scratch subgraph returns only its real contributions, so no zero-materialization op is emitted — native materializes zeros only where a zero dual reaches a graph output.
 A rule's own exception class is propagated verbatim; a rule that cannot answer raises the documented `TransformError` (never a silent fallback).
 
 ### AD delegation (`_native_ad.py`)
