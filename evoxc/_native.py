@@ -43,7 +43,9 @@ Three entry points exist:
   population of programs; returns ``{"module": ir.Module, "batch_report":
   {...}, **extras}`` (the merged program through the same trusted fast decode
   plus the 12-key report payload).
-Nothing else in evoxc delegates to this seam yet.
+The seam is consumed by ``evoxc.transforms`` — all five builtin transforms
+plus ``batch_functions`` — and by the parity harnesses; trace-time inference
+still runs in Python through ``evoxc.ir``.
 """
 
 from __future__ import annotations

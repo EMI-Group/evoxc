@@ -302,8 +302,8 @@ The wire format is unchanged — still `evoxc-native-ir` v1 (`ENVELOPE_FORMAT = 
 `EVOXC_NATIVE_DECODE_CHECK=1` (read ONCE at `_native_codec` import; `""`/`"0"`/`"false"`/`"False"` leave it off) is the dev-only cross-check: the fast-decoded module is run through `ir.verify`, so the trusted path can be audited without paying verification in the hot path.
 It does not re-decode through the validated path or diff the two modules — `ir.verify` on the fast result is the whole check, raising the same `VerificationError` a bad module would.
 The cross-check therefore costs the fast decode plus one `ir.verify` pass (≈4 µs/op at a few thousand ops, rising with size).
-Cost, measured at the native AD seam and recorded with the fast-decoder work (reproducible via `git log --grep 'fast decode'`): the trusted decode is linear at ≈4.9 µs/op — 3.7 ms at 753 ops and 11.2 ms at 2 253 ops, re-measured at 3.4 ms / 2 008 ops and 11.8 ms / 6 008 ops.
-The validated decoder costs ≈20–21 µs/op on the same graphs (15.4 ms at 753 ops, 47.6 ms at 2 253 ops), so the trusted path is ≈4.2–4.3× faster.
+Cost, measured at the native AD seam on this host and recorded with the fast-decoder work (host- and load-dependent, not a fixed per-op budget; reproducible via `git log --grep 'fast decode'`): the trusted `build_module_fast` decode took 3.4 ms at 2 008 ops and 11.8 ms at 6 008 ops.
+The validated decoder was measured at ≈20–21 µs/op on this host (15.4 ms at 753 ops, 47.6 ms at 2 253 ops), so the trusted path is roughly an order of magnitude cheaper per op.
 That validated cost is dominated by `_build_module`'s generic validation walk plus `ir.verify`: `../../native/CONTEXT.md` records 20.3 ms of a 34.6 ms native-`grad` path at 752 ops for the validated decode alone, which is why the same end-to-end `grad`/`vjp` hop is ≈17 ms over the trusted path versus ≈29 ms when the seam decodes validated.
 
 ## Cross-language boundary facts
