@@ -15,3 +15,11 @@ htmlcov/
 *.evoxcgraph
 *.evoxcartifact
 *.executable
+# Rust build products and the in-tree PyO3 extension
+/native/target/
+/target/
+*.rs.bk
+# built native extension (scripts/build-native.sh)
+evoxc/_evoxc_native*.so
+# cached Nix store paths for scripts/dev-env.sh
+/.dev-env.cache
