@@ -339,8 +339,8 @@ pub fn transform(
 /// A Python callable kept alive for the whole transform run and consulted by the
 /// engine through [`ExtensionRule`].
 #[derive(Debug)]
-struct PyExtensionRule {
-    callback: Py<PyAny>,
+pub(crate) struct PyExtensionRule {
+    pub(crate) callback: Py<PyAny>,
 }
 
 impl ExtensionRule for PyExtensionRule {
@@ -380,6 +380,29 @@ fn python_failure(py: Python<'_>, err: &PyErr, op_name: &str) -> evoxc_core::Err
         Err(_) => String::from("<unprintable Python error>"),
     };
     evoxc_core::Error::transform(format!("extension rule for op '{op_name}': {text}"))
+}
+
+/// Decode one `extension_rule` config value into the bridge handle.
+///
+/// Shared by `transform` and `batch_functions`: `None` clears the bridge, a
+/// callable becomes a [`PyExtensionRule`], anything else is a `TypeError`
+/// naming the entry point (`prefix`) and the key.
+pub(crate) fn extension_rule_from_value(
+    value: &Bound<'_, PyAny>,
+    prefix: &str,
+) -> PyResult<Option<PyExtensionRule>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if value.is_callable() {
+        return Ok(Some(PyExtensionRule {
+            callback: value.clone().unbind(),
+        }));
+    }
+    Err(error::type_error(format!(
+        "{prefix}: config.extension_rule must be callable, got {}",
+        type_name(value)
+    )))
 }
 
 /// Decode the Python config dict into the engine's [`TransformConfig`] plus an
@@ -442,18 +465,7 @@ fn parse_config(
                 );
             }
             "extension_rule" => {
-                if value.is_none() {
-                    extension = None;
-                } else if value.is_callable() {
-                    extension = Some(PyExtensionRule {
-                        callback: value.unbind(),
-                    });
-                } else {
-                    return Err(error::type_error(format!(
-                        "transform: config.extension_rule must be callable, got {}",
-                        type_name(&value)
-                    )));
-                }
+                extension = extension_rule_from_value(&value, "transform")?;
             }
             other => {
                 return Err(error::raise(
