@@ -139,17 +139,16 @@ impl AttrValue {
         if value.is_null() {
             return Ok(AttrValue::Null);
         }
-        // A tuple marker round-trips under any declared type.
+        // A tuple marker carries Python's tuple/list distinction.  Decode it
+        // according to the DECLARED tag: typed sequence attributes become
+        // their sequence variant (a tuple and a list are semantically the same
+        // value there), while `any` keeps the generic tuple marker.
         if let Json::Object(map) = value {
             if let Some(items) = map.get(TUPLE_TAG) {
                 let list = items.as_array().ok_or_else(|| {
                     Error::verification(format!("{TUPLE_TAG} must hold a list"))
                 })?;
-                let mut out = Vec::with_capacity(list.len());
-                for item in list {
-                    out.push(AttrValue::from_json(attr_type::ANY, item)?);
-                }
-                return Ok(AttrValue::Tuple(out));
+                return tuple_from_json(ty, list);
             }
         }
         match ty {
@@ -377,6 +376,120 @@ fn json_list<'a>(value: &'a Json, what: &str) -> Result<&'a Vec<Json>> {
     value
         .as_array()
         .ok_or_else(|| Error::verification(format!("expected {what}, got {value}")))
+}
+
+/// Decode the payload of a [`TUPLE_TAG`] marker under a declared attribute tag.
+///
+/// Typed sequence tags decode elementwise to their sequence variant; `any`
+/// keeps the generic tuple (its members are generic [`AttrValue::Any`] values);
+/// a scalar tag is an explicit error — a tuple is not a valid value for it.
+fn tuple_from_json(ty: &str, list: &[Json]) -> Result<AttrValue> {
+    match ty {
+        attr_type::INTS => {
+            let mut out = Vec::with_capacity(list.len());
+            for (index, item) in list.iter().enumerate() {
+                out.push(item.as_i64().ok_or_else(|| {
+                    Error::verification(format!(
+                        "{TUPLE_TAG} item {index} of an ints attribute must be an int, got {item}"
+                    ))
+                })?);
+            }
+            Ok(AttrValue::Ints(out))
+        }
+        attr_type::FLOATS => {
+            let mut out = Vec::with_capacity(list.len());
+            for (index, item) in list.iter().enumerate() {
+                out.push(item.as_f64().ok_or_else(|| {
+                    Error::verification(format!(
+                        "{TUPLE_TAG} item {index} of a floats attribute must be a float, got {item}"
+                    ))
+                })?);
+            }
+            Ok(AttrValue::Floats(out))
+        }
+        attr_type::STRS => {
+            let mut out = Vec::with_capacity(list.len());
+            for (index, item) in list.iter().enumerate() {
+                out.push(
+                    item.as_str()
+                        .ok_or_else(|| {
+                            Error::verification(format!(
+                                "{TUPLE_TAG} item {index} of a strs attribute must be a string, \
+                                 got {item}"
+                            ))
+                        })?
+                        .to_string(),
+                );
+            }
+            Ok(AttrValue::Strs(out))
+        }
+        attr_type::NESTED_INTS => {
+            let mut out = Vec::with_capacity(list.len());
+            for (row_index, item) in list.iter().enumerate() {
+                let row = nested_int_row(item).map_err(|err| {
+                    err.context(format!("{TUPLE_TAG} item {row_index}"))
+                })?;
+                out.push(row);
+            }
+            Ok(AttrValue::NestedInts(out))
+        }
+        attr_type::SHAPE => list
+            .iter()
+            .map(wire::dim_from_json)
+            .collect::<Result<Vec<_>>>()
+            .map(AttrValue::Shape),
+        attr_type::ANY => {
+            let mut out = Vec::with_capacity(list.len());
+            for item in list {
+                out.push(AttrValue::from_json(attr_type::ANY, item)?);
+            }
+            Ok(AttrValue::Tuple(out))
+        }
+        attr_type::BOOL
+        | attr_type::INT
+        | attr_type::FLOAT
+        | attr_type::STR
+        | attr_type::DTYPE
+        | attr_type::NDARRAY => Err(Error::verification(format!(
+            "a tuple ({TUPLE_TAG}) is not a valid value for the {ty:?} attribute type"
+        ))),
+        other => Err(Error::verification(format!(
+            "unknown attribute type tag {other:?}"
+        ))),
+    }
+}
+
+/// One row of a `nested_ints` tuple payload: a plain list or a nested tuple
+/// marker, decoded elementwise as ints.
+fn nested_int_row(item: &Json) -> Result<Vec<i64>> {
+    let list = match item {
+        Json::Array(list) => list.as_slice(),
+        Json::Object(map) => {
+            let inner = map.get(TUPLE_TAG).ok_or_else(|| {
+                Error::verification(format!(
+                    "expected a list or {TUPLE_TAG} of ints, got {item}"
+                ))
+            })?;
+            inner
+                .as_array()
+                .ok_or_else(|| Error::verification(format!("{TUPLE_TAG} must hold a list")))?
+                .as_slice()
+        }
+        _ => {
+            return Err(Error::verification(format!(
+                "expected a list or {TUPLE_TAG} of ints, got {item}"
+            )))
+        }
+    };
+    let mut row = Vec::with_capacity(list.len());
+    for (index, value) in list.iter().enumerate() {
+        row.push(value.as_i64().ok_or_else(|| {
+            Error::verification(format!(
+                "item {index} of a nested_ints row must be an int, got {value}"
+            ))
+        })?);
+    }
+    Ok(row)
 }
 
 impl fmt::Display for AttrValue {
@@ -831,5 +944,129 @@ mod tests {
             ])
         );
         assert_eq!(converted.to_json(), value);
+    }
+
+    #[test]
+    fn tuple_marker_roundtrip_is_tag_directed() {
+        let marker = serde_json::json!({"__evoxc_tuple__": [0]});
+
+        // A typed sequence tag decodes to its sequence variant and re-encodes
+        // as a plain list (tuple/list carry no distinct meaning there).
+        let typed = AttrValue::from_json(attr_type::INTS, &marker).unwrap();
+        assert_eq!(typed, AttrValue::Ints(vec![0]));
+        assert_eq!(typed.to_json(), serde_json::json!([0]));
+
+        // `any` keeps the generic tuple and its marker on re-encode.
+        let generic = AttrValue::from_json(attr_type::ANY, &marker).unwrap();
+        assert_eq!(
+            generic,
+            AttrValue::Tuple(vec![AttrValue::Any(serde_json::json!(0))])
+        );
+        assert_eq!(generic.to_json(), marker);
+    }
+
+    #[test]
+    fn tuple_variant_only_matches_the_any_tag() {
+        let tuple = AttrValue::Tuple(vec![AttrValue::Any(serde_json::json!(0))]);
+        assert!(!tuple.matches_type(attr_type::INTS));
+        assert!(!tuple.matches_type(attr_type::SHAPE));
+        assert!(!tuple.matches_type(attr_type::NESTED_INTS));
+        assert!(tuple.matches_type(attr_type::ANY));
+        assert!(AttrValue::Ints(vec![0]).matches_type(attr_type::INTS));
+    }
+
+    #[test]
+    fn typed_tuple_attributes_decode_via_the_schema() {
+        // gather.axes is `ints`; a Python tuple is a legitimate value.
+        let gather = require("gather").unwrap();
+        let json = serde_json::json!({"axes": {"__evoxc_tuple__": [0]}});
+        let attrs = Attrs::from_json_map(json.as_object().unwrap(), gather).unwrap();
+        assert_eq!(attrs.ints("axes").unwrap(), &[0]);
+        assert_eq!(attrs.to_json(), serde_json::json!({"axes": [0]}));
+
+        // slice.strides is `ints` too, alongside required int lists.
+        let slice = require("slice").unwrap();
+        let json = serde_json::json!({
+            "start_indices": [0, 0],
+            "limit_indices": [2, 4],
+            "strides": {"__evoxc_tuple__": [1, 2]},
+        });
+        let attrs = Attrs::from_json_map(json.as_object().unwrap(), slice).unwrap();
+        assert_eq!(attrs.ints("strides").unwrap(), &[1, 2]);
+        assert_eq!(attrs.to_json()["strides"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn nested_int_tuples_decode_elementwise() {
+        let pad = require("pad").unwrap();
+        let json = serde_json::json!({
+            "padding_config": {"__evoxc_tuple__": [
+                {"__evoxc_tuple__": [1, 2]},
+                [0, 0],
+            ]},
+        });
+        let attrs = Attrs::from_json_map(json.as_object().unwrap(), pad).unwrap();
+        assert_eq!(
+            attrs.nested_ints("padding_config").unwrap(),
+            &[vec![1, 2], vec![0, 0]]
+        );
+        assert_eq!(
+            attrs.to_json()["padding_config"],
+            serde_json::json!([[1, 2], [0, 0]])
+        );
+    }
+
+    #[test]
+    fn shape_tuple_marker_decodes_dim_dicts() {
+        let reshape = require("reshape").unwrap();
+        let json = serde_json::json!({
+            "shape": {"__evoxc_tuple__": [{"int": 2}, {"dim": "B"}, null]},
+        });
+        let attrs = Attrs::from_json_map(json.as_object().unwrap(), reshape).unwrap();
+        assert_eq!(
+            attrs.shape("shape").unwrap(),
+            &vec![Dim::int(2), Dim::named("B"), Dim::Dynamic]
+        );
+        assert_eq!(
+            attrs.to_json()["shape"],
+            serde_json::json!([{"int": 2}, {"dim": "B"}, null])
+        );
+    }
+
+    #[test]
+    fn tuple_marker_rejected_for_scalar_tags() {
+        for (op_name, attr, payload) in [
+            (
+                "cast",
+                "dtype",
+                serde_json::json!({"__evoxc_tuple__": ["float32"]}),
+            ),
+            (
+                "sort",
+                "descending",
+                serde_json::json!({"__evoxc_tuple__": [true]}),
+            ),
+        ] {
+            let op = require(op_name).unwrap();
+            let json = serde_json::json!({ attr: payload });
+            let err = Attrs::from_json_map(json.as_object().unwrap(), op).unwrap_err();
+            assert_eq!(err.kind_str(), "VerificationError", "{}", err.message);
+            assert!(err.message.contains(attr), "{}", err.message);
+            assert!(err.message.contains("tuple"), "{}", err.message);
+            assert!(err.message.contains("not a valid value"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn tuple_marker_non_int_member_names_the_index() {
+        let marker = serde_json::json!({"__evoxc_tuple__": [0, "x"]});
+        let err = AttrValue::from_json(attr_type::INTS, &marker).unwrap_err();
+        assert_eq!(err.kind_str(), "VerificationError");
+        assert!(err.message.contains("item 1"), "{}", err.message);
+
+        let nested = serde_json::json!({"__evoxc_tuple__": [[1, 2], [3, "x"]]});
+        let err = AttrValue::from_json(attr_type::NESTED_INTS, &nested).unwrap_err();
+        assert_eq!(err.kind_str(), "VerificationError");
+        assert!(err.message.contains("item 1"), "{}", err.message);
     }
 }
