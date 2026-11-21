@@ -437,20 +437,15 @@ fn bands_flat_and_explicit_one_emit_the_flat_graph() {
 }
 
 #[test]
-fn banded_merges_report_the_next_stage() {
-    let mut explicit = config();
-    explicit.bands = Bands::Explicit(2);
-    let error = merge_error(&[square(), square()], &explicit);
-    assert_transform_error(&error, "banded merge is not implemented yet (next stage)");
-
-    let mut auto = config();
-    auto.bands = Bands::Auto;
-    let error = merge_error(&[square(), square()], &auto);
-    assert_transform_error(&error, "banded merge is not implemented yet (next stage)");
-
+fn banded_out_of_range_band_counts_are_rejected() {
     let mut out_of_range = config();
     out_of_range.bands = Bands::Explicit(3);
     let error = merge_error(&[square(), square()], &out_of_range);
+    assert_transform_error(&error, "is out of range for 2 function(s)");
+
+    let mut zero = config();
+    zero.bands = Bands::Explicit(0);
+    let error = merge_error(&[square(), square()], &zero);
     assert_transform_error(&error, "is out of range for 2 function(s)");
 }
 

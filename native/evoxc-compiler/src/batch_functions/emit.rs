@@ -1,4 +1,4 @@
-//! Flat emission for `batch_functions`.
+//! Emission for `batch_functions`.
 //!
 //! Port of `evoxc/transforms/_emit.py`'s FLAT half: build ONE ordinary module
 //! whose leading axis is the static length-N function axis.
@@ -19,8 +19,14 @@
 //!   (an unmapped output with `out_axes=Some(0)`), or is mask-muxed across its
 //!   distinct function results (counted on `output_muxes`).
 //!
+//! The same [`Emitter`] drives one BAND of the banded merge ([`super::bands`]):
+//! `n` is then the band size, the band hooks ([`BandHooks`]) resolve a mapped
+//! input leaf to a band-local view, and the band's row map keeps
+//! `SwitchRecord.rows_per_variant` in GLOBAL function indices.
+//!
 //! Rule-emitted ops inherit the contributing source op's `Location`; the
-//! engine's own helpers (masks, broadcasts, alignment reshapes) get `None`.
+//! engine's own helpers (masks, broadcasts, alignment reshapes, band slices /
+//! gathers / output concatenations) get `None`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -31,6 +37,7 @@ use evoxc_core::error::{Error, Result};
 use evoxc_core::graph::{Location, Program, ValueId};
 use evoxc_core::value_type::ValueType;
 
+use crate::batch_functions::bands::BandHooks;
 use crate::batch_functions::canon::Identity;
 use crate::batch_functions::dag::{ClassInfo, MergeDag, Ref};
 use crate::batch_functions::{format_shape, BatchOutput, BatchReport, SwitchRecord};
@@ -45,35 +52,28 @@ struct VariantEmission {
     axes: Vec<MappedAxes>,
 }
 
-struct Emitter<'a> {
-    programs: &'a [Program],
-    dag: &'a MergeDag,
-    n: usize,
-    builder: Builder,
-    input_ids: Vec<ValueId>,
-    /// Mappedness of every emitted value.
-    env: HashMap<ValueId, MappedAxes>,
-    /// `class_id -> its emitted result values`.
-    emitted: HashMap<usize, Vec<ValueId>>,
-    switched: Vec<SwitchRecord>,
-    stacked_constants: usize,
-    output_muxes: usize,
+/// The merged module skeleton: the new builder, its block arguments and the
+/// mappedness of every leaf (shared by the flat and the banded driver).
+pub(crate) struct MergedModule {
+    pub builder: Builder,
+    pub input_ids: Vec<ValueId>,
+    pub input_axes: Vec<MappedAxes>,
 }
 
-/// Emit the flat merged graph of `programs` (the whole `[dag]` in creation
-/// order), returning the new program plus the documented report.
-pub(crate) fn emit_flat(
-    programs: &[Program],
-    dag: &MergeDag,
+/// Build the merged module/function skeleton (steps 1-2 of a merge).
+///
+/// A mapped input leaf gains a STATIC leading `n` dim (never a symbolic
+/// `Dim`); an unmapped leaf is reused unchanged. The entry function keeps its
+/// name and metadata, and the module keeps `programs[0]`'s name/metadata.
+pub(crate) fn build_merged_module(
+    programs: &[&Program],
     entries: &[Option<i64>],
-    out_entries: &[Option<i64>],
-    rules: &TransformEnv<'_>,
-    band_strategy: &'static str,
     n: usize,
-) -> Result<BatchOutput> {
-    let program0 = programs.first().ok_or_else(|| {
-        Error::transform("batch_functions: fns must be a non-empty sequence")
-    })?;
+) -> Result<MergedModule> {
+    let program0 = programs
+        .first()
+        .copied()
+        .ok_or_else(|| Error::transform("batch_functions: fns must be a non-empty sequence"))?;
     let function0 = program0.functions.first().ok_or_else(|| {
         Error::transform("batch_functions: a merged program has no functions")
     })?;
@@ -84,61 +84,64 @@ pub(crate) fn emit_flat(
         .map(|value| Ok(program0.value(*value)?.ty.clone()))
         .collect::<Result<_>>()?;
     let mut input_types = Vec::with_capacity(arg_types.len());
+    let mut input_axes = Vec::with_capacity(arg_types.len());
     for (ty, entry) in arg_types.iter().zip(entries) {
         if entry.is_some() {
             let mut shape = Vec::with_capacity(ty.shape.len() + 1);
             shape.push(Dim::Int(n as i64));
             shape.extend(ty.shape.iter().cloned());
             input_types.push(ValueType::new(ty.dtype, shape));
+            input_axes.push(MappedAxes::new(1));
         } else {
             input_types.push(ty.clone());
+            input_axes.push(MappedAxes::UNMAPPED);
         }
     }
     let mut builder = Builder::with_metadata(program0.name.clone(), program0.metadata.clone());
     builder.open_function(&function0.name, &input_types)?;
     builder.set_function_metadata(function0.metadata.clone())?;
     let input_ids = builder.block_arguments()?;
-    let mut emitter = Emitter {
-        programs,
-        dag,
-        n,
-        builder,
-        input_ids: input_ids.clone(),
-        env: HashMap::new(),
-        emitted: HashMap::new(),
-        switched: Vec::new(),
-        stacked_constants: 0,
-        output_muxes: 0,
+    Ok(MergedModule { builder, input_ids, input_axes })
+}
+
+/// The counters one merge unit (the whole population, or one band) reports.
+pub(crate) struct EmitCounters {
+    pub switched: Vec<SwitchRecord>,
+    pub stacked_constants: usize,
+    pub output_muxes: usize,
+}
+
+/// Emit the flat merged graph of `programs` (the whole `[dag]` in creation
+/// order), returning the new program plus the documented report.
+pub(crate) fn emit_flat(
+    programs: &[&Program],
+    dag: &MergeDag,
+    entries: &[Option<i64>],
+    out_entries: &[Option<i64>],
+    rules: &TransformEnv<'_>,
+    band_strategy: &'static str,
+    n: usize,
+) -> Result<BatchOutput> {
+    let mut module = build_merged_module(programs, entries, n)?;
+    let input_ids = module.input_ids.clone();
+    let (outputs, emitted_ops, counters) = {
+        let mut emitter =
+            Emitter::new(&mut module.builder, programs, dag, n, &input_ids, entries, None);
+        emitter.seed_inputs(&module.input_axes)?;
+        emitter.emit_reachable(rules)?;
+        let outputs = emitter.emit_outputs(out_entries)?;
+        let emitted_ops = emitter.builder.block_op_ids()?.len();
+        emitter.builder.set_terminator(&outputs, None)?;
+        (outputs, emitted_ops, emitter.take_counters())
     };
-    for (index, entry) in entries.iter().enumerate() {
-        let value = *input_ids.get(index).ok_or_else(|| {
-            Error::transform("batch_functions: internal error — an input index is out of range")
-        })?;
-        let axes = if entry.is_some() { MappedAxes::new(1) } else { MappedAxes::UNMAPPED };
-        emitter.env.insert(value, axes);
-    }
-    let reachable = dag.reachable.clone();
-    for class_id in reachable {
-        let info = dag.classes.get(class_id).cloned().ok_or_else(|| {
-            Error::transform("batch_functions: internal error — a reachable class id is out of range")
-        })?;
-        if matches!(info.identity, Identity::Constant) {
-            emitter.emit_constant(&info)?;
-        } else {
-            emitter.emit_class(&info, rules)?;
-        }
-    }
-    let outputs = emitter.emit_outputs(out_entries)?;
-    let emitted_ops = emitter.builder.block_op_ids()?.len();
-    emitter.builder.set_terminator(&outputs, None)?;
-    let program = emitter.builder.finish();
+    let program = module.builder.finish();
     let report = BatchReport {
         n_functions: n,
         value_classes: dag.reachable.len(),
         shared_classes: dag.shared_classes(),
-        switched: emitter.switched,
-        stacked_constants: emitter.stacked_constants,
-        output_muxes: emitter.output_muxes,
+        switched: counters.switched,
+        stacked_constants: counters.stacked_constants,
+        output_muxes: counters.output_muxes,
         emitted_ops,
         bands: 1,
         band_sizes: vec![n],
@@ -149,10 +152,95 @@ pub(crate) fn emit_flat(
     Ok(BatchOutput { program, output_ids: outputs, input_ids, report })
 }
 
-impl Emitter<'_> {
+/// One merge unit's emitter: the whole population (flat) or one BAND.
+pub(crate) struct Emitter<'a> {
+    pub builder: &'a mut Builder,
+    pub programs: &'a [&'a Program],
+    pub dag: &'a MergeDag,
+    /// The unit's program count — the whole population in the flat merge, the
+    /// BAND size for a band (masks and stacked constants are unit-sized).
+    pub n: usize,
+    pub input_ids: &'a [ValueId],
+    pub entries: &'a [Option<i64>],
+    /// Mappedness of every emitted value.
+    env: HashMap<ValueId, MappedAxes>,
+    /// `class_id -> its emitted result values`.
+    emitted: HashMap<usize, Vec<ValueId>>,
+    switched: Vec<SwitchRecord>,
+    stacked_constants: usize,
+    output_muxes: usize,
+    /// Band hooks (`None` = the flat merge).
+    band: Option<BandHooks>,
+}
+
+impl<'a> Emitter<'a> {
+    pub(crate) fn new(
+        builder: &'a mut Builder,
+        programs: &'a [&'a Program],
+        dag: &'a MergeDag,
+        n: usize,
+        input_ids: &'a [ValueId],
+        entries: &'a [Option<i64>],
+        band: Option<BandHooks>,
+    ) -> Emitter<'a> {
+        Emitter {
+            builder,
+            programs,
+            dag,
+            n,
+            input_ids,
+            entries,
+            env: HashMap::new(),
+            emitted: HashMap::new(),
+            switched: Vec::new(),
+            stacked_constants: 0,
+            output_muxes: 0,
+            band,
+        }
+    }
+
+    /// Seed the metadata env of the flat merge's block arguments (a band
+    /// resolves its mapped leaves lazily through [`BandHooks`] instead).
+    pub(crate) fn seed_inputs(&mut self, input_axes: &[MappedAxes]) -> Result<()> {
+        for (index, axes) in input_axes.iter().enumerate() {
+            let value = *self.input_ids.get(index).ok_or_else(|| {
+                Error::transform("batch_functions: internal error — an input index is out of range")
+            })?;
+            self.env.insert(value, *axes);
+        }
+        Ok(())
+    }
+
+    /// Emit every reachable class of the unit in emission order.
+    pub(crate) fn emit_reachable(&mut self, rules: &TransformEnv<'_>) -> Result<()> {
+        let reachable = self.dag.reachable.clone();
+        for class_id in reachable {
+            let info = self.dag.classes.get(class_id).cloned().ok_or_else(|| {
+                Error::transform(
+                    "batch_functions: internal error — a reachable class id is out of range",
+                )
+            })?;
+            if matches!(info.identity, Identity::Constant) {
+                self.emit_constant(&info)?;
+            } else {
+                self.emit_class(&info, rules)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the unit's counters (the report aggregates them over bands).
+    pub(crate) fn take_counters(&mut self) -> EmitCounters {
+        EmitCounters {
+            switched: std::mem::take(&mut self.switched),
+            stacked_constants: self.stacked_constants,
+            output_muxes: self.output_muxes,
+        }
+    }
+
     // -- bookkeeping ------------------------------------------------------
 
-    fn axes_of(&self, value: ValueId, what: &str) -> Result<MappedAxes> {
+    pub(crate) fn axes_of(&self, value: ValueId, what: &str) -> Result<MappedAxes> {
         self.env.get(&value).copied().ok_or_else(|| {
             Error::transform(format!(
                 "batch_functions: internal error — {what} has no recorded batching metadata"
@@ -160,13 +248,31 @@ impl Emitter<'_> {
         })
     }
 
-    fn operand_value(&self, program_index: usize, value: ValueId) -> Result<ValueId> {
-        match self.dag.ref_of(program_index, value)? {
-            Ref::Input(index) => self.input_ids.get(index).copied().ok_or_else(|| {
+    /// Band-local program indices -> GLOBAL function indices (identity when flat).
+    pub(crate) fn global_rows(&self, rows: &[usize]) -> Vec<usize> {
+        match &self.band {
+            None => rows.to_vec(),
+            Some(hooks) => hooks.map_rows(rows),
+        }
+    }
+
+    /// The unit-local value standing for tensor input leaf `leaf`.
+    fn input_value(&mut self, leaf: usize) -> Result<ValueId> {
+        let Some(hooks) = self.band.as_mut() else {
+            return self.input_ids.get(leaf).copied().ok_or_else(|| {
                 Error::transform(
                     "batch_functions: internal error — an input leaf index is out of range",
                 )
-            }),
+            });
+        };
+        let (value, axes) = hooks.view(leaf, self.builder, self.input_ids, self.entries)?;
+        self.env.insert(value, axes);
+        Ok(value)
+    }
+
+    fn operand_value(&mut self, program_index: usize, value: ValueId) -> Result<ValueId> {
+        match self.dag.ref_of(program_index, value)? {
+            Ref::Input(index) => self.input_value(index),
             Ref::Class { class_id, result_index } => self
                 .emitted
                 .get(&class_id)
@@ -212,33 +318,23 @@ impl Emitter<'_> {
     // -- constants --------------------------------------------------------
 
     fn emit_constant(&mut self, info: &ClassInfo) -> Result<()> {
-        let mut first: Option<(usize, Option<Location>)> = None;
-        let mut payloads: BTreeMap<usize, ArrayPayload> = BTreeMap::new();
+        let payloads = constant_payloads(self.programs, info)?;
+        let mut first: Option<Option<Location>> = None;
         for contributor in &info.contributors {
             let program = self.programs.get(contributor.program_index).ok_or_else(|| {
                 Error::transform("batch_functions: internal error — a program index is out of range")
             })?;
-            let op = program.op(contributor.op_id)?;
-            let payload = op.attributes.array("value")?.clone();
             if first.is_none() {
-                first = Some((contributor.program_index, op.location.clone()));
+                first = Some(program.op(contributor.op_id)?.location.clone());
             }
-            payloads.insert(contributor.program_index, payload);
         }
-        let (_, location) = first.ok_or_else(|| {
-            Error::transform("batch_functions: internal error — a constant class has no contributor")
-        })?;
+        let location = first.flatten();
         let reference = payloads
             .values()
             .next()
             .cloned()
             .ok_or_else(|| Error::transform("batch_functions: internal error — no constant payload"))?;
-        let uniform = payloads.len() < 2
-            || payloads.values().all(|payload| {
-                payload.dtype == reference.dtype
-                    && payload.shape == reference.shape
-                    && payload.data == reference.data
-            });
+        let uniform = constant_payloads_agree(&payloads);
         let start = self.builder.block_op_ids()?.len();
         let value = if uniform {
             self.builder.constant(reference.clone())?
@@ -274,22 +370,23 @@ impl Emitter<'_> {
     // -- classes ----------------------------------------------------------
 
     fn operand_stack(
-        &self,
+        &mut self,
         program_index: usize,
         op_id: evoxc_core::graph::OpId,
     ) -> Result<(Vec<ValueId>, Vec<MappedAxes>)> {
-        let program = self.programs.get(program_index).ok_or_else(|| {
+        let program = self.programs.get(program_index).copied().ok_or_else(|| {
             Error::transform("batch_functions: internal error — a program index is out of range")
         })?;
-        let op = program.op(op_id)?;
-        let mut operands = Vec::with_capacity(op.operands.len());
-        let mut axes = Vec::with_capacity(op.operands.len());
-        for operand in &op.operands {
-            let value = self.operand_value(program_index, *operand)?;
-            axes.push(self.axes_of(value, &format!("an operand of op '{}'", op.name))?);
-            operands.push(value);
+        let name = program.op(op_id)?.name.clone();
+        let operands = program.op(op_id)?.operands.clone();
+        let mut values = Vec::with_capacity(operands.len());
+        let mut axes = Vec::with_capacity(operands.len());
+        for operand in operands {
+            let value = self.operand_value(program_index, operand)?;
+            axes.push(self.axes_of(value, &format!("an operand of op '{name}'"))?);
+            values.push(value);
         }
-        Ok((operands, axes))
+        Ok((values, axes))
     }
 
     fn emit_class(&mut self, info: &ClassInfo, rules: &TransformEnv<'_>) -> Result<()> {
@@ -322,7 +419,7 @@ impl Emitter<'_> {
         axes: &[MappedAxes],
     ) -> Result<(Vec<ValueId>, Vec<MappedAxes>)> {
         let (source, location) = {
-            let program = self.programs.get(program_index).ok_or_else(|| {
+            let program = self.programs.get(program_index).copied().ok_or_else(|| {
                 Error::transform(
                     "batch_functions: internal error — a program index is out of range",
                 )
@@ -330,10 +427,10 @@ impl Emitter<'_> {
             let op = program.op(op_id)?;
             (RuleOp::from_source(program, op)?, op.location.clone())
         };
-        let rule_op = source.bind_operands(&self.builder, operands)?;
+        let rule_op = source.bind_operands(self.builder, operands)?;
         let start = self.builder.block_op_ids()?.len();
         let dispatched = {
-            let mut ctx = RuleCtx::with_batch_dim(&mut self.builder, None);
+            let mut ctx = RuleCtx::with_batch_dim(&mut *self.builder, None);
             batching::dispatch(rules, &mut ctx, &rule_op, axes)
         };
         let (values, out_axes) = dispatched?;
@@ -454,7 +551,11 @@ impl Emitter<'_> {
                 accumulator[result_index] = selected;
             }
         }
-        let rows_per_variant = info.rows.clone();
+        let rows_per_variant = info
+            .rows
+            .iter()
+            .map(|rows| self.global_rows(rows))
+            .collect::<Vec<_>>();
         self.switched.push(SwitchRecord {
             group: label,
             variants: per_variant.iter().map(|entry| entry.name.clone()).collect(),
@@ -557,7 +658,7 @@ impl Emitter<'_> {
 
     // -- outputs ----------------------------------------------------------
 
-    fn emit_outputs(&mut self, out_entries: &[Option<i64>]) -> Result<Vec<ValueId>> {
+    pub(crate) fn emit_outputs(&mut self, out_entries: &[Option<i64>]) -> Result<Vec<ValueId>> {
         let leaf_count = self.dag.output_count();
         let mut outputs = Vec::with_capacity(leaf_count);
         for leaf_index in 0..leaf_count {
@@ -647,6 +748,38 @@ impl Emitter<'_> {
     }
 }
 
-fn shape_attrs(shape: Vec<Dim>) -> Attrs {
+/// ``contributing program index -> payload`` of a constant class.
+pub(crate) fn constant_payloads(
+    programs: &[&Program],
+    info: &ClassInfo,
+) -> Result<BTreeMap<usize, ArrayPayload>> {
+    let mut payloads = BTreeMap::new();
+    for contributor in &info.contributors {
+        let program = programs.get(contributor.program_index).copied().ok_or_else(|| {
+            Error::transform("batch_functions: internal error — a program index is out of range")
+        })?;
+        payloads.insert(
+            contributor.program_index,
+            program.op(contributor.op_id)?.attributes.array("value")?.clone(),
+        );
+    }
+    Ok(payloads)
+}
+
+/// Whether every payload of a constant class equals the LOWEST contributing
+/// program's payload (`_emit.constant_payloads_agree`).
+pub(crate) fn constant_payloads_agree(payloads: &BTreeMap<usize, ArrayPayload>) -> bool {
+    if payloads.len() < 2 {
+        return true;
+    }
+    let Some(reference) = payloads.values().next() else { return true };
+    payloads.values().all(|payload| {
+        payload.dtype == reference.dtype
+            && payload.shape == reference.shape
+            && payload.data == reference.data
+    })
+}
+
+pub(crate) fn shape_attrs(shape: Vec<Dim>) -> Attrs {
     Attrs::from_pairs([("shape", AttrValue::Shape(shape))])
 }

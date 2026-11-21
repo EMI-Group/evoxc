@@ -183,8 +183,9 @@ impl MergeDag {
     /// (topological by construction), skipping the terminator; class ids follow
     /// first-appearance order. The caller is responsible for the structural
     /// validation (identical signatures, single-function single-block programs,
-    /// every op batchable).
-    pub fn build(programs: &[Program], groups: &[MergeGroup], alignment: Alignment) -> Result<MergeDag> {
+    /// every op batchable). `programs` is a VIEW: the whole population for the
+    /// flat merge, one band's programs for a banded merge.
+    pub fn build(programs: &[&Program], groups: &[MergeGroup], alignment: Alignment) -> Result<MergeDag> {
         let mut dag = MergeDag { classes: Vec::new(), programs: Vec::new(), reachable: Vec::new() };
         let mut skeleton_classes: HashMap<Skeleton, SkeletonClasses> = HashMap::new();
         for (program_index, program) in programs.iter().enumerate() {

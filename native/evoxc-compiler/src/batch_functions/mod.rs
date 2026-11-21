@@ -13,10 +13,12 @@
 //! all remaining divergence is `select`-muxed at the consumers/outputs.
 //!
 //! This module owns the public surface (config, report, entry points) and the
-//! ordered validation; the bookkeeping is [`dag`] plus [`canon`], and the flat
-//! emission is [`emit`]. The banded merge (`bands=K` / `bands="auto"`) is the
-//! NEXT stage — see the `TODO(bands)` in [`batch_functions_with_env`].
+//! ordered validation; the bookkeeping is [`dag`] plus [`canon`], the flat
+//! emission is [`emit`], and the banded merge (partition rules, structural
+//! fingerprints, the static cost model, band-local input views and the output
+//! combination) is [`bands`].
 
+pub mod bands;
 pub mod canon;
 pub mod dag;
 pub mod emit;
@@ -241,44 +243,67 @@ pub fn batch_functions_with_env(
     // 2. Cross-program contract: identical input and output counts, dtypes and
     //    shapes (the pytrees themselves stay on the Python side).
     check_contract(programs)?;
-    // 3. Every op must be batchable.
+    // 3. Every op must be batchable (checked BEFORE any banding decision, so a
+    //    banded merge reports exactly the errors a flat one would).
     check_ops(programs, env)?;
     // 4. Axis entries: only `0` / `null` in v1.
     let entries = normalise_axes(programs, &config.axes)?;
     let out_entries = normalise_out_axes(programs, &config.out_axes)?;
-    // 5. Bands.
+    // 5. Bands: the flat merge, an explicit band count (`Bands::Explicit(k)`
+    //    with `k > 1`) or the static cost model.
     let n = programs.len();
-    let band_strategy = match config.bands {
+    let strategy: &'static str = match config.bands {
         Bands::Flat => "flat",
-        Bands::Explicit(1) => "explicit",
-        Bands::Explicit(k) => {
-            if k == 0 || k > n {
-                return Err(Error::transform(format!(
-                    "batch_functions: bands={k} is out of range for {n} function(s) — the band \
-                     count K must satisfy 1 <= K <= N; use bands=None for the flat merge"
-                )));
-            }
-            // TODO(bands): implement the banded merge (the next stage):
-            // K contiguous bands merged independently and concatenated along the
-            // function axis, with the documented banded-out check
-            // (`out_axes=None` tensor outputs are rejected when bands != None)
-            // and the per-band report fields (bands/band_sizes/band_strategy/
-            // cost_estimate/flat_cost_estimate) computed by `bands.rs`.
-            return Err(Error::transform(
-                "batch_functions: banded merge is not implemented yet (next stage)",
-            ));
-        }
-        Bands::Auto => {
-            // TODO(bands): the static cost model over flat, fingerprint groups,
-            // groups + a coalesced "misc" band and a geometric ladder.
-            return Err(Error::transform(
-                "batch_functions: banded merge is not implemented yet (next stage)",
-            ));
-        }
+        Bands::Explicit(_) => "explicit",
+        Bands::Auto => "auto",
     };
+    if let Bands::Explicit(k) = config.bands {
+        if k == 0 || k > n {
+            return Err(Error::transform(format!(
+                "batch_functions: bands={k} is out of range for {n} function(s) — the band count \
+                 K must satisfy 1 <= K <= N; use bands=None for the flat merge"
+            )));
+        }
+    }
     let groups = canon::parse_switch_groups(&config.switch_ops)?;
-    let dag = dag::MergeDag::build(programs, &groups, config.alignment)?;
-    emit::emit_flat(programs, &dag, &entries, &out_entries, env, band_strategy, n)
+    let view: Vec<&Program> = programs.iter().collect();
+    let plan = bands::MergePlan {
+        strategy,
+        cost_estimate: None,
+        flat_cost_estimate: None,
+        alignment: config.alignment,
+    };
+    if matches!(config.bands, Bands::Flat) {
+        let dag = dag::MergeDag::build(&view, &groups, config.alignment)?;
+        return emit::emit_flat(&view, &dag, &entries, &out_entries, env, strategy, n);
+    }
+    // A per-band value cannot be a single unmapped output; checked after the
+    // op-batchability check and before the partition, so `bands=1` obeys the
+    // same contract as any other band count.
+    bands::check_banded_out_entries(&out_entries)?;
+    let (partition, cost_estimate, flat_cost_estimate) = match config.bands {
+        Bands::Auto => {
+            let (partition, chosen, flat) =
+                bands::plan_auto_partition(&view, &entries, &groups, config.alignment)?;
+            (partition, Some(chosen), Some(flat))
+        }
+        Bands::Explicit(k) => (bands::even_partition(n, k)?, None, None),
+        Bands::Flat => unreachable!("the flat merge returned above"),
+    };
+    if partition.len() == 1 {
+        // A single-band resolution delegates to the flat emitter, so its graph
+        // is byte-identical to `bands=None` — only the report differs.
+        let dag = dag::MergeDag::build(&view, &groups, config.alignment)?;
+        let mut out = emit::emit_flat(&view, &dag, &entries, &out_entries, env, strategy, n)?;
+        out.report.bands = 1;
+        out.report.band_sizes = vec![n];
+        out.report.band_strategy = strategy;
+        out.report.cost_estimate = cost_estimate;
+        out.report.flat_cost_estimate = flat_cost_estimate;
+        return Ok(out);
+    }
+    let plan = bands::MergePlan { cost_estimate, flat_cost_estimate, ..plan };
+    bands::emit_banded(&view, &partition, &entries, &out_entries, &groups, env, plan)
 }
 
 // ---------------------------------------------------------------------------
