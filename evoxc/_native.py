@@ -31,6 +31,13 @@ Two entry points exist:
   ``grad``/``jvp``/``vjp``). The module is encoded, the extension returns the
   transformed envelope plus its top-level ``"transform"`` metadata, and the
   façade returns ``{"module": ir.Module, "transform": {...}, **extras}``.
+  The returned envelope is TRUSTED (it was produced in-process from the module
+  just encoded), so it is rebuilt with the fast
+  :func:`evoxc._native_codec.decode_native_module` — direct object
+  construction, no generic validation and no ``ir.verify`` (set
+  ``EVOXC_NATIVE_DECODE_CHECK=1`` to enable the verification cross-check).
+  :func:`evoxc._native_codec.decode_module` stays the validated decoder for
+  an envelope of uncertain provenance.
 
 Nothing else in evoxc delegates to this seam yet.
 """
@@ -388,7 +395,7 @@ def transform(kind: str, module: ir.Module, config: dict[str, Any]) -> dict[str,
         if key != "transform" and key not in _native_codec._ENVELOPE_KEYS
     }
     output = {
-        "module": _native_codec.decode_module(dict(result)),
+        "module": _native_codec.decode_native_module(dict(result)),
         "transform": _decode_transform_meta(result["transform"]),
     }
     output.update(extras)

@@ -50,6 +50,13 @@ Conversion (mirrors ``native/evoxc-compiler/tests/parity_transform/convert.py``)
   which rebuilds the module from the self-contained inline payloads (no
   constants-table hoist, no re-encode) and re-verifies it.  Original ids,
   parent pointers and ``uses`` are preserved.
+* :func:`decode_native_module` is the TRUSTED fast decoder for an envelope the
+  native engine just produced from a module this runtime encoded (the
+  transform seam): same discriminator/version check, then
+  :func:`evoxc.ir.serialize._build_module_fast` builds the IR objects directly
+  — no generic ``_require_*`` validation, no sha256 and no ``ir.verify``.
+  The result is structurally identical; ``EVOXC_NATIVE_DECODE_CHECK=1`` turns
+  the verification cross-check back on for development.
 
 Every malformed envelope is a loud error from this module or the
 ``VerificationError`` raised by the rebuild/``verify`` for body violations —
@@ -58,6 +65,7 @@ never a silent coercion.
 
 from __future__ import annotations
 
+import os
 from numbers import Integral
 from typing import Any
 
@@ -67,10 +75,26 @@ from evoxc import ir
 from evoxc.core import Dim, DimExpr
 from evoxc.ir import serialize as _ir_serialize
 
-__all__ = ["ENVELOPE_FORMAT", "encode_module", "decode_module", "encode_type", "decode_type"]
+__all__ = [
+    "ENVELOPE_FORMAT",
+    "encode_module",
+    "decode_module",
+    "decode_native_module",
+    "encode_type",
+    "decode_type",
+]
 
 #: Envelope version this codec reads and writes (the native ``VERSION``).
 ENVELOPE_FORMAT = 1
+
+#: Development-only cross-check for :func:`decode_native_module`: when set (and
+#: not ``0``/empty) at import time, the fast decode is followed by ``ir.verify``.
+_VERIFY_NATIVE_DECODE = os.environ.get("EVOXC_NATIVE_DECODE_CHECK", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
 
 #: Wire discriminator of the native envelope.
 _NATIVE_FORMAT = "evoxc-native-ir"
@@ -256,6 +280,34 @@ def decode_module(envelope: Any) -> ir.Module:
         evoxc.core.VerificationError: Structural violations found while
             rebuilding the body or by ``ir.verify``.
     """
+    return _ir_serialize._deserialize_envelope_body(_validated_envelope_body(envelope))
+
+
+def decode_native_module(envelope: Any, *, verify_module: bool | None = None) -> ir.Module:
+    """Rebuild an ``ir.Module`` from a TRUSTED native envelope (fast path).
+
+    This is the hot-path decoder for an envelope produced in-process by the
+    native transform engine from a module this runtime encoded moments
+    earlier — it constructs the IR objects directly (no generic
+    ``_require_*`` validation, no sha256, no serialize/deserialize round trip)
+    and only checks the envelope discriminator/version.  The result is
+    structurally identical to :func:`decode_module`'s (same ids, attributes,
+    ordered complete ``uses``, parent pointers and advanced id counters).
+
+    ``verify_module`` defaults to the ``EVOXC_NATIVE_DECODE_CHECK`` environment
+    flag (read once at import, off by default), which is the development-only
+    cross-check: it runs ``ir.verify`` over the fast-decoded module.
+    """
+    module = _ir_serialize._build_module_fast(_validated_envelope_body(envelope))
+    if verify_module is None:
+        verify_module = _VERIFY_NATIVE_DECODE
+    if verify_module:
+        ir.verify(module)
+    return module
+
+
+def _validated_envelope_body(envelope: Any) -> dict:
+    """Check the envelope discriminator/version and return its body mapping."""
     if not isinstance(envelope, dict):
         raise ValueError(
             f"malformed native envelope: expected a dict, got {type(envelope).__name__}"
@@ -272,5 +324,4 @@ def decode_module(envelope: Any) -> ir.Module:
             f"unsupported native envelope version {envelope_version!r} "
             f"(this codec accepts only {ENVELOPE_FORMAT})"
         )
-    body = {key: envelope[key] for key in _BODY_KEYS if key in envelope}
-    return _ir_serialize._deserialize_envelope_body(body)
+    return {key: envelope[key] for key in _BODY_KEYS if key in envelope}
