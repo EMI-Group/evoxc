@@ -498,6 +498,8 @@ evoxc/            the `evoxc` distribution's package: core, ir, ops, trace, tran
                 sparse, random, io, pipeline, persist, build_cache, block, external, bench
 evoxc_hf/         the separate `evoxc-hf` distribution: workspace member, src layout
                 (evoxc_hf/src/evoxc_hf/), own pyproject/README/LICENSE/version/extras
+native/         the Rust workspace: numerical core, transform engines, the PyO3 extension
+scripts/        dev-env and native-build helpers (`dev-env.sh`, `build-native.sh`)
 tests/          pytest suite mirroring evoxc/ + spec-compliance tests
 assets/         the diagrams in this README
 CONTEXT.md      architecture, contracts and status (root, the source of truth)
@@ -507,9 +509,9 @@ CONTEXT.md      architecture, contracts and status (root, the source of truth)
 
 ## Status & deferrals
 
-Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, graph transforms, `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `evoxc.bench` harness.
+Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `evoxc.bench` harness.
 
-Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **6965 passed, 80 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, **6551 passed, 112 skipped, 4 xfailed, 0 failed** with an auto-discovered PJRT plugin and no compiler adapter, and the colocated `./evoxc_hf/tests/` suite adds **709 passed, 18 skipped**. Every skip is a host or dependency guard (no NVIDIA CUDA device, no `tvm`/`torch` in the recorded venv, no `uv` build toolchain, no PJRT plugin, a torch-present inverse pin, the io pristine-process guard).
+Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **7024 passed, 86 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, plus **705 passed, 22 skipped** in the colocated `./evoxc_hf/tests/` suite. Every skip is a host or dependency guard (no NVIDIA CUDA or AMD ROCm device on the recorded host, `tvm`/`torch`/`transformers`/`jaxlib`/PJRT plugin absent from the recorded venv, no `uv`/`maturin` build toolchain in it, the io pristine-process guard), so a host carrying those extras turns them into passes.
 
 <details>
 <summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
