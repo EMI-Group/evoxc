@@ -575,11 +575,29 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
 // thread (numpy's ufuncs are single-threaded, so that alone only reaches
 // parity), which is why a big enough result is split across a few scoped
 // threads: four threads measured ~2x the one-thread bandwidth on a 16-cpu host
-// (eight and sixteen were slower -- they contend for the same memory ports),
-// and the ~20 us of thread setup is paid back above ~2^18 elements.  Small maps
-// stay on the calling thread, where spawning would dominate.
+// (eight and sixteen were slower -- they contend for the same memory ports).
+// Scoped-thread setup costs ~10 us per extra thread, so the split only pays for
+// a genuinely large result: measured on this host (`bench_thread_crossover`) one
+// flat `add`, 1 thread / 4 threads, best of 40 --
+//
+//   2^16 elems 0.007 / 0.036 ms   2^18 elems 0.030 / 0.043 ms
+//   2^17 elems 0.014 / 0.038 ms   2^19 elems 0.100 / 0.049 ms
+//   1e6 elems  0.249 / 0.097 ms
+//
+// -- so the crossover sits between 2^18 and 2^19 elements: at 2^18 four threads
+// are 43 % SLOWER than the calling thread, and the 2x win only starts at 2^19
+// (which is why the threshold is 2^19 and not 2^18; the `(4096, 64)` f32 tensors
+// of a merged-GP-shaped graph are exactly 2^18 elements and belong on one
+// thread).  Small maps stay on the calling thread, where spawning would
+// dominate.
 /// Element count from which a flat map is worth splitting across threads.
 const PARALLEL_MIN_ELEMS: usize = 1 << 18;
+/// Elements one thread should own before it earns its setup cost: a split adds
+/// `count / PARALLEL_MIN_PER_THREAD` threads (capped by the core count), so a
+/// 2^18-element map (a `(4096, 64)` f32 tensor) runs on two threads -- measured
+/// faster than the calling thread alone, unlike four -- while a >= 2^19-element
+/// one still gets the full four.
+const PARALLEL_MIN_PER_THREAD: usize = 1 << 17;
 /// Upper bound on the threads one flat map uses (the measured optimum).
 const PARALLEL_MAX_THREADS: usize = 4;
 
@@ -589,12 +607,13 @@ fn parallel_threads(count: usize) -> usize {
         return 1;
     }
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *THREADS.get_or_init(|| {
+    let cores = *THREADS.get_or_init(|| {
         std::thread::available_parallelism()
             .map(|threads| threads.get())
             .unwrap_or(1)
             .clamp(1, PARALLEL_MAX_THREADS)
-    })
+    });
+    cores.min((count / PARALLEL_MIN_PER_THREAD).max(1))
 }
 
 /// Run `body(offset, chunk)` over disjoint chunks of `out` on up to `threads`
@@ -960,6 +979,82 @@ pub fn block_storage<T: Scalar>(
     copy_blocks(&mut out, values, offsets, inner, op)?;
     Ok(T::into_storage(out))
 }
+
+/// A [`Storage`] built by [`copy_blocks`] for a caller that knows the offset
+/// list covers EVERY output element (a repeated `tile`/`gather`/`slice` block
+/// decomposition), so the result needs neither a zero fill nor a
+/// `Vec::with_capacity` + `extend_from_slice` growth: it takes a pooled
+/// allocation of exactly the result's length and `copy_blocks` overwrites all
+/// of it.
+///
+/// That matters for `tile`-shaped results, which are megabyte-sized and die at
+/// their next consumer: without the pool each one is a fresh page-faulted and
+/// zeroed allocation, i.e. a full extra pass over the output the copy is about
+/// to overwrite.  The contract is [`copy_blocks`]': `offsets.len() * inner` must
+/// equal the result's element count (an explicit error, never a truncated
+/// result), and `values` must hold every offset's run.
+pub fn block_storage_filled<T: Scalar>(
+    values: &[T],
+    out_shape: &[usize],
+    offsets: &[usize],
+    inner: usize,
+    op: &str,
+) -> Result<Storage> {
+    let total: usize = out_shape.iter().product();
+    if offsets.len().saturating_mul(inner) != total {
+        return Err(block_error(op));
+    }
+    let mut out = take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total]);
+    copy_blocks(&mut out, values, offsets, inner, op)?;
+    Ok(T::into_storage(out))
+}
+
+/// A [`Storage`] whose every element is a copy of a `run`-element slice of
+/// `values` repeated to fill `total` elements (whole-source `tile`: the result
+/// is the operand repeated `total / run` times).
+///
+/// One `copy_from_slice` per `run`-element chunk instead of one per index row,
+/// so a `(64, 64)` operand tiled to `(4096, 64)` is 64 copies of 16 KiB rather
+/// than 4096 copies of 256 B, and (like [`block_storage_filled`]) the
+/// allocation is pooled instead of fresh and zeroed.  `run` must be non-zero
+/// and no larger than `values`; a short `values` is the [`block_error`] the
+/// block-copy paths raise, never a truncated result.
+pub fn repeat_storage<T: Scalar>(
+    values: &[T],
+    total: usize,
+    run: usize,
+    op: &str,
+) -> Result<Storage> {
+    if run == 0 || run > values.len() {
+        return Err(block_error(op));
+    }
+    let source = &values[..run];
+    let mut out = take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total]);
+    let threads = parallel_threads(total);
+    if threads > 1 {
+        // Each chunk is an independently filled slice of the repetition, so the
+        // split needs no shared mutable state: the operands are read-only and
+        // the chunks are disjoint.  A chunk that starts mid-run takes the tail
+        // of that run first.
+        split_parallel(&mut out, threads, |offset, chunk| {
+            let mut written = 0usize;
+            while written < chunk.len() {
+                let at = (offset + written) % run;
+                let len = (run - at).min(chunk.len() - written);
+                chunk[written..written + len].copy_from_slice(&source[at..at + len]);
+                written += len;
+            }
+        });
+        return Ok(T::into_storage(out));
+    }
+    let mut offset = 0usize;
+    while offset < total {
+        let end = (offset + run).min(total);
+        out[offset..end].copy_from_slice(&source[..end - offset]);
+        offset = end;
+    }
+    Ok(T::into_storage(out))
+}
 fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];
@@ -1029,6 +1124,112 @@ macro_rules! with_same_type {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_thread_split_scales_with_the_work_per_thread() {
+        // The measured policy (`bench_thread_crossover`): below 2^18 elements one
+        // thread, two at 2^18 (a `(4096, 64)` f32 tensor), the full four from
+        // 2^19.  This is a performance rule, not a correctness one, but a silent
+        // change to it would undo the measurement.
+        assert_eq!(parallel_threads(0), 1);
+        assert_eq!(parallel_threads(PARALLEL_MIN_ELEMS - 1), 1);
+        let cores = parallel_threads(1 << 24);
+        assert!(cores <= PARALLEL_MAX_THREADS);
+        assert_eq!(parallel_threads(PARALLEL_MIN_ELEMS), cores.min(2));
+        assert_eq!(parallel_threads(1_000_000), cores.min(8));
+        assert!(parallel_threads(1 << 24) <= PARALLEL_MAX_THREADS);
+        assert_eq!(parallel_threads(1_000_000), parallel_threads(1 << 20));
+    }
+
+    #[test]
+    fn block_storage_filled_matches_the_zero_filled_helper() {
+        let values: Vec<f32> = (0..12).map(|index| index as f32 * 0.5).collect();
+        let offsets = [0usize, 4, 8, 1];
+        let filled = block_storage_filled(&values, &[4, 2], &offsets, 2, "tile").unwrap();
+        let zero_filled = block_storage(&values, &[4, 2], &offsets, 2, "tile").unwrap();
+        assert_eq!(filled, zero_filled);
+        assert_eq!(filled, Storage::F32(vec![0.0, 0.5, 2.0, 2.5, 4.0, 4.5, 0.5, 1.0]));
+        // The block-copy contract is unchanged: a short or long offset list is
+        // the same explicit error, never a truncated result.
+        let short = block_storage_filled(&values, &[3, 2], &offsets, 2, "tile").unwrap_err();
+        assert_eq!(
+            short.message,
+            block_storage(&values, &[3, 2], &offsets, 2, "tile").unwrap_err().message
+        );
+        assert!(short.message.contains("a block copy reads outside the operand"));
+        // A block that runs past the operand is an error too (not a partial copy).
+        assert!(block_storage_filled(&values, &[2, 2], &[0, 11], 2, "tile").is_err());
+    }
+
+    #[test]
+    fn repeat_storage_copies_the_source_over_the_whole_result() {
+        let source = [1.0f32, -0.0, f32::NAN, 3.5];
+        // An exact multiple of the run...
+        let exact = repeat_storage(&source, 12, 4, "tile").unwrap();
+        match &exact {
+            Storage::F32(values) => {
+                assert_eq!(values.len(), 12);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(value.to_bits(), source[index % 4].to_bits(), "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+        // ... and a result that ends mid-run (the last run is a partial copy).
+        let ragged = repeat_storage(&source, 6, 3, "tile").unwrap();
+        match &ragged {
+            Storage::F32(values) => {
+                let expected = [1.0f32, -0.0, f32::NAN, 1.0, -0.0, f32::NAN];
+                assert_eq!(values.len(), expected.len());
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(value.to_bits(), expected[index].to_bits(), "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+        // A run longer than the source, or an empty one, is the block-copy error.
+        assert!(repeat_storage(&source, 8, 5, "tile").is_err());
+        assert!(repeat_storage(&source, 8, 0, "tile").is_err());
+        // An empty result is empty, never an error.
+        assert_eq!(
+            repeat_storage(&source, 0, 4, "tile").unwrap(),
+            Storage::F32(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_pooled_repeat_result_is_fully_overwritten() {
+        // More elements than `PARALLEL_MIN_ELEMS` so the copy takes the threaded
+        // path, and more than `POOL_MIN_BYTES` so the stock is poolable: the
+        // recycled pages must all be overwritten, exactly like `map`'s results.
+        let count = PARALLEL_MIN_ELEMS + 512;
+        garbage_f32(count);
+        let source: Vec<f32> = (0..64).map(|index| index as f32).collect();
+        let storage = repeat_storage(&source, count, 64, "tile").unwrap();
+        match &storage {
+            Storage::F32(values) => {
+                assert_eq!(values.len(), count);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(*value, (index % 64) as f32, "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+        // A run that does not divide the per-thread chunk (100 into a quarter of
+        // the result) still lands every element: the boundary case of the
+        // threaded copy, which takes the tail of a run first.
+        let source: Vec<f32> = (0..100).map(|index| index as f32 * 0.25).collect();
+        let storage = repeat_storage(&source, count, 100, "tile").unwrap();
+        match &storage {
+            Storage::F32(values) => {
+                assert_eq!(values.len(), count);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(*value, source[index % 100], "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
 
     #[test]
     fn broadcast_strides_align_right() {
@@ -1232,6 +1433,54 @@ mod tests {
                 }
             }
             other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// Measurement aid, not a correctness test: `cargo test --release -p
+    /// evoxc-cpu bench_thread_crossover -- --ignored --nocapture` prints the
+    /// per-element cost of one flat `add` at several sizes and thread counts,
+    /// which is what the `PARALLEL_MIN_ELEMS` threshold is chosen from.
+    #[test]
+    #[ignore = "measurement aid: prints timings"]
+    fn bench_thread_crossover() {
+        use std::time::Instant;
+        let left: Vec<f32> = (0..(1 << 20)).map(|index| index as f32 * 0.5).collect();
+        let right: Vec<f32> = (0..(1 << 20)).map(|index| index as f32 * 0.25).collect();
+        for count in [1usize << 16, 1 << 17, 262144, 1 << 19, 1_000_000] {
+            let mut line = format!("count {count:>8} ({:>4} KiB):", count * 4 / 1024);
+            for threads in [1usize, 2, 3, 4] {
+                let mut out = vec![0.0f32; count];
+                let mut best = f64::INFINITY;
+                for _ in 0..40 {
+                    let started = Instant::now();
+                    split_parallel(&mut out, threads, |offset, chunk| {
+                        let len = chunk.len();
+                        for ((slot, x), y) in chunk
+                            .iter_mut()
+                            .zip(window(&left, offset, len))
+                            .zip(window(&right, offset, len))
+                        {
+                            *slot = *x + *y;
+                        }
+                    });
+                    best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                }
+                line.push_str(&format!("  {threads}t {best:7.3} ms"));
+            }
+            let single = {
+                let mut out = vec![0.0f32; count];
+                let mut best = f64::INFINITY;
+                for _ in 0..40 {
+                    let started = Instant::now();
+                    for ((slot, x), y) in out.iter_mut().zip(&left).zip(&right) {
+                        *slot = *x + *y;
+                    }
+                    best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                }
+                best
+            };
+            line.push_str(&format!("   plain {single:7.3} ms"));
+            println!("{line}");
         }
     }
 
