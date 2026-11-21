@@ -373,7 +373,8 @@ editing messages, keep the wording of existing paths intact.
   carries exactly the `SymbolicTensor` leaves of `init` (one `while`-op
   operand + one region block arg each — no dedup, reordering, or packing);
   `evoxc/transforms` REJECTS region-bearing ops outright
-  (`transforms/batching.py:751` → `TransformError`), and the stablehlo
+  (the native `vectorize` engine raises `TransformError`, and
+  `batch_functions._check_ops` names the function index), and the stablehlo
   writer emits every operand positionally with no count gate
   (`backends/stablehlo/writer.py::_emit_while`). Known consequence (iree
   3.9.0): a ≥4-carry `stablehlo.while` in a large module (NSGA3 tell

@@ -7,7 +7,7 @@ Every transform is **graph → graph**: the result is an ordinary `Graph` of ord
 Nothing here executes: `evoxc.backends` / `evoxc.pipeline` are never imported and no tensor is materialized.
 Given a plain function or `Defn` instead of a `Graph`, a transform returns a `TransformCallable` (`TensorSpec`s → `Graph`); concrete `Tensor` arguments raise `TraceError` (see "Spec-callable convention").
 
-The **native Rust engine is the single implementation of all six transforms** — `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge — reached through `evoxc/_native.py` (`transform`, `batch_functions`, `infer`).
+The **native Rust engine is the single implementation of all six transforms** — `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge — reached through `evoxc/_native.py` (`transform` for the five builtin transforms, `batch_functions` for the merge).
 Python in this package is the frontend seam only: validation and normalization with the pinned error wording, the native config, `TensorSpec`/pytree adaptation, `Graph` reconstruction, the extension-rule bridge, and report rehydration.
 `evoxc._native.require()` raising `ImportError` with the build instructions (`scripts/build-native.sh`, the expected `evoxc/_evoxc_native.abi3.so`, the `EVOXC_NATIVE_LIB` override) is the only failure mode when the extension is missing — there is no Python-fallback implementation of any transform.
 `import evoxc.transforms` does not require the extension: `evoxc/_native.py` loads it lazily on the first native call, so the rule registries and the frontend validators stay importable without it.
