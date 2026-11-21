@@ -147,7 +147,9 @@ Envelope cost on the same graphs: `encode_module` 2.75/2.78 ms (750 ops) and 10.
 
 - `autodiff.py` — the rule registries and shared helpers: `jvp_rules` / `vjp_rules` with `register_jvp_rule` / `register_vjp_rule` / `get_jvp_rule` / `get_vjp_rule` / `require_vjp_rule`, `ZeroTangent`, `_jvp_from_vjp`, `_rule_name` / `_rule_display` / `_rule_hint`, `_combine`, `_sym` / `_is_real`. Holds no sweep: every `grad`/`jvp`/`vjp` rewrite is native.
 - `batching.py` — the shared per-op batching-rule registry and helpers, not a rewrite engine: `batching_rules` / `register_batching_rule` / `_rule_key`, `_tensor_input_axes`, `_validate_rule_result`, `_remap_output_aux`, the batched-aux remap registry (`register_batched_aux_remap`, `_lookup_batched_aux_remap`), the batch-depth context (`_batch_dim`, `with_batch_depth`), `_entry_function` and `block_call_pass_through_rule`. Consumers: `_native_rules`, `_native_bridge`, `vmap`, `batch_functions`, `rules`, `../block/rules.py`, `../external_rules.py`.
-- `rules.py` — the builtin Python rule TABLES (batching, JVP, VJP for the standard op set) registered at import: the availability table `batch_functions._check_ops` consults and the Python mirror of the native engine's compiled-in builtin rules. A builtin rule gap must be closed natively AND mirrored here.
+- `rules.py` — the builtin Python rule TABLES (batching, JVP, VJP for the standard op set) registered at import: the BATchING table is the availability gate `batch_functions._check_ops` consults, the JVP table is inert in production, and the VJP table is load-bearing (executed by the portable-decomposition local sweeps — see "Representation and extension boundaries").
+  A builtin rule gap must be closed natively AND mirrored here.
+  `autodiff.get_jvp_rule` / `get_vjp_rule` exist but have no in-tree caller, and there is no `batching.get_batching_rule` (the batching table is only ever membership-tested).
 
 ## Spec-callable convention (design decision)
 
