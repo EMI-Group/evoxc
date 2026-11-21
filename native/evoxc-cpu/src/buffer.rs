@@ -601,6 +601,36 @@ const PARALLEL_MIN_PER_THREAD: usize = 1 << 17;
 /// Upper bound on the threads one flat map uses (the measured optimum).
 const PARALLEL_MAX_THREADS: usize = 4;
 
+/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_THREADS` caps the flat-map thread count.
+fn diagnostic_max_threads() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("EVOXC_CPU_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PARALLEL_MAX_THREADS)
+            .max(1)
+    })
+}
+
+/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_POOL_FIFO=1` selects first-in-first-out
+/// stock reuse instead of the LIFO default.
+fn diagnostic_pool_fifo() -> bool {
+    static FIFO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIFO.get_or_init(|| std::env::var_os("EVOXC_CPU_POOL_FIFO").is_some())
+}
+
+/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_POOL_MIN` overrides [`POOL_MIN_BYTES`].
+fn diagnostic_pool_min() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("EVOXC_CPU_POOL_MIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(POOL_MIN_BYTES)
+    })
+}
+
 /// How many threads a flat map over `count` elements should split across.
 fn parallel_threads(count: usize) -> usize {
     if count < PARALLEL_MIN_ELEMS {
@@ -612,6 +642,7 @@ fn parallel_threads(count: usize) -> usize {
             .map(|threads| threads.get())
             .unwrap_or(1)
             .clamp(1, PARALLEL_MAX_THREADS)
+            .min(diagnostic_max_threads())
     });
     cores.min((count / PARALLEL_MIN_PER_THREAD).max(1))
 }
@@ -765,12 +796,67 @@ pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
 //    [`POOL_MAX_ENTRIES`] values totalling [`POOL_MAX_BYTES`], and only values
 //    of at least [`POOL_MIN_BYTES`] (small results keep the system allocator,
 //    whose bin free lists already make them cheap, and would only crowd out the
-//    entries that matter).  A value the pool cannot take is freed as before.
-const POOL_MIN_BYTES: usize = 1 << 18;
+//    entries that matter).
+//  * The caps are enforced by evicting the LEAST RECENTLY USED entry, never by
+//    refusing the incoming one: a pool that refuses new stocks once it is full
+//    is poisoned for the rest of the thread's life by whichever workload filled
+//    it.  Measured on this host, `gp_gather_4096` (a `(4096, 64)` f32 graph, so
+//    1 MiB temporaries) runs a warm `run` in 0.55-0.60 ms with its own stocks
+//    pooled and 1.5-2.1 ms when the pool instead holds sixteen 4 MiB stocks
+//    from a preceding `ew_chain_1e6` -- the same engine, the same graph, only
+//    the order of two unrelated benchmarks in one process; running
+//    `gp_gather_4096` on a fresh thread (empty pool, same process heap) is fast
+//    again, which is what pinned the poison on the pool rather than on malloc.
+//    LRU eviction keeps the stocks of whatever is RUNNING and discards the ones
+//    that stopped being used, so the numbers are order-independent.
+//    `a_full_pool_evicts_instead_of_poisoning_later_workloads` pins it.
+const POOL_MIN_BYTES: usize = 1 << 12;
 /// Total bytes the pool may retain per thread (the documented retention cap).
 const POOL_MAX_BYTES: usize = 64 << 20;
-/// Number of retained storages per thread.
-const POOL_MAX_ENTRIES: usize = 16;
+/// Number of retained storages per thread, across every size class.
+const POOL_MAX_ENTRIES: usize = 64;
+/// Stocks retained per exact `(dtype, element count)` size class.
+///
+/// A graph reuses a couple of temporaries per size at most (one live result plus
+/// the one it replaced), and a size-blind cap makes a graph with several
+/// concurrent sizes thrash: measured on `gp_gather_4096` (whose 80 ops touch
+/// four sizes: 1 MiB f32, 16 KiB f32, 4 KiB bool, 256 B f32), a flat
+/// 16-entry cap produced 17 evictions and 8 allocation misses per run -- twice
+/// the stocks the run actually needs -- and the churn is what made the row
+/// order-dependent.  Keeping a few spares per size costs a bounded amount of
+/// memory (<= `POOL_MAX_PER_SIZE` x the size class) and makes the steady state
+/// allocation-free.
+const POOL_MAX_PER_SIZE: usize = 4;
+
+/// TEMPORARY DIAGNOSTIC counters (hits, misses, pushes, evictions, refusals).
+pub mod pool_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTERS: [Cell<u64>; 5] =
+            [const { Cell::new(0) }; 5];
+    }
+
+    pub const HIT: usize = 0;
+    pub const MISS: usize = 1;
+    pub const PUSH: usize = 2;
+    pub const EVICT: usize = 3;
+    pub const REFUSE: usize = 4;
+
+    pub fn bump(index: usize) {
+        COUNTERS.with(|counters| counters[index].set(counters[index].get() + 1));
+    }
+
+    pub fn take() -> [u64; 5] {
+        COUNTERS.with(|counters| {
+            let now = std::array::from_fn(|index| counters[index].get());
+            for cell in counters.iter() {
+                cell.set(0);
+            }
+            now
+        })
+    }
+}
 
 thread_local! {
     static STORAGE_POOL: RefCell<StoragePool> = const { RefCell::new(StoragePool::new()) };
@@ -781,43 +867,123 @@ thread_local! {
     static POOL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+/// One retained allocation plus the tick of its last use, which is what the
+/// eviction policy orders by (smaller = older = evicted first).
+struct PoolEntry {
+    storage: Storage,
+    last_use: u64,
+}
+
 /// The thread-local free list of large result storages.
 struct StoragePool {
-    entries: Vec<Storage>,
+    entries: Vec<PoolEntry>,
     bytes: usize,
+    /// Monotonic use counter stamped into [`PoolEntry::last_use`]; `u64` never
+    /// wraps in a process's lifetime (one tick per retained or served value).
+    tick: u64,
 }
 
 impl StoragePool {
     const fn new() -> StoragePool {
-        StoragePool { entries: Vec::new(), bytes: 0 }
+        StoragePool { entries: Vec::new(), bytes: 0, tick: 0 }
     }
 
-    /// Retain `storage`'s allocation when it is large enough and the cap allows,
-    /// returning `false` (and leaving `storage` intact) when it does not.
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    /// Retain `storage`'s allocation, returning `false` (and leaving `storage`
+    /// intact, so the caller frees it as before) when it cannot usefully be
+    /// retained: it is outside `POOL_MIN_BYTES .. POOL_MAX_BYTES`, or
+    /// [`POOL_MAX_PER_SIZE`] stocks of its exact size are already retained.
+    ///
+    /// Room within the global caps is made by evicting the least recently used
+    /// entry of ANOTHER size class, so a workload's own stocks are never the
+    /// victim of its own churn, and a saturated pool of a different size can
+    /// never starve the workload that is running (see the contract block above).
     fn push(&mut self, storage: &mut Storage) -> bool {
         let bytes = storage.bytes();
-        if bytes < POOL_MIN_BYTES
-            || self.entries.len() >= POOL_MAX_ENTRIES
-            || self.bytes + bytes > POOL_MAX_BYTES
-        {
+        if !(diagnostic_pool_min()..=POOL_MAX_BYTES).contains(&bytes) {
             return false;
         }
+        let dtype = storage.dtype();
+        let len = storage.len();
+        if self.count_of(dtype, len) >= POOL_MAX_PER_SIZE {
+            // A spare of this size is already retained; this one is freed.
+            pool_stats::bump(pool_stats::REFUSE);
+            return false;
+        }
+        while self.entries.len() >= POOL_MAX_ENTRIES || self.bytes + bytes > POOL_MAX_BYTES {
+            if !self.evict_for(dtype, len) {
+                // Nothing of another size can be evicted (only possible when the
+                // value alone exceeds the byte cap, excluded above), so the pool
+                // keeps what it has and this stock is freed.
+                pool_stats::bump(pool_stats::REFUSE);
+                return false;
+            }
+        }
+        pool_stats::bump(pool_stats::PUSH);
+        let last_use = self.next_tick();
         let retained = std::mem::replace(storage, Storage::Bool(Vec::new()));
         self.bytes += bytes;
-        self.entries.push(retained);
+        self.entries.push(PoolEntry { storage: retained, last_use });
+        true
+    }
+
+    /// How many stocks of exactly `dtype` and `len` elements are retained.
+    fn count_of(&self, dtype: DType, len: usize) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.storage.dtype() == dtype && entry.storage.len() == len)
+            .count()
+    }
+
+    /// Evict the least recently used entry that is NOT of the incoming size
+    /// class (falling back to the plain LRU entry when every entry is).
+    fn evict_for(&mut self, dtype: DType, len: usize) -> bool {
+        let victim = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !(entry.storage.dtype() == dtype && entry.storage.len() == len))
+            .min_by_key(|(_, entry)| entry.last_use)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.last_use)
+            })
+            .map(|(index, _)| index);
+        let Some(index) = victim else { return false };
+        pool_stats::bump(pool_stats::EVICT);
+        let entry = self.entries.swap_remove(index);
+        self.bytes -= entry.storage.bytes();
         true
     }
 
     /// Take a retained storage of exactly `dtype` and `len` elements.
     fn take(&mut self, dtype: DType, len: usize) -> Option<Storage> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.dtype() == dtype && entry.len() == len)?;
+        let matching = |entry: &PoolEntry| entry.storage.dtype() == dtype && entry.storage.len() == len;
+        let index = if diagnostic_pool_fifo() {
+            self.entries.iter().position(matching)?
+        } else {
+            // LIFO: hand back the MOST recently used matching stock, so a graph
+            // cycles through a couple of hot buffers instead of walking its whole
+            // retained size class and touching memory that has gone cold.
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matching(entry))
+                .max_by_key(|(_, entry)| entry.last_use)
+                .map(|(index, _)| index)?
+        };
+        pool_stats::bump(pool_stats::HIT);
         let entry = self.entries.swap_remove(index);
-        self.bytes -= entry.bytes();
-        Some(entry)
+        self.bytes -= entry.storage.bytes();
+        Some(entry.storage)
     }
+
 }
 
 impl Drop for StoragePool {
@@ -847,11 +1013,30 @@ impl Drop for Storage {
 ///
 /// The caller must overwrite every element before the vector becomes visible.
 fn take_pooled_vec<R: Scalar>(count: usize) -> Option<Vec<R>> {
-    let mut storage = STORAGE_POOL
+    let storage = STORAGE_POOL
         .try_with(|pool| pool.try_borrow_mut().ok()?.take(R::DTYPE, count))
         .ok()
-        .flatten()?;
-    R::take_vec(&mut storage)
+        .flatten();
+    let values = match storage {
+        Some(mut storage) => R::take_vec(&mut storage),
+        None => None,
+    };
+    if values.is_none() {
+        pool_stats::bump(pool_stats::MISS);
+    }
+    values
+}
+
+/// TEMPORARY DIAGNOSTIC: one line describing this thread's pool traffic.
+pub fn pool_stats_text() -> String {
+    let [hits, misses, pushes, evictions, _] = pool_stats::take();
+    let (entries, bytes) = STORAGE_POOL.with(|pool| {
+        let pool = pool.borrow();
+        (pool.entries.len(), pool.bytes)
+    });
+    format!(
+        "pool: hits {hits}, misses {misses}, pushes {pushes}, evictions {evictions}, entries {entries}, bytes {bytes}"
+    )
 }
 
 /// Flat unary builder: `out[i] = f(source[i])` over `out_shape`'s elements,
@@ -1283,6 +1468,133 @@ mod tests {
             pool.borrow_mut().push(&mut storage);
         });
         storage
+    }
+
+    /// Empty this thread's pool so a policy test starts from a known state
+    /// (tests on the same thread share the thread-local).
+    fn reset_pool() {
+        STORAGE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.entries.clear();
+            pool.bytes = 0;
+        });
+    }
+
+    /// `count` f32 elements of `value` as a raw stock the pool can retain.
+    fn pool_stock_f32(count: usize, value: f32) -> Storage {
+        Storage::F32(vec![value; count])
+    }
+
+    #[test]
+    fn stocks_are_retained_per_size_up_to_the_per_size_cap() {
+        reset_pool();
+        let count = (1 << 20) / std::mem::size_of::<f32>();
+        let mut stocks: Vec<Storage> = (0..POOL_MAX_PER_SIZE * 3)
+            .map(|_| pool_stock_f32(count, 1.0))
+            .collect();
+        let mut retained = 0;
+        for stock in stocks.iter_mut() {
+            if STORAGE_POOL.with(|pool| pool.borrow_mut().push(stock)) {
+                retained += 1;
+            }
+        }
+        assert_eq!(retained, POOL_MAX_PER_SIZE, "one size class keeps at most its cap");
+        reset_pool();
+    }
+
+    #[test]
+    fn the_pool_evicts_the_least_recently_used_other_size_class() {
+        // Fill the pool to its entry cap with DISTINCT sizes (so no per-size cap
+        // triggers) and then push one more size: the victim must be the least
+        // recently used entry of another size class, and never a stock of the
+        // incoming size.
+        let base = POOL_MIN_BYTES / std::mem::size_of::<f32>();
+        let mut pool = StoragePool::new();
+        for index in 0..POOL_MAX_ENTRIES {
+            let mut stock = pool_stock_f32(base + index, index as f32);
+            assert!(pool.push(&mut stock), "distinct size {index} fits");
+        }
+        assert_eq!(pool.entries.len(), POOL_MAX_ENTRIES);
+        // Two stocks of one new size are retained -- the second only after
+        // evicting a different size class (there is no room otherwise).
+        let mut first = pool_stock_f32(base + POOL_MAX_ENTRIES + 1, -1.0);
+        assert!(pool.push(&mut first));
+        let mut second = pool_stock_f32(base + POOL_MAX_ENTRIES + 1, -2.0);
+        assert!(pool.push(&mut second));
+        assert_eq!(pool.entries.len(), POOL_MAX_ENTRIES);
+        assert_eq!(pool.count_of(DType::Float32, base + POOL_MAX_ENTRIES + 1), 2);
+        // The oldest sizes went first, and no entry ever exceeds the caps.
+        assert_eq!(pool.count_of(DType::Float32, base), 0, "the oldest stock was evicted");
+        assert_eq!(pool.count_of(DType::Float32, base + 1), 0);
+        assert!(pool.bytes <= POOL_MAX_BYTES);
+        // ... while a size that is still represented survives.
+        assert_eq!(pool.count_of(DType::Float32, base + POOL_MAX_ENTRIES - 1), 1);
+    }
+
+    #[test]
+    fn a_stock_larger_than_the_byte_cap_is_refused_and_evicts_nothing() {
+        let count = (1 << 20) / std::mem::size_of::<f32>();
+        let mut pool = StoragePool::new();
+        let mut stock = pool_stock_f32(count, 1.0);
+        assert!(pool.push(&mut stock));
+        let mut huge = pool_stock_f32(POOL_MAX_BYTES / std::mem::size_of::<f32>() + 1, 2.0);
+        assert!(!pool.push(&mut huge), "a value above the byte cap is never retained");
+        assert_eq!(pool.entries.len(), 1);
+        assert!(pool.take(DType::Float32, count).is_some(), "the small stock was not evicted");
+    }
+
+    #[test]
+    fn a_differently_sized_predecessor_does_not_starve_later_workloads() {
+        // The order-dependent regression this pins: `ew_chain_1e6`-shaped work
+        // (4 MiB temporaries) fills the pool, and a following `gp_gather_4096`
+        // (1 MiB temporaries) then never got a single stock back, which cost it
+        // 2.5x on a warm run.  Filling the pool with the wrong size class must
+        // not stop the next map from recycling ITS result.
+        reset_pool();
+        let big = (4 << 20) / std::mem::size_of::<f32>();
+        let mut stocks: Vec<Storage> = (0..POOL_MAX_PER_SIZE)
+            .map(|_| pool_stock_f32(big, f32::NAN))
+            .collect();
+        STORAGE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for stock in stocks.iter_mut() {
+                assert!(pool.push(stock), "the pool has room for these stocks");
+            }
+        });
+        let count = (1 << 20) / std::mem::size_of::<f32>();
+        assert!(take_pooled_vec::<f32>(count).is_none(), "nothing of this size is pooled yet");
+        let source = vec![0.5f32; count];
+        let result = map1(DType::Float32, &[count], &source, |value| value + 1.0)
+            .expect("the map succeeds without a pooled stock");
+        drop(result);
+        assert!(
+            take_pooled_vec::<f32>(count).is_some(),
+            "a 4 MiB-filled pool must still recycle a 1 MiB result"
+        );
+        STORAGE_POOL.with(|pool| {
+            let pool = pool.borrow();
+            assert_eq!(pool.count_of(DType::Float32, big), POOL_MAX_PER_SIZE);
+        });
+        reset_pool();
+    }
+
+    #[test]
+    fn stock_reuse_is_last_in_first_out() {
+        // LIFO reuse keeps a graph cycling through the same few hot buffers
+        // instead of walking its whole retained size class and touching memory
+        // that has gone cold.
+        reset_pool();
+        let count = (1 << 20) / std::mem::size_of::<f32>();
+        let mut first = pool_stock_f32(count, 1.0);
+        let mut second = pool_stock_f32(count, 2.0);
+        STORAGE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            assert!(pool.push(&mut first));
+            assert!(pool.push(&mut second));
+        });
+        let taken = take_pooled_vec::<f32>(count).expect("a stock of this size is pooled");
+        assert_eq!(taken[0], 2.0, "the most recently freed stock is handed back first");
+        reset_pool();
     }
 
     #[test]

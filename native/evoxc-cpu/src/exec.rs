@@ -69,6 +69,75 @@ pub fn unwrap_value(value: Value) -> Buffer {
     Rc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
 }
 
+/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_PROFILE=1` accumulates per-op wall time and
+/// prints a breakdown for a chosen run number (`EVOXC_CPU_PROFILE_RUN`).
+mod profile {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("EVOXC_CPU_PROFILE").is_some())
+    }
+
+    fn dump_run() -> u64 {
+        static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *RUN.get_or_init(|| {
+            std::env::var("EVOXC_CPU_PROFILE_RUN")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10)
+        })
+    }
+
+    thread_local! {
+        static TOTALS: RefCell<HashMap<String, (u64, u128)>> = RefCell::new(HashMap::new());
+        static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    pub fn record(name: &str, elapsed: Duration) {
+        TOTALS.with(|totals| {
+            let mut totals = totals.borrow_mut();
+            let entry = totals.entry(name.to_string()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += elapsed.as_nanos();
+        });
+    }
+
+    pub fn tick() -> Instant {
+        Instant::now()
+    }
+
+    pub fn run_finished() {
+        let run = RUNS.with(|runs| {
+            let next = runs.get() + 1;
+            runs.set(next);
+            next
+        });
+        let first = dump_run();
+        if run < first || run > first + 8 {
+            return;
+        }
+        TOTALS.with(|totals| {
+            let totals = totals.borrow();
+            let mut rows: Vec<_> = totals.iter().collect();
+            rows.sort_by_key(|(_, (_, nanos))| std::cmp::Reverse(*nanos));
+            let all: u128 = rows.iter().map(|(_, (_, nanos))| *nanos).sum();
+            eprintln!("--- profile run {run}: total {:.3} ms", all as f64 / 1e6);
+            eprintln!("  {}", crate::buffer::pool_stats_text());
+            for (name, (count, nanos)) in rows {
+                eprintln!(
+                    "  {name:28} {count:5}x {:9.1} us total {:8.2} us/op",
+                    *nanos as f64 / 1e3,
+                    *nanos as f64 / 1e3 / *count as f64
+                );
+            }
+        });
+        TOTALS.with(|totals| totals.borrow_mut().clear());
+    }
+}
+
 /// One execution's mutable state.
 pub struct RunCtx<'p> {
     pub program: &'p Program,
@@ -157,6 +226,9 @@ impl<'p> RunCtx<'p> {
                 )));
             }
         }
+        if profile::enabled() {
+            profile::run_finished();
+        }
         Ok(outputs.into_iter().map(unwrap_value).collect())
     }
 
@@ -209,6 +281,8 @@ impl<'p> RunCtx<'p> {
             // step is then one clone of that buffer rather than a per-run
             // decode of the same bytes (`Buffer::from_payload`), with identical
             // values and the same result validation below.
+            let profiled = profile::enabled();
+            let started = if profiled { Some(profile::tick()) } else { None };
             let results = if let Some(constant) = &step.constant {
                 vec![Rc::new(constant.clone())]
             } else {
@@ -220,6 +294,10 @@ impl<'p> RunCtx<'p> {
                     }
                 }
             };
+            if let Some(started) = started {
+                let label = if step.constant.is_some() { "constant(clone)" } else { step.spec.name.as_str() };
+                profile::record(label, started.elapsed());
+            }
             if results.len() != step.results.len() {
                 self.operands = operands;
                 return Err(Error::backend(format!(
