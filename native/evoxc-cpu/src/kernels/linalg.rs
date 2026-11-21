@@ -254,6 +254,12 @@ fn dot_run<T: Num>(
 // accumulation), which is why the fast path is restricted to the two IEEE float
 // dtypes: floating-point sums are order-dependent and that is expected, while
 // integer/complex arithmetic is never routed here.
+//
+// A large enough plain matmul is split across scoped threads ALONG THE OUTPUT
+// ROWS (see `gemm_parallel`): each output element is still produced by exactly
+// one `gemm_into` call with an untouched K axis, so the threaded result is
+// bit-identical to the one-thread result — unlike the numpy backend, whose dot
+// call takes whatever threading its BLAS provides.
 
 /// The float dtypes [`matrixmultiply`] provides a kernel for.  Only these two
 /// are implemented, so [`dot_gemm`]'s storage dispatch is the whole fast-path
@@ -358,9 +364,63 @@ fn dot_gemm(
     }
 }
 
+/// Multiply-adds (`m * k * n * output blocks`) from which the plain matmul is
+/// worth splitting across threads.  A thread spawn costs ~10 us on this class of
+/// host, so below one 128^3 matmul's worth of work the spawn is more than the
+/// work it removes and the call stays on one thread: `gemm_threads` asks for
+/// [`GEMM_PARALLEL_WORK_PER_THREAD`] per thread, which makes this threshold the
+/// point where a second thread appears.
+const GEMM_PARALLEL_MIN_WORK: usize = 1 << 22;
+/// Multiply-adds one thread should own before another thread is worth spawning.
+const GEMM_PARALLEL_WORK_PER_THREAD: usize = 1 << 21;
+/// Thread cap below [`GEMM_WIDE_WORK`].  Measured on a 16-cpu hybrid host (6
+/// performance + 8 efficiency + 2 low-power cores): a 256^3 or 384^3 matmul is
+/// fastest at 8 threads, and 12/16 threads lose ~25 % because the extra strips
+/// land on efficiency cores and each thread re-packs the whole B panel.  The
+/// same cap rationale as the flat elementwise maps' 4-thread limit in
+/// `buffer.rs`, scaled up for a compute-bound (rather than bandwidth-bound)
+/// kernel.
+const GEMM_PARALLEL_MAX_THREADS: usize = 8;
+/// Work from which every available cpu may be used: a 512^3 matmul (exactly this
+/// many multiply-adds) is the size where 16 threads first beat 8 (measured
+/// 2.43 ms vs 2.50 ms, and 4.26 ms vs 5.78 ms at 1024^3), because the per-thread
+/// packing and spawn costs are amortized by then.
+const GEMM_WIDE_WORK: usize = 1 << 27;
+
+/// The host's usable parallelism, probed once.
+fn parallel_cpus() -> usize {
+    static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CPUS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|cpus| cpus.get())
+            .unwrap_or(1)
+    })
+}
+
+/// How many threads a plain matmul with `work` multiply-adds over `blocks`
+/// batch elements of `rows` rows should use.  `1` means "stay on the calling
+/// thread" (small matmuls, and every host with no usable parallelism); the
+/// result never exceeds the number of row strips the output can be cut into,
+/// because a strip is never split across threads.
+fn gemm_threads(work: usize, blocks: usize, rows: usize) -> usize {
+    if work < GEMM_PARALLEL_MIN_WORK {
+        return 1;
+    }
+    let cap = if work >= GEMM_WIDE_WORK {
+        parallel_cpus()
+    } else {
+        parallel_cpus().min(GEMM_PARALLEL_MAX_THREADS)
+    };
+    (work / GEMM_PARALLEL_WORK_PER_THREAD)
+        .min(cap)
+        .min(blocks.saturating_mul(rows))
+        .max(1)
+}
+
 /// One BLAS-3 call per batch element, writing straight into a freshly allocated
 /// result (every block is contiguous, so the kernel's out pointer is the block's
-/// own start).
+/// own start).  Above [`GEMM_PARALLEL_MIN_WORK`] the row axis (or, when the batch
+/// already fills the machine, the batch axis) is split across scoped threads.
 fn gemm_run<T: Gemm>(
     a: &[T],
     b: &[T],
@@ -368,26 +428,121 @@ fn gemm_run<T: Gemm>(
     dtype: DType,
     out_shape: &[usize],
 ) -> Result<Option<Buffer>> {
+    let blocks = util::numel(&g.batch);
+    let threads = gemm_threads(g.m * g.k * g.n * blocks, blocks, g.m);
+    gemm_run_threads(a, b, g, dtype, out_shape, threads)
+}
+
+/// [`gemm_run`] with an explicit thread count (`1` = the calling thread only).
+fn gemm_run_threads<T: Gemm>(
+    a: &[T],
+    b: &[T],
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+    threads: usize,
+) -> Result<Option<Buffer>> {
     let block = g.m * g.n;
     let a_block = g.m * g.k;
     let b_block = g.k * g.n;
     let mut out = vec![T::zero(); block * util::numel(&g.batch)];
-    let strides = [g.a_strides.clone(), g.b_strides.clone()];
-    let mut slot = 0usize;
-    walk(g.batch.len(), &g.batch, &strides, |offsets| {
-        let a_base = offsets[0] * a_block;
-        let b_base = offsets[1] * b_block;
-        T::gemm_into(
-            g.m,
-            g.k,
-            g.n,
-            &a[a_base..a_base + a_block],
-            &b[b_base..b_base + b_block],
-            &mut out[slot..slot + block],
-        );
-        slot += block;
-    });
+    if threads <= 1 || out.is_empty() {
+        let strides = [g.a_strides.clone(), g.b_strides.clone()];
+        let mut slot = 0usize;
+        walk(g.batch.len(), &g.batch, &strides, |offsets| {
+            let a_base = offsets[0] * a_block;
+            let b_base = offsets[1] * b_block;
+            T::gemm_into(
+                g.m,
+                g.k,
+                g.n,
+                &a[a_base..a_base + a_block],
+                &b[b_base..b_base + b_block],
+                &mut out[slot..slot + block],
+            );
+            slot += block;
+        });
+    } else {
+        gemm_parallel(a, b, g, &mut out, threads);
+    }
     Buffer::new(dtype, out_shape.to_vec(), T::into_storage(out)).map(Some)
+}
+
+/// A contiguous row strip of one output block: the strip itself, the batch slot
+/// it belongs to and the strip's first row inside that slot.
+type Strip<'a, T> = (&'a mut [T], usize, usize);
+
+/// Split the output across `threads` scoped threads ALONG THE ROWS (and the
+/// batch axis, which is the same thing at block granularity): every output
+/// element is still produced by exactly one `gemm_into` call whose K axis is
+/// untouched, and `matrixmultiply` accumulates each element over K in the same
+/// ascending `kc`-block order whatever `m` it is handed, so the result is
+/// BIT-IDENTICAL to the one-thread path (pinned by
+/// `dot_parallel_matches_the_single_threaded_path_bit_for_bit`).
+///
+/// A worker panic is re-raised in the calling thread by `thread::scope`, so a
+/// broken kernel surfaces as a panic instead of a silently half-written result.
+fn gemm_parallel<T: Gemm>(a: &[T], b: &[T], g: &MatMul, out: &mut [T], threads: usize) {
+    let block = g.m * g.n;
+    let a_block = g.m * g.k;
+    let b_block = g.k * g.n;
+    let slots = out.len() / block;
+    let strides = [g.a_strides.clone(), g.b_strides.clone()];
+    let mut bases = Vec::with_capacity(slots);
+    walk(g.batch.len(), &g.batch, &strides, |offsets| {
+        bases.push((offsets[0] * a_block, offsets[1] * b_block));
+    });
+    // Row strips per block: enough of them to keep `threads` busy once the batch
+    // has been spread over them, never more than the rows that exist.
+    let strips = threads.div_ceil(slots).min(g.m).max(1);
+    let rows = g.m.div_ceil(strips);
+    let mut groups: Vec<Vec<Strip<'_, T>>> = (0..threads).map(|_| Vec::new()).collect();
+    for (slot, chunk) in out.chunks_mut(block).enumerate() {
+        for (index, strip) in chunk.chunks_mut(rows * g.n).enumerate() {
+            // Round-robin so a short tail strip lands on a different thread than
+            // the one already carrying the most work.
+            groups[(slot * strips + index) % threads].push((strip, slot, index * rows));
+        }
+    }
+    std::thread::scope(|scope| {
+        let mut remaining = groups.into_iter();
+        let first = remaining.next();
+        for group in remaining {
+            let (a, b, bases, g) = (&*a, &*b, &*bases, &*g);
+            scope.spawn(move || gemm_strips(a, b, bases, g, group));
+        }
+        // The calling thread takes a share instead of idling.
+        if let Some(group) = first {
+            gemm_strips(a, b, &bases, g, group);
+        }
+    });
+}
+
+/// Run one thread's strips; `bases` are the per-slot block offsets.
+fn gemm_strips<T: Gemm>(
+    a: &[T],
+    b: &[T],
+    bases: &[(usize, usize)],
+    g: &MatMul,
+    group: Vec<Strip<'_, T>>,
+) {
+    let (k, n) = (g.k, g.n);
+    for (strip, slot, row_start) in group {
+        let rows = strip.len() / n;
+        if rows == 0 {
+            continue;
+        }
+        let (a_base, b_base) = bases[slot];
+        let a_start = a_base + row_start * k;
+        T::gemm_into(
+            rows,
+            k,
+            n,
+            &a[a_start..a_start + rows * k],
+            &b[b_base..b_base + k * n],
+            strip,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,6 +1697,281 @@ mod tests {
             batch: Vec::new(),
         };
         assert!(dot_gemm(&a, &v, &g, DType::Float32, &[2]).unwrap().is_none(), "matrix x vector");
+    }
+
+    // --- dot: the threaded row split of the BLAS-3 fast path ----------------
+
+    /// Deterministic pseudo-random f32 operands (a 32-bit LCG, so the test needs
+    /// no dev-dependency and every run uses the same numbers).
+    fn ramp_f32(count: usize) -> Vec<f32> {
+        let mut state = 0x1234_5678u32;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// The f64 twin of [`ramp_f32`].
+    fn ramp_f64(count: usize) -> Vec<f64> {
+        let mut state = 0x0BAD_F00Du32;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(2_265_480_577).wrapping_add(1);
+                (state >> 8) as f64 / (1u32 << 24) as f64 - 0.5
+            })
+            .collect()
+    }
+
+    fn f32_slice(buffer: &Buffer) -> &[f32] {
+        match &buffer.storage {
+            Storage::F32(values) => values,
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    fn f64_slice(buffer: &Buffer) -> &[f64] {
+        match &buffer.storage {
+            Storage::F64(values) => values,
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// Bit-for-bit equality with a first-mismatch report (an `assert_eq!` on two
+    /// 65k-element vectors prints megabytes).
+    fn assert_bit_identical(actual: &[f32], expected: &[f32], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                got.to_bits() == want.to_bits(),
+                "{what}: index {index}: {got:?} (0x{:08x}) vs {want:?} (0x{:08x})",
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    /// [`assert_bit_identical`] for the f64 path.
+    fn assert_bits_identical_f64(actual: &[f64], expected: &[f64], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                got.to_bits() == want.to_bits(),
+                "{what}: index {index}: {got:?} (0x{:016x}) vs {want:?} (0x{:016x})",
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    /// The operands, geometry and declared result shape of a batch of plain
+    /// `m x k @ k x n` float matmuls (C-order batch blocks, so
+    /// `blocks_contiguous` accepts the layout).
+    fn gemm_pair(
+        m: usize,
+        k: usize,
+        n: usize,
+        batch: &[usize],
+        dtype: DType,
+    ) -> (Value, Value, MatMul, Vec<usize>) {
+        let blocks: usize = batch.iter().product::<usize>().max(1);
+        let a_shape: Vec<usize> = batch.iter().copied().chain([m, k]).collect();
+        let b_shape: Vec<usize> = batch.iter().copied().chain([k, n]).collect();
+        let mut out_shape: Vec<usize> = batch.to_vec();
+        out_shape.extend([m, n]);
+        let (a, b) = if dtype == DType::Float64 {
+            (
+                Buffer::new(dtype, a_shape, Storage::F64(ramp_f64(blocks * m * k))).unwrap(),
+                Buffer::new(dtype, b_shape, Storage::F64(ramp_f64(blocks * k * n))).unwrap(),
+            )
+        } else {
+            (
+                Buffer::new(dtype, a_shape, Storage::F32(ramp_f32(blocks * m * k))).unwrap(),
+                Buffer::new(dtype, b_shape, Storage::F32(ramp_f32(blocks * k * n))).unwrap(),
+            )
+        };
+        let g = geometry(&a, &b);
+        (std::rc::Rc::new(a), std::rc::Rc::new(b), g, out_shape)
+    }
+
+    #[test]
+    fn gemm_threads_gates_on_the_work_threshold() {
+        // Small matmuls must never thread: a 64^3 or 96^3 dot stays on the
+        // calling thread even on a 16-cpu host.
+        assert_eq!(gemm_threads(64 * 64 * 64, 1, 64), 1);
+        assert_eq!(gemm_threads(96 * 96 * 96, 1, 96), 1);
+        assert_eq!(gemm_threads(GEMM_PARALLEL_MIN_WORK - 1, 1, 256), 1);
+        // 256^3 is the measured sweet spot and does thread on a multi-cpu host.
+        let threads = gemm_threads(256 * 256 * 256, 1, 256);
+        assert_eq!(
+            threads > 1,
+            parallel_cpus() > 1,
+            "256^3 must thread iff the host has more than one cpu"
+        );
+        assert!(threads <= parallel_cpus(), "never more threads than cpus");
+        assert!(threads <= 256, "never more threads than output rows");
+        if parallel_cpus() >= GEMM_PARALLEL_MAX_THREADS {
+            // Below a 512^3 matmul the measured optimum is the 8-thread cap.
+            assert_eq!(threads, GEMM_PARALLEL_MAX_THREADS, "256^3 sits at the cap");
+            // ... while a 1024^3 matmul may use the whole machine.
+            assert_eq!(
+                gemm_threads(1024 * 1024 * 1024, 1, 1024),
+                parallel_cpus(),
+                "1024^3 may use every cpu"
+            );
+        }
+        // Never more threads than row strips: one row cannot be shared, and a
+        // single batch block caps the split at its rows.
+        assert_eq!(gemm_threads(4096 * 4096, 1, 1), 1);
+        assert_eq!(gemm_threads(1 << 30, 1, 3), 3);
+        // The work-per-thread target decides the count from 384^3 upward, so a
+        // bigger matmul never asks for fewer threads.
+        assert!(gemm_threads(512 * 512 * 512, 1, 512) >= gemm_threads(256 * 256 * 256, 1, 256));
+    }
+
+    #[test]
+    fn dot_parallel_matches_the_single_threaded_path_bit_for_bit() {
+        // 256^3 f32: the row split must reproduce the one-thread result exactly
+        // (each output element keeps its single accumulation order over K).
+        let (a, b, g, out_shape) = gemm_pair(256, 256, 256, &[], DType::Float32);
+        let one = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, 1)
+            .unwrap()
+            .unwrap();
+        for threads in [2usize, 4, 8] {
+            let many =
+                gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, threads)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(many.shape, out_shape);
+            assert_bit_identical(&f32s(&many), &f32s(&one), "f32 row split");
+        }
+        // The split result is still the product (blocked association order is
+        // the documented difference from the triple loop).
+        assert_relative(
+            &f32s(&one),
+            &f32s(&general_dot(&a, &b, DType::Float32, out_shape)),
+            1e-5,
+            "f32 split vs general",
+        );
+
+        // The same in f64: no dtype in the split may change an association.
+        let (a, b, g, out_shape) = gemm_pair(256, 256, 256, &[], DType::Float64);
+        let one = gemm_run_threads(f64_slice(&a), f64_slice(&b), &g, DType::Float64, &out_shape, 1)
+            .unwrap()
+            .unwrap();
+        let many = gemm_run_threads(f64_slice(&a), f64_slice(&b), &g, DType::Float64, &out_shape, 8)
+            .unwrap()
+            .unwrap();
+        assert_bits_identical_f64(&floats(&many), &floats(&one), "f64 row split");
+    }
+
+    #[test]
+    fn dot_parallel_handles_a_batched_and_a_broadcast_batch() {
+        // Distinct per-batch operands: 4 independent 96^3 products, spread over
+        // both the batch and the row axis.
+        let (a, b, g, out_shape) = gemm_pair(96, 96, 96, &[4], DType::Float32);
+        assert_eq!(out_shape, vec![4, 96, 96]);
+        let one = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, 1)
+            .unwrap()
+            .unwrap();
+        for threads in [2usize, 4, 8, 13] {
+            let many =
+                gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, threads)
+                    .unwrap()
+                    .unwrap();
+            assert_bit_identical(&f32s(&many), &f32s(&one), "batched row split");
+        }
+
+        // A broadcast batch: b carries one shared 48x40 block (stride 0), so
+        // every slot reads the same operand while writing its own output.
+        let a = value(
+            DType::Float32,
+            &[5, 64, 48],
+            Storage::F32(ramp_f32(5 * 64 * 48)),
+        );
+        let b = value(DType::Float32, &[1, 48, 40], Storage::F32(ramp_f32(48 * 40)));
+        let g = geometry(&a, &b);
+        let one = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &[5, 64, 40], 1)
+            .unwrap()
+            .unwrap();
+        let many = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &[5, 64, 40], 4)
+            .unwrap()
+            .unwrap();
+        assert_bit_identical(&f32s(&many), &f32s(&one), "broadcast batch row split");
+        assert_relative(
+            &f32s(&many),
+            &f32s(&general_dot(&a, &b, DType::Float32, vec![5, 64, 40])),
+            1e-5,
+            "broadcast batch split vs general",
+        );
+    }
+
+    #[test]
+    fn dot_parallel_handles_an_odd_row_count_and_a_single_row() {
+        // 251 rows over 7 strips: 36, 36, …, 35 — the tail strip is short and
+        // must still be bit-identical to the one-thread result.
+        let (a, b, g, out_shape) = gemm_pair(251, 173, 97, &[], DType::Float32);
+        let one = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, 1)
+            .unwrap()
+            .unwrap();
+        let many = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, 7)
+            .unwrap()
+            .unwrap();
+        assert_bit_identical(&f32s(&many), &f32s(&one), "odd row count");
+
+        // One row (a rank-2 row vector) can only ever run on one strip.
+        let (a, b, g, out_shape) = gemm_pair(1, 1024, 128, &[], DType::Float32);
+        let one = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, 1)
+            .unwrap()
+            .unwrap();
+        let many = gemm_run_threads(f32_slice(&a), f32_slice(&b), &g, DType::Float32, &out_shape, 8)
+            .unwrap()
+            .unwrap();
+        assert_bit_identical(&f32s(&many), &f32s(&one), "single-row matmul");
+
+        // A rank-1 x matrix dot (the promoted one-row form) never reaches the
+        // fast path at all, so its values are untouched by the split.
+        let row = ramp_f32(1024);
+        let matrix = ramp_f32(1024 * 128);
+        let v = value(DType::Float32, &[1024], Storage::F32(row.clone()));
+        let m = value(DType::Float32, &[1024, 128], Storage::F32(matrix.clone()));
+        let op = spec("dot", DType::Float32, &[128], Attrs::new());
+        let out = dot_impl(&[v.clone(), m.clone()], &op, vec![128]).unwrap();
+        assert_eq!(out[0].shape, vec![128]);
+        let expected: Vec<f32> = (0..128)
+            .map(|column| {
+                (0..1024).map(|inner| row[inner] * matrix[inner * 128 + column]).sum()
+            })
+            .collect();
+        assert_relative(&f32s(&out[0]), &expected, 1e-4, "rank-1 x matrix");
+        assert!(
+            dot_gemm(
+                &v,
+                &m,
+                &MatMul { m: 1, k: 1024, n: 128, a_strides: Vec::new(), b_strides: Vec::new(), batch: Vec::new() },
+                DType::Float32,
+                &[128]
+            )
+            .unwrap()
+            .is_none(),
+            "a rank-1 dot must never reach the BLAS-3 kernel"
+        );
+    }
+
+    #[test]
+    fn dot_small_shapes_stay_on_the_single_threaded_path() {
+        // Below the work threshold the public entry point stays single-threaded
+        // and still equals the general kernel.
+        let (a, b, g, out_shape) = gemm_pair(64, 64, 64, &[], DType::Float32);
+        assert_eq!(gemm_threads(g.m * g.k * g.n, 1, g.m), 1, "64^3 must not thread");
+        let small = dot_gemm(&a, &b, &g, DType::Float32, &out_shape).unwrap().unwrap();
+        assert_relative(
+            &f32s(&small),
+            &f32s(&general_dot(&a, &b, DType::Float32, out_shape)),
+            1e-5,
+            "64^3 fast vs general",
+        );
     }
 
     #[test]
