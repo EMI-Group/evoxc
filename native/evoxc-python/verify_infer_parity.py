@@ -24,6 +24,10 @@ recorded the deeper `shape_fn` error) or the recorded family is not an EVOXC
 family at all while the message is identical (no native family can express it).
 Everything else is a mismatch, and a stale record never passes as one.
 
+It also replays a small `infer` module-argument section (signature-only callee
+contexts in all three entry forms plus a full envelope resolving `call`, the
+unknown-callee `VerificationError` and the `TypeError` argument-shape
+rejections) — extension-only, so it needs no `evoxc` import.
 It additionally cross-checks **every** successful case against the live Python
 authority — `evoxc.ir.op_defs.opdef(name).shape_fn(operand_types, attrs)` with
 the op's declared defaults layered under the case's explicit attributes, the
@@ -450,6 +454,131 @@ def check_case(native: Any, case: dict, expected: dict, report: Report) -> None:
     )
 
 
+# --- the `infer` module argument --------------------------------------------
+#
+# `infer` accepts the `module` argument in two shapes: a full `evoxc-native-ir`
+# envelope (the fixture path above) and a signature-only context that carries
+# just the callee signatures `call` resolves against.  These cases exercise the
+# second shape (and the argument-shape rejections) directly through the
+# extension; they need no `evoxc` import, so they always run.
+SIGNATURE_ONLY_F32 = {"dtype": "float32", "shape": [{"int": 4}, {"int": 3}]}
+SIGNATURE_ONLY_I64 = {"dtype": "int64", "shape": []}
+SIGNATURE_ONLY_ENVELOPE = {
+    "format": "evoxc-native-ir",
+    "version": 1,
+    "module": {"name": "m"},
+    "functions": [
+        {
+            "name": "callee",
+            "input_types": [SIGNATURE_ONLY_F32],
+            "output_types": [SIGNATURE_ONLY_F32],
+            "block": {
+                "arguments": [{"id": 0, "type": SIGNATURE_ONLY_F32}],
+                "ops": [{"id": 0, "ref": "0"}],
+            },
+        }
+    ],
+    "ops": [{"id": 0, "name": "return", "operands": [0], "results": []}],
+}
+
+
+def check_module_contexts(native: Any, report: Report) -> None:
+    """Check the signature-only `infer` module contexts and their rejections."""
+
+    def run(module: Any, callee: str = "callee") -> dict:
+        try:
+            return {
+                "ok": True,
+                "results": native.infer(
+                    "call", [], {"callee": callee}, module=module
+                ),
+            }
+        except native.NativeError as err:
+            return {"ok": False, "kind": err.kind, "message": str(err)}
+        except Exception as err:  # noqa: BLE001 - classified as the finding below
+            return {"ok": False, "kind": f"<{type(err).__name__}>", "message": str(err)}
+
+    # (label, module, expected results | (family, message substring) | TypeError)
+    cases: list[tuple[str, Any, Any]] = [
+        (
+            "module#signature-2",
+            {"functions": [["callee", [SIGNATURE_ONLY_F32]]]},
+            [SIGNATURE_ONLY_F32],
+        ),
+        (
+            "module#signature-3",
+            {"functions": [["callee", [SIGNATURE_ONLY_F32], [SIGNATURE_ONLY_I64]]]},
+            [SIGNATURE_ONLY_I64],
+        ),
+        (
+            "module#signature-dict",
+            {"functions": [{"name": "callee", "output_types": [SIGNATURE_ONLY_I64]}]},
+            [SIGNATURE_ONLY_I64],
+        ),
+        ("module#envelope", SIGNATURE_ONLY_ENVELOPE, [SIGNATURE_ONLY_F32]),
+        (
+            "module#unknown-callee",
+            {"functions": [["callee", [SIGNATURE_ONLY_F32]]]},
+            ("VerificationError", "no function named 'nope'"),
+        ),
+        ("module#missing-functions", {"callees": []}, TypeError),
+        ("module#non-dict", [["callee", []]], TypeError),
+        ("module#functions-not-a-list", {"functions": "nope"}, TypeError),
+        ("module#wrong-entry-length", {"functions": [["callee"]]}, TypeError),
+        (
+            "module#unknown-entry-key",
+            {"functions": [{"name": "callee", "output_types": [], "extra": 1}]},
+            TypeError,
+        ),
+        (
+            "module#bad-type",
+            {"functions": [["callee", [{"dtype": "nope", "shape": []}]]]},
+            ("DTypeError", "module.functions[0] types"),
+        ),
+    ]
+    for label, module, expected in cases:
+        report.cases += 1
+        callee = "nope" if "unknown-callee" in label else "callee"
+        outcome = run(module, callee)
+        if expected is TypeError:
+            if outcome["ok"]:
+                report.fail("call", f"{label}: expected a TypeError, got results")
+            elif outcome["kind"] != "<TypeError>":
+                report.fail(
+                    "call",
+                    f"{label}: expected a TypeError, got {outcome['kind']}: "
+                    f"{outcome['message']}",
+                )
+            else:
+                report.passed += 1
+            continue
+        if isinstance(expected, tuple):
+            family, needle = expected
+            if outcome["ok"]:
+                report.fail("call", f"{label}: expected {family}, got results")
+            elif outcome["kind"] != family or needle not in outcome["message"]:
+                report.fail(
+                    "call",
+                    f"{label}: expected {family} containing {needle!r}, got "
+                    f"{outcome['kind']}: {outcome['message']}",
+                )
+            else:
+                report.passed += 1
+            continue
+        if not outcome["ok"]:
+            report.fail(
+                "call",
+                f"{label}: expected {json.dumps(expected)}, got {outcome['kind']}: "
+                f"{outcome['message']}",
+            )
+            continue
+        difference = first_difference(expected, outcome["results"])
+        if difference is not None:
+            report.fail("call", f"{label}: result type mismatch: {difference}")
+        else:
+            report.passed += 1
+
+
 def check_live_authority(case: dict, native_results: list, report: Report) -> None:
     """Re-derive one successful case from the live Python authority."""
     op = case["op"]
@@ -564,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
     for entry in skipped_ops:
         report.skipped += 1
         print(f"skipped (fixture): {entry.get('op')}: {entry.get('reason')}")
+    check_module_contexts(native, report)
 
     # --- summary -------------------------------------------------------------
     print()
