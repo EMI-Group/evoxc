@@ -31,6 +31,8 @@ transformed IR.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, is_dataclass
 from typing import Any, Sequence, Tuple
 
@@ -280,6 +282,20 @@ def _normalize_leaf_types(spec: "core.TreeSpec") -> "core.TreeSpec":
     )
 
 
+def _iter_nested_ops(region: "ir.Region"):
+    """Yield every op in ``region`` and its nested control-flow regions.
+
+    Walks ``region.blocks`` → ``block.ops`` → ``op.regions`` recursively, so
+    ops inside `if`/`while` (and therefore `cond`/`while_loop`/`scan`) bodies
+    are counted. Pure inspection — never mutates the IR.
+    """
+    for block in region.blocks:
+        for op in block.ops:
+            yield op
+            for nested_region in op.regions:
+                yield from _iter_nested_ops(nested_region)
+
+
 class Graph:
     """A traced graph: IR module plus the input/output trees that let the
     pipeline flatten/validate/unflatten structured data around the module."""
@@ -306,10 +322,147 @@ class Graph:
         self.source_locations = dict(source_locations) if source_locations else {}
 
     def __repr__(self) -> str:
-        return (
-            f"<Graph {len(self.tensor_specs)} tensor inputs, "
-            f"{len(self.static_values)} static values>"
+        """A single-line structural summary of the graph.
+
+        Reports the total op count across every nesting level (control-flow
+        bodies included), the function count, the tensor-input count, the
+        static-value count, and the tensor-output leaf count; a
+        ``batch report`` marker is appended when `batch_functions` attached
+        one. Pure inspection — no tracing, compilation, or caching.
+        """
+        n_ops = sum(
+            1
+            for function in self.module.functions
+            for _ in _iter_nested_ops(function.region)
         )
+        n_functions = len(self.module.functions)
+        n_outputs = self.output_tree.num_leaves - len(self.output_static_values)
+        parts = [
+            f"{n_ops} ops",
+            f"{n_functions} function{'s' if n_functions != 1 else ''}",
+            f"{len(self.tensor_specs)} tensor inputs",
+            f"{len(self.static_values)} static values",
+            f"{n_outputs} output{'s' if n_outputs != 1 else ''}",
+        ]
+        if getattr(self, "batch_report", None) is not None:
+            parts.append("batch report")
+        return f"<Graph {', '.join(parts)}>"
+
+    def summary(self) -> dict:
+        """Return a JSON-safe structural summary of the graph.
+
+        Pure inspection — never traces, compiles, or mutates. Keys:
+
+        * ``functions`` — list of function names.
+        * ``op_count`` — op count across every nesting level (nested
+          `if`/`while` bodies included).
+        * ``op_counts_by_category`` — dict of op category → count, sorted by
+          category; ops missing from the registry are bucketed under
+          ``"unknown"``.
+        * ``tensor_inputs`` — one dict ``{"path", "shape", "dtype"}`` per
+          tensor input, in `tensor_specs` order; ``path`` is the leaf's
+          pytree key path in `input_specs`.
+        * ``tensor_outputs`` — the same shape per tensor output, in
+          `return`-terminator (output-leaf) order.
+        * ``static_values`` — one dict ``{"path", "kind", "value_repr"}`` per
+          static input leaf (``value_repr`` is `repr(value)` truncated to 80
+          chars).
+        * ``source_location_count`` — number of recorded source locations.
+        * ``has_batch_report`` — whether `batch_functions` attached a report.
+        * ``digest`` — the `digest()` string.
+        """
+        op_counts: dict = {}
+        op_count = 0
+        for function in self.module.functions:
+            for op in _iter_nested_ops(function.region):
+                op_count += 1
+                if ir.has_opdef(op.name):
+                    category = ir.opdef(op.name).category
+                else:
+                    category = "unknown"
+                op_counts[category] = op_counts.get(category, 0) + 1
+
+        static_input_indices = {record.index for record in self.static_values}
+        input_paths = [
+            path
+            for flat_index, path in enumerate(_iter_leaf_paths(self.input_specs))
+            if flat_index not in static_input_indices
+        ]
+        tensor_inputs = [
+            {
+                "path": list(path),
+                "shape": [str(dim) for dim in spec.shape],
+                "dtype": str(spec.dtype),
+            }
+            for path, spec in zip(input_paths, self.tensor_specs)
+        ]
+
+        static_output_indices = {
+            record.index for record in self.output_static_values
+        }
+        output_paths = [
+            path
+            for flat_index, path in enumerate(_iter_leaf_paths(self.output_tree))
+            if flat_index not in static_output_indices
+        ]
+        tensor_outputs = [
+            {
+                "path": list(path),
+                "shape": [str(dim) for dim in spec.shape],
+                "dtype": str(spec.dtype),
+            }
+            for path, spec in zip(output_paths, self._output_specs())
+        ]
+
+        static_values = [
+            {
+                "path": list(record.path),
+                "kind": record.kind,
+                "value_repr": repr(record.value)[:80],
+            }
+            for record in self.static_values
+        ]
+
+        return {
+            "functions": [function.name for function in self.module.functions],
+            "op_count": op_count,
+            "op_counts_by_category": dict(sorted(op_counts.items())),
+            "tensor_inputs": tensor_inputs,
+            "tensor_outputs": tensor_outputs,
+            "static_values": static_values,
+            "source_location_count": len(self.source_locations),
+            "has_batch_report": getattr(self, "batch_report", None) is not None,
+            "digest": self.digest(),
+        }
+
+    def digest(self) -> str:
+        """A process-stable SHA-256 digest of the graph's structure + I/O.
+
+        Hashes the canonical JSON of `ir.serialize_module(self.module)` and
+        of `signature_info()`, each length-prefixed so the concatenation cannot
+        collide. It identifies graph STRUCTURE and the input/output signature
+        only: `source_locations` (out-of-process unstable) and the
+        `batch_report` are deliberately excluded, while function/op names,
+        types, static values, and the I/O trees are included. Identical graphs
+        in different processes digest identically.
+        """
+        digest = hashlib.sha256()
+        for payload in (ir.serialize_module(self.module), self.signature_info()):
+            encoded = json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            digest.update(str(len(encoded)).encode("ascii"))
+            digest.update(b":")
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    def text(self) -> str:
+        """Return the pretty-printed IR (`ir.pretty_print(self.module)`).
+
+        This is exactly the string `print()` writes to stdout. Pure
+        inspection — never mutates the graph.
+        """
+        return ir.pretty_print(self.module)
 
     def print(self) -> None:
         """Pretty-print the IR module (`ir.pretty_print(self.module)`) to
