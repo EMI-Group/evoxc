@@ -38,6 +38,16 @@ Must-expose names (re-exported from `evoxc/backends/__init__.py` and from `evoxc
 | `numpy_backend`, `NumpyBackend`, `NumpyExecutable` | `numpy/__init__.py` | the reference CPU interpreter; `numpy_backend` is the instance registered at import — the DEFAULT backend. |
 | `stablehlo` | `stablehlo/__init__.py` | submodule; `stablehlo.export(graph_or_module, options=None) -> str` (MLIR text). `options["rng_bit_generator"]` accepts a bool (backward compat: `True` → both ciphers) or a collection of algorithm names — the NATIVE `stablehlo.rng_bit_generator` emission is selected per-algorithm iff the name is in the set (default empty = inline expansions). |
 
+### Staged-object inspection (pure, `program.py`)
+
+`LoweredProgram` and `CompiledArtifact` expose pure-inspection methods — reads of already-recorded attributes plus an optional payload rendering; no tracing, lowering, compiling, verifying or caching, and a lazy `evoxc.persist`/`evoxc.ir` import inside the rendering body only.
+
+- `__repr__` — one line: backend, target (`CompiledArtifact` only), payload kind + byte size (`?` when not computable), input/output leaf counts. Never raises.
+- `summary() -> dict` — exactly these keys, in order: `backend`, `target` (`None` for a `LoweredProgram`), `payload_kind` (`"serialized-ir"`, `"mlir"`, a known payload `format` such as `"stablehlo"`/`"stablehlo-segments"`, `"json"` for any other dict, else the payload type name), `payload_bytes` (UTF-8 length for `str`, canonical-JSON length for `dict`, `None` when not computable — never raises), `input_count`/`output_count`, `input_shapes`/`output_shapes` (per leaf `[str(dim), …]`), `input_dtypes` (per leaf `str(dtype)`), `static_value_count`, `required_custom_ops` (`[]` for a `LoweredProgram`), `runtime_dependencies` (`{}` for a `LoweredProgram`).
+- `source_text() -> str | None` — the human-readable payload text, implemented ON TOP of the `text()` rendering (`program.py::_render_payload_text`, shared by both classes so `CompiledArtifact.source_text()` and `LoweredProgram.text()` agree): MLIR text verbatim, a payload's `mlir_text`, or the pretty-printed serialized IR; `text()` keeps its raising contract and exact `BackendError` wording, while `source_text()` returns `None` instead of raising.
+- `NumpyExecutable.plan_text() -> str` renders the interpreter's per-block execution plan (see `./numpy/CONTEXT.md`).
+- `save()`/`load()` are unchanged: the persisted container carries the same payload/metadata bytes and none of the runtime-only private attributes.
+
 ## Constraints (binding)
 
 - **Import acyclicity** (from `../CONTEXT.md`): top-level imports restricted to `evoxc.core` and `evoxc.ir`.
