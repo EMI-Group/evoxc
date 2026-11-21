@@ -195,6 +195,14 @@ Batching rules cover elementwise, reductions, structural, dot, linalg aux and co
 - Device kinds and placement semantics are owned by the Python contract (`../evoxc/CONTEXT.md` "Device kinds"); the runtime skeleton models `cpu` plus the generic device-kind string, never a second enumeration.
 - Build products (`native/target/`, `evoxc/_evoxc_native.abi3.so`) are gitignored; commit only sources and generated tables.
 - `source scripts/dev-env.sh` is required in every shell: it exports a writable `CARGO_HOME`, the Nix library paths, and `.venv/bin` on `PATH`.
+- Parity harnesses (rerunnable; both need `scripts/build-native.sh` first): `native/evoxc-python/verify_infer_parity.py` (FFI inference over the committed fixture) and `native/evoxc-compiler/tests/parity_transform/run_parity.py` (numeric transform equivalence), the latter also gated by `cargo test -p evoxc-compiler --test transform_parity`.
+- Known gap: `vmap`/`vectorize` normalize an `out_axes` entry against the output rank `r`, so an unmapped output accepts insertion positions `0..r-1`; `out_axes == r` is an explicit `TransformError` (Python still defers non-leading entries entirely).
+- Known gap: transform deferrals inherited from the Python rules — `conv` VJP, `reduce_mean` over a symbolic reduced dim, multi-axis `gather` sweeps, multi-axis/symbolic slice/pad/concatenate VJPs, `solve` with `left_side=false`, mapped-kernel `conv`, `batch_group_count != 1` — all explicit `TransformError`s naming the op.
+- Known gap: the committed inference fixture records two layered divergences — `sparse_concatenate#2` (fixture records the bare `shape_fn`'s `ShapeError`; the real pipeline and native infer raise `VerificationError` on arity first) and `random_uniform#2` (the Python authority raises a plain `ValueError`, which has no public error family; native raises `VerificationError` with the identical message).
+- Known gap: `envelope::encode` is infallible, so a structurally corrupt program would emit `"type": null` instead of an error; transform outputs are builder-produced, but a validation pass belongs here before any foreign producer uses `encode`.
+- Known gap: `Dim::min_of`/`max_of`/`fold` use `expect` on a `Dim::Dynamic` operand (a documented shape-arithmetic invariant); making them fallible needs a signature change rippling through both crates.
+- Known gap: `evoxc-runtime` is a skeleton — no drivers or allocators, opaque `DeviceHandle` placeholders, and no `MappedView`/`ForeignExport`/DLPack surface yet.
+- Out of this node: the Python packages still use their own implementations; delegating `evoxc.ir`/`evoxc.transforms` to this extension is a separate workstream that must not edit `../evoxc/`, `../tests/` or `../scripts/` from here.
 
 ## Routing Table
 
