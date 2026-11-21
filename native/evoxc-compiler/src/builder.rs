@@ -133,6 +133,15 @@ impl Builder {
         Ok(self.program.block(self.block)?.ops.clone())
     }
 
+    /// Number of ops in the open block (the terminator included).
+    ///
+    /// The cheap length-only companion of [`Builder::block_op_ids`]: a dispatch
+    /// snapshot taken before a rule runs, paired with
+    /// [`Builder::set_op_location_from`] afterwards.
+    pub fn block_op_len(&self) -> Result<usize> {
+        Ok(self.program.block(self.block)?.ops.len())
+    }
+
     /// The open block's terminator operands (`TransformError` when there is none).
     pub fn terminator_operands(&self) -> Result<Vec<ValueId>> {
         let terminator = self.program.terminator(self.block)?.ok_or_else(|| {
@@ -289,6 +298,40 @@ impl Builder {
     /// Record a source location on an already-emitted op.
     pub fn set_op_location(&mut self, op: OpId, location: Option<Location>) -> Result<()> {
         self.program.op_mut(op)?.location = location;
+        Ok(())
+    }
+
+    /// Record `location` on every op appended to the open block since the
+    /// `block_op_len()` snapshot `start`.
+    ///
+    /// The builder only appends, so `ops[start..]` is exactly the range the
+    /// last dispatch emitted: no clone of the op-id vector and no membership
+    /// scan are needed (the old `block_op_ids` + `contains` pair was
+    /// Θ(n²) per op).
+    pub fn set_op_location_from(
+        &mut self,
+        start: usize,
+        location: Option<Location>,
+    ) -> Result<()> {
+        let Program { name, blocks, ops, .. } = &mut self.program;
+        let block = blocks.get_mut(self.block.0).ok_or_else(|| {
+            Error::verification(format!(
+                "block {} is not defined in module '{name}'",
+                self.block
+            ))
+        })?;
+        if start > block.ops.len() {
+            return Err(Error::transform(format!(
+                "builder: cannot set locations from op index {start} in a block with {} op(s)",
+                block.ops.len()
+            )));
+        }
+        for op_id in &block.ops[start..] {
+            let op = ops.get_mut(op_id.0).ok_or_else(|| {
+                Error::verification(format!("op {op_id} is not defined in module '{name}'"))
+            })?;
+            op.location = location.clone();
+        }
         Ok(())
     }
 

@@ -455,6 +455,16 @@ impl Program {
         id
     }
 
+    /// Highest occupied value id, if any (dense-table sizing for transforms).
+    pub fn max_value_id(&self) -> Option<u32> {
+        self.values.max_id()
+    }
+
+    /// Highest occupied op id, if any.
+    pub fn max_op_id(&self) -> Option<u32> {
+        self.ops.max_id()
+    }
+
     /// Raise the allocators above every id already present (decode path).
     pub fn reseed_allocators(&mut self) {
         let op = self.ops.max_id().map_or(0, |id| id + 1);
@@ -491,8 +501,8 @@ impl Program {
     }
 
     pub fn function_mut(&mut self, name: &str) -> Result<&mut Function> {
-        let module_name = self.name.clone();
-        self.functions
+        let Program { name: module_name, functions, .. } = self;
+        functions
             .iter_mut()
             .find(|function| function.name == name)
             .ok_or_else(|| {
@@ -523,8 +533,8 @@ impl Program {
     }
 
     pub fn value_mut(&mut self, id: ValueId) -> Result<&mut Value> {
-        let module_name = self.name.clone();
-        self.values.get_mut(id.0).ok_or_else(|| {
+        let Program { name: module_name, values, .. } = self;
+        values.get_mut(id.0).ok_or_else(|| {
             Error::verification(format!("value %{id} is not defined in module '{module_name}'"))
         })
     }
@@ -536,10 +546,8 @@ impl Program {
     }
 
     pub fn op_mut(&mut self, id: OpId) -> Result<&mut Op> {
-        let module_name = self.name.clone();
-        self.ops
-            .get_mut(id.0)
-            .ok_or_else(|| Error::verification(format!("op {id} is not defined in module '{module_name}'")))
+        let Program { name: module_name, ops, .. } = self;
+        ops.get_mut(id.0).ok_or_else(|| Error::verification(format!("op {id} is not defined in module '{module_name}'")))
     }
 
     pub fn block(&self, id: BlockId) -> Result<&Block> {
@@ -549,8 +557,8 @@ impl Program {
     }
 
     pub fn block_mut(&mut self, id: BlockId) -> Result<&mut Block> {
-        let module_name = self.name.clone();
-        self.blocks.get_mut(id.0).ok_or_else(|| {
+        let Program { name: module_name, blocks, .. } = self;
+        blocks.get_mut(id.0).ok_or_else(|| {
             Error::verification(format!("block {id} is not defined in module '{module_name}'"))
         })
     }
