@@ -8,11 +8,12 @@
 //!
 //! * `version() -> str` and `__version__`
 //! * `infer(op_name, operand_types, attributes, result_types=None, module=None)`
-//! * `transform(kind, module, config)` — signature final, engine wiring pending
+//! * `transform(kind, module, config)` — `evoxc-compiler`'s five transforms
 //! * `NativeError` with `.kind` / `.message`
 mod convert;
 mod error;
 mod module_ops;
+mod transform_config;
 use pyo3::prelude::*;
 /// Native core version (`evoxc._evoxc_native.version()`).
 #[pyfunction]
@@ -47,8 +48,9 @@ fn infer<'py>(
 }
 /// Native graph transform (`vectorize` / `vmap` / `grad` / `jvp` / `vjp`).
 ///
-/// Takes and returns one envelope dict plus the transform config; the engines
-/// live in `evoxc-compiler` and are not wired in this build yet.
+/// Takes one `evoxc-native-ir` envelope, the transform config dict and returns
+/// the transformed envelope plus the `"transform"` metadata object.  The
+/// engines live in `evoxc-compiler`.
 #[pyfunction]
 fn transform(
     py: Python<'_>,
