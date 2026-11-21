@@ -111,3 +111,71 @@ Vulkan warm-run medians vary noticeably between otherwise identical runs (e.g. 0
 The Vulkan graphs are deliberately tiny because IREE's default SPIR-V target profile (`vp_android_baseline_2022`) caps workgroup shared memory; nothing here says anything about large-graph or transformer-class Vulkan codegen.
 `--seed 0` fixes the program population and data, so a re-run reproduces the graphs and the parity checks, but not the wall-clock values.
 The native extension was already built (`evoxc/_evoxc_native.abi3.so`); the probe asserts `_native.available()` and records its version.
+
+## Re-validation at the final native HEAD (seed 0)
+
+The same committed probe (`evoxc/bench/probe_native_architecture.py`, `--seed 0`) was re-run at the HEAD this note is committed on top of (`76c633c`, "Make the batch_functions batchability gate engine-authoritative") with the final release extension, as a re-run of the recorded probe rather than a replacement for the sections above: the original measured sections and their numbers stand unchanged, and the two runs are NOT a speed comparison.
+The re-run finished with `STATUS: PASS` and reproduced the same graph shapes, the same residency/guard results and numeric parity on both legs.
+
+Environment of this re-run: Intel(R) Core(TM) Ultra 7 356H; `Intel(R) Graphics (PTL)` through the Intel open-source Mesa driver 26.3.0 (Vulkan via IREE `vulkan-spirv`, iree-base 3.13.0); Python 3.14.10; numpy 2.5.2; load average `(1.08, 1.34, 1.39)` at the start of the run.
+The host is SHARED with other work, so these timings are indicative only and not a controlled benchmark.
+
+Graph construction: the same traced chain, 1495 IR ops, trace min 15.1 ms / median 15.8 ms (7 repetitions).
+Each transform starts from that pre-traced graph, so its time excludes tracing.
+
+| Transform | min (ms) | median (ms) | output IR ops |
+|---|---:|---:|---:|
+| `vectorize(graph, (0,))` | 26.91 | 27.93 | 2055 |
+| `vmap(graph, in_axes=0, out_axes=0)` | 26.75 | 28.09 | 2055 |
+| `grad(graph, argnums=0)` | 37.06 | 37.92 | 3738 |
+
+`batch_functions`, same population and same `(64, 4, 8)` f32 input:
+
+| Case | N | merge min (ms) | merge median (ms) | emitted ops | selects | row max abs err |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 identical programs | 64 | 8.73 | 8.95 | 12 | 0 | 0.0 |
+| branchy, `switch_ops=True` | 64 | 8.89 | 8.99 | 21 | 1 group (cascade) | 0.0 |
+
+The identical case reports `emitted_ops=12`, `value_classes=9` and zero `select`s; the branchy case reports `emitted_ops=21` with one elementwise switch record of 4 variants and 16 rows each.
+Row parity is exact (`0.0`) in both cases.
+
+CPU end-to-end (part C graph, `backend="numpy"`, 20 warm `run` calls each followed by `Executable.synchronize()`):
+
+| Stage | Time |
+|---|---:|
+| trace + vmap (median) | 0.41 ms |
+| lower | 0.271 ms |
+| compile | 0.194 ms |
+| load | 0.181 ms |
+| warm run min | 0.036 ms |
+| warm run median | 0.037 ms |
+
+numpy parity: max abs error `0.0`; output device `Device(kind='cpu', index=0)`.
+
+Intel Xe GPU end-to-end (part D graph, `vulkan-spirv` through IREE 3.13.0, artifact target `vulkan`, inputs placed explicitly with `.to(Device("vulkan", 0))`):
+
+| Stage | Time |
+|---|---:|
+| lower | 16.49 ms |
+| compile | 217.81 ms |
+| load | 30.52 ms |
+| warm run min | 0.282 ms |
+| warm run median | 0.441 ms |
+
+Residency: `device_resident=True`; `.numpy()` on the Vulkan output raised `DeviceError`; `.to(Device("cpu", 0))` read back successfully.
+Vulkan parity vs the numpy reference: max abs error `1.192e-06`.
+
+Native-produced `batch_functions` graph on Vulkan (part E, the Rust merge of part B's branchy 64-program population):
+
+| Stage | Time |
+|---|---:|
+| lower | 0.73 ms |
+| compile | 200.66 ms |
+| load | 0.26 ms |
+| warm run min | 0.242 ms |
+| warm run median | 0.269 ms |
+
+Residency: `device_resident=True`; row parity vs the per-program numpy results: max abs error `3.815e-06`.
+
+Conclusion: at this HEAD the native engine's `vectorize`/`vmap`/`grad` transforms, the merged-population `batch_functions` merge and both stages of the explicit pipeline (`trace -> lower -> compile -> load -> run`) still pass numeric parity — on the CPU numpy interpreter (`0.0` error) and device-resident on the Intel Xe Vulkan device (`1.192e-06` for the vmap graph, `3.815e-06` for the Rust-merged graph).
+Nothing here is a speed claim beyond the recorded millisecond figures; the wall-clock values are single-session, shared-host observations.
