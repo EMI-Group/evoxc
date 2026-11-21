@@ -1,0 +1,18 @@
+[package]
+name = "evoxc-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PyO3 binding: evoxc._evoxc_native (infer + transform entry points)."
+
+[lib]
+name = "evoxc_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+evoxc-core.workspace = true
+evoxc-compiler.workspace = true
+evoxc-runtime.workspace = true
+pyo3.workspace = true
+serde_json.workspace = true

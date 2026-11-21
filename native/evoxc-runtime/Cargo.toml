@@ -1,0 +1,10 @@
+[package]
+name = "evoxc-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native runtime skeleton: sessions, device contexts, buffers, submissions, executables."
+
+[dependencies]
+evoxc-core.workspace = true
