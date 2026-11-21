@@ -200,7 +200,7 @@ impl Builder {
                 )));
             }
         }
-        let filled = defaulted(schema, attrs)?;
+        let filled = attrs.with_defaults(schema)?;
         validate_attrs(&filled, schema)?;
         let operand_types = self.value_types(operands)?;
         let types = match result_types {
@@ -397,31 +397,6 @@ impl Builder {
         }
         Ok(())
     }
-}
-
-/// `attrs` plus the schema's defaults for every absent optional attribute.
-///
-/// A `null` default means "no value": the attribute stays ABSENT, exactly like
-/// the Python registry's `default=None` (which never fills the attribute), and
-/// core's inference already reads an absent optional attribute as `None` /
-/// "reverse" / "every dimension".  `Attrs::with_defaults` cannot be used
-/// directly because `AttrValue::from_json` refuses to build the `null` for a
-/// declared `ints` / `shape` / `nested_ints` attribute
-/// (`transpose.permutation`, `slice.strides`, `conv.strides`, …).
-fn defaulted(schema: &'static OpSchema, attrs: &Attrs) -> Result<Attrs> {
-    let mut filled = attrs.clone();
-    for declared in schema.attrs {
-        if filled.contains(declared.name) {
-            continue;
-        }
-        if declared.default_json == Some("null") {
-            continue;
-        }
-        if let Some(value) = declared.default_value()? {
-            filled.insert(declared.name, value);
-        }
-    }
-    Ok(filled)
 }
 
 /// `{"a", "b"}` — the declared attribute names of a schema, for messages.
