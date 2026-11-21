@@ -5,14 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "PyO3 binding: evoxc._evoxc_native (infer + transform entry points)."
-
 [lib]
 name = "evoxc_python"
 crate-type = ["cdylib"]
-
 [dependencies]
 evoxc-core.workspace = true
 evoxc-compiler.workspace = true
 evoxc-runtime.workspace = true
-pyo3.workspace = true
 serde_json.workspace = true
+# Deliberately not `pyo3.workspace = true`: the workspace entry hard-enables
+# `extension-module`, and an extension-module build does not link libpython, so
+# a `cargo test` binary that touches the Python API cannot link.  The
+# `extension-module` feature below is on by DEFAULT (the cdylib build path used
+# by `scripts/build-native.sh`); `auto-init` is the test-only alternative that
+# links libpython and initializes an interpreter for the conversion/error tests.
+pyo3 = { version = "0.30", features = ["macros", "abi3-py311"], default-features = false }
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+auto-init = ["pyo3/auto-initialize"]
