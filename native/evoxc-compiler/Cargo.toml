@@ -8,3 +8,4 @@ description = "Native graph builder, vectorize/vmap engine and automatic differe
 
 [dependencies]
 evoxc-core.workspace = true
+serde_json.workspace = true
