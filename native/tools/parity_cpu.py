@@ -510,7 +510,9 @@ def cf_cond(x):
 
 @evoxc.defn
 def cf_while_counted(x):
-    limit = evoxc.cast(evoxc.gather(x, np.array(0, np.int32)), evoxc.int32)
+    # The trip count is a RUNTIME value (x[0] units), so the engine's while
+    # op must execute a data-dependent number of iterations.
+    limit = evoxc.reduce_sum(evoxc.slice(x, 0, 1), axes=None)
 
     def cond_fn(carried):
         i, _ = carried
@@ -518,54 +520,58 @@ def cf_while_counted(x):
 
     def body(carried):
         i, acc = carried
-        return (evoxc.add(i, np.int32(1)), evoxc.add(acc, x))
+        return (evoxc.add(i, 1.0), evoxc.add(acc, x))
 
-    return evoxc.while_loop(cond_fn, body, (np.int32(0), x))
+    return evoxc.while_loop(cond_fn, body, (evoxc.multiply(limit, 0.0), x))
 
 
 @evoxc.defn
 def cf_while_consumes(x):
     def cond_fn(carried):
-        i, _ = carried
-        return evoxc.less(i, 6)
+        i, _, _ = carried
+        return evoxc.less(i, 6.0)
 
     def body(carried):
-        i, acc = carried
-        return (evoxc.add(i, np.int32(1)), evoxc.add(evoxc.multiply(acc, 0.5), x))
+        i, acc, w = carried
+        return (evoxc.add(i, 1.0), evoxc.add(evoxc.multiply(acc, 0.5), w), evoxc.multiply(w, 0.9))
 
-    return evoxc.while_loop(cond_fn, body, (np.int32(0), evoxc.multiply(x, 0.0)))
+    zero = evoxc.multiply(evoxc.reduce_sum(x, axes=None), 0.0)
+    return evoxc.while_loop(cond_fn, body, (zero, evoxc.multiply(x, 0.0), x))
 
 
 cf_call_template = evoxc.defn(lambda x: evoxc.add(x, x))
+
 
 @evoxc.defn
 def cf_cond_with_while(x):
     def cond_fn(carried):
         i, _ = carried
-        return evoxc.less(i, 4)
+        return evoxc.less(i, 4.0)
 
     def body(carried):
         i, acc = carried
-        return (evoxc.add(i, np.int32(1)), evoxc.add(acc, 0.25))
+        return (evoxc.add(i, 1.0), evoxc.add(acc, 0.25))
+
+    def true_fn(a):
+        carried = evoxc.while_loop(cond_fn, body, (evoxc.multiply(evoxc.reduce_sum(x, axes=None), 0.0), a))
+        return carried[1]
 
     pred = evoxc.greater(evoxc.reduce_sum(x, axes=None), 0.0)
-    return evoxc.cond(
-        pred,
-        lambda a: evoxc.while_loop(cond_fn, body, (np.int32(0), a)),
-        lambda a: evoxc.multiply(a, 3.0),
-        x,
-    )
-
+    return evoxc.cond(pred, true_fn, lambda a: evoxc.multiply(a, 3.0), x)
 
 def _rng_graph(algorithm: str, kind: str):
     """One RNG graph per (algorithm, kind) — keys / sampling / normal."""
 
     @evoxc.defn
     def keys():
+        # A key is a plain integer tensor whose static shape encodes the
+        # algorithm (splitmix64: rank-0, threefry2x32: (2,), philox: (4,)),
+        # so split/split_n rounds need no inputs and compare bit-exactly.
         key = evoxc.random.key(7, algorithm=algorithm)
         a, b = evoxc.random.split(key)
-        children = evoxc.random.split_n(key, 3)
-        return (key, a, b, evoxc.gather(children, np.array(0, np.int32)), evoxc.reduce_sum(children, axes=None))
+        c, d = evoxc.random.split(a)
+        stacked = evoxc.stack(evoxc.random.split_n(b, 3))
+        return (key, a, b, c, d, stacked, evoxc.reduce_sum(stacked, axes=None))
 
     @evoxc.defn
     def sampling(probs):
@@ -590,259 +596,167 @@ def _rng_graph(algorithm: str, kind: str):
 
 
 def build_cases() -> list:
-    """The parity corpus — one :class:`Case` per graph."""
+    """The parity corpus — one :class:`Case` per graph, grouped by category.
+
+    Each row is ``(name, category, fn, specs[, extra])``; ``extra`` may carry
+    ``inputs`` (else random concrete inputs are derived from ``specs``),
+    ``graph``, ``flags``, ``native_error``, ``resolver`` and ``note``.
+    """
     rng = np.random.default_rng(20260101)
     f32, f64, c64 = evoxc.float32, evoxc.float64, evoxc.complex64
     i32, i64 = evoxc.int32, evoxc.int64
-    cases: list = []
+    S = _spec  # S((3, 4)) / S((5,), i64)
+    rows: list = []
 
-    def add(name, category, fn, specs, inputs, **kwargs):
-        cases.append(Case(name, category, fn, tuple(specs), tuple(inputs), **kwargs))
-
-    def auto_inputs(*specs):
-        return tuple(_resolve(rng, spec.shape, spec.dtype) for spec in specs)
-
-    def auto(name, category, fn, *specs, **kwargs):
-        add(name, category, fn, specs, auto_inputs(*specs), **kwargs)
+    def rnd(*shape, dtype=f32):
+        return _resolve(rng, shape, dtype)
 
     # ---- 1. elementwise ---------------------------------------------------
-    auto("ew_chain", "elementwise", ew_chain, _spec((4, 5)), _spec((4, 5)))
     nan_x = np.array([[np.nan, 1.0, -2.0, 3.5], [0.5, np.nan, 7.0, -1.0]], np.float32)
     nan_y = np.array([[2.0, np.nan, 1.0, -3.5], [np.nan, 2.5, -7.0, 1.0]], np.float32)
-    add("ew_max_nan", "elementwise", ew_max_nan, (_spec((2, 4)),) * 2, (nan_x, nan_y))
-    auto("ew_round_floor_ceil", "elementwise", ew_rounding, _spec((7,)))
-    auto("ew_abs_complex", "elementwise", ew_abs_complex, _spec((6,), c64))
-    auto("ew_activations", "elementwise", ew_activations, _spec((6,)))
-    add(
-        "ew_casts",
-        "elementwise",
-        ew_casts,
-        (_spec((5,), f32), _spec((5,), i32)),
-        (np.array([0.0, 0.5, -1.5, 2.7, -0.0], np.float32), np.array([1, -2, 3, 4, -5], np.int32)),
-    )
-    auto("ew_select", "elementwise", ew_select, _spec((4, 5)), _spec((4, 5)))
-    add(
-        "ew_remainder_negative_divisor",
-        "elementwise",
-        ew_remainder,
-        (_spec((5,), i64), _spec((5,), i64)),
-        (np.array([-7, 7, -7, 7, 0], np.int64), np.array([3, -3, -3, 3, -5], np.int64)),
-    )
-    add(
-        "ew_int_divide",
-        "elementwise",
-        ew_int_divide,
-        (_spec((3,), i32), _spec((3,), i32)),
-        (np.array([7, -7, 0], np.int32), np.array([2, -2, 3], np.int32)),
-        note="integral divide promotes to float64 (no error)",
-    )
-    add(
-        "err_int_power_negative",
-        "elementwise",
-        ew_int_power_negative,
-        (_spec((2,), i64), _spec((2,), i64)),
-        (np.array([2, 3], np.int64), np.array([-1, -2], np.int64)),
-        note="integer power with a negative exponent: both sides raise",
-    )
+    rows += [
+        ("ew_chain", "elementwise", ew_chain, (S((4, 5)), S((4, 5)))),
+        ("ew_max_nan", "elementwise", ew_max_nan, (S((2, 4)), S((2, 4))), {"inputs": (nan_x, nan_y)}),
+        ("ew_round_floor_ceil", "elementwise", ew_rounding, (S((7,)),)),
+        ("ew_abs_complex", "elementwise", ew_abs_complex, (S((6,), c64),)),
+        ("ew_activations", "elementwise", ew_activations, (S((6,)),)),
+        ("ew_casts", "elementwise", ew_casts, (S((5,), f32), S((5,), i32)), {
+            "inputs": (np.array([0.0, 0.5, -1.5, 2.7, -0.0], np.float32),
+                       np.array([1, -2, 3, 4, -5], np.int32))}),
+        ("ew_select", "elementwise", ew_select, (S((4, 5)), S((4, 5)))),
+        ("ew_remainder_negative_divisor", "elementwise", ew_remainder, (S((5,), i64), S((5,), i64)), {
+            "inputs": (np.array([-7, 7, -7, 7, 0], np.int64), np.array([3, -3, -3, 3, -5], np.int64))}),
+        ("ew_int_divide", "elementwise", ew_int_divide, (S((3,), i32), S((3,), i32)), {
+            "inputs": (np.array([7, -7, 0], np.int32), np.array([2, -2, 3], np.int32)),
+            "note": "integral divide promotes to float64 (no error)"}),
+        ("err_int_power_negative", "elementwise", ew_int_power_negative, (S((2,), i64), S((2,), i64)), {
+            "inputs": (np.array([2, 3], np.int64), np.array([-1, -2], np.int64)),
+            "note": "integer power with a negative exponent: both sides raise"}),
+    ]
 
     # ---- 2. reductions ----------------------------------------------------
-    auto("red_axis_keepdims", "reductions", red_axis, _spec((3, 4)))
-    auto("red_prod", "reductions", red_prod, _spec((2, 5)))
-    add(
-        "red_argmax_argmin_ties",
-        "reductions",
-        red_arg_ties,
-        (_spec((3, 4), i32),),
-        (np.array([[1, 3, 3, 2], [5, 5, 5, 5], [0, -1, 0, -1]], np.int32),),
-    )
-    auto("red_cumsum_cumprod", "reductions", red_cum, _spec((4, 5)))
+    rows += [
+        ("red_axis_keepdims", "reductions", red_axis, (S((3, 4)),)),
+        ("red_prod", "reductions", red_prod, (S((2, 5)),)),
+        ("red_argmax_argmin_ties", "reductions", red_arg_ties, (S((3, 4), i32),), {
+            "inputs": (np.array([[1, 3, 3, 2], [5, 5, 5, 5], [0, -1, 0, -1]], np.int32),)}),
+        ("red_cumsum_cumprod", "reductions", red_cum, (S((4, 5)),)),
+    ]
 
     # ---- 3. indexing / structure -----------------------------------------
-    auto("idx_reshape", "indexing", idx_reshape, _spec((2, 6)))
-    auto("idx_transpose", "indexing", idx_transpose, _spec((2, 3, 4)))
-    auto("idx_slice_strides", "indexing", idx_slice, _spec((5, 6)))
-    auto(
-        "err_slice_negative_stride",
-        "indexing",
-        idx_slice_negative_stride,
-        _spec((5,)),
-        note="negative strides are rejected at trace time by both sides",
-    )
-    add(
-        "idx_gather",
-        "indexing",
-        idx_gather,
-        (_spec((5, 4)), _spec((3,), i32), _spec((2,), i32)),
-        (rng.standard_normal((5, 4)).astype(np.float32), np.array([4, 0, 2], np.int32), np.array([3, 1], np.int32)),
-    )
-    add(
-        "idx_scatter",
-        "indexing",
-        idx_scatter,
-        (_spec((5, 4)), _spec((2,), i32), _spec((2, 4))),
-        (rng.standard_normal((5, 4)).astype(np.float32), np.array([3, 0], np.int32), rng.standard_normal((2, 4)).astype(np.float32)),
-    )
-    auto("idx_concatenate", "indexing", idx_concatenate, _spec((3, 2)), _spec((3, 3)))
-    auto("idx_tile", "indexing", idx_tile, _spec((2, 3)))
-    auto("idx_flip", "indexing", idx_flip, _spec((3, 4)))
-    auto("idx_roll", "indexing", idx_roll, _spec((3, 4)))
-    auto("idx_pad", "indexing", idx_pad, _spec((2, 3)))
-    add("idx_diag", "indexing", idx_diag, (_spec((3,)),), (np.array([1.0, -2.0, 3.5], np.float32),))
-    auto("idx_tril_triu", "indexing", idx_tril_triu, _spec((4, 4)))
-    auto("idx_diagonal_offset", "indexing", idx_diagonal, _spec((3, 5)))
+    rows += [
+        ("idx_reshape", "indexing", idx_reshape, (S((2, 6)),)),
+        ("idx_transpose", "indexing", idx_transpose, (S((2, 3, 4)),)),
+        ("idx_slice_strides", "indexing", idx_slice, (S((5, 6)),)),
+        ("err_slice_negative_stride", "indexing", idx_slice_negative_stride, (S((5,)),),
+         {"note": "negative strides are rejected at trace time by both sides"}),
+        ("idx_gather", "indexing", idx_gather, (S((5, 4)), S((3,), i32), S((2,), i32)), {
+            "inputs": (rnd(5, 4), np.array([4, 0, 2], np.int32), np.array([3, 1], np.int32))}),
+        ("idx_scatter", "indexing", idx_scatter, (S((5, 4)), S((2,), i32), S((2, 4))), {
+            "inputs": (rnd(5, 4), np.array([3, 0], np.int32), rnd(2, 4))}),
+        ("idx_concatenate", "indexing", idx_concatenate, (S((3, 2)), S((3, 3)))),
+        ("idx_tile", "indexing", idx_tile, (S((2, 3)),)),
+        ("idx_flip", "indexing", idx_flip, (S((3, 4)),)),
+        ("idx_roll", "indexing", idx_roll, (S((3, 4)),)),
+        ("idx_pad", "indexing", idx_pad, (S((2, 3)),)),
+        ("idx_diag", "indexing", idx_diag, (S((3,)),), {"inputs": (np.array([1.0, -2.0, 3.5], np.float32),)}),
+        ("idx_tril_triu", "indexing", idx_tril_triu, (S((4, 4)),)),
+        ("idx_diagonal_offset", "indexing", idx_diagonal, (S((3, 5)),)),
+    ]
 
     # ---- 4. linalg --------------------------------------------------------
-    auto("lin_dot_matmul", "linalg", lin_dot, _spec((3, 4), f64), _spec((4, 5), f64))
-    auto("lin_dot_batched", "linalg", lin_dot, _spec((2, 3, 4)), _spec((2, 4, 5)))
-    conv_x = rng.standard_normal((1, 2, 6)).astype(np.float32)
-    conv_w = rng.standard_normal((3, 2, 3)).astype(np.float32)
-    add("lin_conv_valid", "linalg", lin_conv_valid, (_spec((1, 2, 6)), _spec((3, 2, 3))), (conv_x, conv_w))
-    add("lin_conv_same", "linalg", lin_conv_same, (_spec((1, 2, 6)), _spec((3, 2, 3))), (conv_x, conv_w))
+    conv_x, conv_w = rnd(1, 2, 6), rnd(3, 2, 3)
     solve_a = np.eye(4) * 4.0 + rng.standard_normal((4, 4)) * 0.1
-    add("lin_solve", "linalg", lin_solve, (_spec((4, 4), f64), _spec((4,), f64)), (solve_a, rng.standard_normal(4)))
     spd = solve_a @ solve_a.T + np.eye(4) * 4.0
-    add("lin_cholesky", "linalg", lin_cholesky, (_spec((4, 4), f64),), (spd,))
-    auto("lin_qr_reconstruct", "linalg", lin_qr, _spec((5, 3), f64))
-    auto("lin_svd_reconstruct", "linalg", lin_svd, _spec((4, 3), f64))
     sym = spd + spd.T
-    add(
-        "lin_eigh_eigenvalues",
-        "linalg",
-        lin_eigh,
-        (_spec((4, 4), f64),),
-        (sym,),
-        note="eigenvalues + the A@v - v*w residual (eigenvectors are sign-ambiguous)",
-    )
     rank_x = np.outer(np.array([1.0, 2.0, 0.5, -1.0]), np.array([2.0, -1.0, 0.0]))
-    add("lin_matrix_rank", "linalg", lin_matrix_rank, (_spec((4, 3), f64),), (rank_x,))
-    add("lin_matrix_exp", "linalg", lin_matrix_exp, (_spec((3, 3), f64),), (rng.standard_normal((3, 3)) * 0.25,))
-    add(
-        "lin_sort_argsort",
-        "linalg",
-        lin_sort,
-        (_spec((3, 6)),),
-        (np.array([[3.0, 1.0, 3.0, -2.0, 0.5, 0.5], [0.5, 9.0, -1.0, 0.0, 3.0, 3.0], [-4.0, 2.0, 2.0, 7.0, 1.0, 0.0]], np.float32),),
-        note="tie-broken argsort via stable=True (see the documented divergence)",
-    )
-    add(
-        "lin_argsort_no_ties",
-        "linalg",
-        lin_argsort_no_ties,
-        (_spec((4, 5)),),
-        (rng.permutation(20).reshape(4, 5).astype(np.float32),),
-        note="stable=False over distinct values",
-    )
+    sort_x = np.array([[3.0, 1.0, 3.0, -2.0, 0.5, 0.5], [0.5, 9.0, -1.0, 0.0, 3.0, 3.0],
+                       [-4.0, 2.0, 2.0, 7.0, 1.0, 0.0]], np.float32)
+    rows += [
+        ("lin_dot_matmul", "linalg", lin_dot, (S((3, 4), f64), S((4, 5), f64))),
+        ("lin_dot_batched", "linalg", lin_dot, (S((2, 3, 4)), S((2, 4, 5)))),
+        ("lin_conv_valid", "linalg", lin_conv_valid, (S((1, 2, 6)), S((3, 2, 3))), {"inputs": (conv_x, conv_w)}),
+        ("lin_conv_same", "linalg", lin_conv_same, (S((1, 2, 6)), S((3, 2, 3))), {"inputs": (conv_x, conv_w)}),
+        ("lin_solve", "linalg", lin_solve, (S((4, 4), f64), S((4,), f64)),
+         {"inputs": (solve_a, rng.standard_normal(4))}),
+        ("lin_cholesky", "linalg", lin_cholesky, (S((4, 4), f64),), {"inputs": (spd,)}),
+        ("lin_qr_reconstruct", "linalg", lin_qr, (S((5, 3), f64),)),
+        ("lin_svd_reconstruct", "linalg", lin_svd, (S((4, 3), f64),)),
+        ("lin_eigh_eigenvalues", "linalg", lin_eigh, (S((4, 4), f64),), {
+            "inputs": (sym,),
+            "note": "eigenvalues + the A@v - v*w residual (eigenvectors are sign-ambiguous)"}),
+        ("lin_matrix_rank", "linalg", lin_matrix_rank, (S((4, 3), f64),), {"inputs": (rank_x,)}),
+        ("lin_matrix_exp", "linalg", lin_matrix_exp, (S((3, 3), f64),),
+         {"inputs": (rng.standard_normal((3, 3)) * 0.25,)}),
+        ("lin_sort_argsort", "linalg", lin_sort, (S((3, 6)),),
+         {"inputs": (sort_x,), "note": "tie-broken argsort via stable=True (see the documented divergence)"}),
+        ("lin_argsort_no_ties", "linalg", lin_argsort_no_ties, (S((4, 5)),),
+         {"inputs": (rng.permutation(20).reshape(4, 5).astype(np.float32),),
+          "note": "stable=False over distinct values"}),
+    ]
 
     # ---- 5. control flow --------------------------------------------------
-    add(
-        "cf_cond",
-        "control-flow",
-        cf_cond,
-        (_spec((3,)),),
-        (np.array([-1.0, 0.5, -2.0], np.float32),),
-    )
-    add(
-        "cf_while_counted",
-        "control-flow",
-        cf_while_counted,
-        (_spec((3,)),),
-        (np.array([3.0, 1.0, 0.5], np.float32),),
-        note="the trip count comes from the input value x[0]",
-    )
-    auto("cf_while_consumes_input", "control-flow", cf_while_consumes, _spec((4,)))
-    add(
-        "cf_call",
-        "control-flow",
-        None,
-        (),
-        (np.array([1.0, -2.0, 0.5], np.float32),),
-        graph=_build_call_graph(cf_call_template, (_spec((3,)),)),
-        note="hand-built two-function module: main calls helper",
-    )
-    add(
-        "cf_cond_with_while",
-        "control-flow",
-        cf_cond_with_while,
-        (_spec((3,)),),
-        (np.array([0.5, 1.5, -0.5], np.float32),),
-    )
+    rows += [
+        ("cf_cond", "control-flow", cf_cond, (S((3,)),), {"inputs": (np.array([-1.0, 0.5, -2.0], np.float32),)}),
+        ("cf_while_counted", "control-flow", cf_while_counted, (S((3,)),), {
+            "inputs": (np.array([3.0, 1.0, 0.5], np.float32),),
+            "note": "the trip count comes from the input value x[0]"}),
+        ("cf_while_consumes_input", "control-flow", cf_while_consumes, (S((4,)),)),
+        ("cf_call", "control-flow", None, (), {
+            "inputs": (np.array([1.0, -2.0, 0.5], np.float32),),
+            "graph": _build_call_graph(cf_call_template, (S((3,)),)),
+            "note": "hand-built two-function module: main calls helper"}),
+        ("cf_cond_with_while", "control-flow", cf_cond_with_while, (S((3,)),),
+         {"inputs": (np.array([0.5, 1.5, -0.5], np.float32),)}),
+    ]
 
     # ---- 6. random (bit-exact) -------------------------------------------
     probs = np.array([0.1, 0.2, 0.4, 0.05, 0.25], np.float32)
     for algorithm in ("splitmix64", "threefry2x32", "philox4x32_10"):
-        add(f"rng_{algorithm}_keys", "random", _rng_graph(algorithm, "keys"), (), (), flags=frozenset({"exact"}))
-        add(
-            f"rng_{algorithm}_sampling",
-            "random",
-            _rng_graph(algorithm, "sampling"),
-            (_spec((5,)),),
-            (probs,),
-            flags=frozenset({"exact"}),
-        )
-        add(
-            f"rng_{algorithm}_normal",
-            "random",
-            _rng_graph(algorithm, "normal"),
-            (),
-            (),
-            flags=frozenset({"exact", "rng_normal"}),
-            note="f32 normal has a documented 1-ulp window; f64 is bit-exact",
-        )
+        rows += [
+            (f"rng_{algorithm}_keys", "random", _rng_graph(algorithm, "keys"), (),
+             {"flags": frozenset({"exact"})}),
+            (f"rng_{algorithm}_sampling", "random", _rng_graph(algorithm, "sampling"), (S((5,)),),
+             {"inputs": (probs,), "flags": frozenset({"exact"})}),
+            (f"rng_{algorithm}_normal", "random", _rng_graph(algorithm, "normal"), (),
+             {"flags": frozenset({"exact", "rng_normal"}),
+              "note": "f32 normal has a documented 1-ulp window; f64 is bit-exact"}),
+        ]
 
     # ---- 7. dynamic shapes + input validation ----------------------------
     dyn_n = evoxc.dim("n")
     for size in (3, 7):
-        add(
-            f"dyn_reduce_n{size}",
-            "dynamic",
-            dyn_reduce,
-            (_spec((dyn_n, 4)),),
-            (np.arange(size * 4, dtype=np.float32).reshape(size, 4),),
-            note="symbolic (n, 4) spec bound at run time",
-        )
-        add(
-            f"dyn_matmul_n{size}",
-            "dynamic",
-            dyn_matmul,
-            (_spec((dyn_n, 3)), _spec((3, 2))),
-            (rng.standard_normal((size, 3)).astype(np.float32), rng.standard_normal((3, 2)).astype(np.float32)),
-        )
-    add(
-        "err_wrong_dtype",
-        "dynamic",
-        plain_scale,
-        (_spec((3, 4)),),
-        (np.zeros((3, 4), np.float64),),
-        native_error=("DTypeError",),
-        note="float64 input against a float32 spec",
-    )
-    add(
-        "err_wrong_rank",
-        "dynamic",
-        plain_scale,
-        (_spec((3, 4)),),
-        (np.zeros((3, 4, 1), np.float32),),
-        native_error=("ShapeError",),
-        note="rank-3 input against a rank-2 spec",
-    )
+        rows += [
+            (f"dyn_reduce_n{size}", "dynamic", dyn_reduce, (S((dyn_n, 4)),), {
+                "inputs": (np.arange(size * 4, dtype=np.float32).reshape(size, 4),),
+                "note": "symbolic (n, 4) spec bound at run time"}),
+            (f"dyn_matmul_n{size}", "dynamic", dyn_matmul, (S((dyn_n, 3)), S((3, 2))),
+             {"inputs": (rnd(size, 3), rnd(3, 2))}),
+        ]
     evoxc.register_external_kernel("parity_double", lambda x: [np.asarray(x) * 2.0], backend="numpy")
-    add(
-        "err_resolver_required",
-        "dynamic",
-        external_graph,
-        (_spec((3,)),),
-        (np.array([1.0, 2.0, 3.0], np.float32),),
-        native_error=("BackendError",),
-        note="external_call needs a resolver; run with resolver=None",
-    )
-    add(
-        "ext_resolver_provided",
-        "dynamic",
-        external_graph,
-        (_spec((3,)),),
-        (np.array([1.0, 2.0, 3.0], np.float32),),
-        resolver=_ExternalResolver(),
-    )
+    ext_x = np.array([1.0, 2.0, 3.0], np.float32)
+    rows += [
+        ("err_wrong_dtype", "dynamic", plain_scale, (S((3, 4)),), {
+            "inputs": (np.zeros((3, 4), np.float64),), "native_error": ("DTypeError",),
+            "note": "float64 input against a float32 spec"}),
+        ("err_wrong_rank", "dynamic", plain_scale, (S((3, 4)),), {
+            "inputs": (np.zeros((3, 4, 1), np.float32),), "native_error": ("ShapeError",),
+            "note": "rank-3 input against a rank-2 spec"}),
+        ("err_resolver_required", "dynamic", external_graph, (S((3,)),), {
+            "inputs": (ext_x,), "native_error": ("BackendError",),
+            "note": "external_call needs a resolver; run with resolver=None"}),
+        ("ext_resolver_provided", "dynamic", external_graph, (S((3,)),),
+         {"inputs": (ext_x,), "resolver": _ExternalResolver()}),
+    ]
+
+    cases: list = []
+    for row in rows:
+        name, category, fn, specs = row[:4]
+        extra = row[4] if len(row) > 4 else {}
+        given = extra.get("inputs")
+        inputs = given if given is not None else tuple(rnd(*spec.shape, dtype=spec.dtype) for spec in specs)
+        cases.append(Case(name, category, fn, tuple(specs), tuple(inputs),
+                          **{k: v for k, v in extra.items() if k != "inputs"}))
     return cases
 
 
