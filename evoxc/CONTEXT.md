@@ -34,7 +34,7 @@ Pipeline objects are distinct public types (`Defn` → `Graph` → `LoweredProgr
 Every pipeline object exposes a `__repr__` and read-only helpers; none of them traces, compiles, executes, transfers or mutates anything, and every dict-returning helper is JSON-safe.
 - `Graph` (owned by `./trace/`): `repr` carries op / function / tensor-input / static-value / output counts plus a `batch report` marker; `summary() -> dict` with keys `functions`, `op_count` (all nesting levels), `op_counts_by_category`, `tensor_inputs`/`tensor_outputs` (`{"path","shape","dtype"}`), `static_values` (`{"path","kind","value_repr"}`), `source_location_count`, `has_batch_report`, `digest`; `digest() -> str` = sha256 over the canonical serialized module + signature (process-stable for the same source; excludes `source_locations` and `batch_report`); `text() -> str` = the pretty-printed IR that `print()` writes.
 - `LoweredProgram` / `CompiledArtifact` (owned by `./backends/program.py`): `repr` carries backend, target, payload kind + size and leaf counts; `summary() -> dict` with keys `backend`, `target`, `payload_kind`, `payload_bytes`, `input_count`/`output_count`, `input_shapes`/`output_shapes`, `input_dtypes`, `static_value_count`, `required_custom_ops`, `runtime_dependencies`; `source_text() -> str | None` returns the human-readable program text (MLIR/StableHLO text or the serialized-IR pretty print) and `None` when the payload has no text form, where `text()` keeps raising; `save`/`load` are the explicit `./persist` container round trip and never compile.
-- `Executable` / `BoundExecutable` (owned by `./pipeline.py`): `repr`; `summary() -> dict` with keys `backend`, `device`, `functions`, `input_count`/`output_count`, `input_specs`/`output_specs`, `input_tree`/`output_tree`, `static_value_count`, `required_ops`, `capabilities` (the registered backend's flags; `dtypes` reported as `dtype_count`), and `BoundExecutable` adds `bound_count` and reports the reduced unbound inputs; `plan_text() -> str | None` delegates to the backend executable's own textual plan (the numpy interpreter plan) and is `None` for a backend without one.
+- `Executable` / `BoundExecutable` (owned by `./pipeline.py`): `repr`; `summary() -> dict` with keys `backend`, `device`, `functions`, `input_count`/`output_count`, `input_specs`/`output_specs`, `input_tree`/`output_tree`, `static_value_count`, `required_ops`, `capabilities` (the registered backend's flags; `dtypes` reported as `dtype_count`), and `BoundExecutable` adds `bound_count` and reports the reduced unbound inputs; `plan_text() -> str | None` delegates to the backend executable's own textual plan (the numpy interpreter plan) and is `None` for a backend without one. Rendering: `./_inspect.py`; the methods are thin delegations.
 - `Defn` (owned by `./trace/defn.py`): `repr` names the wrapped function's qualname and `__module__`.
 - `Tensor` (owned by `./core/tensor.py`): `repr` shows shape/dtype/device plus a compact value preview ONLY for an ndarray-backed tensor of at most 8 bool/integer/float/complex elements, and the payload class name for a device payload — it never calls `.numpy()`, never materializes a payload host copy, never forces a transfer and never raises.
 
@@ -161,6 +161,7 @@ Formats are versioned via constants (`EVOXC_FORMAT_VERSION`). Artifacts are self
 | `./dist/` | Groups + explicit collectives |
 | `./sparse/` | Sparse tensors: value model (SparseTensor/CSRTensor/CSCTensor/SparseTensorSpec), creators/converters, graph ops, batching/vjp/jvp rules |
 | `./pipeline.py` | Orchestration: `lower/compile/load/run/bind/build/evaluate` + user-facing `Executable`/`BoundExecutable` wrappers |
+| `./_inspect.py` | Private inspection rendering for the pipeline wrappers: `repr`/`summary`/`plan_text` helpers over `Executable`/`BoundExecutable`; imports `core` only |
 | `./persist/` | Save/load container format, explicit cache |
 | `./io.py` | Explicit async host-data IO sugar: `prefetch`/`sink`/`AsyncCopy`/`wait_all` over `Tensor.to` (see "evoxc.io") |
 | `./build_cache.py` | Memoized build sugar: `build_cached` + `CompileCache` LRU (see "Memoized build sugar") |
@@ -173,7 +174,7 @@ Sibling: `../tests/` → test suite (read-only from here; escalate test-related 
 ## evoxc.bench — committed evidence
 
 `./bench/` holds explicit-run benchmark and hardware-validation probes and their records, not a runtime API or a pytest suite.
-Its contents and reproduction constraints are owned by `./bench/CONTEXT.md`; the wider conformance/benchmark harness is archived in the separate evoxc-bench repository.
+Contents and reproduction constraints are owned by `./bench/CONTEXT.md`.
 
 ## evoxc.io — explicit async host-data IO (user-facing module)
 
@@ -254,7 +255,7 @@ out_torch = torch.from_dlpack(out)            # the export side, also zero-copy
 
 ## Test strategy
 
-pytest, CPU only; unit tests per module in `../tests/<module>/`, plus the staging/design-principle compliance suite `../tests/test_spec_compliance.py` (closure-capture errors, `SymbolicTensor` purity, bind-as-sugar, vmap≡vectorize sugar, collective local shapes, serialization round-trips, explicit placement, DLPack interop via `importorskip`).
+pytest, CPU only; unit tests per module in `../tests/<module>/`, plus the staging/design-principle compliance suite `../tests/test_spec_compliance.py` (closure-capture, `SymbolicTensor` purity, bind-as-sugar, vmap≡vectorize, collectives, serialization, placement, DLPack).
 The per-suite inventory (file list, test counts, known skips/gates) is owned by `../tests/CONTEXT.md`.
 
 ## Model readiness — owning contexts
@@ -267,8 +268,7 @@ Full-model measured coverage belongs to `../evoxc_hf/CONTEXT.md`; the small Inte
 - Keep modules thin and single-purpose; files under ~1000 lines (split along declared boundaries instead).
 - Shared capability goes to the lowest common ancestor module per the contracts above — do not duplicate (e.g. numpy kernels live ONLY in `backends/numpy`).
 - `evoxc/__init__.py` re-exports this exact surface; when adding a public name, update `__init__.py` and this contract together.
-- Function-transform integration is narrower than ordinary callable staging: `pipeline.build` and `build_cache.build_cached` always invoke `trace(fn, *specs)` and have no graph-provider dispatch, while `transforms.TransformCallable` consumes specs and returns a standalone Graph rather than symbolic trace outputs.
-- The tracer has no transformed-callable/graph-provider protocol or graph-inlining service, so accepting a transform wrapper through the callable type check does not establish compatibility with `build` or invocation inside an active trace; verified mechanics and source-derived gaps belong to `./trace/CONTEXT.md` and `./transforms/CONTEXT.md`.
+- Function-transform integration is narrower than ordinary callable staging: `pipeline.build` and `build_cache.build_cached` always invoke `trace(fn, *specs)` and have no graph-provider dispatch, while `transforms.TransformCallable` consumes specs and returns a standalone Graph rather than symbolic trace outputs — so accepting a transform wrapper through the callable type check does not establish compatibility with `build` or invocation inside an active trace (verified mechanics and source-derived gaps: `./trace/CONTEXT.md`, `./transforms/CONTEXT.md`).
 - Keep this file to the API contract + routing table: new per-feature detail belongs in the owning child node's CONTEXT.md plus a routing-table row here.
 - **`./_native_codec.py` is the private v1 envelope codec** between a Python `ir.Module` and the neutral in-process dict in `../native/CONTEXT.md` — `ENVELOPE_FORMAT = 1`, `encode_module`/`decode_module`, `encode_type`/`decode_type`; it is NOT the persistence format (`./persist` stays the v1 on-disk format) and imports only `evoxc.core`, `evoxc.ir`, numpy and stdlib.
 - **`./_native.py` is the optional Rust/PyO3 loader and typed façade**: it finds `evoxc/_evoxc_native*.so` (or `EVOXC_NATIVE_LIB`) lazily behind a lock, exposes `available()`/`require()`/`version()`/`infer()`/`transform()`/`batch_functions()` plus the read-only `batching_rule_keys()`, and maps `NativeError.kind` onto the `evoxc.core` public error family verbatim — `import evoxc` never requires the extension, `evoxc.transforms` delegates all six builtin transforms to `transform()`/`batch_functions()`, and `infer()` is consumed by the native inference parity harnesses while trace-time inference still runs in Python (`ir/inference.py`).
