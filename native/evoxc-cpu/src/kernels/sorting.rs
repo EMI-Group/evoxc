@@ -39,6 +39,13 @@
 //! (`f64`/`i64`/`u64`) sort an index vector by `(key, index)`; the key compare
 //! is a plain integer compare, so it stays branch-cheap.
 //!
+//! Short segments do not go through `sort_unstable` at all: a Batcher odd-even
+//! network over the same packed keys orders them in straight-line `min`/`max`
+//! pairs whose indices are literal constants, so the whole network stays in
+//! registers (see the "Small-extent sorting networks" section — measured ~5x
+//! faster at 16 keys and ~1.4x at 64, which is the shape a GP population's
+//! per-row `sort`/`argsort` pair takes).
+//!
 //! Dtype dispatch happens ONCE per call, the scratch buffers are sized once per
 //! call and reused across segments (stack-resident for extents up to
 //! [`STACK_KEYS`]), and the per-segment core is fully monomorphized over the
@@ -265,6 +272,159 @@ impl RowKey for f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Small-extent sorting networks
+// ---------------------------------------------------------------------------
+//
+// Measured on this host in a generic x86-64 release build, one contiguous
+// segment of packed `(key, index)` keys, min over 40 rounds of 4096 rows:
+// `sort_unstable` costs ~50 ns at 8 keys, ~116 ns at 16 and ~291 ns at 64; the
+// Batcher odd-even network over the same array costs ~11/21/217 ns.  The gap is
+// not the comparator count (Batcher needs 19/63/543 compare-exchanges): it is
+// that every step of the network has constant indices, so LLVM keeps the keys
+// in registers and the steps pipeline, while `sort_unstable`'s serial
+// dependency chain and memory round trips cannot.
+//
+// Two limits decide the coverage:
+//
+// * the 8- and 16-key networks are fully unrolled and register-resident; 32 and
+//   64 keys are four/sixteen unrolled 16-key blocks plus Batcher's in-place
+//   merges over the same stack array (measured as fast as a fully unrolled
+//   64-key network, and much smaller);
+// * beyond 64 keys the padded network loses again (a 128-key network is 1471
+//   compare-exchanges, ~1.2 us versus `sort_unstable`'s ~673 ns), so bigger
+//   extents keep `sort_unstable`.  For 33..63 keys the network only pays from a
+//   3/4 fill of the 64-key pad.
+//
+// A network orders ascending only; `(key, index)` packing already breaks every
+// tie, so `descending` stays the write-side flip of the ascending result and
+// stability needs no special case.
+
+/// Sentinel for the padded tail of a network: greater than every real key,
+/// because a real key is `(rank_key << 32) | slot` with `slot < extent <= 64`,
+/// so its low half is at most 63 and never `u32::MAX`.
+const PAD_KEY: u64 = u64::MAX;
+
+/// Compare-exchange one pair of the working array, ascending.
+#[inline]
+fn exchange(keys: &mut [u64], low: usize, high: usize) {
+    let (left, right) = (keys[low], keys[high]);
+    keys[low] = left.min(right);
+    keys[high] = left.max(right);
+}
+
+/// A straight-line ascending compare-exchange sequence over a fixed-width key
+/// array.  Every index is a literal, so LLVM keeps the array in registers.
+macro_rules! network {
+    ($keys:ident: $(($low:literal, $high:literal)),* $(,)?) => {{
+        $(
+            let (left, right) = ($keys[$low], $keys[$high]);
+            $keys[$low] = left.min(right);
+            $keys[$high] = left.max(right);
+        )*
+    }};
+}
+
+/// Batcher's odd-even network for 8 keys (19 comparators).
+#[inline]
+fn network8(keys: &mut [u64; 8]) {
+    network!(keys:
+        (0, 1), (2, 3), (0, 2), (1, 3), (1, 2), (4, 5), (6, 7), (4, 6), (5, 7), (5, 6), (0, 4),
+        (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6),
+    );
+}
+
+/// Batcher's odd-even network for 16 keys (63 comparators).
+#[inline]
+fn network16(keys: &mut [u64; 16]) {
+    network!(keys:
+        (0, 1), (2, 3), (0, 2), (1, 3), (1, 2), (4, 5), (6, 7), (4, 6), (5, 7), (5, 6), (0, 4),
+        (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6), (8, 9), (10, 11), (8, 10),
+        (9, 11), (9, 10), (12, 13), (14, 15), (12, 14), (13, 15), (13, 14), (8, 12), (10, 14),
+        (10, 12), (9, 13), (11, 15), (11, 13), (9, 10), (11, 12), (13, 14), (0, 8), (4, 12),
+        (4, 8), (2, 10), (6, 14), (6, 10), (2, 4), (6, 8), (10, 12), (1, 9), (5, 13), (5, 9),
+        (3, 11), (7, 15), (7, 11), (3, 5), (7, 9), (11, 13), (1, 2), (3, 4), (5, 6), (7, 8),
+        (9, 10), (11, 12), (13, 14),
+    );
+}
+
+/// Batcher's odd-even merge of two adjacent ascending runs of `r` keys at `lo`
+/// (`keys[lo..lo + r]` and `keys[lo + r..lo + 2r]`), recursing over the stride
+/// the way the network's last levels do.  `hi` is exclusive.
+fn merge_runs(keys: &mut [u64], lo: usize, hi: usize, r: usize) {
+    let step = r * 2;
+    if step < hi - lo {
+        merge_runs(keys, lo, hi, step);
+        merge_runs(keys, lo + r, hi, step);
+        let mut low = lo + r;
+        while low + r < hi {
+            exchange(keys, low, low + r);
+            low += step;
+        }
+    } else {
+        exchange(keys, lo, lo + r);
+    }
+}
+
+/// Sort `keys` ascending; its length must be a power of two up to
+/// [`STACK_KEYS`].
+fn network_sort(keys: &mut [u64]) {
+    let length = keys.len();
+    match length {
+        1 => {}
+        2 => exchange(keys, 0, 1),
+        4 => network!(keys: (0, 1), (2, 3), (0, 2), (1, 3), (1, 2)),
+        8 => {
+            if let Ok(fixed) = <&mut [u64; 8]>::try_from(keys) {
+                network8(fixed);
+            }
+        }
+        16 => {
+            if let Ok(fixed) = <&mut [u64; 16]>::try_from(keys) {
+                network16(fixed);
+            }
+        }
+        _ => {
+            for block in keys.chunks_exact_mut(16) {
+                if let Ok(fixed) = <&mut [u64; 16]>::try_from(block) {
+                    network16(fixed);
+                }
+            }
+            let mut width = 32;
+            while width <= length {
+                let mut lo = 0;
+                while lo < length {
+                    merge_runs(keys, lo, lo + width, 1);
+                    lo += width;
+                }
+                width *= 2;
+            }
+        }
+    }
+}
+
+/// Whether `extent` packed keys are worth ordering through the padded network
+/// instead of `sort_unstable` (the measured crossovers in the section note).
+fn network_worthwhile(extent: usize) -> bool {
+    let padded = extent.next_power_of_two();
+    padded <= 32 || (padded == 64 && extent * 4 >= padded * 3)
+}
+
+/// Order the first `extent` packed keys of `keys` ascending: the padded network
+/// where it measured faster, one `sort_unstable` slice otherwise.
+///
+/// `keys` must hold at least `extent.next_power_of_two()` slots when the
+/// network runs (the caller sizes the scratch that way).
+fn order_keys(keys: &mut [u64], extent: usize) {
+    if !network_worthwhile(extent) {
+        keys[..extent].sort_unstable();
+        return;
+    }
+    let padded = extent.next_power_of_two();
+    keys[extent..padded].fill(PAD_KEY);
+    network_sort(&mut keys[..padded]);
+}
+
+// ---------------------------------------------------------------------------
 // The axis-local permutation
 // ---------------------------------------------------------------------------
 
@@ -296,7 +456,15 @@ fn sorted_positions<T: RowKey>(
         return perm;
     }
     // Scratch, sized once per call and reused for every segment: on the stack
-    // for the extents this engine sees most, on the heap beyond that.
+    // for the extents this engine sees most, on the heap beyond that.  The key
+    // scratch is padded to a power of two so [`order_keys`]'s network can fill
+    // its tail with [`PAD_KEY`]; extents past the stack tier keep `sort_unstable`
+    // and need the extent only.
+    let key_len = if extent <= STACK_KEYS {
+        extent.next_power_of_two()
+    } else {
+        extent
+    };
     let mut stack_keys = [0u64; STACK_KEYS];
     let mut stack_order = [0u32; STACK_KEYS];
     let mut stack_positions = [0u32; STACK_KEYS];
@@ -305,12 +473,12 @@ fn sorted_positions<T: RowKey>(
     let mut heap_positions: Vec<u32> = Vec::new();
     let (keys, order, positions): (&mut [u64], &mut [u32], &mut [u32]) = if extent <= STACK_KEYS {
         (
-            &mut stack_keys[..extent],
+            &mut stack_keys[..key_len],
             &mut stack_order[..extent],
             &mut stack_positions[..extent],
         )
     } else {
-        heap_keys.resize(extent, 0);
+        heap_keys.resize(key_len, 0);
         heap_order.resize(extent, 0);
         heap_positions.resize(extent, 0);
         (&mut heap_keys[..], &mut heap_order[..], &mut heap_positions[..])
@@ -341,8 +509,9 @@ fn sorted_positions<T: RowKey>(
 /// Order one gathered segment into `positions`: `positions[p]` is the segment's
 /// index that belongs at sorted position `p` (flipped for `descending`).
 ///
-/// `keys`/`order` are the caller's scratch (length >= `segment.len()`), sized
-/// once per call and reused for every segment.
+/// `keys`/`order` are the caller's scratch, sized once per call and reused for
+/// every segment (`keys` >= `segment.len().next_power_of_two()` for the narrow
+/// arms so the padded network has room).
 fn segment_positions<T: RowKey>(
     segment: &[T],
     positions: &mut [u32],
@@ -352,14 +521,15 @@ fn segment_positions<T: RowKey>(
 ) {
     let extent = segment.len();
     if T::NARROW {
-        // Narrow keys: one `sort_unstable` over packed `(key, index)` pairs —
+        // Narrow keys: one ascending order over packed `(key, index)` pairs —
         // the low 32 bits are the original index, so ties come out in index
-        // order, i.e. the stable order.
+        // order, i.e. the stable order.  [`order_keys`] picks the padded
+        // sorting network for the short extents and `sort_unstable` beyond.
         for (slot, value) in segment.iter().enumerate() {
             keys[slot] = (value.rank_key() << 32) | slot as u64;
         }
-        keys.sort_unstable();
-        for (position, key) in keys.iter().enumerate() {
+        order_keys(keys, extent);
+        for (position, key) in keys[..extent].iter().enumerate() {
             let index = (*key & 0xFFFF_FFFF) as u32;
             positions[if descending { extent - 1 - position } else { position }] = index;
         }
@@ -857,6 +1027,136 @@ mod tests {
         assert_matches_reference(&values, &shape);
         let ints: Vec<i64> = (0..30).map(|step| ((step * 13) % 17) - 8).collect();
         assert_matches_reference(&ints, &shape);
+    }
+
+    #[test]
+    fn every_network_length_orders_ascending() {
+        for length in [2usize, 4, 8, 16, 32, 64] {
+            let mut keys: Vec<u64> = (0..length as u64)
+                .map(|slot| slot.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 1024)
+                .collect();
+            let mut want = keys.clone();
+            want.sort_unstable();
+            network_sort(&mut keys);
+            assert_eq!(keys, want, "network length {length}");
+            // Descending input with duplicates takes the same path.
+            let mut keys: Vec<u64> = (0..length as u64).rev().map(|slot| slot / 3).collect();
+            let mut want = keys.clone();
+            want.sort_unstable();
+            network_sort(&mut keys);
+            assert_eq!(keys, want, "network length {length} reversed");
+        }
+    }
+
+    #[test]
+    fn order_keys_pads_every_power_of_two_tier() {
+        // Every extent the kernel can hand to the network, including the ones
+        // whose pad is larger than the extent (the sentinel tail must sort past
+        // every real key and stay out of the reported positions).
+        for extent in 2usize..=64 {
+            let keys: Vec<u64> = (0..extent as u64)
+                .map(|slot| ((extent as u64 - slot) << 32) | slot)
+                .collect();
+            let mut want = keys.clone();
+            want.sort_unstable();
+            let mut scratch = vec![0u64; extent.next_power_of_two()];
+            scratch[..extent].copy_from_slice(&keys);
+            order_keys(&mut scratch, extent);
+            assert_eq!(&scratch[..extent], &want[..], "extent {extent}");
+        }
+    }
+
+    #[test]
+    fn the_network_covers_its_measured_range() {
+        assert!(network_worthwhile(2));
+        assert!(network_worthwhile(16));
+        assert!(network_worthwhile(32));
+        assert!(!network_worthwhile(40)); // 64-key pad below the 3/4 fill
+        assert!(network_worthwhile(48));
+        assert!(network_worthwhile(64));
+        assert!(!network_worthwhile(65)); // 128-key pad: `sort_unstable` wins
+        assert!(!network_worthwhile(129));
+        for extent in 2..=STACK_KEYS {
+            if network_worthwhile(extent) {
+                assert!(extent.next_power_of_two() <= STACK_KEYS);
+            }
+        }
+    }
+
+    #[test]
+    fn matches_the_reference_across_the_network_extents() {
+        // The padded-network boundaries: both sides of every block edge and of
+        // the 3/4-fill crossover at 48.
+        const EXTENTS: [usize; 20] = [
+            2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 40, 47, 48, 63, 64,
+        ];
+        // Duplicates exercise the index tie-break, and `-0.0`/`0.0` must tie.
+        fn floats(count: usize) -> Vec<f32> {
+            (0..count)
+                .map(|slot| match slot % 7 {
+                    0 => 0.5,
+                    1 => -0.0,
+                    2 => 0.0,
+                    3 | 4 => 3.0,
+                    5 => -7.0,
+                    _ => slot as f32 - 4.0,
+                })
+                .collect()
+        }
+        fn ints(count: usize) -> Vec<i32> {
+            (0..count).map(|slot| ((slot * 5) % 11) as i32 - 5).collect()
+        }
+        fn wide(count: usize) -> Vec<i64> {
+            (0..count).map(|slot| ((slot * 7) % 13) as i64 - 6).collect()
+        }
+        for extent in EXTENTS {
+            // One contiguous segment, several segments, and a strided axis.
+            assert_matches_reference(&floats(extent), &[extent]);
+            assert_matches_reference(&floats(3 * extent), &[3, extent]);
+            assert_matches_reference(&floats(2 * extent), &[extent, 2]);
+            assert_matches_reference(&ints(extent), &[extent]);
+            assert_matches_reference(&ints(2 * extent), &[extent, 2]);
+            // 64-bit keys keep `sort_unstable` at every extent.
+            assert_matches_reference(&wide(extent), &[extent]);
+        }
+    }
+
+    #[test]
+    fn nan_sorts_last_through_the_padded_network() {
+        // Extent 12 pads to the 16-key network: a NaN key is
+        // `(u32::MAX << 32) | slot`, which must still sort before the padding
+        // sentinel and therefore stay inside the reported extent.
+        let values = [
+            f32::NAN,
+            3.0,
+            f32::NAN,
+            -1.0,
+            0.0,
+            2.0,
+            f32::NAN,
+            -0.0,
+            5.0,
+            -3.0,
+            1.0,
+            4.0,
+        ];
+        assert_matches_reference(&values, &[12]);
+        let rows: Vec<f32> = values.iter().chain(values.iter()).copied().collect();
+        assert_matches_reference(&rows, &[2, 12]);
+    }
+
+    #[test]
+    fn matches_the_reference_past_the_network_ceiling() {
+        // Extents above the 64-key pad keep `sort_unstable`, both inside the
+        // stack scratch and beyond it.
+        for extent in [65usize, 96, 128, 129, 200] {
+            let values: Vec<f32> = (0..extent)
+                .map(|slot| ((slot * 17) % 29) as f32 * 0.25 - 3.0)
+                .collect();
+            assert_matches_reference(&values, &[extent]);
+            let rows: Vec<f32> = values.iter().chain(values.iter()).copied().collect();
+            assert_matches_reference(&rows, &[2, extent]);
+        }
     }
 
     #[test]
