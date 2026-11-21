@@ -518,7 +518,7 @@ pub fn response_from_json(json: &Json, op_name: &str) -> Result<Option<Extension
         Json::Object(map) => {
             let mut module: Option<Json> = None;
             let mut entry: Option<String> = None;
-            let mut output_ids: Option<Vec<ValueId>> = None;
+            let mut output_ids: Option<Vec<Option<ValueId>>> = None;
             let mut output_axes: Option<Vec<Option<i64>>> = None;
             for (key, value) in map {
                 match key.as_str() {
@@ -547,15 +547,21 @@ pub fn response_from_json(json: &Json, op_name: &str) -> Result<Option<Extension
                             response_error(
                                 op_name,
                                 "output_ids",
-                                format!("must be a list of value ids, got {}", json_kind(value)),
+                                format!(
+                                    "must be a list of value ids or null entries (null = \
+                                     structurally zero, jvp/vjp only), got {}",
+                                    json_kind(value)
+                                ),
                             )
                         })?;
                         let mut ids = Vec::with_capacity(items.len());
                         for (index, item) in items.iter().enumerate() {
-                            ids.push(value_id_from_json(
-                                item,
-                                &format!("extension rule for op '{op_name}': output_ids[{index}]"),
-                            )?);
+                            let path =
+                                format!("extension rule for op '{op_name}': output_ids[{index}]");
+                            ids.push(match item {
+                                Json::Null => None,
+                                other => Some(value_id_from_json(other, &path)?),
+                            });
                         }
                         output_ids = Some(ids);
                     }
@@ -819,7 +825,10 @@ mod tests {
         .expect("a dict is a rule");
         assert_eq!(response.module, envelope);
         assert_eq!(response.entry, "rule");
-        assert_eq!(response.output_ids, vec![ValueId(3), ValueId(4)]);
+        assert_eq!(
+            response.output_ids,
+            vec![Some(ValueId(3)), Some(ValueId(4))]
+        );
         assert_eq!(response.output_axes, Some(vec![Some(0), None]));
 
         let response = response_from_json(
@@ -829,6 +838,20 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(response.output_axes, None);
+    }
+
+    #[test]
+    fn nullable_output_ids_parse_to_zero_dual_slots() {
+        let response = response_from_json(
+            &json!({"module": {}, "entry": "r", "output_ids": [3, null, 4]}),
+            "block:foo",
+        )
+        .unwrap()
+        .expect("a dict is a rule");
+        assert_eq!(
+            response.output_ids,
+            vec![Some(ValueId(3)), None, Some(ValueId(4))]
+        );
     }
 
     #[test]
@@ -857,6 +880,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("unknown response key"));
+        // a non-null non-id entry still names its position
+        for bad in [json!("abc"), json!(true)] {
+            let err = response_from_json(
+                &json!({"module": {}, "entry": "r", "output_ids": [3, bad]}),
+                "block:foo",
+            )
+            .unwrap_err();
+            assert!(err.message.contains("output_ids[1]"), "{}", err.message);
+        }
+        // a missing output_ids is still required
+        let err = response_from_json(&json!({"module": {}, "entry": "r"}), "block:foo")
+            .unwrap_err();
+        assert!(err.message.contains("\"output_ids\""));
     }
 
     #[test]

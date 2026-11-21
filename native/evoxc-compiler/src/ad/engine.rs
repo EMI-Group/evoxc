@@ -633,17 +633,20 @@ fn extension_derivative(
     let values = response
         .output_ids
         .iter()
-        .map(|id| {
-            mapping.get(id).copied().ok_or_else(|| {
+        .map(|entry| match entry {
+            // `None` = structurally zero dual: the rule omitted the
+            // zero-materialization op for this contribution.
+            None => Ok(Dual::ZeroTangent),
+            Some(id) => mapping.get(id).copied().map(Dual::Value).ok_or_else(|| {
                 Error::transform(format!(
                     "extension rule for op '{}': output id %{id} is not a value of the inlined \
                      entry function",
                     op.name
                 ))
-            })
+            }),
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Some(values.into_iter().map(Dual::Value).collect()))
+    Ok(Some(values))
 }
 
 /// The block arguments the extension subgraph is inlined with.
@@ -725,6 +728,7 @@ fn capitalize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::scalar_payload;
     use crate::Builder;
     use crate::{ExtensionResponse, ExtensionRule, Registry};
     use evoxc_core::attr::{AttrValue, Attrs};
@@ -878,7 +882,7 @@ mod tests {
             Ok(Some(ExtensionResponse::new(
                 envelope::encode(&program),
                 program.functions[0].name.clone(),
-                vec![dual],
+                vec![Some(dual)],
             )))
         }
     }
@@ -939,5 +943,246 @@ mod tests {
         // the spliced cotangent is the explicit cotangent block argument
         assert_eq!(out.output_ids[1], out.input_ids[1]);
         assert_eq!(out.program.value(out.output_ids[1]).unwrap().ty, f32_ty(&[3]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Nullable AD output ids: a `None` entry is a structurally-zero dual
+    // -----------------------------------------------------------------------
+
+    fn zero_constant(builder: &mut Builder) -> ValueId {
+        builder
+            .constant(scalar_payload(DType::parse("float32").unwrap(), 0.0).unwrap())
+            .unwrap()
+    }
+
+    fn defining_op(program: &Program, value: ValueId) -> evoxc_core::graph::OpId {
+        match program.value(value).unwrap().owner {
+            evoxc_core::graph::ValueOwner::OpResult { op, .. } => op,
+            other => panic!("value %{value} has no defining op: {other:?}"),
+        }
+    }
+
+    fn op_count(out: &TransformOutput) -> usize {
+        let block = out
+            .program
+            .entry_block(entry_function(&out.program).unwrap())
+            .unwrap();
+        block.ops.len()
+    }
+
+    /// `x -> multiply(external_call("opaque", x), 2)`: the extension result is
+    /// INTERMEDIATE, so a zero tangent for it never reaches the graph output
+    /// verbatim.
+    fn intermediate_external_program() -> Program {
+        let mut builder = Builder::new("main");
+        builder.open_function("main", &[f32_ty(&[3])]).unwrap();
+        let args = builder.block_arguments().unwrap();
+        let called = builder
+            .emit(
+                "external_call",
+                &args,
+                &Attrs::from_pairs([
+                    ("name", AttrValue::Str("opaque".into())),
+                    (
+                        "result_specs",
+                        AttrValue::Any(json!([{"dtype": "float32", "shape": [{"int": 3}]}])),
+                    ),
+                ]),
+                Some(&[f32_ty(&[3])]),
+                None,
+            )
+            .unwrap()[0];
+        let two = builder
+            .constant(scalar_payload(DType::parse("float32").unwrap(), 2.0).unwrap())
+            .unwrap();
+        let doubled = builder.binary("multiply", called, two).unwrap();
+        builder.set_terminator(&[doubled], None).unwrap();
+        builder.finish()
+    }
+
+    /// `a -> external_call("opaque", a, a)` — one value used as BOTH operands,
+    /// so two real cotangent contributions accumulate into one `add`.
+    fn duplicated_operand_external_program() -> Program {
+        let mut builder = Builder::new("main");
+        builder.open_function("main", &[f32_ty(&[3])]).unwrap();
+        let args = builder.block_arguments().unwrap();
+        let called = builder
+            .emit(
+                "external_call",
+                &[args[0], args[0]],
+                &Attrs::from_pairs([
+                    ("name", AttrValue::Str("opaque".into())),
+                    (
+                        "result_specs",
+                        AttrValue::Any(json!([{"dtype": "float32", "shape": [{"int": 3}]}])),
+                    ),
+                ]),
+                Some(&[f32_ty(&[3])]),
+                None,
+            )
+            .unwrap()[0];
+        builder.set_terminator(&[called], None).unwrap();
+        builder.finish()
+    }
+
+    /// The subgraph block-argument types: the operands, the result proxies and
+    /// then the `Some` duals in list order.
+    fn derivative_argument_types(
+        request: &ExtensionRequest,
+        duals: &[Option<ValueId>],
+        dual_types: &[ValueType],
+    ) -> Vec<ValueType> {
+        let mut types = request.operand_types.clone();
+        types.extend(request.result_types.iter().cloned());
+        types.extend(
+            duals
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| value.map(|_| dual_types[index].clone())),
+        );
+        types
+    }
+
+    /// A JVP rule for `opaque` that reports its single tangent either as a
+    /// structurally-zero dual (`null`: a `None` output id, contributing no op)
+    /// or as an explicit zeros value (`tangent * 0`).
+    struct NullTangentRule {
+        null: bool,
+    }
+
+    impl ExtensionRule for NullTangentRule {
+        fn call(&self, request: &ExtensionRequest) -> Result<Option<ExtensionResponse>> {
+            assert_eq!(request.kind, ExtensionKind::Jvp);
+            let tangents = request
+                .tangent_values
+                .clone()
+                .expect("jvp carries tangent_values");
+            let types = derivative_argument_types(request, &tangents, &request.operand_types);
+            let mut sub = Builder::new("rule");
+            sub.open_function("rule", &types).unwrap();
+            let tangent = *sub.block_arguments().unwrap().last().unwrap();
+            let (output_ids, returns) = if self.null {
+                // Only the real contributions — none here.
+                (vec![None], Vec::new())
+            } else {
+                let zero = zero_constant(&mut sub);
+                let zeroed = sub.binary("multiply", tangent, zero).unwrap();
+                (vec![Some(zeroed)], vec![zeroed])
+            };
+            sub.set_terminator(&returns, None).unwrap();
+            let program = sub.finish();
+            let entry = program.functions[0].name.clone();
+            Ok(Some(ExtensionResponse::new(
+                envelope::encode(&program),
+                entry,
+                output_ids,
+            )))
+        }
+    }
+
+    fn intermediate_jvp(null: bool) -> TransformOutput {
+        let program = intermediate_external_program();
+        let extension = NullTangentRule { null };
+        let env = TransformEnv::builtin().with_extension(&extension);
+        let out = forward_sweep(&program, &[0], &env).unwrap();
+        evoxc_core::verify::verify(&out.program).unwrap();
+        out
+    }
+
+    #[test]
+    fn null_tangent_emits_no_op_and_materializes_only_at_the_output() {
+        // base graph: external_call, constant(two), multiply, return  = 4 ops.
+        let null_out = intermediate_jvp(true);
+        let zero_out = intermediate_jvp(false);
+        let (null_ops, zero_ops) = (op_count(&null_out), op_count(&zero_out));
+        // The explicit-zero rule pays for the zero construction AND the
+        // downstream pointwise tangent; the null rule pays for neither — only
+        // the graph-output materialization of the zero dual remains.
+        assert!(null_ops < zero_ops, "null {null_ops} vs explicit-zero {zero_ops}");
+        assert_eq!(null_ops, 4 + 2, "only the output materialization: {null_ops}");
+        // The returned tangent carries the primal's type ...
+        let tangent = null_out.output_ids[1];
+        assert_eq!(null_out.program.value(tangent).unwrap().ty, f32_ty(&[3]));
+        // ... and is `primal * 0`, materialized from the primal output value.
+        let defining = null_out.program.op(defining_op(&null_out.program, tangent)).unwrap();
+        assert_eq!(defining.name, "multiply");
+        assert!(defining.operands.contains(&null_out.output_ids[0]));
+    }
+
+    /// A VJP rule for `opaque` whose second operand slot is either `None` (a
+    /// structurally-zero cotangent: no accumulation, no op) or a real second
+    /// cotangent (which accumulates into an `add`).
+    struct NullCotangentRule {
+        null: bool,
+    }
+
+    impl ExtensionRule for NullCotangentRule {
+        fn call(&self, request: &ExtensionRequest) -> Result<Option<ExtensionResponse>> {
+            assert_eq!(request.kind, ExtensionKind::Vjp);
+            let cotangents = request
+                .cotangent_values
+                .clone()
+                .expect("vjp carries cotangent_values");
+            let types = derivative_argument_types(request, &cotangents, &request.result_types);
+            let mut sub = Builder::new("rule");
+            sub.open_function("rule", &types).unwrap();
+            let seed = *sub.block_arguments().unwrap().last().unwrap();
+            let mut output_ids = vec![Some(seed)];
+            let mut returns = vec![seed];
+            if self.null {
+                output_ids.push(None);
+            } else {
+                output_ids.push(Some(seed));
+                returns.push(seed);
+            }
+            sub.set_terminator(&returns, None).unwrap();
+            let program = sub.finish();
+            let entry = program.functions[0].name.clone();
+            Ok(Some(ExtensionResponse::new(
+                envelope::encode(&program),
+                entry,
+                output_ids,
+            )))
+        }
+    }
+
+    fn duplicated_operand_vjp(null: bool) -> TransformOutput {
+        let program = duplicated_operand_external_program();
+        let registry = Registry::default();
+        let extension = NullCotangentRule { null };
+        let env = TransformEnv::with_registry(&registry).with_extension(&extension);
+        let out = reverse_sweep(&program, &[0], &env).unwrap();
+        evoxc_core::verify::verify(&out.program).unwrap();
+        out
+    }
+
+    #[test]
+    fn null_cotangent_emits_no_accumulation_op() {
+        let null_out = duplicated_operand_vjp(true);
+        let both_out = duplicated_operand_vjp(false);
+        // 1 primal output + 1 cotangent per input
+        assert_eq!(null_out.output_ids.len(), 2);
+        assert_eq!(both_out.output_ids.len(), 2);
+        let names = |out: &TransformOutput| -> Vec<String> {
+            let block = out
+                .program
+                .entry_block(entry_function(&out.program).unwrap())
+                .unwrap();
+            block
+                .ops
+                .iter()
+                .map(|id| out.program.op(*id).unwrap().name.clone())
+                .filter(|name| name != "return")
+                .collect()
+        };
+        // A null slot contributes nothing: the one real cotangent is a plain
+        // value, so no `add` accumulation appears.
+        assert_eq!(names(&null_out), vec!["external_call"]);
+        // Both slots real → the second contribution accumulates into an `add`.
+        assert_eq!(names(&both_out), vec!["external_call", "add"]);
+        // The null run's cotangent is the single real contribution itself, and
+        // no zero of the shared operand is materialized for the null slot.
+        assert_eq!(null_out.output_ids[1], null_out.input_ids[1]);
+        assert_eq!(null_out.program.value(null_out.output_ids[1]).unwrap().ty, f32_ty(&[3]));
     }
 }

@@ -553,7 +553,7 @@ mod py_tests {
                 .unwrap()
                 .expect("a dict is a rule");
             assert_eq!(response.entry, "rule");
-            assert_eq!(response.output_ids, vec![ValueId(2)]);
+            assert_eq!(response.output_ids, vec![Some(ValueId(2))]);
             assert_eq!(response.output_axes, Some(vec![Some(0)]));
 
             // An exception keeps its text and becomes a TransformError.

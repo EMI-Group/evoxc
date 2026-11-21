@@ -583,7 +583,7 @@ mod tests {
             Ok(Some(ExtensionResponse::new(
                 evoxc_core::envelope::encode(&program),
                 entry,
-                vec![doubled],
+                vec![Some(doubled)],
             )))
         }
     }

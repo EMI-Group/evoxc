@@ -199,8 +199,12 @@ impl ExtensionRule for SubgraphRule {
         *self.last_request.borrow_mut() = Some(request.clone());
         let (program, entry, outputs) = SubgraphRule::subgraph(request, self.results);
         Ok(Some(
-            ExtensionResponse::new(evoxc_core::envelope::encode(&program), entry, outputs)
-                .with_output_axes(vec![Some(0); self.results]),
+            ExtensionResponse::new(
+                evoxc_core::envelope::encode(&program),
+                entry,
+                outputs.into_iter().map(Some).collect(),
+            )
+            .with_output_axes(vec![Some(0); self.results]),
         ))
     }
 }

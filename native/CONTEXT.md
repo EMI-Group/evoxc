@@ -162,13 +162,17 @@ It returns `None` (no rule → `TransformError` naming the op) or a subgraph res
 
 ```
 {"module": Envelope, "entry": str,
- "output_ids": [value_id, ...],            # values of the subgraph to splice in, in order
+ "output_ids": [value_id | null, ...],     # values of the subgraph to splice in, in order
  "output_axes": [int | null, ...] | null}  # batching only: mappedness of each spliced output
 ```
 
 The subgraph's entry block arguments are, in order: the op's operands, the op's results (proxy values for `jvp`/`vjp` rules that need the primal results), and then — `jvp` / `vjp` only — the non-zero duals (`jvp`: the `Some` entries of `tangent_values` in operand order, `vjp`: the `Some` entries of `cotangent_values` in result order; a `null` entry contributes no block argument).
 A `batching` subgraph therefore takes exactly `operands ++ results`.
 The engine inlines the subgraph into the active builder with SSA remapping: operand proxies bind to the rewritten operands, result proxies to the rewritten results, the trailing dual arguments to the values those `Some` entries name; `output_ids` select which values become the rewritten results (batching) or which values are the spliced JVP/VJP contributions.
+An `output_ids` entry of `null` means that contribution is structurally zero (`Dual::ZeroTangent`), with no op spliced for it; it is legal only for `jvp`/`vjp` responses, and a batching response with a `null` entry is an explicit `TransformError` naming the op and the output index.
+The engine materializes such a zero (`multiply` by a zero constant of the primal's own dtype) only where a zero dual reaches a graph output, so a null that feeds only downstream rules stays structurally zero — identical numerics to a rule that returned an explicit zeros value, with fewer ops.
+Because `inline_function` ignores the subgraph's terminator, an AD response subgraph may `return` only its non-zero contributions, and its declared `output_types` must match those return operands.
+The Python bridge sends `None` for every `autodiff.ZeroTangent`/`None` dual slot and omits the `autodiff._materialize` zero values, so the scratch subgraph returns only the non-zero contributions.
 No other Python callback may occur during a transform; the envelope/GIL crossing happens once per transform (plus once per extension-ruled op).
 
 ## Performance rules

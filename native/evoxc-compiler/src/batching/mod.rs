@@ -266,8 +266,17 @@ fn extension_batching(
     let values = response
         .output_ids
         .iter()
-        .map(|id| {
-            mapping.get(id).copied().ok_or_else(|| {
+        .enumerate()
+        .map(|(index, entry)| {
+            let id = entry.ok_or_else(|| {
+                Error::transform(format!(
+                    "extension rule for op '{}': output_ids[{index}] is null — a batching rule \
+                     must return a real value for every result (a null means a structurally-zero \
+                     dual, which is legal only for jvp/vjp responses)",
+                    op.name
+                ))
+            })?;
+            mapping.get(&id).copied().ok_or_else(|| {
                 Error::transform(format!(
                     "extension rule for op '{}': output id %{id} is not a value of the inlined entry function",
                     op.name
@@ -417,7 +426,7 @@ mod tests {
                 ExtensionResponse::new(
                     evoxc_core::envelope::encode(&program),
                     entry,
-                    vec![sum],
+                    vec![Some(sum)],
                 )
                 // the rule declares the spliced output carries the mapped
                 // leading axis
@@ -490,6 +499,75 @@ mod tests {
         fn call(&self, _request: &ExtensionRequest) -> Result<Option<ExtensionResponse>> {
             Ok(None)
         }
+    }
+
+    /// A batching rule that answers with a structurally-zero (`None`) output id,
+    /// which a batching splice cannot accept.
+    struct NullOutputRule;
+
+    impl ExtensionRule for NullOutputRule {
+        fn call(&self, request: &ExtensionRequest) -> Result<Option<ExtensionResponse>> {
+            assert_eq!(request.kind, ExtensionKind::Batching);
+            let mut sub = Builder::new("rule");
+            sub.open_function("rule", &request.operand_types.clone())
+                .unwrap();
+            sub.set_terminator(&[], None).unwrap();
+            let program = sub.finish();
+            let entry = program.functions[0].name.clone();
+            Ok(Some(ExtensionResponse::new(
+                evoxc_core::envelope::encode(&program),
+                entry,
+                vec![None],
+            )))
+        }
+    }
+
+    #[test]
+    fn extension_batching_rejects_a_null_output_id() {
+        // graph: (x: f32[3,2]) -> external_call("double", x)
+        let mut builder = Builder::new("main");
+        builder.open_function("main", &[f32_matrix(3, 2)]).unwrap();
+        let args = builder.block_arguments().unwrap();
+        let result_ty = f32_matrix(3, 2);
+        let out = builder
+            .emit(
+                "external_call",
+                &args,
+                &Attrs::from_pairs([
+                    ("name", AttrValue::Str("double".into())),
+                    (
+                        "result_specs",
+                        AttrValue::Any(json!([{"dtype": "float32", "shape": [{"int": 3}, {"int": 2}]}])),
+                    ),
+                ]),
+                Some(std::slice::from_ref(&result_ty)),
+                None,
+            )
+            .unwrap()[0];
+        builder.set_terminator(&[out], None).unwrap();
+        let program = builder.finish();
+
+        let block = program.entry_block(&program.functions[0]).unwrap();
+        let op = program.op(block.ops[0]).unwrap();
+        let mut rule_op = RuleOp::from_source(&program, op).unwrap();
+        rule_op.operands = args.clone();
+        rule_op.operand_types = vec![result_ty.clone()];
+        rule_op.results = vec![out];
+        rule_op.result_types = vec![result_ty.clone()];
+
+        let mut builder = Builder::new("out");
+        builder
+            .open_function("out", std::slice::from_ref(&result_ty))
+            .unwrap();
+        let mut ctx = RuleCtx::new(&mut builder);
+        let registry = Registry::default();
+        let extension = NullOutputRule;
+        let env = TransformEnv::with_registry(&registry).with_extension(&extension);
+        let err = dispatch(&env, &mut ctx, &rule_op, &[MappedAxes::new(1)]).unwrap_err();
+        assert_eq!(err.kind_str(), "TransformError");
+        assert!(err.message.contains("external_call"), "{}", err.message);
+        assert!(err.message.contains("output_ids[0]"), "{}", err.message);
+        assert!(err.message.contains("batching rule"), "{}", err.message);
     }
 
     #[test]

@@ -243,12 +243,14 @@ impl ExtensionRequest {
 ///
 /// `module` is an `evoxc-native-ir` envelope; `output_ids` name values of its
 /// `entry` function that become the rewritten results (batching) or the
-/// spliced JVP/VJP contributions.
+/// spliced JVP/VJP contributions.  A `None` entry means "structurally zero
+/// dual" (`Dual::ZeroTangent`) — legal only for `jvp`/`vjp` responses, where it
+/// lets the rule omit the zero-materialization op for that contribution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionResponse {
     pub module: Json,
     pub entry: String,
-    pub output_ids: Vec<ValueId>,
+    pub output_ids: Vec<Option<ValueId>>,
     pub output_axes: Option<Vec<Option<i64>>>,
 }
 
@@ -257,7 +259,7 @@ impl ExtensionResponse {
     pub fn new(
         module: Json,
         entry: impl Into<String>,
-        output_ids: Vec<ValueId>,
+        output_ids: Vec<Option<ValueId>>,
     ) -> ExtensionResponse {
         ExtensionResponse {
             module,
