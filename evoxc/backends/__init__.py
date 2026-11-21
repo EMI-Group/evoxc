@@ -10,12 +10,15 @@ Public surface (full contract in this directory's CONTEXT.md and ../CONTEXT.md):
 - ``stablehlo`` submodule (``stablehlo.export``; export utility, NOT a backend) — stablehlo/
 - shared block-inlining machinery                              — inline.py
 - ``adapters`` subpackage (iree/xla/tvm adapter modules — a separate effort) — adapters/
+- ``native`` subpackage (the in-process Rust CPU engine backend)  — native/
 
 Import acyclicity: this package imports ``evoxc.core`` / ``evoxc.ir`` at top level;
 ``evoxc.ops`` only inside function bodies; never ``evoxc.pipeline``. Optional
-compiler adapters are imported only on first registry use (``get("iree")``) —
+adapters (``iree``/``xla``/``tvm`` and the ``native`` Rust CPU-engine backend)
+are imported only on first registry use (``get("iree")`` / ``get("native")``) —
 never at ``import evoxc`` / ``import evoxc.backends`` time (the device-transfer
-thunk below imports the iree adapter lazily, on first call).
+thunk below imports the iree adapter lazily, on first call; ``native`` is not
+imported at all until first use, so the extension stays unloaded).
 """
 from evoxc.core import DeviceError, register_device_transfer_provider
 
