@@ -184,9 +184,11 @@ The API is **functional**, split along evoxc's value model: `load_config(ckpt)` 
 
 ## Notes for Agents
 
-**Native architecture proposal:** `./NATIVE_ARCHITECTURE_PROPOSAL.md` describes a proposed Rust-first end state, not the current implementation.
-Its proposed APIs, ownership decisions, and packaging do not override current contracts or authorize implementation/configuration changes.
-The README continues to describe the implemented system, not this proposal.
+**Native architecture proposal:** `./NATIVE_ARCHITECTURE_PROPOSAL.md` is the approved target design.
+Its numerical-authority rule is implemented for the graph transformations: `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` are one Rust implementation in `./native/`, reached through the `evoxc._evoxc_native` PyO3 extension.
+Python keeps only frontend duties — executing `defn` bodies, adapting trees/specs, and serving extension rules (`block:*`, `external:*`, `sparse_*`) through the native extension-rule bridge.
+Python shape inference/verification at trace time, lowering/StableHLO export, and the backend adapters remain Python; the native ports of inference/verification exist and are parity-tested but are not yet on the Python hot path, and the native runtime crate is a skeleton.
+Do not reintroduce a builtin batching/AD/merge implementation in Python: extend the native engine and expose it through the bridge.
 
 **README (`./README.md`) is the front page and a derived document.**
 It states the four defining properties (simple / minimal / explicit / compiler-neutral), the pipeline `defn → trace → Graph → transform → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor`, and the per-feature sections.
