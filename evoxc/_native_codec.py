@@ -283,7 +283,9 @@ def decode_module(envelope: Any) -> ir.Module:
     return _ir_serialize._deserialize_envelope_body(_validated_envelope_body(envelope))
 
 
-def decode_native_module(envelope: Any, *, verify_module: bool | None = None) -> ir.Module:
+def decode_native_module(
+    envelope: Any, *, verify_module: bool | None = None
+) -> ir.Module:
     """Rebuild an ``ir.Module`` from a TRUSTED native envelope (fast path).
 
     This is the hot-path decoder for an envelope produced in-process by the

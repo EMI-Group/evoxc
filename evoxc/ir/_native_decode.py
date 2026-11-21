@@ -132,7 +132,10 @@ def _build_region_fast(
             argument_index += 1
         block.arguments = tuple(arguments)
         for entry in block_data["ops"]:
-            op = ops_by_id[entry["id"]]
+            op_id = entry.get("id")
+            if op_id is None:  # the native writer always emits it, mirrors "ref"
+                op_id = int(entry["ref"])
+            op = ops_by_id[op_id]
             op.parent = block
             block.ops.append(op)
         region.append_block(block)
@@ -142,8 +145,8 @@ def _build_region_fast(
 def build_module_fast(body: dict) -> Module:
     """Rebuild a module from a TRUSTED ``evoxc-native-ir`` body (fast path).
 
-    This is the hot-path sibling of ``evoxc.ir.serialize._build_module``: it accepts the
-    in-process envelope the native extension returns (produced from a module
+    This is the hot-path sibling of ``evoxc.ir.serialize._build_module``: it
+    accepts the in-process envelope the native extension returns (produced from a module
     this runtime encoded moments earlier), constructs every IR object
     positionally, appends ``Use`` records directly (a trusted envelope has no
     duplicate uses), memoizes types/locations by envelope-object identity and
@@ -279,5 +282,3 @@ def build_module_fast(body: dict) -> Module:
         op.operands = tuple(operands)
     _fast_forward_counters(module, ops_by_id, values_by_id)
     return module
-
-
