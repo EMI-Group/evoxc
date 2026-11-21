@@ -8,24 +8,25 @@
     ],
     "cpu_count": 16,
     "cpu_model": "Intel(R) Core(TM) Ultra 7 356H",
-    "date_utc": "2026-11-21T18:28:34+00:00",
+    "date_utc": "2026-11-21T19:31:26+00:00",
     "env": {
       "EVOXC_DISABLE_LOCATIONS": "1"
     },
     "evoxc": "0.1.0",
     "labels": [
+      "after",
       "before"
     ],
-    "last_label": "before",
+    "last_label": "after",
     "loadavg_end": [
-      3.61,
-      3.63,
-      1.91
+      3.25,
+      2.75,
+      3.05
     ],
     "loadavg_start": [
-      3.84,
-      3.67,
-      1.92
+      3.27,
+      2.75,
+      3.06
     ],
     "machine": "x86_64",
     "native_extension": "0.1.0",
@@ -45,6 +46,231 @@
     "unavailable_backends": {}
   },
   "runs": {
+    "after": {
+      "available_backends": [
+        "numpy"
+      ],
+      "backends": [
+        "numpy"
+      ],
+      "cells": {
+        "numpy|1700": {
+          "backend": "numpy",
+          "build": {
+            "median_ms": 30.78467701561749,
+            "min_ms": 29.6959740226157
+          },
+          "build_cached": {
+            "hit": {
+              "median_ms": 0.04723796155303717,
+              "min_ms": 0.04108401481062174
+            },
+            "hits": 7,
+            "miss_ms": 69.87953698262572,
+            "misses": 1
+          },
+          "build_max_abs_err": 0.0,
+          "compile": {
+            "median_ms": 0.016971025615930557,
+            "min_ms": 0.015071011148393154
+          },
+          "iterations": 850,
+          "load": {
+            "median_ms": 0.10569603182375431,
+            "min_ms": 0.10243500582873821
+          },
+          "loadavg": [
+            3.27,
+            2.75,
+            3.06
+          ],
+          "lower": {
+            "median_ms": 17.243538983166218,
+            "min_ms": 16.61360199796036
+          },
+          "max_abs_err": 0.0,
+          "op_count": 1702,
+          "reps": 7,
+          "requested_ops": 1700,
+          "staging_total": {
+            "median_ms": 17.366566054988652,
+            "min_ms": 16.733862983528525
+          },
+          "trace": {
+            "median_ms": 13.304942985996604,
+            "min_ms": 12.332172016613185
+          },
+          "warm_run": {
+            "median_ms": 1.7032100004144013,
+            "min_ms": 1.683796988800168,
+            "output_device": "Device(kind='cpu', index=0)",
+            "warmup_runs": 1
+          }
+        },
+        "numpy|200": {
+          "backend": "numpy",
+          "build": {
+            "median_ms": 3.679545014165342,
+            "min_ms": 3.5804290091618896
+          },
+          "build_cached": {
+            "hit": {
+              "median_ms": 0.04449201514944434,
+              "min_ms": 0.0408630003221333
+            },
+            "hits": 7,
+            "miss_ms": 3.658977977465838,
+            "misses": 1
+          },
+          "build_max_abs_err": 0.0,
+          "compile": {
+            "median_ms": 0.0048559741117060184,
+            "min_ms": 0.004256959073245525
+          },
+          "iterations": 100,
+          "load": {
+            "median_ms": 0.02290797419846058,
+            "min_ms": 0.018997990991920233
+          },
+          "loadavg": [
+            3.27,
+            2.75,
+            3.06
+          ],
+          "lower": {
+            "median_ms": 2.0157190156169236,
+            "min_ms": 1.9670329638756812
+          },
+          "max_abs_err": 0.0,
+          "op_count": 202,
+          "reps": 7,
+          "requested_ops": 200,
+          "staging_total": {
+            "median_ms": 2.0467170979827642,
+            "min_ms": 1.991857890971005
+          },
+          "trace": {
+            "median_ms": 1.6041080234572291,
+            "min_ms": 1.471439958550036
+          },
+          "warm_run": {
+            "median_ms": 0.21333200857043266,
+            "min_ms": 0.21010899217799306,
+            "output_device": "Device(kind='cpu', index=0)",
+            "warmup_runs": 1
+          }
+        },
+        "numpy|5000": {
+          "backend": "numpy",
+          "build": {
+            "median_ms": 137.29283295106143,
+            "min_ms": 89.60012998431921
+          },
+          "build_cached": {
+            "hit": {
+              "median_ms": 0.04561198875308037,
+              "min_ms": 0.040229992009699345
+            },
+            "hits": 7,
+            "miss_ms": 151.45597496302798,
+            "misses": 1
+          },
+          "build_max_abs_err": 0.0,
+          "compile": {
+            "median_ms": 0.01882301876321435,
+            "min_ms": 0.017364975064992905
+          },
+          "iterations": 2500,
+          "load": {
+            "median_ms": 0.25247002486139536,
+            "min_ms": 0.24532200768589973
+          },
+          "loadavg": [
+            3.27,
+            2.75,
+            3.06
+          ],
+          "lower": {
+            "median_ms": 50.93565699644387,
+            "min_ms": 49.35936600668356
+          },
+          "max_abs_err": 0.0,
+          "op_count": 5002,
+          "reps": 7,
+          "requested_ops": 5000,
+          "staging_total": {
+            "median_ms": 51.19980202289298,
+            "min_ms": 49.62812107987702
+          },
+          "trace": {
+            "median_ms": 37.328962003812194,
+            "min_ms": 36.43835399998352
+          },
+          "warm_run": {
+            "median_ms": 5.049097002483904,
+            "min_ms": 5.015406990423799,
+            "output_device": "Device(kind='cpu', index=0)",
+            "warmup_runs": 1
+          }
+        }
+      },
+      "command": "python -m evoxc.bench.probe_compile_perf --seed 0 --reps 7 --sizes 200,1700,5000 --backends numpy --out evoxc/bench/compile_perf_results.json --label after",
+      "date_utc": "2026-11-21T19:31:26+00:00",
+      "env": {
+        "EVOXC_DISABLE_LOCATIONS": "1"
+      },
+      "failures": [],
+      "graph": "evoxc.tanh(x) * x applied `count` times (a STATIC Python int argument, two IR ops per iteration) then evoxc.sum(x); input (8, 16) float32; --sizes names the REQUESTED traced-op count, op_count is the actual traced module size",
+      "label": "after",
+      "loadavg_end": [
+        3.25,
+        2.75,
+        3.05
+      ],
+      "loadavg_start": [
+        3.27,
+        2.75,
+        3.06
+      ],
+      "reps": 7,
+      "seed": 0,
+      "sizes": [
+        200,
+        1700,
+        5000
+      ],
+      "status": "PASS",
+      "timing": "min and median over --reps; each stage rep runs trace -> lower -> compile -> load chained in one repetition; staging_total is the per-repetition sum lower+compile+load; warm run = one untimed warmup then --reps timed runs; build_cached miss is one cold call on a fresh CompileCache and its hit is min/median over --reps",
+      "transforms": {
+        "grad": {
+          "median_ms": 26.907476014457643,
+          "min_ms": 26.55029098968953,
+          "out_ops": 3380
+        },
+        "graph_op_count": 752,
+        "loadavg": [
+          3.25,
+          2.75,
+          3.05
+        ],
+        "vmap": {
+          "median_ms": 11.185197974555194,
+          "min_ms": 10.309635021258146,
+          "out_ops": 752
+        }
+      },
+      "unavailable_backends": {},
+      "versions": {
+        "cpu_count": 16,
+        "cpu_model": "Intel(R) Core(TM) Ultra 7 356H",
+        "evoxc": "0.1.0",
+        "machine": "x86_64",
+        "native_extension": "0.1.0",
+        "numpy": "2.5.2",
+        "platform": "Linux-7.3.4-x86_64-with-glibc2.44",
+        "python": "3.14.10"
+      }
+    },
     "before": {
       "available_backends": [
         "numpy"
