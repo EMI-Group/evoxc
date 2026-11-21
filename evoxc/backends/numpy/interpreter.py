@@ -421,6 +421,47 @@ def _build_plan(block: ir.Block) -> _BlockPlan:
     return _BlockPlan(block, tuple(steps), return_ids)
 
 
+def _ids(values: Sequence[Any]) -> str:
+    """Render ``%<id>`` for value objects or bare value ids as a comma list."""
+    return ", ".join(
+        f"%{value if isinstance(value, int) else value.id}" for value in values
+    )
+
+
+def _format_attribute(value: Any, limit: int = 24) -> str:
+    """Bounded, O(1) rendering of one op attribute for ``plan_text``.
+
+    Scalars render via ``repr`` (truncated) and dtypes via ``str``; containers
+    and bulk payloads (a ``constant``'s data, a ``result_specs`` list, …) render
+    as their type + size, so the inspection text never materializes a huge
+    ``repr``.
+    """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        text = repr(value)
+        return text if len(text) <= limit else text[: limit - 3] + "..."
+    if isinstance(value, np.dtype):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return f"<{type(value).__name__} {len(value)} bytes>"
+    if isinstance(value, (list, tuple)):
+        return f"<{type(value).__name__} len={len(value)}>"
+    if isinstance(value, dict):
+        return f"<dict len={len(value)}>"
+    return f"<{type(value).__name__}>"
+
+
+def _attribute_summary(op: ir.Op, limit: int = 3) -> str:
+    """Bounded ``[key=value, ...]`` attribute summary for ``plan_text``."""
+    attributes = op.attributes
+    if not attributes:
+        return ""
+    keys = list(attributes)[:limit]
+    parts = [f"{key}={_format_attribute(attributes[key])}" for key in keys]
+    if len(attributes) > limit:
+        parts.append("...")
+    return " [" + ", ".join(parts) + "]"
+
+
 class KernelContext:
     """Per-execution state handed to every kernel (see module docstring).
 
@@ -556,6 +597,55 @@ class Interpreter:
         #: later execution (including loop iterations of nested regions). The
         #: plan holds its block, so a cached key's id can never be reused.
         self._plans: Dict[int, _BlockPlan] = {}
+
+    # ------------------------------------------------------------ inspection
+
+    def plan_text(self) -> str:
+        """Render every execution plan as human-readable text — executes NOTHING.
+
+        Walks the entry function (``entry_function(self.module)``) and, per
+        block, re-derives the plan with :func:`_build_plan` and renders one line
+        per planned step: the op name, a bounded attribute summary, the operand
+        value ids, the result value ids, the value ids whose last use this step
+        is (freed), the resolved kernel marker, and ``fast`` when the static
+        result-shape fast path applies. The ``return`` terminator is NOT a step,
+        so it is rendered from ``plan.return_ids`` as ``<return> (<ids>)``.
+        Nested region blocks (``op.regions`` — ``if``/``while`` bodies) are
+        rendered indented under the op that owns them; each block gets a header
+        line carrying its argument value ids.
+
+        PURE inspection: no kernel is invoked, the value store and the
+        ``self._plans`` cache are untouched (the plans rendered here are
+        derived and discarded, so a later ``run`` still builds its own), and it
+        is O(ops) in the module. It never raises for a valid module — a block
+        that cannot be planned raises the same ``BackendError`` ``run`` would.
+        """
+        lines: List[str] = []
+        function = entry_function(self.module)
+        lines.append(f"function @{function.name}")
+        self._plan_lines(function.entry_block, 1, lines)
+        return "\n".join(lines)
+
+    def _plan_lines(self, block: ir.Block, depth: int, lines: List[str]) -> None:
+        """Append ``block``'s plan rendering (and its nested regions') to ``lines``."""
+        plan = _build_plan(block)  # derived for display only — never cached
+        indent = "  " * depth
+        lines.append(f"{indent}block({_ids(block.arguments)})")
+        for op, kernel, operand_ids, result_ids, free_ids, fast, _one in plan.steps:
+            kernel_marker = getattr(kernel, "__name__", None) or repr(kernel)
+            lines.append(
+                f"{indent}  %{op.id} {op.name}{_attribute_summary(op)} "
+                f"in=({_ids(operand_ids)}) out=({_ids(result_ids)}) "
+                f"free=({_ids(free_ids)}) kernel={kernel_marker}"
+                f"{' fast' if fast else ''}"
+            )
+            for region in op.regions:
+                for nested in region.blocks:
+                    self._plan_lines(nested, depth + 2, lines)
+        if plan.return_ids is None:
+            lines.append(f"{indent}  <no return terminator>")
+        else:
+            lines.append(f"{indent}  <return> ({_ids(plan.return_ids)})")
 
     # ------------------------------------------------------------------ run
 

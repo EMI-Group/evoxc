@@ -61,8 +61,21 @@ class Defn:
         )
 
     def __repr__(self) -> str:
-        name = getattr(self.fn, "__qualname__", repr(self.fn))
-        return f"<Defn {name}>"
+        """Metadata-only description of the wrapped function.
+
+        Includes the function's qualname (falling back to its name, then to
+        the function's own repr) and, when available, its defining
+        ``__module__``. Never traces, compiles, or calls the function.
+        """
+        qualname = getattr(self.fn, "__qualname__", None)
+        if qualname is None:
+            qualname = getattr(self.fn, "__name__", None)
+        if qualname is None:
+            qualname = repr(self.fn)
+        module = getattr(self.fn, "__module__", None)
+        if module:
+            return f"<Defn {qualname} ({module})>"
+        return f"<Defn {qualname}>"
 
 
 def defn(fn: Optional[Callable[..., Any]] = None, **options: Any) -> Any:

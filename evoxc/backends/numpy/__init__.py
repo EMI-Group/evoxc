@@ -68,7 +68,73 @@ __all__ = [
     # canonical collective protocol + the default single-rank executor
     "CollectiveExecutor",
     "SingleRankCollectiveExecutor",
+    # test seam (NOT a public API for users) — single-decode accounting
+    "decode_stats",
+    "reset_decode_stats",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Single-decode seam (test seam — not a public API for users)
+# ---------------------------------------------------------------------------
+
+#: Process-global count of ``ir.deserialize_module`` calls made by this backend.
+#: A plain int increment under the GIL is exact enough for a test seam.
+_deserialize_count = 0
+
+
+def _decode_payload(payload: Any) -> "Module":
+    """The numpy backend's SINGLE deserialize entry point.
+
+    EVERY ``ir.deserialize_module`` call in this backend goes through here, so
+    ``decode_stats()`` is exact. The in-process pipeline
+    (``trace -> lower -> compile -> load``) deserializes at most ONCE: ``lower``
+    attaches the LIVE module (plus the payload object and the custom-op names)
+    to the ``LoweredProgram``, and ``compile``/``load`` reuse it instead of
+    decoding again. A ``LoweredProgram``/``CompiledArtifact`` loaded from disk
+    carries no such attachment (the attributes are never persisted), so it takes
+    this path exactly once.
+    """
+    global _deserialize_count
+    _deserialize_count += 1
+    return ir.deserialize_module(payload)
+
+
+def decode_stats() -> dict:
+    """Return this backend's decode counters, e.g. ``{"deserialize": 1}``.
+
+    TEST SEAM, not a public API for users: it exists so a test can pin "the
+    numpy backend deserializes the module exactly once per in-process
+    pipeline". Reads the module-level counters at CALL time (so it observes a
+    monkeypatched ``_decode_payload`` too); call ``reset_decode_stats()`` first
+    for a clean measurement window.
+    """
+    return {"deserialize": _deserialize_count}
+
+
+def reset_decode_stats() -> None:
+    """Zero the counters reported by ``decode_stats()`` (TEST SEAM)."""
+    global _deserialize_count
+    _deserialize_count = 0
+
+
+def _custom_op_names(module: "Module") -> tuple[str, ...]:
+    """Sorted, deduplicated custom-op names a module requires (ONE walk).
+
+    ``block_call`` BLOCK names plus ``external_call`` KERNEL names — the
+    self-describing ``CompiledArtifact.required_custom_ops`` set. Used only by
+    ``compile``'s deserialize fallback: an in-process program reuses the names
+    the post-inline capability walk already collected (no extra walk, no
+    decode).
+    """
+    block_names = set()
+    external_names = set()
+    for op in iter_ops(module):
+        if op.name == "block_call":
+            block_names.add(op.attributes["block_name"])
+        elif op.name == "external_call":
+            external_names.add(op.attributes["name"])
+    return tuple(sorted(block_names | external_names))
 
 
 def _all_numpy_dtypes() -> frozenset:
@@ -130,12 +196,21 @@ class NumpyBackend(Backend):
            "numpy"`` — portables may themselves emit block calls). A block
            with neither a portable decomposition nor a registered numpy
            impl -> ``core.BackendError`` naming the block — never a silent
-           skip. ``graph.verify()`` again afterwards (defensive, cheap).
-        4. Record the ``Signature`` from the Graph's LIVE attributes
+           skip. ``graph.verify()`` again afterwards ONLY when inlining
+           actually changed the module (see the proof at the call site).
+        4. ONE post-inline capability walk: the kernel-table drift net AND
+           the ``required_custom_ops`` names (``block_call`` block names +
+           ``external_call`` kernel names) that ``compile`` records — never a
+           separate name-scanning pass.
+        5. Record the ``Signature`` from the Graph's LIVE attributes
            (input/output TreeSpec + per-leaf specs + static values) — passed
            down, never re-derived.
-        5. ``payload`` = versioned self-describing
-           ``ir.serialize_module(graph.module)``.
+        6. ``payload`` = versioned self-describing
+           ``ir.serialize_module(graph.module)``; the LIVE module, the payload
+           object and the custom-op names are attached to the returned
+           ``LoweredProgram`` as PRIVATE runtime-only attributes (never
+           dataclass fields, never persisted) so ``compile``/``load`` can skip
+           the deserialize+scan round trip for an in-process program.
 
         Raises ``core.VerificationError`` / ``core.BackendError`` — no silent
         fallbacks or partial semantics.
@@ -143,9 +218,35 @@ class NumpyBackend(Backend):
         graph.verify()  # surfaces core.VerificationError as-is
         kernels.register_all()  # idempotent
         self._check_capabilities(graph.module, check_kernels=False)
-        inline_portables(graph.module, keep_backend_impls="numpy")
-        self._check_capabilities(graph.module, check_kernels=True)
-        graph.verify()  # defensive post-inline verification
+        inline_expansions = inline_portables(
+            graph.module, keep_backend_impls="numpy"
+        )
+        # ONE post-inline capability walk: it runs the kernel-table drift net
+        # AND returns the sorted custom-op names ``compile`` records. The names
+        # are collected from the FINAL module state — exactly what ``compile``
+        # used to rescan after deserializing — and with zero expansions the
+        # post-inline state IS the pre-inline state, so this single walk covers
+        # both cases and adds no ``iter_ops`` pass.
+        required_custom_ops = self._check_capabilities(
+            graph.module, check_kernels=True, collect_names=True
+        )
+        # Defensive post-inline verification — SKIPPED when it is provably
+        # redundant (proof, binding): ``inline_portables`` is the ONLY thing
+        # that mutates ``graph.module`` between the ``graph.verify()`` above and
+        # this point. It is a fixpoint driver whose return value is the number
+        # of expansions it performed, and that counter is incremented only AFTER
+        # ``_next_inline_target`` selects an op to splice (a walk that itself
+        # never touches the module). So a ZERO return means nothing was spliced
+        # and nothing was removed: ``graph.module`` is byte-for-byte the module
+        # already verified above, so re-walking its SSA graph would yield
+        # provably no new information (and ``ir.verify``'s ``_verify_uses`` is
+        # superlinear in use-count — on a large chain the walk is a measurable
+        # share of ``lower``). A NON-ZERO return means the module DID change, so
+        # the defensive verification is kept — semantics are never weakened,
+        # only a provably-redundant walk is dropped. NOTE: nothing below this
+        # point may mutate the module before the serialize below.
+        if inline_expansions:
+            graph.verify()  # defensive post-inline verification (module changed)
 
         main_fn = entry_function(graph.module)
         signature = Signature(
@@ -162,19 +263,32 @@ class NumpyBackend(Backend):
             ),
         )
         payload = ir.serialize_module(graph.module)
-        return LoweredProgram(backend="numpy", signature=signature, payload=payload)
+        lowered = LoweredProgram(backend="numpy", signature=signature, payload=payload)
+        # Private, RUNTIME-ONLY attachments (never declared dataclass fields, so
+        # ``save()`` — which persists only the declared fields — cannot leak
+        # them; the persisted container stays byte-identical). They let
+        # ``compile``/``load`` reuse the module this method just verified and
+        # the names it just collected, instead of deserializing the payload back.
+        # A ``LoweredProgram.load``ed from disk has neither, so it falls back to
+        # the one-deserialize path.
+        lowered._numpy_module = graph.module
+        lowered._numpy_payload = payload
+        lowered._numpy_required_custom_ops = required_custom_ops
+        return lowered
 
     def compile(self, lowered: LoweredProgram, options: dict | None = None) -> CompiledArtifact:
         """Wrap the serialized IR into a self-describing CompiledArtifact.
 
         1. Validate ``lowered.backend == "numpy"`` — mismatch =>
            ``core.BackendError`` (never cross-backend compilation).
-        2. Deserialize + scan the module for ``block_call`` ops (recorded
-           ``required_custom_ops`` BLOCK names) and ``external_call`` ops
-           (recorded EXTERNAL KERNEL names — self-description only; kernels
-           resolve lazily at run time) — sorted, deduplicated; record
-           ``runtime_dependencies`` (self-describing per the serialization
-           contract).
+        2. Determine the custom-op names recorded as ``required_custom_ops``
+           (``block_call`` BLOCK names + ``external_call`` EXTERNAL KERNEL
+           names — sorted, deduplicated; kernels resolve lazily at run time).
+           For an IN-PROCESS program (``lower`` attached its live module and
+           the names it already collected) they are reused as-is: no decode,
+           no rescan. A ``LoweredProgram.load``ed from disk falls back to ONE
+           deserialize + ONE ``iter_ops`` scan. Record ``runtime_dependencies``
+           (self-describing per the serialization contract).
         3. ``target = "cpu"``; ``payload`` = the serialized ``ir.Module``.
            There is NO machine code — the artifact IS serialized IR.
 
@@ -185,20 +299,26 @@ class NumpyBackend(Backend):
                 f"cannot compile a LoweredProgram produced by backend "
                 f"{lowered.backend!r} with the numpy backend"
             )
-        module = ir.deserialize_module(lowered.payload)
-        block_names = {
-            op.attributes["block_name"]
-            for op in iter_ops(module)
-            if op.name == "block_call"
-        }
-        external_names = {
-            op.attributes["name"]
-            for op in iter_ops(module)
-            if op.name == "external_call"
-        }
-        required_custom_ops = tuple(sorted(block_names | external_names))
+        cached_module = getattr(lowered, "_numpy_module", None)
+        if (
+            getattr(lowered, "_numpy_payload", None) is lowered.payload
+            and cached_module is not None
+        ):
+            # In-process program: reuse the module ``lower`` verified and the
+            # names its post-inline capability walk collected.
+            module = cached_module
+            required_custom_ops = getattr(
+                lowered, "_numpy_required_custom_ops", None
+            )
+            if required_custom_ops is None:  # defensive: attached module, no names
+                required_custom_ops = _custom_op_names(module)
+        else:
+            # Disk-loaded program (or a program built by hand): the payload is
+            # the only source of truth — decode it ONCE and scan it ONCE.
+            module = _decode_payload(lowered.payload)
+            required_custom_ops = _custom_op_names(module)
         runtime_dependencies = {"numpy": np.__version__}
-        return CompiledArtifact(
+        artifact = CompiledArtifact(
             backend="numpy",
             signature=lowered.signature,
             target="cpu",
@@ -206,6 +326,12 @@ class NumpyBackend(Backend):
             required_custom_ops=required_custom_ops,
             runtime_dependencies=runtime_dependencies,
         )
+        # Private, RUNTIME-ONLY attachments (never declared fields, never
+        # persisted by ``CompiledArtifact.save``): the module ``load`` must hand
+        # to the interpreter and the exact payload object that identifies it.
+        artifact._numpy_module = module
+        artifact._numpy_payload = lowered.payload
+        return artifact
 
     def load(
         self,
@@ -227,7 +353,9 @@ class NumpyBackend(Backend):
            ``required_custom_ops`` for self-description only — they resolve
            LAZILY at run time (kernels must be re-registered in the process
            before RUN, not before load).
-        4. Build a ``NumpyExecutable``.
+        4. Build a ``NumpyExecutable`` around the module — the SAME object
+           ``compile``/``lower`` already produced in-process (no re-decode for
+           an in-process artifact); a disk-loaded artifact decodes ONCE here.
 
         ``options``: accepted and DELIBERATELY unvalidated/ignored, exactly as
         in ``run`` — a shared option dict forwarded by ``evoxc.build`` carries
@@ -254,7 +382,17 @@ class NumpyBackend(Backend):
                     f"the numpy backend v1 supports CPU devices only, got "
                     f"device kind {device.kind!r}"
                 )
-        module = ir.deserialize_module(artifact.payload)
+        cached_module = getattr(artifact, "_numpy_module", None)
+        if (
+            getattr(artifact, "_numpy_payload", None) is artifact.payload
+            and cached_module is not None
+        ):
+            # In-process artifact: hand the interpreter the exact module
+            # ``lower`` verified — never a fresh decode of the same IR.
+            module = cached_module
+        else:
+            # Disk-loaded artifact: the payload is the only source of truth.
+            module = _decode_payload(artifact.payload)
         block_names = {
             op.attributes["block_name"]
             for op in iter_ops(module)
@@ -285,7 +423,13 @@ class NumpyBackend(Backend):
 
     # ------------------------------------------------------------- internals
 
-    def _check_capabilities(self, module: "Module", *, check_kernels: bool) -> None:
+    def _check_capabilities(
+        self,
+        module: "Module",
+        *,
+        check_kernels: bool,
+        collect_names: bool = False,
+    ) -> tuple[str, ...] | None:
         """Capability drift net over the module's current (live) op set.
 
         - every non-terminator op must have a kernel when ``check_kernels``
@@ -294,8 +438,16 @@ class NumpyBackend(Backend):
         - ``runtime_call``/``block_call``/``collective``-effect ops require
           the matching ``Capabilities`` flag (all True for numpy v1 — the
           flags make future capability changes fail explicitly).
+
+        ``collect_names`` (opt-in) additionally GATHERS, in this same loop, the
+        custom-op names the module requires — ``block_call`` block names and
+        ``external_call`` kernel names — and returns them sorted and
+        deduplicated (``None`` when not collecting). ``lower`` uses it for the
+        ``required_custom_ops`` metadata so no separate ``iter_ops`` pass (and
+        no deserialize in ``compile``) is needed.
         """
         capabilities = self.capabilities
+        names: set | None = set() if collect_names else None
         for op in iter_ops(module):
             if op.is_terminator:
                 continue  # 'return' is special-cased in the interpreter loop
@@ -319,6 +471,12 @@ class NumpyBackend(Backend):
                     f"capability drift: the numpy backend cannot execute "
                     f"collective op '{op.name}'"
                 )
+            if names is not None:
+                if op.name == "block_call":
+                    names.add(op.attributes["block_name"])
+                elif op.name == "external_call":
+                    names.add(op.attributes["name"])
+        return None if names is None else tuple(sorted(names))
 
 def _module_function_names(module: Any) -> tuple[str, ...]:
     """Function names exposed by an ``ir.Module`` (the single access point)."""
@@ -398,6 +556,16 @@ class NumpyExecutable:
         if options:
             rank_context = options.get("rank_context", rank_context)
         return self._interpreter.run(flat_input_tensors, rank_context=rank_context)
+
+    def plan_text(self) -> str:
+        """Render the loaded program's execution plans as text (PURE inspection).
+
+        Delegates to ``Interpreter.plan_text``: the plans are re-derived for
+        display only — NOTHING executes and the interpreter's plan cache is
+        neither read nor populated (a later ``run`` builds its own plans
+        exactly as before).
+        """
+        return self._interpreter.plan_text()
 
     def save(self, path: str | os.PathLike) -> None:
         """Save the underlying CompiledArtifact.

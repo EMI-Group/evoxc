@@ -71,6 +71,7 @@ from typing import Any, Iterator, Tuple
 
 import numpy as np
 
+from evoxc import _inspect
 from evoxc import backends
 from evoxc import core
 from evoxc.backends import CompiledArtifact, LoweredProgram
@@ -83,6 +84,44 @@ from evoxc.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
 __all__ = ["Executable", "BoundExecutable", "lower", "compile", "load", "run",
            "bind", "build", "evaluate"]
+
+
+# ---------------------------------------------------------------------------
+# Inspection helpers (pure rendering lives in `evoxc._inspect`; the registry
+# lookup and the trace-time leaf markers stay here, in the module that owns
+# them — see `_inspect.executable_summary` / `_inspect.tree_summary`)
+# ---------------------------------------------------------------------------
+
+# Trace-time tensor-leaf markers, per direction, handed to `evoxc._inspect` so
+# that module keeps its `core`-only import rule. `_TensorSpecLeaf` /
+# `_SymbolicLeaf` are the trace-built markers, `core.TensorSpec` /
+# `core.SymbolicTensor` the transform-built ones (jvp tangent trees etc.).
+_TENSOR_LEAF_TYPES = ((_TensorSpecLeaf, core.TensorSpec),
+                      (_SymbolicLeaf, core.SymbolicTensor))
+
+
+def _backend_capabilities(backend_name):
+    """Capabilities summary of the REGISTERED backend ``backend_name``, or
+    ``None`` when there is no name, the backend cannot be resolved (a missing
+    optional adapter dependency) or it declares no ``capabilities``.
+
+    Inspection only: reads the registry's backend object and its static
+    ``Capabilities`` declaration — no trace/lower/compile/load, no cache
+    mutation. Resolution goes through ``backends.get`` (so an optional adapter
+    registered under that name resolves exactly as it does for ``lower``); a
+    resolution failure (e.g. a missing optional dependency) is reported as
+    ``None`` because an inspection snapshot must never raise.
+    """
+    if not backend_name:
+        return None
+    try:
+        backend = backends.get(backend_name)
+        capabilities = getattr(backend, "capabilities", None)
+        if capabilities is None:
+            return None
+        return _inspect.capabilities_summary(capabilities)
+    except Exception:  # noqa: BLE001 - inspection must never raise
+        return None
 
 
 class Executable:
@@ -147,6 +186,72 @@ class Executable:
         """Device the executable is bound to (delegates to the backend
         executable)."""
         return self.backend_executable.device
+
+    def __repr__(self) -> str:
+        """One-line inspection line: backend, device, input/output leaf counts.
+
+        E.g. ``<Executable backend=numpy device=cpu:0 inputs=1 outputs=1>``;
+        an unknown backend name or device renders as ``None``. Pure inspection
+        — never runs, traces, compiles, or populates the fast-path caches.
+        Rendering: ``evoxc._inspect.executable_repr``.
+        """
+        return _inspect.executable_repr(
+            backend=self.backend,
+            device=_inspect.backend_device(self.backend_executable),
+            signature=self.signature,
+        )
+
+    def summary(self) -> dict:
+        """JSON-safe inspection snapshot of this loaded executable.
+
+        Pure inspection — reads the wrapper's signature and the backend
+        executable's already-built metadata only; never traces, compiles,
+        loads, runs, or populates a cache. Keys:
+
+        * ``backend`` — backend name (or ``None``).
+        * ``device`` — ``str(device)`` (or ``None``).
+        * ``functions`` — function names exported by the loaded program.
+        * ``input_count`` / ``output_count`` — tensor leaf counts, i.e.
+          ``len(signature.input_specs)`` / ``len(signature.output_specs)``.
+        * ``input_specs`` / ``output_specs`` — one dict
+          ``{"shape": [str(dim), ...], "dtype": str, "device": str | None}``
+          per tensor leaf, in flat leaf order.
+        * ``input_tree`` / ``output_tree`` — the one-line description of the
+          recorded TreeSpec (``None`` when absent): ``core.describe_node``'s
+          wording for containers and static leaves, with tensor leaves
+          rendered as ``tensor input leaf`` / ``tensor output leaf`` /
+          ``tensor leaf`` instead of a private trace marker class name.
+        * ``static_value_count`` — ``len(signature.static_values)``.
+        * ``required_ops`` — the compiled artifact's ``required_custom_ops``
+          (``[]`` when the backend executable exposes no artifact).
+        * ``capabilities`` — the registered backend's ``Capabilities`` as a
+          dict (``dtypes`` as ``"dtype_count"``; other sets as sorted lists),
+          or ``None`` when the backend cannot be resolved.
+
+        A missing signature yields zeroed counts, ``None`` trees and an empty
+        ``input_specs``/``output_specs`` — it never raises.
+        Rendering: ``evoxc._inspect.executable_summary``.
+        """
+        return _inspect.executable_summary(
+            backend=self.backend,
+            device=_inspect.backend_device(self.backend_executable),
+            backend_executable=self.backend_executable,
+            signature=self.signature,
+            capabilities=_backend_capabilities(self.backend),
+            tensor_leaf_types=_TENSOR_LEAF_TYPES,
+        )
+
+    def plan_text(self):
+        """The backend's execution-plan text, or ``None`` when it has none.
+
+        Delegates to the backend executable's optional ``plan_text`` (the numpy
+        interpreter implements it — ``NumpyExecutable.plan_text`` renders the
+        per-block execution plan). Backends without a textual plan return
+        ``None``, exactly like ``CompiledArtifact.source_text()``. Pure
+        inspection: rendering a plan executes nothing, reads no cached plan,
+        and populates none. Rendering: ``evoxc._inspect.plan_text``.
+        """
+        return _inspect.plan_text(self.backend_executable)
 
     def synchronize(self):
         """Wait until all device work submitted by previous ``run()`` calls on
@@ -299,6 +404,66 @@ class BoundExecutable:
     def backend(self):
         """Backend name the wrapped executable runs on (delegates)."""
         return self.executable.backend
+
+    def _reduced_input_specs(self):
+        """Tensor specs a caller must still supply after the bindings, or
+        ``None`` when the cheap derivation is unavailable.
+
+        Derives the REDUCED (unbound) input signature by dropping the bound
+        flat leaf indices — the same pre-order flat leaf indexing
+        ``bind``/``run`` use. Pure inspection: never traces, validates a
+        binding value, or touches a plan; a missing/malformed signature yields
+        ``None`` so callers fall back to the wrapped executable's full
+        signature. Derivation: ``evoxc._inspect.bindings_reduced_input_specs``.
+        """
+        return _inspect.bindings_reduced_input_specs(
+            self.signature, self.bindings, _walk_leaves, _is_tensor_leaf_spec
+        )
+
+    def __repr__(self) -> str:
+        """One-line inspection line: backend, device, remaining input/output
+        leaf counts and the bound-leaf count.
+
+        E.g. ``<BoundExecutable backend=numpy device=cpu:0 inputs=1 outputs=1
+        bound=1>``; ``inputs`` counts the UNBOUND tensor inputs (the ones a
+        caller still passes to ``run``). Pure inspection — never runs, traces,
+        compiles, or populates the fast-path caches.
+        Rendering: ``evoxc._inspect.bound_executable_repr``.
+        """
+        return _inspect.bound_executable_repr(
+            backend=self.backend,
+            device=self.device,
+            signature=self.signature,
+            bound_count=len(self.bindings),
+            reduced_input_specs=self._reduced_input_specs(),
+        )
+
+    def summary(self) -> dict:
+        """JSON-safe inspection snapshot of this bound executable.
+
+        Delegates to the wrapped ``Executable.summary()`` and adds a
+        ``bound_count`` key; the input side is REDUCED to the unbound
+        signature whenever the cheap derivation is available (``input_count``
+        and ``input_specs`` then describe only the inputs a caller still
+        supplies, while ``input_tree`` stays the full recorded tree), and
+        delegated unchanged otherwise. Pure inspection — never runs, traces,
+        compiles, or populates a cache.
+        Rendering: ``evoxc._inspect.bound_executable_summary``.
+        """
+        return _inspect.bound_executable_summary(
+            self.executable.summary(),
+            bound_count=len(self.bindings),
+            reduced_input_specs=self._reduced_input_specs(),
+        )
+
+    def plan_text(self):
+        """The backend's execution-plan text, or ``None`` when it has none.
+
+        Delegates to the wrapped ``Executable.plan_text()`` (backends without a
+        textual plan return ``None``). Pure inspection: executes nothing and
+        populates no plan cache.
+        """
+        return self.executable.plan_text()
 
     def synchronize(self):
         """Wait for all device work submitted by previous ``run`` calls on the
