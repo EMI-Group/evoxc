@@ -553,6 +553,58 @@ pub fn zip3<P: Copy, T: Copy, R: Copy>(
         *slot = f(*p, *x, *y);
     }
 }
+/// Flat unary builder: `out[i] = f(source[i])` over `out_shape`'s elements,
+/// with the result storage built straight from the mapped iterator.
+///
+/// Unlike [`zip1`], this never zero-fills a buffer first: `Vec` collects a
+/// `Map` over a slice with an exact size hint, so the result is allocated once
+/// and written once.  Elementwise kernels that produce a fresh result use
+/// these; the in-place `zip*` helpers stay for kernels that already own the
+/// memory they write into.  The `Buffer::new` validation is defensive (a
+/// caller gates on [`Buffer::is_flat_for`], so the element count and the dtype
+/// already agree) and keeps a short or long operand an explicit error rather
+/// than a silently truncated result.
+pub fn map1<T: Copy, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    source: &[T],
+    f: impl Fn(T) -> R,
+) -> Result<Buffer> {
+    let values: Vec<R> = source.iter().map(|value| f(*value)).collect();
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
+/// Flat binary builder: `out[i] = f(left[i], right[i])` (see [`map1`]).
+pub fn map2<T: Copy, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    left: &[T],
+    right: &[T],
+    f: impl Fn(T, T) -> R,
+) -> Result<Buffer> {
+    let values: Vec<R> = left.iter().zip(right.iter()).map(|(x, y)| f(*x, *y)).collect();
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
+/// Flat ternary builder: `out[i] = f(first[i], second[i], third[i])` -- the
+/// `select` shape (see [`map1`]).
+pub fn map3<P: Copy, T: Copy, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    first: &[P],
+    second: &[T],
+    third: &[T],
+    f: impl Fn(P, T, T) -> R,
+) -> Result<Buffer> {
+    let values: Vec<R> = first
+        .iter()
+        .zip(second.iter())
+        .zip(third.iter())
+        .map(|((p, x), y)| f(*p, *x, *y))
+        .collect();
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
 fn block_error(op: &str) -> Error {
     Error::verification(format!(
         "op '{op}': a block copy reads outside the operand (internal engine error)"
@@ -686,5 +738,28 @@ mod tests {
         let scalar = Buffer::new(DType::Int32, vec![], Storage::I32(vec![7])).unwrap();
         let out = broadcast_to(&scalar, &[2, 2]).unwrap();
         assert_eq!(out.storage, Storage::I32(vec![7, 7, 7, 7]));
+    }
+
+    #[test]
+    fn map_builders_skip_the_zero_fill_and_validate() {
+        let left = [1.0f32, -2.0, 3.0];
+        let right = [2.0f32, 2.0, 0.5];
+        let unary = map1(DType::Float32, &[3], &left, |value| value * 2.0).unwrap();
+        assert_eq!(unary.storage, Storage::F32(vec![2.0, -4.0, 6.0]));
+        assert_eq!(unary.shape, vec![3]);
+        let binary = map2(DType::Float32, &[3], &left, &right, |a, b| a + b).unwrap();
+        assert_eq!(binary.storage, Storage::F32(vec![3.0, 0.0, 3.5]));
+        let mask = [true, false, true];
+        let ternary =
+            map3(DType::Float32, &[3], &mask, &left, &right, |pick, a, b| if pick { a } else { b })
+                .unwrap();
+        assert_eq!(ternary.storage, Storage::F32(vec![1.0, 2.0, 3.0]));
+
+        // The shape is authoritative: a short or long operand is an explicit
+        // error instead of a silently truncated result.
+        assert!(map1(DType::Float32, &[4], &left, |value| value).is_err());
+        assert!(map2(DType::Float32, &[2], &left, &right, |a, b| a + b).is_err());
+        // And a dtype that disagrees with the value type is rejected there too.
+        assert!(map1(DType::Float64, &[3], &left, |value| value).is_err());
     }
 }
