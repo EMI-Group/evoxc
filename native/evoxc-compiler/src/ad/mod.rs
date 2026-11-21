@@ -557,11 +557,22 @@ mod tests {
         fn call(&self, request: &ExtensionRequest) -> Result<Option<ExtensionResponse>> {
             assert_eq!(request.kind, ExtensionKind::Jvp);
             assert_eq!(request.tangents, Some(vec![true]));
-            // subgraph: (x, y_proxy) -> return add(x, x)
+            let tangents = request
+                .tangent_values
+                .as_ref()
+                .expect("jvp carries tangent_values");
+            assert_eq!(tangents.len(), 1);
+            assert!(tangents[0].is_some());
+            // subgraph: (x, y_proxy, dx) -> return add(x, x)
+            // block args are operands, result proxies, then the dual values
             let mut sub = Builder::new("rule");
             sub.open_function(
                 "rule",
-                &[request.operand_types[0].clone(), request.result_types[0].clone()],
+                &[
+                    request.operand_types[0].clone(),
+                    request.result_types[0].clone(),
+                    request.operand_types[0].clone(),
+                ],
             )
             .unwrap();
             let args = sub.block_arguments().unwrap();

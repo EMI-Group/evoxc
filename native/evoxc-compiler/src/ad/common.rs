@@ -6,8 +6,6 @@
 //! `_sum_terms`, `_reduce_leading`, `_reduce_to_operand` and `_expand_reduced`
 //! from `evoxc/transforms/autodiff.py` + `evoxc/transforms/rules.py`.
 
-use std::collections::HashMap;
-
 use evoxc_core::dim::Dim;
 use evoxc_core::error::Result;
 use evoxc_core::graph::ValueId;
@@ -15,6 +13,59 @@ use evoxc_core::graph::ValueId;
 use super::Dual;
 use crate::builder::Builder;
 use crate::emit::RuleCtx;
+
+/// A dense SSA-value-id-indexed slot table.
+///
+/// Value ids are module-unique and handed out densely, so a `Vec<Option<T>>`
+/// keyed by the id is both smaller and faster than a `HashMap` on the
+/// per-op sweep path: one indexed load, no hashing, no rehash.  The table
+/// grows on demand, so it also works for the builder's fresh output ids.
+#[derive(Debug, Clone, Default)]
+pub struct Slots<T> {
+    slots: Vec<Option<T>>,
+}
+
+impl<T> Slots<T> {
+    /// An empty table with room for `hint` ids.
+    pub fn with_capacity(hint: usize) -> Slots<T> {
+        Slots {
+            slots: Vec::with_capacity(hint),
+        }
+    }
+
+    /// The slot of `id`, if set.
+    #[inline]
+    pub fn get(&self, id: ValueId) -> Option<&T> {
+        self.slots.get(id.index()).and_then(|slot| slot.as_ref())
+    }
+
+    /// The slot of `id`, if set (mutable).
+    #[inline]
+    pub fn get_mut(&mut self, id: ValueId) -> Option<&mut T> {
+        self.slots.get_mut(id.index()).and_then(|slot| slot.as_mut())
+    }
+
+    /// Store `value` at `id`, growing the table as needed.
+    #[inline]
+    pub fn set(&mut self, id: ValueId, value: T) {
+        let index = id.index();
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        self.slots[index] = Some(value);
+    }
+}
+
+impl<T: Copy> Slots<T> {
+    /// The slot of `id` copied out, if set.
+    #[inline]
+    pub fn copied(&self, id: ValueId) -> Option<T> {
+        self.slots
+            .get(id.index())
+            .and_then(|slot| slot.as_ref())
+            .copied()
+    }
+}
 
 /// An all-zeros tensor with `value`'s exact shape and dtype.
 ///
@@ -67,17 +118,17 @@ pub fn combine(builder: &mut Builder, terms: &[ValueId]) -> Result<ValueId> {
 /// Accumulate `cotangent` into `env` under `value` (multiply-used values add).
 pub fn accumulate(
     builder: &mut Builder,
-    env: &mut HashMap<ValueId, Dual>,
+    env: &mut Slots<Dual>,
     value: ValueId,
     cotangent: ValueId,
 ) -> Result<()> {
-    match env.get(&value).copied() {
+    match env.copied(value) {
         None | Some(Dual::ZeroTangent) => {
-            env.insert(value, Dual::Value(cotangent));
+            env.set(value, Dual::Value(cotangent));
         }
         Some(Dual::Value(existing)) => {
             let total = builder.binary("add", existing, cotangent)?;
-            env.insert(value, Dual::Value(total));
+            env.set(value, Dual::Value(total));
         }
     }
     Ok(())
@@ -187,14 +238,28 @@ mod tests {
         assert_eq!(ctx.shape(total).unwrap(), dims_i64(&[2, 3]));
         assert!(sum_terms(&mut ctx, &[]).is_err());
 
-        let mut env: HashMap<ValueId, Dual> = HashMap::new();
+        let mut env: Slots<Dual> = Slots::with_capacity(4);
         accumulate(ctx.builder, &mut env, args[0], zeros).unwrap();
-        assert_eq!(env[&args[0]], Dual::Value(zeros));
+        assert_eq!(env.copied(args[0]), Some(Dual::Value(zeros)));
         accumulate(ctx.builder, &mut env, args[0], zeros).unwrap();
-        assert!(matches!(env[&args[0]], Dual::Value(value) if value != zeros));
+        assert!(matches!(env.copied(args[0]), Some(Dual::Value(value)) if value != zeros));
+        assert_eq!(env.copied(ValueId(99)), None);
         let combined = combine(ctx.builder, &[zeros, zeros]).unwrap();
         assert_eq!(ctx.rank(combined).unwrap(), 2);
         assert!(combine(ctx.builder, &[]).is_err());
+    }
+
+    #[test]
+    fn slots_grow_and_index_by_value_id() {
+        let mut slots: Slots<u32> = Slots::with_capacity(1);
+        assert_eq!(slots.copied(ValueId(3)), None);
+        slots.set(ValueId(3), 30);
+        slots.set(ValueId(0), 1);
+        assert_eq!(slots.copied(ValueId(3)), Some(30));
+        assert_eq!(slots.copied(ValueId(0)), Some(1));
+        assert_eq!(slots.copied(ValueId(1)), None);
+        *slots.get_mut(ValueId(3)).unwrap() = 31;
+        assert_eq!(slots.get(ValueId(3)), Some(&31));
     }
 
     #[test]

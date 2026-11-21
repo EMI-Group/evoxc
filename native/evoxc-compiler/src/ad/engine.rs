@@ -8,7 +8,7 @@
 //! the module path exposes (`forward_sweep`, `reverse_sweep`, `dispatch_jvp`,
 //! `dispatch_vjp`, the missing-rule errors and their message helpers).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use evoxc_core::error::{Error, Result};
 use evoxc_core::graph::{Op as IrOp, Program, ValueId};
@@ -103,13 +103,17 @@ fn sweep(
             }
         }
     }
+    // The explicit tangent/cotangent block arguments are typed in SELECTOR
+    // order: `extra_inputs[k]` (validated in range and unique) is the source
+    // value whose type position `k` carries.  `positions` maps the source
+    // index back to its position for the seeding lookups below.
     let extra_types: Vec<ValueType> = match mode {
-        Mode::Jvp => positions
-            .keys()
+        Mode::Jvp => extra_inputs
+            .iter()
             .map(|index| primal_types[*index].clone())
             .collect(),
-        Mode::Vjp => positions
-            .keys()
+        Mode::Vjp => extra_inputs
+            .iter()
             .map(|index| output_types[*index].clone())
             .collect(),
     };
@@ -121,16 +125,18 @@ fn sweep(
     let primal_count = primal_types.len();
     let (primal_args, extra_args) = new_args.split_at(primal_count);
 
-    let mut value_env: HashMap<ValueId, ValueId> = HashMap::new();
-    let mut dual_env: HashMap<ValueId, Dual> = HashMap::new();
+    let source_values = program.values.max_id().map_or(0, |id| id as usize + 1);
+    let mut value_env: common::Slots<ValueId> =
+        common::Slots::with_capacity(source_values);
+    let mut dual_env: common::Slots<Dual> = common::Slots::with_capacity(source_values * 3);
     for (old, new) in block.arguments.iter().zip(primal_args) {
-        value_env.insert(*old, *new);
+        value_env.set(*old, *new);
     }
     if mode == Mode::Jvp {
         for (index, arg) in primal_args.iter().enumerate() {
             match positions.get(&index) {
-                Some(position) => dual_env.insert(*arg, Dual::Value(extra_args[*position])),
-                None => dual_env.insert(*arg, Dual::ZeroTangent),
+                Some(position) => dual_env.set(*arg, Dual::Value(extra_args[*position])),
+                None => dual_env.set(*arg, Dual::ZeroTangent),
             };
         }
     }
@@ -149,7 +155,7 @@ fn sweep(
         }
         let mut operands = Vec::with_capacity(op.operands.len());
         for operand in &op.operands {
-            let rewritten = value_env.get(operand).copied().ok_or_else(|| {
+            let rewritten = value_env.get(*operand).copied().ok_or_else(|| {
                 Error::transform(format!(
                     "{}: op '{}' reads value %{operand}, which the sweep has not rewritten",
                     mode.name(),
@@ -158,6 +164,10 @@ fn sweep(
             })?;
             operands.push(rewritten);
         }
+        // The sweep never changes a value's type, so the source types ARE the
+        // rebuilt ones: read them from the source program once and reuse them
+        // for both `emit` and the rule op instead of re-reading the builder.
+        let operand_types = program.operand_types(op)?;
         let result_types = op
             .results
             .iter()
@@ -171,13 +181,13 @@ fn sweep(
             op.location.clone(),
         )?;
         for (old, new) in op.results.iter().zip(&new_results) {
-            value_env.insert(*old, *new);
+            value_env.set(*old, *new);
         }
-        let rule_op = captured(&builder, &op.name, &op.attributes, operands, new_results, op.location.clone())?;
+        let rule_op = captured(op, operand_types, result_types, operands, new_results);
         if mode == Mode::Jvp {
             if is_constant {
                 for result in &rule_op.results {
-                    dual_env.insert(*result, Dual::ZeroTangent);
+                    dual_env.set(*result, Dual::ZeroTangent);
                 }
             } else {
                 let tangents: Vec<Dual> = op
@@ -185,8 +195,8 @@ fn sweep(
                     .iter()
                     .map(|old| {
                         value_env
-                            .get(old)
-                            .and_then(|new| dual_env.get(new).copied())
+                            .copied(*old)
+                            .and_then(|new| dual_env.copied(new))
                             .unwrap_or(Dual::ZeroTangent)
                     })
                     .collect();
@@ -200,7 +210,7 @@ fn sweep(
                     )));
                 }
                 for (result, dual) in rule_op.results.iter().zip(out) {
-                    dual_env.insert(*result, dual);
+                    dual_env.set(*result, dual);
                 }
             }
         } else {
@@ -211,7 +221,7 @@ fn sweep(
     let primal_outputs: Vec<ValueId> = output_ids
         .iter()
         .map(|old| {
-            value_env.get(old).copied().ok_or_else(|| {
+            value_env.copied(*old).ok_or_else(|| {
                 Error::transform(format!(
                     "{}: return operand %{old} was not rewritten by the sweep",
                     mode.name()
@@ -224,7 +234,7 @@ fn sweep(
         for (index, new) in primal_outputs.iter().enumerate() {
             match positions.get(&index) {
                 Some(position) => {
-                    dual_env.insert(*new, Dual::Value(extra_args[*position]));
+                    dual_env.set(*new, Dual::Value(extra_args[*position]));
                 }
                 None => {
                     // Validated before the rebuild: an unseeded output is scalar.
@@ -233,7 +243,7 @@ fn sweep(
                         let mut ctx = RuleCtx::new(&mut builder);
                         ctx.scalar(ty.dtype, 1.0)?
                     };
-                    dual_env.insert(*new, Dual::Value(one));
+                    dual_env.set(*new, Dual::Value(one));
                 }
             }
         }
@@ -244,7 +254,7 @@ fn sweep(
             let cotangents: Vec<Dual> = rule_op
                 .results
                 .iter()
-                .map(|id| dual_env.get(id).copied().unwrap_or(Dual::ZeroTangent))
+                .map(|id| dual_env.copied(*id).unwrap_or(Dual::ZeroTangent))
                 .collect();
             let in_cotangents =
                 dispatch_vjp(env, &mut RuleCtx::new(&mut builder), rule_op, &cotangents)?;
@@ -270,7 +280,7 @@ fn sweep(
     };
     let mut extras = Vec::with_capacity(seeds.len());
     for value in seeds {
-        let dual = dual_env.get(value).copied().unwrap_or(Dual::ZeroTangent);
+        let dual = dual_env.copied(*value).unwrap_or(Dual::ZeroTangent);
         extras.push(common::materialize(
             &mut RuleCtx::new(&mut builder),
             dual,
@@ -314,36 +324,31 @@ fn index_positions(
     Ok(positions)
 }
 
-/// Capture an op of the output module as a [`RuleOp`] (original types equal the
-/// rebuilt ones — the sweep never changes a value's type).
+/// Capture a rebuilt op as a [`RuleOp`].
+///
+/// The sweep never changes a value's type, so the SOURCE op's operand/result
+/// types (cloned from the source program by the caller) are also the rebuilt
+/// ones.  Passing them in avoids re-reading and re-cloning every type from the
+/// builder; the `original_*` and live lists are two copies of the same data
+/// because the rule API owns both.
 fn captured(
-    builder: &Builder,
-    name: &str,
-    attributes: &evoxc_core::attr::Attrs,
+    source: &IrOp,
+    operand_types: Vec<ValueType>,
+    result_types: Vec<ValueType>,
     operands: Vec<ValueId>,
     results: Vec<ValueId>,
-    location: Option<evoxc_core::graph::Location>,
-) -> Result<RuleOp> {
-    let program = builder.program();
-    let operand_types = operands
-        .iter()
-        .map(|id| Ok(program.value(*id)?.ty.clone()))
-        .collect::<Result<Vec<_>>>()?;
-    let result_types = results
-        .iter()
-        .map(|id| Ok(program.value(*id)?.ty.clone()))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RuleOp {
-        name: name.to_string(),
-        attributes: attributes.clone(),
+) -> RuleOp {
+    RuleOp {
+        name: source.name.clone(),
+        attributes: source.attributes.clone(),
         original_operand_types: operand_types.clone(),
-        original_result_types: result_types.clone(),
-        operands,
         operand_types,
-        results,
+        original_result_types: result_types.clone(),
         result_types,
-        location,
-    })
+        operands,
+        results,
+        location: source.location.clone(),
+    }
 }
 
 /// Capture an already-emitted op of `program` as a [`RuleOp`].
@@ -478,7 +483,10 @@ fn jvp_from_vjp(
         .get(&key)
         .ok_or_else(|| missing_vjp_error(&key))?;
     let cotangents: Vec<Dual> = op.results.iter().map(|id| Dual::Value(*id)).collect();
-    let before = ctx.builder.block_op_ids()?.len();
+    // Record the emitted range by LENGTH, not by cloning the block's whole op
+    // list: the rule appends to the open block, so everything from `before` on
+    // is the derivative subgraph.
+    let before = ctx.builder.program().block(ctx.builder.block())?.ops.len();
     let seeds = rule(ctx, op, &cotangents)?;
     if seeds.len() != op.operands.len() {
         return Err(Error::transform(format!(
@@ -487,48 +495,52 @@ fn jvp_from_vjp(
             op.operands.len()
         )));
     }
-    let op_ids = ctx.builder.block_op_ids()?;
-    let emitted = &op_ids[before..];
-    let mut emitted_ops: Vec<RuleOp> = Vec::with_capacity(emitted.len());
-    let mut on_password = HashSet::new();
+    let mut emitted_ops: Vec<RuleOp> = Vec::new();
+    let mut on_password: common::Slots<bool> = common::Slots::with_capacity(2 * op.results.len());
     for id in op.results.iter() {
-        on_password.insert(*id);
+        on_password.set(*id, true);
     }
-    for op_id in emitted {
-        let ir_op = ctx.builder.program().op(*op_id)?;
-        let recorded = captured_ir(ctx.builder.program(), ir_op)?;
-        if recorded
-            .operands
-            .iter()
-            .any(|operand| on_password.contains(operand))
-        {
-            for result in &recorded.results {
-                on_password.insert(*result);
+    {
+        // Borrow the appended ids in place — no copy of the (growing) op list.
+        let program = ctx.builder.program();
+        let block = program.block(ctx.builder.block())?;
+        let emitted = &block.ops[before..];
+        emitted_ops.reserve(emitted.len());
+        for op_id in emitted {
+            let ir_op = program.op(*op_id)?;
+            let recorded = captured_ir(program, ir_op)?;
+            if recorded
+                .operands
+                .iter()
+                .any(|operand| on_password.copied(*operand).unwrap_or(false))
+            {
+                for result in &recorded.results {
+                    on_password.set(*result, true);
+                }
             }
+            emitted_ops.push(recorded);
         }
-        emitted_ops.push(recorded);
     }
 
-    let mut acc: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    let mut acc: common::Slots<Vec<ValueId>> = common::Slots::with_capacity(emitted_ops.len());
     for (seed, tangent) in seeds.iter().zip(tangents) {
         if let (Dual::Value(seed), Dual::Value(tangent)) = (seed, tangent) {
-            acc.entry(*seed).or_default().push(*tangent);
+            push_term(&mut acc, *seed, *tangent);
         }
     }
     for recorded in emitted_ops.iter().rev() {
         if recorded.name == "constant" {
             continue;
         }
-        if !recorded
-            .results
-            .iter()
-            .any(|result| acc.get(result).is_some_and(|terms| !terms.is_empty()))
-        {
+        if !recorded.results.iter().any(|result| {
+            acc.get(*result)
+                .is_some_and(|terms| !terms.is_empty())
+        }) {
             continue;
         }
         let mut per_result = Vec::with_capacity(recorded.results.len());
         for result in &recorded.results {
-            match acc.get(result) {
+            match acc.get(*result) {
                 Some(terms) if !terms.is_empty() => {
                     per_result.push(Dual::Value(common::combine(ctx.builder, terms)?))
                 }
@@ -551,21 +563,29 @@ fn jvp_from_vjp(
         }
         for (operand, cotangent) in recorded.operands.iter().zip(in_cotangents) {
             if let Dual::Value(value) = cotangent {
-                if on_password.contains(operand) {
-                    acc.entry(*operand).or_default().push(value);
+                if on_password.copied(*operand).unwrap_or(false) {
+                    push_term(&mut acc, *operand, value);
                 }
             }
         }
     }
     op.results
         .iter()
-        .map(|result| match acc.get(result) {
+        .map(|result| match acc.get(*result) {
             Some(terms) if !terms.is_empty() => {
                 Ok(Dual::Value(common::combine(ctx.builder, terms)?))
             }
             _ => Ok(Dual::ZeroTangent),
         })
         .collect()
+}
+
+/// Push one cotangent term onto `acc[value]` (append into the dense slot).
+fn push_term(acc: &mut common::Slots<Vec<ValueId>>, value: ValueId, term: ValueId) {
+    match acc.get_mut(value) {
+        Some(terms) => terms.push(term),
+        None => acc.set(value, vec![term]),
+    }
 }
 
 fn extension_derivative(
@@ -580,8 +600,14 @@ fn extension_derivative(
     };
     let mut request = ExtensionRequest::new(kind, op);
     request = match kind {
-        ExtensionKind::Jvp => request.with_tangents(duals),
-        ExtensionKind::Vjp => request.with_cotangent_type(op.result_types.first()),
+        // JVP: the per-operand tangent flags plus the tangent SSA values
+        // themselves, in operand order (`None` = zero tangent).
+        ExtensionKind::Jvp => request.with_tangents(duals).with_tangent_values(duals),
+        // VJP: the cotangent type plus the per-result cotangent SSA values, in
+        // result order (`None` = zero cotangent).
+        ExtensionKind::Vjp => request
+            .with_cotangent_type(op.result_types.first())
+            .with_cotangent_values(duals),
         ExtensionKind::Batching => request,
     };
     let Some(response) = extension.call(&request)? else {
@@ -599,7 +625,7 @@ fn extension_derivative(
             response.output_ids.len()
         )));
     }
-    let arguments = extension_arguments(op, kind)?;
+    let arguments = extension_arguments(op, kind, duals)?;
     let module = evoxc_core::envelope::decode(&response.module)?;
     let mapping = ctx
         .builder
@@ -620,15 +646,25 @@ fn extension_derivative(
     Ok(Some(values.into_iter().map(Dual::Value).collect()))
 }
 
-fn extension_arguments(op: &RuleOp, kind: ExtensionKind) -> Result<Vec<ValueId>> {
+/// The block arguments the extension subgraph is inlined with.
+///
+/// Order: the rewritten operands, then one proxy per rewritten result, then —
+/// for JVP/VJP — the `Some` tangent/cotangent SSA values in list order (the
+/// zero slots carry no argument).  That trailing block is exactly the
+/// `tangent_values` / `cotangent_values` the request carried.
+fn extension_arguments(
+    op: &RuleOp,
+    kind: ExtensionKind,
+    duals: &[Dual],
+) -> Result<Vec<ValueId>> {
     match kind {
         // A batching subgraph receives the rewritten operands only — there are
-        // no rewritten results yet.
+        // no rewritten results or duals.
         ExtensionKind::Batching => Ok(op.operands.clone()),
-        // JVP/VJP subgraphs receive the operands followed by a proxy per result.
         ExtensionKind::Jvp | ExtensionKind::Vjp => {
             let mut arguments = op.operands.clone();
             arguments.extend(op.results.iter().copied());
+            arguments.extend(duals.iter().filter_map(|dual| dual.value()));
             Ok(arguments)
         }
     }
@@ -685,3 +721,223 @@ fn capitalize(text: &str) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Builder;
+    use crate::{ExtensionResponse, ExtensionRule, Registry};
+    use evoxc_core::attr::{AttrValue, Attrs};
+    use evoxc_core::dim::Dim;
+    use evoxc_core::dtype::DType;
+    use evoxc_core::envelope;
+    use evoxc_core::value_type::ValueType;
+    use serde_json::json;
+
+    fn f32_ty(shape: &[i64]) -> ValueType {
+        ValueType::of(
+            DType::parse("float32").unwrap(),
+            shape.iter().map(|dim| Dim::Int(*dim)),
+        )
+    }
+
+    /// The rebuilt function's block-argument types, in order.
+    fn argument_types(out: &TransformOutput) -> Vec<ValueType> {
+        out.input_ids
+            .iter()
+            .map(|id| out.program.value(*id).unwrap().ty.clone())
+            .collect()
+    }
+
+    /// `(a: f32[2], b: f32[3, 4], c: f32[5]) -> c` — no body ops.
+    fn three_input_program() -> Program {
+        let types = [f32_ty(&[2]), f32_ty(&[3, 4]), f32_ty(&[5])];
+        let mut builder = Builder::new("main");
+        builder.open_function("main", &types).unwrap();
+        let args = builder.block_arguments().unwrap();
+        builder.set_terminator(&[args[2]], None).unwrap();
+        builder.finish()
+    }
+
+    /// `(a: f32[2], b: f32[3, 4], c: f32[5]) -> (c, a, b)` — no body ops.
+    fn three_output_program() -> Program {
+        let types = [f32_ty(&[2]), f32_ty(&[3, 4]), f32_ty(&[5])];
+        let mut builder = Builder::new("main");
+        builder.open_function("main", &types).unwrap();
+        let args = builder.block_arguments().unwrap();
+        builder.set_terminator(&[args[2], args[0], args[1]], None).unwrap();
+        builder.finish()
+    }
+
+    #[test]
+    fn jvp_extra_arguments_follow_selector_order() {
+        let program = three_input_program();
+        let env = TransformEnv::builtin();
+        let primals = [f32_ty(&[2]), f32_ty(&[3, 4]), f32_ty(&[5])];
+        // selector [2, 0, 1] → the extras are typed c, a, b — NOT map order.
+        let expected: Vec<ValueType> = primals
+            .iter()
+            .cloned()
+            .chain([primals[2].clone(), primals[0].clone(), primals[1].clone()])
+            .collect();
+        for attempt in 0..50 {
+            let out = forward_sweep(&program, &[2, 0, 1], &env).unwrap();
+            assert_eq!(attempt_types(&out, &expected), expected, "attempt {attempt}");
+            assert_eq!(out.output_ids.len(), 2);
+        }
+    }
+
+    #[test]
+    fn vjp_extra_arguments_follow_selector_order() {
+        let program = three_output_program();
+        let env = TransformEnv::builtin();
+        let primals = [f32_ty(&[2]), f32_ty(&[3, 4]), f32_ty(&[5])];
+        let outputs = [f32_ty(&[5]), f32_ty(&[2]), f32_ty(&[3, 4])];
+        // selector [2, 0, 1] → the extras are typed output[2], output[0], output[1].
+        let expected: Vec<ValueType> = primals
+            .iter()
+            .cloned()
+            .chain([outputs[2].clone(), outputs[0].clone(), outputs[1].clone()])
+            .collect();
+        for attempt in 0..50 {
+            let out = reverse_sweep(&program, &[2, 0, 1], &env).unwrap();
+            assert_eq!(attempt_types(&out, &expected), expected, "attempt {attempt}");
+            // 3 primal outputs + one cotangent per input
+            assert_eq!(out.output_ids.len(), 6);
+        }
+    }
+
+
+    fn attempt_types(out: &TransformOutput, expected: &[ValueType]) -> Vec<ValueType> {
+        assert_eq!(out.input_ids.len(), expected.len());
+        argument_types(out)
+    }
+
+    /// Serves one JVP or VJP rule, asserting the request carries the dual SSA
+    /// values and that the subgraph's trailing block arguments bind them.
+    struct DualExtension {
+        kind: ExtensionKind,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ExtensionRule for DualExtension {
+        fn call(&self, request: &ExtensionRequest) -> Result<Option<ExtensionResponse>> {
+            self.calls.set(self.calls.get() + 1);
+            assert_eq!(request.kind, self.kind);
+            let (values, types) = match self.kind {
+                ExtensionKind::Jvp => {
+                    assert!(request.cotangent_values.is_none());
+                    // one entry per OPERAND, in operand order
+                    (
+                        request
+                            .tangent_values
+                            .as_ref()
+                            .expect("jvp carries tangent_values")
+                            .clone(),
+                        request.operand_types.clone(),
+                    )
+                }
+                ExtensionKind::Vjp => {
+                    assert!(request.tangent_values.is_none());
+                    // one entry per RESULT, in result order
+                    (
+                        request
+                            .cotangent_values
+                            .as_ref()
+                            .expect("vjp carries cotangent_values")
+                            .clone(),
+                        request.result_types.clone(),
+                    )
+                }
+                ExtensionKind::Batching => panic!("batching is not served here"),
+            };
+            assert_eq!(values.len(), types.len());
+            // Each `Some` dual is a real SSA value; a `None` is the zero slot.
+            assert!(values[0].is_some());
+            for (index, value) in values.iter().enumerate() {
+                assert_eq!(value.is_some(), index == 0, "unexpected dual slot {index}");
+            }
+
+            // Subgraph block args: operands, result proxies, then the Some
+            // duals in list order.
+            let mut arg_types = request.operand_types.clone();
+            arg_types.extend(request.result_types.iter().cloned());
+            let dual_types: Vec<ValueType> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| value.map(|_| types[index].clone()))
+                .collect();
+            arg_types.extend(dual_types);
+            let mut sub = Builder::new("rule");
+            sub.open_function("rule", &arg_types).unwrap();
+            let args = sub.block_arguments().unwrap();
+            let dual = *args.last().unwrap();
+            assert_eq!(sub.value_type(dual).unwrap(), types[0]);
+            sub.set_terminator(&[dual], None).unwrap();
+            let program = sub.finish();
+            Ok(Some(ExtensionResponse::new(
+                envelope::encode(&program),
+                program.functions[0].name.clone(),
+                vec![dual],
+            )))
+        }
+    }
+
+    fn external_call_program(operands: usize) -> Program {
+        let types = vec![f32_ty(&[3]); operands];
+        let mut builder = Builder::new("main");
+        builder.open_function("main", &types).unwrap();
+        let args = builder.block_arguments().unwrap();
+        let called = builder
+            .emit(
+                "external_call",
+                &args,
+                &Attrs::from_pairs([
+                    ("name", AttrValue::Str("opaque".into())),
+                    ("result_specs", AttrValue::Any(json!([]))),
+                ]),
+                Some(&[f32_ty(&[3])]),
+                None,
+            )
+            .unwrap()[0];
+        builder.set_terminator(&[called], None).unwrap();
+        builder.finish()
+    }
+
+    #[test]
+    fn jvp_extension_receives_and_binds_tangent_values() {
+        let program = external_call_program(2);
+        let registry = Registry::default();
+        let extension = DualExtension {
+            kind: ExtensionKind::Jvp,
+            calls: std::cell::Cell::new(0),
+        };
+        let env = TransformEnv::with_registry(&registry).with_extension(&extension);
+        // only input 0 gets an explicit tangent → operand 0 has a value, operand 1 none
+        let out = forward_sweep(&program, &[0], &env).unwrap();
+        assert_eq!(extension.calls.get(), 1);
+        assert_eq!(out.input_ids.len(), 3);
+        // the spliced tangent is the explicit tangent block argument itself
+        assert_eq!(out.output_ids[1], out.input_ids[2]);
+        assert_eq!(out.program.value(out.output_ids[1]).unwrap().ty, f32_ty(&[3]));
+        // the extension subgraph contributes no op: external_call + return
+        assert_eq!(out.program.block(entry_function(&out.program).unwrap().body.entry().unwrap()).unwrap().ops.len(), 2);
+    }
+
+    #[test]
+    fn vjp_extension_receives_and_binds_cotangent_values() {
+        let program = external_call_program(1);
+        let registry = Registry::default();
+        let extension = DualExtension {
+            kind: ExtensionKind::Vjp,
+            calls: std::cell::Cell::new(0),
+        };
+        let env = TransformEnv::with_registry(&registry).with_extension(&extension);
+        let out = reverse_sweep(&program, &[0], &env).unwrap();
+        assert_eq!(extension.calls.get(), 1);
+        assert_eq!(out.input_ids.len(), 2);
+        // the spliced cotangent is the explicit cotangent block argument
+        assert_eq!(out.output_ids[1], out.input_ids[1]);
+        assert_eq!(out.program.value(out.output_ids[1]).unwrap().ty, f32_ty(&[3]));
+    }
+}

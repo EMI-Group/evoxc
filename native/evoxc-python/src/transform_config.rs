@@ -275,6 +275,32 @@ pub fn request_to_json(request: &ExtensionRequest) -> Json {
             None => Json::Null,
         },
     );
+    // The dual SSA values are kind-specific: the key is present only when the
+    // request carries that kind's list (JVP → `tangent_values`, VJP →
+    // `cotangent_values`), so a batching request and the other AD kind leave
+    // the key out entirely.
+    if let Some(entries) = &request.tangent_values {
+        map.insert(
+            "tangent_values".to_string(),
+            Json::Array(
+                entries
+                    .iter()
+                    .map(|value| value.map_or(Json::Null, |id| Json::from(id.0)))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(entries) = &request.cotangent_values {
+        map.insert(
+            "cotangent_values".to_string(),
+            Json::Array(
+                entries
+                    .iter()
+                    .map(|value| value.map_or(Json::Null, |id| Json::from(id.0)))
+                    .collect(),
+            ),
+        );
+    }
     Json::Object(map)
 }
 
@@ -394,7 +420,7 @@ fn response_error(op_name: &str, field: &str, detail: impl std::fmt::Display) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evoxc_compiler::{ExtensionKind, ExtensionRequest};
+    use evoxc_compiler::{Dual, ExtensionKind, ExtensionRequest};
     use evoxc_core::attr::Attrs;
     use evoxc_core::dtype::DType;
     use evoxc_core::value_type::ValueType;
@@ -518,6 +544,49 @@ mod tests {
         assert_eq!(encoded["cotangent_type"], Json::Null);
         assert_eq!(encoded["operand_types"].as_array().unwrap().len(), 2);
         assert_eq!(encoded["attributes"]["block_name"], json!("foo"));
+    }
+
+    #[test]
+    fn request_json_carries_the_dual_values_of_its_kind_only() {
+        let rule_op = evoxc_compiler::RuleOp {
+            name: "block_call".to_string(),
+            attributes: {
+                let mut attrs = Attrs::new();
+                attrs.insert("block_name", evoxc_core::attr::AttrValue::Str("foo".to_string()));
+                attrs
+            },
+            original_operand_types: vec![f32_ty(), f32_ty()],
+            original_result_types: vec![f32_ty()],
+            operands: Vec::new(),
+            operand_types: vec![f32_ty(), f32_ty()],
+            results: Vec::new(),
+            result_types: Vec::new(),
+            location: None,
+        };
+
+        // batching: neither key is present
+        let batching = ExtensionRequest::new(ExtensionKind::Batching, &rule_op);
+        let encoded = request_to_json(&batching);
+        assert!(encoded.get("tangent_values").is_none());
+        assert!(encoded.get("cotangent_values").is_none());
+
+        // jvp: `tangent_values` only (operand order, null for a zero tangent)
+        let jvp = ExtensionRequest::new(ExtensionKind::Jvp, &rule_op).with_tangent_values(&[
+            Dual::Value(ValueId(11)),
+            Dual::ZeroTangent,
+        ]);
+        let encoded = request_to_json(&jvp);
+        assert_eq!(encoded["kind"], json!("jvp"));
+        assert_eq!(encoded["tangent_values"], json!([11, null]));
+        assert!(encoded.get("cotangent_values").is_none());
+
+        // vjp: `cotangent_values` only (result order)
+        let vjp = ExtensionRequest::new(ExtensionKind::Vjp, &rule_op)
+            .with_cotangent_values(&[Dual::ZeroTangent, Dual::Value(ValueId(12))]);
+        let encoded = request_to_json(&vjp);
+        assert_eq!(encoded["kind"], json!("vjp"));
+        assert_eq!(encoded["cotangent_values"], json!([null, 12]));
+        assert!(encoded.get("tangent_values").is_none());
     }
 
     #[test]

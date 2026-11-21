@@ -143,12 +143,18 @@ The callback receives one small neutral request dict:
  "op_name": str, "rule_key": str,
  "attributes": {json},
  "operand_types": [Type, ...], "result_types": [Type, ...],
- "axes": [int | null, ...] | null,              # batching only: axis per operand
- "tangents": [bool, ...] | null,                # jvp only: operands carrying a tangent
- "cotangent_type": Type | null}                 # vjp only
+ "axes": [int | null, ...] | null,                     # batching only: axis per operand
+ "tangents": [bool, ...] | null,                       # jvp only: operand carries a tangent
+ "tangent_values": [value_id | null, ...] | null,      # jvp only: one per operand, operand order
+ "cotangent_type": Type | null,                        # vjp only
+ "cotangent_values": [value_id | null, ...] | null}    # vjp only: one per result, result order
 ```
 
-and returns `None` (no rule → `TransformError` naming the op) or a subgraph response:
+`tangent_values` / `cotangent_values` are the dual SSA values themselves: `Some(id)` is that operand's tangent (resp. that result's cotangent) as a value of the transform's **output** graph, `null` is the zero tangent / zero cotangent.
+Each key is present only on its own kind — absent for batching and for the other kind — with exactly one entry per op operand (`tangent_values`) resp. per op result (`cotangent_values`).
+At the entry function's block arguments this is exactly the selector order of `tangent_inputs` / `cotangent_inputs`; for an inner op, operand order resp. result order is the only coherent global contract, and the ids index the rewritten graph, so a rule may pass a tangent straight through.
+
+It returns `None` (no rule → `TransformError` naming the op) or a subgraph response:
 
 ```
 {"module": Envelope, "entry": str,
@@ -156,8 +162,9 @@ and returns `None` (no rule → `TransformError` naming the op) or a subgraph re
  "output_axes": [int | null, ...] | null}  # batching only: mappedness of each spliced output
 ```
 
-The subgraph's entry block arguments are, in order, the op's operands followed by the op's results (proxy values for `jvp`/`vjp` rules that need the primal results).
-The engine inlines the subgraph into the active builder with SSA remapping: operand proxies bind to the rewritten operands, result proxies to the rewritten results; `output_ids` select which values become the rewritten results (batching) or which values are the spliced JVP/VJP contributions.
+The subgraph's entry block arguments are, in order: the op's operands, the op's results (proxy values for `jvp`/`vjp` rules that need the primal results), and then — `jvp` / `vjp` only — the non-zero duals (`jvp`: the `Some` entries of `tangent_values` in operand order, `vjp`: the `Some` entries of `cotangent_values` in result order; a `null` entry contributes no block argument).
+A `batching` subgraph therefore takes exactly `operands ++ results`.
+The engine inlines the subgraph into the active builder with SSA remapping: operand proxies bind to the rewritten operands, result proxies to the rewritten results, the trailing dual arguments to the values those `Some` entries name; `output_ids` select which values become the rewritten results (batching) or which values are the spliced JVP/VJP contributions.
 No other Python callback may occur during a transform; the envelope/GIL crossing happens once per transform (plus once per extension-ruled op).
 
 ## Performance rules

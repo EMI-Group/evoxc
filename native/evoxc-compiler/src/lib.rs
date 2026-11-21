@@ -169,6 +169,23 @@ pub struct ExtensionRequest {
     pub tangents: Option<Vec<bool>>,
     /// VJP only: the cotangent type the rule must consume.
     pub cotangent_type: Option<ValueType>,
+    /// JVP only: one entry per op operand in OPERAND order.
+    ///
+    /// `Some(id)` is that operand's tangent SSA value (a value of the
+    /// rewritten/output graph) and `None` is the zero tangent.  At the entry
+    /// block this is exactly the selector order of `tangent_inputs`; for an
+    /// inner op operand order is the only coherent global contract.  The
+    /// `Some` ids are appended to the subgraph's block arguments after the
+    /// operands and the result proxies, in this order.
+    pub tangent_values: Option<Vec<Option<ValueId>>>,
+    /// VJP only: one entry per op result in RESULT order.
+    ///
+    /// `Some(id)` is that result's cotangent SSA value and `None` is the zero
+    /// cotangent.  At the entry block this is exactly the selector order of
+    /// `cotangent_inputs`; for an inner op result order is the only coherent
+    /// global contract.  The `Some` ids are appended to the subgraph's block
+    /// arguments after the operands and the result proxies, in this order.
+    pub cotangent_values: Option<Vec<Option<ValueId>>>,
 }
 
 impl ExtensionRequest {
@@ -185,6 +202,8 @@ impl ExtensionRequest {
             axes: None,
             tangents: None,
             cotangent_type: None,
+            tangent_values: None,
+            cotangent_values: None,
         }
     }
 
@@ -203,6 +222,18 @@ impl ExtensionRequest {
     /// Fill the VJP cotangent type.
     pub fn with_cotangent_type(mut self, ty: Option<&ValueType>) -> ExtensionRequest {
         self.cotangent_type = ty.cloned();
+        self
+    }
+
+    /// Fill the per-operand tangent SSA values (operand order; `None` = zero).
+    pub fn with_tangent_values(mut self, tangents: &[Dual]) -> ExtensionRequest {
+        self.tangent_values = Some(tangents.iter().map(|dual| dual.value()).collect());
+        self
+    }
+
+    /// Fill the per-result cotangent SSA values (result order; `None` = zero).
+    pub fn with_cotangent_values(mut self, cotangents: &[Dual]) -> ExtensionRequest {
+        self.cotangent_values = Some(cotangents.iter().map(|dual| dual.value()).collect());
         self
     }
 }
