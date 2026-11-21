@@ -131,11 +131,38 @@ def _spec_summary(spec) -> dict:
     }
 
 
+def _signature_node_summary(spec) -> str:
+    """User-facing one-line description of ONE signature ``core.TreeSpec`` node.
+
+    ``core.describe_node(spec)`` for container nodes and for every non-tensor
+    leaf (static positions keep their Python type name verbatim), but a
+    CHILDLESS tensor leaf renders a readable role name instead of leaking the
+    private trace-time marker class into an inspection dict:
+    ``_TensorSpecLeaf`` / ``core.TensorSpec`` → ``"tensor input leaf"``,
+    ``_SymbolicLeaf`` / ``core.SymbolicTensor`` → ``"tensor output leaf"``,
+    and a plain ``type=None`` leaf (grad/vjp-built output trees) →
+    ``"tensor leaf"``.
+
+    Display only: ``core.describe_node`` itself keeps its wording unchanged,
+    because that text is bound into structure-mismatch error messages.
+    """
+    if not spec.children and spec.num_leaves == 1:
+        leaf_type = spec.type
+        if leaf_type is _TensorSpecLeaf or leaf_type is core.TensorSpec:
+            return "tensor input leaf"
+        if leaf_type is _SymbolicLeaf or leaf_type is core.SymbolicTensor:
+            return "tensor output leaf"
+        if leaf_type is None:
+            return "tensor leaf"
+    return core.describe_node(spec)
+
+
 def _tree_summary(tree):
-    """``core.describe_node(tree)`` (one-line tree description) or ``None``."""
+    """``_signature_node_summary(tree)`` (one-line tree description) or
+    ``None``."""
     if tree is None:
         return None
-    return core.describe_node(tree)
+    return _signature_node_summary(tree)
 
 
 def _capabilities_summary(capabilities) -> dict:
@@ -292,8 +319,11 @@ class Executable:
         * ``input_specs`` / ``output_specs`` — one dict
           ``{"shape": [str(dim), ...], "dtype": str, "device": str | None}``
           per tensor leaf, in flat leaf order.
-        * ``input_tree`` / ``output_tree`` — the ``core.describe_node``
-          one-line description of the recorded TreeSpec (or ``None``).
+        * ``input_tree`` / ``output_tree`` — the one-line description of the
+          recorded TreeSpec (``None`` when absent): ``core.describe_node``'s
+          wording for containers and static leaves, with tensor leaves
+          rendered as ``tensor input leaf`` / ``tensor output leaf`` /
+          ``tensor leaf`` instead of a private trace marker class name.
         * ``static_value_count`` — ``len(signature.static_values)``.
         * ``required_ops`` — the compiled artifact's ``required_custom_ops``
           (``[]`` when the backend executable exposes no artifact).
