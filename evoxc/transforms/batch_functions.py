@@ -694,6 +694,22 @@ def _check_contract(graphs: Sequence[Graph]) -> None:
         )
 
 
+_NATIVE_BATCHABLE: frozenset[str] | None = None
+
+
+def _native_batchable() -> frozenset[str]:
+    """The native engine's builtin batching rule keys (lazily, once)."""
+    global _NATIVE_BATCHABLE
+    if _NATIVE_BATCHABLE is None:
+        from evoxc import _native
+
+        if not _native.available():
+            _NATIVE_BATCHABLE = frozenset()
+        else:
+            _NATIVE_BATCHABLE = frozenset(_native.batching_rule_keys())
+    return _NATIVE_BATCHABLE
+
+
 def _check_ops(graphs: Sequence[Graph]) -> None:
     """Every op in every program must be batchable (or a `constant`).
 
@@ -702,7 +718,10 @@ def _check_ops(graphs: Sequence[Graph]) -> None:
     `batching._rule_key`, so `block:<name>` / `external:<name>` namespacing
     works) is a v1 deferral of `batch_functions` — an explicit
     `core.TransformError` naming the op and the function index, never a silent
-    Python-loop fallback.
+    Python-loop fallback. A key is available when the Python registry holds it
+    OR the native engine's compiled-in builtin set does, so a native-only rule
+    can never be rejected by a stale mirror; host-namespace rules
+    (`block:*` / `external:*` / `sparse_*`) live only in the Python registry.
 
     The native engine runs the same check with the same wording; it stays here
     because it must fire BEFORE the banded-`out_axes` restriction (the standard
@@ -725,7 +744,7 @@ def _check_ops(graphs: Sequence[Graph]) -> None:
             if op.name == "constant":
                 continue
             key = batching._rule_key(op)
-            if key in batching.batching_rules:
+            if key in batching.batching_rules or key in _native_batchable():
                 continue
             raise core.TransformError(
                 f"batch_functions: cannot batch op '{op.name}' from function "

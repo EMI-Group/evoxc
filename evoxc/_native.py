@@ -21,7 +21,7 @@ v1 envelope in :mod:`evoxc._native_codec` and maps the extension's
 ``NativeError.kind`` onto the public ``evoxc.core`` error family (message
 preserved verbatim).
 
-Three entry points exist:
+Three graph entry points exist, plus one read-only registry query:
 
 * :func:`infer` — op result-type inference; operands and result types travel
   as native type dicts, ``attributes`` pass through verbatim and the optional
@@ -43,6 +43,9 @@ Three entry points exist:
   population of programs; returns ``{"module": ir.Module, "batch_report":
   {...}, **extras}`` (the merged program through the same trusted fast decode
   plus the 12-key report payload).
+* :func:`batching_rule_keys` — the sorted rule keys of the native builtin
+  batching registry (a read-only availability query; host namespaces
+  ``block:*`` / ``external:*`` / ``sparse_*`` are never listed).
 The seam is consumed by ``evoxc.transforms`` — all five builtin transforms
 plus ``batch_functions`` — and by the parity harnesses; trace-time inference
 still runs in Python through ``evoxc.ir``.
@@ -71,6 +74,7 @@ __all__ = [
     "infer",
     "transform",
     "batch_functions",
+    "batching_rule_keys",
 ]
 
 #: Environment variable naming an explicit extension path (``.so``/``.pyd``).
@@ -218,6 +222,22 @@ def require() -> ModuleType:
 def version() -> str:
     """The extension's reported version string."""
     return require().version()
+
+
+def batching_rule_keys() -> list[str]:
+    """The sorted rule keys of the native builtin batching registry.
+
+    Exactly the ops the native ``vectorize``/``batch_functions`` engines can
+    map. Host rules (``block:*`` / ``external:*`` / ``sparse_*``) are never
+    listed — those come from the extension-rule bridge.
+    """
+    keys = require().batching_rule_keys()
+    if not isinstance(keys, (list, tuple)):
+        raise TypeError(
+            "the native extension's batching_rule_keys returned "
+            f"{type(keys).__name__} where a list was expected"
+        )
+    return [str(key) for key in keys]
 
 
 # ---------------------------------------------------------------------------
