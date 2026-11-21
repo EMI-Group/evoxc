@@ -2,27 +2,19 @@
 
 The `batch_functions` merge itself runs in the native engine
 (``native/evoxc-compiler/src/batch_functions/``, reached through the PyO3 entry
-point); this module is the Python seam that mirrors
-:func:`evoxc._native.transform`:
-
-* every input `ir.Module` is encoded as an ``evoxc-native-ir`` v1 envelope
-  (:func:`evoxc._native_codec.encode_module`);
-* the extension is called with the population and the merge config (which
-  passes through untouched — a callable ``config["extension_rule"]`` is never
-  encoded);
-* a native failure is re-raised as its public ``evoxc.core`` counterpart with
-  the message preserved verbatim (the same ``NativeError.kind`` mapping
-  :mod:`evoxc._native` applies);
-* the merged envelope (nested under ``"module"``) is decoded back into an
-  :class:`ir.Module` and the 12-key ``"batch_report"`` payload is validated as
-  a mapping and returned as the plain dict
-  :func:`evoxc.transforms._report.report_from_native` rehydrates.
-
-The façade returns ``{"module": ir.Module, "batch_report": {...}}``, plus an
+point); this module adds the config bridging the public contract needs on top
+of :func:`evoxc._native.batch_functions`, which owns the envelope encode, the
+extension call, the ``NativeError.kind`` translation and the trusted fast
+decode of the merged envelope:
+* the extension's 12-key ``"batch_report"`` payload is validated and returned
+  as the plain dict :func:`evoxc.transforms._report.report_from_native`
+  rehydrates;
+* a rank-0 function-axis output is bridged (below);
+* the merge config passes through untouched — a callable
+  ``config["extension_rule"]`` is never encoded.
+The result is ``{"module": ir.Module, "batch_report": {...}}``, plus an
 ``"input_ids"`` list when the extension reports one (the merged entry
-function's block-argument ids, in input order — the `batch_functions` FFI keeps
-that mapping implicit today, so callers fall back to the decoded block
-arguments).
+function's block-argument ids, in input order).
 
 Rank-0 function-axis outputs (the one config gap this seam bridges): the public
 contract makes ``out_axes=0`` on a rank-0 unmapped output the legal "broadcast
@@ -42,9 +34,14 @@ so the merge's class/op counts stay exactly the merge of the given programs):
    (the mapped-input case: a per-program reduction to a scalar), each program's
    output is expressed as a rank-1 ``(1,)`` value — one `reshape` inserted
    before that program's ``return`` in a decoded COPY (the caller's modules are
-   never mutated) — and the merged ``(N, 1)`` output is reshaped back to
-   ``(N,)``.
-
+   never mutated) — and the merged ``(N, 1)`` output is unwrapped to ``(N,)``.
+   When all programs collapse into one shared output class the merged value is
+   exactly the wrapper's `reshape`, so that op is stripped again (the reported
+   graph is the legacy one); only a muxed output keeps its wrapper ops and then
+   inserts an unwrap `reshape`.
+   Either way the wrapper classes are scaffold, never part of the requested
+   merge, so the reported ``value_classes`` / ``shared_classes`` /
+   ``emitted_ops`` are discounted by one per rank-0 leaf.
 Nothing else about the merge changes: the edit is the same rank bookkeeping the
 frontend already does for specs.
 """
