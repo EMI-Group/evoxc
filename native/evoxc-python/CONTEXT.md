@@ -46,8 +46,26 @@ The JSON walk (`decode_module_json`/`signature_program`/`signature_entry`) is in
 - Non-finite floats (NaN/∞) are a `TypeError` — they have no JSON form; they belong inside an ndarray attribute payload.
 - `dict` keys must be `str`; a non-string key is a `TypeError` naming the path.
 - JSON → Python rebuilds `dict`/`list`/`str`/`bool`/`int`/`float`/`None` only (never a wrapper object), and an `i64`/`u64` JSON number becomes a Python `int`.
-- One conversion per call, in one reused path buffer: a per-node Python callback is explicitly rejected by the contract (it would cross the GIL once per op and tie the native dispatch loop to Python object lifetimes).
+- One conversion per call: a per-node Python callback is explicitly rejected by the contract (it would cross the GIL once per op and tie the native dispatch loop to Python object lifetimes).
 - Conversion failures are `TypeError`s; envelope/schema/inference failures are `NativeError`s from `evoxc_core::Error`.
+
+### Outbound object sharing (what the returned envelope aliases)
+
+A transform returns tens of thousands of small Python objects and almost all of them are repeats, so `py_from_json` runs with a per-call `PyCache` (dropped when the call returns; nothing is shared across calls or with the input envelope):
+
+| Cache | Sharing rule | Why it is unobservable |
+|---|---|---|
+| strings | one `PyString` per spelling, dict keys and string values alike | `str` is immutable; the shared object is also where `PyDict_SetItem` finds the hash it caches |
+| ints | one `PyInt` per value in `0..8192` (CPython's own `-5..=256` singletons are used as-is and never enter the table) | Python `int`s are immutable |
+| type dicts | one `{"dtype": …, "shape": […]}` dict per distinct native type, keyed by a content fingerprint (FNV-64, collisions resolved by comparing the JSON) | only reached from `Type` positions (`results[].type`, `block.arguments[].type`, `function.input_types`/`output_types`); `evoxc.ir` reads `dtype`/`shape` by field into its own `ValueType` |
+| location dicts | one `{"file","line","col","code_snippet"}` dict per distinct location | same: `_decode_location` reads the four fields |
+
+Every `dict`/`list` **other** than those records is allocated per node — a caller may mutate a container in the returned envelope, so aliasing one would be observable. That is also why empty `attributes`/`regions`/`metadata` containers are **not** shared: `evoxc.ir` can hold a decoded attribute mapping, so one shared empty dict would let one op's mutation reach every other op.
+A shared record is only ever handed out at a *record* position: `is_type_object`/`is_location_object` require the exact two-/four-key record shape, so an arbitrary payload that happens to sit under a `"type"` or `"location"` attribute key is converted (and kept distinct) like any other dict.
+
+### Inbound path rendering
+
+The `attributes.axes[1]` path in a `TypeError` is a parent-linked `Path` chain (one stack frame per recursion level), rendered exactly once and only on failure. It used to be written into a reused `String` at every key and element — tens of thousands of `write!` calls per transform for a message that almost never renders.
 
 ## GIL discipline
 
