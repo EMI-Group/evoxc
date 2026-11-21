@@ -1,23 +1,21 @@
-"""Batching: the rule registry and the TEMPORARY Python shim surfaces.
+"""Shared per-op BATCHING-rule registry and rule-helper library.
 
-TEMPORARY SHIM: `evoxc.vectorize` / `evoxc.vmap` do NOT use this module's
-rewriting algorithm — the native (Rust) engine owns the op rewrite, and Python
-keeps only frontend validation plus `Graph` reconstruction (see
-`_native_bridge`).
-What remains here is what the still-Python `batch_functions` / `_emit` /
-`_merge` / `_bands` path, the native extension-rule bridge
-(`_native_rules`), `evoxc/block/rules.py` and `evoxc/external_rules.py` need:
-the batching-rule registry, `_tensor_input_axes`, `_validate_rule_result`,
+Load-bearing, not transitional: the native (Rust) engine performs every
+rewrite (the five builtin transforms and the `batch_functions` merge); this
+module holds `batching_rules` / `register_batching_rule`, `_rule_key`,
+`_resolve_batching_rule`, `_tensor_input_axes`, `_validate_rule_result`,
 `_remap_output_aux`, the batched-aux remap registry, the batch-depth context
 and `block_call_pass_through_rule`.
-A native `batch_functions` port lands separately; this module is deleted with
-it.
-Rule convention: while a rule runs, the machinery has pushed its `ir.Builder`
-onto the trace builder stack, so rules build replacement ops with ordinary
+Consumers: the native seam (`_native_bridge.py`, `_native_rules.py` — the
+extension-rule bridge, also reached through `_native_ad.py`), `vmap.py`,
+`batch_functions.py`, `rules.py`, `evoxc/block/rules.py`,
+`evoxc/external_rules.py` and `evoxc/transforms/__init__.py` (public
+`transforms.batching_rules`).
+Rule convention: the machinery pushes its `ir.Builder` onto the trace builder
+stack while a rule runs, so rules build replacement ops with ordinary
 `evoxc.ops.*` functions (`trace.current_builder()` resolves to the transform
-builder).
-Rules are pure graph builders: no Python loops over batch elements, no silent
-fallbacks.
+builder); they are pure graph builders — no Python loops over batch elements,
+no silent fallbacks.
 """
 
 from __future__ import annotations

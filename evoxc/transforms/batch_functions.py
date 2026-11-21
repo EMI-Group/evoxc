@@ -773,12 +773,12 @@ def _normalize_out_axes(
 ) -> List[Optional[int]]:
     """Normalize `out_axes` into one ``0``/``None`` per TENSOR output leaf.
 
-    Mirrors the front half of `vmap._rearrange_outputs`: the pytree must match
-    the graph's output structure (first-mismatch-path `core.TransformError`
-    otherwise), static output leaves must be `None`, entries must be
-    ``{0, None}`` (non-zero ints are the v1 non-leading-axes deferral), and a
-    bare int/None is accepted only with at most ONE tensor output. No
-    rearrangement ops are emitted — the caller only reads the entries.
+    The pytree must match the graph's output structure (first-mismatch-path
+    `core.TransformError` otherwise), static output leaves must be `None`,
+    entries must be ``{0, None}`` (non-zero ints are the v1 non-leading-axes
+    deferral), and a bare int/None is accepted only with at most ONE tensor
+    output. No rearrangement ops are emitted — the caller only reads the
+    entries.
     """
     static_positions = {record.index for record in graph.output_static_values}
     tensor_positions = set(range(graph.output_tree.num_leaves)) - static_positions

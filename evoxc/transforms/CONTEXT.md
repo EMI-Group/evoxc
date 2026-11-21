@@ -143,6 +143,14 @@ The `constant` op is handled structurally by the machinery (fixed data ⇒ zero 
 - **JVP derived from VJP**: when only a VJP rule is registered, the tangent is derived by the adjoint trick instead of raising — the VJP rule's linear map `c ↦ Jᵀc` is instantiated with `c` = the op's primal results, then a second reverse sweep over the rule's emitted ops applies its transpose to the tangents, propagating cotangents only along paths reaching a result slot (primal paths are second-order terms and are dropped). All-zero tangents short-circuit to `ZeroTangent` without calling the rule.
 - Extension-ruled graphs are NOT special-cased: their Python rules run inside the native sweep through the bridge with the dual SSA values, so `grad`/`jvp`/`vjp` have exactly one implementation.
 
+## Measured cost (whole-graph AD on this host)
+
+Measured with `perf_counter`, min/median of 7 reps, at loadavg ≈ 7, on a scalar rank-0 program (a chain of `sin(y) * 1.0001`, so 3 ops per iteration).
+750-op graph (trace 5.88/6.23 ms): `grad` 14.48/15.97 ms, `vjp` 13.93/14.98 ms, against the retained Python reference sweep `autodiff.reverse_sweep` at 16.01/16.24 ms — 0.90× `grad`, 0.87× `vjp`.
+2250-op graph (trace 18.26/18.56 ms): `grad` 52.71/59.22 ms, `vjp` 52.64/53.11 ms, against the reference sweep at 50.31/52.22 ms — 1.05× both.
+Envelope cost on the same graphs: `encode_module` 2.75/2.78 ms (750 ops) and 10.39/10.51 ms (2250 ops); validated `decode_module` 5.83/5.99 ms and 20.48/20.81 ms; trusted `decode_native_module` 2.39/2.44 ms and 8.52/10.10 ms (≈2.4× faster than the validated decoder), which is the seam that closed the gap.
+The reference sweep is the retained `autodiff.forward_sweep` / `autodiff.reverse_sweep` library, not a production path, and the whole-graph `grad`/`vjp` path is within 1.1× of it at both sizes.
+
 ## Retained Python modules
 
 - `autodiff.py` — the rule library: `jvp_rules` / `vjp_rules` and `register_*`, `ZeroTangent`, `_jvp_from_vjp`, `_materialize`, `_accumulate` / `_combine`, and the retained reference sweeps `forward_sweep` / `reverse_sweep` (no production caller; kept as the executable reference of the sweep semantics for the rules and for direct use). No transform entry point delegates to them.
@@ -200,7 +208,6 @@ Spec-compliance additions live in `../../tests/test_spec_compliance.py`; the per
 
 ## Known Issues
 
-- **`batching.py`'s module docstring is stale**: it describes a "temporary shim" for a Python `batch_functions` / `_emit` / `_merge` / `_bands` path that no longer exists and says the module will be deleted. The module itself is load-bearing (see "Retained Python modules").
 - **`vmap.py`'s `_collect_batch_dims` / `_is_batch_entry` / `_dims_in_batch` / `_leading_batch_count` are off the active path**: mapped-output detection is native; these helpers only reference each other.
 - **The Python batching table must track the native builtin set**: `batch_functions._check_ops` accepts an op only when `batching.batching_rules` has its key, so an op with a native batching rule but no `rules.py` entry is wrongly rejected as a v1 deferral. Adding a builtin batching rule means updating `rules.py` (and vice versa) in the same change.
 - **AD registration is table-driven — a category-tuple op without a rule-table entry is a latent bug**: every op in `ELEMENTWISE_OPS` and the other category tuples is auto-registered to the generic handlers, which raise `TransformError` at rule-call time unless the op also appears in `_UNARY_DERIV` / `_POINTWISE_JVP` / `_POINTWISE_VJP`. When adding an op to a tuple, add its rule-table entry and mirror the rule natively.
