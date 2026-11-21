@@ -12,7 +12,7 @@ use num_complex::Complex;
 use serde_json::Value as Json;
 
 use crate::buffer::{
-    apply2, apply3, broadcast_shape, broadcast_to, shape_text, Buffer, Storage,
+    apply2, apply3, broadcast_shape, broadcast_to, shape_text, zip1, zip2, zip3, Buffer, Storage,
 };
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
@@ -299,11 +299,83 @@ fn typed_binary<T: Num>(
     out_dtype: DType,
 ) -> Result<Buffer> {
     let mut out = T::zeros(util::numel(out_shape));
-    apply2(&mut out, out_shape, left, left_shape, right, right_shape, |a, b| {
-        apply_bin(kind, a, b)
-    });
+    match (
+        layout(out_shape, left, left_shape),
+        layout(out_shape, right, right_shape),
+    ) {
+        (Layout::Flat, Layout::Flat) => dense_binary(kind, &mut out, left, right),
+        (Layout::Flat, Layout::Scalar) if !right.is_empty() => {
+            dense_binary_right_scalar(kind, &mut out, left, right[0])
+        }
+        (Layout::Scalar, Layout::Flat) if !left.is_empty() => {
+            dense_binary_left_scalar(kind, &mut out, left[0], right)
+        }
+        _ => apply2(&mut out, out_shape, left, left_shape, right, right_shape, |a, b| {
+            apply_bin(kind, a, b)
+        }),
+    }
     Buffer::new(out_dtype, out_shape.to_vec(), T::into_storage(out))
 }
+
+/// A broadcast-free operand layout, cheapest first: exactly the result shape, a
+/// single element (the `x * 2.0` / `x + bias` form, which is most elementwise
+/// ops in a real graph), or anything the general broadcast driver owns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Layout {
+    Flat,
+    Scalar,
+    Broadcast,
+}
+
+fn layout<T>(out_shape: &[usize], values: &[T], values_shape: &[usize]) -> Layout {
+    if values_shape == out_shape && values.len() == util::numel(out_shape) {
+        // `out` always holds exactly `numel(out_shape)` elements, so the length
+        // compare also rules out a short slice reaching a driver that would
+        // silently stop early.
+        Layout::Flat
+    } else if values_shape.is_empty() && values.len() == 1 {
+        Layout::Scalar
+    } else {
+        Layout::Broadcast
+    }
+}
+
+/// The broadcast-free binary fast paths, generated from one op list so the
+/// scalar forms cannot drift from the elementwise one.  `kind` is dispatched
+/// ONCE in each: every arm is its own flat loop whose closure folds to a single
+/// machine operation, which is what the vectorizer needs (a `match` inside the
+/// loop blocks it).  Semantics are `apply_bin`'s, arm for arm.
+macro_rules! dense_binary_drivers {
+    ($($kind:ident),* $(,)?) => {
+        fn dense_binary<T: Num>(kind: BinKind, out: &mut [T], left: &[T], right: &[T]) {
+            match kind {
+                $(BinKind::$kind => zip2(out, left, right, |a, b| apply_bin(BinKind::$kind, a, b)),)*
+                // Comparisons never reach the arithmetic path (`compare` owns
+                // them); the arm keeps the match exhaustive and answers exactly
+                // what the general driver would.
+                _ => zip2(out, left, right, |a, b| apply_bin(kind, a, b)),
+            }
+        }
+
+        fn dense_binary_left_scalar<T: Num>(kind: BinKind, out: &mut [T], left: T, right: &[T]) {
+            match kind {
+                $(BinKind::$kind => zip1(out, right, |b| apply_bin(BinKind::$kind, left, b)),)*
+                _ => zip1(out, right, |b| apply_bin(kind, left, b)),
+            }
+        }
+
+        fn dense_binary_right_scalar<T: Num>(kind: BinKind, out: &mut [T], left: &[T], right: T) {
+            match kind {
+                $(BinKind::$kind => zip1(out, left, |a| apply_bin(BinKind::$kind, a, right)),)*
+                _ => zip1(out, left, |a| apply_bin(kind, a, right)),
+            }
+        }
+    };
+}
+
+dense_binary_drivers!(
+    Add, Sub, Mul, Div, Pow, Rem, Max, Min, BitAnd, BitOr, BitXor, Shl, Shr
+);
 
 fn compare(
     name: &str,
@@ -334,15 +406,12 @@ fn compare(
     };
     let left = left.as_ref().unwrap_or(a);
     let right = right.as_ref().unwrap_or(b);
-    if compute.is_complex() {
-        with_same_type!(left, right, |x, y| {
-            compare_eq(x, &left.shape, y, &right.shape, kind, out_shape)
-        })
-    } else {
-        with_same_type!(left, right, |x, y| {
-            compare_ord(x, &left.shape, y, &right.shape, kind, out_shape)
-        })
-    }
+    // Complex values only support `equal`/`not_equal` (an ordering kind is
+    // rejected above) and every dtype implements [`Orderable`], so one driver
+    // serves both.
+    with_same_type!(left, right, |x, y| {
+        compare_typed(x, &left.shape, y, &right.shape, kind, out_shape)
+    })
 }
 
 /// Ordering comparisons, without requiring `PartialOrd` (complex has none).
@@ -380,7 +449,7 @@ impl Orderable for Complex<f64> {
     fn ge(&self, _other: &Self) -> bool { false }
 }
 
-fn compare_eq<T: PartialEq + Copy>(
+fn compare_typed<T: Orderable + Copy>(
     left: &[T],
     left_shape: &[usize],
     right: &[T],
@@ -389,38 +458,66 @@ fn compare_eq<T: PartialEq + Copy>(
     out_shape: &[usize],
 ) -> Result<Vec<Value>> {
     let mut out = vec![false; util::numel(out_shape)];
-    apply2(&mut out, out_shape, left, left_shape, right, right_shape, |p, q| {
-        match kind {
-            BinKind::Eq => p == q,
-            BinKind::Ne => p != q,
-            _ => false,
+    match (
+        layout(out_shape, left, left_shape),
+        layout(out_shape, right, right_shape),
+    ) {
+        (Layout::Flat, Layout::Flat) => dense_compare(kind, &mut out, left, right),
+        (Layout::Flat, Layout::Scalar) if !right.is_empty() => {
+            dense_compare_right_scalar(kind, &mut out, left, right[0])
         }
-    });
+        (Layout::Scalar, Layout::Flat) if !left.is_empty() => {
+            dense_compare_left_scalar(kind, &mut out, left[0], right)
+        }
+        _ => apply2(&mut out, out_shape, left, left_shape, right, right_shape, |p, q| {
+            compare_op(kind, p, q)
+        }),
+    }
     single(Buffer::new(DType::Bool, out_shape.to_vec(), Storage::Bool(out))?)
 }
 
-fn compare_ord<T: Orderable + Copy>(
-    left: &[T],
-    left_shape: &[usize],
-    right: &[T],
-    right_shape: &[usize],
-    kind: BinKind,
-    out_shape: &[usize],
-) -> Result<Vec<Value>> {
-    let mut out = vec![false; util::numel(out_shape)];
-    apply2(&mut out, out_shape, left, left_shape, right, right_shape, |p, q| {
-        match kind {
-            BinKind::Eq => p == q,
-            BinKind::Ne => p != q,
-            BinKind::Lt => p.lt(&q),
-            BinKind::Le => p.le(&q),
-            BinKind::Gt => p.gt(&q),
-            BinKind::Ge => p.ge(&q),
-            _ => false,
-        }
-    });
-    single(Buffer::new(DType::Bool, out_shape.to_vec(), Storage::Bool(out))?)
+/// One comparison, numpy semantics (a NaN compares false against everything).
+fn compare_op<T: Orderable>(kind: BinKind, left: T, right: T) -> bool {
+    match kind {
+        BinKind::Eq => left == right,
+        BinKind::Ne => left != right,
+        BinKind::Lt => left.lt(&right),
+        BinKind::Le => left.le(&right),
+        BinKind::Gt => left.gt(&right),
+        BinKind::Ge => left.ge(&right),
+        _ => false,
+    }
 }
+
+/// The broadcast-free comparison fast paths (one arm list, three layouts, as
+/// for the arithmetic drivers): `kind` is dispatched once and each arm is a
+/// flat `zip` into the bool result.
+macro_rules! dense_compare_drivers {
+    ($($kind:ident),* $(,)?) => {
+        fn dense_compare<T: Orderable + Copy>(kind: BinKind, out: &mut [bool], left: &[T], right: &[T]) {
+            match kind {
+                $(BinKind::$kind => zip2(out, left, right, |p, q| compare_op(BinKind::$kind, p, q)),)*
+                _ => zip2(out, left, right, |p, q| compare_op(kind, p, q)),
+            }
+        }
+
+        fn dense_compare_left_scalar<T: Orderable + Copy>(kind: BinKind, out: &mut [bool], left: T, right: &[T]) {
+            match kind {
+                $(BinKind::$kind => zip1(out, right, |q| compare_op(BinKind::$kind, left, q)),)*
+                _ => zip1(out, right, |q| compare_op(kind, left, q)),
+            }
+        }
+
+        fn dense_compare_right_scalar<T: Orderable + Copy>(kind: BinKind, out: &mut [bool], left: &[T], right: T) {
+            match kind {
+                $(BinKind::$kind => zip1(out, left, |p| compare_op(BinKind::$kind, p, right)),)*
+                _ => zip1(out, left, |p| compare_op(kind, p, right)),
+            }
+        }
+    };
+}
+
+dense_compare_drivers!(Eq, Ne, Lt, Le, Gt, Ge);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnKind {
@@ -561,10 +658,42 @@ fn typed_unary<T: Num>(
         return single(Buffer::new(DType::Bool, shape.to_vec(), Storage::Bool(out))?);
     }
     let mut out = T::zeros(values.len());
-    for (slot, value) in out.iter_mut().zip(values.iter()) {
-        *slot = apply_un(kind, *value);
-    }
+    dense_unary(kind, &mut out, values);
     single(Buffer::new(out_dtype, shape.to_vec(), T::into_storage(out))?)
+}
+
+/// The unary fast path (the operand always has the result's shape).  `kind` is
+/// dispatched ONCE so each arm's closure folds to that single operation — the
+/// cheap ops become vector moves and the transcendental ones a tight call loop.
+/// Every arm delegates to [`apply_un`], so there is one definition per op.
+fn dense_unary<T: Num>(kind: UnKind, out: &mut [T], values: &[T]) {
+    macro_rules! arm {
+        ($kind:ident) => {
+            zip1(out, values, |value| apply_un(UnKind::$kind, value))
+        };
+    }
+    match kind {
+        UnKind::Abs => arm!(Abs),
+        UnKind::Negate => arm!(Negate),
+        UnKind::Square => arm!(Square),
+        UnKind::Sqrt => arm!(Sqrt),
+        UnKind::Exp => arm!(Exp),
+        UnKind::Log => arm!(Log),
+        UnKind::Log1p => arm!(Log1p),
+        UnKind::Sin => arm!(Sin),
+        UnKind::Cos => arm!(Cos),
+        UnKind::Tan => arm!(Tan),
+        UnKind::Acos => arm!(Acos),
+        UnKind::Tanh => arm!(Tanh),
+        UnKind::Sigmoid => arm!(Sigmoid),
+        UnKind::Relu => arm!(Relu),
+        UnKind::Sign => arm!(Sign),
+        UnKind::Floor => arm!(Floor),
+        UnKind::Ceil => arm!(Ceil),
+        UnKind::Round => arm!(Round),
+        // `logical_not` leaves through `typed_unary` (it produces bool).
+        UnKind::LogicalNot => zip1(out, values, |value| value),
+    }
 }
 
 fn is_truthy<T: Scalar>(value: T) -> bool {
@@ -653,7 +782,14 @@ fn select_kernel(_ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Re
     let storage = match (&on_true.storage, &on_false.storage, &predicate.storage) {
         (Storage::Bool(a), Storage::Bool(b), Storage::Bool(p)) => {
             let mut out = vec![false; total];
-            apply3(&mut out, &out_shape, p, &predicate.shape, a, &on_true.shape, b, &on_false.shape, |q, x, y| if q { x } else { y });
+            if predicate.is_flat_for(&out_shape)
+                && on_true.is_flat_for(&out_shape)
+                && on_false.is_flat_for(&out_shape)
+            {
+                zip3(&mut out, p, a, b, |q, x, y| if q { x } else { y });
+            } else {
+                apply3(&mut out, &out_shape, p, &predicate.shape, a, &on_true.shape, b, &on_false.shape, |q, x, y| if q { x } else { y });
+            }
             Storage::Bool(out)
         }
         _ => select_numeric(predicate, on_true, on_false, &out_shape)?,
@@ -707,18 +843,25 @@ fn select_apply<T>(
 where
     T: Copy + Scalar,
 {
-    let mut out = vec![a[0]; util::numel(out_shape)];
-    apply3(
-        &mut out,
-        out_shape,
-        pred,
-        &predicate.shape,
-        a,
-        &a_buf.shape,
-        b,
-        &b_buf.shape,
-        |p, x, y| if p { x } else { y },
-    );
+    let total = util::numel(out_shape);
+    let mut out = vec![T::zero(); total];
+    if predicate.is_flat_for(out_shape) && a_buf.is_flat_for(out_shape) && b_buf.is_flat_for(out_shape)
+    {
+        // Broadcast-free: one flat three-way zip.
+        zip3(&mut out, pred, a, b, |p, x, y| if p { x } else { y });
+    } else {
+        apply3(
+            &mut out,
+            out_shape,
+            pred,
+            &predicate.shape,
+            a,
+            &a_buf.shape,
+            b,
+            &b_buf.shape,
+            |p, x, y| if p { x } else { y },
+        );
+    }
     T::into_storage(out)
 }
 
@@ -994,5 +1137,122 @@ mod tests {
             }
             other => panic!("unexpected storage {other:?}"),
         }
+    }
+
+    #[test]
+    fn layout_classifies_flat_scalar_and_broadcast_operands() {
+        let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        assert_eq!(layout(&[2, 3], &values, &[2, 3]), Layout::Flat);
+        assert_eq!(layout(&[2, 3], &values[..1], &[]), Layout::Scalar);
+        assert_eq!(layout(&[2, 3], &values, &[2, 1]), Layout::Broadcast);
+        assert_eq!(layout(&[2, 3], &values, &[3, 2]), Layout::Broadcast);
+        // A rank-0 result is flat against a rank-0 operand, not a broadcast.
+        assert_eq!(layout(&[], &values[..1], &[]), Layout::Flat);
+    }
+
+    #[test]
+    fn flat_binary_and_comparison_agree_with_the_broadcast_path() {
+        // Same values, once as a flat (2, 3) pair (fast path) and once as a
+        // (1, 3) row broadcast over the same rows (general path).
+        let flat_left = buffer(
+            DType::Float32,
+            &[2, 3],
+            Storage::F32(vec![1., -2., 3., -4., 5., 0.]),
+        );
+        let flat_right = buffer(
+            DType::Float32,
+            &[2, 3],
+            Storage::F32(vec![2., 2., -1., 2., 2., -1.]),
+        );
+        let row_right = buffer(DType::Float32, &[1, 3], Storage::F32(vec![2., 2., -1.]));
+        let column_left = buffer(DType::Float32, &[2, 1], Storage::F32(vec![1., -4.]));
+        let cases: [(&str, DType); 13] = [
+            ("add", DType::Float32),
+            ("subtract", DType::Float32),
+            ("multiply", DType::Float32),
+            ("divide", DType::Float32),
+            ("remainder", DType::Float32),
+            ("maximum", DType::Float32),
+            ("minimum", DType::Float32),
+            ("equal", DType::Bool),
+            ("not_equal", DType::Bool),
+            ("less", DType::Bool),
+            ("less_equal", DType::Bool),
+            ("greater", DType::Bool),
+            ("greater_equal", DType::Bool),
+        ];
+        let out = [Dim::int(2), Dim::int(3)];
+        for (name, dtype) in cases {
+            let op = spec(name, ValueType::of(dtype, out.clone()));
+            let flat = binary(&op, &flat_left, &flat_right).unwrap();
+            let broadcast = binary(&op, &flat_left, &row_right).unwrap();
+            assert_eq!(flat[0].storage, broadcast[0].storage, "op {name}");
+            // A rank-1 (2, 1) column broadcasts in the general driver.
+            let op = spec(name, ValueType::of(dtype, out.clone()));
+            let column = binary(&op, &column_left, &flat_right).unwrap();
+            let repeated = buffer(
+                DType::Float32,
+                &[2, 3],
+                Storage::F32(vec![1., 1., 1., -4., -4., -4.]),
+            );
+            let general = binary(&op, &repeated, &flat_right).unwrap();
+            assert_eq!(column[0].storage, general[0].storage, "op {name}: column");
+        }
+        // Spot-check one value of the flat path so the comparison is not vacuous.
+        let op = spec("add", ValueType::of(DType::Float32, out));
+        assert_eq!(
+            binary(&op, &flat_left, &flat_right).unwrap()[0].storage,
+            Storage::F32(vec![3., 0., 2., -2., 7., -1.])
+        );
+    }
+
+    #[test]
+    fn scalar_operand_agrees_with_a_size_one_operand() {
+        // `x * 2.0` takes the hoisted-scalar loop; `x * [2.0]` (shape (1,)) is
+        // the general broadcast driver.  Same numbers.
+        let x = buffer(DType::Float32, &[2, 2], Storage::F32(vec![1., -2., 3., 0.5]));
+        let scalar = buffer(DType::Float32, &[], Storage::F32(vec![2.0]));
+        let vector = buffer(DType::Float32, &[1], Storage::F32(vec![2.0]));
+        let op = spec("multiply", ValueType::of(DType::Float32, [Dim::int(2), Dim::int(2)]));
+        let hoisted = binary(&op, &x, &scalar).unwrap();
+        let broadcast = binary(&op, &x, &vector).unwrap();
+        assert_eq!(hoisted[0].storage, broadcast[0].storage);
+        assert_eq!(hoisted[0].storage, Storage::F32(vec![2., -4., 6., 1.]));
+
+        // The scalar-fast-path is implemented for the left operand too.
+        let op = spec("subtract", ValueType::of(DType::Float32, [Dim::int(2), Dim::int(2)]));
+        let hoisted = binary(&op, &scalar, &x).unwrap();
+        let broadcast = binary(&op, &vector, &x).unwrap();
+        assert_eq!(hoisted[0].storage, broadcast[0].storage);
+        assert_eq!(hoisted[0].storage, Storage::F32(vec![1., 4., -1., 1.5]));
+
+        // Comparisons have the same two shapes.
+        let zero = buffer(DType::Float32, &[], Storage::F32(vec![0.0]));
+        let zeros = buffer(DType::Float32, &[1], Storage::F32(vec![0.0]));
+        let op = spec("greater", ValueType::of(DType::Bool, [Dim::int(2), Dim::int(2)]));
+        assert_eq!(
+            binary(&op, &x, &zero).unwrap()[0].storage,
+            binary(&op, &x, &zeros).unwrap()[0].storage
+        );
+        assert_eq!(binary(&op, &x, &zero).unwrap()[0].storage, Storage::Bool(vec![true, false, true, true]));
+    }
+
+    #[test]
+    fn flat_select_agrees_with_the_broadcast_path() {
+        let predicate = buffer(DType::Bool, &[2, 2], Storage::Bool(vec![true, false, true, false]));
+        let on_true = buffer(DType::Float32, &[2, 2], Storage::F32(vec![1., 2., 3., 4.]));
+        let on_false = buffer(DType::Float32, &[2, 2], Storage::F32(vec![-1., -2., -1., -2.]));
+        let row = buffer(DType::Float32, &[1, 2], Storage::F32(vec![-1., -2.]));
+        let out_shape = [2usize, 2];
+        let flat = select_numeric(&predicate, &on_true, &on_false, &out_shape).unwrap();
+        let broadcast = select_numeric(&predicate, &on_true, &row, &out_shape).unwrap();
+        assert_eq!(flat, Storage::F32(vec![1., -2., 3., -2.]));
+        assert_eq!(flat, broadcast);
+        // A scalar branch selects against the general driver too.
+        let scalar = buffer(DType::Float32, &[], Storage::F32(vec![-1.0]));
+        assert_eq!(
+            select_numeric(&predicate, &on_true, &scalar, &out_shape).unwrap(),
+            Storage::F32(vec![1., -1., 3., -1.])
+        );
     }
 }

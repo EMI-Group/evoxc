@@ -105,6 +105,12 @@ impl Buffer {
         Ok(Buffer { dtype, shape, storage })
     }
 
+    /// True when this buffer already has `shape` and exactly that many
+    /// elements -- i.e. element `i` of it is element `i` of an output of that
+    /// shape, so a kernel may take a flat, broadcast-free fast path.
+    pub fn is_flat_for(&self, shape: &[usize]) -> bool {
+        self.shape == shape && self.storage.len() == shape.iter().product::<usize>()
+    }
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
     }
@@ -471,6 +477,9 @@ pub fn apply3<T: Copy, U: Copy, V: Copy, R>(
 
 /// Materialize `buffer` broadcast to `shape`.
 pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
+    if buffer.shape == shape {
+        return Ok(buffer.clone());
+    }
     let out_shape = broadcast_shape(&[&buffer.shape, shape])?;
     if out_shape != shape {
         return Err(Error::shape(format!(
@@ -498,6 +507,96 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
     Buffer::new(buffer.dtype, shape.to_vec(), storage)
 }
 
+// ---------------------------------------------------------------------------
+// Broadcast-free (flat) drivers
+// ---------------------------------------------------------------------------
+//
+// The `walk`/`applyN` machines above serve every strided or broadcast kernel:
+// they recompute one offset per operand per element.  A kernel whose operands
+// all already have the output shape needs none of that -- element `i` of every
+// operand is element `i` of the output, so the kernel is one flat `zip` over
+// plain slices.  These drivers are monomorphized over the element types AND the
+// closure, which is what lets LLVM turn the loop into vector moves; keep them
+// that way (no `&dyn Fn`, no per-element `match` on an op code -- dispatch the
+// op code once in the caller and let each arm's closure fold to one operation).
+//
+// Callers gate on [`Buffer::is_flat_for`], so every slice has the output's
+// length; the `zip` therefore visits every element.  A slice that is somehow
+// shorter would be a broken internal buffer, not user input.
+/// Flat unary map: `out[i] = f(source[i])`.
+pub fn zip1<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: impl Fn(T) -> R) {
+    for (slot, value) in out.iter_mut().zip(source.iter()) {
+        *slot = f(*value);
+    }
+}
+/// Flat binary map: `out[i] = f(left[i], right[i])`.
+pub fn zip2<T: Copy, R: Copy>(out: &mut [R], left: &[T], right: &[T], f: impl Fn(T, T) -> R) {
+    for ((slot, x), y) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
+        *slot = f(*x, *y);
+    }
+}
+/// Flat ternary map: `out[i] = f(first[i], second[i], third[i])` (the `select`
+/// shape: predicate, on-true, on-false).
+pub fn zip3<P: Copy, T: Copy, R: Copy>(
+    out: &mut [R],
+    first: &[P],
+    second: &[T],
+    third: &[T],
+    f: impl Fn(P, T, T) -> R,
+) {
+    for (((slot, p), x), y) in out
+        .iter_mut()
+        .zip(first.iter())
+        .zip(second.iter())
+        .zip(third.iter())
+    {
+        *slot = f(*p, *x, *y);
+    }
+}
+fn block_error(op: &str) -> Error {
+    Error::verification(format!(
+        "op '{op}': a block copy reads outside the operand (internal engine error)"
+    ))
+}
+/// Block copy: output block `b` is the `inner`-element run starting at
+/// `source[offsets[b]]` (the `gather`/`slice`/`tile` fast path: whole index-axis
+/// rows instead of one offset per element).
+pub fn copy_blocks<T: Copy>(
+    out: &mut [T],
+    source: &[T],
+    offsets: &[usize],
+    inner: usize,
+    op: &str,
+) -> Result<()> {
+    if offsets.len().saturating_mul(inner) != out.len() {
+        return Err(block_error(op));
+    }
+    if inner == 0 {
+        return Ok(());
+    }
+    for (block, offset) in offsets.iter().enumerate() {
+        let start = *offset;
+        let run = start..start + inner;
+        let src = source.get(run).ok_or_else(|| block_error(op))?;
+        let slot = block * inner;
+        let dst = out.get_mut(slot..slot + inner).ok_or_else(|| block_error(op))?;
+        dst.copy_from_slice(src);
+    }
+    Ok(())
+}
+/// A [`Storage`] built by [`copy_blocks`] over `values`.
+pub fn block_storage<T: Scalar>(
+    values: &[T],
+    out_shape: &[usize],
+    offsets: &[usize],
+    inner: usize,
+    op: &str,
+) -> Result<Storage> {
+    let total: usize = out_shape.iter().product();
+    let mut out = vec![T::zero(); total];
+    copy_blocks(&mut out, values, offsets, inner, op)?;
+    Ok(T::into_storage(out))
+}
 fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];

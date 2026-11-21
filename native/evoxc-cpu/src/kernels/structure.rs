@@ -41,7 +41,7 @@
 use evoxc_core::{AttrValue, Error, Result};
 use serde_json::Value as Json;
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::{block_storage, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
@@ -72,10 +72,14 @@ fn structure_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> 
 fn structural(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<Value>> {
     let name = spec.name.as_str();
     let (map, fill) = match name {
-        "tile" => (
-            tile_map(name, &input.shape, out_shape, &reps(spec)?)?,
-            None,
-        ),
+        "tile" => {
+            let reps = reps(spec)?;
+            // Contiguous operands: whole-run copies, no per-element index map.
+            if let Some(storage) = tile_blocks(name, input, out_shape, &reps)? {
+                return single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?);
+            }
+            (tile_map(name, &input.shape, out_shape, &reps)?, None)
+        }
         "flip" => (
             flip_map(name, &input.shape, out_shape, &flip_axes(spec, input.rank())?)?,
             None,
@@ -207,15 +211,16 @@ fn reps(spec: &OpSpec) -> Result<Vec<usize>> {
     Ok(reps)
 }
 
-/// `tile`'s index map: axis `a` of the result reads `index % extent` of the
-/// right-aligned operand axis (the operand's leading axes beyond its rank are
-/// implicit size-1 axes, so they contribute nothing).
-fn tile_map(
+/// Validate the declared result shape against `np.tile`'s promoted shape and
+/// return the promoted extents: `max(operand rank, reps len)` axes, each the
+/// operand's extent (implicit 1 beyond its rank) times its rep (implicit 1
+/// before `reps`).
+fn tile_promoted(
     op: &str,
     in_shape: &[usize],
     out_shape: &[usize],
     reps: &[usize],
-) -> Result<Vec<Option<usize>>> {
+) -> Result<Vec<usize>> {
     let rank = in_shape.len();
     let out_rank = rank.max(reps.len());
     if out_shape.len() != out_rank {
@@ -243,6 +248,70 @@ fn tile_map(
     if !same_shape(out_shape, &promoted) {
         return Err(util::shape_error(op, "the tiled shape", &promoted, out_shape));
     }
+    Ok(promoted)
+}
+
+/// `tile`'s contiguous fast path: both operands are C-contiguous, so the
+/// trailing axes that are not repeated map element-for-element onto the result
+/// and every run of `inner` output elements is one contiguous slice copy.
+/// Returns `None` (the general index map takes over) for an empty result or a
+/// shape the promotion rejects, so the error wording stays the map path's.
+fn tile_blocks(
+    op: &str,
+    input: &Buffer,
+    out_shape: &[usize],
+    reps: &[usize],
+) -> Result<Option<Storage>> {
+    let in_shape = &input.shape;
+    if util::numel(out_shape) == 0 || input.storage.is_empty() {
+        return Ok(None);
+    }
+    tile_promoted(op, in_shape, out_shape, reps)?;
+    let rank = in_shape.len();
+    let out_rank = out_shape.len();
+    let lead = out_rank - rank;
+    // The trailing run of axes the tiling leaves in place: one contiguous copy
+    // per block.  (`out == in` on an axis means rep 1 or extent 1, both of
+    // which the operand's own stride already handles.)
+    let mut trailing = 0usize;
+    while trailing < rank && in_shape[rank - 1 - trailing] == out_shape[out_rank - 1 - trailing] {
+        trailing += 1;
+    }
+    let inner: usize = in_shape[rank - trailing..].iter().product();
+    let leading_shape = &out_shape[..out_rank - trailing];
+    let leading_sources = rank - trailing;
+    let in_strides = util::c_strides(in_shape);
+    let mut offsets = Vec::with_capacity(util::numel(leading_shape));
+    each_index(leading_shape, |index| {
+        let mut offset = 0usize;
+        for (axis, stride) in in_strides.iter().enumerate().take(leading_sources) {
+            let extent = in_shape[axis];
+            if extent == 0 {
+                continue;
+            }
+            offset += (index[axis + lead] % extent) * stride;
+        }
+        offsets.push(offset);
+    });
+    let storage = with_type!(input, |values| {
+        block_storage(values, out_shape, &offsets, inner, "tile")
+    })?;
+    Ok(Some(storage))
+}
+
+/// `tile`'s index map: axis `a` of the result reads `index % extent` of the
+/// right-aligned operand axis (the operand's leading axes beyond its rank are
+/// implicit size-1 axes, so they contribute nothing).
+fn tile_map(
+    op: &str,
+    in_shape: &[usize],
+    out_shape: &[usize],
+    reps: &[usize],
+) -> Result<Vec<Option<usize>>> {
+    let rank = in_shape.len();
+    let out_rank = rank.max(reps.len());
+    let lead = out_rank - rank;
+    tile_promoted(op, in_shape, out_shape, reps)?;
     let in_strides = util::c_strides(in_shape);
     let mut map = Vec::with_capacity(util::numel(out_shape));
     each_index(out_shape, |index| {
@@ -716,6 +785,44 @@ mod tests {
         let spec = op("tile", DType::Int32, &[2], vec![("reps", ints(&[1, -1]))]);
         let text = message(&spec, &input, &[2, 2]);
         assert!(text.contains("non-negative"), "{text}");
+    }
+
+    #[test]
+    fn tile_block_fast_path_agrees_with_the_index_map() {
+        // The contiguous block copy must equal the general per-element map for
+        // every tiling shape (repeats on the leading axis, both axes, a shorter
+        // reps list, and a longer one that adds a leading axis).
+        let cases: [(&[usize], &[i64], &[usize]); 6] = [
+            (&[2, 3], &[2, 1], &[4, 3]),
+            (&[2, 3], &[2, 2], &[4, 6]),
+            (&[2, 3], &[1, 2], &[2, 6]),
+            (&[2, 3], &[2], &[2, 6]),
+            (&[3], &[2, 3], &[2, 9]),
+            (&[2, 2, 2], &[3, 1, 1], &[6, 2, 2]),
+        ];
+        for (in_shape, reps, out_shape) in cases {
+            let total: usize = in_shape.iter().product();
+            let values: Vec<i32> = (0..total as i32).collect();
+            let input = i32_buffer(in_shape, &values);
+            let reps: Vec<usize> = reps.iter().map(|rep| *rep as usize).collect();
+            let fast = tile_blocks("tile", &input, out_shape, &reps)
+                .expect("the fast path succeeds")
+                .expect("the fast path applies");
+            let map = tile_map("tile", in_shape, out_shape, &reps).expect("map builds");
+            let general = copy_mapped(&op("tile", DType::Int32, out_shape, vec![]), &input, out_shape, &map, None)
+                .expect("the map path succeeds");
+            assert_eq!(fast, general[0].storage, "shapes {in_shape:?} reps {reps:?}");
+        }
+    }
+
+    #[test]
+    fn tile_with_a_zero_rep_stays_on_the_map_path() {
+        // An empty result is the general path's: the block copy has nothing to
+        // copy and must not be asked to cover a non-empty result.
+        let input = i32_buffer(&[2], &[0, 1]);
+        let spec = op("tile", DType::Int32, &[0], vec![("reps", ints(&[0]))]);
+        let out = run(&spec, &input, &[0]);
+        assert_eq!(out.storage, Storage::I32(vec![]));
     }
 
     #[test]

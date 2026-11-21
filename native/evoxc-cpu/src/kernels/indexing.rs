@@ -35,7 +35,7 @@
 //! strict helper.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{shape_text, walk, Buffer, Storage};
+use crate::buffer::{block_storage, shape_text, walk, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
@@ -272,6 +272,11 @@ fn transpose(source: &Buffer, permutation: &[usize], declared: &[Option<usize>])
         .map(|axis| source.shape[*axis])
         .collect();
     let shape = reconcile("transpose", declared, derived)?;
+    // An identity permutation (which is what a `null` permutation means below
+    // rank 2) moves no data: the result is the operand, re-labelled.
+    if permutation.iter().enumerate().all(|(axis, target)| axis == *target) {
+        return Buffer::new(source.dtype, shape, source.storage.clone());
+    }
     let source_strides = util::c_strides(&source.shape);
     let strides: Vec<usize> = permutation
         .iter()
@@ -415,6 +420,9 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
         base += range.start * *stride as i64;
         steps.push(range.step * *stride as i64);
     }
+    if let Some(storage) = slice_row_blocks(source, ranges, &shape, base, &steps)? {
+        return Buffer::new(source.dtype, shape, storage);
+    }
     with_type!(source, |values| slice_typed(
         values,
         source.dtype,
@@ -422,6 +430,63 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
         base,
         &steps
     ))
+}
+
+/// `slice`'s contiguous fast path.
+///
+/// The trailing axes a slice selects WHOLE (`start == 0`, `step == 1`, the whole
+/// extent) are one contiguous run per block, so the result is `copy_blocks` over
+/// the leading axes' offsets instead of one source index per output element.
+/// Only a non-negative step plan qualifies; anything else (negative strides,
+/// per-axis steps, an empty result) stays on the general driver.
+fn slice_row_blocks(
+    source: &Buffer,
+    ranges: &[DimSlice],
+    out_shape: &[usize],
+    base: i64,
+    steps: &[i64],
+) -> Result<Option<Storage>> {
+    let rank = ranges.len();
+    if util::numel(out_shape) == 0 || steps.iter().any(|step| *step < 0) {
+        return Ok(None);
+    }
+    let mut trailing = 0usize;
+    while trailing < rank {
+        let axis = rank - 1 - trailing;
+        let range = &ranges[axis];
+        if range.start != 0 || range.step != 1 || range.extent != source.shape[axis] {
+            break;
+        }
+        trailing += 1;
+    }
+    let inner: usize = out_shape[rank - trailing..].iter().product();
+    if inner == 0 {
+        return Ok(None);
+    }
+    let start = usize::try_from(base).map_err(|_| {
+        Error::verification("slice: a negative base offset reached the row copy (internal engine error)")
+    })?;
+    let leading_shape = &out_shape[..rank - trailing];
+    let mut offsets = Vec::with_capacity(util::numel(leading_shape));
+    for_each_index(leading_shape, |index| {
+        let mut offset = start as i128;
+        for (coordinate, step) in index.iter().zip(steps) {
+            offset += *coordinate as i128 * *step as i128;
+        }
+        match usize::try_from(offset) {
+            Ok(offset) => {
+                offsets.push(offset);
+                Ok(())
+            }
+            Err(_) => Err(Error::verification(
+                "slice: a negative source offset reached the row copy (internal engine error)",
+            )),
+        }
+    })?;
+    let storage = with_type!(source, |values| {
+        block_storage(values, out_shape, &offsets, inner, "slice")
+    })?;
+    Ok(Some(storage))
 }
 
 fn slice_typed<T: Scalar>(
@@ -499,6 +564,9 @@ fn gather(
     derived.extend_from_slice(index_shape);
     derived.extend_from_slice(&source.shape[axis + 1..]);
     let shape = reconcile("gather", declared, derived)?;
+    if let Some(storage) = gather_blocks(source, indices, axis, &shape)? {
+        return Buffer::new(source.dtype, shape, storage);
+    }
     with_type!(source, |values| gather_typed(
         values,
         source.dtype,
@@ -508,6 +576,47 @@ fn gather(
         indices,
         &shape
     ))
+}
+
+/// `gather`'s contiguous fast path.
+///
+/// Only the gathered axis selects anything, so the result is `outer × n` runs
+/// of `inner` whole elements copied verbatim out of the operand (`outer` = the
+/// extents before the axis, `n` = the index count, `inner` = the extents after
+/// it — exactly the C order the spliced result shape has).  The index tensor is
+/// resolved once per row through [`resolve_index`], so numpy's negative-index
+/// and bounds rules are unchanged; only the per-ELEMENT index arithmetic and
+/// the `i128` re-read per output element are gone.  `None` for an empty result
+/// or a shape this decomposition does not cover — the general path owns those.
+fn gather_blocks(
+    source: &Buffer,
+    indices: &[i128],
+    axis: usize,
+    out_shape: &[usize],
+) -> Result<Option<Storage>> {
+    let outer: usize = source.shape[..axis].iter().product();
+    let inner: usize = source.shape[axis + 1..].iter().product();
+    let total = util::numel(out_shape);
+    if total == 0 || indices.is_empty() || inner == 0 {
+        return Ok(None);
+    }
+    let extent = source.shape[axis];
+    let band = extent * inner;
+    let count = outer * indices.len();
+    if count.checked_mul(inner) != Some(total) {
+        return Ok(None);
+    }
+    let mut offsets = Vec::with_capacity(count);
+    for block in 0..outer {
+        let base = block * band;
+        for raw in indices {
+            offsets.push(base + resolve_index(*raw, extent, axis, "gather")? * inner);
+        }
+    }
+    let storage = with_type!(source, |values| {
+        block_storage(values, out_shape, &offsets, inner, "gather")
+    })?;
+    Ok(Some(storage))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1164,6 +1273,43 @@ mod tests {
         let out = gather(&x, &[1], &[], 0, &declared(&[2])).unwrap();
         assert_eq!(out.shape, vec![2]);
         assert_eq!(out.storage, Storage::F32(vec![3., 4.]));
+    }
+
+    /// `(input shape, indices, index shape, axis)` for the gather agreement test.
+    type GatherCase<'a> = (&'a [usize], &'a [i128], &'a [usize], usize);
+
+    #[test]
+    fn gather_block_fast_path_agrees_with_the_per_element_path() {
+        // Every single-axis gather on a contiguous operand takes the row-copy
+        // fast path; it must equal the general element-at-a-time driver for
+        // rank-1/2/3 operands, every axis, a lower- and a higher-rank index
+        // tensor, negative indices and duplicate indices.
+        let cases: [GatherCase; 7] = [
+            (&[3, 2], &[2, 0], &[2], 0),
+            (&[3, 2], &[-1, 0, -3], &[3], 0),
+            (&[2, 3, 2], &[0, 2, 1, 1], &[2, 2], 1),
+            (&[3, 2], &[1], &[], 0),
+            (&[4, 3], &[0, 2, 2], &[3], 1),
+            (&[2, 4, 3], &[3, 0], &[2], 1),
+            (&[2, 2, 3], &[1, 0, 1, 1], &[2, 2], 2),
+        ];
+        for (in_shape, indices, index_shape, axis) in cases {
+            let total: usize = in_shape.iter().product();
+            let values: Vec<f32> = (0..total).map(|value| value as f32).collect();
+            let x = f32_buffer(in_shape, &values);
+            let mut derived: Vec<usize> = in_shape[..axis].to_vec();
+            derived.extend_from_slice(index_shape);
+            derived.extend_from_slice(&in_shape[axis + 1..]);
+            let shape = derived.clone();
+            let fast = gather_blocks(&x, indices, axis, &shape)
+                .expect("the fast path succeeds")
+                .expect("the fast path applies");
+            let general = with_type!(x, |values| gather_typed(
+                values, x.dtype, &x.shape, axis, index_shape, indices, &shape
+            ))
+            .expect("the general path succeeds");
+            assert_eq!(fast, general.storage, "shapes {in_shape:?} axis {axis}");
+        }
     }
 
     #[test]
