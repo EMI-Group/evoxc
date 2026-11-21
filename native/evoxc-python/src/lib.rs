@@ -14,6 +14,7 @@
 mod batch_ops;
 mod convert;
 mod error;
+mod infer_context;
 mod module_ops;
 mod transform_config;
 use pyo3::prelude::*;
