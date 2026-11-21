@@ -147,6 +147,16 @@ pub fn register_builtin(registry: &mut Registry) {
     structure::register_rules(registry);
     linalg::register_rules(registry);
 }
+/// The rule keys of the compiled-in builtin batching registry, sorted.
+///
+/// Read-only introspection for the frontend (`batching_rule_keys` on the FFI):
+/// exactly the ops `vectorize` / `batch_functions` can map natively, so a
+/// caller can check batchability against the engine instead of a Python-side
+/// mirror.  Host rules (`block:*`, `external:*`, `sparse_*`) are never included
+/// — they live in the bridge, not in this registry.
+pub fn builtin_rule_keys() -> Vec<String> {
+    crate::builtin_registry().batching.keys()
+}
 
 /// The `TransformError` for an op with no batching rule.
 pub fn missing_rule_error(key: &str, attrs: &Attrs) -> Error {
@@ -593,5 +603,57 @@ mod tests {
         let mut ctx = RuleCtx::new(&mut builder);
         let err = dispatch(&env, &mut ctx, &rule_op, &[MappedAxes::new(1)]).unwrap_err();
         assert!(err.message.contains("no batching rule for op 'external_call'"));
+    }
+    #[test]
+    fn builtin_rule_keys_are_sorted_and_cover_the_builtins() {
+        let keys = builtin_rule_keys();
+        assert!(!keys.is_empty());
+        let sorted = {
+            let mut copy = keys.clone();
+            copy.sort();
+            copy
+        };
+        assert_eq!(keys, sorted);
+        // Sorted AND duplicate-free: keys are strictly increasing.
+        for pair in keys.windows(2) {
+            assert!(pair[0] < pair[1], "duplicate or unsorted key '{}'", pair[0]);
+        }
+        for name in ["add", "dot", "reduce_sum", "reshape", "gather"] {
+            assert!(
+                keys.iter().any(|key| key == name),
+                "missing builtin batching rule '{name}'"
+            );
+        }
+    }
+    #[test]
+    fn builtin_rule_keys_exclude_unruled_ops_and_host_namespaces() {
+        let keys = builtin_rule_keys();
+        // The 15-op batch gap + random ops + the runtime call op have no rule.
+        for name in [
+            "sort",
+            "argsort",
+            "tile",
+            "flip",
+            "roll",
+            "diag",
+            "cumprod",
+            "nan_to_num",
+            "random_uniform",
+            "runtime_call",
+        ] {
+            assert!(
+                !keys.iter().any(|key| key == name),
+                "unexpected builtin batching rule '{name}'"
+            );
+        }
+        // Host rules live in the bridge, never in the builtin registry.
+        for key in &keys {
+            for prefix in ["block:", "external:", "sparse_"] {
+                assert!(
+                    !key.starts_with(prefix),
+                    "host-namespace key '{key}' listed as builtin"
+                );
+            }
+        }
     }
 }

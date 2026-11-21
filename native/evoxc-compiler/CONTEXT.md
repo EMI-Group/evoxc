@@ -23,6 +23,7 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 - `ExtensionRequest { kind, op_name, rule_key, attributes, operand_types, result_types, axes, tangents, cotangent_type }`, built with `new(kind, &RuleOp)` and refined by `with_axes` / `with_tangents` / `with_cotangent_type`.
 - `ExtensionResponse { module, entry, output_ids, output_axes }`, built with `new(module, entry, output_ids)` and refined by `with_output_axes`; `output_ids` is `Vec<Option<ValueId>>`, where `None` is a structurally-zero dual (`Dual::ZeroTangent`) and is legal only for `jvp`/`vjp` responses (a batching response needs a real value per result).
 - `Registry { batching, jvp, vjp }` with `new()` / `register_builtins()`; `builtin_registry() -> &'static Registry` is the `OnceLock` singleton the FFI path reads.
+- `batching::builtin_rule_keys() -> Vec<String>` (re-exported as `builtin_rule_keys`) is read-only introspection over that singleton's batching keys — sorted, builtin-only (never `block:*`/`external:*`/`sparse_*`), and the source of the FFI `batching_rule_keys()`.
 - `TransformEnv<'a> { registry: &'a Registry, extension: Option<&'a dyn ExtensionRule> }` with `builtin()`, `with_registry(&Registry)` and `with_extension(&dyn ExtensionRule)`.
 - `VERSION` (the crate version marker).
 

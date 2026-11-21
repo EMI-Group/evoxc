@@ -23,7 +23,7 @@ use evoxc_core::value_type::ValueType;
 use serde_json::{Map, Value as Json};
 
 pub use ad::{Dual, JvpRules, VjpRules};
-pub use batching::{BatchingRule, BatchingRules, MappedAxes};
+pub use batching::{builtin_rule_keys, BatchingRule, BatchingRules, MappedAxes};
 pub use builder::Builder;
 pub use emit::{ConvParams, RuleCtx, RuleOp};
 

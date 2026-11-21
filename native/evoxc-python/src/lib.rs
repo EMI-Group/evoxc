@@ -10,6 +10,7 @@
 //! * `infer(op_name, operand_types, attributes, result_types=None, module=None)`
 //! * `transform(kind, module, config)` — `evoxc-compiler`'s five transforms
 //! * `batch_functions(programs, config)` — `evoxc-compiler`'s population merge
+//! * `batching_rule_keys() -> list[str]` — the builtin batching registry keys
 //! * `NativeError` with `.kind` / `.message`
 mod batch_ops;
 mod convert;
@@ -82,6 +83,17 @@ fn batch_functions(
 ) -> PyResult<Py<PyAny>> {
     batch_ops::batch_functions(py, programs, config)
 }
+/// The rule keys of the compiled-in builtin batching registry, sorted.
+///
+/// Read-only introspection: exactly the ops the native `vectorize` /
+/// `batch_functions` engines can map, so the frontend can check batchability
+/// against the engine instead of a Python-side mirror.  Host rules
+/// (`block:*`, `external:*`, `sparse_*`) are never listed — they come from the
+/// bridge, not from the builtin registry.
+#[pyfunction]
+fn batching_rule_keys() -> Vec<String> {
+    evoxc_compiler::builtin_rule_keys()
+}
 #[pymodule]
 fn _evoxc_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
@@ -95,5 +107,6 @@ fn _evoxc_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(infer, module)?)?;
     module.add_function(wrap_pyfunction!(transform, module)?)?;
     module.add_function(wrap_pyfunction!(batch_functions, module)?)?;
+    module.add_function(wrap_pyfunction!(batching_rule_keys, module)?)?;
     Ok(())
 }
