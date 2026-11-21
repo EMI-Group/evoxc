@@ -3,7 +3,7 @@
 ## Intent
 
 `evoxc-compiler` is the single native home of graph construction and graph-to-graph transformation: the mutable `Builder`, the `vectorize`/`vmap` engine with the builtin batching rules, the AD engines (`jvp`/`vjp`/`grad`) with the builtin derivative rules, and the extension-rule inlining bridge.
-It mirrors, op for op and error for error, the Python authority — `evoxc/transforms/vectorize.py`, `vmap.py`, `batching.py`, `rules.py`, `autodiff.py`, `grad.py`, `jvp.py`, `vjp.py` and `evoxc/ir/builder.py` — and never invents semantics of its own.
+It mirrors, op for op and error for error, the Python authority — `evoxc/transforms/vectorize.py`, `vmap.py`, `batching.py`, `rules.py`, `autodiff.py`, `grad.py`, `jvp.py`, `vjp.py` and `evoxc/ir/builder.py` — with one deliberate exception: `vmap`'s non-leading `out_axes` rearrangement is implemented here ahead of the Python path (which still defers those entries).
 The binding FFI and wire format are `../../native/CONTEXT.md`; the core API this crate builds on is `../evoxc-core/CONTEXT.md`; this file refines crate internals and changes neither.
 Python keeps the public frontend surface (decorators, pytrees, static values, reconstruction metadata); this crate sees only an `evoxc-native-ir` `Program` plus a typed config, and it holds no Python objects.
 
@@ -30,7 +30,7 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 | kind | fields |
 |---|---|
 | `vectorize` | `input_axes` and/or `axes` (every input needs an entry: `Some(0)` maps the leading axis, `None` shares the input), optional `batch_dim_name` |
-| `vmap` | the `vectorize` fields plus `out_axes` (default `All(Some(0))`) |
+| `vmap` | the `vectorize` fields plus `out_axes` (default `All(Some(0))`; any integer entry or `null` per output, negative entries resolve like Python indices) |
 | `grad` | `argnums` over the flattened tensor inputs (absent = every input in input order; an explicit list keeps its own order) |
 | `jvp` | `tangent_inputs` (required; the flattened input indices that get an explicit tangent block argument) |
 | `vjp` | `cotangent_inputs` (required; the flattened output indices that get an explicit cotangent block argument) |
@@ -66,7 +66,7 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 | `./src/builder.rs` | The mutable `Builder` over `evoxc_core::Program`: schema lookup, arity check, attribute defaulting/validation, native inference, terminator take/set, `resume`, `inline_function`, `finish`. | `evoxc/ir/builder.py` (`Builder`). |
 | `./src/emit.rs` | The neutral rule surface: `RuleCtx` (typed emission helpers) and `RuleOp` (one op as a rule sees it), `ConvParams`, constant-payload helpers. | The `_ctx` helper vocabulary of `evoxc/transforms/rules.py` / `_emit.py` (`_op`, `_const`, `_scalar`, `_reshape`, `_reduce_*`, …). |
 | `./src/vectorize.rs` | The `vectorize` engine: entry-function checks, per-input axis normalization, one shared fresh batch `Dim`, program-order rebuild through the batching registry, location propagation, `format_shape`. | `vectorize_graph` in `evoxc/transforms/batching.py` (plus `vectorize.py` sugar). |
-| `./src/vmap.rs` | `vmap` = `vectorize` + output-axis rearrangement (`reshape` of a size-one leading axis), `out_axes` normalization. | `_rearrange_outputs` in `evoxc/transforms/vmap.py`. |
+| `./src/vmap.rs` | `vmap` = `vectorize` + output-axis rearrangement (a mapped output moves its leading batch axis with one `transpose`; an unmapped one inserts a size-one axis with `reshape` and broadcasts it to the pass's batch `Dim` when the pass has a mapped input), `out_axes` normalization. | `_rearrange_outputs` in `evoxc/transforms/vmap.py` (the Rust engine is ahead of the Python path, which still defers non-zero entries). |
 | `./src/batching/mod.rs` | `MappedAxes`, the rule type/registry, `rule_key`, `extension_eligible`, `dispatch`, rule-result validation, extension inlining, `derive_output_axes`, the missing-rule `TransformError` texts. | The rule dispatch/registry of `evoxc/transforms/batching.py` + `rules.py`. |
 | `./src/batching/common.rs` | Shared batching shape arithmetic: `fold_product`, `is_batch_dim`, `leading_batch_count`, `row_shape`/`row_rank`, `shift_axes`, `leading_axes`, `reshape_to_broadcast`, `mapped`. | `_fold_product`, `_leading_batch_count`, `_reshape_to_broadcast` in `rules.py`. |
 | `./src/batching/elementwise.rs` | The pointwise batching rule (`POINTWISE_OPS`, 28 ops + the 12 `NONDIFF_POINTWISE_OPS`, with the `broadcast` special case) and the reduction rule (`REDUCTION_OPS` + `ARG_REDUCTION_OPS`). | `_pointwise_batching` / `_reduction_batching` in `rules.py`. |
@@ -100,12 +100,17 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 - All mapped inputs of one pass share that single `Dim`, so same-level batch extents unify by construction and `is_batch_dim` recognizes only an UNSIZED named dim of that name (or `max` of two such dims).
 - `resolve_input_axes` requires an entry per input (from `input_axes` positionally, overridden by the value-id-keyed `axes`), errors on an entry naming a non-input value id, and errors when an input has no entry at all.
 - Rule-result validation is one value plus one `MappedAxes` per source result, with counts not exceeding the produced rank; a mismatch is a `TransformError` naming the op.
-- `vmap` then normalizes `out_axes`: a mapped output at `Some(0)` stays put, an unmapped output at `Some(0)` gets a size-one leading `reshape`, `None` requires a proved-unmapped output, any other axis defers, and a bare `All` entry on a multi-output graph is rejected.
+- `vmap` then normalizes `out_axes` per output (`OutAxes::resolve`; a bare `All` entry on a graph with more than one tensor output is rejected), then against the output rank `r`: a negative entry is `k + r`, and an entry `< -r` or `>= r` is a `TransformError` naming the output index, the entry and the rank (a rank-0 output accepts only `0`).
+- A mapped output with entry `k` moves its leading batch axis to position `k` with one `transpose` (permutation `[1..k, 0, k+1..r-1]`, so output axis `j < k` reads input axis `j+1`, axis `k` reads `0`, `j > k` reads `j`); `k == 0` emits nothing.
+- An unmapped output with entry `k` inserts a size-one axis at `k` with one `reshape` and, when the pass resolved at least one mapped input (a real runtime batch extent), broadcasts that axis to `Dim::named(<batch_dim_name>)`; with no mapped input only the size-one insertion is emitted, and `k == 0` keeps the size-one leading axis without a broadcast.
+- `null` requires a proved-unmapped output — a mapped output with `null` is a `TransformError` (a batch axis is never silently dropped) — and emits nothing.
 - With `out_axes = 0` on every mapped output, `vmap` emits nothing extra — the IR is identical to plain `vectorize`.
+- Every rearrangement op is spliced immediately before the `return` (`Builder::resume` / `take_terminator` / `RuleCtx` / `set_terminator`), one `transpose` or `reshape`(+`broadcast`) per changed output.
 
 ## The Builder contract
 
 - Every op goes through the same door: `schema::require(name)` (unknown op = `VerificationError`), the declared arity check, an unknown-attribute check against `OpSchema`, `Attrs::with_defaults` + `validate_attrs`, then `infer_op` for the result types.
+- Emitted ops carry the schema defaults filled by `attrs.with_defaults(schema)`, with nullable attributes stored as `AttrValue::Null`; core inference reads an absent attribute and `AttrValue::Null` alike as `None` and `envelope::validate_attrs` / the encoder render the `Null` as JSON `null`.
 - `result_types` is an override reserved for op-specific ops (`constant`, `if`, `runtime_call`, `block_call`, `external_call`), the terminator (`Some(&[])`) and inlined extension subgraphs / swept ops whose types must be carried verbatim; everything else infers.
 - Result count is validated against the schema, values are allocated from `Program::new_value_id`/`new_op_id`, and the op is appended to the open block (`push_op`).
 - `require_open_block` forbids appending after a terminator (`the block already has a terminator`).
@@ -143,7 +148,7 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 ## v1 deferrals (explicit errors, never silent fallback)
 
 - `vectorize`/`vmap` reject a module that is not exactly one single-block function (`entry_function`) and reject every region-bearing op (`if`/`while`/`scan`) with `cannot batch op '<op>': region-bearing control-flow ops … are not vectorizable in v1`.
-- `vmap` defers every `out_axes` entry other than `0`/`null`, and a bare `out_axes` on a graph with more than one tensor output.
+- `vmap` defers a bare `out_axes` on a graph with more than one tensor output.
 - Batching deferrals: `conv` with a mapped kernel (a symbolic `batch_group_count`), `conv` with `batch_group_count != 1`, `conv` over a dynamic batch dim or a rank-0 input; `gather` with mapped data but unmapped indices, with multiple `axes`, or with dynamic index dims; `scatter` with mapped data but unmapped indices/updates, or with indices and updates disagreeing on mappedness; `slice` with a dynamic batch dim or a symbolic per-axis limit; `concatenate` with no operand carrying all mapped axes; `solve` with `left_side = false`; per-axis int attributes whose length disagrees with the per-row rank.
 - AD deferrals: `conv` VJP (the IR has no transposed-convolution op); `reduce_mean` over a symbolic reduced dim (the count is unknown); `gather` with multiple axes in both sweeps; a `slice` VJP with strided entries on more than one axis, or over a symbolic dim; a `pad` VJP over a symbolic dim; a `concatenate` VJP with symbolic dims; `solve` with `left_side = false` in both sweeps; a `conv` with `batch_group_count != 1`.
 - Ops with NO batching rule at all (a `TransformError` naming the op): `acos`/`ceil`/`floor`/`round`, `cumprod`, `bitwise_left_shift`/`bitwise_right_shift`, `sort`/`argsort`/`tile`/`flip`/`roll`/`diag`/`nan_to_num`, `diagonal`, the linalg factorizations (`cholesky`/`eigh`/`matrix_exp`/`matrix_rank`/`qr`/`svd`), the `random_*` ops, the collectives (`all_reduce`/`all_gather`/`reduce_scatter`/`all_to_all`/`broadcast_collective`/`collective_permute`), `rank`/`world_size`, control flow, `call` and `runtime_call`. Every sparse op reaches the host bridge instead — the `sparse_*` family plus `dense_dot_sparse`, the one sparse op whose IR name carries no `sparse_` prefix (the eligibility gate names it explicitly) — and fails only when the host has no rule.
@@ -153,10 +158,8 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 
 ## Known gaps / notes for agents
 
-- **The `with_defaults` null-default gap:** `evoxc_core::attr::Attrs::with_defaults` fills a declared default by decoding it, and a declared `null` default for an `INTS`/`SHAPE` attribute does not decode (`expected a list of ints, got null`) — unguarded, it makes `conv` without `strides`, `slice` without `strides` and `transpose` without `permutation` unemittable.
-- `Builder::emit` works around it in `defaulted()`: an optional attribute whose schema default is `null` is left ABSENT instead of being filled, and core inference already reads an absent optional attribute as `None` (reverse permutation, unit strides, `VALID` padding).
-- Where the source carried `null` (the frontend always serializes those attributes as `null`) the value arrives as `AttrValue::Null`, `with_defaults` skips it and `envelope::attr_accepts` accepts it, so a rebuild of a decoded op is fine too.
-- `ConvParams::to_attrs` omits `strides`/`input_dilation`/`kernel_dilation` when the source did not carry them; that is now harmless (`defaulted()` leaves them absent), and repairing the generator/decoder mismatch belongs to `evoxc-core`, not here.
+- Where the source carried `null` (the frontend always serializes those attributes as `null`) the value arrives as `AttrValue::Null`, `with_defaults` skips it and `envelope::validate_attrs` accepts it, so a rebuild of a decoded op is fine too.
+- `ConvParams::to_attrs` omits `strides`/`input_dilation`/`kernel_dilation` when the source did not carry them; `Builder::emit` fills the schema defaults via `Attrs::with_defaults`, so the omission is harmless.
 - Frontend-vs-IR differences every rule must respect: `ops.slice` takes SIZES in Python while the IR `slice` carries `start_indices`/`limit_indices` (+ optional `strides`); `ops.gather(axis=a)` is the IR `gather` with `axes = [a]`; `ops.scatter(axis=a)` is the IR `scatter` with a scalar `axis`; `reduce_*` requires the `reduce_op` attribute (the frontend sugar sets it, hand-built attrs must too); `transpose`'s `permutation: null` means full reversal; `padding_config` is one `(low, high)` (or bare int) pair per axis.
 - Batching rules see the op's REWRITTEN operands and an EMPTY `results`/`result_types` (`RuleOp::from_source(...).bind_operands(...)`), so a batching rule must never read a rewritten result.
 - AD rules see both: the rewritten operands (the primals of the output module) and the rebuilt `results` (which is what the Python rules receive as `primals`).
@@ -168,7 +171,7 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 ## Test strategy
 
 - In-file `#[cfg(test)]` unit tests per module; no GPU, no network, no Python interpreter — `cargo test --manifest-path native/Cargo.toml -p evoxc-compiler`.
-- The crate currently holds 106 in-file tests, all passing; the test-vs-implementation drift previously recorded here is resolved, so the suite itself (`cargo test --manifest-path native/Cargo.toml -p evoxc-compiler`, 0 failed) is the gate.
+- The crate currently holds 114 in-file tests, all passing; the test-vs-implementation drift previously recorded here is resolved, so the suite itself (`cargo test --manifest-path native/Cargo.toml -p evoxc-compiler`, 0 failed) is the gate.
 - Every module test builds small programs with `Builder` (or the raw `Program` API) and asserts the emitted op sequence, the result types and one error per documented deferral.
 - The structural tests assert the shape of the rewrite (op names, `axis` shifts, permutation lists, return operand order) rather than numerics: numeric parity is the Python suite's job.
 - The parity oracle is `../tests/transforms/` (`test_vectorize.py`, `test_vmap.py`, `test_autodiff_rules.py`, `test_grad.py`, `test_jvp.py`, `test_vjp.py`, `test_errors.py`): a rule change must be reflected there first, and this crate's tests follow.
@@ -183,7 +186,7 @@ Python keeps the public frontend surface (decorators, pytrees, static values, re
 | `./src/builder.rs` | Mutable `Builder` over `evoxc_core::Program`: schema + arity + attribute validation, native inference, terminator take/set, `resume`, `inline_function`, `finish`. |
 | `./src/emit.rs` | Rule-facing emission surface: `RuleCtx` helpers, `RuleOp`, `ConvParams`, constant/scalar/int64 payload builders. |
 | `./src/vectorize.rs` | The `vectorize` engine: entry-function checks, input-axis normalization, the shared fresh batch `Dim`, program-order rebuild, `format_shape`. |
-| `./src/vmap.rs` | `vmap`: `vectorize` plus `out_axes` rearrangement (`reshape` of a size-one leading axis). |
+| `./src/vmap.rs` | `vmap`: `vectorize` plus `out_axes` rearrangement (one `transpose` for a mapped output at a non-zero axis; `reshape` + optional `broadcast` for an unmapped output). |
 | `./src/batching/mod.rs` | The batching engine: `MappedAxes`, rule type/registry, `rule_key`, `dispatch`, rule-result validation, extension inlining, `derive_output_axes`, missing-rule errors. |
 | `./src/batching/common.rs` | Shared batching shape arithmetic (`fold_product`, `is_batch_dim`, `leading_batch_count`, `row_shape`/`row_rank`, `shift_axes`, `leading_axes`, `reshape_to_broadcast`, `mapped`). |
 | `./src/batching/elementwise.rs` | The pointwise batching rule and its 28-op `POINTWISE_OPS` list plus the 12 `NONDIFF_POINTWISE_OPS`, and the `reduce_*`/`argmax`/`argmin` reduction rule (`REDUCTION_OPS`, `ARG_REDUCTION_OPS`). |

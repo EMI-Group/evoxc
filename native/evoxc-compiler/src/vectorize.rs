@@ -234,7 +234,12 @@ pub fn vectorize_impl(
 /// Normalize the per-input axes: one `Some(0)` / `None` entry per block
 /// argument, from `config.input_axes` (positional) overridden by
 /// `config.axes` (value ids).
-fn resolve_input_axes(
+/// Normalize the per-input axes (`config.axes` over `config.input_axes`).
+///
+/// `pub(crate)`: `vmap` reuses it to decide whether the pass has a mapped input
+/// (and therefore a real runtime batch extent to broadcast an unmapped output
+/// to).
+pub(crate) fn resolve_input_axes(
     _program: &Program,
     arguments: &[ValueId],
     config: &TransformConfig,
