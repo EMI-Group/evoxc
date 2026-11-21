@@ -7,6 +7,7 @@
 //! `native/evoxc-compiler/CONTEXT.md` for the internal invariants.
 
 pub mod ad;
+pub mod batch_functions;
 pub mod batching;
 pub mod builder;
 pub mod emit;
