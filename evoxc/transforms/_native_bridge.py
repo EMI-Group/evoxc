@@ -64,7 +64,16 @@ def call_native(
     if kind in _BATCHING_KINDS:
         resolved.setdefault("batch_dim_name", batching._batch_dim().name)
     resolved.setdefault("extension_rule", _native_rules.extension_rule)
-    result = _native.transform(kind, module, resolved)
+    _native_rules.reset_rule_failure()
+    try:
+        result = _native.transform(kind, module, resolved)
+    except Exception as exc:
+        # The engine wraps a bridge failure in its own `TransformError`; restore
+        # the rule's original exception (same message, own class) instead.
+        failure = _native_rules.take_rule_failure()
+        if failure is not None and failure is not exc:
+            raise failure from exc
+        raise
     return result["module"], result["transform"]
 
 

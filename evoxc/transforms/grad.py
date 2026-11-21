@@ -5,11 +5,10 @@ same inputs to gradient tensors. The native (Rust) AD engine is the default
 authority for the backward sweep and every builtin VJP rule; Python keeps the
 frontend validation/normalization and the `Graph` reconstruction here.
 
-The documented Python fallback (`autodiff.reverse_sweep`) runs only for graphs
-whose derivative rules live in Python — `block_call`, `external_call`, or a
-`sparse_*` op with a registered rule — because the native extension request
-carries tangent FLAGS rather than the cotangent SSA values (see
-`_native_ad.py`). Semantics are binding — see `./CONTEXT.md` "AD semantics".
+Derivative rules that live in Python (`block_call`, `external_call`, the
+sparse ops) are served to the engine through the extension-rule bridge, which
+receives the dual SSA values (see `_native_rules.py`); there is no Python AD
+fallback. Semantics are binding — see `./CONTEXT.md` "AD semantics".
 
 This module also hosts the small shared helpers used by the sibling AD entry
 points (`jvp.py`, `vjp.py`): return-op inspection and tangent/cotangent
@@ -25,7 +24,6 @@ from evoxc.trace import Graph, StaticValue, trace
 from evoxc.trace.trace import _format_path, _iter_leaf_paths
 from evoxc.transforms import _native_ad
 from evoxc.transforms._wrappers import TransformCallable
-from evoxc.transforms.autodiff import reverse_sweep
 
 
 def grad(fn_or_graph, argnums=None):
@@ -153,8 +151,8 @@ def _normalize_extra_pytree(
     Walks the user's pytree in parallel with `tree_spec` (the graph's input
     tree for jvp tangents, output tree for vjp cotangents) and returns the
     flat tuple of `core.TensorSpec`/`None` entries aligned with the tree's
-    tensor leaves (== `primal_specs` order) — exactly what
-    `forward_sweep`/`reverse_sweep` expect.
+    tensor leaves (== `primal_specs` order) — exactly the native sweep's
+    `tangent_inputs` / `cotangent_inputs` selector.
 
     Rules:
 
@@ -287,9 +285,8 @@ def _grad_graph(graph: Graph, argnums) -> Graph:
     `argnums` (out-of-range/non-differentiable entries → `TransformError`), and
     return a graph producing only the selected input gradients.
 
-    Delegates the backward sweep to the native AD engine; graphs with
-    extension-ruled ops (`block:*`/`external:*`/`sparse_*`) take the documented
-    Python fallback (`_grad_graph_python`)."""
+    Delegates the backward sweep to the native AD engine (extension-ruled ops
+    included — their Python rules are served through the extension bridge)."""
     _single_scalar_output(graph, "grad")
 
     is_single = isinstance(argnums, int) and not isinstance(argnums, bool)
@@ -303,56 +300,7 @@ def _grad_graph(graph: Graph, argnums) -> Graph:
                 f"or complex"
             )
 
-    if _native_ad._needs_python_ad(graph):
-        return _grad_graph_python(graph, selected, is_single)
     return _native_ad.grad_graph(graph, selected, is_single)
-
-
-def _grad_graph_python(graph: Graph, selected, is_single: bool) -> Graph:
-    """Python fallback: run the reverse sweep in `autodiff.py` seeded with the
-    scalar-one cotangent, then trim the return op to the selected gradients."""
-    # Reverse sweep seeded with the scalar-one cotangent (`None` → in-graph
-    # ones constant, so NO cotangent block args). The sweep module's `return`
-    # op yields (primal output, one cotangent per tensor input).
-    swept = reverse_sweep(graph, (None,))
-    module = swept.module
-    return_op = module.main.entry_block.terminator
-    cotangents = return_op.operands[1:]
-    new_operands = tuple(cotangents[index] for index in selected)
-
-    # Re-point the `return` op at only the selected cotangents. `ir.Op` is a
-    # mutable dataclass: reassign `operands` and reconcile the `Use` records
-    # by hand (`ir.verify` checks them in both directions).
-    for value in return_op.operands:
-        value.uses[:] = [use for use in value.uses if use.owner is not return_op]
-    return_op.operands = new_operands
-    for position, value in enumerate(new_operands):
-        value.add_use(ir.Use(return_op, position))
-
-    # Output tree: one bare gradient (int argnum) or a tuple of gradients.
-    # Leaf specs use `type=None` — the canonical plain-leaf spec (the persist
-    # codec round-trips "NoneType" ↔ None; `TreeSpec.num_leaves` counts it as
-    # one leaf and `unflatten_outputs` consumes one tensor for it).
-    if is_single:
-        output_tree = core.TreeSpec(type=None)
-    else:
-        output_tree = core.TreeSpec(
-            type=tuple,
-            children=tuple(core.TreeSpec(type=None) for _ in new_operands),
-        )
-
-    # Inputs are unchanged: drop the sweep's 2-tuple input tree (and the
-    # StaticValue records it appended for the None extra leaves) in favor of
-    # the original tree/records. No static outputs.
-    return Graph(
-        module,
-        input_specs=graph.input_specs,
-        tensor_specs=graph.tensor_specs,
-        output_tree=output_tree,
-        static_values=graph.static_values,
-        output_static_values=(),
-        source_locations=swept.source_locations,
-    )
 
 
 def _grad_fn(fn, args, argnums) -> Graph:
