@@ -153,13 +153,11 @@ fn signature_program(functions: &Json) -> std::result::Result<Program, ContextEr
     Ok(program)
 }
 
-/// Decode one `module.functions[i]` signature entry into
-/// `(name, input types, output types)`.
-fn signature_entry(
-    entry: &Json,
-    at: &str,
-) -> std::result::Result<(String, Vec<evoxc_core::ValueType>, Vec<evoxc_core::ValueType>), ContextError>
-{
+/// One decoded signature entry: `(name, input types, output types)`.
+type Signature = (String, Vec<evoxc_core::ValueType>, Vec<evoxc_core::ValueType>);
+
+/// Decode one `module.functions[i]` signature entry.
+fn signature_entry(entry: &Json, at: &str) -> std::result::Result<Signature, ContextError> {
     match entry {
         Json::Array(items) => {
             if !(2..=3).contains(&items.len()) {
