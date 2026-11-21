@@ -21,7 +21,7 @@ v1 envelope in :mod:`evoxc._native_codec` and maps the extension's
 ``NativeError.kind`` onto the public ``evoxc.core`` error family (message
 preserved verbatim).
 
-Two entry points exist:
+Three entry points exist:
 
 * :func:`infer` — op result-type inference; operands and result types travel
   as native type dicts, ``attributes`` pass through verbatim and the optional
@@ -39,6 +39,10 @@ Two entry points exist:
   :func:`evoxc._native_codec.decode_module` stays the validated decoder for
   an envelope of uncertain provenance.
 
+* :func:`batch_functions` — one native ``batch_functions`` merge over a
+  population of programs; returns ``{"module": ir.Module, "batch_report":
+  {...}, **extras}`` (the merged program through the same trusted fast decode
+  plus the 12-key report payload).
 Nothing else in evoxc delegates to this seam yet.
 """
 
@@ -64,6 +68,7 @@ __all__ = [
     "version",
     "infer",
     "transform",
+    "batch_functions",
 ]
 
 #: Environment variable naming an explicit extension path (``.so``/``.pyd``).
@@ -399,4 +404,80 @@ def transform(kind: str, module: ir.Module, config: dict[str, Any]) -> dict[str,
         "transform": _decode_transform_meta(result["transform"]),
     }
     output.update(extras)
+    return output
+
+
+def batch_functions(
+    programs: Sequence[ir.Module | Mapping[str, Any]], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the native ``batch_functions`` merge over ``programs``.
+
+    Each program is an :class:`ir.Module` (encoded here with
+    :func:`evoxc._native_codec.encode_module`) or an ALREADY-encoded
+    ``evoxc-native-ir`` envelope mapping (the rank-0 bridge re-encodes edited
+    copies and passes them straight through, so nothing is encoded twice).
+
+    The extension's result nests the merged envelope under ``"module"`` and its
+    12-key payload under ``"batch_report"``; the merged module is rebuilt with
+    the trusted fast :func:`evoxc._native_codec.decode_native_module` (it was
+    produced in-process from these programs), and any other top-level key is
+    preserved verbatim. ``config`` passes through untouched — a callable
+    ``config["extension_rule"]`` is never encoded.
+    """
+    if isinstance(programs, (str, bytes, bytearray)) or not isinstance(
+        programs, Sequence
+    ):
+        raise TypeError(
+            "batch_functions: 'programs' must be a sequence of ir.Module "
+            f"programs or encoded envelopes, got {type(programs).__name__}"
+        )
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"batch_functions: 'config' must be a dict, got {type(config).__name__}"
+        )
+    envelopes: list[dict[str, Any]] = []
+    for index, program in enumerate(programs):
+        if isinstance(program, ir.Module):
+            envelopes.append(_native_codec.encode_module(program))
+        elif isinstance(program, Mapping):
+            envelopes.append(dict(program))
+        else:
+            raise TypeError(
+                f"batch_functions: 'programs[{index}]' must be an ir.Module or "
+                f"an encoded envelope mapping, got {type(program).__name__}"
+            )
+    native = require()
+    try:
+        result = native.batch_functions(envelopes, config)
+    except Exception as exc:  # translated only for a known NativeError.kind
+        _translate(native, exc)
+        raise  # unreachable; keeps linters/type-checkers honest
+    if not isinstance(result, Mapping):
+        raise TypeError(
+            "the native extension's batch_functions returned "
+            f"{type(result).__name__} where a mapping was expected"
+        )
+    envelope = result.get("module")
+    if not isinstance(envelope, Mapping):
+        raise TypeError(
+            "the native extension's batch_functions result 'module' must be an "
+            "evoxc-native-ir envelope mapping"
+        )
+    report = result.get("batch_report")
+    if not isinstance(report, Mapping):
+        raise TypeError(
+            "the native extension's batch_functions result 'batch_report' must "
+            f"be a mapping, got {type(report).__name__}"
+        )
+    output: dict[str, Any] = {
+        "module": _native_codec.decode_native_module(dict(envelope)),
+        "batch_report": dict(report),
+    }
+    output.update(
+        {
+            key: value
+            for key, value in result.items()
+            if key not in ("module", "batch_report")
+        }
+    )
     return output

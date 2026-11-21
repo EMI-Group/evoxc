@@ -60,26 +60,6 @@ from evoxc.transforms._report import REPORT_KEYS
 __all__ = ["batch_functions", "REPORT_KEYS"]
 
 
-def _encode_programs(modules: Sequence[ir.Module]) -> list[dict]:
-    """Encode every input program, naming the offending position on error."""
-    if isinstance(modules, (str, bytes, bytearray)) or not isinstance(
-        modules, collections.abc.Sequence
-    ):
-        raise TypeError(
-            "batch_functions: 'modules' must be a sequence of ir.Module "
-            f"programs, got {type(modules).__name__}"
-        )
-    envelopes = []
-    for index, module in enumerate(modules):
-        if not isinstance(module, ir.Module):
-            raise TypeError(
-                f"batch_functions: 'modules[{index}]' must be an ir.Module, "
-                f"got {type(module).__name__}"
-            )
-        envelopes.append(_native_codec.encode_module(module))
-    return envelopes
-
-
 def _decode_report(raw: Any) -> dict[str, Any]:
     """Validate the extension's ``"batch_report"`` payload (a plain mapping)."""
     if not isinstance(raw, Mapping):
@@ -176,47 +156,6 @@ def _rank0_unmapped_rejection(exc: BaseException) -> bool:
     return "requires the output to be unmapped" in str(exc)
 
 
-def _call_native(native: Any, envelopes: Sequence[Mapping], config: Mapping) -> Any:
-    """Call the extension, translating a ``NativeError`` into its public kind."""
-    try:
-        return native.batch_functions(list(envelopes), dict(config))
-    except Exception as exc:  # translated only for a known NativeError.kind
-        _native._translate(native, exc)
-        raise  # unreachable; keeps linters/type-checkers honest
-
-
-def _assemble(modules: Sequence[ir.Module], result: Any) -> dict[str, Any]:
-    """Validate the extension result and decode the merged module."""
-    if not isinstance(result, Mapping):
-        raise TypeError(
-            f"the native batch_functions returned {type(result).__name__} "
-            "where a mapping was expected"
-        )
-    if "module" not in result:
-        raise TypeError(
-            "the native batch_functions result is missing its merged 'module' "
-            "envelope"
-        )
-    if "batch_report" not in result:
-        raise TypeError(
-            "the native batch_functions result is missing its 'batch_report' "
-            "payload"
-        )
-    envelope = result["module"]
-    if not isinstance(envelope, Mapping):
-        raise TypeError(
-            "the native batch_functions result 'module' must be an "
-            f"evoxc-native-ir envelope mapping, got {type(envelope).__name__}"
-        )
-    output: dict[str, Any] = {
-        "module": _native_codec.decode_module(dict(envelope)),
-        "batch_report": _decode_report(result["batch_report"]),
-    }
-    if "input_ids" in result:
-        output["input_ids"] = [int(value) for value in result["input_ids"]]
-    return output
-
-
 def batch_functions(
     modules: Sequence[ir.Module], config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -246,10 +185,8 @@ def batch_functions(
             f"batch_functions: 'config' must be a dict, got {type(config).__name__}"
         )
     rank0_leaves = _rank0_function_axis_leaves(modules, config.get("out_axes"))
-    envelopes = _encode_programs(modules)
-    native = _native.require()
     if not rank0_leaves:
-        return _assemble(modules, _call_native(native, envelopes, config))
+        return _merge(modules, config)
     n_functions = len(modules)
     # Cheap tier: leave the programs untouched and ask for an UNMAPPED rank-0
     # output, then add the function axis with ONE post-merge `broadcast`. A
@@ -261,15 +198,14 @@ def batch_functions(
         cheap_entries[leaf_index] = None
     cheap_config["out_axes"] = cheap_entries
     try:
-        result = None if config.get("bands") is not None else _call_native(
-            native, envelopes, cheap_config
+        assembled = (
+            None if config.get("bands") is not None else _merge(modules, cheap_config)
         )
     except core.TransformError as exc:
         if not _rank0_unmapped_rejection(exc):
             raise
     else:
-        if result is not None:
-            assembled = _assemble(modules, result)
+        if assembled is not None:
             module = assembled["module"]
             for leaf_index in rank0_leaves:
                 if len(module.main.output_types[leaf_index].shape) == 0:
@@ -280,13 +216,25 @@ def batch_functions(
     # Wrapped tier: the merged values ARE mapped, so native cannot keep a rank-0
     # output at all — express each program's output as a `(1,)` row and unwrap
     # the merged `(N, 1)` back to the documented `(N,)` function axis.
-    wrapped = [_wrap_program_envelope(envelope, rank0_leaves) for envelope in envelopes]
-    assembled = _assemble(modules, _call_native(native, wrapped, config))
+    wrapped = [
+        _wrap_program_envelope(_native_codec.encode_module(module), rank0_leaves)
+        for module in modules
+    ]
+    assembled = _merge(wrapped, config)
     module = assembled["module"]
     for leaf_index in rank0_leaves:
         if not _strip_rank0_wrapper(module, leaf_index):
             _insert_output_op(module, leaf_index, "reshape", {"shape": (n_functions,)})
     _discount_wrapper_classes(assembled["batch_report"], modules, rank0_leaves)
+    return assembled
+
+
+def _merge(
+    programs: Sequence[Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One façade merge: modules (or envelopes) in, decoded module + report out."""
+    assembled = _native.batch_functions(list(programs), dict(config))
+    assembled["batch_report"] = _decode_report(assembled["batch_report"])
     return assembled
 
 
