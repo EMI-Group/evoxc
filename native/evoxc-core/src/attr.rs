@@ -86,12 +86,16 @@ pub enum AttrValue {
 
 impl AttrValue {
     /// Does this value satisfy the declared attribute type tag?
+    ///
+    /// [`AttrValue::Null`] is the explicit `None` value the Python registry
+    /// models (`default=None`), so it satisfies every declared tag.
     pub fn matches_type(&self, ty: &str) -> bool {
+        if matches!(self, AttrValue::Null) {
+            return true;
+        }
         match (ty, self) {
             (attr_type::BOOL, AttrValue::Bool(_)) => true,
             (attr_type::INT, AttrValue::Int(_)) => true,
-            // `None` is documented for optional ints (e.g. argmax axis).
-            (attr_type::INT, AttrValue::Null) => true,
             (attr_type::FLOAT, AttrValue::Float(_)) => true,
             (attr_type::STR, AttrValue::Str(_)) => true,
             (attr_type::DTYPE, AttrValue::DType(_)) => true,
@@ -126,7 +130,15 @@ impl AttrValue {
     }
 
     /// Convert one JSON value under a declared attribute type tag.
+    ///
+    /// JSON `null` decodes to [`AttrValue::Null`] for every tag: the Python
+    /// registry declares `default=None` on optional attributes of any type
+    /// (`slice.strides` (`ints`), `transpose.permutation` (`ints`),
+    /// `flip.axes` (`any`), …), so `None` is a legal value for every tag.
     pub fn from_json(ty: &str, value: &Json) -> Result<AttrValue> {
+        if value.is_null() {
+            return Ok(AttrValue::Null);
+        }
         // A tuple marker round-trips under any declared type.
         if let Json::Object(map) = value {
             if let Some(items) = map.get(TUPLE_TAG) {
@@ -145,15 +157,10 @@ impl AttrValue {
                 .as_bool()
                 .map(AttrValue::Bool)
                 .ok_or_else(|| Error::verification(format!("expected a bool, got {value}"))),
-            attr_type::INT => {
-                if value.is_null() {
-                    return Ok(AttrValue::Null);
-                }
-                value
-                    .as_i64()
-                    .map(AttrValue::Int)
-                    .ok_or_else(|| Error::verification(format!("expected an int, got {value}")))
-            }
+            attr_type::INT => value
+                .as_i64()
+                .map(AttrValue::Int)
+                .ok_or_else(|| Error::verification(format!("expected an int, got {value}"))),
             attr_type::FLOAT => value
                 .as_f64()
                 .map(AttrValue::Float)
@@ -449,6 +456,30 @@ impl Attrs {
         }
     }
 
+    /// A nullable `ints` attribute: `None` when absent or [`AttrValue::Null`].
+    pub fn opt_ints(&self, name: &str) -> Result<Option<&[i64]>> {
+        match self.get(name) {
+            None | Some(AttrValue::Null) => Ok(None),
+            Some(value) => value.as_ints().map(Some),
+        }
+    }
+
+    /// A nullable `strs` attribute: `None` when absent or [`AttrValue::Null`].
+    pub fn opt_strs(&self, name: &str) -> Result<Option<&[String]>> {
+        match self.get(name) {
+            None | Some(AttrValue::Null) => Ok(None),
+            Some(value) => value.as_strs().map(Some),
+        }
+    }
+
+    /// A nullable `shape` attribute: `None` when absent or [`AttrValue::Null`].
+    pub fn opt_shape(&self, name: &str) -> Result<Option<&Shape>> {
+        match self.get(name) {
+            None | Some(AttrValue::Null) => Ok(None),
+            Some(value) => value.as_shape().map(Some),
+        }
+    }
+
     pub fn f64(&self, name: &str) -> Result<f64> {
         self.get_required(name)?.as_f64()
     }
@@ -678,6 +709,113 @@ mod tests {
                 assert!(filled.contains(declared.name), "default for {}", declared.name);
             }
         }
+    }
+
+    #[test]
+    fn every_registered_op_fills_its_defaults() {
+        // Attribute plumbing only: no op-specific inference rule is involved.
+        for op in crate::schema::all() {
+            let filled = Attrs::new().with_defaults(op).unwrap_or_else(|err| {
+                panic!("op {} defaults failed: {}", op.name, err.message)
+            });
+            for declared in op.attrs {
+                if declared.required {
+                    continue;
+                }
+                assert!(
+                    filled.contains(declared.name),
+                    "op {} did not fill optional attribute {}",
+                    op.name,
+                    declared.name
+                );
+                if declared.default_json == Some("null") {
+                    assert_eq!(
+                        filled.get(declared.name),
+                        Some(&AttrValue::Null),
+                        "op {} attribute {} should be Null",
+                        op.name,
+                        declared.name
+                    );
+                    assert!(filled
+                        .get(declared.name)
+                        .unwrap()
+                        .matches_type(declared.ty));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn null_default_decodes_for_every_sequence_tag() {
+        for (ty, op_name, attr_name) in [
+            (attr_type::INTS, "slice", "strides"),
+            (attr_type::INTS, "transpose", "permutation"),
+        ] {
+            let op = require(op_name).unwrap();
+            let declared = op.attr(attr_name).unwrap();
+            assert_eq!(declared.ty, ty);
+            assert_eq!(declared.default_value().unwrap(), Some(AttrValue::Null));
+            assert!(AttrValue::Null.matches_type(ty));
+        }
+    }
+
+    #[test]
+    fn null_attribute_roundtrips_through_the_envelope() {
+        let op = require("slice").unwrap();
+        let json = serde_json::json!({
+            "start_indices": [0],
+            "limit_indices": [2],
+            "strides": null,
+        });
+        let attrs = Attrs::from_json_map(json.as_object().unwrap(), op).unwrap();
+        assert_eq!(attrs.get("strides"), Some(&AttrValue::Null));
+        assert_eq!(attrs.opt_ints("strides").unwrap(), None);
+        // The required accessor still rejects the null value.
+        assert_eq!(attrs.ints("strides").unwrap_err().kind_str(), "VerificationError");
+        assert_eq!(attrs.to_json(), json);
+    }
+
+    #[test]
+    fn optional_sequence_accessors() {
+        let attrs = Attrs::from_pairs([
+            ("ints_attr", AttrValue::Ints(vec![1, 2])),
+            ("strs_attr", AttrValue::Strs(vec!["a".to_string()])),
+            ("shape_attr", AttrValue::Shape(vec![Dim::int(2), Dim::named("B")])),
+            ("null_attr", AttrValue::Null),
+            ("int_attr", AttrValue::Int(3)),
+        ]);
+
+        assert_eq!(attrs.opt_ints("ints_attr").unwrap(), Some(&[1, 2][..]));
+        assert_eq!(attrs.opt_ints("null_attr").unwrap(), None);
+        assert_eq!(attrs.opt_ints("absent").unwrap(), None);
+        assert_eq!(
+            attrs.opt_ints("int_attr").unwrap_err().kind_str(),
+            "VerificationError"
+        );
+
+        assert_eq!(
+            attrs.opt_strs("strs_attr").unwrap(),
+            Some(&["a".to_string()][..])
+        );
+        assert_eq!(attrs.opt_strs("null_attr").unwrap(), None);
+        assert_eq!(attrs.opt_strs("absent").unwrap(), None);
+        assert!(attrs.opt_strs("ints_attr").is_err());
+
+        assert_eq!(
+            attrs.opt_shape("shape_attr").unwrap(),
+            Some(&vec![Dim::int(2), Dim::named("B")])
+        );
+        assert_eq!(attrs.opt_shape("null_attr").unwrap(), None);
+        assert_eq!(attrs.opt_shape("absent").unwrap(), None);
+        assert!(attrs.opt_shape("int_attr").is_err());
+    }
+
+    #[test]
+    fn opt_i64_stays_none_after_null_defaults_are_filled() {
+        let op = require("argmax").unwrap();
+        let filled = Attrs::new().with_defaults(op).unwrap();
+        assert_eq!(filled.get("axis"), Some(&AttrValue::Null));
+        assert_eq!(filled.opt_i64("axis").unwrap(), None);
     }
 
     #[test]

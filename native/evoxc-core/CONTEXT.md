@@ -52,7 +52,7 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 - Constant payloads are raw little-endian bytes inside `{"__evoxc_ndarray__": {"dtype", "shape", "data_b64"}}`; tuples use `{"__evoxc_tuple__": [...]}`.
 - Decode validates duplicate value/op ids, dangling operands, unreferenced table entries, unknown op names, malformed payloads and declared-vs-computed `output_types`, then rebuilds uses and reseeds the allocators.
 - Encode is deterministic (ascending op ids, function/block/region order, preserved map key order) and always emits `location`, `metadata`, `input_types`, `output_types` and both `id` and `ref`.
-- Attribute decoding accepts JSON `null` for an `INTS` attribute whose declared default is `null` (`conv.strides`/`input_dilation`/`kernel_dilation`, `slice.strides`, `transpose.permutation`, …) because the Python builder serializes those defaults as `null`; `AttrValue::Null` round-trips back to `null`.
+- Attribute decoding accepts JSON `null` for EVERY declared type tag, decoding it to `AttrValue::Null` (the registry models `default=None` on optional attributes of any type: `conv.strides`/`input_dilation`/`kernel_dilation`, `slice.strides`, `transpose.permutation` (`ints`), `flip.axes`/`roll.axis` (`any`), …); `AttrValue::Null` matches every declared tag, round-trips back to `null`, and the required accessors reject it while `opt_i64`/`opt_ints`/`opt_strs`/`opt_shape` read it as `None`.
 
 ## Inference contract
 
@@ -79,7 +79,7 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 
 ## Test strategy
 
-- `cargo test --manifest-path native/Cargo.toml -p evoxc-core` runs 212 in-crate tests plus the 2-test parity integration test; no GPU, network or Python interpreter is needed.
+- `cargo test --manifest-path native/Cargo.toml -p evoxc-core` runs 217 in-crate tests plus the 2-test parity integration test; no GPU, network or Python interpreter is needed.
 - Per-module in-file `#[cfg(test)]` tests cover dims/dtypes/attrs/wire, graph construction and use tracking, envelope round-trips (symbolic dims, nested `if`/`while` regions, tuple/ndarray attributes, every validation error), helper parity (broadcasting, count folding/division, axis normalization, reduce dtypes, default filling) and each inference category ported case-by-case from `tests/ir/test_inference.py`.
 - `verify.rs` tests construct small programs and assert one violation each (terminator, dominance, arity, dtype/shape disagreement, constant payload, `if` branches, use records, location annotation).
 - `tests/parity.rs` replays 518 committed cases over all 113 shape-fn ops (461 successful, 57 explicit-rejection) and requires exact result types for the successes and error-ness for the rejections; `KNOWN_DIVERGENCES` is empty.
