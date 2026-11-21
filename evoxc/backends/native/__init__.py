@@ -26,17 +26,28 @@ Staging (mirrors ``numpy/`` step for step):
   versioned, self-describing serialized ``ir.Module`` (so lowered programs and
   artifacts stay savable and portable).
 - ``compile(lowered, options)``: validate ``lowered.backend == "native"``,
-  scan the serialized module for the custom-op names it requires
-  (``block_call`` / ``external_call`` / ``runtime_call``), record
-  ``target="cpu"`` and the runtime dependencies (``numpy`` + the extension
-  version). No lowering work happens here.
-- ``load(artifact, device, options)``: accept only a CPU ``Device``; rebuild
-  the engine program from the artifact payload (never re-lower); require a
-  registered ``native`` impl for every remaining ``block_call`` (missing ⇒
+  resolve the custom-op names it requires (``block_call`` / ``external_call``
+  / ``runtime_call`` — reused from ``lower`` in-process, ONE decode + ONE scan
+  for a disk-loaded program), record ``target="cpu"`` and the runtime
+  dependencies (``numpy`` + the extension version). No lowering work happens
+  here.
+- ``load(artifact, device, options)``: accept only a CPU ``Device``; reuse the
+  artifact's in-process module/program attachments, else rebuild the engine
+  program from the artifact payload (never re-lower); require a registered
+  ``native`` impl for every remaining ``block_call`` (missing ⇒
   ``PersistenceError`` naming the block). External kernels and
   ``runtime_call`` callbacks stay LAZY (per the binding persistence contract:
   the registries are never serialized and must be re-established before RUN,
   not before load).
+
+Single-decode staging (mirroring ``numpy/``): ``lower`` attaches the live
+module, the payload object, the collected names, the encoded envelope and the
+compiled program as PRIVATE non-persisted hints, and ``compile``/``load`` reuse
+them under a payload-identity check — so one in-process
+``lower → compile → load`` chain decodes ZERO times, encodes once and compiles
+once, while a disk-loaded program/artifact takes exactly one decode + one
+encode + one ``native_compile``. Persisted container bytes are unchanged; the
+``staging_stats()`` / ``reset_staging_stats()`` counters expose the tallies.
 
 ``NativeExecutable`` satisfies the ``Executable`` protocol and adds
 ``plan_text()`` / ``stats()`` / ``required_ops()`` so the engine's dispatch
@@ -661,6 +672,14 @@ class NativeExecutable:
         self.device = device
         self.functions = (engine.program_entry(program),)
         self._resolver = NativeCallbackResolver()
+        # Per-executable run-path caches (pure derivations, no observable
+        # behavior change): the resolved extension module (the program can only
+        # exist once it loaded, so resolving once is enough) and the flattened
+        # signature layout, rebuilt only when ``signature`` is REPLACED (identity
+        # check) — validation and every error message stay exactly as they were.
+        self._native_module = None
+        self._input_specs_cache = None
+        self._output_specs_cache = None
 
     # ------------------------------------------------------------------- run
 
@@ -683,8 +702,18 @@ class NativeExecutable:
         """
         validate_options(options, NativeBackend.KNOWN_OPTIONS, self.backend_name, "run")
         inputs = self._validated_inputs(flat_input_tensors)
-        outputs = engine.program_run(self._program, inputs, self._resolver)
+        outputs = engine.program_run(
+            self._program, inputs, self._resolver, self._engine()
+        )
         return self._wrap_outputs(outputs)
+
+    def _engine(self):
+        """The resolved extension module, resolved ONCE per executable."""
+        module = self._native_module
+        if module is None:
+            module = engine.engine_module()
+            self._native_module = module
+        return module
 
     def synchronize(self) -> None:
         """Documented no-op: the native engine's ``run`` already blocks.
@@ -736,6 +765,37 @@ class NativeExecutable:
 
     # ------------------------------------------------------------- internals
 
+    def _input_specs(self) -> tuple:
+        """The flattened input specs, cached against the CURRENT signature object.
+
+        A pure derivation of ``signature.input_specs``; the cache is keyed on the
+        identity of ``self.signature``, so replacing the attribute is honored.
+        """
+        signature = self.signature
+        cached = self._input_specs_cache
+        if cached is None or cached[0] is not signature:
+            specs = tuple(signature.input_specs) if signature is not None else ()
+            cached = self._input_specs_cache = (signature, specs)
+        return cached[1]
+
+    def _output_specs(self) -> tuple[tuple, tuple]:
+        """``(output_specs, per-output (np.dtype, declared dims))``, cached.
+
+        Same identity-keyed derivation as :meth:`_input_specs`. The per-output
+        pairs are exactly what :meth:`_check_output_spec` compares against, so
+        the recorded ``TensorSpec``s are coerced once instead of per call —
+        validation (and every error message) is unchanged.
+        """
+        signature = self.signature
+        cached = self._output_specs_cache
+        if cached is None or cached[0] is not signature:
+            specs = tuple(signature.output_specs) if signature is not None else ()
+            prepared = tuple(
+                (np.dtype(spec.dtype), tuple(spec.shape or ())) for spec in specs
+            )
+            cached = self._output_specs_cache = (signature, specs, prepared)
+        return cached[1], cached[2]
+
     def _validated_inputs(self, flat_input_tensors: list["Tensor"]) -> list:
         """Validate the flat host inputs and return the engine's array list."""
         if not isinstance(flat_input_tensors, (list, tuple)):
@@ -743,7 +803,7 @@ class NativeExecutable:
                 "NativeExecutable.run expects a list of core.Tensor inputs, "
                 f"got {type(flat_input_tensors).__name__}"
             )
-        specs = self.signature.input_specs if self.signature is not None else ()
+        specs = self._input_specs()
         if specs and len(flat_input_tensors) != len(specs):
             raise core.BackendError(
                 f"native executable expects {len(specs)} input tensor(s), got "
@@ -776,13 +836,14 @@ class NativeExecutable:
                 f"{type(outputs).__name__} where a list of output arrays was "
                 "expected"
             )
-        outputs = list(outputs)
-        specs = self.signature.output_specs if self.signature is not None else ()
+        specs, prepared = self._output_specs()
         if specs and len(outputs) != len(specs):
             raise core.BackendError(
                 f"the native CPU engine returned {len(outputs)} output(s), the "
                 f"signature declares {len(specs)}"
             )
+        if not isinstance(outputs, list):
+            outputs = list(outputs)
         tensors = []
         for index, array in enumerate(outputs):
             if not isinstance(array, np.ndarray):
@@ -790,25 +851,30 @@ class NativeExecutable:
                     f"the native CPU engine returned {type(array).__name__} for "
                     f"output {index}, expected a numpy array"
                 )
-            if index < len(specs):
-                self._check_output_spec(index, array, specs[index])
+            if index < len(prepared):
+                dtype, declared = prepared[index]
+                self._check_output_spec(index, array, dtype, declared)
             tensors.append(core.Tensor(array))
         return tensors
 
     @staticmethod
-    def _check_output_spec(index: int, array: np.ndarray, spec: Any) -> None:
+    def _check_output_spec(
+        index: int, array: np.ndarray, dtype: np.dtype, declared: tuple
+    ) -> None:
         """Validate one output against its recorded ``TensorSpec``.
 
-        dtype must match exactly (``core.BackendError``); shape is compared
-        only on the dims the spec declares concretely (a symbolic or ``None``
-        dim is runtime-dynamic and unchecked) — ``core.ShapeError`` otherwise.
+        ``dtype``/``declared`` are the spec's coerced dtype and declared shape
+        (precomputed by :meth:`_output_specs`; ``np.dtype(spec.dtype)`` and
+        ``tuple(spec.shape or ())`` verbatim). dtype must match exactly
+        (``core.BackendError``); shape is compared only on the dims the spec
+        declares concretely (a symbolic or ``None`` dim is runtime-dynamic and
+        unchecked) — ``core.ShapeError`` otherwise.
         """
-        if np.dtype(spec.dtype) != array.dtype:
+        if dtype != array.dtype:
             raise core.BackendError(
                 f"output {index} dtype is {array.dtype.name} from the native "
-                f"engine but {np.dtype(spec.dtype).name} in the graph signature"
+                f"engine but {dtype.name} in the graph signature"
             )
-        declared = tuple(spec.shape or ())
         if not declared:
             if array.ndim != 0:
                 raise core.ShapeError(

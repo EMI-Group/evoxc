@@ -281,17 +281,31 @@ def _optional_attr(program: Any, name: str):
     return accessor
 
 
-def program_run(program: Any, flat_inputs: Iterable[Any], resolver: Any = None):
+def program_run(
+    program: Any,
+    flat_inputs: Iterable[Any],
+    resolver: Any = None,
+    native: Any = None,
+):
     """``NativeProgram.run(flat_inputs, resolver)`` with error translation.
 
     ``flat_inputs`` are numpy arrays (host data — the engine's v1 contract);
     ``resolver`` is the callback resolver object (``call_block`` /
     ``call_external`` / ``call_runtime``, see ``resolver.py``) or ``None`` for
     a graph with no callback boundaries.
+
+    ``native``: an ALREADY-RESOLVED extension module (the caller's cached
+    :func:`engine_module` result), used instead of re-resolving it on every
+    call — the hot path of a device-free ``run``. ``None`` resolves it here,
+    with the same explicit ``core.BackendError`` when it is unavailable.
     """
-    native = engine_module()
+    if native is None:
+        native = engine_module()
     try:
-        return program.run(list(flat_inputs), resolver)
+        return program.run(
+            flat_inputs if isinstance(flat_inputs, list) else list(flat_inputs),
+            resolver,
+        )
     except Exception as exc:  # noqa: BLE001 — translated only for NativeError
         _translate(native, exc)
         raise  # unreachable; keeps linters honest
