@@ -658,8 +658,71 @@ class Tensor:
     # Like ndarray, tensors are unhashable (value equality is not identity).
     __hash__ = None  # type: ignore[assignment]
 
+    #: At most this many elements are previewed by ``__repr__``.
+    _REPR_PREVIEW_ELEMENTS = 8
+
+    def _repr_value_preview(self) -> Optional[str]:
+        """A compact one-line value preview for SMALL ndarray-backed tensors.
+        INSPECTION ONLY, host-only by construction: this is only reached for
+        ``isinstance(self.data, np.ndarray)`` (see :meth:`__repr__`), so no
+        device payload and no host copy is ever touched.
+        A bool/integer/float/complex dtype of at most 8 elements renders via
+        ``np.array2string`` (``precision=4``, ``threshold=8``,
+        ``max_line_width=200``) on the flattened array; larger arrays and
+        string/object dtypes get NO preview (big data is never printed).
+        Returns:
+            The preview text, or ``None`` when no preview applies or the
+            formatting fails unexpectedly (``repr`` then stays metadata-only
+            — formatting must never raise).
+        """
+        try:
+            data = self.data
+            if not isinstance(data, np.ndarray):
+                return None
+            if data.size > self._REPR_PREVIEW_ELEMENTS:
+                return None
+            if data.dtype.kind not in "biufc":
+                return None
+            text = np.array2string(
+                data.reshape(-1),
+                precision=4,
+                threshold=self._REPR_PREVIEW_ELEMENTS,
+                max_line_width=200,
+            )
+            return " ".join(text.splitlines())
+        except Exception:  # best-effort inspection: repr must never raise
+            return None
+
     def __repr__(self) -> str:
-        return f"Tensor(shape={self.shape}, dtype={self.dtype}, device={self.device!r})"
+        """One-line, informative, INSPECTION-ONLY summary of this tensor.
+        Always renders shape, dtype and device, e.g.
+        ``Tensor(shape=(2, 3), dtype=float32, device=cpu:0)``. An
+        ndarray-backed tensor of at most 8 elements with a
+        bool/integer/float/complex dtype additionally renders a compact value
+        preview (``, data=[1. 2. 3.]``); larger arrays and string/object
+        dtypes stay metadata-only. A device-payload-backed tensor renders
+        metadata plus the payload class name (``, payload=IreeDevicePayload``).
+        **The preview is host-only and never materializes device memory**:
+        ``repr`` never calls ``.numpy()``, never asks a payload for its host
+        copy, and never forces a device-to-host transfer — a device tensor
+        costs exactly a metadata read. ``repr`` never raises: unexpected
+        formatting failures fall back to metadata-only text.
+        """
+        try:
+            parts = [
+                f"shape={self.shape}",
+                f"dtype={self.dtype}",
+                f"device={self.device.kind}:{self.device.index}",
+            ]
+            if isinstance(self.data, np.ndarray):
+                preview = self._repr_value_preview()
+                if preview is not None:
+                    parts.append(f"data={preview}")
+            else:
+                parts.append(f"payload={type(self.data).__name__}")
+            return f"Tensor({', '.join(parts)})"
+        except Exception:  # inspection-only: repr must never raise
+            return f"Tensor(<unrepresentable {type(self.data).__name__}>)"
 
 
 def from_numpy(array: np.ndarray) -> Tensor:
