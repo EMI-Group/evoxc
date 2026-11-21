@@ -1,11 +1,10 @@
 # Rust-first evoxc: native architecture proposal
 
-**Status: proposed target architecture, not implemented policy.**
-This document describes the intended clean architecture if a Rust-first evoxc is approved.
-All interfaces, crate names, code fragments, and packaging choices below are proposed, not current APIs.
-The repository remains a pure-Python implementation governed by [CONTEXT.md](CONTEXT.md) and [the package contract](evoxc/CONTEXT.md).
-This proposal neither changes those contracts nor claims that native code has been benchmarked.
-It specifies an end state and explicit compatibility decisions, not a migration plan.
+**Status: the graph-transformation and packaging layers are implemented; the rest is the target design.**
+Implemented in `native/` and shipped through the maturin-built PyO3 extension `evoxc._evoxc_native`: the op schema table, dtype promotion, `Dim`/`DimExpr`, graph IR and envelope codec, the batching/vmap engine, the AD engines, `batch_functions`, the extension-rule bridge, and the Python delegation of `vectorize`/`vmap`/`grad`/`jvp`/`vjp`/`batch_functions`.
+Still proposed rather than current: `infer`/`verify` on the Python trace hot path (native ports exist and are parity-tested), native lowering/StableHLO export, the backend adapters, and the runtime session/buffer layer (`evoxc-runtime` is a compiling skeleton).
+Where this document and [CONTEXT.md](CONTEXT.md) or [the package contract](evoxc/CONTEXT.md) differ, the contract wins.
+The measured state and evidence are in the root contract's Status section, `./evoxc/bench/native_architecture_findings.md` and `./evoxc/transforms/CONTEXT.md`.
 
 ## Contents
 
