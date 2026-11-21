@@ -53,7 +53,7 @@ Conversion (mirrors ``native/evoxc-compiler/tests/parity_transform/convert.py``)
 * :func:`decode_native_module` is the TRUSTED fast decoder for an envelope the
   native engine just produced from a module this runtime encoded (the
   transform seam): same discriminator/version check, then
-  :func:`evoxc.ir.serialize._build_module_fast` builds the IR objects directly
+  :func:`evoxc.ir._native_decode.build_module_fast` builds the IR objects directly
   — no generic ``_require_*`` validation, no sha256 and no ``ir.verify``.
   The result is structurally identical; ``EVOXC_NATIVE_DECODE_CHECK=1`` turns
   the verification cross-check back on for development.
@@ -73,7 +73,7 @@ import numpy as np
 
 from evoxc import ir
 from evoxc.core import Dim, DimExpr
-from evoxc.ir import serialize as _ir_serialize
+from evoxc.ir import _native_decode, serialize as _ir_serialize
 
 __all__ = [
     "ENVELOPE_FORMAT",
@@ -298,7 +298,7 @@ def decode_native_module(envelope: Any, *, verify_module: bool | None = None) ->
     flag (read once at import, off by default), which is the development-only
     cross-check: it runs ``ir.verify`` over the fast-decoded module.
     """
-    module = _ir_serialize._build_module_fast(_validated_envelope_body(envelope))
+    module = _native_decode.build_module_fast(_validated_envelope_body(envelope))
     if verify_module is None:
         verify_module = _VERIFY_NATIVE_DECODE
     if verify_module:
