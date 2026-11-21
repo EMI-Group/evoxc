@@ -20,6 +20,8 @@ A committed artefact is history — a new measurement is a new file or a re-run 
 
 | `probe_intel_vulkan.py` | Deterministic (no RNG or timing) real-Intel ANV correctness/residency probe, run as `python -m evoxc.bench.probe_intel_vulkan` with the adapter context's scoped ICD/loader recipe; five same-device elementwise/reduction/matmul iterations, explicit readback and host-transfer guards. |
 | `intel_vulkan_findings.md` | Panther Lake `8086:b0a0`, Mesa 26.3.0 ANV and pinned IREE 3.13.0 evidence, measured errors and scope boundaries; links to the single maintained reproduction recipe in the adapter context. |
+| `probe_native_architecture.py` | Deterministic (`--seed 0`) public-API native-engine evidence probe: ~1500-op chain construction plus native `vectorize`/`vmap`/`grad` min/median of 7, `batch_functions` on 64 identical and 64 branchy (`switch_ops=True`) programs with the 12-key `graph.batch_report` and row-correctness, the explicit `trace → lower → compile → load` CPU pipeline on a vmap-batched per-sample graph, the same graph device-resident on Intel Xe Vulkan through IREE (residency, `.numpy()`/`.to(cpu)` guards, host-input refusal, parity, warm `run`), and the Rust-produced `batch_functions` graph executing on Vulkan; `--skip-vulkan` runs the CPU half and any correctness failure exits nonzero. |
+| `native_architecture_findings.md` | Host/CPU/Intel Xe GPU/driver and version provenance, exact commands, the transform/`batch_functions`/CPU/Vulkan numeric tables and parity errors, the 101/101 Vulkan suite count, and the shared-host/indicative-timing caveats. |
 ## Measured conclusion
 
 The iree compile option `dispatch_formation="aggressive"` (→ `--iree-dispatch-creation-enable-aggressive-fusion`) is the only dispatch-formation knob that moves the count — 596 → 548 dispatches and −7…−9 % warm on rocm merged-population graphs (−5 % compile at pop 4000) with no llvm-cpu gain — so it ships OPT-IN and is enabled per-call on rocm.
@@ -29,6 +31,11 @@ In the ROCm 3.13 campaign Vulkan device visibility was checked but no vulkan CEL
 
 The separate Intel Panther Lake ANV validation passed five small-graph same-device iterations with zero `asdevicearray` calls, 17 guards and maximum matmul absolute error `1.91e-6`; the existing Vulkan suites passed 101/101 without skips.
 This is correctness/residency coverage only, not general GPU support, performance or model readiness, and does not replace the historical lavapipe evidence.
+
+The native (Rust) transform-engine probe passed end-to-end with exit 0: on a 1495-op chain `vectorize`/`vmap`/`grad` took 27.08/27.79, 26.53/28.14 and 36.07/37.30 ms (min/median of 7), and `batch_functions` merged 64 identical and 64 branchy programs in 8.69/8.81 and 8.86/8.94 ms with row-exact results.
+The CPU explicit pipeline ran the vmap-batched per-sample graph at 0.036/0.037 ms warm with bit-exact numpy parity, and the same graph ran device-resident on the Intel Xe Vulkan device at 0.269/0.291 ms warm with maximum absolute error `1.19e-6`.
+The Rust-produced 64-program `batch_functions` graph also executed device-resident on Vulkan with row-level maximum absolute error `3.82e-6`, and the three Vulkan suites passed 101/101 with no skips.
+Those timings are indicative (one session, shared CPU/GPU), and the GPU leg is correctness+residency evidence rather than a performance claim.
 ## Constraints
 
 - Never run a probe while another benchmark is timing the GPU: one timing process at a time, `EVOXC_DISABLE_LOCATIONS=1` as recorded.
