@@ -3,9 +3,9 @@
 Load-bearing, not transitional: the native (Rust) engine performs every
 rewrite (the five builtin transforms and the `batch_functions` merge); this
 module holds `batching_rules` / `register_batching_rule`, `_rule_key`,
-`_resolve_batching_rule`, `_tensor_input_axes`, `_validate_rule_result`,
-`_remap_output_aux`, the batched-aux remap registry, the batch-depth context
-and `block_call_pass_through_rule`.
+`_tensor_input_axes`, `_validate_rule_result`, `_remap_output_aux`, the
+batched-aux remap registry, the batch-depth context and
+`block_call_pass_through_rule`.
 Consumers: the native seam (`_native_bridge.py`, `_native_rules.py` — the
 extension-rule bridge, also reached through `_native_ad.py`), `vmap.py`,
 `batch_functions.py`, `rules.py`, `evoxc/block/rules.py`,
@@ -61,24 +61,6 @@ def register_batching_rule(op_name: str, fn: BatchingRule) -> None:
     if not isinstance(op_name, str) or not op_name:
         raise ValueError("op_name must be a non-empty string")
     batching_rules[op_name] = fn
-
-
-def get_batching_rule(op_name: str) -> Optional[BatchingRule]:
-    """The registered rule for `op_name`, or `None` (never raises)."""
-    return batching_rules.get(op_name)
-
-
-def require_batching_rule(op_name: str) -> BatchingRule:
-    """Like `get_batching_rule`, but raises `TransformError` naming the op."""
-    rule = batching_rules.get(op_name)
-    if rule is None:
-        raise TransformError(
-            f"vectorize: no batching rule for op '{op_name}'. "
-            f"Register one with register_batching_rule('{op_name}', fn) "
-            f"(custom blocks: BlockOp.batching_rule); there is no silent "
-            f"Python-loop fallback."
-        )
-    return rule
 
 
 #: Pytree node type → batched-output aux remap fn. Registered pytree nodes
@@ -245,39 +227,6 @@ def _rule_key(op: ir.Op) -> str:
     if op.name == "external_call":
         return f"external:{op.attributes['name']}"
     return op.name
-
-
-def _resolve_batching_rule(op: ir.Op) -> BatchingRule:
-    """The rule vectorizing `op`.
-
-    Lookup: the registry first — block calls under the namespaced key
-    `block:<block_name>`, external calls under `external:<name>` (exactly
-    like autodiff's `_rule_name`; an explicitly registered rule always
-    wins). No registered rule ⇒ `TransformError` naming the op/block/kernel
-    with an adaptive registration hint — never a silent fallback.
-    """
-    key = _rule_key(op)
-    rule = batching_rules.get(key)
-    if rule is not None:
-        return rule
-    if key.startswith("block:"):
-        block_name = op.attributes["block_name"]
-        raise TransformError(
-            f"vectorize: no batching rule for block '{block_name}' — "
-            f"register one with register_batching_rule('{key}', fn) "
-            f"(custom blocks: BlockOp.batching_rule); there is no silent "
-            f"Python-loop fallback."
-        )
-    if key.startswith("external:"):
-        name = op.attributes["name"]
-        raise TransformError(
-            f"vectorize: no batching rule for op 'external_call' (key "
-            f"'{key}') — register one via the external-kernel handle "
-            f"returned by evoxc.register_external_kernel('{name}', fn) "
-            f"(.batching_rule/.vjp_rule/.jvp_rule) or register a portable "
-            f"decomposition; there is no silent Python-loop fallback."
-        )
-    return require_batching_rule(op.name)
 
 
 def _tensor_input_axes(graph: Graph, axes) -> Tuple[Optional[int], ...]:
