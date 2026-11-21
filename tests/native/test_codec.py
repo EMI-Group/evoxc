@@ -1,21 +1,30 @@
 """Round-trip pins for the private native envelope codec.
 
 The codec is the in-process bridge to the optional Rust/PyO3 core; these tests
-pin the neutral envelope (format 1) without requiring the extension to exist.
+pin the ``evoxc-native-ir`` v1 envelope without requiring the extension to
+exist.  The envelope is flat at the top level — ``format``, ``version``,
+``module``, ``functions`` and ``ops`` — with every ndarray payload INLINE
+(``{"__evoxc_ndarray__": {"dtype", "shape", "data_b64"}}``), so there is no
+``constants`` table and no ``sha256``.  ``"module"`` here is the envelope body's
+module-info object; the façade's ``{"module": ir.Module, ...}`` result key is a
+different thing.
 """
 
 from __future__ import annotations
 
+import base64
 import copy
+import importlib
 
 import numpy as np
 import pytest
 
 import evoxc
-from evoxc import ir
+from evoxc import core, ir
 from evoxc._native_codec import (
     ENVELOPE_FORMAT,
     decode_module,
+    decode_native_module,
     decode_type,
     encode_module,
     encode_type,
@@ -194,6 +203,13 @@ def _assert_attr_equal(actual, expected) -> None:
         for a, e in zip(actual, expected):
             _assert_attr_equal(a, e)
         return
+    # `result_specs` is schema-decoded to a TUPLE (a builder-normalized
+    # attribute), so a list expectation compares element-wise against it.
+    if isinstance(expected, (list, tuple)) and isinstance(actual, (list, tuple)):
+        assert len(actual) == len(expected)
+        for a, e in zip(actual, expected):
+            _assert_attr_equal(a, e)
+        return
     if isinstance(expected, dict) and isinstance(actual, dict):
         assert list(actual.keys()) == list(expected.keys())
         for key in expected:
@@ -250,12 +266,7 @@ def _assert_block_equal(actual: ir.Block, expected: ir.Block) -> None:
         if a_op.location is None:
             assert e_op.location is None
         else:
-            assert (a_op.location.file, a_op.location.line, a_op.location.col) == (
-                e_op.location.file,
-                e_op.location.line,
-                e_op.location.col,
-            )
-            assert a_op.location.code_snippet is None
+            assert a_op.location == e_op.location
         for value in a_op.results:
             assert value.owner is a_op
 
@@ -280,6 +291,46 @@ def _all_values(module: ir.Module):
         yield from block.arguments
         for op in block.ops:
             yield from op.results
+
+
+def _all_ops(module: ir.Module):
+    for block in _walk_blocks(module):
+        yield from block.ops
+
+
+def _envelope_value_types(envelope: dict) -> dict:
+    """The envelope's INLINE value types, keyed by decimal SSA id string.
+
+    The envelope has no ``value_types`` map: every value's type travels on its
+    block-argument entry or on its op's ``results`` entry.  Nested op regions
+    carry their own block arguments, so the walk is recursive.
+    """
+    types = {}
+
+    def walk_block(block: dict) -> None:
+        for argument in block["arguments"]:
+            types[str(argument["id"])] = argument["type"]
+        for entry in block["ops"]:
+            # Block op entries are refs into the flat module ops table.
+            op_id = entry.get("id", entry.get("ref"))
+            results = ops_by_id.get(str(op_id), {}).get("results", ())
+            for result in results:
+                types[str(result["id"])] = result["type"]
+
+    def walk_region(region: dict) -> None:
+        if "blocks" in region:
+            for block in region["blocks"]:
+                walk_block(block)
+        else:
+            walk_block(region)
+
+    ops_by_id = {str(op["id"]): op for op in envelope["ops"]}
+    for function in envelope["functions"]:
+        walk_block(function["block"])
+    for op in envelope["ops"]:
+        for region in op["regions"]:
+            walk_region(region)
+    return types
 
 
 def _assert_uses_consistent(module: ir.Module) -> None:
@@ -316,14 +367,47 @@ def test_type_round_trip(shape):
     assert decoded == value_type
 
 
-def test_type_envelope_shape_uses_positional_dim_forms():
+def test_type_envelope_shape_uses_object_dim_forms():
     payload = encode_type(ir.ValueType(np.float32, (Dim("B"), None, 3)))
     assert payload == {
         "dtype": "float32",
-        "shape": [["dim", "B", None], None, 3],
+        "shape": [{"dim": "B"}, None, {"int": 3}],
     }
     expr = encode_type(ir.ValueType(np.int64, (DimExpr("mul", Dim("B", 4), 2),)))
-    assert expr["shape"] == [["expr", "mul", ["dim", "B", 4], 2]]
+    assert expr["shape"] == [
+        {
+            "expr": {
+                "op": "mul",
+                "args": [{"dim": "B", "size": 4}, {"int": 2}],
+            }
+        }
+    ]
+
+
+def test_envelope_is_flat_with_inline_arrays():
+    """The wire envelope is flat: module-info + inline arrays, no side tables.
+
+    ``"module"`` here is the module-info object (``{"name", "metadata"}``); the
+    façade's ``{"module": ir.Module, ...}`` result key is a different thing.
+    Array attributes are inline rather than hoisted into a ``constants`` table,
+    and an in-process envelope carries no ``sha256``.
+    """
+    envelope = encode_module(_simple_module())
+    assert set(envelope) == {
+        "format",
+        "version",
+        "module",
+        "functions",
+        "ops",
+    }
+    assert envelope["format"] == "evoxc-native-ir"
+    assert envelope["version"] == ENVELOPE_FORMAT
+    assert isinstance(envelope["module"], dict)
+    assert set(envelope["module"]) == {"name", "metadata"}
+    assert "value_types" not in envelope
+    assert "constants" not in envelope
+    assert "sha256" not in envelope
+
 
 
 def test_empty_function_round_trip():
@@ -343,7 +427,7 @@ def test_simple_function_round_trip_preserves_ids():
     ir.verify(decoded)
     _assert_module_equal(decoded, module)
     value_ids = {value.id for value in _all_values(module)}
-    assert set(envelope["value_types"]) == {str(i) for i in value_ids}
+    assert set(_envelope_value_types(envelope)) == {str(i) for i in value_ids}
     assert decoded.new_op_id() > max(op.id for op in decoded.main.entry_block.ops)
     assert decoded.new_value_id() > max(value_ids)
 
@@ -352,7 +436,7 @@ def test_value_types_cover_every_ssa_value():
     module = _multi_feature_module()
     envelope = encode_module(module)
     ids = {str(value.id) for value in _all_values(module)}
-    assert set(envelope["value_types"]) == ids
+    assert set(_envelope_value_types(envelope)) == ids
     assert len(ids) == len({value.id for value in _all_values(module)})
 
 
@@ -385,9 +469,17 @@ def test_symbolic_dims_and_dimexpr_round_trip():
     decoded = decode_module(envelope)
     ir.verify(decoded)
     _assert_module_equal(decoded, module)
-    flattened = str(envelope)
-    assert "['dim', 'B', None]" in flattened
-    assert "'expr', 'mul'" in flattened
+    shapes = [
+        dim
+        for function in envelope["functions"]
+        for value_type in function["input_types"]
+        for dim in value_type["shape"]
+    ]
+    assert {"dim": "B"} in shapes
+    assert {"int": 3} in shapes
+    assert {
+        "expr": {"op": "mul", "args": [{"dim": "B"}, {"int": 2}]}
+    } in shapes
 
 
 def test_attribute_variety_round_trip():
@@ -395,8 +487,9 @@ def test_attribute_variety_round_trip():
     b = ir.Builder(m)
     f = b.build_function("main", (ir.ValueType(np.float32, (2,)),))
     x = f.entry_block.arguments[0]
-    first_op = b.create("add", (x, x))
-    first = first_op.result
+    # `block_call.static_args` is the generic (ATTR_ANY) attribute slot, so it
+    # is the contract-bearing place for the JSON-able value variety.  (A
+    # schema-typed op such as `add` rejects unknown attributes at verify time.)
     payload = {
         "bool_true": True,
         "int": 7,
@@ -405,31 +498,48 @@ def test_attribute_variety_round_trip():
         "none": None,
         "tuple": (1, "a", None),
         "list": [1, 2, 3],
-        "dtype": np.dtype("int32"),
-        "dtype_name": "float32",
         "dim": Dim("B", 8),
         "expr": DimExpr("add", Dim("B"), 2),
-        "nested": {"inner": (True, 2.5), 3: "three"},
+        "nested": {"inner": (True, 2.5), "three": "three"},
         "nested_ints": ((1, 2), (3, 4, 5)),
         "shape": (Dim("B"), None, 4),
         "value_type": ir.ValueType(np.float64, (Dim("B"), 3)),
         "array": np.arange(6, dtype=np.int16).reshape(2, 3),
     }
-    first_op.attributes = dict(payload)
-    b.set_terminator(f.entry_block, "return", (first,))
+    call = b.create(
+        "block_call",
+        (x,),
+        attributes={
+            "block_name": "my_block",
+            "static_args": payload,
+            "result_specs": [ir.ValueType(np.float32, (2,))],
+        },
+    )
+    b.set_terminator(f.entry_block, "return", (call.result,))
     decoded = decode_module(encode_module(m))
-    attrs = decoded.main.entry_block.ops[0].attributes
+    attrs = decoded.main.entry_block.ops[0].attributes["static_args"]
     assert list(attrs) == list(payload)
     for key, expected in payload.items():
+        if key == "value_type":
+            continue  # asserted structurally below (generic ValueTypes are dicts)
         _assert_attr_equal(attrs[key], expected)
     assert isinstance(attrs["tuple"], tuple)
     assert isinstance(attrs["list"], list)
-    assert isinstance(attrs["dtype_name"], str)
-    assert isinstance(attrs["dtype"], np.dtype)
-    assert attrs["dtype"].name == "int32"
+    assert isinstance(attrs["dim"], Dim)
+    assert isinstance(attrs["expr"], DimExpr)
     assert isinstance(attrs["nested"]["inner"], tuple)
-    assert attrs["nested"][3] == "three"
+    assert attrs["nested"]["three"] == "three"
     assert attrs["nested_ints"] == ((1, 2), (3, 4, 5))
+    # A generic `ValueType` round-trips structurally as a plain type dict (the
+    # `result_specs` slot is the schema-driven one that restores `ValueType`s).
+    # Symbolic dims restore to `Dim`; an `{"int": n}` entry stays a plain dict
+    # because int dims only exist inside schema-decoded shape lists.
+    assert attrs["value_type"] == {
+        "dtype": "float64",
+        "shape": [Dim("B"), {"int": 3}],
+    }
+    assert attrs["array"].dtype == np.dtype("int16")
+    assert np.array_equal(attrs["array"], payload["array"])
 
 
 def test_builder_normalized_attributes_round_trip():
@@ -458,7 +568,27 @@ def test_constants_round_trip_including_byte_order_and_zero_dim():
     dup = b.emit("constant", (), attributes={"value": scalars.copy()})
     b.set_terminator(f.entry_block, "return", (c1, c2, c3, dup))
     envelope = encode_module(m)
-    assert all(isinstance(entry["data"], bytes) for entry in envelope["constants"])
+    # Every array is INLINE (no constants table, no side reference).
+    assert "constants" not in envelope
+    markers = [op["attributes"]["value"] for op in envelope["ops"][:4]]
+    assert all(set(marker) == {"__evoxc_ndarray__"} for marker in markers)
+    inline = [marker["__evoxc_ndarray__"] for marker in markers]
+    assert [(entry["dtype"], entry["shape"]) for entry in inline] == [
+        ("float32", [3]),
+        ("float64", []),
+        ("int16", [2, 3]),
+        ("int16", [2, 3]),
+    ]
+    assert all(isinstance(entry["data_b64"], str) for entry in inline)
+    # Raw little-endian C-order payload: 3 float32s, 1 float64, 6 int16s.
+    assert [len(base64.b64decode(entry["data_b64"])) for entry in inline] == [
+        12,
+        8,
+        12,
+        12,
+    ]
+    # Duplicate payloads encode identically (there is deliberately no dedup).
+    assert inline[2] == inline[3]
     decoded = decode_module(envelope)
     ops = decoded.main.entry_block.ops
     be = ops[0].attributes["value"]
@@ -470,7 +600,6 @@ def test_constants_round_trip_including_byte_order_and_zero_dim():
     assert arr.shape == (2, 3) and arr.dtype.name == "int16"
     assert np.array_equal(arr, scalars)
     assert np.array_equal(ops[3].attributes["value"], scalars)
-    assert len(envelope["constants"]) == 3
 
 
 def test_multi_block_region_round_trip():
@@ -509,14 +638,21 @@ def test_locations_round_trip_and_none_stays_none():
     located = b.emit("add", (x, x), location=ir.Location("model.py", 83, 5, "x = y"))
     plain = b.emit("multiply", (located, x))
     b.set_terminator(f.entry_block, "return", (plain,))
-    decoded = decode_module(encode_module(m))
+    envelope = encode_module(m)
+    assert envelope["ops"][0]["location"] == {
+        "file": "model.py",
+        "line": 83,
+        "col": 5,
+        "code_snippet": "x = y",
+    }
+    assert envelope["ops"][1]["location"] is None
+    decoded = decode_module(envelope)
     add_op, mul_op = decoded.main.entry_block.ops[:2]
-    assert (add_op.location.file, add_op.location.line, add_op.location.col) == (
-        "model.py",
-        83,
-        5,
-    )
-    assert add_op.location.code_snippet is None
+    assert add_op.location.file == "model.py"
+    assert (add_op.location.line, add_op.location.col) == (83, 5)
+    # The full location, including the captured source snippet, round-trips.
+    assert add_op.location.code_snippet == "x = y"
+    # An absent location stays absent (never invented).
     assert mul_op.location is None
 
 
@@ -550,30 +686,121 @@ def test_encode_module_does_not_mutate_input():
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    "mutate, error_cls",
     [
-        lambda env: env.__setitem__("format", 2),
-        lambda env: env.pop("functions"),
-        lambda env: env.pop("value_types"),
-        lambda env: env["value_types"].pop(next(iter(env["value_types"]))),
-        lambda env: env["functions"][0]["blocks"][0]["ops"][0].__setitem__(
-            "results", [999999]
+        # Discriminator / version problems are explicit codec errors.
+        (lambda env: env.__setitem__("format", 2), ValueError),
+        (lambda env: env.__setitem__("version", 99), ValueError),
+        # Structural body problems are VerificationErrors from `serialize`.
+        (lambda env: env.pop("functions"), core.VerificationError),
+        (lambda env: env.pop("module"), core.VerificationError),
+        (lambda env: env.pop("ops"), core.VerificationError),
+        (
+            lambda env: env["ops"][0]["results"][0].__setitem__("id", 999999),
+            core.VerificationError,
         ),
-        lambda env: env["functions"][0]["blocks"][0]["ops"][0]["attributes"].__setitem__(
-            "value", {"__evoxc__": "const_ref", "index": 99}
+        (
+            lambda env: env["ops"][0].__setitem__("operands", [999999, 999999]),
+            core.VerificationError,
+        ),
+        (
+            lambda env: env["ops"][0]["attributes"].__setitem__("bogus", 1),
+            core.VerificationError,
+        ),
+        (
+            lambda env: env["functions"][0]["input_types"][0]["shape"].__setitem__(
+                0, ["dim", "B"]
+            ),
+            core.VerificationError,
         ),
     ],
 )
-def test_malformed_envelopes_raise_value_error(mutate):
+def test_malformed_envelopes_raise_documented_errors(mutate, error_cls):
+    """Structural problems are ``VerificationError``, never the old ``ValueError``."""
     envelope = encode_module(_simple_module())
     mutate(envelope)
-    with pytest.raises(ValueError):
+    with pytest.raises(error_cls):
+        decode_module(envelope)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda env: env.pop("functions"),
+        lambda env: env.pop("module"),
+        lambda env: env.pop("ops"),
+    ],
+)
+def test_malformed_payloads_name_the_missing_field(mutate):
+    """Structural body errors keep the documented ``malformed IR payload`` prefix."""
+    envelope = encode_module(_simple_module())
+    mutate(envelope)
+    with pytest.raises(core.VerificationError, match="malformed IR payload"):
         decode_module(envelope)
 
 
 def test_duplicate_value_id_rejected():
+    """A value id may appear exactly once (a block argument reusing a result id)."""
     envelope = encode_module(_simple_module())
-    ops = envelope["functions"][0]["blocks"][0]["ops"]
-    ops[0]["results"] = list(ops[0]["results"]) + [ops[0]["results"][0]]
-    with pytest.raises(ValueError):
+    block = envelope["functions"][0]["block"]
+    result_id = envelope["ops"][0]["results"][0]["id"]
+    block["arguments"][0]["id"] = result_id
+    envelope["ops"][0]["operands"] = [result_id, result_id]
+    with pytest.raises(core.VerificationError, match="duplicate value id"):
         decode_module(envelope)
+
+
+# ---------------------------------------------------------------------------
+# The TRUSTED fast decoder used by the transform seam
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_decode_matches_the_validated_decode():
+    """`decode_native_module` is structurally identical to `decode_module`."""
+    module = _multi_feature_module()
+    envelope = encode_module(module)
+    fast = decode_native_module(envelope)
+    validated = decode_module(encode_module(module))
+    ir.verify(fast)
+    _assert_module_equal(fast, validated)
+    _assert_uses_consistent(fast)
+    assert fast.new_op_id() > max(op.id for op in _all_ops(module))
+    assert fast.new_value_id() > max(value.id for value in _all_values(module))
+
+
+def test_trusted_decode_skips_verify_but_can_cross_check():
+    """The fast path trusts the envelope; `verify_module=True` re-checks it.
+
+    A recorded result type the fast decode accepts (it trusts the wire) is
+    caught by the development-only `ir.verify` cross-check — the same one
+    `EVOXC_NATIVE_DECODE_CHECK=1` turns on.
+    """
+    envelope = encode_module(_simple_module())
+    envelope["ops"][0]["results"][0]["type"] = {
+        "dtype": "float64",
+        "shape": [{"int": 4}],
+    }
+    trusted = decode_native_module(envelope, verify_module=False)
+    assert trusted.main.entry_block.ops[0].results[0].type.dtype == np.dtype("float64")
+    with pytest.raises(core.VerificationError):
+        decode_native_module(envelope, verify_module=True)
+
+
+def test_native_decode_check_env_flag_enables_the_cross_check(monkeypatch):
+    """`EVOXC_NATIVE_DECODE_CHECK=1` (read at import) turns the verify on."""
+    from evoxc import _native_codec as codec_module
+
+    envelope = encode_module(_simple_module())
+    monkeypatch.setenv("EVOXC_NATIVE_DECODE_CHECK", "1")
+    try:
+        importlib.reload(codec_module)
+        assert codec_module._VERIFY_NATIVE_DECODE is True
+        envelope["ops"][0]["results"][0]["type"] = {
+            "dtype": "float64",
+            "shape": [{"int": 4}],
+        }
+        with pytest.raises(core.VerificationError):
+            codec_module.decode_native_module(envelope)
+    finally:
+        monkeypatch.delenv("EVOXC_NATIVE_DECODE_CHECK", raising=False)
+        importlib.reload(codec_module)

@@ -130,7 +130,7 @@ def test_infer_encodes_and_decodes_types():
             result_types=result_types,
             module=module,
         )
-        return [{"dtype": "float64", "shape": [4]}]
+        return [{"dtype": "float64", "shape": [{"int": 4}]}]
 
     _native._MODULE = _fake_module(infer=fake_infer)
     spec = ir.ValueType(np.float32, (2, 3))
@@ -139,13 +139,15 @@ def test_infer_encodes_and_decodes_types():
     result = _native.infer("add", [spec], attributes, module=context)
 
     assert recorded["op_name"] == "add"
-    assert recorded["operand_types"] == [{"dtype": "float32", "shape": [2, 3]}]
+    assert recorded["operand_types"] == [
+        {"dtype": "float32", "shape": [{"int": 2}, {"int": 3}]}
+    ]
     assert recorded["attributes"] is attributes
     assert recorded["result_types"] is None
-    assert recorded["module"] == {
-        "functions": [("main", [{"dtype": "float32", "shape": [2, 3]}])],
-        "tag": 7,
-    }
+    # An already-encoded envelope mapping passes through VERBATIM (a shallow
+    # copy: the façade never re-encodes a mapping the caller built).
+    assert recorded["module"] == context
+    assert recorded["module"] is not context
     assert result == [ir.ValueType(np.dtype("float64"), (4,))]
 
 
@@ -172,8 +174,16 @@ def test_transform_round_trips_module_and_preserves_extra_keys():
         seen["envelope"] = envelope
         seen["config"] = config
         return {
-            "module": envelope,
-            "output_types": [{"dtype": "float32", "shape": [4]}],
+            # The extension returns the transformed envelope FLAT (its own
+            # ``module`` entry is the module-info object), plus the metadata.
+            **envelope,
+            "transform": {
+                "kind": kind,
+                "output_ids": [1],
+                "input_ids": [0],
+                "batch_dim": "batch",
+            },
+            "output_types": [{"dtype": "float32", "shape": [{"int": 4}]}],
             "report": sentinel,
         }
 
@@ -191,7 +201,14 @@ def test_transform_round_trips_module_and_preserves_extra_keys():
     assert [value.id for value in result["module"].main.entry_block.ops[1].results] == [
         value.id for value in module.main.entry_block.ops[1].results
     ]
-    assert result["output_types"] == [ir.ValueType(np.dtype("float32"), (4,))]
+    assert result["transform"] == {
+        "kind": "vectorize",
+        "output_ids": [1],
+        "input_ids": [0],
+        "batch_dim": "batch",
+    }
+    # Any non-envelope top-level key is preserved VERBATIM.
+    assert result["output_types"] == [{"dtype": "float32", "shape": [{"int": 4}]}]
     assert result["report"] is sentinel
 
 
