@@ -1,4 +1,17 @@
-"""Batching: the vectorize primitive's rule registry and core algorithm.
+"""Batching: the transform rule registry + TEMPORARY shim surfaces.
+
+TEMPORARY SHIM: `vectorize`/`vmap` no longer use the Python rewriting
+algorithm in this module (the native engine owns the op rewrite; Python keeps
+only frontend validation plus `Graph` reconstruction, see `_native_bridge`).
+What remains here is what `batch_functions` / `_emit` / `_merge` / `_bands`
+plus the extension-rule bridge (`_native_rules`) and `evoxc/block/rules.py` /
+`evoxc/external_rules.py` still need: the rule registry, the MappedAxes
+helpers, `_tensor_input_axes`, the batch-depth context and
+`_remap_output_aux`. The leftover `vectorize_graph` implementation is
+retained only for reference until a native `batch_functions` port lands; do
+not route new code through it.
+
+Original description: the vectorize primitive's rule registry and core algorithm.
 
 `vectorize` is THE primitive graph transformation of this package: it rewrites
 a traced `Graph` into a new `Graph` in which inputs mapped by `axes` carry
