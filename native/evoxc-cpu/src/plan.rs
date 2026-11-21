@@ -16,6 +16,7 @@ use evoxc_core::{
     schema, Attrs, BlockId, DType, Error, Location, Op, Program, Region, Result, ValueType,
 };
 
+use crate::buffer::Buffer;
 use crate::kernels::{self, KernelFn};
 
 /// The static description of one op handed to its kernel.
@@ -40,8 +41,16 @@ pub struct Step {
     pub results: Vec<usize>,
     /// Values whose last use is this op (defined in this block only).
     pub free: Vec<usize>,
-    /// Fully static single-result fast path: `(dtype, shape)`.
-    pub fast: Option<(DType, Vec<usize>)>,
+    /// Per-result static-shape fast path (`(dtype, shape)` per result index,
+    /// `None` for a result whose declared shape has a symbolic or dynamic
+    /// dim).  `insert`/`get` are by result index, so a multi-result op whose
+    /// results are all static skips re-evaluating `Dim`s at run time too.
+    pub fast: Vec<Option<(DType, Vec<usize>)>>,
+    /// A `constant` op's payload, decoded ONCE here so a run clones a buffer
+    /// instead of re-decoding the same bytes on every call.  `None` for every
+    /// other op (and the value is identical to what the `constant` kernel
+    /// would decode).
+    pub constant: Option<Buffer>,
 }
 
 /// One block's plan.
@@ -119,11 +128,17 @@ impl Plan {
                 block.id, block.arg_ids, block.return_ids
             ));
             for (index, step) in block.steps.iter().enumerate() {
-                let fast = step
-                    .fast
-                    .as_ref()
-                    .map(|(dtype, shape)| format!(" static {dtype}{shape:?}"))
-                    .unwrap_or_default();
+                // The documented suffix is the single-result static marker; a
+                // multi-result op simply has no suffix.
+                let fast = if step.results.len() == 1 {
+                    step.fast
+                        .first()
+                        .and_then(|entry| entry.as_ref())
+                        .map(|(dtype, shape)| format!(" static {dtype}{shape:?}"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!(
                     "  {index:4} {:<20} {:?} -> {:?} free={:?}{fast}\n",
                     step.spec.name, step.operands, step.results, step.free
@@ -335,8 +350,9 @@ fn build_block(
             .iter()
             .map(|value| Ok(program.value(*value)?.ty.clone()))
             .collect::<Result<Vec<_>>>()?;
-        let fast = if result_types.len() == 1 {
-            match result_types[0].static_shape() {
+        let fast = result_types
+            .iter()
+            .map(|ty| match ty.static_shape() {
                 Some(shape) => {
                     let extents = shape
                         .iter()
@@ -349,10 +365,15 @@ fn build_block(
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    Some((result_types[0].dtype, extents))
+                    Ok(Some((ty.dtype, extents)))
                 }
-                None => None,
-            }
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // A `constant`'s payload is decoded here, once per compile, instead of
+        // once per run (see [`Step::constant`]).
+        let constant = if op.name == "constant" {
+            Some(Buffer::from_payload(attrs.array("value")?)?)
         } else {
             None
         };
@@ -370,6 +391,7 @@ fn build_block(
             results: op.results.iter().map(|value| value.index()).collect(),
             free: free_by_index.remove(&index).unwrap_or_default(),
             fast,
+            constant,
         });
     }
 

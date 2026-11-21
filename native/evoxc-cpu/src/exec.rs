@@ -78,6 +78,12 @@ pub struct RunCtx<'p> {
     pub rank: i64,
     pub world_size: i64,
     pub callbacks: Option<&'p dyn Callbacks>,
+    /// Reusable step operand list: a `Vec<Value>` the block loop hands to each
+    /// kernel and takes back, so a step never allocates its operand vector.
+    /// Scratch state of ONE run, never part of the (immutable) plan; a
+    /// control-flow kernel that re-enters [`RunCtx::run_block`] takes the
+    /// (then empty) scratch and gives it back on the way out.
+    operands: Vec<Value>,
 }
 
 impl<'p> RunCtx<'p> {
@@ -96,6 +102,7 @@ impl<'p> RunCtx<'p> {
             rank: options.rank,
             world_size: options.world_size,
             callbacks,
+            operands: Vec::new(),
         }
     }
 
@@ -126,6 +133,14 @@ impl<'p> RunCtx<'p> {
         }
         let wrapped: Vec<Value> = inputs.into_iter().map(Rc::new).collect();
         let outputs = self.run_block(signature.entry, wrapped)?;
+        // The store still holds a second reference to every returned value, and
+        // `unwrap_value` can only MOVE a buffer out of an `Rc` when it is the
+        // last owner.  Releasing the run's store here therefore turns a whole
+        // output array copy per call into a pointer move (values that are
+        // genuinely shared — the same value returned twice — still copy).
+        for slot in self.store.iter_mut() {
+            *slot = None;
+        }
         if outputs.len() != signature.output_types.len() {
             return Err(Error::backend(format!(
                 "program produced {} output tensor(s), expected {}",
@@ -170,16 +185,43 @@ impl<'p> RunCtx<'p> {
                 *slot = Some(value);
             }
         }
+        // One scratch operand list for the whole block (and, through the take /
+        // put-back below, for the whole run): the step loop clears it per step
+        // instead of allocating a fresh `Vec<Value>` per op.
+        let mut operands = std::mem::take(&mut self.operands);
         for step in &block.steps {
-            let mut operands: Vec<Value> = Vec::with_capacity(step.operands.len());
+            operands.clear();
+            let mut missing = None;
             for value_id in &step.operands {
-                match self.store.get(*value_id).and_then(|slot| slot.clone()) {
-                    Some(value) => operands.push(value),
-                    None => return Err(unresolved(*value_id)),
+                match self.store.get(*value_id).and_then(|slot| slot.as_ref()) {
+                    Some(value) => operands.push(Rc::clone(value)),
+                    None => {
+                        missing = Some(*value_id);
+                        break;
+                    }
                 }
             }
-            let results = (step.kernel)(self, &step.spec, &operands)?;
+            if let Some(value_id) = missing {
+                self.operands = operands;
+                return Err(unresolved(value_id));
+            }
+            // A `constant` carries its payload decoded ONCE at plan build: the
+            // step is then one clone of that buffer rather than a per-run
+            // decode of the same bytes (`Buffer::from_payload`), with identical
+            // values and the same result validation below.
+            let results = if let Some(constant) = &step.constant {
+                vec![Rc::new(constant.clone())]
+            } else {
+                match (step.kernel)(self, &step.spec, &operands) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        self.operands = operands;
+                        return Err(err);
+                    }
+                }
+            };
             if results.len() != step.results.len() {
+                self.operands = operands;
                 return Err(Error::backend(format!(
                     "kernel for op '{}' produced {} result(s), expected {}",
                     step.spec.name,
@@ -203,6 +245,7 @@ impl<'p> RunCtx<'p> {
                 }
             }
         }
+        self.operands = operands;
         let mut outputs = Vec::with_capacity(block.return_ids.len());
         for value_id in &block.return_ids {
             match self.store.get(*value_id).and_then(|slot| slot.clone()) {
@@ -275,7 +318,7 @@ impl<'p> RunCtx<'p> {
                 ty.dtype.name()
             )));
         }
-        if let Some((dtype, shape)) = &step.fast {
+        if let Some((dtype, shape)) = step.fast.get(index).and_then(|entry| entry.as_ref()) {
             if value.dtype == *dtype && value.shape == *shape {
                 return Ok(());
             }
@@ -329,3 +372,292 @@ pub fn callback_values(items: Vec<Buffer>) -> Vec<Value> {
 
 /// Re-exported for kernels that need the binding map type.
 pub type RunBindings = HashMap<String, i64>;
+
+#[cfg(test)]
+mod tests {
+    //! Contracts of the plan/exec seam that the per-op fast paths added:
+    //! the per-result static-shape marker, the plan-time `constant` decode, the
+    //! reusable operand scratch, and the store release that lets a run MOVE its
+    //! outputs instead of copying them.  Every fast path keeps the general
+    //! check as its fallback and the exact error wording.
+    use super::*;
+    use crate::buffer::Storage;
+    use crate::plan::{self, Step};
+    use evoxc_core::{
+        ArrayPayload, AttrValue, Attrs, Block, DType, ErrorKind, Function, Op as IrOp,
+        Value as IrValue,
+    };
+
+    /// The smallest module `plan::compile` accepts: `main` with a body that is
+    /// just a `return` (no inputs, no outputs).  Enough to build a `RunCtx`.
+    fn return_only_program() -> Program {
+        let mut program = Program::new("fixture");
+        let block_id = program.new_block_id();
+        let return_id = program.new_op_id();
+        program.add_op(IrOp::new(return_id, "return")).unwrap();
+        let mut block = Block::new(block_id);
+        block.ops = vec![return_id];
+        program.add_block(block).unwrap();
+        let mut function = Function::new("main", Vec::new());
+        function.output_types = Vec::new();
+        function.body = Region::single(block_id);
+        program.add_function(function).unwrap();
+        program
+    }
+
+    fn context(program: &Program) -> RunCtx<'_> {
+        let plan = Arc::new(plan::compile(program).expect("the fixture program compiles"));
+        RunCtx::new(program, plan, RunOptions::default(), None)
+    }
+
+    fn spec(name: &str, result_types: Vec<ValueType>) -> OpSpec {
+        OpSpec {
+            name: name.to_string(),
+            attrs: Attrs::new(),
+            operand_types: Vec::new(),
+            result_types,
+            regions: Vec::new(),
+            location: None,
+        }
+    }
+
+    fn step(spec: OpSpec, fast: Vec<Option<(DType, Vec<usize>)>>) -> Step {
+        let kernel = crate::kernels::lookup(&spec.name).expect("the fixture op has a kernel");
+        let results = (0..spec.result_types.len()).collect();
+        Step {
+            spec,
+            kernel,
+            operands: Vec::new(),
+            results,
+            free: Vec::new(),
+            fast,
+            constant: None,
+        }
+    }
+
+    fn f32_buffer(shape: &[usize], values: &[f32]) -> Buffer {
+        Buffer::new(DType::Float32, shape.to_vec(), Storage::F32(values.to_vec()))
+            .unwrap_or_else(|err| panic!("test fixture is malformed: {}", err.message))
+    }
+
+    #[test]
+    fn static_result_marker_validates_every_result_of_a_multi_result_op() {
+        let program = return_only_program();
+        let ctx = context(&program);
+        let f32_2 = ValueType::new(DType::Float32, vec![Dim::int(2)]);
+        let s = step(
+            spec("add", vec![f32_2.clone(), f32_2]),
+            vec![
+                Some((DType::Float32, vec![2])),
+                Some((DType::Float32, vec![2])),
+            ],
+        );
+        let good = f32_buffer(&[2], &[1.0, 2.0]);
+        ctx.validate_result(&s, 1, &good).expect("a static marker accepts its own shape");
+        let wrong_dtype = Buffer::new(DType::Float64, vec![2], Storage::F64(vec![1.0, 2.0]))
+            .expect("fixture");
+        let err = ctx.validate_result(&s, 0, &wrong_dtype).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Backend);
+        assert!(
+            err.message
+                .contains("produced result 0 with dtype float64, expected float32"),
+            "{}",
+            err.message
+        );
+        let wrong_extent = f32_buffer(&[3], &[0.0; 3]);
+        let err = ctx.validate_result(&s, 0, &wrong_extent).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Shape);
+        assert!(err.message.contains("dim 0: got 3, expected 2"), "{}", err.message);
+        let wrong_rank = f32_buffer(&[2, 1], &[0.0; 2]);
+        let err = ctx.validate_result(&s, 0, &wrong_rank).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Shape);
+        assert!(err.message.contains("rank mismatch"), "{}", err.message);
+    }
+
+    #[test]
+    fn symbolic_and_dynamic_result_dims_keep_the_general_check() {
+        let program = return_only_program();
+        let mut ctx = context(&program);
+        let symbolic = ValueType::new(DType::Float32, vec![Dim::named("N")]);
+        let dynamic = ValueType::new(DType::Float32, vec![Dim::dynamic(), Dim::int(3)]);
+        let s = step(spec("add", vec![symbolic, dynamic]), vec![None, None]);
+        let value = f32_buffer(&[2], &[0.0; 2]);
+        // An unbound symbolic dim fails loudly instead of accepting anything.
+        assert_eq!(
+            ctx.validate_result(&s, 0, &value).unwrap_err().kind,
+            ErrorKind::Shape
+        );
+        dims::bind_dim(&mut ctx.bindings, &Dim::named("N"), 2, "test").expect("bind N");
+        ctx.validate_result(&s, 0, &value).expect("the bound symbolic dim matches");
+        let wider = f32_buffer(&[4], &[0.0; 4]);
+        let err = ctx.validate_result(&s, 0, &wider).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Shape);
+        assert!(err.message.contains("dim 0: got 4, expected 2"), "{}", err.message);
+        // A runtime-dynamic dim accepts whatever extent the kernel derived ...
+        let wide = f32_buffer(&[7, 3], &[0.0; 21]);
+        ctx.validate_result(&s, 1, &wide).expect("a runtime-dynamic dim is unchecked");
+        // ... but the rank and every static sibling dim are still checked.
+        let flat = f32_buffer(&[7], &[0.0; 7]);
+        assert_eq!(
+            ctx.validate_result(&s, 1, &flat).unwrap_err().kind,
+            ErrorKind::Shape
+        );
+        let wrong_sibling = f32_buffer(&[7, 4], &[0.0; 28]);
+        assert_eq!(
+            ctx.validate_result(&s, 1, &wrong_sibling).unwrap_err().kind,
+            ErrorKind::Shape
+        );
+    }
+
+    /// Build `main()` returning one `constant` op carrying `payload`.
+    fn constant_program(payload: ArrayPayload) -> Program {
+        let mut program = Program::new("constant");
+        let block_id = program.new_block_id();
+        let out_id = program.new_value_id();
+        let constant_id = program.new_op_id();
+        let return_id = program.new_op_id();
+        let out_ty = ValueType::new(
+            payload.dtype,
+            payload.shape.iter().map(|dim| Dim::int(*dim)).collect(),
+        );
+        program
+            .add_value(IrValue::op_result(out_id, out_ty.clone(), constant_id, 0))
+            .expect("fixture value");
+        let mut constant = IrOp::new(constant_id, "constant");
+        constant.attributes = Attrs::from_pairs([("value", AttrValue::Array(payload))]);
+        constant.results = vec![out_id];
+        program.add_op(constant).expect("fixture op");
+        let mut ret = IrOp::new(return_id, "return");
+        ret.operands = vec![out_id];
+        program.add_op(ret).expect("fixture op");
+        let mut block = Block::new(block_id);
+        block.ops = vec![constant_id, return_id];
+        program.add_block(block).expect("fixture block");
+        let mut function = Function::new("main", Vec::new());
+        function.output_types = vec![out_ty];
+        function.body = Region::single(block_id);
+        program.add_function(function).expect("fixture function");
+        program
+    }
+
+    fn f32_payload(values: &[f32], shape: Vec<i64>) -> ArrayPayload {
+        let mut data = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        ArrayPayload {
+            dtype: DType::Float32,
+            shape,
+            data,
+        }
+    }
+
+    #[test]
+    fn a_constant_is_decoded_once_at_plan_time_and_runs_through_the_plan() {
+        let payload = f32_payload(&[1.5, -2.5, 0.0, 4.0], vec![2, 2]);
+        let program = constant_program(payload.clone());
+        let plan = plan::compile(&program).expect("the constant program compiles");
+        let block = plan.blocks[0].as_ref().expect("the entry block is compiled");
+        let step = &block.steps[0];
+        let decoded = step.constant.as_ref().expect("the payload is decoded at compile time");
+        // Identical to the decode the `constant` kernel used to do per run.
+        let expected = Buffer::from_payload(&payload).expect("the payload decodes");
+        assert_eq!(decoded.dtype, expected.dtype);
+        assert_eq!(decoded.shape, expected.shape);
+        assert_eq!(decoded.storage, expected.storage);
+        // The per-result static marker covers `constant` too.
+        assert_eq!(step.fast, vec![Some((DType::Float32, vec![2, 2]))]);
+        assert!(plan.text().contains("static"), "{}", plan.text());
+        // And the run returns those values (twice: the same plan is reusable).
+        let mut ctx = context(&program);
+        for _ in 0..2 {
+            let out = ctx.run(Vec::new()).expect("the constant run succeeds");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].shape, vec![2, 2]);
+            assert_eq!(out[0].storage, Storage::F32(vec![1.5, -2.5, 0.0, 4.0]));
+        }
+    }
+
+    #[test]
+    fn a_malformed_constant_payload_fails_at_plan_time() {
+        // Two elements declared, four bytes carried.
+        let payload = f32_payload(&[1.0], vec![2]);
+        let program = constant_program(payload);
+        let err = plan::compile(&program).err().expect("compile rejects the payload");
+        assert!(
+            err.message
+                .contains("constant payload declares 8 byte(s) but carries 4"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// `main(x) = add(x, x)` over one `f32[2]` input, plus a `return x, x` form
+    /// exercising the shared-output case.
+    fn add_program(twice: bool) -> Program {
+        let mut program = Program::new("add");
+        let block_id = program.new_block_id();
+        let x_id = program.new_value_id();
+        let sum_id = program.new_value_id();
+        let add_id = program.new_op_id();
+        let return_id = program.new_op_id();
+        let ty = ValueType::new(DType::Float32, vec![Dim::int(2)]);
+        program
+            .add_value(IrValue::block_argument(x_id, ty.clone(), block_id, 0))
+            .expect("fixture value");
+        program
+            .add_value(IrValue::op_result(sum_id, ty.clone(), add_id, 0))
+            .expect("fixture value");
+        let mut add = IrOp::new(add_id, "add");
+        add.operands = vec![x_id, x_id];
+        add.results = vec![sum_id];
+        program.add_op(add).expect("fixture op");
+        let mut ret = IrOp::new(return_id, "return");
+        ret.operands = if twice { vec![sum_id, sum_id] } else { vec![sum_id] };
+        program.add_op(ret).expect("fixture op");
+        let mut block = Block::new(block_id);
+        block.arguments = vec![x_id];
+        block.ops = vec![add_id, return_id];
+        program.add_block(block).expect("fixture block");
+        let mut function = Function::new("main", vec![ty.clone()]);
+        function.output_types = if twice { vec![ty.clone(), ty] } else { vec![ty] };
+        function.body = Region::single(block_id);
+        program.add_function(function).expect("fixture function");
+        program
+    }
+
+    #[test]
+    fn one_run_state_is_reusable_across_runs_and_shares_no_values() {
+        let program = add_program(false);
+        let plan = Arc::new(plan::compile(&program).expect("the add program compiles"));
+        let mut ctx = RunCtx::new(&program, plan, RunOptions::default(), None);
+        for input in [[1.0f32, 2.0], [5.0, -1.0]] {
+            let out = ctx
+                .run(vec![f32_buffer(&[2], &input)])
+                .expect("the add run succeeds");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].storage, Storage::F32(vec![input[0] * 2.0, input[1] * 2.0]));
+            // The run releases its store, so a second run re-binds every value
+            // and no buffer of the previous run survives into this one.
+            assert!(ctx.store.iter().all(|slot| slot.is_none()));
+        }
+    }
+
+    #[test]
+    fn a_value_returned_twice_is_still_correct() {
+        // The output move turns into a copy exactly when a value is genuinely
+        // shared (here: the same op result returned twice).
+        let program = add_program(true);
+        let out = crate::evaluate(
+            &program,
+            vec![f32_buffer(&[2], &[1.0, 2.0])],
+            RunOptions::default(),
+            None,
+        )
+        .expect("the shared-output run succeeds");
+        assert_eq!(out.len(), 2);
+        for buffer in &out {
+            assert_eq!(buffer.storage, Storage::F32(vec![2.0, 4.0]));
+        }
+    }
+}
