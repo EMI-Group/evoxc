@@ -35,7 +35,7 @@ from evoxc.transforms.jvp import jvp
 from evoxc.transforms.vjp import vjp
 from evoxc.transforms._wrappers import TransformCallable
 
-# Registers builtin rules for the standard op set (stubs in this phase).
+# Registers the builtin batching/JVP/VJP rules for the standard op set.
 from evoxc.transforms import rules as _rules  # noqa: E402,F401
 
 __all__ = [

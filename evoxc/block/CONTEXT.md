@@ -162,8 +162,9 @@ decomposition fallback → else TransformError.
 the `__evoxc_defn__` marker; traced lazily). Declaration is registration:
 duplicate names → `BlockError` (reuse `get_block(name)` to add impls/rules).
 v1 numpy impls are callables the numpy interpreter backend invokes when it
-meets the block_call — the exact call signature is finalized with
-`evoxc/backends` at implementation time.
+meets the block_call: `impl(*numpy_arrays, **static_args)` returning one
+ndarray or a tuple of them, with the JSON-able `static_args` attribute as
+kwargs (see `../backends/numpy/CONTEXT.md`).
 
 ## Rule bridge to transforms
 
@@ -194,13 +195,16 @@ Frozen transforms rule signatures (binding — see `../transforms/CONTEXT.md`):
 Fallback semantics (implemented in `rules.py`):
 
 - **Batching fallback** traces the portable over the (batched) operand
-  values in the active transform builder, tracks `MappedAxes` through the
-  inlined ops in creation order (result axes = union of operand axes — the
-  longest contiguous leading tuple; constant ops are unmapped), and returns
-  the decomposition's outputs + their axes. Union semantics = the
-  decomposition is polymorphic in leading batch dims (elementwise-style);
-  transforms' vectorize consumes the returned values directly. Missing
-  portable → `TransformError` (never guesses).
+  values in the scratch builder the extension-rule bridge activates, tracks
+  `MappedAxes` through the inlined ops in creation order (result axes = union
+  of operand axes — the longest contiguous leading tuple; constant ops are
+  unmapped), and returns the decomposition's outputs + their axes. Union
+  semantics = the decomposition is polymorphic in leading batch dims
+  (elementwise-style); the native `vectorize`/`vmap` engine calls the rule
+  through the extension-rule bridge (`../transforms/_native_rules.py` — a
+  fresh one-function scratch module per rule invocation; see
+  `../transforms/CONTEXT.md`) and consumes the returned values directly.
+  Missing portable → `TransformError` (never guesses).
 - **VJP fallback** short-circuits to all-`ZeroTangent` when every cotangent
   is None/ZeroTangent; otherwise traces the portable over the primals and
   runs a LOCAL reverse sweep over ONLY the inlined ops (reverse creation
