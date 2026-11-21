@@ -23,8 +23,12 @@ fn version() -> &'static str {
 /// Native shape inference: one op's result types from its operand types.
 ///
 /// `operand_types` / `result_types` accept lists or tuples of
-/// `{"dtype": str, "shape": [dim, ...]}` dicts.  `module` is an
-/// `evoxc-native-ir` envelope, needed only by `call` (callee resolution);
+/// `{"dtype": str, "shape": [dim, ...]}` dicts.  `module` supplies the callee
+/// signatures `call` resolves against and comes in two shapes: a full
+/// `evoxc-native-ir` envelope, or the lightweight signature-only context
+/// `{"functions": [[name, [output types]], ...]}` (also
+/// `[name, [input types], [output types]]` and
+/// `{"name": ..., "input_types": ..., "output_types": ...}` entries).
 /// `result_types` is needed only by the op-specific ops (`if`, `while`,
 /// `runtime_call`, `block_call`, `external_call`).  Arguments are read-only.
 #[pyfunction]
