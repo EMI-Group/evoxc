@@ -17,7 +17,7 @@ use evoxc_core::{Dim, Error, Program, Region, Result, ValueType};
 
 use crate::buffer::{shape_text, Buffer};
 use crate::dims::{self, Bindings};
-use crate::plan::{OpSpec, Plan};
+use crate::plan::{OpSpec, Plan, Step};
 
 /// One SSA value in the flat run-time store.
 pub type Value = Rc<Buffer>;
@@ -67,75 +67,6 @@ pub fn single(buffer: Buffer) -> Result<Vec<Value>> {
 /// Move a `Buffer` out of a shared value (copying only when still shared).
 pub fn unwrap_value(value: Value) -> Buffer {
     Rc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
-}
-
-/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_PROFILE=1` accumulates per-op wall time and
-/// prints a breakdown for a chosen run number (`EVOXC_CPU_PROFILE_RUN`).
-mod profile {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
-
-    pub fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("EVOXC_CPU_PROFILE").is_some())
-    }
-
-    fn dump_run() -> u64 {
-        static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *RUN.get_or_init(|| {
-            std::env::var("EVOXC_CPU_PROFILE_RUN")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(10)
-        })
-    }
-
-    thread_local! {
-        static TOTALS: RefCell<HashMap<String, (u64, u128)>> = RefCell::new(HashMap::new());
-        static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-
-    pub fn record(name: &str, elapsed: Duration) {
-        TOTALS.with(|totals| {
-            let mut totals = totals.borrow_mut();
-            let entry = totals.entry(name.to_string()).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += elapsed.as_nanos();
-        });
-    }
-
-    pub fn tick() -> Instant {
-        Instant::now()
-    }
-
-    pub fn run_finished() {
-        let run = RUNS.with(|runs| {
-            let next = runs.get() + 1;
-            runs.set(next);
-            next
-        });
-        let first = dump_run();
-        if run < first || run > first + 8 {
-            return;
-        }
-        TOTALS.with(|totals| {
-            let totals = totals.borrow();
-            let mut rows: Vec<_> = totals.iter().collect();
-            rows.sort_by_key(|(_, (_, nanos))| std::cmp::Reverse(*nanos));
-            let all: u128 = rows.iter().map(|(_, (_, nanos))| *nanos).sum();
-            eprintln!("--- profile run {run}: total {:.3} ms", all as f64 / 1e6);
-            eprintln!("  {}", crate::buffer::pool_stats_text());
-            for (name, (count, nanos)) in rows {
-                eprintln!(
-                    "  {name:28} {count:5}x {:9.1} us total {:8.2} us/op",
-                    *nanos as f64 / 1e3,
-                    *nanos as f64 / 1e3 / *count as f64
-                );
-            }
-        });
-        TOTALS.with(|totals| totals.borrow_mut().clear());
-    }
 }
 
 /// One execution's mutable state.
@@ -226,10 +157,39 @@ impl<'p> RunCtx<'p> {
                 )));
             }
         }
-        if profile::enabled() {
-            profile::run_finished();
-        }
         Ok(outputs.into_iter().map(unwrap_value).collect())
+    }
+
+    /// Try the plan's in-place accumulation for one step (see
+    /// [`crate::plan::InPlace`]).
+    ///
+    /// `Some(Ok(results))` is the step's result, computed into the dying
+    /// operand's own memory; `Some(Err(..))` is the kernel's error; `None` means
+    /// the step was not attempted — no marker, or the operand's buffer is still
+    /// shared with something outside this step's data flow (a nested region's
+    /// caller holds a handle), so the caller must run the ordinary allocating
+    /// kernel.  The operand list is left intact in the `None` case only.
+    fn try_in_place(&mut self, step: &Step, operands: &mut Vec<Value>) -> Option<Result<Vec<Value>>> {
+        let in_place = step.in_place?;
+        if operands.len() != 2 || in_place.operand >= operands.len() {
+            return None;
+        }
+        // The plan only marks an operand whose last use is this step, so the
+        // store's handle would be released here anyway.  Taking it first leaves
+        // the operand list's handle as the only owner a plain data-flow step
+        // has, which is exactly what lets `try_unwrap` move the buffer out.
+        let value_id = step.operands[in_place.operand];
+        let from_store = self.store.get_mut(value_id).and_then(|slot| slot.take());
+        drop(from_store);
+        let taken = operands.remove(in_place.operand);
+        match Rc::try_unwrap(taken) {
+            // The other operand is the only element left in the list.
+            Ok(buffer) => Some((in_place.kernel)(self, &step.spec, buffer, &operands[0])),
+            Err(shared) => {
+                operands.insert(in_place.operand, shared);
+                None
+            }
+        }
     }
 
     /// Execute one block's plan; returns the terminator's values.
@@ -280,24 +240,26 @@ impl<'p> RunCtx<'p> {
             // A `constant` carries its payload decoded ONCE at plan build: the
             // step is then one clone of that buffer rather than a per-run
             // decode of the same bytes (`Buffer::from_payload`), with identical
-            // values and the same result validation below.
-            let profiled = profile::enabled();
-            let started = if profiled { Some(profile::tick()) } else { None };
+            // values and the same result validation below.  Otherwise the step
+            // may be an in-place accumulate (see [`RunCtx::try_in_place`]).
             let results = if let Some(constant) = &step.constant {
                 vec![Rc::new(constant.clone())]
             } else {
-                match (step.kernel)(self, &step.spec, &operands) {
-                    Ok(results) => results,
-                    Err(err) => {
+                match self.try_in_place(step, &mut operands) {
+                    Some(Ok(results)) => results,
+                    Some(Err(err)) => {
                         self.operands = operands;
                         return Err(err);
                     }
+                    None => match (step.kernel)(self, &step.spec, &operands) {
+                        Ok(results) => results,
+                        Err(err) => {
+                            self.operands = operands;
+                            return Err(err);
+                        }
+                    },
                 }
             };
-            if let Some(started) = started {
-                let label = if step.constant.is_some() { "constant(clone)" } else { step.spec.name.as_str() };
-                profile::record(label, started.elapsed());
-            }
             if results.len() != step.results.len() {
                 self.operands = operands;
                 return Err(Error::backend(format!(
@@ -460,7 +422,7 @@ mod tests {
     //! check as its fallback and the exact error wording.
     use super::*;
     use crate::buffer::Storage;
-    use crate::plan::{self, Step};
+    use crate::plan::{self};
     use evoxc_core::{
         ArrayPayload, AttrValue, Attrs, Block, DType, ErrorKind, Function, Op as IrOp,
         Value as IrValue,
@@ -510,6 +472,7 @@ mod tests {
             free: Vec::new(),
             fast,
             constant: None,
+            in_place: None,
         }
     }
 

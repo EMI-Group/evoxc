@@ -601,36 +601,6 @@ const PARALLEL_MIN_PER_THREAD: usize = 1 << 17;
 /// Upper bound on the threads one flat map uses (the measured optimum).
 const PARALLEL_MAX_THREADS: usize = 4;
 
-/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_THREADS` caps the flat-map thread count.
-fn diagnostic_max_threads() -> usize {
-    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("EVOXC_CPU_THREADS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(PARALLEL_MAX_THREADS)
-            .max(1)
-    })
-}
-
-/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_POOL_FIFO=1` selects first-in-first-out
-/// stock reuse instead of the LIFO default.
-fn diagnostic_pool_fifo() -> bool {
-    static FIFO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FIFO.get_or_init(|| std::env::var_os("EVOXC_CPU_POOL_FIFO").is_some())
-}
-
-/// TEMPORARY DIAGNOSTIC: `EVOXC_CPU_POOL_MIN` overrides [`POOL_MIN_BYTES`].
-fn diagnostic_pool_min() -> usize {
-    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("EVOXC_CPU_POOL_MIN")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(POOL_MIN_BYTES)
-    })
-}
-
 /// How many threads a flat map over `count` elements should split across.
 fn parallel_threads(count: usize) -> usize {
     if count < PARALLEL_MIN_ELEMS {
@@ -642,7 +612,6 @@ fn parallel_threads(count: usize) -> usize {
             .map(|threads| threads.get())
             .unwrap_or(1)
             .clamp(1, PARALLEL_MAX_THREADS)
-            .min(diagnostic_max_threads())
     });
     cores.min((count / PARALLEL_MIN_PER_THREAD).max(1))
 }
@@ -663,18 +632,21 @@ fn split_parallel<R: Copy + Send, F: Fn(usize, &mut [R]) + Sync>(
     let chunk = out.len().div_ceil(threads);
     let mut chunks = out.chunks_mut(chunk);
     std::thread::scope(|scope| {
-        let mut offset = 0;
-        let first = chunks.next();
+        // The leading chunk stays on the calling thread.  Every spawned chunk
+        // starts at the number of elements the previous ones cover, which is
+        // accumulated here rather than derived from the chunk length: the last
+        // chunk of a size that does not divide evenly is shorter, so deriving
+        // the offset from `chunk.len()` shifted every operand window of the last
+        // chunk by the difference (a wrong result, not just a slow one).
+        let Some(first) = chunks.next() else { return };
+        let mut offset = first.len();
         for chunk in chunks {
-            let start = offset + chunk.len();
+            let start = offset;
+            offset += chunk.len();
             let body = &body;
             scope.spawn(move || body(start, chunk));
-            offset = start;
         }
-        // The calling thread takes the leading chunk instead of idling.
-        if let Some(chunk) = first {
-            body(0, chunk);
-        }
+        body(0, first);
     });
 }
 
@@ -728,6 +700,35 @@ pub fn zip2<T: Copy + Sync, R: Copy + Send>(
     }
     for ((slot, x), y) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
         *slot = f(*x, *y);
+    }
+}
+/// Flat in-place binary accumulate: `slot[i] = f(slot[i], other[i])`, writing
+/// the result into memory the caller already owns (an operand whose value dies
+/// at the step — see [`crate::plan::InPlace`]).
+///
+/// Element `i` of the result depends on element `i` of both operands and on
+/// nothing else, which is what makes overwriting the first operand in place
+/// bit-identical to the allocating path; the chunking policy is [`zip2`]'s.
+pub fn zip2_accumulate<T: Copy + Sync + Send>(
+    slot: &mut [T],
+    other: &[T],
+    f: impl Fn(T, T) -> T + Sync,
+) {
+    let threads = parallel_threads(slot.len());
+    if threads > 1 {
+        split_parallel(slot, threads, |offset, chunk| {
+            let len = chunk.len();
+            // The other operand is only READ: every chunk owns a disjoint part
+            // of `slot`, so the views never overlap a write.
+            let other = window(other, offset, len);
+            for (value, rhs) in chunk.iter_mut().zip(other) {
+                *value = f(*value, *rhs);
+            }
+        });
+        return;
+    }
+    for (value, rhs) in slot.iter_mut().zip(other.iter()) {
+        *value = f(*value, *rhs);
     }
 }
 /// Flat ternary map: `out[i] = f(first[i], second[i], third[i])` (the `select`
@@ -837,36 +838,6 @@ const POOL_MAX_ENTRIES: usize = 64;
 /// `POOL_MAX_PER_SIZE` of its own buffers and never a malloc round trip.
 const POOL_MAX_PER_SIZE: usize = 8;
 
-/// TEMPORARY DIAGNOSTIC counters (hits, misses, pushes, evictions, refusals).
-pub mod pool_stats {
-    use std::cell::Cell;
-
-    thread_local! {
-        static COUNTERS: [Cell<u64>; 5] =
-            [const { Cell::new(0) }; 5];
-    }
-
-    pub const HIT: usize = 0;
-    pub const MISS: usize = 1;
-    pub const PUSH: usize = 2;
-    pub const EVICT: usize = 3;
-    pub const REFUSE: usize = 4;
-
-    pub fn bump(index: usize) {
-        COUNTERS.with(|counters| counters[index].set(counters[index].get() + 1));
-    }
-
-    pub fn take() -> [u64; 5] {
-        COUNTERS.with(|counters| {
-            let now = std::array::from_fn(|index| counters[index].get());
-            for cell in counters.iter() {
-                cell.set(0);
-            }
-            now
-        })
-    }
-}
-
 thread_local! {
     static STORAGE_POOL: RefCell<StoragePool> = const { RefCell::new(StoragePool::new()) };
     /// Cleared once the pool's own destructor starts, so a retained value that
@@ -913,7 +884,7 @@ impl StoragePool {
     /// never starve the workload that is running (see the contract block above).
     fn push(&mut self, storage: &mut Storage) -> bool {
         let bytes = storage.bytes();
-        if !(diagnostic_pool_min()..=POOL_MAX_BYTES).contains(&bytes) {
+        if !(POOL_MIN_BYTES..=POOL_MAX_BYTES).contains(&bytes) {
             return false;
         }
         let dtype = storage.dtype();
@@ -924,7 +895,6 @@ impl StoragePool {
             // that keeps one more buffer of this size in flight than it retains
             // never pays a malloc round trip per run.
             if !self.evict_same_size(dtype, len) {
-                pool_stats::bump(pool_stats::REFUSE);
                 return false;
             }
         }
@@ -933,11 +903,9 @@ impl StoragePool {
                 // Nothing of another size can be evicted (only possible when the
                 // value alone exceeds the byte cap, excluded above), so the pool
                 // keeps what it has and this stock is freed.
-                pool_stats::bump(pool_stats::REFUSE);
                 return false;
             }
         }
-        pool_stats::bump(pool_stats::PUSH);
         let last_use = self.next_tick();
         let retained = std::mem::replace(storage, Storage::Bool(Vec::new()));
         self.bytes += bytes;
@@ -964,7 +932,6 @@ impl StoragePool {
             .min_by_key(|(_, entry)| entry.last_use)
             .map(|(index, _)| index);
         let Some(index) = victim else { return false };
-        pool_stats::bump(pool_stats::EVICT);
         let entry = self.entries.swap_remove(index);
         self.bytes -= entry.storage.bytes();
         true
@@ -986,7 +953,6 @@ impl StoragePool {
             })
             .map(|(index, _)| index);
         let Some(index) = victim else { return false };
-        pool_stats::bump(pool_stats::EVICT);
         let entry = self.entries.swap_remove(index);
         self.bytes -= entry.storage.bytes();
         true
@@ -995,20 +961,16 @@ impl StoragePool {
     /// Take a retained storage of exactly `dtype` and `len` elements.
     fn take(&mut self, dtype: DType, len: usize) -> Option<Storage> {
         let matching = |entry: &PoolEntry| entry.storage.dtype() == dtype && entry.storage.len() == len;
-        let index = if diagnostic_pool_fifo() {
-            self.entries.iter().position(matching)?
-        } else {
-            // LIFO: hand back the MOST recently used matching stock, so a graph
-            // cycles through a couple of hot buffers instead of walking its whole
-            // retained size class and touching memory that has gone cold.
-            self.entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| matching(entry))
-                .max_by_key(|(_, entry)| entry.last_use)
-                .map(|(index, _)| index)?
-        };
-        pool_stats::bump(pool_stats::HIT);
+        // LIFO: hand back the MOST recently used matching stock, so a graph
+        // cycles through a couple of hot buffers instead of walking its whole
+        // retained size class and touching memory that has gone cold.
+        let index = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matching(entry))
+            .max_by_key(|(_, entry)| entry.last_use)
+            .map(|(index, _)| index)?;
         let entry = self.entries.swap_remove(index);
         self.bytes -= entry.storage.bytes();
         Some(entry.storage)
@@ -1047,26 +1009,10 @@ fn take_pooled_vec<R: Scalar>(count: usize) -> Option<Vec<R>> {
         .try_with(|pool| pool.try_borrow_mut().ok()?.take(R::DTYPE, count))
         .ok()
         .flatten();
-    let values = match storage {
+    match storage {
         Some(mut storage) => R::take_vec(&mut storage),
         None => None,
-    };
-    if values.is_none() {
-        pool_stats::bump(pool_stats::MISS);
     }
-    values
-}
-
-/// TEMPORARY DIAGNOSTIC: one line describing this thread's pool traffic.
-pub fn pool_stats_text() -> String {
-    let [hits, misses, pushes, evictions, _] = pool_stats::take();
-    let (entries, bytes) = STORAGE_POOL.with(|pool| {
-        let pool = pool.borrow();
-        (pool.entries.len(), pool.bytes)
-    });
-    format!(
-        "pool: hits {hits}, misses {misses}, pushes {pushes}, evictions {evictions}, entries {entries}, bytes {bytes}"
-    )
 }
 
 /// Flat unary builder: `out[i] = f(source[i])` over `out_shape`'s elements,
@@ -1311,6 +1257,39 @@ macro_rules! with_type {
 macro_rules! with_same_type {
     ($left:expr, $right:expr, |$a:ident, $b:ident| $body:expr) => {
         match (&$left.storage, &$right.storage) {
+            ($crate::buffer::Storage::Bool($a), $crate::buffer::Storage::Bool($b)) => $body,
+            ($crate::buffer::Storage::I8($a), $crate::buffer::Storage::I8($b)) => $body,
+            ($crate::buffer::Storage::I16($a), $crate::buffer::Storage::I16($b)) => $body,
+            ($crate::buffer::Storage::I32($a), $crate::buffer::Storage::I32($b)) => $body,
+            ($crate::buffer::Storage::I64($a), $crate::buffer::Storage::I64($b)) => $body,
+            ($crate::buffer::Storage::U8($a), $crate::buffer::Storage::U8($b)) => $body,
+            ($crate::buffer::Storage::U16($a), $crate::buffer::Storage::U16($b)) => $body,
+            ($crate::buffer::Storage::U32($a), $crate::buffer::Storage::U32($b)) => $body,
+            ($crate::buffer::Storage::U64($a), $crate::buffer::Storage::U64($b)) => $body,
+            ($crate::buffer::Storage::F16($a), $crate::buffer::Storage::F16($b)) => $body,
+            ($crate::buffer::Storage::F32($a), $crate::buffer::Storage::F32($b)) => $body,
+            ($crate::buffer::Storage::F64($a), $crate::buffer::Storage::F64($b)) => $body,
+            ($crate::buffer::Storage::C64($a), $crate::buffer::Storage::C64($b)) => $body,
+            ($crate::buffer::Storage::C128($a), $crate::buffer::Storage::C128($b)) => $body,
+            _ => {
+                return Err(Error::dtype(format!(
+                    "dtype mismatch: {} vs {}",
+                    $left.dtype.name(),
+                    $right.dtype.name()
+                )))
+            }
+        }
+    };
+}
+
+/// Match two buffers of the same dtype, binding the LEFT one's typed vector
+/// mutably and the right one's immutably — the in-place counterpart of
+/// [`with_same_type!`], for a kernel that owns its first operand (see
+/// [`zip2_accumulate`]).
+#[macro_export]
+macro_rules! with_same_type_mut {
+    ($left:expr, $right:expr, |$a:ident, $b:ident| $body:expr) => {
+        match (&mut $left.storage, &$right.storage) {
             ($crate::buffer::Storage::Bool($a), $crate::buffer::Storage::Bool($b)) => $body,
             ($crate::buffer::Storage::I8($a), $crate::buffer::Storage::I8($b)) => $body,
             ($crate::buffer::Storage::I16($a), $crate::buffer::Storage::I16($b)) => $body,
@@ -1692,6 +1671,66 @@ mod tests {
             map3(DType::Float32, &[count], &mask, &left, &right, |pick, a, b| if pick { a } else { b })
                 .unwrap();
         assert_eq!(ternary.storage, map1(DType::Float32, &[count], &left, |value| value).unwrap().storage);
+    }
+
+    #[test]
+    fn threaded_chunks_read_their_operands_at_their_own_offset() {
+        // A count no thread split divides evenly leaves a SHORT last chunk.  Its
+        // operand window must start where the previous chunks end, which is the
+        // running total of their lengths — deriving it from a chunk length
+        // shifted that window by the rounding difference and silently paired
+        // each element with a neighbour's operand.
+        for extra in [1usize, 3, 5, 1234] {
+            let count = PARALLEL_MIN_ELEMS + extra;
+            let left: Vec<f32> = (0..count).map(|index| index as f32 * 0.5 - 3.0).collect();
+            let right: Vec<f32> = (0..count).map(|index| 1.25 - index as f32 * 0.125).collect();
+            let mut slot = left.clone();
+            zip2_accumulate(&mut slot, &right, |value, other| value * other);
+            for (index, value) in slot.iter().enumerate() {
+                assert_eq!(
+                    *value,
+                    left[index] * right[index],
+                    "count {count} element {index}"
+                );
+            }
+            let expected = map2(DType::Float32, &[count], &left, &right, |x, y| x * y)
+                .expect("the allocating map accepts full-length operands");
+            match &expected.storage {
+                Storage::F32(values) => assert_eq!(&slot, values, "count {count}"),
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_accumulation_matches_the_allocating_map() {
+        // The in-place driver must be bit-identical to a fresh `map2` result,
+        // element for element, on both the one-thread path and the chunked one
+        // (with the other operand read from a windowed view per chunk).
+        for count in [0usize, 1, 7, PARALLEL_MIN_ELEMS + 3] {
+            let left: Vec<f32> = (0..count).map(|index| index as f32 * 0.5 - 3.0).collect();
+            let right: Vec<f32> = (0..count).map(|index| 1.25 - index as f32 * 0.125).collect();
+            let mut slot = left.clone();
+            zip2_accumulate(&mut slot, &right, |value, other| value * other);
+            let expected = map2(DType::Float32, &[count], &left, &right, |x, y| x * y)
+                .expect("the allocating map accepts full-length operands");
+            match &expected.storage {
+                Storage::F32(values) => assert_eq!(&slot, values, "count {count}"),
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
+        // A short `other` stops the zip exactly where the allocating driver
+        // stops, so a mismatched pair can never read past the operand.
+        let mut slot = vec![1.0f32, 2.0, 3.0];
+        zip2_accumulate(&mut slot, &[10.0f32, 20.0], |value, other| value + other);
+        assert_eq!(slot, vec![11.0, 22.0, 3.0]);
+        // NaN/inf semantics are the closure's, so a NaN operand poisons only
+        // the element it lands on (no reordering, no accumulation).
+        let mut slot = vec![1.0f32, f32::NAN, 3.0];
+        zip2_accumulate(&mut slot, &[f32::INFINITY, 2.0, 4.0], |value, other| value + other);
+        assert_eq!(slot[0], f32::INFINITY);
+        assert!(slot[1].is_nan());
+        assert_eq!(slot[2], 7.0);
     }
 
     #[test]

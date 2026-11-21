@@ -17,7 +17,34 @@ use evoxc_core::{
 };
 
 use crate::buffer::Buffer;
-use crate::kernels::{self, KernelFn};
+use crate::exec::{RunCtx, Value};
+use crate::kernels::{self, elementwise, KernelFn};
+
+/// One op's in-place accumulate implementation: it receives the OWNED buffer of
+/// the operand the plan selected (see [`InPlace`]) plus the other operand, in
+/// operand order, and returns the step's results.  A kernel that finds the
+/// runtime dtype/shape does not match what the plan proved must fall back to its
+/// allocating path rather than decline — the buffer it was handed is already off
+/// the store.
+pub type InPlaceFn = fn(&mut RunCtx<'_>, &OpSpec, Buffer, &Value) -> Result<Vec<Value>>;
+
+/// Set on a step whose result may be written into one of its own operands.
+///
+/// The plan only selects an operand whose value DIES at this step, so the store
+/// slot is released here anyway and the buffer can be moved into the kernel
+/// instead of allocating a fresh result (a 1 MiB write-allocate per step on a
+/// `(4096, 64)` f32 graph).  The run still takes the buffer only when it is the
+/// last owner; a value still shared with a nested region's caller falls back to
+/// the allocating path, which is why this is a hint rather than a contract.
+#[derive(Debug, Clone, Copy)]
+pub struct InPlace {
+    /// Operand index whose buffer the result overwrites (`0` = left, `1` = the
+    /// one whitelisted binary shape's right operand).
+    pub operand: usize,
+    /// The op's in-place implementation (`kernels::elementwise`), already
+    /// specialised to `operand`'s side of the operator.
+    pub kernel: InPlaceFn,
+}
 
 /// The static description of one op handed to its kernel.
 #[derive(Debug, Clone)]
@@ -51,6 +78,9 @@ pub struct Step {
     /// other op (and the value is identical to what the `constant` kernel
     /// would decode).
     pub constant: Option<Buffer>,
+    /// `Some` when this step may accumulate into one of its own operands (see
+    /// [`InPlace`]); `None` for every op that must allocate a result.
+    pub in_place: Option<InPlace>,
 }
 
 /// One block's plan.
@@ -314,6 +344,13 @@ fn build_block(
     let mut nested_blocks: Vec<u32> = Vec::new();
     let mut callees: Vec<String> = Vec::new();
     let mut steps = Vec::with_capacity(body.len());
+    // Values an in-place step must never overwrite: the block's own arguments
+    // (a graph/region input, which the caller still owns) and the terminator's
+    // operands (a value this block must still hand back).  A `return` operand's
+    // last use is past every step, so it never reaches `free` either — the
+    // explicit exclusion keeps the rule readable and independent of that.
+    let mut not_takeable: HashSet<usize> = block.arguments.iter().map(|value| value.index()).collect();
+    not_takeable.extend(return_ids.iter().copied());
     for (index, op) in body.iter().enumerate() {
         let op_schema = schema::require(&op.name)?;
         let attrs = op.attributes.with_defaults(op_schema)?;
@@ -371,12 +408,22 @@ fn build_block(
             })
             .collect::<Result<Vec<_>>>()?;
         // A `constant`'s payload is decoded here, once per compile, instead of
-        // once per run (see [`Step::constant`]).
+        // once per run (see [`Step::constant`]).  Its result is a fresh clone per
+        // use but stays a plan-time payload, so it is never an in-place target.
         let constant = if op.name == "constant" {
             Some(Buffer::from_payload(attrs.array("value")?)?)
         } else {
             None
         };
+        if constant.is_some() {
+            not_takeable.extend(op.results.iter().map(|value| value.index()));
+        }
+        let free = free_by_index.remove(&index).unwrap_or_default();
+        let in_place = in_place_operand(op, &operand_types, &result_types, &free, &not_takeable)
+            .and_then(|operand| {
+                let kernel = elementwise::in_place_kernel(&op.name, operand == 0)?;
+                Some(InPlace { operand, kernel })
+            });
         steps.push(Step {
             spec: OpSpec {
                 name: op.name.clone(),
@@ -389,9 +436,10 @@ fn build_block(
             kernel,
             operands: op.operands.iter().map(|value| value.index()).collect(),
             results: op.results.iter().map(|value| value.index()).collect(),
-            free: free_by_index.remove(&index).unwrap_or_default(),
+            free,
             fast,
             constant,
+            in_place,
         });
     }
 
@@ -406,6 +454,44 @@ fn build_block(
             .collect(),
     };
     Ok((plan, nested_blocks, callees))
+}
+
+/// Select the operand an in-place step may overwrite, if any.
+///
+/// The implementation is only ever called for an op
+/// [`elementwise::in_place_kernel`] whitelists, i.e. a binary elementwise op
+/// whose scalar function maps element `i` of its two same-dtype, same-shape
+/// operands to element `i` of the result and reads nothing else.  On top of that
+/// this requires:
+///
+///  * exactly two operands with DISTINCT value ids — `add(a, a)` would alias one
+///    buffer as both the read and the write of the same element;
+///  * both operands' declared types equal to the result type, which is what
+///    makes the flat (broadcast-free) path the one the kernel will take, with no
+///    cast and no scalar broadcast;
+///  * the selected operand's value dies at this step and is not a block
+///    argument, a `return` operand or a plan-time constant (see `not_takeable`).
+fn in_place_operand(
+    op: &Op,
+    operand_types: &[ValueType],
+    result_types: &[ValueType],
+    free: &[usize],
+    not_takeable: &HashSet<usize>,
+) -> Option<usize> {
+    if op.operands.len() != 2 || op.results.len() != 1 || result_types.len() != 1 {
+        return None;
+    }
+    if op.operands[0] == op.operands[1] {
+        return None;
+    }
+    let result = &result_types[0];
+    if operand_types.iter().any(|ty| ty != result) {
+        return None;
+    }
+    (0..op.operands.len()).find(|index| {
+        let value = op.operands[*index].index();
+        free.contains(&value) && !not_takeable.contains(&value)
+    })
 }
 
 fn record_region_uses(
@@ -427,4 +513,223 @@ fn record_region_uses(
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    //! Contracts of the in-place marker: which steps the plan lets a kernel
+    //! write into one of its own operands, and which it must not.  The runtime
+    //! re-checks what it can (`exec` only takes an unshared buffer, the kernel
+    //! only accumulates onto a flat, same-dtype pair), so these tests pin the
+    //! plan-time rules that decide whether the question is ever asked.
+    use super::*;
+    use evoxc_core::{
+        AttrValue, ArrayPayload, Block, Dim, Function, Op as IrOp, Value as IrValue,
+    };
+
+    fn f32_ty(shape: &[usize]) -> ValueType {
+        ValueType::of(DType::Float32, shape.iter().map(|dim| Dim::int(*dim as i64)))
+    }
+
+    /// A one-block `main` under construction: `nodes` holds every value id in
+    /// creation order (inputs first), and each `op` call indexes into it.
+    struct Fixture {
+        program: Program,
+        block: Block,
+        function: Function,
+        nodes: Vec<evoxc_core::ValueId>,
+    }
+
+    impl Fixture {
+        fn new(inputs: &[&[usize]]) -> Fixture {
+            let mut program = Program::new("in-place fixture");
+            let block_id = program.new_block_id();
+            let mut block = Block::new(block_id);
+            let mut nodes = Vec::new();
+            let mut input_types = Vec::new();
+            for (index, shape) in inputs.iter().enumerate() {
+                let id = program.new_value_id();
+                let ty = f32_ty(shape);
+                program
+                    .add_value(IrValue::block_argument(id, ty.clone(), block_id, index as u32))
+                    .expect("fixture value");
+                block.arguments.push(id);
+                nodes.push(id);
+                input_types.push(ty);
+            }
+            let mut function = Function::new("main", input_types);
+            function.body = Region::single(block_id);
+            Fixture { program, block, function, nodes }
+        }
+
+        fn push(&mut self, name: &str, operands: &[usize], ty: ValueType, attrs: Attrs) -> usize {
+            let op_id = self.program.new_op_id();
+            let value_id = self.program.new_value_id();
+            self.program
+                .add_value(IrValue::op_result(value_id, ty, op_id, 0))
+                .expect("fixture value");
+            let mut op = IrOp::new(op_id, name);
+            op.operands = operands.iter().map(|index| self.nodes[*index]).collect();
+            op.results = vec![value_id];
+            op.attributes = attrs;
+            self.program.add_op(op).expect("fixture op");
+            self.block.ops.push(op_id);
+            self.nodes.push(value_id);
+            self.nodes.len() - 1
+        }
+
+        fn op(&mut self, name: &str, operands: &[usize], shape: &[usize]) -> usize {
+            self.push(name, operands, f32_ty(shape), Attrs::new())
+        }
+
+        fn constant(&mut self, values: &[f32]) -> usize {
+            let mut data = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            let payload = ArrayPayload {
+                dtype: DType::Float32,
+                shape: vec![values.len() as i64],
+                data,
+            };
+            let attrs = Attrs::from_pairs([("value", AttrValue::Array(payload))]);
+            self.push("constant", &[], f32_ty(&[values.len()]), attrs)
+        }
+
+        fn finish(mut self, returns: &[usize]) -> Program {
+            let return_id = self.program.new_op_id();
+            let mut ret = IrOp::new(return_id, "return");
+            ret.operands = returns.iter().map(|index| self.nodes[*index]).collect();
+            self.function.output_types = ret
+                .operands
+                .iter()
+                .map(|value| self.program.value(*value).expect("fixture value").ty.clone())
+                .collect();
+            self.program.add_op(ret).expect("fixture op");
+            self.block.ops.push(return_id);
+            self.program.add_block(self.block).expect("fixture block");
+            self.program.add_function(self.function).expect("fixture function");
+            self.program
+        }
+    }
+
+    /// The in-place marker of every step of the entry block.
+    fn markers(program: &Program) -> Vec<Option<InPlace>> {
+        let plan = compile(program).expect("the fixture compiles");
+        plan.blocks[0]
+            .as_ref()
+            .expect("the entry block is planned")
+            .steps
+            .iter()
+            .map(|step| step.in_place)
+            .collect()
+    }
+
+    #[test]
+    fn a_dying_broadcast_free_operand_is_the_in_place_target() {
+        // `main(x, y)`: r0 = add(x, y); r1 = add(r0, y); return r1
+        // r0 dies at the second add and is neither an argument nor a return, so
+        // that step accumulates into its (left) buffer.
+        let mut fixture = Fixture::new(&[&[2, 2], &[2, 2]]);
+        let sum = fixture.op("add", &[0, 1], &[2, 2]);
+        let total = fixture.op("add", &[sum, 1], &[2, 2]);
+        let program = fixture.finish(&[total]);
+        let markers = markers(&program);
+        assert!(markers[0].is_none(), "the first add reads only block arguments");
+        let in_place = markers[1].expect("the second add takes its dying operand");
+        assert_eq!(in_place.operand, 0);
+        // The kernel the plan selected is the left-hand accumulate.
+        assert!(std::ptr::fn_addr_eq(
+            in_place.kernel,
+            crate::kernels::elementwise::in_place_kernel("add", true).expect("add is whitelisted")
+        ));
+    }
+
+    #[test]
+    fn a_dying_right_operand_is_taken_when_it_is_the_only_candidate() {
+        // `main(x, y)`: r0 = add(x, y); r1 = add(x, r0); return r1
+        // r0 is the RIGHT operand of r1 and dies there, so operand index 1.
+        let mut fixture = Fixture::new(&[&[3], &[3]]);
+        let sum = fixture.op("add", &[0, 1], &[3]);
+        let total = fixture.op("add", &[0, sum], &[3]);
+        let program = fixture.finish(&[total]);
+        let in_place = markers(&program)[1].expect("the dying right operand is taken");
+        assert_eq!(in_place.operand, 1);
+        assert!(std::ptr::fn_addr_eq(
+            in_place.kernel,
+            crate::kernels::elementwise::in_place_kernel("add", false).expect("add is whitelisted")
+        ));
+    }
+
+    #[test]
+    fn block_arguments_and_return_operands_are_never_overwritten() {
+        // `main(x, y)`: r0 = add(x, y) — x and y are inputs; return r0, r0.
+        let mut fixture = Fixture::new(&[&[2], &[2]]);
+        let sum = fixture.op("add", &[0, 1], &[2]);
+        let program = fixture.finish(&[sum, sum]);
+        assert!(markers(&program).iter().all(|marker| marker.is_none()));
+
+        // `main(x, y)`: r0 = add(x, y); r1 = add(r0, r0) is the aliasing case —
+        // one buffer as both the read and the write — so it must allocate.
+        let mut fixture = Fixture::new(&[&[2], &[2]]);
+        let first = fixture.op("add", &[0, 1], &[2]);
+        let second = fixture.op("add", &[first, first], &[2]);
+        let program = fixture.finish(&[second]);
+        assert!(markers(&program)[1].is_none(), "add(a, a) must not alias");
+    }
+
+    #[test]
+    fn a_returned_value_is_not_an_in_place_target_until_its_last_use() {
+        // `main(x, y)`: r0 = add(x, y); r1 = add(r0, y); return r0, r1
+        // r0 is a return operand, so the second add may not overwrite it.
+        let mut fixture = Fixture::new(&[&[2], &[2]]);
+        let first = fixture.op("add", &[0, 1], &[2]);
+        let second = fixture.op("add", &[first, 1], &[2]);
+        let program = fixture.finish(&[first, second]);
+        assert!(markers(&program).iter().all(|marker| marker.is_none()));
+    }
+
+    #[test]
+    fn a_constant_payload_is_never_an_in_place_target() {
+        // `main(y)`: c = constant([1, 2]); r0 = add(c, y); return r0
+        let mut fixture = Fixture::new(&[&[2]]);
+        let constant = fixture.constant(&[1.0, 2.0]);
+        let sum = fixture.op("add", &[constant, 0], &[2]);
+        let program = fixture.finish(&[sum]);
+        assert!(
+            markers(&program)[1].is_none(),
+            "a plan-time constant keeps its own bytes"
+        );
+    }
+
+    #[test]
+    fn only_broadcast_free_same_dtype_binary_ops_are_marked() {
+        // A broadcasting pair (shapes (2, 1) and (1, 2) into (2, 2)) has no
+        // element-for-element correspondence, so the second add allocates.
+        let mut fixture = Fixture::new(&[&[2, 1], &[1, 2]]);
+        let first = fixture.op("add", &[0, 1], &[2, 2]);
+        let second = fixture.op("add", &[first, 1], &[2, 2]);
+        let program = fixture.finish(&[second]);
+        assert!(markers(&program)[1].is_none(), "a broadcasting pair allocates");
+
+        // A different dtype (the frontend would insert a cast; the plan sees an
+        // f32 operand feeding an i32 result) is not an in-place candidate.
+        let mut fixture = Fixture::new(&[&[2], &[2]]);
+        let first = fixture.op("add", &[0, 1], &[2]);
+        let wrong = fixture.push(
+            "add",
+            &[first, 1],
+            ValueType::of(DType::Int32, [Dim::int(2)]),
+            Attrs::new(),
+        );
+        let program = fixture.finish(&[wrong]);
+        assert!(markers(&program)[1].is_none(), "a dtype change is not elementwise");
+
+        // And an op outside the whitelist is never marked, even when its single
+        // operand dies: `power` may hand its base buffer back unchanged.
+        let mut fixture = Fixture::new(&[&[2], &[2]]);
+        let first = fixture.op("multiply", &[0, 1], &[2]);
+        let powered = fixture.op("power", &[first, 1], &[2]);
+        let program = fixture.finish(&[powered]);
+        assert!(markers(&program)[1].is_none(), "power is not whitelisted");
+    }
 }
