@@ -53,6 +53,14 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 - Decode validates duplicate value/op ids, dangling operands, unreferenced table entries, unknown op names, malformed payloads and declared-vs-computed `output_types`, then rebuilds uses and reseeds the allocators.
 - Encode is deterministic (ascending op ids, function/block/region order, preserved map key order) and always emits `location`, `metadata`, `input_types`, `output_types` and both `id` and `ref`.
 - Attribute decoding accepts JSON `null` for EVERY declared type tag, decoding it to `AttrValue::Null` (the registry models `default=None` on optional attributes of any type: `conv.strides`/`input_dilation`/`kernel_dilation`, `slice.strides`, `transpose.permutation` (`ints`), `flip.axes`/`roll.axis` (`any`), …); `AttrValue::Null` matches every declared tag, round-trips back to `null`, and the required accessors reject it while `opt_i64`/`opt_ints`/`opt_strs`/`opt_shape` read it as `None`.
+- A `{"__evoxc_tuple__": [...]}` marker decodes by the DECLARED tag (Python tuples reach typed attributes: `gather.axes = (0,)`, `slice.strides = (1, 2)`, tuple-built `pad.padding_config`).
+- `ints`/`floats`/`strs` decode the marker to their sequence variant, elementwise, and a wrong member type is a `VerificationError` naming the item index.
+- `nested_ints` decodes each item as a plain list OR a nested tuple marker, elementwise as ints.
+- `shape` decodes each item with `wire::dim_from_json` (`{"int": ...}`/`{"dim": ...}`/`{"expr": ...}`/`null`).
+- `any` keeps `AttrValue::Tuple` of generic `AttrValue::Any` members and re-emits the marker.
+- A scalar tag (`bool`/`int`/`float`/`str`/`dtype`/`ndarray`) rejects a tuple with an explicit `VerificationError` naming the tag.
+- Typed sequence variants (`Ints`/`Floats`/`Strs`/`NestedInts`/`Shape`) re-encode as plain lists (semantically identical for typed attributes), and `AttrValue::Tuple` matches only the `any` tag, so a malformed envelope that bypasses decoding is still rejected.
+- The compiler parity converter's `_flatten_tuple_markers` workaround is no longer needed and can be removed (that crate is outside this one's write scope).
 
 ## Inference contract
 
