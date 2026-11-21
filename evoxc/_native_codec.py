@@ -7,14 +7,13 @@ strings, and an envelope returned by native code is converted back into a
 fully wired, ``ir.verify``-clean ``ir.Module``.
 
 It is deliberately **not** the persistence format (``evoxc.persist`` owns the
-on-disk format) and it imports only ``evoxc.core``, ``evoxc.ir``, NumPy and
-the standard library.
+on-disk format) and it imports only ``evoxc.core``, ``evoxc.ir``, NumPy and the
+standard library.
 
 The envelope is ``evoxc-native-ir`` version 1 (``ENVELOPE_FORMAT``), documented
 in ``native/CONTEXT.md`` ("Wire format: the envelope").  Its body is the
-``evoxc-ir`` payload produced by :func:`evoxc.ir.serialize_module` — same
-``module``/``functions``/``ops`` layout, same value ids, same dim encodings —
-with two deliberate differences:
+``evoxc-ir`` payload layout — same ``module``/``functions``/``ops`` layout, same
+value ids, same dim encodings — with two deliberate differences:
 
 * the discriminator is ``{"format": "evoxc-native-ir", "version": 1}`` instead
   of ``{"format": "evoxc-ir", "version": ir.IR_FORMAT_VERSION}``, and there is
@@ -36,34 +35,29 @@ Type and dim encodings (shared with the Python payload)::
          | None                                     # runtime-dynamic
 
 Tuples that must survive the round trip encode as ``{"__evoxc_tuple__": [...]}``
-and are passed through VERBATIM (contents are still walked, so nested array
-payloads convert); native code decodes every tuple through its own tag-directed
-path.
+and are passed through VERBATIM (contents are still walked natively); native
+code decodes every tuple through its own tag-directed path.
 
 Conversion (mirrors ``native/evoxc-compiler/tests/parity_transform/convert.py``):
 
-* :func:`encode_module` serializes with :func:`evoxc.ir.serialize_module`,
-  drops ``sha256`` and the ``constants`` table, inlines every ndarray payload
-  and stamps the native discriminator.  The input module is only read (never
-  mutated, no counter advance).
-* :func:`decode_module` reverses it: inline payloads are hoisted back into a
-  ``constants`` table (``npy`` base64, the form :mod:`evoxc.ir.serialize`
-  uses), the Python discriminator and version are restored, the ``sha256`` is
-  recomputed, and :func:`evoxc.ir.deserialize_module` rebuilds and re-verifies
-  the module (original ids, parent pointers and ``uses`` preserved).
+* :func:`encode_module` serializes through
+  :func:`evoxc.ir.serialize._serialize_native_payload`, which verifies the
+  module (exactly like the public ``ir.serialize_module``), emits every ndarray
+  inline and skips the integrity hash — no second walk of the payload.  The
+  input module is only read (never mutated, no counter advance).
+* :func:`decode_module` validates the envelope discriminator/version and hands
+  the body straight to :func:`evoxc.ir.serialize._deserialize_envelope_body`,
+  which rebuilds the module from the self-contained inline payloads (no
+  constants-table hoist, no re-encode) and re-verifies it.  Original ids,
+  parent pointers and ``uses`` are preserved.
 
-Every malformed envelope is a loud ``ValueError`` from this module, or the
-``PersistenceError``/``VerificationError`` raised by
-:func:`evoxc.ir.deserialize_module` for body violations — never a silent
-coercion.
+Every malformed envelope is a loud error from this module or the
+``VerificationError`` raised by the rebuild/``verify`` for body violations —
+never a silent coercion.
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import io
-import json
 from numbers import Integral
 from typing import Any
 
@@ -71,6 +65,7 @@ import numpy as np
 
 from evoxc import ir
 from evoxc.core import Dim, DimExpr
+from evoxc.ir import serialize as _ir_serialize
 
 __all__ = ["ENVELOPE_FORMAT", "encode_module", "decode_module", "encode_type", "decode_type"]
 
@@ -79,9 +74,6 @@ ENVELOPE_FORMAT = 1
 
 #: Wire discriminator of the native envelope.
 _NATIVE_FORMAT = "evoxc-native-ir"
-
-#: Wire discriminator of the Python IR payload this codec converts to/from.
-_PYTHON_FORMAT = "evoxc-ir"
 
 #: Top-level keys that belong to the envelope body (everything else is metadata
 #: a caller may carry through untouched).
@@ -227,174 +219,6 @@ def _decode_dim(raw: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# ndarray payloads
-# ---------------------------------------------------------------------------
-
-
-def _array_to_inline(array: np.ndarray) -> dict:
-    """Encode an ndarray as the native inline payload (raw little-endian bytes)."""
-    name = array.dtype.name
-    little_endian = np.dtype(name).newbyteorder("<")
-    converted = array.astype(little_endian, copy=False)
-    return {
-        "dtype": name,
-        "shape": [int(size) for size in array.shape],
-        "data_b64": base64.b64encode(converted.tobytes(order="C")).decode("ascii"),
-    }
-
-
-def _inline_to_array(inner: Any, where: str) -> np.ndarray:
-    """Decode one native inline payload into an owning, native-order ndarray."""
-    if not isinstance(inner, dict):
-        raise ValueError(
-            f"{where}: inline ndarray payload must be a dict, got {type(inner).__name__}"
-        )
-    name = _require_key(inner, "dtype", f"{where} ndarray")
-    shape = _require_key(inner, "shape", f"{where} ndarray")
-    data_b64 = _require_key(inner, "data_b64", f"{where} ndarray")
-    if not isinstance(name, str):
-        raise ValueError(f"{where}: ndarray 'dtype' must be a string, got {name!r}")
-    if not isinstance(shape, (list, tuple)) or not all(_is_int(size) for size in shape):
-        raise ValueError(f"{where}: ndarray 'shape' must be a list of ints, got {shape!r}")
-    if not isinstance(data_b64, str):
-        raise ValueError(f"{where}: ndarray 'data_b64' must be a string, got {data_b64!r}")
-    try:
-        dtype = np.dtype(name)
-    except TypeError as exc:
-        raise ValueError(f"{where}: invalid dtype name {name!r}: {exc}") from exc
-    try:
-        raw = base64.b64decode(data_b64.encode("ascii"), validate=True)
-    except ValueError as exc:
-        raise ValueError(f"{where}: ndarray 'data_b64' is not valid base64: {exc}") from exc
-    try:
-        flat = np.frombuffer(raw, dtype=dtype.newbyteorder("<"))
-        view = flat.reshape(tuple(int(size) for size in shape))
-    except ValueError as exc:
-        raise ValueError(
-            f"{where}: malformed ndarray payload for dtype {name!r} and shape "
-            f"{list(shape)!r}: {exc}"
-        ) from exc
-    # ``np.array(..., copy=True)`` normalizes byte order to native, makes the
-    # array owning and writable, and keeps C order (including 0-d shape ()).
-    return np.array(view, dtype=dtype, order="C", copy=True)
-
-
-def _constants_array(entry: Any, where: str) -> np.ndarray:
-    """Decode one python-payload ``constants`` entry (base64 ``npy`` bytes)."""
-    if not isinstance(entry, dict):
-        raise ValueError(
-            f"{where}: constants entry must be a dict, got {type(entry).__name__}"
-        )
-    name = _require_key(entry, "dtype", f"{where} constants entry")
-    shape = _require_key(entry, "shape", f"{where} constants entry")
-    data_b64 = _require_key(entry, "data_b64", f"{where} constants entry")
-    if not isinstance(data_b64, str):
-        raise ValueError(f"{where}: constants 'data_b64' must be a string, got {data_b64!r}")
-    try:
-        raw = base64.b64decode(data_b64.encode("ascii"), validate=True)
-    except ValueError as exc:
-        raise ValueError(f"{where}: constants 'data_b64' is not valid base64: {exc}") from exc
-    try:
-        with io.BytesIO(raw) as buffer:
-            array = np.load(buffer, allow_pickle=False)
-    except (ValueError, EOFError) as exc:
-        raise ValueError(f"{where}: constants payload is corrupt: {exc}") from exc
-    if not isinstance(array, np.ndarray):
-        raise ValueError(f"{where}: constants payload is not an ndarray")
-    if array.dtype.name != name or tuple(int(d) for d in array.shape) != tuple(
-        int(d) for d in shape
-    ):
-        raise ValueError(
-            f"{where}: constants payload does not match its recorded dtype/shape "
-            f"({name!r}, {list(shape)!r})"
-        )
-    return array
-
-
-def _array_to_npy_b64(array: np.ndarray) -> str:
-    """Base64 of the ``np.save`` bytes of ``array`` (the python payload form)."""
-    buffer = io.BytesIO()
-    np.save(buffer, array, allow_pickle=False)
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-# ---------------------------------------------------------------------------
-# Payload rewriting (python payload <-> native envelope body)
-# ---------------------------------------------------------------------------
-
-
-def _to_native_value(value: Any, constants: dict, where: str) -> Any:
-    """Recursively rewrite one payload value, inlining ndarray payloads."""
-    if isinstance(value, list):
-        return [_to_native_value(item, constants, where) for item in value]
-    if isinstance(value, dict):
-        keys = set(value.keys())
-        if keys == {_NDARRAY_TAG}:
-            key = value[_NDARRAY_TAG]
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"{where}: unexpected already-inline ndarray payload {value!r}"
-                )
-            if key not in constants:
-                raise ValueError(
-                    f"{where}: ndarray attribute references missing constants key {key!r}"
-                )
-            return {_NDARRAY_TAG: _array_to_inline(_constants_array(constants[key], where))}
-        if keys == {_TUPLE_TAG}:
-            return {
-                _TUPLE_TAG: [
-                    _to_native_value(item, constants, where) for item in value[_TUPLE_TAG]
-                ]
-            }
-        return {
-            str(key): _to_native_value(item, constants, where)
-            for key, item in value.items()
-        }
-    return value
-
-
-def _from_native_value(value: Any, constants: dict, where: str) -> Any:
-    """Recursively rewrite one native value, hoisting inline arrays into ``constants``."""
-    if isinstance(value, list):
-        return [_from_native_value(item, constants, where) for item in value]
-    if isinstance(value, dict):
-        keys = set(value.keys())
-        if keys == {_NDARRAY_TAG}:
-            inner = value[_NDARRAY_TAG]
-            if isinstance(inner, str):
-                raise ValueError(
-                    f"{where}: unexpected constants reference {value!r} in a native "
-                    "envelope (payloads are inline)"
-                )
-            array = _inline_to_array(inner, where)
-            key = f"c{len(constants)}"
-            constants[key] = {
-                "dtype": array.dtype.name,
-                "shape": [int(size) for size in array.shape],
-                "data_b64": _array_to_npy_b64(array),
-            }
-            return {_NDARRAY_TAG: key}
-        if keys == {_TUPLE_TAG}:
-            return {
-                _TUPLE_TAG: [
-                    _from_native_value(item, constants, where)
-                    for item in value[_TUPLE_TAG]
-                ]
-            }
-        return {
-            str(key): _from_native_value(item, constants, where)
-            for key, item in value.items()
-        }
-    return value
-
-
-def _sha256(payload: dict) -> str:
-    """The python payload's canonical integrity hash (mirrors ``ir.serialize``)."""
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-
-# ---------------------------------------------------------------------------
 # Module encoding / decoding
 # ---------------------------------------------------------------------------
 
@@ -403,20 +227,17 @@ def encode_module(module: ir.Module) -> dict:
     """Encode ``module`` as an ``evoxc-native-ir`` v1 envelope dict.
 
     Read-only: the module is never mutated (no counter advance, no ``uses``
-    edits).  The module must verify (``ir.serialize_module`` verifies first).
+    edits), and it must verify (the serializer verifies it before emitting the
+    envelope, exactly as the public ``ir.serialize_module`` does).
     """
     if not isinstance(module, ir.Module):
         raise TypeError(f"encode_module expects an ir.Module, got {type(module).__name__}")
-    payload = ir.serialize_module(module)
-    constants = payload.get("constants", {})
-    if not isinstance(constants, dict):
-        raise ValueError("malformed IR payload: 'constants' must be a dict")
-    body = {
+    payload = _ir_serialize._serialize_native_payload(module)
+    envelope = {
         key: value
         for key, value in payload.items()
-        if key not in ("sha256", "constants")
+        if key not in ("format", "version", "constants", "sha256")
     }
-    envelope = _to_native_value(body, constants, "payload")
     envelope["format"] = _NATIVE_FORMAT
     envelope["version"] = ENVELOPE_FORMAT
     return envelope
@@ -431,12 +252,9 @@ def decode_module(envelope: Any) -> ir.Module:
     decoded id.
 
     Raises:
-        ValueError: For a malformed envelope (wrong format/version, a
-            constants-style ndarray reference, a bad inline payload, ...).
-        evoxc.core.PersistenceError: Wrong python discriminator/version or a
-            sha256 mismatch in the rebuilt payload.
-        evoxc.core.VerificationError: Structural violations found by
-            ``evoxc.ir.deserialize_module``.
+        ValueError: For a malformed envelope discriminator/version.
+        evoxc.core.VerificationError: Structural violations found while
+            rebuilding the body or by ``ir.verify``.
     """
     if not isinstance(envelope, dict):
         raise ValueError(
@@ -454,13 +272,5 @@ def decode_module(envelope: Any) -> ir.Module:
             f"unsupported native envelope version {envelope_version!r} "
             f"(this codec accepts only {ENVELOPE_FORMAT})"
         )
-    body = {
-        key: envelope[key] for key in _BODY_KEYS if key in envelope
-    }
-    constants: dict = {}
-    payload = _from_native_value(body, constants, "envelope")
-    payload["format"] = _PYTHON_FORMAT
-    payload["version"] = ir.IR_FORMAT_VERSION
-    payload["constants"] = constants
-    payload["sha256"] = _sha256(payload)
-    return ir.deserialize_module(payload)
+    body = {key: envelope[key] for key in _BODY_KEYS if key in envelope}
+    return _ir_serialize._deserialize_envelope_body(body)
