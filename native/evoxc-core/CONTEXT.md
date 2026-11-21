@@ -61,7 +61,6 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 - `any` keeps `AttrValue::Tuple` of generic `AttrValue::Any` members and re-emits the marker.
 - A scalar tag (`bool`/`int`/`float`/`str`/`dtype`/`ndarray`) rejects a tuple with an explicit `VerificationError` naming the tag.
 - Typed sequence variants (`Ints`/`Floats`/`Strs`/`NestedInts`/`Shape`) re-encode as plain lists (semantically identical for typed attributes), and `AttrValue::Tuple` matches only the `any` tag, so a malformed envelope that bypasses decoding is still rejected.
-- The compiler parity converter's `_flatten_tuple_markers` workaround is no longer needed and can be removed (that crate is outside this one's write scope).
 
 ## Envelope cost model (decode / encode)
 - Decode is two passes over the flat `ops` array: `OpTable` holds `(op id, &Json)` entries sorted once and indexed by binary search, and `in_progress`/`referenced` are dense `Vec<bool>` indexed by an op's position in that table (no `BTreeMap`/`BTreeSet`, no per-op string keys).
