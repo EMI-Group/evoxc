@@ -122,8 +122,9 @@ A malformed response is a `TransformError` naming the op and the field (unknown 
 | Path | Area |
 |---|---|
 | `./src/lib.rs` | `#[pymodule] _evoxc_native`: `version`/`infer`/`transform` wiring, `__version__`, `NativeError` registration (`__module__` rewritten to `evoxc._evoxc_native`). |
-| `./src/module_ops.rs` | The `infer`/`transform` entry points: argument decoding (including the dual-shape `module`: envelope or signature-only callee context), `Python::detach` boundary, result encoding; config-dict decoding; `PyExtensionRule`; `TRANSFORM_KINDS`. |
-| `./src/transform_config.rs` | Interpreter-free `transform` config/response decoding and request/response JSON (unit-tested without a Python interpreter). |
+| `./src/module_ops.rs` | The `infer`/`transform` entry points: argument decoding (including the dual-shape `module`: envelope or signature-only callee context), `Python::detach` boundary, result encoding; config-dict decoding; `PyExtensionRule` + the shared `extension_rule_from_value`; `TRANSFORM_KINDS`. |
+| `./src/batch_ops.rs` | The `batch_functions` entry point: program/envelope decoding (one `programs[i]` context each), config-dict walk + callable extraction, `Python::detach` merge under the shared extension bridge, `{"module", "batch_report"}` result encoding. |
+| `./src/transform_config.rs` | Interpreter-free `transform` + `batch_functions` config/response decoding and request/response JSON (unit-tested without a Python interpreter). |
 | `./src/convert.rs` | Python ⇄ envelope JSON conversion (one pass per call, path-tagged `TypeError`s, number/`bool` fidelity). |
 | `./src/error.rs` | `NativeError` (`create_exception!`), `KINDS`, `raise`/`from_core`/`type_error`/`object_error`. |
 | `./Cargo.toml` | cdylib crate, the `extension-module`/`auto-init` feature split. |
