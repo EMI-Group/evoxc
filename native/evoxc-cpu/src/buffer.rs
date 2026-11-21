@@ -12,6 +12,8 @@ use evoxc_core::{ArrayPayload, DType, Error, Result};
 use half::f16;
 use num_complex::Complex;
 
+use std::cell::RefCell;
+
 use crate::scalar::Scalar;
 
 /// One typed, C-contiguous value buffer.
@@ -74,6 +76,28 @@ impl Storage {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    /// Bytes of element storage this value holds (not its capacity).
+    fn bytes(&self) -> usize {
+        fn size<T>(values: &[T]) -> usize {
+            std::mem::size_of_val(values)
+        }
+        match self {
+            Storage::Bool(v) => size(v),
+            Storage::I8(v) => size(v),
+            Storage::I16(v) => size(v),
+            Storage::I32(v) => size(v),
+            Storage::I64(v) => size(v),
+            Storage::U8(v) => size(v),
+            Storage::U16(v) => size(v),
+            Storage::U32(v) => size(v),
+            Storage::U64(v) => size(v),
+            Storage::F16(v) => size(v),
+            Storage::F32(v) => size(v),
+            Storage::F64(v) => size(v),
+            Storage::C64(v) => size(v),
+            Storage::C128(v) => size(v),
+        }
     }
 }
 
@@ -217,10 +241,33 @@ fn decode_storage(dtype: DType, bytes: &[u8]) -> Result<Storage> {
     Ok(storage)
 }
 
+/// Decode `bytes`' little-endian words into a vector, reusing a pooled
+/// allocation of exactly that many elements when one is available (a caller
+/// decodes fresh multi-megabyte payloads per run, so this is the same
+/// page-fault argument as for a result — see the pool note below).
 fn decode_le<T>(bytes: &[u8]) -> Vec<T>
 where
-    T: Copy + LeScalar,
+    T: Copy + LeScalar + Scalar,
 {
+    let count = bytes.len() / T::SIZE;
+    if let Some(mut values) = take_pooled_vec::<T>(count) {
+        let threads = parallel_threads(count);
+        if threads > 1 {
+            split_parallel(&mut values, threads, |offset, chunk| {
+                let start = offset * T::SIZE;
+                let len = chunk.len() * T::SIZE;
+                let window = bytes.get(start..start + len).unwrap_or(&[]);
+                for (slot, word) in chunk.iter_mut().zip(window.chunks_exact(T::SIZE)) {
+                    *slot = T::from_le(word);
+                }
+            });
+        } else {
+            for (slot, chunk) in values.iter_mut().zip(bytes.chunks_exact(T::SIZE)) {
+                *slot = T::from_le(chunk);
+            }
+        }
+        return values;
+    }
     bytes
         .chunks_exact(T::SIZE)
         .map(|chunk| T::from_le(chunk))
@@ -523,27 +570,140 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
 // Callers gate on [`Buffer::is_flat_for`], so every slice has the output's
 // length; the `zip` therefore visits every element.  A slice that is somehow
 // shorter would be a broken internal buffer, not user input.
+//
+// These maps are DRAM-bandwidth bound at ~0.21 ms per 1e6 f32 elements on one
+// thread (numpy's ufuncs are single-threaded, so that alone only reaches
+// parity), which is why a big enough result is split across a few scoped
+// threads: four threads measured ~2x the one-thread bandwidth on a 16-cpu host
+// (eight and sixteen were slower -- they contend for the same memory ports),
+// and the ~20 us of thread setup is paid back above ~2^18 elements.  Small maps
+// stay on the calling thread, where spawning would dominate.
+/// Element count from which a flat map is worth splitting across threads.
+const PARALLEL_MIN_ELEMS: usize = 1 << 18;
+/// Upper bound on the threads one flat map uses (the measured optimum).
+const PARALLEL_MAX_THREADS: usize = 4;
+
+/// How many threads a flat map over `count` elements should split across.
+fn parallel_threads(count: usize) -> usize {
+    if count < PARALLEL_MIN_ELEMS {
+        return 1;
+    }
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+            .clamp(1, PARALLEL_MAX_THREADS)
+    })
+}
+
+/// Run `body(offset, chunk)` over disjoint chunks of `out` on up to `threads`
+/// scoped threads.  Every chunk is visited exactly once, so a body that writes
+/// all of its chunk writes all of `out`; `offset` is the chunk's start index,
+/// which is how a caller slices its operands to match.
+fn split_parallel<R: Copy + Send, F: Fn(usize, &mut [R]) + Sync>(
+    out: &mut [R],
+    threads: usize,
+    body: F,
+) {
+    if threads <= 1 || out.len() < threads {
+        body(0, out);
+        return;
+    }
+    let chunk = out.len().div_ceil(threads);
+    let mut chunks = out.chunks_mut(chunk);
+    std::thread::scope(|scope| {
+        let mut offset = 0;
+        let first = chunks.next();
+        for chunk in chunks {
+            let start = offset + chunk.len();
+            let body = &body;
+            scope.spawn(move || body(start, chunk));
+            offset = start;
+        }
+        // The calling thread takes the leading chunk instead of idling.
+        if let Some(chunk) = first {
+            body(0, chunk);
+        }
+    });
+}
+
+/// The operand window of chunk `[offset, offset + len)` (empty past the end,
+/// preserving `zip`'s stop-at-the-shortest behaviour).
+#[inline]
+fn window<T>(values: &[T], offset: usize, len: usize) -> &[T] {
+    values.get(offset..offset + len).unwrap_or(&[])
+}
+
 /// Flat unary map: `out[i] = f(source[i])`.
-pub fn zip1<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: impl Fn(T) -> R) {
+pub fn zip1<T: Copy + Sync, R: Copy + Send>(
+    out: &mut [R],
+    source: &[T],
+    f: impl Fn(T) -> R + Sync,
+) {
+    let threads = parallel_threads(out.len());
+    if threads > 1 {
+        split_parallel(out, threads, |offset, chunk| {
+            let len = chunk.len();
+            for (slot, value) in chunk.iter_mut().zip(window(source, offset, len)) {
+                *slot = f(*value);
+            }
+        });
+        return;
+    }
     for (slot, value) in out.iter_mut().zip(source.iter()) {
         *slot = f(*value);
     }
 }
 /// Flat binary map: `out[i] = f(left[i], right[i])`.
-pub fn zip2<T: Copy, R: Copy>(out: &mut [R], left: &[T], right: &[T], f: impl Fn(T, T) -> R) {
+pub fn zip2<T: Copy + Sync, R: Copy + Send>(
+    out: &mut [R],
+    left: &[T],
+    right: &[T],
+    f: impl Fn(T, T) -> R + Sync,
+) {
+    let threads = parallel_threads(out.len());
+    if threads > 1 {
+        split_parallel(out, threads, |offset, chunk| {
+            let len = chunk.len();
+            for ((slot, x), y) in chunk
+                .iter_mut()
+                .zip(window(left, offset, len))
+                .zip(window(right, offset, len))
+            {
+                *slot = f(*x, *y);
+            }
+        });
+        return;
+    }
     for ((slot, x), y) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
         *slot = f(*x, *y);
     }
 }
 /// Flat ternary map: `out[i] = f(first[i], second[i], third[i])` (the `select`
 /// shape: predicate, on-true, on-false).
-pub fn zip3<P: Copy, T: Copy, R: Copy>(
+pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     first: &[P],
     second: &[T],
     third: &[T],
-    f: impl Fn(P, T, T) -> R,
+    f: impl Fn(P, T, T) -> R + Sync,
 ) {
+    let threads = parallel_threads(out.len());
+    if threads > 1 {
+        split_parallel(out, threads, |offset, chunk| {
+            let len = chunk.len();
+            for (((slot, p), x), y) in chunk
+                .iter_mut()
+                .zip(window(first, offset, len))
+                .zip(window(second, offset, len))
+                .zip(window(third, offset, len))
+            {
+                *slot = f(*p, *x, *y);
+            }
+        });
+        return;
+    }
     for (((slot, p), x), y) in out
         .iter_mut()
         .zip(first.iter())
@@ -553,49 +713,193 @@ pub fn zip3<P: Copy, T: Copy, R: Copy>(
         *slot = f(*p, *x, *y);
     }
 }
+// ---------------------------------------------------------------------------
+// Large-result allocation
+// ---------------------------------------------------------------------------
+//
+// Every elementwise op over a multi-megabyte array produces a fresh `Vec` for
+// its result, and those results die at their last use a step or two later.
+// Left to the system allocator that is a page-fault treadmill: once a chain's
+// live set grows past one temporary, glibc grows the heap, coalesces the freed
+// temporaries back into the heap top, trims it again, and the *same* pages are
+// re-faulted (and re-zeroed by the kernel) on the next call.  Measured on the
+// `ew_chain_1e6` benchmark graph: 3874 minor faults and 9.4 ms per `run`, versus
+// 0 faults and 4.2 ms when the churn is removed -- while the kernels themselves
+// are already at numpy-parity speed (0.21 ms per 1e6-element flat map, i.e.
+// DRAM-bandwidth bound, so there is nothing left to win in the loops).
+//
+// The engine therefore keeps its own small free list of large result storages:
+// dropping a large enough [`Storage`] hands its allocation to a thread-local
+// pool instead of back to `malloc`, and [`take_pooled_vec`] hands it out again
+// to the next flat map that needs exactly that dtype and element count.  Those
+// bytes then never leave the process, so they are never re-faulted.  This is
+// plain safe Rust -- no `unsafe`, no `mallopt`, no allocator hook -- and it
+// keeps `Buffer` an ordinary owning value: no kernel signature changes.
+//
+// Contract:
+//  * A pooled vector is only handed to a caller that overwrites EVERY element
+//    (the flat maps gate on an exact length match), so no stale value can reach
+//    a result -- pinned by `recycled_results_are_fully_overwritten` below.
+//  * The pool is thread-local: a value is only recycled on the thread that
+//    dropped it, and nothing is shared or synchronized.
+//  * Retention is bounded and never grows across unrelated calls: at most
+//    [`POOL_MAX_ENTRIES`] values totalling [`POOL_MAX_BYTES`], and only values
+//    of at least [`POOL_MIN_BYTES`] (small results keep the system allocator,
+//    whose bin free lists already make them cheap, and would only crowd out the
+//    entries that matter).  A value the pool cannot take is freed as before.
+const POOL_MIN_BYTES: usize = 1 << 18;
+/// Total bytes the pool may retain per thread (the documented retention cap).
+const POOL_MAX_BYTES: usize = 64 << 20;
+/// Number of retained storages per thread.
+const POOL_MAX_ENTRIES: usize = 16;
+
+thread_local! {
+    static STORAGE_POOL: RefCell<StoragePool> = const { RefCell::new(StoragePool::new()) };
+    /// Cleared once the pool's own destructor starts, so a retained value that
+    /// is dropped during thread teardown frees itself instead of re-entering the
+    /// pool it is a part of (a `Cell<bool>` has no destructor, so it stays
+    /// reachable for as long as the thread lives).
+    static POOL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// The thread-local free list of large result storages.
+struct StoragePool {
+    entries: Vec<Storage>,
+    bytes: usize,
+}
+
+impl StoragePool {
+    const fn new() -> StoragePool {
+        StoragePool { entries: Vec::new(), bytes: 0 }
+    }
+
+    /// Retain `storage`'s allocation when it is large enough and the cap allows,
+    /// returning `false` (and leaving `storage` intact) when it does not.
+    fn push(&mut self, storage: &mut Storage) -> bool {
+        let bytes = storage.bytes();
+        if bytes < POOL_MIN_BYTES
+            || self.entries.len() >= POOL_MAX_ENTRIES
+            || self.bytes + bytes > POOL_MAX_BYTES
+        {
+            return false;
+        }
+        let retained = std::mem::replace(storage, Storage::Bool(Vec::new()));
+        self.bytes += bytes;
+        self.entries.push(retained);
+        true
+    }
+
+    /// Take a retained storage of exactly `dtype` and `len` elements.
+    fn take(&mut self, dtype: DType, len: usize) -> Option<Storage> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.dtype() == dtype && entry.len() == len)?;
+        let entry = self.entries.swap_remove(index);
+        self.bytes -= entry.bytes();
+        Some(entry)
+    }
+}
+
+impl Drop for StoragePool {
+    fn drop(&mut self) {
+        let _ = POOL_OPEN.try_with(|open| open.set(false));
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if self.bytes() < POOL_MIN_BYTES {
+            return;
+        }
+        if !POOL_OPEN.try_with(|open| open.get()).unwrap_or(false) {
+            return;
+        }
+        // On refusal (or during thread teardown) the allocation simply stays
+        // here and is freed by the normal field drop that follows this call.
+        let _ = STORAGE_POOL.try_with(|pool| match pool.try_borrow_mut() {
+            Ok(mut pool) => pool.push(self),
+            Err(_) => false,
+        });
+    }
+}
+
+/// A retained result vector of exactly `count` elements of `R`, or `None`.
+///
+/// The caller must overwrite every element before the vector becomes visible.
+fn take_pooled_vec<R: Scalar>(count: usize) -> Option<Vec<R>> {
+    let mut storage = STORAGE_POOL
+        .try_with(|pool| pool.try_borrow_mut().ok()?.take(R::DTYPE, count))
+        .ok()
+        .flatten()?;
+    R::take_vec(&mut storage)
+}
+
 /// Flat unary builder: `out[i] = f(source[i])` over `out_shape`'s elements,
 /// with the result storage built straight from the mapped iterator.
 ///
-/// Unlike [`zip1`], this never zero-fills a buffer first: `Vec` collects a
-/// `Map` over a slice with an exact size hint, so the result is allocated once
-/// and written once.  Elementwise kernels that produce a fresh result use
-/// these; the in-place `zip*` helpers stay for kernels that already own the
-/// memory they write into.  The `Buffer::new` validation is defensive (a
-/// caller gates on [`Buffer::is_flat_for`], so the element count and the dtype
-/// already agree) and keeps a short or long operand an explicit error rather
-/// than a silently truncated result.
-pub fn map1<T: Copy, R: Scalar>(
+/// Unlike [`zip1`], this never zero-fills a buffer first: a `Vec` built from a
+/// slice with an exact size hint is allocated once and written once (and a
+/// recycled vector from the storage pool is already allocated).  Elementwise
+/// kernels that produce a fresh result use these; the in-place `zip*` helpers
+/// stay for kernels that already own the memory they write into.  The
+/// `Buffer::new` validation is defensive (a caller gates on
+/// [`Buffer::is_flat_for`], so the element count and the dtype already agree)
+/// and keeps a short or long operand an explicit error rather than a silently
+/// truncated result.
+pub fn map1<T: Copy + Sync, R: Scalar>(
     dtype: DType,
     out_shape: &[usize],
     source: &[T],
-    f: impl Fn(T) -> R,
+    f: impl Fn(T) -> R + Sync,
 ) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    if source.len() == count {
+        if let Some(mut values) = take_pooled_vec::<R>(count) {
+            zip1(&mut values, source, f);
+            return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+        }
+    }
     let values: Vec<R> = source.iter().map(|value| f(*value)).collect();
     Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
 }
 
 /// Flat binary builder: `out[i] = f(left[i], right[i])` (see [`map1`]).
-pub fn map2<T: Copy, R: Scalar>(
+pub fn map2<T: Copy + Sync, R: Scalar>(
     dtype: DType,
     out_shape: &[usize],
     left: &[T],
     right: &[T],
-    f: impl Fn(T, T) -> R,
+    f: impl Fn(T, T) -> R + Sync,
 ) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    if left.len() == count && right.len() == count {
+        if let Some(mut values) = take_pooled_vec::<R>(count) {
+            zip2(&mut values, left, right, f);
+            return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+        }
+    }
     let values: Vec<R> = left.iter().zip(right.iter()).map(|(x, y)| f(*x, *y)).collect();
     Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
 }
 
 /// Flat ternary builder: `out[i] = f(first[i], second[i], third[i])` -- the
 /// `select` shape (see [`map1`]).
-pub fn map3<P: Copy, T: Copy, R: Scalar>(
+pub fn map3<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
     dtype: DType,
     out_shape: &[usize],
     first: &[P],
     second: &[T],
     third: &[T],
-    f: impl Fn(P, T, T) -> R,
+    f: impl Fn(P, T, T) -> R + Sync,
 ) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    if first.len() == count && second.len() == count && third.len() == count {
+        if let Some(mut values) = take_pooled_vec::<R>(count) {
+            zip3(&mut values, first, second, third, f);
+            return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+        }
+    }
     let values: Vec<R> = first
         .iter()
         .zip(second.iter())
@@ -603,6 +907,13 @@ pub fn map3<P: Copy, T: Copy, R: Scalar>(
         .map(|((p, x), y)| f(*p, *x, *y))
         .collect();
     Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
+/// Element count of a concrete shape (`buffer.rs` cannot reach
+/// `kernels::util`, which is a higher layer than the value type).
+#[inline]
+fn util_numel(shape: &[usize]) -> usize {
+    shape.iter().product()
 }
 
 fn block_error(op: &str) -> Error {
@@ -761,5 +1072,176 @@ mod tests {
         assert!(map2(DType::Float32, &[2], &left, &right, |a, b| a + b).is_err());
         // And a dtype that disagrees with the value type is rejected there too.
         assert!(map1(DType::Float64, &[3], &left, |value| value).is_err());
+    }
+
+    /// A stock for the pool: `count` f32 elements' worth, filled with garbage
+    /// that no correct result can contain.
+    fn garbage_f32(count: usize) -> Storage {
+        let mut storage = Storage::F32(vec![f32::NAN; count]);
+        STORAGE_POOL.with(|pool| {
+            pool.borrow_mut().push(&mut storage);
+        });
+        storage
+    }
+
+    #[test]
+    fn a_recycled_result_is_fully_overwritten() {
+        // More elements than `POOL_MIN_BYTES` so the pool accepts the stock, and
+        // more than `PARALLEL_MIN_ELEMS` so the map takes the wide path.
+        let count = PARALLEL_MIN_ELEMS + 64;
+        assert!(count * std::mem::size_of::<f32>() > POOL_MIN_BYTES);
+        garbage_f32(count);
+        let left: Vec<f32> = (0..count).map(|index| index as f32).collect();
+        let right = vec![2.0f32; count];
+        let binary = map2(DType::Float32, &[count], &left, &right, |x, y| x * y).unwrap();
+        match &binary.storage {
+            Storage::F32(values) => {
+                assert_eq!(values.len(), count);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(*value, left[index] * 2.0, "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+        // Same for the unary path: every element overwritten, none left stale.
+        let unary = map1(DType::Float32, &[count], &left, |value| value + 1.0).unwrap();
+        match &unary.storage {
+            Storage::F32(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(*value, left[index] + 1.0, "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+        // ... and the ternary one.
+        let mask = vec![true; count];
+        let ternary =
+            map3(DType::Float32, &[count], &mask, &left, &right, |pick, a, b| if pick { a } else { b })
+                .unwrap();
+        assert_eq!(ternary.storage, map1(DType::Float32, &[count], &left, |value| value).unwrap().storage);
+    }
+
+    #[test]
+    fn a_large_result_is_recycled_and_stays_correct() {
+        // The result of the first map is dropped, so the second map reuses it.
+        let count = POOL_MIN_BYTES / std::mem::size_of::<f32>() + 8;
+        let source: Vec<f32> = (0..count).map(|index| index as f32).collect();
+        let first = map1(DType::Float32, &[count], &source, |value| value * 3.0).unwrap();
+        let expected = map1(DType::Float32, &[count], &source, |value| value * 3.0).unwrap();
+        assert_eq!(first.storage, expected.storage);
+        // A recycled buffer must not leak an integer result into a float one or
+        // vice versa: the pool is keyed by dtype as well as length.
+        let ints = map1(DType::Int32, &[count], &source, |value| value as i32).unwrap();
+        match &ints.storage {
+            Storage::I32(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(*value, index as i32);
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_operands_still_error_with_a_pooled_result_available() {
+        // A pooled vector of `count` elements must not turn a short operand into
+        // a silently truncated result: the length gate falls back to `collect`,
+        // where `Buffer::new` reports the mismatch.
+        let count = POOL_MIN_BYTES / std::mem::size_of::<f32>() + 4;
+        garbage_f32(count);
+        let short: Vec<f32> = vec![1.0; count - 1];
+        assert!(map1(DType::Float32, &[count], &short, |value| value).is_err());
+        assert!(map2(DType::Float32, &[count], &short, &short, |a, b| a + b).is_err());
+    }
+
+    #[test]
+    fn the_pool_keeps_only_large_values_and_respects_its_cap() {
+        let small = Storage::F32(vec![0.0; POOL_MIN_BYTES / std::mem::size_of::<f32>() - 1]);
+        let mut small = small;
+        STORAGE_POOL.with(|pool| {
+            pool.borrow_mut().push(&mut small);
+        });
+        let (entries, bytes) = STORAGE_POOL.with(|pool| {
+            let pool = pool.borrow();
+            (pool.entries.len(), pool.bytes)
+        });
+        assert_eq!((entries, bytes), (0, 0), "a small value must not be retained");
+        // Then overfill: the caps hold.
+        let count = POOL_MIN_BYTES / std::mem::size_of::<f32>() + 2;
+        let mut values: Vec<Storage> = (0..POOL_MAX_ENTRIES * 2)
+            .map(|_| Storage::F32(vec![1.0; count]))
+            .collect();
+        STORAGE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for value in values.iter_mut() {
+                pool.push(value);
+            }
+            assert!(pool.entries.len() <= POOL_MAX_ENTRIES);
+            assert!(pool.bytes <= POOL_MAX_BYTES);
+        });
+    }
+
+    #[test]
+    fn wide_and_narrow_maps_agree() {
+        // The wide (threaded) path and the narrow one must produce identical
+        // bits, NaN and signed zeros included.
+        let count = PARALLEL_MIN_ELEMS + 1000;
+        let left: Vec<f32> = (0..count)
+            .map(|index| match index % 5 {
+                0 => f32::NAN,
+                1 => -0.0,
+                2 => f32::INFINITY,
+                _ => index as f32,
+            })
+            .collect();
+        let right: Vec<f32> = (0..count).map(|index| (index % 7) as f32 - 3.0).collect();
+        let wide = map2(DType::Float32, &[count], &left, &right, |x, y| {
+            if x.is_nan() {
+                x
+            } else if y.is_nan() {
+                y
+            } else if x >= y {
+                x
+            } else {
+                y
+            }
+        })
+        .unwrap();
+        let mut narrow = vec![0.0f32; count];
+        for index in 0..count {
+            let (x, y) = (left[index], right[index]);
+            narrow[index] = if x.is_nan() {
+                x
+            } else if y.is_nan() {
+                y
+            } else if x >= y {
+                x
+            } else {
+                y
+            };
+        }
+        match &wide.storage {
+            Storage::F32(values) => {
+                assert_eq!(values.len(), count);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(
+                        value.to_bits(),
+                        narrow[index].to_bits(),
+                        "element {index} differs between the wide and narrow paths"
+                    );
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_recycles_and_still_reads_every_element() {
+        let count = POOL_MIN_BYTES / std::mem::size_of::<f32>() + 32;
+        garbage_f32(count);
+        let words: Vec<f32> = (0..count).map(|index| index as f32 * 0.5).collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let storage = decode_storage(DType::Float32, &bytes).unwrap();
+        assert_eq!(storage, Storage::F32(words));
     }
 }

@@ -190,6 +190,7 @@ pub(crate) fn reject_negative_exponent(name: &str, exponent: &Buffer) -> Result<
 mod tests {
     use super::*;
     use crate::kernels::elementwise;
+    use crate::scalar::Scalar;
     use crate::plan::OpSpec;
     use evoxc_core::{Attrs, DType, Dim, ValueType};
     use half::f16;
@@ -227,10 +228,9 @@ mod tests {
         let base = Buffer::new(DType::Float32, shape.to_vec(), Storage::F32(x.to_vec())).unwrap();
         let exponent = Buffer::new(DType::Float32, vec![], Storage::F32(vec![exponent])).unwrap();
         match pow_scalar(&shape, &base, &exponent, true).unwrap().expect("fast path") {
-            PowScalar::Built(buffer) => match buffer.storage {
-                Storage::F32(values) => values,
-                other => panic!("unexpected storage {other:?}"),
-            },
+            PowScalar::Built(mut buffer) => {
+                Scalar::take_vec(&mut buffer.storage).expect("f32 storage")
+            }
             PowScalar::Reuse => x.to_vec(),
         }
     }
@@ -240,10 +240,9 @@ mod tests {
         let base = Buffer::new(DType::Float64, shape.to_vec(), Storage::F64(x.to_vec())).unwrap();
         let exponent = Buffer::new(DType::Float64, vec![], Storage::F64(vec![exponent])).unwrap();
         match pow_scalar(&shape, &base, &exponent, true).unwrap().expect("fast path") {
-            PowScalar::Built(buffer) => match buffer.storage {
-                Storage::F64(values) => values,
-                other => panic!("unexpected storage {other:?}"),
-            },
+            PowScalar::Built(mut buffer) => {
+                Scalar::take_vec(&mut buffer.storage).expect("f64 storage")
+            }
             PowScalar::Reuse => x.to_vec(),
         }
     }

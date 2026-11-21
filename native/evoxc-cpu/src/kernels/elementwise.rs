@@ -437,7 +437,7 @@ fn compare(
 }
 
 /// Ordering comparisons, without requiring `PartialOrd` (complex has none).
-trait Orderable: PartialEq {
+trait Orderable: PartialEq + Send + Sync {
     fn lt(&self, other: &Self) -> bool;
     fn le(&self, other: &Self) -> bool;
     fn gt(&self, other: &Self) -> bool;
