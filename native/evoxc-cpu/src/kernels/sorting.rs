@@ -275,34 +275,42 @@ impl RowKey for f64 {
 // The short-segment sorting network
 // ---------------------------------------------------------------------------
 //
-// Measured on this host in a generic x86-64 release build, per segment of packed
-// `(key, index)` keys built from random f32s, ns per segment, min of 40 rounds of
-// 4096 rows, three runs each, network versus `sort_unstable`:
+// A short segment is ordered by Batcher's odd-even network over the same packed
+// `(key, index)` keys.  Every compare-exchange has literal indices, so LLVM
+// keeps the keys in registers, the steps pipeline, and — the decisive part —
+// there is no data-dependent branch to mispredict.  `sort_unstable` falls back
+// to insertion sort below 20 keys, and on random input that loop mispredicts on
+// nearly every comparison.
 //
-// | extent |    6 |    7 |    8 |   10 |   12 |   16 |
-// | network| 95-99 | 98-100 | 97-100 | 117-119 | 118-120 | 105-107 |
-// | sort_unstable | 76 | 86-92 | 94-100 | 114-116 | 140-142 | 190-191 |
+// Measured in the engine (`NativeProgram.run` of a one-op graph, ns per segment,
+// min/median of 30 iterations, one shape per process, min over three runs):
 //
-// So the 16-key network is worth it from a 3/4 fill of its pad (12 keys) up:
-// ~1.2x at 12 and ~1.8x at 16, while below that `sort_unstable`'s insertion
-// sort wins (a 6-key row is 26 % slower through the padded 8-key network).  The
-// window is deliberately ONE network and ONE padded tier: Batcher's larger
-// networks would need in-place merges over a spilled array once 16 keys no
-// longer fit the unrolled block, and those measured a LOSS against
-// `sort_unstable` (32 keys 240 vs 216 ns, 64 keys 411 vs 341 ns — an end-to-end
-// `sort(4096, 64)` regressed 1.56 -> 1.94 ms with them enabled), so every extent
-// outside 12..=16 keeps exactly the code path it took before.
+// | (rows, extent) | `sort_unstable` | network | argsort `sort_unstable` | argsort network |
+// | (131072, 8)    | 74.1 / 75.4     | 29.2 / 29.6 | 141.4 / 143.0 | 76.8 / 79.6 |
+// | (65536, 16)    | 158.5           | 48.5 / 51.3 | 177.7 / 180.0 | 138.3 / 144.0 |
+//
+// i.e. 2.5x at extent 8 and 3.3x at 16 (`sort(65536, 16)`: 10.39 ms = 158
+// ns/segment before the network, 3.20 ms = 48.8 ns after).  A standalone
+// keys-only harness reports a much smaller gap because its own per-row overhead
+// dilutes it — the engine measurement is what the coverage decision follows.
+//
+// Two limits decide the coverage:
+//
+// * coverage stops at a 16-key pad.  Batcher's larger networks need in-place
+//   merges over a spilled array once 16 keys no longer fit the unrolled block,
+//   and those measured a LOSS against `sort_unstable` (32 keys 240 vs 216 ns,
+//   64 keys 411 vs 341 ns; an end-to-end `sort(4096, 64)` regressed 1.56 ->
+//   1.94 ms with them enabled), so extents above 16 keep `sort_unstable`;
+// * each extent runs the network of its own pad — 2, 4, 8 or 16 keys — so a
+//   6-key segment is a 4-key network over 4 real keys plus 2 sentinels rather
+//   than the 16-key one.
 //
 // The network orders ascending only; `(key, index)` packing already breaks every
 // tie, so `descending` stays the write-side flip of the ascending result and
 // stability needs no special case.
 
-/// The longest extent ordered through the sorting network (see the note above).
+/// The longest extent ordered through a sorting network (see the note above).
 const NETWORK_MAX: usize = 16;
-
-/// The shortest extent the 16-key network measured faster than `sort_unstable`
-/// at: three quarters of the pad.
-const NETWORK_MIN: usize = 12;
 
 /// Sentinel for the padded tail of the network: greater than every real key,
 /// because a real key is `(rank_key << 32) | slot` with `slot < extent <= 16`,
@@ -321,6 +329,15 @@ macro_rules! network {
     }};
 }
 
+/// Batcher's odd-even network for 8 keys (19 comparators).
+#[inline]
+fn network8(keys: &mut [u64; 8]) {
+    network!(keys:
+        (0, 1), (2, 3), (0, 2), (1, 3), (1, 2), (4, 5), (6, 7), (4, 6), (5, 7), (5, 6), (0, 4),
+        (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6),
+    );
+}
+
 /// Batcher's odd-even network for 16 keys (63 comparators).
 #[inline]
 fn network16(keys: &mut [u64; 16]) {
@@ -335,34 +352,48 @@ fn network16(keys: &mut [u64; 16]) {
     );
 }
 
-/// Whether `extent` packed keys are worth ordering through the 16-key network
-/// instead of `sort_unstable` (the measured window in the section note).
-fn network_worthwhile(extent: usize) -> bool {
-    (NETWORK_MIN..=NETWORK_MAX).contains(&extent)
+/// The padded width whose network orders `extent` keys, or `0` when the extent
+/// is outside the measured range and keeps `sort_unstable`.
+fn network_width(extent: usize) -> usize {
+    if (2..=NETWORK_MAX).contains(&extent) {
+        extent.next_power_of_two()
+    } else {
+        0
+    }
 }
 
-/// Order the first `extent` packed keys of `keys` ascending: the padded 16-key
-/// network where it measured faster, one `sort_unstable` slice otherwise.
-///
-/// `keys` must hold at least `extent.next_power_of_two()` slots (the caller
-/// sizes the scratch that way), which the network fills past `extent` with
-/// [`PAD_KEY`] so a padded tail always sorts after every real key.
-fn order_keys(keys: &mut [u64], extent: usize) {
-    // `None` for every extent outside the window, and for a slice too short for
-    // the network — which the caller never produces, so the general path below
-    // is the only fallback and never a panic.
-    let network = if network_worthwhile(extent) {
-        keys.get_mut(..NETWORK_MAX)
-            .and_then(|slots| <&mut [u64; NETWORK_MAX]>::try_from(slots).ok())
-    } else {
-        None
-    };
-    match network {
+/// Run `network` over the first `N` key slots of `keys`, after filling the tail
+/// past `extent` with [`PAD_KEY`] so the padding always sorts after every real
+/// key.  A slice too short for the network (which the caller never produces)
+/// falls back to `sort_unstable` rather than panicking.
+fn run_network<const N: usize>(keys: &mut [u64], extent: usize, network: fn(&mut [u64; N])) {
+    let fixed = keys
+        .get_mut(..N)
+        .and_then(|slots| <&mut [u64; N]>::try_from(slots).ok());
+    match fixed {
         Some(fixed) => {
             fixed[extent..].fill(PAD_KEY);
-            network16(fixed);
+            network(fixed);
         }
         None => keys[..extent].sort_unstable(),
+    }
+}
+
+/// Order the first `extent` packed keys of `keys` ascending: the network of the
+/// extent's own pad width where it measured faster, one `sort_unstable` slice
+/// otherwise.
+///
+/// `keys` must hold at least `extent.next_power_of_two()` slots when a network
+/// runs (the caller sizes the scratch that way).
+fn order_keys(keys: &mut [u64], extent: usize) {
+    match network_width(extent) {
+        2 => run_network(keys, extent, |fixed: &mut [u64; 2]| network!(fixed: (0, 1))),
+        4 => run_network(keys, extent, |fixed: &mut [u64; 4]| {
+            network!(fixed: (0, 1), (2, 3), (0, 2), (1, 3), (1, 2))
+        }),
+        8 => run_network(keys, extent, network8),
+        16 => run_network(keys, extent, network16),
+        _ => keys[..extent].sort_unstable(),
     }
 }
 
@@ -399,13 +430,12 @@ fn sorted_positions<T: RowKey>(
     }
     // Scratch, sized once per call and reused for every segment: on the stack
     // for the extents this engine sees most, on the heap beyond that.  The key
-    // scratch is padded to a power of two so [`order_keys`]'s network can fill
+    // scratch is padded to the extent's network width so [`order_keys`] can fill
     // its tail with [`PAD_KEY`]; extents past [`NETWORK_MAX`] keep
     // `sort_unstable` and need the extent only.
-    let key_len = if network_worthwhile(extent) {
-        NETWORK_MAX
-    } else {
-        extent
+    let key_len = match network_width(extent) {
+        0 => extent,
+        width => width,
     };
     let mut stack_keys = [0u64; STACK_KEYS];
     let mut stack_order = [0u32; STACK_KEYS];
@@ -1001,29 +1031,21 @@ mod tests {
 
     #[test]
     fn the_network_covers_only_the_extents_it_wins_at() {
-        // The measured crossover (see the section note): the unrolled 16-key
-        // block is the ceiling, and every longer extent keeps `sort_unstable`.
-        assert!(!network_worthwhile(2));
-        assert!(!network_worthwhile(6));
-        assert!(!network_worthwhile(8));
-        assert!(!network_worthwhile(11));
-        assert!(network_worthwhile(12));
-        assert!(network_worthwhile(16));
-        assert!(!network_worthwhile(17));
-        assert!(!network_worthwhile(32));
-        assert!(!network_worthwhile(64));
-        assert!(!network_worthwhile(129));
-        for extent in 2..=STACK_KEYS {
-            if network_worthwhile(extent) {
-                assert!(extent.next_power_of_two() == NETWORK_MAX);
-            }
+        // The measured range (see the section note): every extent up to a 16-key
+        // pad runs a network, and every longer extent keeps `sort_unstable`.
+        for extent in 2..=NETWORK_MAX {
+            assert_eq!(network_width(extent), extent.next_power_of_two());
+            assert!(network_width(extent) <= STACK_KEYS);
+        }
+        for extent in [0, 1, 17, 32, 64, 129] {
+            assert_eq!(network_width(extent), 0, "extent {extent}");
         }
     }
 
     #[test]
     fn matches_the_reference_across_the_network_extents() {
-        // Both sides of the network window (12..=16) and a spread of the
-        // extents that keep `sort_unstable`.
+        // Both sides of every network width boundary (4/5, 8/9, 16/17) and a
+        // spread of the extents that keep `sort_unstable`.
         const EXTENTS: [usize; 20] = [
             2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 40, 47, 48, 63, 64,
         ];
