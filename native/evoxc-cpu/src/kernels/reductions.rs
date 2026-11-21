@@ -12,11 +12,19 @@
 //!   happens here.  `keepdims` shapes the declared result only; the reduced
 //!   axis SET decides the values.
 //! * `reduce_max`/`reduce_min` propagate NaN (numpy's rule) because the fold
-//!   uses the NaN-propagating `Num::max`/`Num::min` vocabulary.
+//!   compares through the NaN-propagating [`FoldSelect`] vocabulary.
 //! * `argmax`/`argmin` produce `int64` indices with numpy's tie-break (the
 //!   FIRST occurrence) and numpy's NaN rule (the first NaN wins, for both).
 //! * `cumsum`/`cumprod` preserve the operand dtype and honor `reverse`
 //!   (accumulate from the end toward the start).
+//!
+//! Performance shape: a reduction whose reduced axes are CONTIGUOUS runs the
+//! flat multi-accumulator [`Block`] path (no per-element offset table, no
+//! per-output odometer); every other axis pattern keeps the general [`Layout`]
+//! path.  The two agree bit-for-bit for integer, bool, float16 and complex
+//! folds — reassociation is exact for wrapping integers and those dtypes stay on
+//! one sequential lane — and only float32/float64 sums move inside the parity
+//! tolerance's documented window.
 //!
 //! Every result shape is the DECLARED result shape evaluated by the runtime
 //! ([`util::result_shape`]); a kernel never re-derives one.  Combinations the
