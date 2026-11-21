@@ -129,6 +129,22 @@ fn unary_vjp(ctx: &mut RuleCtx<'_>, op: &RuleOp, cotangent: Dual) -> Result<Vec<
     Ok(vec![Dual::Value(ctx.binary("multiply", cotangent, coefficient)?)])
 }
 
+/// The second operand of a binary pointwise op.
+///
+/// `relu`, `cast` and `broadcast` carry a rule here but are arity-1 and are
+/// not in the shared unary derivative table, so their arms never read operand
+/// 1 and a missing second operand is an explicit `TransformError`, never an
+/// index panic.
+fn second_operand(op: &RuleOp) -> Result<ValueId> {
+    op.operands.get(1).copied().ok_or_else(|| {
+        Error::transform(format!(
+            "pointwise derivative: op '{}' has no second operand ({} operand(s))",
+            op.name,
+            op.operands.len()
+        ))
+    })
+}
+
 /// The per-op JVP (one `Dual` out per result).
 pub fn jvp_rule(
     ctx: &mut RuleCtx<'_>,
@@ -139,8 +155,10 @@ pub fn jvp_rule(
         return unary_jvp(ctx, op, tangents[0]);
     }
     let a = op.operands[0];
-    let b = op.operands[1];
-    let (ta, tb) = (tangents[0].value(), tangents[1].value());
+    let (ta, tb) = (
+        tangents.first().copied().unwrap_or(Dual::ZERO).value(),
+        tangents.get(1).copied().unwrap_or(Dual::ZERO).value(),
+    );
     match op.name.as_str() {
         "add" => match (ta, tb) {
             (None, None) => Ok(vec![Dual::ZERO]),
@@ -160,6 +178,7 @@ pub fn jvp_rule(
             }
         },
         "multiply" => {
+            let b = second_operand(op)?;
             let mut terms = Vec::new();
             if let Some(tb) = tb {
                 terms.push(ctx.binary("multiply", a, tb)?);
@@ -173,6 +192,7 @@ pub fn jvp_rule(
             Ok(vec![Dual::Value(sum_terms(ctx, &terms)?)])
         }
         "divide" => {
+            let b = second_operand(op)?;
             let y = op.results[0];
             let mut terms = Vec::new();
             if let Some(ta) = ta {
@@ -189,6 +209,7 @@ pub fn jvp_rule(
             Ok(vec![Dual::Value(sum_terms(ctx, &terms)?)])
         }
         "power" => {
+            let b = second_operand(op)?;
             let y = op.results[0];
             let mut terms = Vec::new();
             if let Some(tb) = tb {
@@ -208,6 +229,7 @@ pub fn jvp_rule(
         }
         "remainder" => Ok(vec![Dual::from_option(ta)]),
         "maximum" | "minimum" => {
+            let b = second_operand(op)?;
             if ta.is_none() && tb.is_none() {
                 return Ok(vec![Dual::ZERO]);
             }
@@ -266,17 +288,20 @@ pub fn vjp_rule(
         return unary_vjp(ctx, op, cotangents[0]);
     }
     let a = op.operands[0];
-    let b = op.operands[1];
     let Some(ct) = cotangents[0].value() else {
         let zeros = vec![Dual::ZERO; op.operands.len()];
         return Ok(zeros);
     };
     match op.name.as_str() {
-        "add" => Ok(vec![
-            Dual::Value(reduce_to_operand(ctx, ct, a)?),
-            Dual::Value(reduce_to_operand(ctx, ct, b)?),
-        ]),
+        "add" => {
+            let b = second_operand(op)?;
+            Ok(vec![
+                Dual::Value(reduce_to_operand(ctx, ct, a)?),
+                Dual::Value(reduce_to_operand(ctx, ct, b)?),
+            ])
+        }
         "subtract" => {
+            let b = second_operand(op)?;
             let negated = ctx.unary("negate", ct)?;
             Ok(vec![
                 Dual::Value(reduce_to_operand(ctx, ct, a)?),
@@ -284,6 +309,7 @@ pub fn vjp_rule(
             ])
         }
         "multiply" => {
+            let b = second_operand(op)?;
             let grad_a = ctx.binary("multiply", ct, b)?;
             let grad_b = ctx.binary("multiply", ct, a)?;
             Ok(vec![
@@ -292,6 +318,7 @@ pub fn vjp_rule(
             ])
         }
         "divide" => {
+            let b = second_operand(op)?;
             let y = op.results[0];
             let grad_a = ctx.binary("divide", ct, b)?;
             let scaled = ctx.binary("multiply", ct, y)?;
@@ -303,6 +330,7 @@ pub fn vjp_rule(
             ])
         }
         "power" => {
+            let b = second_operand(op)?;
             let y = op.results[0];
             let ratio = ctx.binary("divide", b, a)?;
             let scaled = ctx.binary("multiply", ct, y)?;
@@ -316,6 +344,7 @@ pub fn vjp_rule(
         }
         "remainder" => Ok(vec![Dual::Value(ct), Dual::ZERO]),
         "maximum" | "minimum" => {
+            let b = second_operand(op)?;
             let comparison = if op.name == "maximum" { "greater" } else { "less" };
             let bool_mask = ctx.binary(comparison, a, b)?;
             let dtype = ctx.dtype(ct)?;
@@ -433,10 +462,18 @@ mod tests {
         let mut builder = Builder::new("main");
         builder.open_function("main", &types).unwrap();
         let args = builder.block_arguments().unwrap();
-        let op = if is_unary(name) {
-            builder.unary(name, args[0]).unwrap()
-        } else {
-            builder.binary(name, args[0], args[1]).unwrap()
+        let op = match types.len() {
+            // `cast` is arity-1 but carries a required `dtype` attribute
+            1 if name == "cast" => {
+                let attrs = evoxc_core::attr::Attrs::from_pairs([(
+                    "dtype",
+                    evoxc_core::attr::AttrValue::DType(DType::parse("float32").unwrap()),
+                )]);
+                builder.emit_typed_one(name, &[args[0]], &attrs).unwrap()
+            }
+            1 => builder.unary(name, args[0]).unwrap(),
+            2 => builder.binary(name, args[0], args[1]).unwrap(),
+            other => panic!("graph helper: {name} takes {other} operands; build it explicitly"),
         };
         (builder, args, op)
     }
@@ -484,7 +521,9 @@ mod tests {
             .iter()
             .map(|(_, op)| op.name.clone())
             .collect();
-        assert_eq!(names, vec!["multiply", "return", "multiply"]);
+        // the source `multiply`, the scalar-one tangent constant, then the
+        // single product-rule term `tangent_a * b` (zero tangents are skipped)
+        assert_eq!(names, vec!["multiply", "constant", "multiply"]);
     }
 
     #[test]
@@ -537,9 +576,16 @@ mod tests {
 
         let (mut builder, args, result) = graph("cast", &[&[4]]);
         let cast = source(&builder, "cast", &args, &[result]);
+        // the cotangent is an ordinary value of THIS builder
+        let cotangent = {
+            let mut ctx = RuleCtx::new(&mut builder);
+            let one = ctx.scalar(DType::parse("float32").unwrap(), 1.0).unwrap();
+            ctx.broadcast(one, &dims_i64(&[4])).unwrap()
+        };
         let mut ctx = RuleCtx::new(&mut builder);
-        let out = vjp_rule(&mut ctx, &cast, &[Dual::Value(tangent)]).unwrap();
+        let out = vjp_rule(&mut ctx, &cast, &[Dual::Value(cotangent)]).unwrap();
         assert_eq!(out.len(), 1);
+        assert_eq!(ctx.shape(out[0].value().unwrap()).unwrap(), dims_i64(&[4]));
 
         let mut builder = Builder::new("main");
         builder
@@ -555,6 +601,12 @@ mod tests {
         let args = builder.block_arguments().unwrap();
         let selected = builder.ternary("select", args[0], args[1], args[2]).unwrap();
         let op = source(&builder, "select", &args, &[selected]);
+        // the truthy tangent is an ordinary value of THIS builder
+        let tangent = {
+            let mut ctx = RuleCtx::new(&mut builder);
+            let one = ctx.scalar(DType::parse("float32").unwrap(), 1.0).unwrap();
+            ctx.broadcast(one, &dims_i64(&[4])).unwrap()
+        };
         let mut ctx = RuleCtx::new(&mut builder);
         let out = jvp_rule(
             &mut ctx,

@@ -174,10 +174,7 @@ pub struct ExtensionRequest {
 impl ExtensionRequest {
     /// Build a request for one op.
     pub fn new(kind: ExtensionKind, op: &RuleOp) -> ExtensionRequest {
-        let attributes = match op.attributes.to_json() {
-            Json::Object(map) => map,
-            _ => Map::new(),
-        };
+        let attributes = attrs_json(&op.attributes);
         ExtensionRequest {
             kind,
             op_name: op.name.clone(),

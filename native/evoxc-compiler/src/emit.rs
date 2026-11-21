@@ -523,11 +523,7 @@ impl ConvParams {
         }
         Ok(ConvParams {
             strides: op.opt_ints("strides")?.map(|value| value.to_vec()),
-            padding: op
-                .attributes
-                .get("padding")
-                .cloned()
-                .unwrap_or(AttrValue::Str("VALID".to_string())),
+            padding: padding_attr(op),
             input_dilation: op.opt_ints("input_dilation")?.map(|value| value.to_vec()),
             kernel_dilation: op.opt_ints("kernel_dilation")?.map(|value| value.to_vec()),
             feature_group_count: op.attributes.opt_i64("feature_group_count")?.unwrap_or(1),
@@ -554,9 +550,25 @@ impl ConvParams {
     }
 }
 
+/// The source op's `padding` attribute in its canonical form.
+///
+/// `padding` is declared `any`: a decoded/schema-defaulted value is an
+/// `AttrValue::Any` wrapping a plain string ("VALID"/"SAME"), which the
+/// emitted attribute renders as that same string.  A bare string is
+/// canonicalized to `AttrValue::Str` so `to_attrs` writes a plain string (the
+/// Python frontend's form); lists and ints stay `Any`.
+fn padding_attr(op: &RuleOp) -> AttrValue {
+    match op.attributes.get("padding") {
+        Some(AttrValue::Any(serde_json::Value::String(text))) => {
+            AttrValue::Str(text.clone())
+        }
+        Some(value) => value.clone(),
+        None => AttrValue::Str("VALID".to_string()),
+    }
+}
+
 /// `[1, 2, 3]` — int literals as shape dims.
-pub fn dims_i64(values: &[i64]) -> Vec<Dim> {
-    values.iter().map(|value| Dim::Int(*value)).collect()
+pub fn dims_i64(values: &[i64]) -> Vec<Dim> {    values.iter().map(|value| Dim::Int(*value)).collect()
 }
 
 /// A rank-0 payload of `dtype` holding `value` (raw little-endian bytes).
@@ -729,12 +741,12 @@ mod tests {
         ctx.argmin(args[0], None, true).unwrap();
         ctx.slice(args[0], &[0, 1], &[2, 3], Some(&[1, 1])).unwrap();
         ctx.concatenate(&[args[0], args[0]], 1).unwrap();
-        ctx.scatter(args[0], idx, args[0], 0).is_err();
+        let _ = ctx.scatter(args[0], idx, args[0], 0).is_err();
         ctx.cumsum(args[0], 1, false).unwrap();
         ctx.cumprod(args[0], 1, true).unwrap();
         ctx.tril(args[0], 0).unwrap();
         ctx.triu(args[0], 0).unwrap();
-        ctx.solve(args[0], args[0]).is_err();
+        let _ = ctx.solve(args[0], args[0]).is_err();
     }
 
     #[test]

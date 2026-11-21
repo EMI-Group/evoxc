@@ -31,8 +31,7 @@ use crate::builder::Builder;
 use crate::emit::{RuleCtx, RuleOp};
 use crate::vectorize::{entry_function, format_shape};
 use crate::{
-    ExtensionKind, ExtensionRequest, ExtensionResponse, Registry, TransformConfig, TransformEnv,
-    TransformOutput,
+    ExtensionKind, ExtensionRequest, Registry, TransformConfig, TransformEnv, TransformOutput,
 };
 
 /// A tangent/cotangent slot: either a real SSA value or the structurally-zero
@@ -350,6 +349,22 @@ fn sweep(
         Mode::Vjp => output_ids.len(),
     };
     let positions = index_positions(extra_inputs, expected, mode.name())?;
+    // vjp validates the cotangent structure BEFORE the sweep touches any rule
+    // (parity with `evoxc/transforms/vjp.py::_vjp_graph`, which normalizes the
+    // cotangent pytree first): an output that gets no explicit cotangent is
+    // seeded in-graph with a scalar one, so it must be scalar.
+    if mode == Mode::Vjp {
+        for (index, ty) in output_types.iter().enumerate() {
+            if !positions.contains_key(&index) && ty.rank() != 0 {
+                return Err(Error::shape(format!(
+                    "vjp: an output that gets no explicit cotangent must be scalar \
+                     (shape ()), got shape {} for output {index} — pass an explicit \
+                     cotangent for it",
+                    format_shape(&ty.shape)
+                )));
+            }
+        }
+    }
     let extra_types: Vec<ValueType> = match mode {
         Mode::Jvp => positions
             .keys()
@@ -474,15 +489,8 @@ fn sweep(
                     dual_env.insert(*new, Dual::Value(extra_args[*position]));
                 }
                 None => {
+                    // Validated before the rebuild: an unseeded output is scalar.
                     let ty = output_types[index].clone();
-                    if ty.rank() != 0 {
-                        return Err(Error::shape(format!(
-                            "vjp: an output that gets no explicit cotangent must be scalar \
-                             (shape ()), got shape {} for output {index} — pass an explicit \
-                             cotangent for it",
-                            format_shape(&ty.shape)
-                        )));
-                    }
                     let one = {
                         let mut ctx = RuleCtx::new(&mut builder);
                         ctx.scalar(ty.dtype, 1.0)?
@@ -948,6 +956,7 @@ mod tests {
     use serde_json::json;
 
     use crate::emit::dims_i64;
+    use crate::ExtensionResponse;
     use crate::ExtensionRule;
 
     fn f32_scalar() -> ValueType {
@@ -1055,13 +1064,22 @@ mod tests {
         assert_eq!(err.kind_str(), "ShapeError");
         assert!(err.message.contains("scalar tensor"));
 
-        // two outputs
+        // one scalar output, one scalar input (the argnum case below)
         let mut builder = Builder::new("main");
         builder.open_function("main", &[f32_scalar()]).unwrap();
         let args = builder.block_arguments().unwrap();
         builder.set_terminator(&args, None).unwrap();
-        let one_output = builder.finish();
-        let err = grad_graph(&one_output, &TransformConfig::default(), &env).unwrap_err();
+        let scalar_output = builder.finish();
+
+        // two outputs (two scalar inputs, both returned)
+        let mut builder = Builder::new("main");
+        builder
+            .open_function("main", &[f32_scalar(), f32_scalar()])
+            .unwrap();
+        let args = builder.block_arguments().unwrap();
+        builder.set_terminator(&args, None).unwrap();
+        let two_outputs = builder.finish();
+        let err = grad_graph(&two_outputs, &TransformConfig::default(), &env).unwrap_err();
         assert_eq!(err.kind_str(), "ShapeError");
         assert!(err.message.contains("exactly one tensor output"));
 
@@ -1094,7 +1112,7 @@ mod tests {
             argnums: Some(vec![9]),
             ..TransformConfig::default()
         };
-        let err = grad_graph(&one_output, &config, &env).unwrap_err();
+        let err = grad_graph(&scalar_output, &config, &env).unwrap_err();
         assert!(err.message.contains("argnum 9 is out of range"));
     }
 
