@@ -1,0 +1,196 @@
+# evoxc-compiler — the native builder and transform engines
+
+## Intent
+
+`evoxc-compiler` is the single native home of graph construction and graph-to-graph transformation: the mutable `Builder`, the `vectorize`/`vmap` engine with the builtin batching rules, the AD engines (`jvp`/`vjp`/`grad`) with the builtin derivative rules, and the extension-rule inlining bridge.
+It mirrors, op for op and error for error, the Python authority — `evoxc/transforms/vectorize.py`, `vmap.py`, `batching.py`, `rules.py`, `autodiff.py`, `grad.py`, `jvp.py`, `vjp.py` and `evoxc/ir/builder.py` — and never invents semantics of its own.
+The binding FFI and wire format are `../../native/CONTEXT.md`; the core API this crate builds on is `../evoxc-core/CONTEXT.md`; this file refines crate internals and changes neither.
+Python keeps the public frontend surface (decorators, pytrees, static values, reconstruction metadata); this crate sees only an `evoxc-native-ir` `Program` plus a typed config, and it holds no Python objects.
+
+## API Surface
+
+### Crate entry points
+
+- `transform(kind, &Program, &TransformConfig, Option<&dyn ExtensionRule>) -> Result<TransformOutput>` — the one entry point the PyO3 binding calls; it dispatches to `vectorize::vectorize_graph`, `vmap::vmap_graph`, `ad::grad_graph`, `ad::jvp_graph` or `ad::vjp_graph`.
+- `transform` always uses the process-wide builtin registry (`builtin_registry()`); a caller-supplied registry is reachable only through those module-level functions with an explicit `TransformEnv`.
+- `TransformKind { Vectorize, Vmap, Grad, Jvp, Vjp }` with `as_str()` (the wire/error spelling) and `parse()` (an unknown name is a `TransformError` listing the five kinds).
+- `TransformConfig { axes, input_axes, out_axes, batch_dim_name, argnums, tangent_inputs, cotangent_inputs }` — one typed config struct, each field used by the kinds in the table below.
+- `TransformOutput { program, output_ids, input_ids, batch_dim }` — the transformed module (entry = its first function), the return operands in order, the function's block arguments in order, and the fresh batch `Dim` name (`None` for every AD kind).
+- `OutAxes { All(Option<i64>), PerOutput(Vec<Option<i64>>) }` with `resolve(outputs, transform)` normalizing one entry per output.
+- `ExtensionRule` (trait) with `call(&self, &ExtensionRequest) -> Result<Option<ExtensionResponse>>`; `Ok(None)` means "no rule" and the engine raises its ordinary `TransformError`, an `Err` propagates verbatim.
+- `ExtensionKind { Batching, Jvp, Vjp }` with `as_str`/`parse` (`batching`, `jvp`, `vjp`).
+- `ExtensionRequest { kind, op_name, rule_key, attributes, operand_types, result_types, axes, tangents, cotangent_type }`, built with `new(kind, &RuleOp)` and refined by `with_axes` / `with_tangents` / `with_cotangent_type`.
+- `ExtensionResponse { module, entry, output_ids, output_axes }`, built with `new(module, entry, output_ids)` and refined by `with_output_axes`.
+- `Registry { batching, jvp, vjp }` with `new()` / `register_builtins()`; `builtin_registry() -> &'static Registry` is the `OnceLock` singleton the FFI path reads.
+- `TransformEnv<'a> { registry: &'a Registry, extension: Option<&'a dyn ExtensionRule> }` with `builtin()`, `with_registry(&Registry)` and `with_extension(&dyn ExtensionRule)`.
+- `VERSION` (the crate version marker).
+
+### Per-kind config usage
+
+| kind | fields |
+|---|---|
+| `vectorize` | `input_axes` and/or `axes` (every input needs an entry: `Some(0)` maps the leading axis, `None` shares the input), optional `batch_dim_name` |
+| `vmap` | the `vectorize` fields plus `out_axes` (default `All(Some(0))`) |
+| `grad` | `argnums` over the flattened tensor inputs (absent = every input in input order; an explicit list keeps its own order) |
+| `jvp` | `tangent_inputs` (required; the flattened input indices that get an explicit tangent block argument) |
+| `vjp` | `cotangent_inputs` (required; the flattened output indices that get an explicit cotangent block argument) |
+
+### Rule surface
+
+- `RuleCtx<'a> { builder, batch_dim }` with `new(builder)` (AD rules) and `with_batch_dim(builder, name)` (`vectorize`/`vmap` rules).
+- `RuleCtx` type readers: `ty`, `dtype`, `rank`, `shape`.
+- `RuleCtx` emission: `op`/`op1`/`call`/`unary`/`binary`/`ternary`/`constant`/`scalar`/`scalar_i64`/`arange_i64`, structural `reshape`/`broadcast`/`transpose`/`slice`/`pad`/`concatenate`/`gather`/`scatter`, reductions `reduce`/`reduce_sum`/`reduce_prod`/`reduce_mean`/`reduce_max`/`reduce_min`, `argmax`/`argmin`, `cast`/`select`/`dot`/`conv`/`solve`/`tril`/`triu`/`cumsum`/`cumprod`/`stop_gradient`.
+- Every `RuleCtx` emission re-validates and re-infers through the native schema table, exactly like the frontend.
+- `RuleOp { name, attributes, original_operand_types, original_result_types, operands, operand_types, results, result_types, location }` — one op as a rule sees it, captured with `from_source(&Program, &Op)` and refined by `bind_operands(&Builder, &[ValueId])` / `bind_results(&Builder, &[ValueId])`.
+- `RuleOp` accessors: `rule_key()` (`block:<name>`, `external:<name>` or the op name), `display()`, `original_operand(i)`, `original_result(i)`, then `int`/`opt_int`/`ints`/`opt_ints`/`bool`/`str`/`dtype`/`shape_attr`/`float`/`nested_ints`/`any`.
+- `ConvParams { strides, padding, input_dilation, kernel_dilation, feature_group_count, batch_group_count }` with `from_op(&RuleOp)` (validated read) and `to_attrs()` (IR rebuild).
+- `MappedAxes` (batching metadata) and `Dual { ZeroTangent, Value(ValueId) }` (AD metadata), both `Copy`.
+- `BatchingRule = fn(&mut RuleCtx, &RuleOp, &[MappedAxes]) -> Result<(Vec<ValueId>, Vec<MappedAxes>)>`, `JvpRule = fn(&mut RuleCtx, &RuleOp, &[Dual]) -> Result<Vec<Dual>>`, `VjpRule = fn(&mut RuleCtx, &RuleOp, &[Dual]) -> Result<Vec<Dual>>`.
+- Builtin coverage: 42 batching keys (28 pointwise, 8 structural, 6 linalg) and 60 JVP plus 60 VJP keys (27 pointwise, 5 reduction, 7 structural, 14 non-differentiable zero rules plus `stop_gradient`, 6 linalg).
+
+### Builder
+
+- `Builder { program, function, block }` — a mutable builder that appends to ONE open block of ONE function of a program; there is no insertion cursor.
+- `new(module_name)` / `with_metadata(module_name, metadata)` start an empty module; `resume(program, function, block)` continues an existing one (allocators reseeded above every live id, missing function = `TransformError`).
+- `open_function(name, input_types)` creates the entry block arguments and the function; `set_function_metadata`, `program`, `block`, `function_name`, `block_arguments`, `value_type(s)`, `block_op_ids`, `terminator_operands` read the state under construction.
+- `emit`/`emit_typed`/`emit_typed_one`/`unary`/`binary`/`ternary`/`constant` write ops; `set_terminator` writes the `return`; `take_terminator` removes it again; `set_op_location` stamps a location on an emitted op; `push_op_with` is the explicit-location form of `emit`.
+- `inline_function(sub, entry, arg_values)` splices a straight-line subgraph with SSA remapping and returns the sub-value → new-value map.
+- `finish()` rebuilds the use lists, refreshes every function's `output_types` from its terminator, and returns the `Program`.
+- Free helpers: `declared_attrs(&OpSchema)` / `result_text(&OpSchema)` (message rendering), `scalar_payload(dtype, value)` (re-exported from `emit`), `emit::dims_i64`, `emit::i64_vector_payload`, `emit::f32_to_f16_bits`.
+
+## Module map
+
+| Path | Responsibility | Python port |
+|---|---|---|
+| `./src/lib.rs` | Crate entry: `TransformKind`/`OutAxes`/`TransformConfig`/`TransformOutput`, the extension bridge types, `Registry` + `builtin_registry()`, `TransformEnv`, `transform`, and the `#[cfg(test)] test_support` helpers. | The dispatch layer behind `evoxc._native.transform` (`evoxc/transforms/__init__.py` wiring); no single function. |
+| `./src/builder.rs` | The mutable `Builder` over `evoxc_core::Program`: schema lookup, arity check, attribute defaulting/validation, native inference, terminator take/set, `resume`, `inline_function`, `finish`. | `evoxc/ir/builder.py` (`Builder`). |
+| `./src/emit.rs` | The neutral rule surface: `RuleCtx` (typed emission helpers) and `RuleOp` (one op as a rule sees it), `ConvParams`, constant-payload helpers. | The `_ctx` helper vocabulary of `evoxc/transforms/rules.py` / `_emit.py` (`_op`, `_const`, `_scalar`, `_reshape`, `_reduce_*`, …). |
+| `./src/vectorize.rs` | The `vectorize` engine: entry-function checks, per-input axis normalization, one shared fresh batch `Dim`, program-order rebuild through the batching registry, location propagation, `format_shape`. | `vectorize_graph` in `evoxc/transforms/batching.py` (plus `vectorize.py` sugar). |
+| `./src/vmap.rs` | `vmap` = `vectorize` + output-axis rearrangement (`reshape` of a size-one leading axis), `out_axes` normalization. | `_rearrange_outputs` in `evoxc/transforms/vmap.py`. |
+| `./src/batching/mod.rs` | `MappedAxes`, the rule type/registry, `rule_key`, `extension_eligible`, `dispatch`, rule-result validation, extension inlining, `derive_output_axes`, the missing-rule `TransformError` texts. | The rule dispatch/registry of `evoxc/transforms/batching.py` + `rules.py`. |
+| `./src/batching/common.rs` | Shared batching shape arithmetic: `fold_product`, `is_batch_dim`, `leading_batch_count`, `row_shape`/`row_rank`, `shift_axes`, `leading_axes`, `reshape_to_broadcast`, `mapped`. | `_fold_product`, `_leading_batch_count`, `_reshape_to_broadcast` in `rules.py`. |
+| `./src/batching/elementwise.rs` | The pointwise batching rule (`POINTWISE_OPS`, 28 ops) plus the `broadcast` special case. | `_pointwise_batching` in `rules.py`. |
+| `./src/batching/structure.rs` | Batching rules for `reshape`, `transpose`, `slice`, `pad`, `concatenate`, `gather`, `scatter`, `constant`, with the per-axis attribute readers. | `_reshape_batching`, `_transpose_batching`, `_slice_batching`, `_pad_batching`, `_concatenate_batching`, `_gather_batching`, `_scatter_batching`, `_constant_batching` in `rules.py`. |
+| `./src/batching/linalg.rs` | Batching rules for `dot`, `conv`, `tril`/`triu`, `cumsum`, `solve`. | `_dot_batching`, `_conv_batching`, `_triangular_batching`, `_cumsum_batching`, `_solve_batching` in `rules.py`. |
+| `./src/ad/mod.rs` | The sweep engine: `Dual`, `JvpRules`/`VjpRules`, `forward_sweep`/`reverse_sweep`, `grad_graph`, `jvp_graph`, `vjp_graph`, rule dispatch, the JVP-from-VJP adjoint trick, the extension bridge, the missing-rule errors. | `evoxc/transforms/autodiff.py` plus the `grad`/`jvp`/`vjp` entry points. |
+| `./src/ad/common.rs` | Shared AD helpers: `zeros_of`, `materialize`, `sum_terms`, `combine`, `accumulate`, `reduce_leading`, `reduce_to_operand`, `expand_reduced`. | `_zeros`, `_materialize`, `_accumulate`, `_combine`, `_sum_terms`, `_reduce_leading`, `_reduce_to_operand`, `_expand_reduced`. |
+| `./src/ad/pointwise.rs` | Pointwise JVP + VJP rules for 27 ops, the shared unary-coefficient table, and the special cases (`add`, `subtract`, `multiply`, `divide`, `power`, `remainder`, `maximum`, `minimum`, `relu`, `cast`, `select`, `broadcast`). | `_UNARY_DERIV`, `_POINTWISE_JVP`, `_POINTWISE_VJP` in `rules.py`. |
+| `./src/ad/reduction_structure.rs` | Reduction (5) and structural (7) JVP/VJP rules plus the 14 non-differentiable zero rules and `stop_gradient`. | `_reduction_jvp`/`_reduction_vjp`/`_slice_vjp`, `_structural_jvp`/`_structural_vjp`, `_zero_jvp`/`_zero_vjp`, `_stop_gradient_*`. |
+| `./src/ad/linalg.rs` | JVP/VJP rules for `dot`, `conv`, `tril`/`triu`, `cumsum`, `solve`. | `_dot_conv_jvp`, `_dot_conv_vjp`, `_triangular_*`, `_cumsum_*`, `_solve_*` in `rules.py`. |
+
+## Constraints
+
+- Dependencies are `evoxc-core` and `serde_json` only; no `pyo3`, no Python, no `evoxc-runtime` and no backend/compiler knowledge.
+- Builtin inference and builtin rules live here (and in `evoxc-core`), never as a second Python-side implementation; the Python graph path is the parity oracle, never the other way round.
+- Rules never touch a `Program` directly: they read `RuleOp` and emit through `RuleCtx`, which goes through schema validation + `infer_op` on every op.
+- No rule ever falls back to a Python loop, a silent pass-through or a guessed shape; a missing rule is an explicit `TransformError` naming the op (and the registration call to add one).
+- User errors are `Result` values with `Error::transform` / `Error::shape` / `Error::verification`; rule code uses guarded accessors instead of indexing, and no `unwrap`/`expect` on user input.
+- Messages carry the transform prefix (`vectorize:`, `vmap:`, `jvp:`, `vjp:`, `grad/vjp:`) and reuse `format_shape` so the dims render like the Python tuples.
+- The transform never mutates its input `Program`: a fresh module is built from `Builder::with_metadata(&program.name, program.metadata)` (+ `batch_depth` metadata preserved for `vectorize`), and op order, locations and attributes are carried forward.
+- Ids are fresh and allocated by the program's reserved allocators; decoded ids are never renumbered and `Builder::resume` reseeds first.
+- Every emission is statically typed: shapes are `Dim`s, symbolic dims are handled where the rules say so and rejected with an explicit `TransformError` everywhere else.
+- `src/ad/mod.rs` and `src/ad/reduction_structure.rs` exceed the ~1000-line guideline (`batching/structure.rs` sits just under it); split only along the existing per-category rule boundaries.
+
+## The mappedness model
+
+- `MappedAxes` is a leading-batch-axis COUNT (`MappedAxes::new(count)`, `UNMAPPED`, `count()`, `is_mapped()`, `axis()` → `Some(0)`/`None`), because mapped axes are always a contiguous prefix of the shape.
+- v1 maps exactly the leading axis: `MappedAxes::from_axis` maps `Some(0)` to count 1 and `None` to 0, and any other axis value is rejected during input-axis normalization (`must be 0 (the leading axis) or None in v1`).
+- Nesting accumulates counts through rule results (a second pass sees count 1 and returns count 2); a rule result is rejected when `count > rank`.
+- One fresh `Dim` per pass: `batch_dim_name` uses `config.batch_dim_name` when non-blank, else the module metadata key `batch_depth` (`batch` at depth 0, `batch_1`, `batch_2`, …).
+- All mapped inputs of one pass share that single `Dim`, so same-level batch extents unify by construction and `is_batch_dim` recognizes only an UNSIZED named dim of that name (or `max` of two such dims).
+- `resolve_input_axes` requires an entry per input (from `input_axes` positionally, overridden by the value-id-keyed `axes`), errors on an entry naming a non-input value id, and errors when an input has no entry at all.
+- Rule-result validation is one value plus one `MappedAxes` per source result, with counts not exceeding the produced rank; a mismatch is a `TransformError` naming the op.
+- `vmap` then normalizes `out_axes`: a mapped output at `Some(0)` stays put, an unmapped output at `Some(0)` gets a size-one leading `reshape`, `None` requires a proved-unmapped output, any other axis defers, and a bare `All` entry on a multi-output graph is rejected.
+- With `out_axes = 0` on every mapped output, `vmap` emits nothing extra — the IR is identical to plain `vectorize`.
+
+## The Builder contract
+
+- Every op goes through the same door: `schema::require(name)` (unknown op = `VerificationError`), the declared arity check, an unknown-attribute check against `OpSchema`, `Attrs::with_defaults` + `validate_attrs`, then `infer_op` for the result types.
+- `result_types` is an override reserved for op-specific ops (`constant`, `if`, `runtime_call`, `block_call`, `external_call`), the terminator (`Some(&[])`) and inlined extension subgraphs / swept ops whose types must be carried verbatim; everything else infers.
+- Result count is validated against the schema, values are allocated from `Program::new_value_id`/`new_op_id`, and the op is appended to the open block (`push_op`).
+- `require_open_block` forbids appending after a terminator (`the block already has a terminator`).
+- `take_terminator` pops and removes the `return` op (returning its operands and location) so a transform can rewrite outputs and `set_terminator` again — the mechanism behind `vmap`'s output rearrangement and `grad`'s selective return.
+- `inline_function` requires the named entry function, an argument-count match, and a straight-line block: a region-bearing sub-op, a sub-op reading an undefined value, or a wrong argument count is an explicit `TransformError`; each inlined op keeps its location and its declared result types.
+- `finish()` rebuilds uses and refreshes `output_types`, so the returned module is shaped so that `evoxc_core::verify` accepts it — the engines never call `verify` themselves, the binding (or a caller) does.
+- Sweeps emit with explicit `result_types` (`captured`/`captured_ir`) so a transform never changes a value's type and the constant payloads survive unchanged.
+
+## The sweep contracts
+
+- `Dual` is a real value or the structurally-zero `ZeroTangent` sentinel; zero is materialized (`zeros_of` = `multiply` by a zero constant of the primal's own dtype) only when a graph output must carry it.
+- Forward sweep (`jvp`): rebuild the graph in program order and apply the op's JVP immediately, threading one `Dual` per new SSA value; `constant` results are `ZeroTangent` and need no rule.
+- Reverse sweep (`vjp`): rebuild the whole graph first, seed the output cotangents, then walk the recorded ops backwards applying VJP rules and accumulating into the operand values with `add` (multiply-used values accumulate; `constant` ops are skipped).
+- The output seed is the explicit cotangent block argument when the output is listed in `cotangent_inputs`, else an in-graph rank-0 scalar one — which is why an unlisted output must be rank 0 (`ShapeError` otherwise).
+- Rule resolution order is: the registered rule, then — for `jvp` only — the adjoint trick over a registered VJP rule, then the host bridge for `block:*`/`external:*`/`sparse_*`, else an explicit `TransformError` naming the op.
+- The adjoint trick calls the VJP rule with the op's own results as cotangents, records every op the rule emitted, marks the values on the op's path, then reverse-sweeps only that emitted subgraph (with the op's tangents as seeds) using the registry's VJP rules, and combines the accumulated terms.
+- `jvp` requires `tangent_inputs`: the selected inputs get an explicit tangent block argument appended after the primals; unselected inputs use the zero tangent; the result function returns the primal outputs followed by one tangent per output.
+- `vjp` requires `cotangent_inputs`: the selected outputs get an explicit cotangent block argument appended after the primals; the result function returns the primal outputs followed by one cotangent per input.
+- `grad` is `vjp` with the scalar-one seed: exactly one tensor output, rank 0 (`ShapeError` with the shape in the message), `argnums` validated for range and duplicates, every selected input float or complex, then the swept module is resumed, its terminator taken, and only the selected gradients (in selector order) returned.
+- `stop_gradient` and the 14 non-differentiable ops have explicit zero rules, so they contribute `ZeroTangent` instead of failing.
+- The VJP extension request carries `cotangent_type` as the op's FIRST result type (the wire request shape holds one type); the JVP request carries one tangent flag per operand.
+- Rule results are count-checked against the op's results (JVP) or operands (VJP) before they are threaded, with the transform's prefix in the error.
+
+## The extension-rule inlining contract
+
+- Only `block:*`, `external:*` and `sparse_*` keys are bridge-eligible (`extension_eligible`); a builtin rule always wins, and no other op may reach the host.
+- The request is neutral JSON-shaped data: kind, op name, rule key, attributes as a JSON map, the operand/result types the rule must consume, plus `axes` (batching), `tangents` (jvp) or `cotangent_type` (vjp).
+- The response carries an `evoxc-native-ir` envelope, its entry function name, the `output_ids` that become the rewritten results/contributions, and (batching only) optional `output_axes`.
+- The subgraph entry block arguments are, in order, the op's rewritten operands — and, for `jvp`/`vjp`, one proxy value per result; batching subgraphs receive operands only.
+- The engine decodes the envelope, `inline_function`s it, and maps `output_ids` through the SSA remapping; an id that is not a value of the inlined entry is an explicit `TransformError`.
+- Response arity is validated for the kind (results for batching/jvp, operands for vjp), and batching output axes must be `0` or `null`.
+- Without `output_axes`, batching mappedness is derived from the spliced values' leading dims named like the pass's batch `Dim` (all unmapped when the pass has no batch dim).
+- No other Python callback may occur during a transform: the GIL crossing is once per transform plus once per extension-ruled op.
+
+## v1 deferrals (explicit errors, never silent fallback)
+
+- `vectorize`/`vmap` reject a module that is not exactly one single-block function (`entry_function`) and reject every region-bearing op (`if`/`while`/`scan`) with `cannot batch op '<op>': region-bearing control-flow ops … are not vectorizable in v1`.
+- `vmap` defers every `out_axes` entry other than `0`/`null`, and a bare `out_axes` on a graph with more than one tensor output.
+- Batching deferrals: `conv` with a mapped kernel (a symbolic `batch_group_count`), `conv` with `batch_group_count != 1`, `conv` over a dynamic batch dim or a rank-0 input; `gather` with mapped data but unmapped indices, with multiple `axes`, or with dynamic index dims; `scatter` with mapped data but unmapped indices/updates, or with indices and updates disagreeing on mappedness; `slice` with a dynamic batch dim or a symbolic per-axis limit; `concatenate` with no operand carrying all mapped axes; `solve` with `left_side = false`; per-axis int attributes whose length disagrees with the per-row rank.
+- AD deferrals: `conv` VJP (the IR has no transposed-convolution op); `reduce_mean` over a symbolic reduced dim (the count is unknown); `gather` with multiple axes in both sweeps; a `slice` VJP with strided entries on more than one axis, or over a symbolic dim; a `pad` VJP over a symbolic dim; a `concatenate` VJP with symbolic dims; `solve` with `left_side = false` in both sweeps; a `conv` with `batch_group_count != 1`.
+- Ops with NO batching rule at all (a `TransformError` naming the op): comparisons/logical/bitwise (`equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal`, `logical_*`, `bitwise_*` incl. the shifts), the `reduce_*` family, `argmax`/`argmin`, `acos`/`ceil`/`floor`/`round`, `cumprod`, `sort`/`argsort`/`tile`/`flip`/`roll`/`diag`/`nan_to_num`, `diagonal`, the linalg factorizations (`cholesky`/`eigh`/`matrix_exp`/`matrix_rank`/`qr`/`svd`), the `random_*` ops, the collectives (`all_reduce`/`all_gather`/`reduce_scatter`/`all_to_all`/`broadcast_collective`/`collective_permute`), `rank`/`world_size`, control flow, `call`, `runtime_call`, the sparse ops (which reach the bridge instead), and `dense_dot_sparse` (a sparse op whose name is not `sparse_`-prefixed, so the bridge is NOT consulted).
+- Ops with NO derivative rule at all (a `TransformError` naming the op and the registration call): `acos`/`ceil`/`floor`/`round`, `cumprod`, `sort`/`argsort`/`tile`/`flip`/`roll`/`diag`/`nan_to_num`, `diagonal`, the linalg factorizations, `random_*`, the collectives, `rank`/`world_size`, control flow, `call`, `runtime_call`, the sparse ops (bridge only) and `dense_dot_sparse`.
+- Frontend compositions need no rule of their own: `eye`/`linspace` become `constant` payloads, and `matmul`/`topk`/`stack`/`clamp`/`isnan`/`mean`/`std`/`var`/`median`/`norm` expand onto ruled IR ops — so their transformability follows their components (`topk` needs `sort`/`argsort`, which have no rule).
+- `constant` needs no rule in either sweep (special-cased), `return` is never dispatched, and `block_call`/`external_call`/`sparse_*` are never "missing" while the bridge answers for them.
+
+## Known gaps / notes for agents
+
+- **The `with_defaults` null-default gap:** `evoxc_core::attr::Attrs::with_defaults` fills a declared default by decoding it, and a declared `null` default for an `INTS` attribute does not decode (`expected a list of ints, got null`); `Builder::emit` calls it unguarded, so omitting `conv.strides` / `conv.input_dilation` / `conv.kernel_dilation` / `slice.strides` / `transpose.permutation` is a `VerificationError`.
+- This crate works around it only where a rule materializes the attribute itself: `batching::structure`'s `transpose` rule always computes an explicit permutation, its `slice` rule always passes explicit strides, and `ConvParams::to_attrs` writes the three lists whenever the source carried them.
+- Where the source carried `null` (the frontend always serializes those attributes as `null`), the value arrives as `AttrValue::Null`, `with_defaults` skips it and `envelope::attr_accepts` accepts it — so a rebuild of a decoded op is fine, while a rebuild that DROPS the attribute is not.
+- `ConvParams::to_attrs` still omits `strides`/`input_dilation`/`kernel_dilation` when they are `None`, and `RuleCtx::transpose(value, None)` / `RuleCtx::slice(..., None)` still omit them, so those paths hit the gap; `emit::tests::rule_op_accessors_and_conv_params` is currently red for exactly this reason.
+- Frontend-vs-IR differences every rule must respect: `ops.slice` takes SIZES in Python while the IR `slice` carries `start_indices`/`limit_indices` (+ optional `strides`); `ops.gather(axis=a)` is the IR `gather` with `axes = [a]`; `ops.scatter(axis=a)` is the IR `scatter` with a scalar `axis`; `reduce_*` requires the `reduce_op` attribute (the frontend sugar sets it, hand-built attrs must too); `transpose`'s `permutation: null` means full reversal; `padding_config` is one `(low, high)` (or bare int) pair per axis.
+- Batching rules see the op's REWRITTEN operands and an EMPTY `results`/`result_types` (`RuleOp::from_source(...).bind_operands(...)`), so a batching rule must never read a rewritten result.
+- AD rules see both: the rewritten operands (the primals of the output module) and the rebuilt `results` (which is what the Python rules receive as `primals`).
+- `lib.rs` owns `test_support` (a `#[cfg(test)] pub(crate)` module with `f32_ty` and `add_program`), which the module test modules share — a new test module should import from there rather than redefining helpers.
+- `gather.axes` and `scatter.axis` are optional in the schema, so the rules read them with the schema defaults (`[0]` / `0`) instead of requiring them.
+- `src/batching/elementwise.rs`'s header names `_reduction_batching` but only the pointwise family is registered here; `reduce_*` batching has no native rule yet (see the deferral list), so `vectorize`/`vmap` of a reducing graph fails explicitly.
+- This crate contains no Python, no device, no backend and no runtime code; it never edits `../evoxc-core/`, the Python packages or the PyO3 crate.
+
+## Test strategy
+
+- In-file `#[cfg(test)]` unit tests per module; no GPU, no network, no Python interpreter — `cargo test --manifest-path native/Cargo.toml -p evoxc-compiler`.
+- The crate currently holds 98 in-file tests and **16 of them fail** (82 passing); the failures are test-vs-implementation drift, not a compile problem, and are reported here rather than fixed from this file: the `reduce_op` requirement in `builder::tests::emits_and_infers_elementwise_and_reduction` / `builder::tests::defaults_are_filled_and_terminator_is_unique`, the null-default gap in `emit::tests::rule_op_accessors_and_conv_params`, a slot-index panic in `ad::pointwise::tests::relu_select_and_cast_rules_work`, an op/remapping-count expectation in `builder::tests::inlines_a_subgraph_with_ssa_remapping`, a missing expected `constant`/`reshape` in `ad::pointwise::tests::multiply_jvp_sums_the_product_rule_terms` / `batching::elementwise::tests::pointwise_aligns_unmapped_operands_and_prepends_the_batch_axis` / `vectorize::tests::vectorize_prepends_one_shared_batch_dim`, message/kind drift in `batching::tests::extension_none_falls_back_to_transform_error`, `batching::tests::extension_rule_inlines_with_ssa_remapping`, `vmap::tests::non_leading_out_axes_and_bare_multi_output_defer`, `vectorize::tests::axis_validation_errors`, `ad::tests::vjp_rejects_a_non_scalar_unseeded_output`, `ad::tests::grad_errors`, and dim/symbolic arithmetic in `batching::common::tests::fold_product_folds_static_dims_and_rejects_dynamic` / `batching::common::tests::batch_dim_detection_is_structural`.
+- Every module test builds small programs with `Builder` (or the raw `Program` API) and asserts the emitted op sequence, the result types and one error per documented deferral.
+- The structural tests assert the shape of the rewrite (op names, `axis` shifts, permutation lists, return operand order) rather than numerics: numeric parity is the Python suite's job.
+- The parity oracle is `../tests/transforms/` (`test_vectorize.py`, `test_vmap.py`, `test_autodiff_rules.py`, `test_grad.py`, `test_jvp.py`, `test_vjp.py`, `test_errors.py`): a rule change must be reflected there first, and this crate's tests follow.
+- The Python-free gates are `cargo test -p evoxc-compiler`, `cargo test -p evoxc-core` and `cargo build -p evoxc-python`; every shell command starts with `source scripts/dev-env.sh &&` and cargo needs `--manifest-path native/Cargo.toml`.
+
+## Routing Table
+
+| Path | Area |
+|---|---|
+| `./Cargo.toml` | Crate manifest: workspace-inherited version/edition/rust-version/license, dependencies `evoxc-core` + `serde_json` only. |
+| `./src/lib.rs` | Crate entry point: `transform`, `TransformKind`, `TransformConfig`, `TransformOutput`, `OutAxes`, the extension bridge types, `Registry`/`builtin_registry`, `TransformEnv`, `test_support`. |
+| `./src/builder.rs` | Mutable `Builder` over `evoxc_core::Program`: schema + arity + attribute validation, native inference, terminator take/set, `resume`, `inline_function`, `finish`. |
+| `./src/emit.rs` | Rule-facing emission surface: `RuleCtx` helpers, `RuleOp`, `ConvParams`, constant/scalar/int64 payload builders. |
+| `./src/vectorize.rs` | The `vectorize` engine: entry-function checks, input-axis normalization, the shared fresh batch `Dim`, program-order rebuild, `format_shape`. |
+| `./src/vmap.rs` | `vmap`: `vectorize` plus `out_axes` rearrangement (`reshape` of a size-one leading axis). |
+| `./src/batching/mod.rs` | The batching engine: `MappedAxes`, rule type/registry, `rule_key`, `dispatch`, rule-result validation, extension inlining, `derive_output_axes`, missing-rule errors. |
+| `./src/batching/common.rs` | Shared batching shape arithmetic (`fold_product`, `is_batch_dim`, `leading_batch_count`, `row_shape`/`row_rank`, `shift_axes`, `leading_axes`, `reshape_to_broadcast`, `mapped`). |
+| `./src/batching/elementwise.rs` | The pointwise batching rule and its 28-op `POINTWISE_OPS` list (plus the `broadcast` special case). |
+| `./src/batching/structure.rs` | Batching rules for `reshape`, `transpose`, `slice`, `pad`, `concatenate`, `gather`, `scatter`, `constant` and their per-axis attribute readers. |
+| `./src/batching/linalg.rs` | Batching rules for `dot`, `conv`, `tril`/`triu`, `cumsum`, `solve`. |
+| `./src/ad/mod.rs` | The AD engines: `Dual`, `JvpRules`/`VjpRules`, forward/reverse sweep, `grad`/`jvp`/`vjp`, rule dispatch, the JVP-from-VJP adjoint trick, the extension bridge, missing-rule errors. |
+| `./src/ad/common.rs` | Shared AD helpers (`zeros_of`, `materialize`, `sum_terms`, `combine`, `accumulate`, `reduce_leading`, `reduce_to_operand`, `expand_reduced`). |
+| `./src/ad/pointwise.rs` | Pointwise JVP + VJP rules for 27 ops: the shared unary-coefficient table and the arithmetic/`relu`/`cast`/`select`/`broadcast` special cases. |
+| `./src/ad/reduction_structure.rs` | Reduction (5) and structural (7) JVP/VJP rules, the 14 non-differentiable zero rules and `stop_gradient`. |
+| `./src/ad/linalg.rs` | JVP/VJP rules for `dot`, `conv`, `tril`/`triu`, `cumsum`, `solve` (with the `conv`-VJP deferral). |
