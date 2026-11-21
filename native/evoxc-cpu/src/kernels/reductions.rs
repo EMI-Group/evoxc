@@ -111,6 +111,252 @@ impl Layout {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Contiguous-block fast path
+// ---------------------------------------------------------------------------
+
+/// A reduction whose reduced axes form ONE contiguous block in C order.
+///
+/// Such an operand is `outer` consecutive groups of `red * inner` elements, and
+/// each group is `red` interleaved runs of `inner` consecutive lanes: the
+/// elements folded into output lane `i` of a group are `group[k * inner + i]`
+/// for `k in 0..red`.  That covers every shape real graphs reduce — a full
+/// reduction, a trailing-axis row reduction, a leading column reduction and any
+/// contiguous multi-axis block — with one flat walk and no per-element offset
+/// table, which is exactly the cost the generic [`Layout`] pays (it allocates
+/// and re-indexes an offset vector, and re-derives the output offsets with a
+/// division-free odometer per output).
+///
+/// `inner == 1` means each output sits on one contiguous run (the case a plain
+/// fold can vectorize); `inner > 1` means a group reduces into `inner` lanes at
+/// once (the column-sum / outer-product shape).
+struct Block {
+    /// Groups of `red * inner` elements, one group per `inner` outputs.
+    outer: usize,
+    /// Elements folded into one output.
+    red: usize,
+    /// Output lanes per group.
+    inner: usize,
+}
+
+impl Block {
+    /// The block of `reduced`, or `None` when the reduced axes are NOT
+    /// contiguous (a gap inside them forces the general [`Layout`] path) or when
+    /// nothing is reduced at all (an identity reduction keeps the operand shape
+    /// and values, which the general path handles with one zero offset).
+    fn new(shape: &[usize], reduced: &[bool]) -> Option<Block> {
+        let first = reduced.iter().position(|flag| *flag)?;
+        let last = reduced.iter().rposition(|flag| *flag)?;
+        if !reduced[first..=last].iter().all(|flag| *flag) {
+            return None;
+        }
+        Some(Block {
+            outer: util::numel(&shape[..first]),
+            red: util::numel(&shape[first..=last]),
+            inner: util::numel(&shape[last + 1..]),
+        })
+    }
+
+    fn out_len(&self) -> usize {
+        self.outer * self.inner
+    }
+}
+
+/// Independent accumulator lanes per contiguous fold run.
+///
+/// A sequential float fold is ONE dependency chain (4-cycle add latency per
+/// element), which is why a full `reduce_sum` used to run ~14x slower than
+/// numpy's pairwise sum; [`LANE_COUNT`] accumulators make the chains
+/// independent, which is what lets the loop reach the memory bound.
+const LANE_COUNT: usize = 8;
+
+/// Lanes one contiguous fold run uses for an accumulator of `dtype`.
+///
+/// Integer and bool folds are exact under any association (wrapping adds and
+/// multiplies are associative), so they take the multi-accumulator path too.
+/// Float16 folds IN float16 and complex in complex, where the parity contract's
+/// ulp window is tighter than a reassociated sum can honour, so those keep the
+/// interpreter's exact sequential order (and neither is on a large workload).
+fn fold_lanes(dtype: DType) -> usize {
+    if matches!(
+        dtype,
+        DType::Float16 | DType::Complex64 | DType::Complex128
+    ) {
+        1
+    } else {
+        LANE_COUNT
+    }
+}
+
+/// Fold one contiguous run with `lanes` independent accumulators.
+///
+/// A run shorter than `lanes` folds sequentially from `init` in operand order,
+/// so every small reduction keeps the interpreter's exact arithmetic.  Integer,
+/// bool and complex adds/multiplies are associative (wrapping / exact), and
+/// `max`/`min` are NaN-propagating in both directions and idempotent, so
+/// reordering only moves float32/float64 sums inside their documented tolerance.
+#[inline]
+fn fold_run<T: Num, F: Fn(T, T) -> T + Copy>(values: &[T], init: T, op: F, lanes: usize) -> T {
+    if lanes == LANE_COUNT {
+        fold_run_lanes::<T, F, LANE_COUNT>(values, init, op)
+    } else {
+        fold_run_lanes::<T, F, 1>(values, init, op)
+    }
+}
+
+#[inline]
+fn fold_run_lanes<T: Num, F: Fn(T, T) -> T, const LANES: usize>(values: &[T], init: T, op: F) -> T {
+    let mut acc = [init; LANES];
+    let mut chunks = values.chunks_exact(LANES);
+    for chunk in &mut chunks {
+        for lane in 0..LANES {
+            acc[lane] = op(acc[lane], chunk[lane]);
+        }
+    }
+    let mut total = acc[0];
+    for value in acc.iter().skip(1) {
+        total = op(total, *value);
+    }
+    for value in chunks.remainder() {
+        total = op(total, *value);
+    }
+    total
+}
+
+/// Fold every output of a contiguous block, in C output order.
+///
+/// `identity` is the reduction's identity element (`0` for sum, `1` for prod);
+/// `None` seeds each group from its FIRST element, which is how max/min fold
+/// without an identity (the caller has already rejected an empty reduction).
+fn fold_groups<T: Num, F: Fn(T, T) -> T + Copy>(
+    values: &[T],
+    block: &Block,
+    identity: Option<T>,
+    op: F,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(block.out_len());
+    if block.red == 0 || block.inner == 0 {
+        // An empty reduction has no group to walk; `reduce_*` rejects a
+        // zero-size max/min before this point and the identity folds below have
+        // nothing to produce when there is no output lane.
+        return out;
+    }
+    let lanes = fold_lanes(T::DTYPE);
+    for group in values.chunks_exact(block.red * block.inner) {
+        if block.inner == 1 {
+            let init = identity.unwrap_or(group[0]);
+            out.push(fold_run(group, init, op, lanes));
+        } else {
+            // One accumulator per lane: the identity when the reduction has one,
+            // otherwise the group's first row (max/min have no identity).
+            let mut acc: Vec<T> = match identity {
+                Some(value) => vec![value; block.inner],
+                None => group[..block.inner].to_vec(),
+            };
+            let mut rows = group.chunks_exact(block.inner);
+            if identity.is_none() {
+                // The first row already seeded the accumulators.
+                rows.next();
+            }
+            for row in rows {
+                for (slot, value) in acc.iter_mut().zip(row) {
+                    *slot = op(*slot, *value);
+                }
+            }
+            out.append(&mut acc);
+        }
+    }
+    out
+}
+
+/// The per-element comparison a max/min fold uses.
+///
+/// `Num::max`/`Num::min` test BOTH operands for NaN first, which is three
+/// dependent operations before the select and keeps the fold loop from
+/// vectorizing (~2x numpy on a row max); here NaN is decided only when neither
+/// `>=` holds, so the common path is one compare-and-select.  The result matches
+/// `Num::max`/`Num::min` wherever it is defined — including `max(-0.0, 0.0)`
+/// keeping the left operand and any NaN operand propagating — except that a
+/// propagated NaN carries the canonical payload rather than the operand's.
+trait FoldSelect: Copy {
+    fn select_max(self, other: Self) -> Self;
+    fn select_min(self, other: Self) -> Self;
+}
+
+macro_rules! fold_select_total {
+    ($($ty:ty),*) => {$(
+        impl FoldSelect for $ty {
+            #[inline]
+            fn select_max(self, other: Self) -> Self {
+                if self >= other {
+                    self
+                } else {
+                    other
+                }
+            }
+            #[inline]
+            fn select_min(self, other: Self) -> Self {
+                if self <= other {
+                    self
+                } else {
+                    other
+                }
+            }
+        }
+    )*};
+}
+
+macro_rules! fold_select_ieee {
+    ($($ty:ty),*) => {$(
+        impl FoldSelect for $ty {
+            #[inline]
+            fn select_max(self, other: Self) -> Self {
+                if self >= other {
+                    self
+                } else if other >= self {
+                    other
+                } else {
+                    // Neither ordering holds: a NaN operand propagates.
+                    Self::NAN
+                }
+            }
+            #[inline]
+            fn select_min(self, other: Self) -> Self {
+                if self <= other {
+                    self
+                } else if other <= self {
+                    other
+                } else {
+                    Self::NAN
+                }
+            }
+        }
+    )*};
+}
+
+fold_select_total!(bool, i8, i16, i32, i64, u8, u16, u32, u64);
+fold_select_ieee!(half::f16, f32, f64);
+
+/// Complex has no ordering in the scalar vocabulary and an arg/max reduction
+/// over it is rejected before a fold runs; `Num::max`/`Num::min` are the
+/// identity on it, which this mirrors.
+macro_rules! fold_select_identity {
+    ($($ty:ty),*) => {$(
+        impl FoldSelect for $ty {
+            #[inline]
+            fn select_max(self, _other: Self) -> Self {
+                self
+            }
+            #[inline]
+            fn select_min(self, _other: Self) -> Self {
+                self
+            }
+        }
+    )*};
+}
+
+fold_select_identity!(Complex<f32>, Complex<f64>);
+
 /// Increment a C-order odometer (the last axis varies fastest).
 fn advance(index: &mut [usize], dims: &[usize]) {
     for axis in (0..dims.len()).rev() {
@@ -275,16 +521,42 @@ fn reduce(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<Valu
     single(computed)
 }
 
-fn compute_reduce<T: Num>(request: &Request<'_>, values: &[T], in_shape: &[usize]) -> Result<Buffer> {
-    let layout = Layout::new(in_shape, request.reduced);
-    let folded = match request.kind {
-        Kind::Sum => fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
-        Kind::Prod => fold_all(&layout, values, T::one(), |a, b| a.mul(b)),
-        Kind::Max => fold_first(request.name, "maximum", &layout, values, |a, b| a.max(b))?,
-        Kind::Min => fold_first(request.name, "minimum", &layout, values, |a, b| a.min(b))?,
-        Kind::Mean => {
-            let sums = fold_all(&layout, values, T::zero(), |a, b| a.add(b));
-            divide_by(request.acc_dtype, sums, request.count)
+fn compute_reduce<T: Num + FoldSelect>(
+    request: &Request<'_>,
+    values: &[T],
+    in_shape: &[usize],
+) -> Result<Buffer> {
+    let folded = match Block::new(in_shape, request.reduced) {
+        // The contiguous fast path (see [`Block`]); `red == 0` (an empty reduced
+        // axis) falls through to the general path, which owns the identity /
+        // zero-size rules.
+        Some(block) if block.red > 0 => match request.kind {
+            Kind::Sum => fold_groups(values, &block, Some(T::zero()), |a, b| a.add(b)),
+            Kind::Prod => fold_groups(values, &block, Some(T::one()), |a, b| a.mul(b)),
+            Kind::Max => fold_groups(values, &block, None, |a, b| a.select_max(b)),
+            Kind::Min => fold_groups(values, &block, None, |a, b| a.select_min(b)),
+            Kind::Mean => divide_by(
+                request.acc_dtype,
+                fold_groups(values, &block, Some(T::zero()), |a, b| a.add(b)),
+                request.count,
+            ),
+        },
+        _ => {
+            let layout = Layout::new(in_shape, request.reduced);
+            match request.kind {
+                Kind::Sum => fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
+                Kind::Prod => fold_all(&layout, values, T::one(), |a, b| a.mul(b)),
+                Kind::Max => {
+                    fold_first(request.name, "maximum", &layout, values, |a, b| a.select_max(b))?
+                }
+                Kind::Min => {
+                    fold_first(request.name, "minimum", &layout, values, |a, b| a.select_min(b))?
+                }
+                Kind::Mean => {
+                    let sums = fold_all(&layout, values, T::zero(), |a, b| a.add(b));
+                    divide_by(request.acc_dtype, sums, request.count)
+                }
+            }
         }
     };
     let computed = Buffer::new(
@@ -400,7 +672,7 @@ fn arg_reduce(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<
     })
 }
 
-fn compute_arg<T: Scalar>(
+fn compute_arg<T: Scalar + ArgOrd>(
     want_max: bool,
     name: &str,
     values: &[T],
@@ -409,45 +681,44 @@ fn compute_arg<T: Scalar>(
     out_shape: &[usize],
     out_dtype: DType,
 ) -> Result<Vec<Value>> {
-    let layout = Layout::new(in_shape, reduced);
-    if layout.red_offsets.is_empty() {
+    let reduced_len: usize = reduced
+        .iter()
+        .zip(in_shape)
+        .filter(|(flag, _)| **flag)
+        .map(|(_, dim)| *dim)
+        .product();
+    if reduced_len == 0 {
         return Err(Error::shape(format!(
             "op '{name}': zero-size arg reduction — a reduced axis has extent 0, so there is no \
              index to return (numpy raises the same way)"
         )));
     }
-    let mut indices: Vec<i64> = Vec::with_capacity(layout.out_len());
-    layout.for_each_output(|_, base| {
-        // `red_offsets` is a C-order odometer over the reduced axes, so with a
-        // single reduced axis (the `axis` case) its position IS the axis index,
-        // and with every axis reduced (`axis=None`) it is the flat index.
-        let mut best = values[base + layout.red_offsets[0]];
-        let mut best_index = 0i64;
-        for (position, offset) in layout.red_offsets.iter().enumerate().skip(1) {
-            let candidate = values[base + offset];
-            // numpy's rule: a NaN best is never replaced; a NaN candidate
-            // always wins.  Otherwise only a strict improvement replaces, so a
-            // tie keeps the FIRST occurrence.
-            if scalar_nan(best.to_scalar()) {
-                continue;
-            }
-            if scalar_nan(candidate.to_scalar()) {
-                best = candidate;
-                best_index = position as i64;
-                continue;
-            }
-            let improves = if want_max {
-                ordered_gt(candidate.to_scalar(), best.to_scalar())
+    let indices = match Block::new(in_shape, reduced) {
+        // The contiguous fast path: the reduced position of a winner IS its
+        // index, because a contiguous reduced block's flat position is the
+        // C-order odometer position the general path walks.
+        Some(block) if block.red > 0 && block.inner > 0 => {
+            let mut indices: Vec<i64> = Vec::with_capacity(block.out_len());
+            if block.inner == 1 {
+                for run in values.chunks_exact(block.red) {
+                    indices.push(arg_run(run, want_max) as i64);
+                }
             } else {
-                ordered_gt(best.to_scalar(), candidate.to_scalar())
-            };
-            if improves {
-                best = candidate;
-                best_index = position as i64;
+                for group in values.chunks_exact(block.red * block.inner) {
+                    indices.extend(arg_group(group, block.inner, want_max));
+                }
             }
+            indices
         }
-        indices.push(best_index);
-    });
+        _ => {
+            let layout = Layout::new(in_shape, reduced);
+            let mut indices: Vec<i64> = Vec::with_capacity(layout.out_len());
+            layout.for_each_output(|_, base| {
+                indices.push(arg_offsets(values, base, &layout.red_offsets, want_max));
+            });
+            indices
+        }
+    };
     let buffer = Buffer::new(DType::Int64, out_shape.to_vec(), Storage::I64(indices))?;
     if out_dtype == DType::Int64 {
         single(buffer)
@@ -456,31 +727,139 @@ fn compute_arg<T: Scalar>(
     }
 }
 
-fn scalar_nan(value: ScalarValue) -> bool {
-    match value {
-        ScalarValue::F(real) => real.is_nan(),
-        ScalarValue::C(complex) => complex.re.is_nan() || complex.im.is_nan(),
-        _ => false,
+/// The typed comparison an arg reduction scans with.
+///
+/// `Num` offers `max`/`min` but no ordering, and the dtype-erased
+/// [`ScalarValue`] round trip this used to go through per element was the whole
+/// cost of `argmax`/`argmin`; ordering on the concrete scalar keeps the scan one
+/// compare per element.
+trait ArgOrd: Copy {
+    fn arg_nan(self) -> bool;
+    fn arg_gt(self, other: Self) -> bool;
+}
+
+macro_rules! arg_ord_ordered {
+    ($($ty:ty),*) => {$(
+        impl ArgOrd for $ty {
+            #[inline]
+            fn arg_nan(self) -> bool {
+                false
+            }
+            #[inline]
+            fn arg_gt(self, other: Self) -> bool {
+                self > other
+            }
+        }
+    )*};
+}
+
+macro_rules! arg_ord_float {
+    ($($ty:ty),*) => {$(
+        impl ArgOrd for $ty {
+            #[inline]
+            fn arg_nan(self) -> bool {
+                <$ty>::is_nan(self)
+            }
+            #[inline]
+            fn arg_gt(self, other: Self) -> bool {
+                self > other
+            }
+        }
+    )*};
+}
+
+arg_ord_ordered!(bool, i8, i16, i32, i64, u8, u16, u32, u64);
+arg_ord_float!(half::f16, f32, f64);
+
+/// Complex has no order in the scalar vocabulary (an arg reduction over complex
+/// is rejected before a scan runs), so it only needs a total fallback: the real
+/// projection, matching what the dtype-erased comparison did.
+macro_rules! arg_ord_complex {
+    ($($ty:ty),*) => {$(
+        impl ArgOrd for $ty {
+            #[inline]
+            fn arg_nan(self) -> bool {
+                self.re.is_nan() || self.im.is_nan()
+            }
+            #[inline]
+            fn arg_gt(self, other: Self) -> bool {
+                self.re > other.re
+            }
+        }
+    )*};
+}
+
+arg_ord_complex!(Complex<f32>, Complex<f64>);
+
+/// numpy's arg rule over one candidate: a NaN best is never replaced (so the
+/// FIRST NaN wins), a NaN candidate always wins, and otherwise only a strict
+/// improvement replaces (so a tie keeps the FIRST occurrence).
+#[inline]
+fn arg_better<T: ArgOrd>(best: T, candidate: T, want_max: bool) -> bool {
+    if best.arg_nan() {
+        return false;
+    }
+    if candidate.arg_nan() {
+        return true;
+    }
+    if want_max {
+        candidate.arg_gt(best)
+    } else {
+        best.arg_gt(candidate)
     }
 }
 
-/// Strict `left > right` on the dtype-erased scalar (complex inputs are
-/// rejected before an arg reduction reaches here).
-fn ordered_gt(left: ScalarValue, right: ScalarValue) -> bool {
-    match (left, right) {
-        (ScalarValue::I(a), ScalarValue::I(b)) => a > b,
-        (ScalarValue::U(a), ScalarValue::U(b)) => a > b,
-        (ScalarValue::F(a), ScalarValue::F(b)) => a > b,
-        // One buffer holds one dtype, so mixed variants cannot occur inside a
-        // comparison; the real projection is a total order if they ever do.
-        _ => left.real() > right.real(),
+/// Index of the winning position in one contiguous run (one output).
+///
+/// The replacement is written as two selects rather than a branch: whether a
+/// value improves is DATA-dependent, so a branch mispredicts on roughly half the
+/// elements of a random run, which is what made `argmax` several times slower
+/// than numpy's compare-and-select loop.
+#[inline]
+fn arg_run<T: ArgOrd>(values: &[T], want_max: bool) -> usize {
+    let mut best = values[0];
+    let mut best_index = 0usize;
+    for (position, candidate) in values.iter().enumerate().skip(1) {
+        let replace = arg_better(best, *candidate, want_max);
+        best = if replace { *candidate } else { best };
+        best_index = if replace { position } else { best_index };
     }
+    best_index
+}
+
+/// One group reducing into `inner` output lanes, one step per reduced position
+/// (`row`).  Each lane walks its positions in operand order, so the tie and NaN
+/// rules are exactly the sequential ones.
+fn arg_group<T: ArgOrd>(group: &[T], inner: usize, want_max: bool) -> Vec<i64> {
+    let mut best: Vec<T> = group[..inner].to_vec();
+    let mut indices = vec![0i64; inner];
+    for (position, row) in group.chunks_exact(inner).enumerate().skip(1) {
+        for (lane, candidate) in row.iter().enumerate() {
+            let replace = arg_better(best[lane], *candidate, want_max);
+            best[lane] = if replace { *candidate } else { best[lane] };
+            indices[lane] = if replace { position as i64 } else { indices[lane] };
+        }
+    }
+    indices
+}
+
+/// One output of the general (non-contiguous) layout: `offsets` is the C-order
+/// odometer over the reduced axes, so a position in it IS the reported index.
+fn arg_offsets<T: ArgOrd>(values: &[T], base: usize, offsets: &[usize], want_max: bool) -> i64 {
+    let mut best = values[base + offsets[0]];
+    let mut best_index = 0i64;
+    for (position, offset) in offsets.iter().enumerate().skip(1) {
+        let candidate = values[base + offset];
+        let replace = arg_better(best, candidate, want_max);
+        best = if replace { candidate } else { best };
+        best_index = if replace { position as i64 } else { best_index };
+    }
+    best_index
 }
 
 // ---------------------------------------------------------------------------
 // cumsum / cumprod
 // ---------------------------------------------------------------------------
-
 fn cumulative_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
     let out_shape = util::result_shape(ctx, spec, 0)?;
     cumulative(spec, &operands[0], &out_shape)
@@ -910,5 +1289,414 @@ mod tests {
         let op = arg_op("argmax", Some(1), false, &[2, 3]);
         let err = error_of(arg_reduce(&op, &input, &[2, 3]));
         assert!(err.message.contains("yields rank 1"), "{}", err.message);
+    }
+
+    // -----------------------------------------------------------------------
+    // The contiguous fast path (see `Block`) against the retained offset-table
+    // path: bit-exact for integers/bool/float16, tolerance-equal for f32/f64.
+    // -----------------------------------------------------------------------
+
+    /// The general (offset-table) fold — the implementation the fast path
+    /// replaced, kept here as the reference.
+    fn general<T: Num + FoldSelect>(
+        kind: Kind,
+        values: &[T],
+        shape: &[usize],
+        reduced: &[bool],
+        count: usize,
+        acc_dtype: DType,
+    ) -> Vec<T> {
+        let layout = Layout::new(shape, reduced);
+        match kind {
+            Kind::Sum => fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
+            Kind::Prod => fold_all(&layout, values, T::one(), |a, b| a.mul(b)),
+            Kind::Max => {
+                fold_first("reference", "maximum", &layout, values, |a, b| a.select_max(b)).unwrap()
+            }
+            Kind::Min => {
+                fold_first("reference", "minimum", &layout, values, |a, b| a.select_min(b)).unwrap()
+            }
+            Kind::Mean => divide_by(
+                acc_dtype,
+                fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
+                count,
+            ),
+        }
+    }
+
+    /// The declared result extent of a reduction, for building the `OpSpec`.
+    fn out_shape_of(shape: &[usize], axes: &[i64], keepdims: bool) -> Vec<usize> {
+        let mask = reduce_mask(axes, shape.len(), "reference").unwrap();
+        let mut out = Vec::new();
+        for (axis, dim) in shape.iter().enumerate() {
+            if mask[axis] {
+                if keepdims {
+                    out.push(1);
+                }
+            } else {
+                out.push(*dim);
+            }
+        }
+        out
+    }
+
+    /// Shapes that hit every layout class: all-axes, a trailing axis, a leading
+    /// axis, a contiguous middle block, a multi-axis block, a gapped axis pair
+    /// (the fallback), a rank-1 and a rank-0 operand.
+    fn layout_cases() -> Vec<(Vec<usize>, Vec<i64>, bool)> {
+        let mut cases = Vec::new();
+        for shape in [
+            vec![],
+            vec![7],
+            vec![2, 3],
+            vec![3, 4, 5],
+            vec![9, 1, 7],
+            vec![5, 6, 3, 2],
+        ] {
+            let rank = shape.len() as i64;
+            let mut axes_sets: Vec<Vec<i64>> = vec![vec![]];
+            for axis in 0..rank {
+                axes_sets.push(vec![axis]);
+                axes_sets.push(vec![axis - rank]);
+            }
+            if rank >= 2 {
+                axes_sets.push((0..rank).collect());
+                axes_sets.push(vec![0, 1]);
+                axes_sets.push(vec![rank - 1, rank - 2]);
+            }
+            if rank == 3 {
+                // A gapped pair: the general path owns this one.
+                axes_sets.push(vec![0, 2]);
+            }
+            if rank == 4 {
+                axes_sets.push(vec![1, 2]);
+                axes_sets.push(vec![0, 3]);
+            }
+            for axes in axes_sets {
+                for keepdims in [false, true] {
+                    cases.push((shape.clone(), axes.clone(), keepdims));
+                }
+            }
+        }
+        cases
+    }
+
+    fn kind_cases() -> [(&'static str, &'static str, Kind); 5] {
+        [
+            ("reduce_sum", "sum", Kind::Sum),
+            ("reduce_prod", "prod", Kind::Prod),
+            ("reduce_max", "max", Kind::Max),
+            ("reduce_min", "min", Kind::Min),
+            ("reduce_mean", "mean", Kind::Mean),
+        ]
+    }
+
+    /// Deterministic, sign-varying integer data (no overflow, so the reference
+    /// and the kernel agree on the mathematical result whatever the order).
+    fn int_data(count: usize) -> Vec<i64> {
+        (0..count).map(|index| (index as i64 % 5) - 2).collect()
+    }
+
+    fn close(left: f32, right: f32) -> bool {
+        left == right || (left - right).abs() <= 1e-6 + 1e-5 * right.abs()
+    }
+
+    #[test]
+    fn block_classifies_every_layout_class() {
+        // All axes: one group, one contiguous run.
+        let full = Block::new(&[2, 3], &[true, true]).unwrap();
+        assert_eq!((full.outer, full.red, full.inner), (1, 6, 1));
+        // Trailing axis: one row per group.
+        let rows = Block::new(&[3, 4, 5], &[false, false, true]).unwrap();
+        assert_eq!((rows.outer, rows.red, rows.inner), (12, 5, 1));
+        // Leading axis: `inner` lanes per group.
+        let cols = Block::new(&[3, 4, 5], &[true, false, false]).unwrap();
+        assert_eq!((cols.outer, cols.red, cols.inner), (1, 3, 20));
+        // A contiguous middle block keeps both an outer and an inner extent.
+        let middle = Block::new(&[5, 6, 3, 2], &[false, true, true, false]).unwrap();
+        assert_eq!((middle.outer, middle.red, middle.inner), (5, 18, 2));
+        // A gap inside the reduced axes, and a reduction over nothing, are the
+        // general path's.
+        assert!(Block::new(&[2, 3, 4], &[true, false, true]).is_none());
+        assert!(Block::new(&[2, 3], &[false, false]).is_none());
+        assert_eq!(Block::new(&[], &[]).map(|b| b.out_len()), None);
+    }
+
+    #[test]
+    fn fast_path_matches_the_offset_table_path_for_integers() {
+        for (shape, axes, keepdims) in layout_cases() {
+            let count: usize = shape.iter().product();
+            let values = int_data(count);
+            let input = buffer(DType::Int64, &shape, Storage::I64(values.clone()));
+            let reduced = reduce_mask(&axes, shape.len(), "reference").unwrap();
+            let declared = out_shape_of(&shape, &axes, keepdims);
+            let reduced_count: usize = reduced
+                .iter()
+                .zip(&shape)
+                .filter(|(flag, _)| **flag)
+                .map(|(_, dim)| *dim)
+                .product();
+            for (name, attribute, kind) in kind_cases() {
+                // Mean of integers accumulates (and stores) float64, so it is
+                // pinned by the float test instead.
+                if name == "reduce_mean" {
+                    continue;
+                }
+                let op = reduce_op(name, attribute, &axes, keepdims, DType::Int64, &declared);
+                let got = reduce(&op, &input, &declared).unwrap().remove(0);
+                let want = general(
+                    kind,
+                    &values,
+                    &shape,
+                    &reduced,
+                    reduced_count,
+                    DType::Int64,
+                );
+                assert_eq!(
+                    got.storage,
+                    Storage::I64(want),
+                    "op {name} shape {shape:?} axes {axes:?} keepdims {keepdims}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_path_matches_the_offset_table_path_for_float32() {
+        for (shape, axes, keepdims) in layout_cases() {
+            let count: usize = shape.iter().product();
+            let values: Vec<f32> = (0..count).map(|index| ((index * 7 % 23) as f32) * 0.5 - 5.5).collect();
+            let input = buffer(DType::Float32, &shape, Storage::F32(values.clone()));
+            let reduced = reduce_mask(&axes, shape.len(), "reference").unwrap();
+            let declared = out_shape_of(&shape, &axes, keepdims);
+            let reduced_count: usize = reduced
+                .iter()
+                .zip(&shape)
+                .filter(|(flag, _)| **flag)
+                .map(|(_, dim)| *dim)
+                .product();
+            for (name, attribute, kind) in kind_cases() {
+                let op = reduce_op(name, attribute, &axes, keepdims, DType::Float32, &declared);
+                let got = reduce(&op, &input, &declared).unwrap().remove(0);
+                // `reduce_prod` multiplies the raw values, which is why its data
+                // is kept near zero here; the comparison is the tolerance one.
+                let want = general(
+                    kind,
+                    &values,
+                    &shape,
+                    &reduced,
+                    reduced_count,
+                    DType::Float32,
+                );
+                match &got.storage {
+                    Storage::F32(got) => {
+                        assert_eq!(got.len(), want.len(), "op {name} shape {shape:?}");
+                        for (index, (left, right)) in got.iter().zip(&want).enumerate() {
+                            assert!(
+                                close(*left, *right),
+                                "op {name} shape {shape:?} axes {axes:?} keepdims {keepdims} \
+                                 element {index}: {left} vs {right}"
+                            );
+                        }
+                    }
+                    other => panic!("unexpected storage {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn float16_and_complex_folds_keep_the_sequential_order() {
+        // The lane policy skips float16/complex, where the parity contract's ulp
+        // window cannot absorb a reassociated sum — so those stay BIT-identical
+        // to the offset-table path, even on a long run.
+        let count = 1000;
+        let values: Vec<f16> = (0..count).map(|index| f16::from_f32(index as f32 * 0.01)).collect();
+        let input = buffer(DType::Float16, &[count], Storage::F16(values.clone()));
+        let op = reduce_op("reduce_sum", "sum", &[], false, DType::Float16, &[]);
+        let got = reduce(&op, &input, &[]).unwrap().remove(0);
+        assert_eq!(got.storage, Storage::F16(general(Kind::Sum, &values, &[count], &[true], count, DType::Float16)));
+
+        let values: Vec<Complex<f32>> = (0..count)
+            .map(|index| Complex::new(index as f32 * 0.25, -(index as f32) * 0.5))
+            .collect();
+        let input = buffer(DType::Complex64, &[count], Storage::C64(values.clone()));
+        let op = reduce_op("reduce_sum", "sum", &[], false, DType::Complex64, &[]);
+        let got = reduce(&op, &input, &[]).unwrap().remove(0);
+        assert_eq!(got.storage, Storage::C64(general(Kind::Sum, &values, &[count], &[true], count, DType::Complex64)));
+    }
+
+    #[test]
+    fn long_integer_sums_are_bit_exact_under_the_lane_split() {
+        // 1000 elements is far past the 8-lane chunk, so the multi-accumulator
+        // path runs; wrapping integer addition is associative, so the result must
+        // still equal the sequential fold exactly.
+        let count = 1000;
+        let values: Vec<i64> = (0..count as i64).map(|index| index * 1_000_003 - 500).collect();
+        let expected: i64 = values.iter().fold(0i64, |acc, value| acc.wrapping_add(*value));
+        let input = buffer(DType::Int64, &[count], Storage::I64(values.clone()));
+        let op = reduce_op("reduce_sum", "sum", &[], false, DType::Int64, &[]);
+        assert_eq!(reduce(&op, &input, &[]).unwrap()[0].storage, Storage::I64(vec![expected]));
+        let expected_prod: i64 = values.iter().fold(1i64, |acc, value| acc.wrapping_mul(*value));
+        let op = reduce_op("reduce_prod", "prod", &[], false, DType::Int64, &[]);
+        assert_eq!(reduce(&op, &input, &[]).unwrap()[0].storage, Storage::I64(vec![expected_prod]));
+    }
+
+    #[test]
+    fn long_float_sums_stay_within_the_documented_tolerance() {
+        let count = 10_000;
+        let values: Vec<f32> = (0..count).map(|index| ((index * 37 % 101) as f32) * 0.125 - 3.0).collect();
+        let sequential = values.iter().fold(0.0f32, |acc, value| acc + *value);
+        let input = buffer(DType::Float32, &[count], Storage::F32(values));
+        let op = reduce_op("reduce_sum", "sum", &[], false, DType::Float32, &[]);
+        match &reduce(&op, &input, &[]).unwrap()[0].storage {
+            Storage::F32(sum) => assert!(
+                close(sum[0], sequential),
+                "lane-folded sum {} vs sequential {sequential}",
+                sum[0]
+            ),
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_accumulator_max_and_min_propagate_nan_in_a_long_run() {
+        for position in [0usize, 3, 8, 9, 777] {
+            let count = 1000;
+            let mut values: Vec<f32> = (0..count).map(|index| index as f32 * 0.5 - 100.0).collect();
+            values[position] = f32::NAN;
+            let input = buffer(DType::Float32, &[count], Storage::F32(values));
+            for (name, attribute) in [("reduce_max", "max"), ("reduce_min", "min")] {
+                let op = reduce_op(name, attribute, &[], false, DType::Float32, &[]);
+                match &reduce(&op, &input, &[]).unwrap()[0].storage {
+                    Storage::F32(out) => assert!(out[0].is_nan(), "op {name} at {position}"),
+                    other => panic!("unexpected storage {other:?}"),
+                }
+                // Row-wise (many short runs) propagates the same way.
+                let input = buffer(DType::Float32, &[20, 50], Storage::F32({
+                    let mut values: Vec<f32> = (0..1000).map(|index| index as f32).collect();
+                    values[position] = f32::NAN;
+                    values
+                }));
+                let out = reduce(&op_for_rows(name, attribute), &input, &[20]).unwrap();
+                match &out[0].storage {
+                    Storage::F32(out) => {
+                        assert!(out[position / 50].is_nan(), "op {name} row at {position}");
+                    }
+                    other => panic!("unexpected storage {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn op_for_rows(name: &str, attribute: &str) -> OpSpec {
+        reduce_op(name, attribute, &[1], false, DType::Float32, &[20])
+    }
+
+    /// The bit-exact reference for an arg reduction: a plain sequential walk in
+    /// the offset-table order, with the NaN and first-occurrence rules spelled
+    /// out.
+    fn reference_arg<T: ArgOrd>(
+        values: &[T],
+        shape: &[usize],
+        reduced: &[bool],
+        want_max: bool,
+    ) -> Vec<i64> {
+        let layout = Layout::new(shape, reduced);
+        let mut out = Vec::with_capacity(layout.out_len());
+        layout.for_each_output(|_, base| {
+            let mut best = values[base + layout.red_offsets[0]];
+            let mut best_index = 0i64;
+            for (position, offset) in layout.red_offsets.iter().enumerate().skip(1) {
+                let candidate = values[base + offset];
+                if best.arg_nan() {
+                    continue;
+                }
+                if candidate.arg_nan() {
+                    best = candidate;
+                    best_index = position as i64;
+                    continue;
+                }
+                let improves = if want_max {
+                    candidate.arg_gt(best)
+                } else {
+                    best.arg_gt(candidate)
+                };
+                if improves {
+                    best = candidate;
+                    best_index = position as i64;
+                }
+            }
+            out.push(best_index);
+        });
+        out
+    }
+
+    #[test]
+    fn arg_reductions_match_the_offset_table_path() {
+        let cases: Vec<(Vec<usize>, Option<i64>)> = vec![
+            (vec![7], Some(0)),
+            (vec![7], None),
+            (vec![2, 3], Some(1)),
+            (vec![2, 3], Some(0)),
+            (vec![2, 3], None),
+            (vec![3, 4, 5], Some(2)),
+            (vec![3, 4, 5], Some(1)),
+            (vec![3, 4, 5], Some(0)),
+            (vec![5, 6, 3, 2], Some(1)),
+            (vec![5, 6, 3, 2], Some(2)),
+            (vec![5, 6, 3, 2], None),
+        ];
+        for (shape, axis) in cases {
+            let count: usize = shape.iter().product();
+            // Ties, a repeated maximum and a NaN at a fixed position.
+            let values: Vec<f32> = (0..count)
+                .map(|index| ((index * 13 % 7) as f32) + 0.25)
+                .collect();
+            let mut reduced = vec![false; shape.len()];
+            match axis {
+                Some(axis) => reduced[axis.rem_euclid(shape.len() as i64) as usize] = true,
+                None => reduced = vec![true; shape.len()],
+            }
+            let kept = reduced.iter().filter(|flag| !**flag).count();
+            let declared: Vec<usize> = shape
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !reduced[*index])
+                .map(|(_, dim)| *dim)
+                .collect();
+            assert_eq!(declared.len(), kept);
+            let input = buffer(DType::Float32, &shape, Storage::F32(values.clone()));
+            for (name, want_max) in [("argmax", true), ("argmin", false)] {
+                let op = arg_op(name, axis, false, &declared);
+                let got = arg_reduce(&op, &input, &declared).unwrap().remove(0);
+                assert_eq!(
+                    got.storage,
+                    Storage::I64(reference_arg(&values, &shape, &reduced, want_max)),
+                    "op {name} shape {shape:?} axis {axis:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arg_reductions_keep_the_first_nan_and_the_first_of_a_tie() {
+        let values = vec![1.0f32, f32::NAN, 5.0, 5.0, f32::NAN, 0.0];
+        let input = buffer(DType::Float32, &[2, 3], Storage::F32(values.clone()));
+        // Row 0: the first NaN at position 1 wins for both directions.
+        // Row 1: NaN at position 1 again, over a 5.0/0.0 tie elsewhere.
+        for (name, keepdims) in [("argmax", false), ("argmin", false)] {
+            let op = arg_op(name, Some(1), keepdims, &[2]);
+            assert_eq!(
+                arg_reduce(&op, &input, &[2]).unwrap()[0].storage,
+                Storage::I64(vec![1, 1]),
+                "op {name}"
+            );
+        }
+        // A NaN later in the run replaces a numeric best; a tie keeps the first.
+        let values = vec![3.0f32, 3.0, 1.0, f32::NAN];
+        let input = buffer(DType::Float32, &[1, 4], Storage::F32(values));
+        let op = arg_op("argmax", Some(1), false, &[1]);
+        assert_eq!(arg_reduce(&op, &input, &[1]).unwrap()[0].storage, Storage::I64(vec![3]));
     }
 }
