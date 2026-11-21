@@ -41,7 +41,7 @@
 use evoxc_core::{AttrValue, Error, Result};
 use serde_json::Value as Json;
 
-use crate::buffer::{block_storage, Buffer, Storage};
+use crate::buffer::{block_storage_filled, repeat_storage, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
@@ -74,6 +74,12 @@ fn structural(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<
     let (map, fill) = match name {
         "tile" => {
             let reps = reps(spec)?;
+            // Whole-source repeats first: `reps` repeats only the leading axis,
+            // so every output element is `source[i % source.len()]` and the
+            // result is the operand copied whole, `reps[0]` times.
+            if let Some(storage) = tile_whole_repeat(name, input, out_shape, &reps)? {
+                return single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?);
+            }
             // Contiguous operands: whole-run copies, no per-element index map.
             if let Some(storage) = tile_blocks(name, input, out_shape, &reps)? {
                 return single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?);
@@ -251,6 +257,54 @@ fn tile_promoted(
     Ok(promoted)
 }
 
+/// `tile`'s whole-source repeat: the operand copied end to end `k` times.
+///
+/// When the only repeated axis is the operand's leading one (same rank, every
+/// other rep 1), `tile` is exactly `np.tile(operand, [k] + [1] * (rank - 1))`,
+/// i.e. output element `i` is `operand[i % operand.len()]`.  The result is then
+/// `k` copies of the operand's whole contiguous run, which is one
+/// [`repeat_storage`] instead of one `copy_from_slice` per index row: a
+/// `(64, 64)` operand tiled to `(4096, 64)` becomes 64 copies of 16 KiB rather
+/// than 4096 copies of 256 B, into a pooled (never zero-filled) allocation.
+/// The workload that motivates it is a merged-GP-shaped graph, where 8 such
+/// tiles dominate the run.
+///
+/// `None` (the block-copy path takes over) unless the promotion has already
+/// validated the shape and the repeat count closes exactly.
+fn tile_whole_repeat(
+    op: &str,
+    input: &Buffer,
+    out_shape: &[usize],
+    reps: &[usize],
+) -> Result<Option<Storage>> {
+    let in_shape = &input.shape;
+    let out_rank = out_shape.len();
+    // Same rank (numpy's leading size-1 promotion would otherwise add axes) and
+    // a non-empty operand: an empty one has nothing to repeat.
+    if in_shape.len() != out_rank || reps.len() > out_rank {
+        return Ok(None);
+    }
+    let rep_lead = out_rank - reps.len();
+    let mut repeat = 1usize;
+    for (index, rep) in reps.iter().enumerate() {
+        if *rep == 1 {
+            continue;
+        }
+        // A rep on any axis but the leading one interleaves the copies.
+        if index + rep_lead != 0 {
+            return Ok(None);
+        }
+        repeat = *rep;
+    }
+    let run: usize = util::numel(in_shape);
+    let total = util::numel(out_shape);
+    if run == 0 || run.checked_mul(repeat) != Some(total) {
+        return Ok(None);
+    }
+    let storage = with_type!(input, |values| repeat_storage(values, total, run, op))?;
+    Ok(Some(storage))
+}
+
 /// `tile`'s contiguous fast path: both operands are C-contiguous, so the
 /// trailing axes that are not repeated map element-for-element onto the result
 /// and every run of `inner` output elements is one contiguous slice copy.
@@ -294,7 +348,9 @@ fn tile_blocks(
         offsets.push(offset);
     });
     let storage = with_type!(input, |values| {
-        block_storage(values, out_shape, &offsets, inner, "tile")
+        // Every output element is covered by one block, so the result needs no
+        // zero fill and can reuse a pooled allocation of exactly its length.
+        block_storage_filled(values, out_shape, &offsets, inner, "tile")
     })?;
     Ok(Some(storage))
 }

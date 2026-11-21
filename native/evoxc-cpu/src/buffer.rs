@@ -575,11 +575,23 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
 // thread (numpy's ufuncs are single-threaded, so that alone only reaches
 // parity), which is why a big enough result is split across a few scoped
 // threads: four threads measured ~2x the one-thread bandwidth on a 16-cpu host
-// (eight and sixteen were slower -- they contend for the same memory ports),
-// and the ~20 us of thread setup is paid back above ~2^18 elements.  Small maps
-// stay on the calling thread, where spawning would dominate.
+// (eight and sixteen were slower -- they contend for the same memory ports).
+// Scoped-thread setup costs ~10 us per extra thread, so the split only pays for
+// a genuinely large result: measured on this host (`bench_thread_crossover`) one
+// flat `add`, 1 thread / 4 threads, best of 40 --
+//
+//   2^16 elems 0.007 / 0.036 ms   2^18 elems 0.030 / 0.043 ms
+//   2^17 elems 0.014 / 0.038 ms   2^19 elems 0.100 / 0.049 ms
+//   1e6 elems  0.249 / 0.097 ms
+//
+// -- so the crossover sits between 2^18 and 2^19 elements: at 2^18 four threads
+// are 43 % SLOWER than the calling thread, and the 2x win only starts at 2^19
+// (which is why the threshold is 2^19 and not 2^18; the `(4096, 64)` f32 tensors
+// of a merged-GP-shaped graph are exactly 2^18 elements and belong on one
+// thread).  Small maps stay on the calling thread, where spawning would
+// dominate.
 /// Element count from which a flat map is worth splitting across threads.
-const PARALLEL_MIN_ELEMS: usize = 1 << 18;
+const PARALLEL_MIN_ELEMS: usize = 1 << 19;
 /// Upper bound on the threads one flat map uses (the measured optimum).
 const PARALLEL_MAX_THREADS: usize = 4;
 
@@ -960,6 +972,65 @@ pub fn block_storage<T: Scalar>(
     copy_blocks(&mut out, values, offsets, inner, op)?;
     Ok(T::into_storage(out))
 }
+
+/// A [`Storage`] built by [`copy_blocks`] for a caller that knows the offset
+/// list covers EVERY output element (a repeated `tile`/`gather`/`slice` block
+/// decomposition), so the result needs neither a zero fill nor a
+/// `Vec::with_capacity` + `extend_from_slice` growth: it takes a pooled
+/// allocation of exactly the result's length and `copy_blocks` overwrites all
+/// of it.
+///
+/// That matters for `tile`-shaped results, which are megabyte-sized and die at
+/// their next consumer: without the pool each one is a fresh page-faulted and
+/// zeroed allocation, i.e. a full extra pass over the output the copy is about
+/// to overwrite.  The contract is [`copy_blocks`]': `offsets.len() * inner` must
+/// equal the result's element count (an explicit error, never a truncated
+/// result), and `values` must hold every offset's run.
+pub fn block_storage_filled<T: Scalar>(
+    values: &[T],
+    out_shape: &[usize],
+    offsets: &[usize],
+    inner: usize,
+    op: &str,
+) -> Result<Storage> {
+    let total: usize = out_shape.iter().product();
+    if offsets.len().saturating_mul(inner) != total {
+        return Err(block_error(op));
+    }
+    let mut out = take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total]);
+    copy_blocks(&mut out, values, offsets, inner, op)?;
+    Ok(T::into_storage(out))
+}
+
+/// A [`Storage`] whose every element is a copy of a `run`-element slice of
+/// `values` repeated to fill `total` elements (whole-source `tile`: the result
+/// is the operand repeated `total / run` times).
+///
+/// One `copy_from_slice` per `run`-element chunk instead of one per index row,
+/// so a `(64, 64)` operand tiled to `(4096, 64)` is 64 copies of 16 KiB rather
+/// than 4096 copies of 256 B, and (like [`block_storage_filled`]) the
+/// allocation is pooled instead of fresh and zeroed.  `run` must be non-zero
+/// and no larger than `values`; a short `values` is the [`block_error`] the
+/// block-copy paths raise, never a truncated result.
+pub fn repeat_storage<T: Scalar>(
+    values: &[T],
+    total: usize,
+    run: usize,
+    op: &str,
+) -> Result<Storage> {
+    if run == 0 || run > values.len() {
+        return Err(block_error(op));
+    }
+    let source = &values[..run];
+    let mut out = take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total]);
+    let mut offset = 0usize;
+    while offset < total {
+        let end = (offset + run).min(total);
+        out[offset..end].copy_from_slice(&source[..end - offset]);
+        offset = end;
+    }
+    Ok(T::into_storage(out))
+}
 fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];
@@ -1232,6 +1303,54 @@ mod tests {
                 }
             }
             other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// Measurement aid, not a correctness test: `cargo test --release -p
+    /// evoxc-cpu bench_thread_crossover -- --ignored --nocapture` prints the
+    /// per-element cost of one flat `add` at several sizes and thread counts,
+    /// which is what the `PARALLEL_MIN_ELEMS` threshold is chosen from.
+    #[test]
+    #[ignore = "measurement aid: prints timings"]
+    fn bench_thread_crossover() {
+        use std::time::Instant;
+        let left: Vec<f32> = (0..(1 << 20)).map(|index| index as f32 * 0.5).collect();
+        let right: Vec<f32> = (0..(1 << 20)).map(|index| index as f32 * 0.25).collect();
+        for count in [1usize << 16, 1 << 17, 262144, 1 << 19, 1_000_000] {
+            let mut line = format!("count {count:>8} ({:>4} KiB):", count * 4 / 1024);
+            for threads in [1usize, 2, 3, 4] {
+                let mut out = vec![0.0f32; count];
+                let mut best = f64::INFINITY;
+                for _ in 0..40 {
+                    let started = Instant::now();
+                    split_parallel(&mut out, threads, |offset, chunk| {
+                        let len = chunk.len();
+                        for ((slot, x), y) in chunk
+                            .iter_mut()
+                            .zip(window(&left, offset, len))
+                            .zip(window(&right, offset, len))
+                        {
+                            *slot = *x + *y;
+                        }
+                    });
+                    best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                }
+                line.push_str(&format!("  {threads}t {best:7.3} ms"));
+            }
+            let single = {
+                let mut out = vec![0.0f32; count];
+                let mut best = f64::INFINITY;
+                for _ in 0..40 {
+                    let started = Instant::now();
+                    for ((slot, x), y) in out.iter_mut().zip(&left).zip(&right) {
+                        *slot = *x + *y;
+                    }
+                    best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                }
+                best
+            };
+            line.push_str(&format!("   plain {single:7.3} ms"));
+            println!("{line}");
         }
     }
 
