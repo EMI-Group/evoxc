@@ -34,17 +34,17 @@ evoxc learns from Nx (explicit numerical language, `block`, `vectorize`, `runtim
 ```
                     evoxc  (package: Python frontend)
         tensor-graph frontend (ops core, numpy namespace, trace, block)
-        function-side sugar (vmap/grad builders), explicit collectives (dist)
+        function-side sugar (vmap/grad over the native transforms), explicit collectives (dist)
                          │
                          ▼
                       EvoXIR (ir)
                          │
         ┌────────────────┴──────────────────┐
         ▼                                   ▼
-  native Rust core (in-process)      backends (Python)
-  schemas · promotion · inference    StableHLO export · numpy interpreter
-  vectorize/vmap · AD · batch_       iree / xla / tvm adapters
-  functions  →  evoxc._evoxc_native
+  native Rust core (in-process)      trace-time inference (Python)
+  schemas · promotion                backends (Python)
+  vectorize/vmap · AD · batch_       StableHLO export · numpy interpreter
+  functions  →  evoxc._evoxc_native  iree / xla / tvm adapters
 ────────────────── runtime boundary ──────────────────
                      Tensor  +  DLPack
 ```

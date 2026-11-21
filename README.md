@@ -498,8 +498,8 @@ evoxc/            the `evoxc` distribution's package: core, ir, ops, trace, tran
                 sparse, random, io, pipeline, persist, build_cache, block, external, bench
 evoxc_hf/         the separate `evoxc-hf` distribution: workspace member, src layout
                 (evoxc_hf/src/evoxc_hf/), own pyproject/README/LICENSE/version/extras
-native/         the Rust workspace: numerical core, transform engines, the PyO3 extension
-scripts/        dev-env and native-build helpers (`dev-env.sh`, `build-native.sh`)
+native/           the Rust workspace: numerical core, transform engines, the PyO3 extension
+scripts/          dev-env and native-build helpers (`dev-env.sh`, `build-native.sh`)
 tests/          pytest suite mirroring evoxc/ + spec-compliance tests
 assets/         the diagrams in this README
 CONTEXT.md      architecture, contracts and status (root, the source of truth)
