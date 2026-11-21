@@ -30,7 +30,8 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 ## Public API
 
 - `Program` owns every value, op and block in `Vec`-backed `Table` arenas; ids are `ValueId(u32)`, `OpId(u32)` and `BlockId(u32)` and are module-unique and never renumbered by the codec.
-- `Program::new/new_op_id/new_value_id/new_block_id/reseed_allocators/add_function/function/function_mut/main/value/op/block/add_value/add_op/add_block/push_op/entry_block/terminator/operand_types/computed_output_types/add_use/remove_use/rebuild_uses`.
+- `Program::new/new_op_id/new_value_id/new_block_id/max_value_id/max_op_id/reseed_allocators/add_function/function/function_mut/main/value/value_mut/op/op_mut/block/block_mut/add_value/add_op/add_block/push_op/entry_block/terminator/operand_types/computed_output_types/add_use/remove_use/rebuild_uses`.
+- `max_value_id`/`max_op_id` expose the highest occupied id (`None` on an empty arena) for dense id-indexed transform tables; the `_mut` accessors destructure the `Program` fields so their "not defined in module …" error borrows `name` instead of cloning it per call.
 - `Value` carries type, owner (`ValueOwner::OpResult { op, index }` or `BlockArgument { block, index }`) and the recorded `uses`; the IR stores no data.
 - `envelope::decode(&Json) -> Result<Program>` / `envelope::encode(&Program) -> Json`, plus `attrs_from_json` / `validate_attrs` for op attribute maps.
 - `infer::infer_op(op_name, operand_types, attrs, result_types, module) -> Result<Vec<ValueType>>` with `InferCtx` carrying the optional explicit result types and the owning module.

@@ -7,8 +7,6 @@
 //! mapped inputs share ONE fresh symbolic `Dim` (named `batch` at depth 0,
 //! `batch_1`, … when nested), so same-level batch dims always unify.
 
-use std::collections::HashMap;
-
 use evoxc_core::dim::Dim;
 use evoxc_core::error::{Error, Result};
 use evoxc_core::graph::{Function, Program, ValueId};
@@ -18,6 +16,23 @@ use crate::batching::{dispatch, MappedAxes};
 use crate::builder::Builder;
 use crate::emit::{RuleCtx, RuleOp};
 use crate::{TransformConfig, TransformEnv, TransformOutput};
+
+/// Store `value` in the dense id-indexed table, growing it if a freshly built
+/// value id outruns the source program's id space.
+#[inline]
+fn set_dense<T: Copy>(slots: &mut Vec<Option<T>>, id: ValueId, value: T) {
+    let index = id.0 as usize;
+    if slots.len() <= index {
+        slots.resize(index + 1, None);
+    }
+    slots[index] = Some(value);
+}
+
+/// Read the dense id-indexed table (`None` for an absent or out-of-range id).
+#[inline]
+fn get_dense<T: Copy>(slots: &[Option<T>], id: ValueId) -> Option<T> {
+    slots.get(id.0 as usize).and_then(|slot| *slot)
+}
 
 /// The transform's entry function (exactly one function with one entry block).
 pub fn entry_function(program: &Program) -> Result<&Function> {
@@ -120,11 +135,16 @@ pub fn vectorize_impl(
         ));
     }
 
-    let mut remap: HashMap<ValueId, ValueId> = HashMap::with_capacity(block.arguments.len());
-    let mut axes_env: HashMap<ValueId, MappedAxes> = HashMap::with_capacity(block.arguments.len());
+    // Dense id-indexed tables: the source program's ids are bounded by
+    // `max_value_id`, and freshly built values are appended sequentially, so a
+    // `Vec<Option<_>>` beats a `HashMap` without changing any error path (a
+    // missing slot is the same "no rewritten value" case).
+    let width = program.max_value_id().map_or(0, |id| id as usize + 1);
+    let mut remap: Vec<Option<ValueId>> = vec![None; width];
+    let mut axes_env: Vec<Option<MappedAxes>> = vec![None; width];
     for ((old, new), axis) in block.arguments.iter().zip(&new_args).zip(&input_axes) {
-        remap.insert(*old, *new);
-        axes_env.insert(*new, MappedAxes::from_axis(*axis));
+        set_dense(&mut remap, *old, *new);
+        set_dense(&mut axes_env, *new, MappedAxes::from_axis(*axis));
     }
 
     let mut output_ids: Vec<ValueId> = Vec::new();
@@ -136,7 +156,7 @@ pub fn vectorize_impl(
                 .operands
                 .iter()
                 .map(|value| {
-                    remap.get(value).copied().ok_or_else(|| {
+                    get_dense(&remap, *value).ok_or_else(|| {
                         Error::transform(format!(
                             "vectorize: the graph returns %{value}, which has no rewritten value"
                         ))
@@ -158,7 +178,7 @@ pub fn vectorize_impl(
             .operands
             .iter()
             .map(|value| {
-                remap.get(value).copied().ok_or_else(|| {
+                get_dense(&remap, *value).ok_or_else(|| {
                     Error::transform(format!(
                         "vectorize: internal error — operand %{value} of op '{}' has no rewritten \
                          value",
@@ -170,7 +190,7 @@ pub fn vectorize_impl(
         let operand_axes = operands
             .iter()
             .map(|value| {
-                axes_env.get(value).copied().ok_or_else(|| {
+                get_dense(&axes_env, *value).ok_or_else(|| {
                     Error::transform(format!(
                         "vectorize: internal error — rewritten operand %{value} of op '{}' has no \
                          recorded batching metadata",
@@ -180,17 +200,14 @@ pub fn vectorize_impl(
             })
             .collect::<Result<Vec<_>>>()?;
         let rule_op = RuleOp::from_source(program, op)?.bind_operands(&builder, &operands)?;
-        let before = builder.block_op_ids()?;
+        let len_before = builder.block_op_len()?;
         let (values, result_axes) = {
             let mut ctx = RuleCtx::with_batch_dim(&mut builder, Some(batch_dim.clone()));
             dispatch(env, &mut ctx, &rule_op, &operand_axes)?
         };
-        let after = builder.block_op_ids()?;
-        for emitted in after {
-            if !before.contains(&emitted) {
-                builder.set_op_location(emitted, op.location.clone())?;
-            }
-        }
+        // Dispatch only appends, so the ops emitted by this rule are exactly
+        // `ops[len_before..]` — no op-id clone, no membership scan.
+        builder.set_op_location_from(len_before, op.location.clone())?;
         if values.len() != op.results.len() {
             return Err(Error::transform(format!(
                 "vectorize: batching rule for op '{}' returned {} value(s) for {} result(s)",
@@ -200,8 +217,8 @@ pub fn vectorize_impl(
             )));
         }
         for ((old, new), axes) in op.results.iter().zip(&values).zip(&result_axes) {
-            remap.insert(*old, *new);
-            axes_env.insert(*new, *axes);
+            set_dense(&mut remap, *old, *new);
+            set_dense(&mut axes_env, *new, *axes);
         }
     }
     if !terminated {
@@ -212,7 +229,7 @@ pub fn vectorize_impl(
     let output_axes = output_ids
         .iter()
         .map(|value| {
-            axes_env.get(value).copied().ok_or_else(|| {
+            get_dense(&axes_env, *value).ok_or_else(|| {
                 Error::transform(format!(
                     "vectorize: internal error — output %{value} has no recorded batching metadata"
                 ))
@@ -302,8 +319,9 @@ mod tests {
     use super::*;
     use crate::emit::dims_i64;
     use crate::Registry;
+    use evoxc_core::attr::{AttrValue, Attrs};
     use evoxc_core::dtype::DType;
-    use evoxc_core::graph::{Block, Program, Region};
+    use evoxc_core::graph::{Block, Location, Program, Region};
 
     fn f32(shape: &[i64]) -> ValueType {
         ValueType::new(DType::parse("float32").unwrap(), dims_i64(shape))
@@ -450,5 +468,78 @@ mod tests {
         assert_eq!(format_shape(&[]), "()");
         assert_eq!(format_shape(&dims_i64(&[2, 3])), "(2, 3)");
         assert_eq!(format_shape(&[Dim::named("batch"), Dim::Int(3)]), "(batch, 3)");
+    }
+
+    /// A `len`-op pointwise chain followed by one multi-op batching rule
+    /// (`concatenate` of a mapped and an unmapped operand emits a `broadcast`
+    /// plus the `concatenate`), every source op carrying its own location.
+    fn located_chain(len: usize) -> Program {
+        let location = |line: usize| {
+            Some(Location {
+                file: "chain.py".to_string(),
+                line: line as i64,
+                col: 0,
+                code_snippet: None,
+            })
+        };
+        let mut builder = Builder::new("main");
+        builder
+            .open_function("main", &[f32(&[3]), f32(&[3])])
+            .unwrap();
+        let args = builder.block_arguments().unwrap();
+        let mut acc = args[0];
+        for index in 0..len {
+            acc = builder.binary("add", acc, acc).unwrap();
+            let op_id = *builder.block_op_ids().unwrap().last().unwrap();
+            builder.set_op_location(op_id, location(index + 1)).unwrap();
+        }
+        let attrs = Attrs::from_pairs([("axis", AttrValue::Int(0))]);
+        let out = builder
+            .emit_typed_one("concatenate", &[acc, args[1]], &attrs)
+            .unwrap();
+        let op_id = *builder.block_op_ids().unwrap().last().unwrap();
+        builder.set_op_location(op_id, location(len + 1)).unwrap();
+        builder.set_terminator(&[out], None).unwrap();
+        builder.finish()
+    }
+
+    #[test]
+    fn locations_cover_exactly_each_dispatch() {
+        let len = 200;
+        let program = located_chain(len);
+        let config = TransformConfig {
+            input_axes: vec![Some(0), None],
+            ..TransformConfig::default()
+        };
+        let output = vectorize_graph(&program, &config, &TransformEnv::builtin()).unwrap();
+        let block_id = output.program.entry_block(&output.program.functions[0]).unwrap().id;
+        let ops: Vec<&evoxc_core::graph::Op> = output
+            .program
+            .block(block_id)
+            .unwrap()
+            .ops
+            .iter()
+            .map(|id| output.program.op(*id).unwrap())
+            .collect();
+        // len pointwise adds + (broadcast, concatenate) + return.
+        assert_eq!(ops.len(), len + 3);
+        let names: Vec<&str> = ops.iter().map(|op| op.name.as_str()).collect();
+        assert_eq!(&names[..3], &["add", "add", "add"]);
+        assert_eq!(&names[len..], &["broadcast", "concatenate", "return"]);
+
+        // Every emitted op carries the location of the source op that emitted it
+        // — never a neighbour's (the Θ(n²) rewrite overwrote earlier ops when
+        // the "new ops" range was mis-computed).
+        for (index, op) in ops[..len].iter().enumerate() {
+            let location = op.location.as_ref().expect("pointwise op has a location");
+            assert_eq!(location.file, "chain.py");
+            assert_eq!(location.line, index as i64 + 1, "op {index} ({})", op.name);
+        }
+        for op in &ops[len..len + 2] {
+            let location = op.location.as_ref().expect("concatenate-rule op has a location");
+            assert_eq!(location.line, len as i64 + 1, "op {}", op.name);
+        }
+        // The terminator keeps its own (absent) source location.
+        assert!(ops[len + 2].location.is_none());
     }
 }
