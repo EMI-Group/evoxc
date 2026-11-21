@@ -167,6 +167,8 @@ Formats are versioned via constants (`EVOXC_FORMAT_VERSION`). Artifacts are self
 | `./persist/` | Save/load container format, explicit cache |
 | `./io.py` | Explicit async host-data IO sugar: `prefetch`/`sink`/`AsyncCopy`/`wait_all` over `Tensor.to` (see "evoxc.io") |
 | `./build_cache.py` | Memoized build sugar: `build_cached` + `CompileCache` LRU (see "Memoized build sugar") |
+| `./_native_codec.py` | Private v1 envelope codec: `encode_module`/`decode_module` + `encode_type`/`decode_type`/`ENVELOPE_FORMAT = 1` between `ir.Module` and the neutral dict documented in `../native/CONTEXT.md` (not the persistence format) |
+| `./_native.py` | Optional `evoxc._evoxc_native` extension loader + typed façade (`available`/`require`/`version`/`infer`/`transform`), lazily loaded and thread-safe; `import evoxc` never requires the extension |
 | `./bench/` | Committed benchmark and hardware-validation evidence plus reproducible probes (not imported by evoxc); the wider harness is archived in the separate evoxc-bench repository |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related writes to root — it owns the per-suite inventory and test-count registry).
