@@ -34,7 +34,7 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 
 ## Four words
 
-**Minimal** — `numpy` is the only hard dependency; pure Python, no native code, no device runtime, no code generator, no kernel library. The default backend interprets the IR with numpy kernels. *So what: no compiler toolchain stands between you and a running graph.*
+**Minimal** — `numpy` is the only hard runtime dependency, with no device runtime, no code generator and no kernel library; the graph frontend and the numpy interpreter are Python, and the numerical core ships as a Rust/PyO3 `abi3` extension built from source by maturin (so the wheel is platform-specific). The default backend interprets the IR with numpy kernels. *So what: no compiler toolchain stands between you and a running graph.*
 
 **Explicit** — every stage is a public function (`trace`, `lower`, `compile`, `load`, `run`) and every object a distinct public type (`Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor`); convenience APIs are documented shorthand whose exact expansion is in their docstrings. *So what: you can stop at any stage, inspect it, save it, or ship it.*
 
@@ -441,7 +441,7 @@ oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy
 
 **The one real difference: the program is a first-class object.** No eager mode, no implicit tracing, no mode switch, no compiler-owned semantics. Whatever a framework has to derive internally — by tracing at every call, by capturing a graph on a guard, by compiling behind an annotation — evoxc hands you directly: the graph is what you wrote, an inspectable, diffable, saveable, transformable value, and every stage from `trace` to `run` is a public function returning a public type you can stop at, keep, or ship.
 
-**Choose evoxc when…** you want the program itself as an artifact (inspect, diff, save, transform, ship it to a device, hand it to another process); you need compiler neutrality — the same graph on a numpy interpreter, IREE, XLA or TVM, with no vendor IR in your source; you build meta-level or graph-generating workloads (NAS, genetic programming, algorithm synthesis) where a static program is data, `build_cached` is the compile boundary and `batch_functions` turns a whole population into one graph; or you want numpy-only deployment, a pure-Python dependency tree, and no compiler in the loop.
+**Choose evoxc when…** you want the program itself as an artifact (inspect, diff, save, transform, ship it to a device, hand it to another process); you need compiler neutrality — the same graph on a numpy interpreter, IREE, XLA or TVM, with no vendor IR in your source; you build meta-level or graph-generating workloads (NAS, genetic programming, algorithm synthesis) where a static program is data, `build_cached` is the compile boundary and `batch_functions` turns a whole population into one graph; or you want numpy-only deployment, a dependency tree that is just numpy plus the extension wheel, and no compiler in the loop.
 
 **Reach for something else when…** you need an ecosystem (layers, optimizers, pretrained models, serving), the most mature vendor GPU kernel coverage, fast eager iteration on dynamic Python control flow over tensors, or tens of thousands of users' worth of battle-testing. Those are real gaps in evoxc, not opinions — but they are also not reasons to accept a compiler that owns your program's meaning. If the library you would reach for does not itself run on evoxc, and **its license permits**, the concrete move is to rewrite or port that library onto evoxc with **EvoX Genesis** ([EMI-Group/genesis](https://github.com/EMI-Group/genesis)): the graph, the staging pipeline and the compiler adapters are already here, so the port adds the ecosystem instead of a second runtime.
 
@@ -456,6 +456,8 @@ pip install evoxc-hf            # the HuggingFace layer — a separate distribut
 pip install "evoxc-hf[hf]"      # + torch/transformers reference oracles for evoxc-hf (never runtime requirements)
 ```
 
+`evoxc`'s only runtime dependency is numpy; its wheel also carries the compiled Rust/PyO3 extension (`evoxc/_evoxc_native.abi3.so`), so published wheels are per-platform. Building from a source distribution needs a Rust toolchain and a C compiler — maturin compiles the in-repo `./native/` crate.
+
 `evoxc` and `evoxc-hf` are two **independent distributions** built from this one repository (one `uv` workspace, one `uv.lock`, one version per project); each is installed and upgrades on its own, and neither contains the other.
 
 From source — the checkout, for development (`requires-python >= 3.11`):
@@ -469,6 +471,8 @@ uv build --all-packages              # build both wheels + sdists into dist/
 pip install -e ".[dev]"              # editable install + pytest
 pytest
 ```
+
+`uv sync` and `pip install -e .` build the extension, so both need a Rust toolchain and a C compiler on `PATH`; `evoxc-hf` alone builds without one.
 
 **A plain `uv sync` is not enough for development:** it installs the root project only and *uninstalls* the workspace member, leaving `evoxc_hf/` in the checkout looking importable as a namespace package — so `import evoxc_hf` silently resolves to the wrong, unbuilt thing. Always pass `--all-packages` (add `--all-extras` to install every optional extra of both projects: the adapters and the `evoxc-hf` oracles).
 

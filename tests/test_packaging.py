@@ -2,15 +2,21 @@
 
 Both are built from this single workspace (one `uv.lock` at the root):
 
-* ``evoxc`` — the WORKSPACE-ROOT project at the repo root, **flat layout**
-  (`./evoxc/` is the import package, `module-root = ""`);
-* ``evoxc-hf`` — the workspace MEMBER at ``./evoxc_hf/``, **src layout**
-  (``evoxc_hf/src/evoxc_hf/``, ``module-root = "src"``).
+* ``evoxc`` — the WORKSPACE-ROOT project at the repo root: a MIXED ``maturin``
+  project, **flat layout** (`./evoxc/` is the Python package,
+  ``python-source = "."``) plus the Rust/PyO3 ``abi3-py311`` extension compiled
+  from the in-repo ``./native/`` workspace and installed as
+  ``evoxc/_evoxc_native.abi3.so`` — so its wheel is platform-specific;
+* ``evoxc-hf`` — the workspace MEMBER at ``./evoxc_hf/``, a pure-Python
+  ``uv_build`` project, **src layout**
+  (``evoxc_hf/src/evoxc_hf/``, ``module-root = "src"``), so its wheel stays
+  ``py3-none-any``.
 
 The member's distribution name (`evoxc-hf`) differs from its import name
-(`evoxc_hf`) — that is what ``module-name`` declares, and since `uv_build`
-packages exactly ``<module-root>/<module-name>`` neither distribution can ever
-contain the sibling: a structural guarantee, not a glob that could be widened.
+(`evoxc_hf`) — that is what its ``module-name`` declares. The root project ships
+``evoxc`` plus the compiled extension and nothing else; the member ships exactly
+``evoxc_hf`` from its own src layout. Neither distribution can contain the
+sibling.
 
 The HuggingFace integration lives in the member, so its reference oracles (torch
 + transformers) sit behind ``evoxc-hf[hf]``: ``evoxc`` has no ``hf`` extra, stays
@@ -18,10 +24,11 @@ numpy-only at runtime, and ``import evoxc`` never imports ``evoxc_hf``, torch or
 transformers. The member hard-depends on ``evoxc`` (``evoxc = { workspace = true
 }`` for development, ``evoxc>=0.1.0`` published).
 
-Numeric- and network-free, fast, deterministic: both `pyproject.toml` files and
-`uv.lock` are read with `tomllib`, the checkout is walked, installed metadata is
-inspected via `importlib.metadata`, and REAL artifacts come from ONE
-`uv build --all-packages` over a throwaway copy of the checkout. Every
+Numeric-free, fast, deterministic: both `pyproject.toml` files and `uv.lock` are
+read with `tomllib`, the checkout is walked, installed metadata is inspected via
+`importlib.metadata`, and REAL artifacts come from ONE
+`uv build --all-packages` over a throwaway copy of the checkout (that leg needs
+`uv`, a Rust toolchain and a C compiler for the extension). Every
 environment-dependent step SKIPS with a clear reason; only a genuine contract
 violation fails.
 """
@@ -92,9 +99,14 @@ def _project_version(path: Path) -> str:
     return _load(path)["project"]["version"]
 
 
-def _build_backend_config(document: dict) -> dict:
-    """`[tool.uv.build-backend]` — the one-module contract of that project."""
+def _uv_build_config(document: dict) -> dict:
+    """`[tool.uv.build-backend]` — the one-module contract of a `uv_build` project."""
     return document["tool"]["uv"]["build-backend"]
+
+
+def _maturin_config(document: dict | None = None) -> dict:
+    """`[tool.maturin]` — the mixed-project contract of the root `evoxc` project."""
+    return (document if document is not None else _pyproject())["tool"]["maturin"]
 
 
 def _requirement_name(requirement: str) -> str:
@@ -205,51 +217,86 @@ def test_pytest_collects_both_suites():
     assert (MEMBER_DIR / "src" / MEMBER_MODULE).is_dir()
 
 
-def test_both_projects_use_the_uv_build_backend():
-    """Both projects are real `uv_build` projects — no setuptools anywhere."""
-    requirements = []
-    for path in (PYPROJECT, MEMBER_PYPROJECT):
-        document = _load(path)
-        build = document["build-system"]
-        assert build["build-backend"] == "uv_build", (path.name, build["build-backend"])
-        requires = [req.replace(" ", "") for req in build["requires"]]
-        assert any(req.startswith("uv_build") for req in requires), (path.name, requires)
-        assert not [req for req in requires if req.lower().startswith("setuptools")], requires
-        assert "setuptools" not in document.get("tool", {}), (
-            f"{path.name}: a stale [tool.setuptools] table survives — dead config no backend reads"
-        )
-        requirements.append(next(req for req in requires if req.startswith("uv_build")))
-    # Same backend family: both projects pin the same uv_build requirement.
-    assert requirements[0] == requirements[1], requirements
+def test_root_uses_the_maturin_backend_for_the_native_extension():
+    """The root project is a mixed maturin project: Rust/PyO3 abi3 + pure Python."""
+    document = _pyproject()
+    build = document["build-system"]
+    assert build["build-backend"] == "maturin", build["build-backend"]
+    requires = [req.replace(" ", "") for req in build["requires"]]
+    assert len(requires) == 1, requires
+    assert re.fullmatch(r"maturin>=1\.7(?:\.\d+)*,<2", requires[0]), requires[0]
+    assert not [req for req in requires if req.lower().startswith("setuptools")], requires
+    assert "uv_build" not in requires, requires
+    assert "setuptools" not in document.get("tool", {}), (
+        "a stale [tool.setuptools] table survives — dead config no backend reads"
+    )
+    assert "uv" not in document.get("tool", {}) or "build-backend" not in document["tool"]["uv"], (
+        "the root project still carries a [tool.uv.build-backend] table: maturin reads [tool.maturin]"
+    )
+
+    config = _maturin_config(document)
+    assert config["bindings"] == "pyo3", config
+    assert config["manifest-path"] == "native/evoxc-python/Cargo.toml", config["manifest-path"]
+    assert (REPO_ROOT / config["manifest-path"]).is_file(), config["manifest-path"]
+    assert config["python-source"] == ".", config["python-source"]
+    assert config["module-name"] == f"{ROOT_MODULE}._evoxc_native", config["module-name"]
 
 
-def test_root_source_include_ships_only_the_sdist_extras():
-    """The `evoxc` sdist adds `tests/`, `assets/`, `conftest.py`, `CHANGELOG.md` — nothing else."""
-    patterns = list(_build_backend_config(_pyproject())["source-include"])
-    for entry in ("tests/**", "assets/**", "conftest.py", "CHANGELOG.md"):
-        assert entry in patterns, (
-            f"source-include={patterns} does not ship `{entry}`: a built sdist must be able to "
-            "run the packaged test suite (and its release-hygiene leg)"
+def test_member_stays_a_pure_python_uv_build_project():
+    """`evoxc-hf` is still a `uv_build` project with no native build anywhere."""
+    document = _member_pyproject()
+    build = document["build-system"]
+    assert build["build-backend"] == "uv_build", build["build-backend"]
+    requires = [req.replace(" ", "") for req in build["requires"]]
+    assert any(req.startswith("uv_build") for req in requires), requires
+    assert not [req for req in requires if req.lower().startswith(("setuptools", "maturin"))], requires
+    assert "maturin" not in document.get("tool", {}), (
+        "the member must stay pure Python: `evoxc-hf` builds no Rust extension"
+    )
+    assert _uv_build_config(document)["module-name"] == MEMBER_MODULE, document["tool"]["uv"]
+
+
+def test_root_maturin_ships_the_sdist_extras_only():
+    """The maturin config adds `tests/`, `assets/`, `conftest.py`, `CHANGELOG.md` to the SDIST only."""
+    config = _maturin_config(_pyproject())
+    includes = config["include"]
+    sdist_only = {}
+    for entry in includes:
+        assert isinstance(entry, dict), (
+            f"include entry {entry!r} is unconditional: it would also ship in the wheel"
         )
-    assert any(pat.startswith("tests/") for pat in patterns), patterns
+        sdist_only[entry["path"]] = entry["format"]
+    for path in ("tests/**/*", "assets/**/*", "conftest.py", "CHANGELOG.md"):
+        assert sdist_only.get(path) == "sdist", (
+            f"include={includes} does not ship `{path}` in the sdist only: a built-from-sdist "
+            "tree must be able to run the packaged test suite"
+        )
 
     # Every pattern is root-anchored and relative.
-    for pattern in patterns:
+    for pattern in sdist_only:
         assert not pattern.startswith(("/", ".")), pattern
         assert ".." not in Path(pattern).parts, pattern
 
-    # No pattern may reach the workspace member, the scratch area, a root probe
-    # script, the packaging config or the VCS directory.
-    for pattern in patterns:
-        for forbidden in (MEMBER_DIR.name, "bench_logs", "probe_new_emitters.py", "pyproject.toml", ".git"):
-            assert not fnmatch.fnmatchcase(forbidden, pattern), (pattern, forbidden)
-            assert not fnmatch.fnmatchcase(f"{forbidden}/nested_file.py", pattern), (pattern, forbidden)
+    # No pattern may reach the workspace member or the VCS directory.
+    for pattern in sdist_only:
+        for forbidden in (MEMBER_DIR.name, "probe_new_emitters.py", "pyproject.toml", ".git"):
+            assert not any(
+                fnmatch.fnmatchcase(f"{forbidden}/{nested}", pattern) or fnmatch.fnmatchcase(forbidden, pattern)
+                for nested in ("file.py", "nested/file.py")
+            ), (pattern, forbidden)
 
     # ... and the included paths really exist (a typo would silently ship nothing).
     for entry in ("tests", "assets"):
         assert (REPO_ROOT / entry).is_dir(), entry
     for entry in ("conftest.py", "CHANGELOG.md"):
         assert (REPO_ROOT / entry).is_file(), entry
+
+    # The dev-built extension is a gitignored build product: never package it from source.
+    excludes = config["exclude"]
+    assert excludes, "the dev-built evoxc/_evoxc_native*.so must be excluded from wheel and sdist"
+    for entry in excludes:
+        path = entry["path"] if isinstance(entry, dict) else entry
+        assert "evoxc_native" in path, entry
 
 
 # ---- 2. identity and dependency metadata of the two distributions ------------
@@ -264,9 +311,9 @@ def test_distribution_names_differ_from_their_import_names():
     """`evoxc` / `evoxc-hf` are the distribution names; `evoxc` / `evoxc_hf` are the modules."""
     root, member = _pyproject(), _member_pyproject()
     assert root["project"]["name"] == ROOT_DIST, root["project"]["name"]
-    assert _build_backend_config(root)["module-name"] == ROOT_MODULE
+    assert _maturin_config(root)["module-name"] == f"{ROOT_MODULE}._evoxc_native"
     assert member["project"]["name"] == MEMBER_DIST, member["project"]["name"]
-    assert _build_backend_config(member)["module-name"] == MEMBER_MODULE
+    assert _uv_build_config(member)["module-name"] == MEMBER_MODULE
 
     # The member is the one whose distribution name differs from its import name —
     # `module-name` is what makes `pip install evoxc-hf` provide `import evoxc_hf`.
@@ -377,11 +424,14 @@ def test_repo_walk_sees_both_package_trees():
 
 
 def test_root_package_is_the_flat_evoxc_package():
-    """`module-root = ""` + `module-name = "evoxc"` = this repo's flat layout."""
-    config = _build_backend_config(_pyproject())
-    assert config["module-root"] == "", f"module-root is {config['module-root']!r}: the root project is FLAT"
-    assert config["module-name"] == ROOT_MODULE, config["module-name"]
-    module_dir = REPO_ROOT / config["module-root"] / config["module-name"]
+    """`python-source = "."` + `module-name = "evoxc._evoxc_native"` = this repo's flat layout."""
+    config = _maturin_config(_pyproject())
+    assert config["python-source"] == ".", (
+        f"python-source is {config['python-source']!r}: the root project is FLAT"
+    )
+    package = config["module-name"].split(".", 1)[0]
+    assert package == ROOT_MODULE, config["module-name"]
+    module_dir = REPO_ROOT / config["python-source"] / package
     assert module_dir == REPO_ROOT / ROOT_MODULE, module_dir
     assert (module_dir / "__init__.py").is_file(), f"{module_dir} is not a Python package"
     packages = _packages_below(ROOT_MODULE)
@@ -391,7 +441,7 @@ def test_root_package_is_the_flat_evoxc_package():
 
 def test_member_module_dir_is_the_src_layout_package():
     """`module-root = "src"` + `module-name = "evoxc_hf"` = the member's src layout."""
-    config = _build_backend_config(_member_pyproject())
+    config = _uv_build_config(_member_pyproject())
     assert config["module-root"] == "src", config["module-root"]
     assert config["module-name"] == MEMBER_MODULE, config["module-name"]
     module_dir = MEMBER_DIR / config["module-root"] / config["module-name"]
@@ -476,20 +526,26 @@ def _importable(module: str) -> bool:
 def _build_plan(src: Path, out_dir: Path, project: str | None) -> list[tuple[Path, list[str]]] | None:
     """`(cwd, argv)` steps building the whole workspace (`project=None`) or one project.
 
-    `uv build` runs ISOLATED deliberately: uv bundles the `uv_build` backend, so the
-    build needs no network and nothing installed here (`--no-build-isolation` would
-    defeat exactly that). The `python -m build --no-isolation` fallback needs
-    `uv_build` importable, and it can only build one project at a time.
+    `uv build` runs ISOLATED deliberately: uv bundles the `maturin` and
+    `uv_build` backends, so the build needs no toolchain installed here beyond
+    `uv`, a Rust toolchain and a C compiler for the `evoxc` extension. The
+    `python -m build --no-isolation` fallback needs the matching backend
+    importable (`maturin` for the root project, `uv_build` for the member), and
+    it can only build one project at a time.
     """
     uv = shutil.which("uv")
     if uv is not None:
         scope = ["--all-packages"] if project is None else ["--package", project]
         return [(src, [uv, "build", *scope, "--out-dir", str(out_dir)])]
-    if not (_importable("uv_build") and _importable("build")):
+    if not _importable("build"):
         return None
     member_dir = src / MEMBER_DIR.name
     directories = {None: [src, member_dir], ROOT_DIST: [src], MEMBER_DIST: [member_dir]}.get(project)
     if directories is None:
+        return None
+    if any(directory == src for directory in directories) and not _importable("maturin"):
+        return None
+    if any(directory != src for directory in directories) and not _importable("uv_build"):
         return None
     per_project = [sys.executable, "-m", "build", "--sdist", "--wheel", "--no-isolation"]
     return [(directory, per_project + ["--outdir", str(out_dir)]) for directory in directories]
@@ -506,7 +562,8 @@ _STALE_EGG_INFO = "evoxc.egg-info"
 
 _NO_BUILD_TOOLCHAIN = (
     "no workspace build toolchain: `uv build --all-packages` is needed (uv bundles the "
-    "`uv_build` backend, so the build stays isolated; the fallback needs `uv_build` importable)"
+    "`maturin` and `uv_build` backends, so the build stays isolated; building the `evoxc` "
+    "extension also needs a Rust toolchain and a C compiler)"
 )
 
 
@@ -658,10 +715,11 @@ def _entries_under(entries: Iterable[str], module: str) -> list[str]:
 
 
 _STALE_HINT = (
-    "Cause and fix: the `[tool.uv.build-backend] module-name` decides what ships, and each "
-    "distribution ships exactly ONE module. `evoxc_hf` belongs to the member distribution "
+    "Cause and fix: `[tool.maturin] module-name` decides what the root `evoxc` project ships "
+    "(the `evoxc` package plus the compiled extension), and the member's `[tool.uv.build-backend] "
+    "`module-name`` decides what `evoxc_hf` ships. `evoxc_hf` belongs to the member distribution "
     "(`evoxc_hf/src/evoxc_hf/`), never to the root `evoxc` project. Rebuild after fixing the "
-    "backend config; a stale `evoxc.egg-info/` cannot cause this under uv_build."
+    "backend config; a stale `evoxc.egg-info/` cannot cause this under maturin or uv_build."
 )
 
 
@@ -669,17 +727,28 @@ def test_workspace_build_produces_exactly_the_four_artifacts(built_artifacts):
     """ONE `uv build --all-packages` = a wheel + an sdist for EACH distribution (never `etl`)."""
     root_version = _project_version(PYPROJECT)
     member_version = _project_version(MEMBER_PYPROJECT)
-    expected = {
-        f"{ROOT_DIST}-{root_version}-py3-none-any.whl",
-        f"{ROOT_DIST}-{root_version}.tar.gz",
+    names = sorted(path.name for path in built_artifacts.values())
+    assert len(names) == 4, f"expected four artifacts, got {names}"
+
+    # The member stays pure Python: an exact `py3-none-any` wheel + its sdist.
+    member_expected = {
         f"{MEMBER_MODULE}-{member_version}-py3-none-any.whl",
         f"{MEMBER_MODULE}-{member_version}.tar.gz",
     }
-    names = sorted(path.name for path in built_artifacts.values())
-    assert names == sorted(expected), (
-        f"the workspace build produced {names}, expected exactly {sorted(expected)} — both "
-        "projects build their own sdist + pure-python (`py3-none-any`) wheel"
+    assert member_expected <= set(names), (
+        f"the workspace build produced {names}, expected the member's pure-Python artifacts "
+        f"{sorted(member_expected)}"
     )
+
+    # The root wheel is a PLATFORM wheel (cpython abi3 + a platform tag), not `py3-none-any`.
+    root_wheels = [n for n in names if n.startswith(f"{ROOT_DIST}-") and n.endswith(".whl")]
+    assert len(root_wheels) == 1, names
+    root_wheel = root_wheels[0]
+    assert re.fullmatch(
+        rf"{re.escape(ROOT_DIST)}-{re.escape(root_version)}-cp\d+-abi3-[a-z0-9_]+\.whl", root_wheel
+    ), f"the `evoxc` wheel {root_wheel!r} is not a cp<X>-abi3 platform wheel"
+    assert f"{ROOT_DIST}-{root_version}.tar.gz" in names, names
+
     for name in names:  # the brand pin: named for the two distributions, never `etl`
         assert name.startswith((f"{ROOT_DIST}-", f"{MEMBER_MODULE}-")), name
     assert len([n for n in names if n.startswith(f"{ROOT_DIST}-")]) == 2, names
@@ -694,7 +763,8 @@ def test_each_wheel_ships_only_its_own_top_level_modules(built_artifacts):
         roots = sorted({entry.split("/", 1)[0] for entry in _wheel_names(wheel)})
         modules = [root for root in roots if not root.endswith(".dist-info")]
         assert modules == [module], (
-            f"{wheel.name} root set is {roots}: uv_build ships exactly the `{module}` module\n{_STALE_HINT}"
+            f"{wheel.name} root set is {roots}: each distribution ships exactly the `{module}` "
+            f"module\n{_STALE_HINT}"
         )
         assert [root for root in roots if root.endswith(".dist-info")] == [
             f"{module}-{versions[module]}.dist-info"
@@ -714,13 +784,54 @@ def test_each_wheel_ships_only_its_own_top_level_modules(built_artifacts):
         )
 
 
+def test_root_wheel_ships_the_compiled_native_extension(built_artifacts):
+    """The `evoxc` wheel carries `evoxc/_evoxc_native.abi3.so` — exactly what `_native.py` loads."""
+    wheel = _artifact(built_artifacts, ROOT_DIST, "wheel")
+    names = _wheel_names(wheel)
+    extension = "evoxc/_evoxc_native.abi3.so"
+    assert extension in names, (
+        f"{wheel.name} ships no {extension}: maturin must install the compiled abi3 extension "
+        f"inside the `evoxc` package (entries matching `_evoxc_native`: "
+        f"{[n for n in names if '_evoxc_native' in n]})"
+    )
+    with zipfile.ZipFile(wheel) as zf:
+        assert zf.getinfo(extension).file_size > 0, f"{extension} in {wheel.name} is empty"
+    # The compiled artifact is in the RECORD (installed, hash-checked), and only once.
+    record = next(n for n in names if n.endswith(".dist-info/RECORD"))
+    record_entries = [line.split(",", 1)[0] for line in _wheel_read(wheel, record).splitlines()]
+    assert record_entries.count(extension) == 1, (
+        f"{wheel.name} RECORD lists {extension} {record_entries.count(extension)} times"
+    )
+    assert len([n for n in names if n.endswith(".so")]) == 1, [n for n in names if n.endswith(".so")]
+
+    # The member stays pure: no compiled artifact of any kind.
+    member_wheel = _artifact(built_artifacts, MEMBER_MODULE, "wheel")
+    compiled = [n for n in _wheel_names(member_wheel) if n.endswith((".so", ".pyd", ".dylib"))]
+    assert not compiled, f"{member_wheel.name} ships compiled artifacts: {compiled}"
+
+
+def test_evoxc_sdist_is_a_complete_buildable_source_tree(built_artifacts):
+    """The `evoxc` sdist carries the Rust workspace and the Python package, and no built `.so`."""
+    sdist = _artifact(built_artifacts, ROOT_DIST, "sdist")
+    entries = _relative_entries(sdist)
+    for required in ("native/Cargo.toml", "native/Cargo.lock", "native/evoxc-python/Cargo.toml"):
+        assert required in entries, (
+            f"{sdist.name} does not ship {required}: a source install must be able to build the "
+            "extension from the sdist"
+        )
+    assert any(entry.startswith("native/evoxc-python/src/") for entry in entries), sorted(entries)[:5]
+    assert not [entry for entry in entries if entry.endswith((".so", ".pyd", ".dylib"))], (
+        "the sdist ships a build product: the extension is compiled from source by maturin"
+    )
+
+
 def test_wheel_top_level_txt_when_present_declares_one_module(built_artifacts):
     """`top_level.txt`, WHEN the backend writes one, declares exactly that one module."""
     for module in (ROOT_MODULE, MEMBER_MODULE):
         wheel = _artifact(built_artifacts, module, "wheel")
         names = _wheel_names(wheel)
         entry = next((n for n in names if n.endswith("/top_level.txt")), None)
-        if entry is None:  # uv_build writes no top_level.txt — conditional on purpose
+        if entry is None:  # maturin/uv_build write no top_level.txt — conditional on purpose
             modules = sorted({n.split("/", 1)[0] for n in names if not n.startswith(f"{module}-")})
             assert modules == [module], wheel.name  # ... the root set still pins one module
             continue
@@ -867,9 +978,10 @@ def test_stale_egg_info_cannot_leak_evoxc_hf(tmp_path):
 
     MEASURED under setuptools (68.1.2 and 84.0.0): an sdist built from a tree
     carrying a stale `evoxc.egg-info/SOURCES.txt` DID ship the listed `evoxc_hf/`
-    paths that still existed on disk. `uv_build` reads no such manifest: the wheel
-    is the module dir, the sdist is the module dir + license/readme + root-anchored
-    `source-include`. So this test plants the exact historical artifact into a real
+    paths that still existed on disk. `maturin` reads no such manifest: the wheel
+    is the `evoxc` package plus the compiled extension, and the sdist is generated
+    from the Cargo workspace + the Python package + the declared sdist-only
+    `include` list. So this test plants the exact historical artifact into a real
     checkout copy (whose member sources do exist, the trap's precondition) and
     asserts both `evoxc` artifacts still ship zero `evoxc_hf` entries.
     """
@@ -893,7 +1005,7 @@ def test_stale_egg_info_cannot_leak_evoxc_hf(tmp_path):
         shipped = _entries_under(entries, MEMBER_MODULE)
         assert not shipped, (
             f"the {kind} built from a tree with a planted {_STALE_EGG_INFO}/SOURCES.txt ships "
-            f"{shipped[:5]}: uv_build must never read a stale manifest\n{_STALE_HINT}"
+            f"{shipped[:5]}: maturin must never read a stale manifest\n{_STALE_HINT}"
         )
         # Anti-vacuity: the build succeeded and shipped the real package.
         assert _entries_under(entries, ROOT_MODULE), f"the {kind} shipped no evoxc sources"
@@ -964,7 +1076,7 @@ def test_installed_distribution_metadata_matches_its_own_module(dist_name, pypro
     )
 
     top_level = dist.read_text("top_level.txt")
-    if top_level is not None:  # uv_build writes no top_level.txt — conditional on purpose
+    if top_level is not None:  # maturin/uv_build write no top_level.txt — conditional on purpose
         names = [line.strip() for line in top_level.splitlines() if line.strip()]
         assert names == [module], f"installed `{dist_name}` declares top-level packages {names!r}"
 
@@ -991,7 +1103,7 @@ def test_license_metadata_is_declared_once_as_spdx_in_both_projects():
 
 
 def test_wheels_carry_pep639_license_metadata(built_artifacts):
-    """uv_build preserves the PEP 639 metadata in BOTH wheels' METADATA."""
+    """Both backends preserve the PEP 639 metadata in the wheels' METADATA."""
     for module in (ROOT_MODULE, MEMBER_MODULE):
         wheel = _artifact(built_artifacts, module, "wheel")
         metadata = _wheel_metadata(wheel)

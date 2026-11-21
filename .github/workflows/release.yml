@@ -104,6 +104,17 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
+      # The root `evoxc` distribution is a mixed maturin project (a Rust/PyO3
+      # abi3 extension from `./native/`), so building its wheel needs a Rust
+      # toolchain. `evoxc-hf` builds without one.
+      - name: Set up Rust (maturin builds evoxc._evoxc_native)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+
       # ONE routing decision for the whole run: the tag names the distribution.
       # Everything downstream reads these outputs (job outputs are set above),
       # so the accepted tag schemes live in exactly one place.

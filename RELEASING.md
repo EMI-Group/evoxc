@@ -97,10 +97,12 @@ same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
    uv run pytest -q
    uv build --all-packages && uvx twine check dist/*
    ```
+   The `evoxc` build compiles the Rust/PyO3 extension, so it needs a Rust
+   toolchain and a C compiler on `PATH`.
 
 1. **Bump `[project].version`** in that package's project file (e.g. `0.1.0` →
-   `0.1.1`). The version is static: `uv_build` requires it, and nothing else
-   derives it.
+   `0.1.1`). The version is static: both build backends require it, and nothing
+   else derives it.
 2. **Add a `CHANGELOG.md` entry** for the new version (newest version at the top),
    naming which distribution it belongs to.
 3. **Commit** both changes on `main`:
@@ -139,12 +141,15 @@ same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
   `pip install "evoxc-hf[hf]"` where relevant) — `pip install evoxc` must still
   pull numpy only and never `evoxc-hf`;
 - the GitHub Release has the right artifacts attached (the `attach` job):
-  `evoxc-X.Y.Z-py3-none-any.whl` + `evoxc-X.Y.Z.tar.gz` for `v<version>`,
-  `evoxc_hf-X.Y.Z-py3-none-any.whl` + `evoxc_hf-X.Y.Z.tar.gz` for
-  `evoxc-hf-v<version>`;
+  `evoxc-X.Y.Z-cp3XX-abi3-<platform>.whl` + `evoxc-X.Y.Z.tar.gz` for
+  `v<version>`, `evoxc_hf-X.Y.Z-py3-none-any.whl` + `evoxc_hf-X.Y.Z.tar.gz` for
+  `evoxc-hf-v<version>`.
+  The `evoxc` wheel is a per-platform abi3 wheel because it embeds the Rust/PyO3
+  extension; the `evoxc-hf` wheel stays pure Python (`py3-none-any`);
 - each wheel contains only its own module — the `packaging` CI job pins that
   boundary, but a quick eyeball is cheap:
-  `unzip -l dist/evoxc-X.Y.Z-py3-none-any.whl` shows only `evoxc/…`, and
+  `unzip -l dist/evoxc-X.Y.Z-cp3XX-abi3-<platform>.whl` shows only `evoxc/…`
+  (including `evoxc/_evoxc_native.abi3.so`), and
   `unzip -l dist/evoxc_hf-X.Y.Z-py3-none-any.whl` only `evoxc_hf/…`.
 
 ---
