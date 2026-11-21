@@ -134,9 +134,11 @@ def _require_registered_backend(name: str) -> None:
 _KNOWN_PAYLOAD_FORMATS = frozenset({"stablehlo", "stablehlo-segments"})
 
 
-def _payload_kind(payload: Any) -> str:
+def _payload_kind(payload: Any) -> str | None:
     """Classify a staged payload for ``__repr__``/``summary()`` (pure).
 
+    * ``None`` — an absent payload (both staged objects default ``payload`` to
+      ``None``), reported as ``None`` rather than an invented kind.
     * ``"serialized-ir"`` — a dict carrying ``version`` + ``module``
       (``ir.serialize_module`` output, the numpy backend's payload).
     * ``"mlir"`` — MLIR text itself (a ``str``) or a dict carrying
@@ -145,6 +147,8 @@ def _payload_kind(payload: Any) -> str:
       field names one of the known compiler payload formats.
     * ``"json"`` — any other dict; the payload's type name for anything else.
     """
+    if payload is None:
+        return None
     if isinstance(payload, dict):
         if "version" in payload and "module" in payload:
             return "serialized-ir"
@@ -237,17 +241,21 @@ def _program_repr(
     """One-line ``__repr__`` body shared by both staged objects.
 
     Reports the backend, the target (``CompiledArtifact`` only), the payload
-    kind + byte size and the signature's leaf counts. A not-computable size
-    renders as ``?``; anything that could make an attribute unreadable is
-    caught by the callers, so a ``repr`` never raises.
+    kind + byte size and the signature's leaf counts. An absent payload renders
+    as ``payload=None``; a not-computable size renders as ``?``; anything that
+    could make an attribute unreadable is caught by the callers, so a ``repr``
+    never raises.
     """
-    size = _payload_bytes(payload)
     parts = [f"backend={backend!r}"]
     if target is not None:
         parts.append(f"target={target!r}")
-    parts.append(
-        f"payload={_payload_kind(payload)} {'?' if size is None else f'{size} B'}"
-    )
+    if payload is None:
+        parts.append("payload=None")
+    else:
+        size = _payload_bytes(payload)
+        parts.append(
+            f"payload={_payload_kind(payload)} {'?' if size is None else f'{size} B'}"
+        )
     parts.append(f"inputs={len(_signature_field(signature, 'input_specs'))}")
     parts.append(f"outputs={len(_signature_field(signature, 'output_specs'))}")
     return f"{cls_name}({', '.join(parts)})"
