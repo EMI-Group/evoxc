@@ -76,7 +76,10 @@ version = "0.1.0"
 dependencies = [
  "evoxc-compiler",
  "evoxc-core",
+ "evoxc-cpu",
  "evoxc-runtime",
+ "half",
+ "num-complex",
  "pyo3",
  "serde_json",
 ]

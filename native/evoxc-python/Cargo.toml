@@ -12,7 +12,15 @@ crate-type = ["cdylib"]
 evoxc-core.workspace = true
 evoxc-compiler.workspace = true
 evoxc-runtime.workspace = true
+evoxc-cpu.workspace = true
 serde_json.workspace = true
+# `half` and `num-complex` type the `Storage` variants of `evoxc-cpu`'s
+# `Buffer`; the binding only reads them (flattening to little-endian bytes for
+# numpy).  Same semver as `evoxc-cpu`, so cargo unifies the crates.  There is no
+# `numpy` crate here on purpose: the newest one needs pyo3 0.28 and this crate
+# pins pyo3 0.30, so numpy interop crosses as bytes.
+half = "2"
+num-complex = "0.4"
 # Deliberately not `pyo3.workspace = true`: the workspace entry hard-enables
 # `extension-module`, and an extension-module build does not link libpython, so
 # a `cargo test` binary that touches the Python API cannot link.  The

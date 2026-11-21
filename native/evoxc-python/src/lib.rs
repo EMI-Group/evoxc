@@ -11,9 +11,11 @@
 //! * `transform(kind, module, config)` — `evoxc-compiler`'s five transforms
 //! * `batch_functions(programs, config)` — `evoxc-compiler`'s population merge
 //! * `batching_rule_keys() -> list[str]` — the builtin batching registry keys
+//! * `native_compile(envelope) -> NativeProgram` — `evoxc-cpu`'s plan + run
 //! * `NativeError` with `.kind` / `.message`
 mod batch_ops;
 mod convert;
+mod cpu;
 mod error;
 mod infer_context;
 mod module_ops;
@@ -108,5 +110,7 @@ fn _evoxc_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(transform, module)?)?;
     module.add_function(wrap_pyfunction!(batch_functions, module)?)?;
     module.add_function(wrap_pyfunction!(batching_rule_keys, module)?)?;
+    module.add_function(wrap_pyfunction!(cpu::native_compile, module)?)?;
+    module.add_class::<cpu::NativeProgram>()?;
     Ok(())
 }
