@@ -1,15 +1,22 @@
 """Public `vjp` — reverse-mode vector-Jacobian products.
 
 `vjp` is graph→graph: the result is a `Graph` of ordinary ops mapping
-(primal inputs, cotangent inputs) → (primal outputs, input cotangents), built
-by the backward sweep in `autodiff.py`. It shares VJP rules with `grad`.
-Semantics are binding — see `./CONTEXT.md` "AD semantics".
+(primal inputs, cotangent inputs) → (primal outputs, input cotangents). The
+native (Rust) AD engine owns the backward sweep and every builtin VJP rule;
+Python keeps the cotangent-tree validation/normalization and the `Graph`
+reconstruction.
+
+The documented Python fallback (`autodiff.reverse_sweep`) runs only for graphs
+whose derivative rules live in Python (`block:*`/`external:*`/`sparse_*`) — the
+native extension request cannot carry the cotangent SSA values (see
+`_native_ad.py`). Semantics are binding — see `./CONTEXT.md` "AD semantics".
 """
 
 from __future__ import annotations
 
 from evoxc import core
 from evoxc.trace import Graph, trace
+from evoxc.transforms import _native_ad
 from evoxc.transforms._wrappers import TransformCallable
 from evoxc.transforms.autodiff import reverse_sweep
 from evoxc.transforms.grad import _normalize_extra_pytree, _return_values
@@ -56,11 +63,12 @@ def vjp(fn_or_graph, cotangents=None):
 def _vjp_graph(graph: Graph, cotangents) -> Graph:
     """Validate/normalize the cotangent spec tree against the graph outputs
     (the `None` default becomes an explicit scalar-one cotangent spec, valid
-    only for a single scalar output), run the backward sweep, and return the
-    sweep graph as-is — it already has the required input/output structure:
-    inputs = 2-tuple (original input tree, flat cotangent tuple tree),
-    outputs = 2-tuple (primal outputs with the original output tree, flat
-    input cotangents aligned with the flattened tensor inputs)."""
+    only for a single scalar output), then run the backward sweep (native by
+    default, the documented Python fallback for extension-ruled ops). The
+    result already has the required input/output structure: inputs = 2-tuple
+    (original input tree, flat cotangent tuple tree), outputs = 2-tuple (primal
+    outputs with the original output tree, flat input cotangents aligned with
+    the flattened tensor inputs)."""
     outputs = _return_values(graph)
     if cotangents is None:
         # Default: scalar-one cotangent as an explicit scalar input — requires
@@ -76,7 +84,10 @@ def _vjp_graph(graph: Graph, cotangents) -> Graph:
                 f"vjp: cotangents=None requires a scalar output (shape ()), "
                 f"got shape {tuple(output_type.shape)}"
             )
-        return reverse_sweep(graph, (core.TensorSpec((), output_type.dtype),))
+        flat_cotangents = (core.TensorSpec((), output_type.dtype),)
+        if _native_ad._needs_python_ad(graph):
+            return reverse_sweep(graph, flat_cotangents)
+        return _native_ad.sweep_graph(graph, "vjp", flat_cotangents)
 
     # Explicit cotangent pytree: validate against the output tree (tensor
     # output positions take TensorSpec/None; static output positions must be
@@ -96,7 +107,9 @@ def _vjp_graph(graph: Graph, cotangents) -> Graph:
         kind="cotangent",
         none_requires_scalar=True,
     )
-    return reverse_sweep(graph, flat_cotangents)
+    if _native_ad._needs_python_ad(graph):
+        return reverse_sweep(graph, flat_cotangents)
+    return _native_ad.sweep_graph(graph, "vjp", flat_cotangents)
 
 
 def _vjp_fn(fn, args, cotangents) -> Graph:

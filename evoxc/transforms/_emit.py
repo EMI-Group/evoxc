@@ -255,10 +255,10 @@ def _run_rule(
 ) -> Tuple[Tuple[ir.Value, ...], Tuple[MappedAxes, ...]]:
     """Invoke one batching rule and validate/stamp its emission.
 
-    Mirrors `batching._rewrite_op`: the ORIGINAL `ir.Op` is passed (rules read
-    `op.attributes` / `op.operands[i].type`, i.e. the unbatched types) together
-    with the NEW module's operand values; the rule's return value is validated
-    and every emitted op inherits the original op's source location.
+    Follows the binding rule convention: the ORIGINAL `ir.Op` is passed (rules
+    read `op.attributes` / `op.operands[i].type`, i.e. the unbatched types)
+    together with the NEW module's operand values; the rule's return value is
+    validated and every emitted op inherits the original op's source location.
     """
     start = len(new_block.ops)
     new_values, new_axes = rule(op, operands, axes)

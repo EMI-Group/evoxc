@@ -1,14 +1,20 @@
 """Public `jvp` — forward-mode Jacobian-vector products.
 
 `jvp` is graph→graph: the result is a `Graph` of ordinary ops mapping
-(primal inputs, tangent inputs) → (primal outputs, tangent outputs), built by
-the forward sweep in `autodiff.py` using per-op JVP rules. Semantics are
-binding — see `./CONTEXT.md` "AD semantics".
+(primal inputs, tangent inputs) → (primal outputs, tangent outputs). The native
+(Rust) AD engine owns the forward sweep and every builtin JVP rule; Python keeps
+the tangent-tree validation/normalization and the `Graph` reconstruction.
+
+The documented Python fallback (`autodiff.forward_sweep`) runs only for graphs
+whose derivative rules live in Python (`block:*`/`external:*`/`sparse_*`) — the
+native extension request cannot carry the tangent SSA values (see
+`_native_ad.py`). Semantics are binding — see `./CONTEXT.md` "AD semantics".
 """
 
 from __future__ import annotations
 
 from evoxc.trace import Graph, trace
+from evoxc.transforms import _native_ad
 from evoxc.transforms._wrappers import TransformCallable
 from evoxc.transforms.autodiff import forward_sweep
 from evoxc.transforms.grad import _normalize_extra_pytree
@@ -50,12 +56,12 @@ def jvp(fn_or_graph, tangents):
 
 
 def _jvp_graph(graph: Graph, tangents) -> Graph:
-    """Validate/normalize the tangent spec tree against the graph inputs, run
-    the forward sweep, and return the sweep graph as-is — it already has the
-    required input/output structure: inputs = 2-tuple (original input tree,
-    flat tangent tuple tree), outputs = 2-tuple (primal outputs with the
-    original output tree, flat tangent tensors aligned with the flattened
-    tensor outputs)."""
+    """Validate/normalize the tangent spec tree against the graph inputs, then
+    run the forward sweep (native by default, the documented Python fallback for
+    extension-ruled ops). The result already has the required input/output
+    structure: inputs = 2-tuple (original input tree, flat tangent tuple tree),
+    outputs = 2-tuple (primal outputs with the original output tree, flat
+    tangent tensors aligned with the flattened tensor outputs)."""
     flat_tangents = _normalize_extra_pytree(
         tangents,
         graph.input_specs,
@@ -64,7 +70,9 @@ def _jvp_graph(graph: Graph, tangents) -> Graph:
         transform="jvp",
         kind="tangent",
     )
-    return forward_sweep(graph, flat_tangents)
+    if _native_ad._needs_python_ad(graph):
+        return forward_sweep(graph, flat_tangents)
+    return _native_ad.sweep_graph(graph, "jvp", flat_tangents)
 
 
 def _jvp_fn(fn, args, tangents) -> Graph:

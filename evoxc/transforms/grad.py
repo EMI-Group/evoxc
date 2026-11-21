@@ -1,9 +1,15 @@
-"""Public `grad` — reverse-mode gradients via the shared VJP machinery.
+"""Public `grad` — reverse-mode gradients.
 
 `grad` is graph→graph: the result is a `Graph` of ordinary ops mapping the
-same inputs to gradient tensors. It shares VJP rules with `vjp` (and the
-backward sweep in `autodiff.py`). Semantics are binding — see `./CONTEXT.md`
-"AD semantics".
+same inputs to gradient tensors. The native (Rust) AD engine is the default
+authority for the backward sweep and every builtin VJP rule; Python keeps the
+frontend validation/normalization and the `Graph` reconstruction here.
+
+The documented Python fallback (`autodiff.reverse_sweep`) runs only for graphs
+whose derivative rules live in Python — `block_call`, `external_call`, or a
+`sparse_*` op with a registered rule — because the native extension request
+carries tangent FLAGS rather than the cotangent SSA values (see
+`_native_ad.py`). Semantics are binding — see `./CONTEXT.md` "AD semantics".
 
 This module also hosts the small shared helpers used by the sibling AD entry
 points (`jvp.py`, `vjp.py`): return-op inspection and tangent/cotangent
@@ -17,6 +23,7 @@ from typing import Any, Sequence, Tuple
 from evoxc import core, ir
 from evoxc.trace import Graph, StaticValue, trace
 from evoxc.trace.trace import _format_path, _iter_leaf_paths
+from evoxc.transforms import _native_ad
 from evoxc.transforms._wrappers import TransformCallable
 from evoxc.transforms.autodiff import reverse_sweep
 
@@ -277,9 +284,12 @@ def _normalize_argnums(argnums, num_inputs: int) -> Tuple[int, ...]:
 
 def _grad_graph(graph: Graph, argnums) -> Graph:
     """Validate the single-scalar-output requirement (`ShapeError`), normalize
-    `argnums` (out-of-range/non-differentiable entries → `TransformError`),
-    run the reverse sweep with a scalar-one cotangent of the output dtype, and
-    return a graph producing only the selected input gradients."""
+    `argnums` (out-of-range/non-differentiable entries → `TransformError`), and
+    return a graph producing only the selected input gradients.
+
+    Delegates the backward sweep to the native AD engine; graphs with
+    extension-ruled ops (`block:*`/`external:*`/`sparse_*`) take the documented
+    Python fallback (`_grad_graph_python`)."""
     _single_scalar_output(graph, "grad")
 
     is_single = isinstance(argnums, int) and not isinstance(argnums, bool)
@@ -293,6 +303,14 @@ def _grad_graph(graph: Graph, argnums) -> Graph:
                 f"or complex"
             )
 
+    if _native_ad._needs_python_ad(graph):
+        return _grad_graph_python(graph, selected, is_single)
+    return _native_ad.grad_graph(graph, selected, is_single)
+
+
+def _grad_graph_python(graph: Graph, selected, is_single: bool) -> Graph:
+    """Python fallback: run the reverse sweep in `autodiff.py` seeded with the
+    scalar-one cotangent, then trim the return op to the selected gradients."""
     # Reverse sweep seeded with the scalar-one cotangent (`None` → in-graph
     # ones constant, so NO cotangent block args). The sweep module's `return`
     # op yields (primal output, one cotangent per tensor input).
