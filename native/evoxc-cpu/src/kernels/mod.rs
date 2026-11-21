@@ -201,3 +201,30 @@ pub fn unsupported_ops() -> Vec<&'static str> {
     missing.sort_unstable();
     missing
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole dense op set must be dispatchable: an op listed here but not
+    /// registered would make `plan::compile` reject ordinary graphs.  This test
+    /// is the machine-readable support inventory the FFI reports.
+    #[test]
+    fn every_dense_op_has_a_kernel() {
+        let missing = unsupported_ops();
+        assert!(
+            missing.is_empty(),
+            "dense ops without a native kernel: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn table_has_no_foreign_entries() {
+        for name in table().keys() {
+            assert!(
+                DENSE_OPS.contains(name),
+                "'{name}' is registered but missing from DENSE_OPS"
+            );
+        }
+    }
+}
