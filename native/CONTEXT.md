@@ -177,6 +177,16 @@ No other Python callback may occur during a transform; the envelope/GIL crossing
 - `scripts/build-native.sh` is the end-to-end gate: it must build and its smoke test must print the version.
 - Tests must not require a GPU, the network, or the Python interpreter (except the generated-table freshness test, which skips without the venv).
 
+## Status (phase 1 — vertical slice complete)
+
+Four crates implemented and green: `evoxc-core` (dtypes + generated promotion table, `Dim`/`DimExpr`, `ValueType`, `AttrValue`, generated 119-op schema table, graph IR, envelope codec, full per-category inference, `verify`), `evoxc-compiler` (`Builder`, `vectorize`/`vmap` with the full builtin batching-rule set, `jvp`/`vjp`/`grad` with the builtin derivative-rule set, extension-rule inlining), `evoxc-runtime` (session/device/buffer/submission/executable skeleton), `evoxc-python` (`version`, `infer`, `transform`, `NativeError`).
+`scripts/build-native.sh` builds `evoxc-python` → `libevoxc_python.so`, installs `evoxc/_evoxc_native.abi3.so` and its smoke test prints the version.
+Rust workspace suite: **403 passed, 0 failed** (`evoxc-core` 224 + 2 parity, `evoxc-compiler` 114 + 1 transform-parity gate, `evoxc-python` 13, `evoxc-runtime` 61); `cargo clippy -p evoxc-core -p evoxc-compiler --all-targets --no-deps -- -D warnings` is clean.
+Inference parity: **518 cases over 113 ops, 0 mismatches** through the FFI (`evoxc._evoxc_native.infer`), with all 461 successful cases re-derived live from `evoxc.ir.op_defs.opdef(name).shape_fn`.
+Transform parity: **61 cases × 122 mode-runs, 0 mismatches** (`vectorize`, `vmap` incl. non-leading `out_axes`, `grad`, `jvp`, `vjp`) comparing native-transformed graphs numerically against the Python transforms; 12 mode-runs are documented deferrals where both engines raise `TransformError`.
+Coverage: inference for elementwise/comparison/cast/select/broadcast, reshape/transpose/slice/gather/scatter/concatenate/pad/diagonal/tile/diag, reductions/argmax/argmin/sort/argsort, dot/conv/solve, linalg, random (algorithm-aware), collectives, all 16 sparse ops, and the op-specific cases (`constant`, `call`, `if`, `while`, `runtime_call`, `block_call`, `external_call`).
+Batching rules cover elementwise, reductions, structural, dot, linalg aux and constants; AD rules cover the pointwise/unary table, reductions, structural, dot/conv, tril/triu/cumsum/solve, zero rules and `stop_gradient`, with `conv` VJP and the other Python-side deferrals preserved as explicit errors.
+
 ## Known Issues / Notes for Agents
 
 - `native/CONTEXT.md` is the binding FFI contract; crate-level `CONTEXT.md` files may refine internals but never change the wire format or the FFI names.
