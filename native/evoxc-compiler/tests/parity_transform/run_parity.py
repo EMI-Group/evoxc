@@ -33,6 +33,11 @@ Modes
 Deferral assertions pin the documented v1 gaps on BOTH engines: the Python
 transform and the native transform must raise ``TransformError``.
 
+Tuple-valued attributes (``gather.axes``, the ``slice`` index/stride triples,
+the nested ``pad.padding_config``) travel as ``{"__evoxc_tuple__": [...]}``
+markers that the converter passes through verbatim: the four ``tuple_*`` cases
+run real transforms over them and a wire-shape self-check pins the markers.
+
 Run it directly (the cargo gate does exactly this)::
 
     source scripts/dev-env.sh
@@ -737,6 +742,57 @@ CASES: list[Case] = [
         ),
         seed=43,
     ),
+    # ------------------------------------------------------------------
+    # Tuple-valued attributes: the Python serializer wraps every tuple as
+    # ``{"__evoxc_tuple__": [...]}`` and the converter passes that marker
+    # through VERBATIM, so these cases exercise core's tag-directed decoding
+    # (`ints`/`nested_ints`/`shape` by the declared attribute tag) end to end.
+    # ------------------------------------------------------------------
+    Case(
+        # `gather.axes` is an `ints` tuple: `(1,)` reaches the envelope as the
+        # tuple marker and decodes to the sequence variant on the native side.
+        "tuple_gather_axes",
+        lambda x, idx: evoxc.sum(evoxc.gather(x, idx, axis=1) * 2.0),
+        (_spec((3, 4)), _spec((2,), I32)),
+        (grad_mode((0,)), vjp_mode((0,))),
+        seed=52,
+    ),
+    Case(
+        # `slice` carries THREE `ints` tuples (`start_indices`,
+        # `limit_indices`, `strides`); unit strides keep the VJP ruled.
+        "tuple_slice_strides",
+        lambda x: evoxc.sum(evoxc.slice(x, 1, 3, strides=(1, 1)) * 2.0),
+        (_spec((5, 4)),),
+        (vectorize_mode((0,)), grad_mode((0,)), jvp_mode((0,))),
+        seed=53,
+    ),
+    Case(
+        # `padding_config` is `nested_ints`: a tuple OF tuples, so the envelope
+        # holds a tuple marker whose items are themselves tuple markers.
+        "tuple_pad_nested_config",
+        lambda x: evoxc.sum(evoxc.pad(x, ((1, 0), (0, 2)), 0.25) * 2.0),
+        (_spec((2, 3)),),
+        (vectorize_mode((0,)), grad_mode((0,))),
+        seed=54,
+    ),
+    Case(
+        # Several tuple attributes in ONE graph: gather.axes + the three slice
+        # tuples + the nested pad config, with a transform that rewrites them.
+        "tuple_attributes_combined",
+        lambda x, idx: evoxc.sum(
+            evoxc.pad(
+                evoxc.slice(
+                    evoxc.gather(x, idx, axis=1), 0, 2, strides=(1, 1)
+                ),
+                ((0, 1), (1, 0)),
+                0.5,
+            )
+            * 2.0
+        ),
+        (_spec((3, 4)), _spec((2,), I32)),
+        (grad_mode((0,)),),
+        seed=55,
+    ),
 ]
 
 
@@ -1029,6 +1085,65 @@ def _self_check() -> None:
     print("SELF-CHECK: the comparison detects perturbed values, dtypes, shapes and arity")
 
 
+def _tuple_marker_check() -> None:
+    """The converter must hand Python tuple markers to native VERBATIM.
+
+    The Python serializer wraps every tuple as ``{"__evoxc_tuple__": [...]}``;
+    core decodes that marker by the declared attribute tag.  A converter that
+    flattened it (the removed ``_flatten_tuple_markers`` workaround) would hide
+    that decoding path from every case, so this pins the wire shape itself and
+    the corpus cases below pin that native accepts it: the `ints` tuples
+    (`gather.axes`, the three `slice` tuples) and the NESTED `nested_ints`
+    tuple (`pad.padding_config`) survive the round trip.
+    """
+    graph = evoxc.trace(
+        lambda x, idx: (
+            evoxc.gather(x, idx, axis=1),
+            evoxc.slice(x, 0, 2, strides=(1, 1)),
+            evoxc.pad(x, ((0, 1), (1, 0)), 0.5),
+        ),
+        _spec((3, 4)),
+        _spec((2,), I32),
+    )
+    envelope = convert.to_native(graph.module)
+    attributes = {
+        op["name"]: op["attributes"]
+        for op in envelope["ops"]
+        if op["name"] in ("gather", "slice", "pad")
+    }
+    expected = {
+        "gather": ("axes",),
+        "slice": ("start_indices", "limit_indices", "strides"),
+        "pad": ("padding_config",),
+    }
+
+    def marker(value) -> bool:
+        return isinstance(value, dict) and set(value) == {"__evoxc_tuple__"}
+
+    for op_name, keys in expected.items():
+        attrs = attributes.get(op_name)
+        if attrs is None:
+            raise AssertionError(f"tuple marker self-check: no {op_name} op")
+        for key in keys:
+            if not marker(attrs.get(key)):
+                raise AssertionError(
+                    f"tuple marker self-check: {op_name}.{key} reached the "
+                    f"envelope as {attrs.get(key)!r}, not a tuple marker"
+                )
+    rows = attributes["pad"]["padding_config"]["__evoxc_tuple__"]
+    if not all(marker(row) for row in rows):
+        raise AssertionError(
+            "tuple marker self-check: pad.padding_config lost its nested "
+            f"tuple markers: {rows!r}"
+        )
+    # The native decoder must accept the verbatim markers for these tags; the
+    # `tuple_*` corpus cases run real transforms over them.
+    print(
+        "SELF-CHECK: tuple attribute markers reach the envelope verbatim "
+        "(gather.axes, the slice triples, nested pad.padding_config)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # One case, one mode
 # ---------------------------------------------------------------------------
@@ -1248,6 +1363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     _self_check()
+    _tuple_marker_check()
     for case in selected_cases:
         run_case(case, stats)
     for deferral in selected_deferrals:

@@ -12,9 +12,12 @@ Two wire formats exist for the same IR:
   ``{"dtype": str, "shape": [ints], "data_b64": str}`` where ``data_b64`` is
   base64 of the array's RAW C-ORDER LITTLE-ENDIAN bytes (no NPY header).
 
-Everything else (dims, types, tuple markers, locations, block/op layout) is
-byte-compatible, so the conversion only rewrites ndarray payloads and the two
-top-level discriminators (``format``/``version`` plus ``sha256``/``constants``).
+Everything else (dims, types, locations, block/op layout) is byte-compatible,
+and tuple markers are passed through VERBATIM — the converter never flattens a
+``{"__evoxc_tuple__": [...]}`` marker, so native code decodes every tuple-valued
+attribute through its real tag-directed path.  The conversion therefore only
+rewrites ndarray payloads and the two top-level discriminators
+(``format``/``version`` plus ``sha256``/``constants``).
 """
 from __future__ import annotations
 
@@ -145,48 +148,6 @@ def _to_native_value(value, constants: dict):
     return value
 
 
-def _flatten_tuple_markers(value):
-    """Replace ``{"__evoxc_tuple__": [...]}`` by a plain list, recursively.
-
-    The native attribute model accepts the tuple marker under an ``any``
-    attribute (``AttrValue::Tuple``) but rejects it for a typed attribute
-    (``ints``/``nested_ints``/``shape``/…): ``AttrValue::matches_type`` has no
-    tuple case, so a Python ``reduce_sum.axes`` tuple never decodes.  The
-    list/tuple distinction carries no semantics for those attributes, so the
-    conversion normalizes them to the native list form (the native encoder then
-    returns a plain list, which the Python verifier accepts for the same schema
-    tag).  ``any`` attributes keep their marker untouched.
-    """
-    if isinstance(value, list):
-        return [_flatten_tuple_markers(item) for item in value]
-    if isinstance(value, dict):
-        keys = set(value.keys())
-        if keys == {_TUPLE_TAG}:
-            return [_flatten_tuple_markers(item) for item in value[_TUPLE_TAG]]
-        return {str(key): _flatten_tuple_markers(item) for key, item in value.items()}
-    return value
-
-
-def _normalize_typed_attributes(envelope: dict) -> None:
-    """Flatten tuple markers in every op attribute the native schema types."""
-    try:
-        from evoxc.ir.op_defs import opdef
-    except Exception:  # pragma: no cover - the harness always runs with evoxc
-        return
-    for op in envelope.get("ops", []):
-        try:
-            definition = opdef(op["name"])
-        except (KeyError, TypeError):
-            continue
-        types = {spec.name: spec.type for spec in definition.attributes}
-        attributes = op.get("attributes") or {}
-        for key, value in attributes.items():
-            # ``any`` attributes round-trip the tuple marker natively; every
-            # schema-typed attribute needs the plain-list form.
-            if types.get(key) != "any":
-                attributes[key] = _flatten_tuple_markers(value)
-
-
 def to_native(module) -> dict:
     """Convert a Python ``ir.Module`` into an ``evoxc-native-ir`` envelope."""
     from evoxc import ir
@@ -196,7 +157,6 @@ def to_native(module) -> dict:
     envelope = _to_native_value(body, payload.get("constants", {}))
     envelope["format"] = "evoxc-native-ir"
     envelope["version"] = 1
-    _normalize_typed_attributes(envelope)
     return envelope
 
 
