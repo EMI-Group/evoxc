@@ -56,7 +56,7 @@ Builtin graph transformations are one Rust implementation, reached through the `
 
 | Path | Area |
 |---|---|
-| `./NATIVE_ARCHITECTURE_PROPOSAL.md` | Proposed Rust-first target architecture, including native transform ownership and runtime/binding boundaries; design only, not current implementation or policy. |
+| `./NATIVE_ARCHITECTURE_PROPOSAL.md` | Rust-first target architecture (ownership, interfaces, transform semantics, runtime lifetimes, bindings, packaging). Its graph-transformation and packaging layers are implemented in `./native/` and the maturin build; its native inference/verification hot path, lowering and runtime sessions remain proposed. Where the document and `./CONTEXT.md` differ, this contract wins. |
 | `./evoxc/` | The package. Public API contract lives in `./evoxc/CONTEXT.md` — read it before touching anything. |
 | `./native/` | Rust workspace implementing the numerical authority — dtypes/dims/shapes, op schemas and inference, graph IR, the batching/vmap and AD (jvp/vjp/grad) engines, and the PyO3 extension `evoxc._evoxc_native` (compiled by maturin into the `evoxc` wheel). Binding contract (envelope + FFI + single-authority rules): `./native/CONTEXT.md`. |
 | `./scripts/` | Developer environment and build helpers (`dev-env.sh` for the NixOS/uv/CARGO_HOME setup, `build-native.sh` for the extension). |
