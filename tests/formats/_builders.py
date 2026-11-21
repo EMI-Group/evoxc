@@ -53,10 +53,6 @@ SAFETENSORS_WRITABLE_TAGS = tuple(
 )
 
 
-def safetensors_dtype(tag: str) -> np.dtype:
-    return np.dtype(SAFETENSORS_DTYPES[tag])
-
-
 def encode_safetensors_header(header) -> bytes:
     """Encode a header object exactly as the canonical writer does."""
     return json.dumps(
@@ -157,8 +153,6 @@ GGML_BLOCK = {
     14: (256, 210),
     30: (1, 2),
 }
-
-GGUF_QUANTIZED_IDS = tuple(t for t in GGML_BLOCK if GGML_BLOCK[t][0] > 1)
 
 # metadata value type ids (GGUF spec)
 UINT8, INT8, UINT16, INT16 = 0, 1, 2, 3
@@ -694,14 +688,3 @@ REFERENCE_QUANTIZERS = {
     6: quantize_q5_0,
     8: quantize_q8_0,
 }
-
-
-def real_file(candidates):
-    """First existing path among ``candidates`` (``None`` when none is present)."""
-    import os
-
-    for candidate in candidates:
-        path = os.path.expanduser(candidate)
-        if os.path.isfile(path):
-            return path
-    return None

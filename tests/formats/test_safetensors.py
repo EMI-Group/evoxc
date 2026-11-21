@@ -40,25 +40,16 @@ from evoxc.formats import (
     save_safetensors,
 )
 from tests.formats._builders import (
+    SAFETENSORS_DTYPES,
+    SAFETENSORS_WRITABLE_TAGS,
     build_safetensors,
     parse_safetensors,
     raw_safetensors,
 )
 
-#: every dtype the writer accepts, with its safetensors tag and numpy name.
+#: every dtype the writer accepts: (numpy dtype name, safetensors tag).
 WRITABLE_DTYPES = [
-    ("float64", "F64"),
-    ("float32", "F32"),
-    ("float16", "F16"),
-    ("int64", "I64"),
-    ("int32", "I32"),
-    ("int16", "I16"),
-    ("int8", "I8"),
-    ("uint64", "U64"),
-    ("uint32", "U32"),
-    ("uint16", "U16"),
-    ("uint8", "U8"),
-    ("bool", "BOOL"),
+    (np.dtype(SAFETENSORS_DTYPES[tag]).name, tag) for tag in SAFETENSORS_WRITABLE_TAGS
 ]
 
 _CHECKPOINT_PATTERNS = (

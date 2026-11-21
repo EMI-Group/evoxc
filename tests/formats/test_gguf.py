@@ -49,7 +49,6 @@ from tests.formats._builders import (
     align_up,
     build_gguf,
     build_gguf_detailed,
-    encode_string,
     ne_dims,
     reference_values,
     tensor_payload,
