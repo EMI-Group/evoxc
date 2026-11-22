@@ -56,7 +56,7 @@ use crate::graph::{
     Block, BlockId, Function, Location, Op, OpId, Program, Region, ValueId, ValueOwner,
 };
 use crate::infer;
-use crate::schema::{self, attr_type, AttrSchema, OpSchema};
+use crate::schema::{self, AttrSchema, OpSchema};
 use crate::value_type::ValueType;
 use crate::wire;
 
@@ -503,13 +503,14 @@ fn verify_op(program: &Program, op: &Op) -> Result<()> {
 
 /// Does `value` satisfy the declared attribute type tag?
 ///
-/// Same policy as `envelope::validate_attrs` / `infer::validate_attrs`: a
-/// nullable `INTS` attribute may be an explicit `Null` (the Python encoder
-/// emits `null` for `conv.strides`, `slice.strides`, `transpose.permutation`,
-/// ...).  `AttrValue::matches_type` already accepts `Null` under `INT`.
+/// Same policy as `envelope::validate_attrs` / `infer::validate_attrs`: the
+/// declared tag, refined by the schema's null policy — a nullable attribute
+/// (an `any` one, or an optional `int`/`ints` declared `default=None`, e.g.
+/// `conv.strides`, `slice.strides`, `transpose.permutation`, `flip.axes`,
+/// `nan_to_num.posinf`) may be an explicit `Null`, while a required attribute
+/// may not.
 fn attr_accepts(declared: &AttrSchema, value: &AttrValue) -> bool {
-    value.matches_type(declared.ty)
-        || (declared.ty == attr_type::INTS && matches!(value, AttrValue::Null))
+    declared.accepts(value)
 }
 
 fn verify_attrs(op: &Op, schema: &'static OpSchema, loc: Option<&Location>) -> Result<()> {

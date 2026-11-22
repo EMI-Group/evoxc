@@ -44,7 +44,7 @@ pub(crate) use common::*;
 use crate::attr::{AttrValue, Attrs};
 use crate::error::{Error, Result};
 use crate::graph::Program;
-use crate::schema::{self, attr_type, OpSchema};
+use crate::schema::{self, OpSchema};
 use crate::value_type::ValueType;
 
 /// Inferred context of one op: the caller-supplied result types and the
@@ -262,24 +262,22 @@ fn op_specific_result_types(
 // Attribute validation and default filling
 // ---------------------------------------------------------------------------
 
-/// Validate caller attributes against the op's declared schema (tolerant local
-/// validator; `attr.rs` is not modified).
+/// Validate caller attributes against the op's declared schema.
 ///
 /// Rejects unknown names, wrong type tags and missing required attributes with
-/// the same messages as `Attrs::validate`, with one deliberate exception: an
-/// `AttrValue::Null` under an `ints` attribute is accepted, because the Python
-/// encoder emits `null` for the nullable-default `ints` attributes
-/// (`conv.strides` / `input_dilation` / `kernel_dilation`, `slice.strides`,
-/// `transpose.permutation`).
+/// the same messages as `Attrs::validate`, and applies the same schema-aware
+/// null policy ([`crate::schema::AttrSchema::accepts`]): an `any` attribute or
+/// an optional `int`/`ints` attribute declared `default=None` may be
+/// `AttrValue::Null` (the Python encoder emits `null` for them:
+/// `flip.axes`/`roll.axis`/`matrix_rank.tol`/`nan_to_num.posinf`, `argmax.axis`,
+/// `conv.strides` / `input_dilation` / `kernel_dilation`, `slice.strides`,
+/// `transpose.permutation`); every other attribute requires a value.
 fn validate_attrs(op_name: &str, schema: &'static OpSchema, attrs: &Attrs) -> Result<()> {
     for (name, value) in attrs.iter() {
         let declared = schema.attr(name).ok_or_else(|| {
             Error::verification(format!("op '{op_name}' has no attribute {name:?}"))
         })?;
-        if value.matches_type(declared.ty) {
-            continue;
-        }
-        if declared.ty == attr_type::INTS && *value == AttrValue::Null {
+        if declared.accepts(value) {
             continue;
         }
         return Err(Error::verification(format!(

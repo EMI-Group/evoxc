@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::graph::{
     Block, BlockId, Function, Location, Op, OpId, Program, Region, Value, ValueId, ValueOwner,
 };
-use crate::schema::{self, attr_type, AttrSchema, OpSchema};
+use crate::schema::{self, AttrSchema, OpSchema};
 use crate::value_type::ValueType;
 use crate::wire;
 
@@ -38,25 +38,21 @@ pub const VERSION: u32 = 1;
 // ---------------------------------------------------------------------------
 
 /// True when `value` is acceptable for `declared` under the Python acceptance
-/// policy, extended with one documented tolerance: an `INTS` attribute whose
-/// declared default is JSON `null` (`conv.strides`, `slice.strides`,
-/// `transpose.permutation`, ...) also accepts an explicit JSON `null`, decoded
-/// as [`AttrValue::Null`].
+/// policy: the declared type tag, refined by the schema's null policy — an
+/// explicit JSON `null` (decoded as [`AttrValue::Null`]) is legal only for an
+/// `any` attribute and for the optional `int`/`ints` attributes declared
+/// `default=None` (`conv.strides`, `slice.strides`, `transpose.permutation`,
+/// `argmax.axis`, `flip.axes`, `nan_to_num.posinf`, ...).  See
+/// [`AttrSchema::accepts`].
 fn attr_accepts(declared: &AttrSchema, value: &AttrValue) -> bool {
-    if matches!(value, AttrValue::Null)
-        && declared.ty == attr_type::INTS
-        && declared.default_json == Some("null")
-    {
-        return true;
-    }
-    value.matches_type(declared.ty)
+    declared.accepts(value)
 }
 
 /// Decode an op's attribute map against its declared schema.
 ///
 /// Unknown names, missing required attributes and type mismatches are
-/// `VerificationError`s; a nullable-default `INTS` attribute may arrive as
-/// JSON `null` and decodes to [`AttrValue::Null`] (see [`attr_accepts`]).
+/// `VerificationError`s; a JSON `null` decodes to [`AttrValue::Null`] and is
+/// accepted only where the schema allows it (see [`attr_accepts`]).
 /// Defaults are *not* filled here — that is the builder's job.
 pub fn attrs_from_json(
     map: &Map<String, Json>,
@@ -67,16 +63,9 @@ pub fn attrs_from_json(
         let declared = op.attr(name).ok_or_else(|| {
             Error::verification(format!("op '{}' has no attribute {name:?}", op.name))
         })?;
-        let converted = if value.is_null()
-            && declared.ty == attr_type::INTS
-            && declared.default_json == Some("null")
-        {
-            AttrValue::Null
-        } else {
-            AttrValue::from_json(declared.ty, value).map_err(|err| {
-                err.context(format!("op '{}' attribute {name:?}", op.name))
-            })?
-        };
+        let converted = AttrValue::from_json(declared.ty, value).map_err(|err| {
+            err.context(format!("op '{}' attribute {name:?}", op.name))
+        })?;
         attrs.insert(name.clone(), converted);
     }
     validate_attrs(&attrs, op)?;
@@ -85,8 +74,8 @@ pub fn attrs_from_json(
 
 /// Validate an attribute map against an op schema.
 ///
-/// This is [`Attrs::validate`]'s policy plus the nullable-`INTS` tolerance
-/// documented on [`attrs_from_json`].
+/// This is [`Attrs::validate`]'s policy, i.e. the declared tags plus the
+/// schema's null policy documented on [`attr_accepts`].
 pub fn validate_attrs(attrs: &Attrs, op: &'static OpSchema) -> Result<()> {
     for (name, value) in attrs.iter() {
         let declared = op.attr(name).ok_or_else(|| {

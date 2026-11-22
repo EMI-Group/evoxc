@@ -447,6 +447,15 @@ idx_concatenate = evoxc.defn(lambda x, y: evoxc.concatenate([x, y], axis=1))
 idx_tile = evoxc.defn(lambda x: evoxc.tile(x, (2, 3)))
 
 idx_flip = evoxc.defn(lambda x: (evoxc.flip(x, (0,)), evoxc.flip(x, (0, 1))))
+# Nullable-attribute graphs: every `None` parameter below is serialized as an
+# explicit JSON `null` on the op (the registry's documented `default=None`).
+ew_nan_to_num = evoxc.defn(lambda x: evoxc.nan_to_num(x))
+ew_nan_to_num_explicit = evoxc.defn(lambda x: evoxc.nan_to_num(x, nan=7, posinf=1.0, neginf=-1.0))
+idx_flip_all_axes = evoxc.defn(lambda x: evoxc.flip(x, None))
+idx_roll_flat = evoxc.defn(lambda x: evoxc.roll(x, 3))
+idx_slice_default_strides = evoxc.defn(lambda x: evoxc.slice(x, (0, 1), (2, 3)))
+red_argmax_flat = evoxc.defn(lambda x: (evoxc.argmax(x), evoxc.argmin(x)))
+
 
 idx_roll = evoxc.defn(lambda x: (evoxc.roll(x, 2), evoxc.roll(x, (1, 2), axis=(0, 1))))
 
@@ -612,6 +621,7 @@ def build_cases() -> list:
 
     # ---- 1. elementwise ---------------------------------------------------
     nan_x = np.array([[np.nan, 1.0, -2.0, 3.5], [0.5, np.nan, 7.0, -1.0]], np.float32)
+    nan_inf = np.array([np.nan, np.inf, -np.inf, 1.0, -0.5], np.float32)
     nan_y = np.array([[2.0, np.nan, 1.0, -3.5], [np.nan, 2.5, -7.0, 1.0]], np.float32)
     rows += [
         ("ew_chain", "elementwise", ew_chain, (S((4, 5)), S((4, 5)))),
@@ -628,6 +638,15 @@ def build_cases() -> list:
         ("ew_int_divide", "elementwise", ew_int_divide, (S((3,), i32), S((3,), i32)), {
             "inputs": (np.array([7, -7, 0], np.int32), np.array([2, -2, 3], np.int32)),
             "note": "integral divide promotes to float64 (no error)"}),
+        ("ew_nan_to_num_defaults", "elementwise", ew_nan_to_num, (S((5,)),), {
+            "inputs": (nan_inf,),
+            "note": "posinf/neginf arrive as JSON null: the dtype's max/min finite value"}),
+        ("ew_nan_to_num_defaults_f16", "elementwise", ew_nan_to_num, (S((5,), evoxc.float16),), {
+            "inputs": (nan_inf.astype(np.float16),), "note": "f16 dtype bounds"}),
+        ("ew_nan_to_num_defaults_f64", "elementwise", ew_nan_to_num, (S((5,), f64),), {
+            "inputs": (nan_inf.astype(np.float64),)}),
+        ("ew_nan_to_num_explicit", "elementwise", ew_nan_to_num_explicit, (S((5,)),), {
+            "inputs": (nan_inf,)}),
         ("err_int_power_negative", "elementwise", ew_int_power_negative, (S((2,), i64), S((2,), i64)), {
             "inputs": (np.array([2, 3], np.int64), np.array([-1, -2], np.int64)),
             "note": "integer power with a negative exponent: both sides raise"}),
@@ -656,6 +675,14 @@ def build_cases() -> list:
         ("idx_concatenate", "indexing", idx_concatenate, (S((3, 2)), S((3, 3)))),
         ("idx_tile", "indexing", idx_tile, (S((2, 3)),)),
         ("idx_flip", "indexing", idx_flip, (S((3, 4)),)),
+        ("idx_flip_all_axes", "indexing", idx_flip_all_axes, (S((3, 4)),),
+         {"note": "flip axes=null reverses every axis"}),
+        ("idx_roll_flat", "indexing", idx_roll_flat, (S((3, 4)),),
+         {"note": "roll axis=null rolls the flattened array"}),
+        ("idx_slice_default_strides", "indexing", idx_slice_default_strides, (S((4, 5)),),
+         {"note": "slice strides=null walks with stride 1"}),
+        ("red_argmax_argmin_flat", "reductions", red_argmax_flat, (S((3, 4)),),
+         {"note": "argmax/argmin axis=null reduce over the flattened operand"}),
         ("idx_roll", "indexing", idx_roll, (S((3, 4)),)),
         ("idx_pad", "indexing", idx_pad, (S((2, 3)),)),
         ("idx_diag", "indexing", idx_diag, (S((3,)),), {"inputs": (np.array([1.0, -2.0, 3.5], np.float32),)}),
