@@ -18,15 +18,17 @@
 //! * `cumsum`/`cumprod` preserve the operand dtype and honor `reverse`
 //!   (accumulate from the end toward the start).
 //!
-//! Performance shape: the layout is one ndarray lane walk (kept axes permuted
-//! first, reduced axes last, `axis_iter` recursion), folding each output lane
-//! through the multi-accumulator fold.  A contiguous reduced block with
-//! `inner > 1` (a leading / middle-axis reduction the general walk would visit
-//! as long strided lanes) takes the [`Block`] specialization, accumulating its
-//! `inner` output lanes row by row.  The two agree bit-for-bit for integer, bool,
-//! float16 and complex folds — reassociation is exact for wrapping integers and
-//! those dtypes stay on one sequential lane — and only float32/float64 sums move
-//! inside the parity tolerance's documented window.
+//! Performance shape: a contiguous reduced block — the `outer x red x inner`
+//! layout of every real reduce, including `inner == 1` — is folded flat by
+//! [`fold_block`] ([`flat`]), one pass over the slice with no per-lane view
+//! construction.  Every other layout (a gapped reduced axis pair, or nothing
+//! reduced at all) takes the ndarray lane walk (kept axes permuted first, reduced
+//! axes last, `axis_iter` recursion), folding each output lane through the
+//! multi-accumulator fold; that walk is the reference the flat fold is pinned
+//! against.  The two agree bit-for-bit for integer, bool, float16 and complex
+//! folds — reassociation is exact for wrapping integers and those dtypes stay on
+//! one sequential lane — and only float32/float64 sums move inside the parity
+//! tolerance's documented window.
 //!
 //! Every result shape is the DECLARED result shape evaluated by the runtime
 //! ([`util::result_shape`]); a kernel never re-derives one.  Combinations the
@@ -36,6 +38,7 @@
 
 mod argmax;
 mod cumulative;
+mod flat;
 mod layout;
 
 use evoxc_core::{DType, Error, Result};
@@ -51,9 +54,8 @@ use crate::with_type;
 
 use argmax::arg_kernel;
 use cumulative::cumulative_kernel;
-use layout::{
-    expect_rank, fold_all, fold_contiguous_block, fold_first, reduce_mask, Block, FoldSelect,
-};
+use flat::fold_block;
+use layout::{expect_rank, fold_all, fold_first, reduce_mask, Block, FoldSelect};
 
 pub fn register(map: &mut KernelMap) {
     for name in [
@@ -194,36 +196,35 @@ fn compute_reduce<T: Num + FoldSelect + NdScalar>(
     values: &[T],
     in_shape: &[usize],
 ) -> Result<Buffer> {
-    // The contiguous-block specialization owns a reduced block with `inner > 1`
-    // (a leading / middle-axis reduction the general walk would visit as long
-    // strided lanes); every other axis pattern — including a `red == 0` empty
-    // reduced axis, which the general path's identity / zero-size rules handle —
-    // takes the ndarray lane walk.
-    let block = Block::new(in_shape, request.reduced).filter(|block| block.inner > 1 && block.red > 0);
+    // The flat block fold owns every contiguous reduced block (any `inner`,
+    // including the trailing-axis `inner == 1` rows); every other axis pattern —
+    // including a `red == 0` empty reduced axis, which the general path's
+    // identity / zero-size rules handle — takes the ndarray lane walk.
+    let block = Block::new(in_shape, request.reduced).filter(|block| block.inner > 0 && block.red > 0);
     let folded = match request.kind {
         Kind::Sum => match &block {
-            Some(block) => fold_contiguous_block(values, in_shape, block, Some(T::zero()), |a, b| a.add(b))?,
+            Some(block) => fold_block(values, block, Some(T::zero()), |a, b| a.add(b))?,
             None => fold_all(values, in_shape, request.reduced, T::zero(), |a, b| a.add(b))?,
         },
         Kind::Prod => match &block {
-            Some(block) => fold_contiguous_block(values, in_shape, block, Some(T::one()), |a, b| a.mul(b))?,
+            Some(block) => fold_block(values, block, Some(T::one()), |a, b| a.mul(b))?,
             None => fold_all(values, in_shape, request.reduced, T::one(), |a, b| a.mul(b))?,
         },
         Kind::Max => match &block {
-            Some(block) => fold_contiguous_block(values, in_shape, block, None, |a, b| a.select_max(b))?,
+            Some(block) => fold_block(values, block, None, |a, b| a.select_max(b))?,
             None => fold_first(request.name, "maximum", values, in_shape, request.reduced, |a, b| {
                 a.select_max(b)
             })?,
         },
         Kind::Min => match &block {
-            Some(block) => fold_contiguous_block(values, in_shape, block, None, |a, b| a.select_min(b))?,
+            Some(block) => fold_block(values, block, None, |a, b| a.select_min(b))?,
             None => fold_first(request.name, "minimum", values, in_shape, request.reduced, |a, b| {
                 a.select_min(b)
             })?,
         },
         Kind::Mean => {
             let sums = match &block {
-                Some(block) => fold_contiguous_block(values, in_shape, block, Some(T::zero()), |a, b| a.add(b))?,
+                Some(block) => fold_block(values, block, Some(T::zero()), |a, b| a.add(b))?,
                 None => fold_all(values, in_shape, request.reduced, T::zero(), |a, b| a.add(b))?,
             };
             divide_by(request.acc_dtype, sums, request.count)

@@ -1,10 +1,10 @@
 //! `argmax` / `argmin`: one index per output, numpy's first-occurrence tie-break
 //! and its first-NaN rule, with the length-dispatched branchy/branchless scans.
 use evoxc_core::{DType, Error, Result};
-use ndarray::{Array1, ArrayViewD, Axis, Zip};
+use ndarray::ArrayViewD;
 use num_complex::Complex;
 
-use crate::buffer::{array_view, Buffer, NdScalar, Storage};
+use crate::buffer::{Buffer, NdScalar, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
@@ -70,12 +70,10 @@ fn compute_arg<T: Scalar + ArgOrd + NdScalar>(
         )));
     }
     let indices = match Block::new(in_shape, reduced) {
-        // The contiguous-block specialization: a leading / middle-axis reduction
-        // folds its `inner` output lanes row by row, the winner's row position
-        // being its reported index.
-        Some(block) if block.red > 0 && block.inner > 1 => {
-            arg_group_block(values, in_shape, &block, want_max)?
-        }
+        // The flat contiguous-block specialization: every output lane is a
+        // stride-`inner` walk of one `red * inner` group, scanned in place for
+        // its winning row (which IS the reported index).
+        Some(block) if block.red > 0 && block.inner > 0 => arg_group_block(values, &block, want_max),
         // The general lane walk: each output lane is an arg scan over its reduced
         // positions in C order, so the scanned position IS the reported index.
         _ => {
@@ -124,42 +122,51 @@ fn arg_iter<T: ArgOrd, I: IntoIterator<Item = T>>(iter: I, want_max: bool) -> i6
     best_index
 }
 
-/// One contiguous reduced block reducing into `inner` output lanes: each lane
-/// walks its positions in operand order, so the tie and NaN rules are exactly
-/// the sequential ones.  Output order is C order (outer, then inner).
-fn arg_group_block<T: ArgOrd + NdScalar>(
-    values: &[T],
-    shape: &[usize],
-    block: &Block,
-    want_max: bool,
-) -> Result<Vec<i64>> {
-    let view = array_view(values, shape)?;
-    let groups = view
-        .to_shape((block.outer, block.red, block.inner))
-        .map_err(|error| {
-            Error::shape(format!(
-                "contiguous arg block {}x{}x{} does not reshape the operand: {error}",
-                block.outer, block.red, block.inner
-            ))
-        })?;
+/// One contiguous reduced block: `inner == 1` scans each group's contiguous run
+/// with [`arg_run`], and `inner > 1` scans its `inner` output lanes row by row,
+/// the winner's row position being its reported index.  Both spellings follow the
+/// sequential operand order, so the tie and NaN rules are exactly the ones the
+/// ndarray lane walk reports; output order is C order (outer, then inner).
+fn arg_group_block<T: ArgOrd + NdScalar>(values: &[T], block: &Block, want_max: bool) -> Vec<i64> {
     let mut out = Vec::with_capacity(block.out_len());
-    for group in groups.axis_iter(Axis(0)) {
-        let mut best = group.index_axis(Axis(0), 0).to_owned();
-        let mut indices = Array1::from_elem(block.inner, 0i64);
-        for (position, row) in group.axis_iter(Axis(0)).enumerate().skip(1) {
-            Zip::from(&mut best)
-                .and(&mut indices)
-                .and(&row)
-                .for_each(|slot, index, &value| {
-                    if arg_better(*slot, value, want_max) {
-                        *slot = value;
-                        *index = position as i64;
-                    }
-                });
-        }
-        out.extend(indices.iter().copied());
+    if block.red == 0 || block.inner == 0 {
+        return out;
     }
-    Ok(out)
+    let group_len = block.red * block.inner;
+    if block.inner == 1 {
+        for group in values.chunks_exact(group_len) {
+            out.push(arg_run(group, want_max) as i64);
+        }
+        return out;
+    }
+    // One running best per output lane of a group, reused across groups so a
+    // column arg-max pays no allocation per group.
+    let mut best: Vec<T> = Vec::with_capacity(block.inner);
+    let mut indices = vec![0i64; block.inner];
+    for group in values.chunks_exact(group_len) {
+        let mut rows = group.chunks_exact(block.inner);
+        match rows.next() {
+            Some(first) => {
+                best.clear();
+                best.extend_from_slice(first);
+            }
+            // `red > 0`, so a group always has its first row.
+            None => break,
+        }
+        indices.fill(0);
+        for (position, row) in rows.enumerate() {
+            let position = (position + 1) as i64;
+            let slots = best.iter_mut().zip(indices.iter_mut()).zip(row);
+            for ((slot, index), value) in slots {
+                if arg_better(*slot, *value, want_max) {
+                    *slot = *value;
+                    *index = position;
+                }
+            }
+        }
+        out.extend_from_slice(&indices);
+    }
+    out
 }
 
 /// The typed comparison an arg reduction scans with.
@@ -319,7 +326,8 @@ mod tests {
     use super::super::layout::axis_permutation;
     use super::super::test_support::{arg_op, buffer};
     use super::*;
-    use crate::buffer::Storage;
+    use crate::buffer::{array_view, Storage};
+    use ndarray::{Axis, Zip};
 
     /// The independent ndarray reference: permute kept-first, reshape to
     /// `(kept, red)`, zip each value with its C-order reduced index and fold each

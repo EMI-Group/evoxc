@@ -9,15 +9,15 @@
 //! contiguous slice and reproduces the identical rotation element-by-element on
 //! a strided lane.
 //!
-//! [`fold_contiguous_block`] is the one documented SPECIALIZATION: a contiguous
-//! reduced block with `inner > 1` (a leading / middle-axis reduction) that the
-//! general walk would visit as long strided lanes instead accumulates its
-//! `inner` output lanes row by row.  Both paths implement the SAME semantics and
-//! must stay bit-for-bit equivalent for integer, bool, float16 and complex folds;
-//! only float32/float64 sums may move inside the documented parity window (the
-//! per-lane 8-accumulator reassociation).
+//! The flat fold of a contiguous reduced block ([`super::flat::fold_block`]) is
+//! the one documented SPECIALIZATION of this walk: it folds a `Block` layout
+//! straight off the operand slice, with no per-lane view construction.  This
+//! module keeps the ndarray lane walk as its reference for every other layout,
+//! and the two implement the SAME semantics — bit-for-bit equivalent for
+//! integer, bool, float16 and complex folds; only float32/float64 sums may move
+//! inside the documented parity window (the 8-accumulator reassociation).
 use evoxc_core::{DType, Error, Result};
-use ndarray::{Array1, ArrayViewD, Axis, Zip};
+use ndarray::{ArrayViewD, Axis};
 use num_complex::Complex;
 
 use crate::buffer::{array_view, shape_text, NdScalar};
@@ -80,10 +80,9 @@ pub(super) fn reduced_extent(shape: &[usize], reduced: &[bool]) -> usize {
 /// Such an operand is `outer` consecutive groups of `red * inner` elements, and
 /// each group is `red` interleaved runs of `inner` consecutive lanes: the
 /// elements folded into output lane `i` of a group are `group[k * inner + i]`
-/// for `k in 0..red`.  Only the `inner > 1` case is worth specialising
-/// ([`fold_contiguous_block`], [`fold_lane`]'s caller); `inner == 1` (a trailing
-/// axis or full reduction) is a contiguous per-lane run the general walk already
-/// folds through [`fold_run`].
+/// for `k in 0..red`.  Every such layout is folded flat by
+/// [`fold_block`](super::flat::fold_block): `inner == 1` is a contiguous per-lane
+/// run and `inner > 1` accumulates the group's `inner` lanes row by row.
 pub(super) struct Block {
     /// Groups of `red * inner` elements, one group per `inner` outputs.
     pub(super) outer: usize,
@@ -170,7 +169,7 @@ where
 /// element), which is why a full `reduce_sum` used to run ~14x slower than
 /// numpy's pairwise sum; [`LANE_COUNT`] accumulators make the chains
 /// independent, which is what lets the loop reach the memory bound.
-const LANE_COUNT: usize = 8;
+pub(super) const LANE_COUNT: usize = 8;
 
 /// Lanes one lane fold uses for an accumulator of `dtype`.
 ///
@@ -179,7 +178,7 @@ const LANE_COUNT: usize = 8;
 /// Float16 folds IN float16 and complex in complex, where the parity contract's
 /// ulp window is tighter than a reassociated sum can honour, so those keep the
 /// interpreter's exact sequential order.
-fn fold_lanes(dtype: DType) -> usize {
+pub(super) fn fold_lanes(dtype: DType) -> usize {
     if matches!(dtype, DType::Float16 | DType::Complex64 | DType::Complex128) {
         1
     } else {
@@ -195,7 +194,7 @@ fn fold_lanes(dtype: DType) -> usize {
 /// `max`/`min` are NaN-propagating in both directions and idempotent, so
 /// reordering only moves float32/float64 sums inside their documented tolerance.
 #[inline]
-fn fold_run<T: Num, F: Fn(T, T) -> T + Copy>(values: &[T], init: T, op: F, lanes: usize) -> T {
+pub(super) fn fold_run<T: Num, F: Fn(T, T) -> T + Copy>(values: &[T], init: T, op: F, lanes: usize) -> T {
     if lanes == LANE_COUNT {
         fold_run_lanes::<T, F, LANE_COUNT>(values, init, op)
     } else {
@@ -297,7 +296,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// The per-op folds (general lane walk + the contiguous-block specialization)
+// The per-op folds of the general lane walk
 // ---------------------------------------------------------------------------
 
 /// Fold every output lane into its slot, starting from `init` (the reduction's
@@ -348,54 +347,6 @@ where
         out.push(fold_first_lane(&view, op, lanes));
         Ok(())
     })?;
-    Ok(out)
-}
-
-/// The contiguous-block specialization: fold every output of a `Block` whose
-/// `inner > 1`, accumulating the `inner` output lanes of each group row by row.
-///
-/// `identity` is the reduction's identity element (`0` for sum, `1` for prod);
-/// `None` seeds each group from its FIRST row, which is how max/min fold without
-/// an identity.  Output order is C order (outer, then inner).
-pub(super) fn fold_contiguous_block<T, F>(
-    values: &[T],
-    shape: &[usize],
-    block: &Block,
-    identity: Option<T>,
-    op: F,
-) -> Result<Vec<T>>
-where
-    T: Num + NdScalar,
-    F: Fn(T, T) -> T + Copy,
-{
-    let view = array_view(values, shape)?;
-    let groups = view
-        .to_shape((block.outer, block.red, block.inner))
-        .map_err(|error| {
-            Error::shape(format!(
-                "contiguous reduction block {}x{}x{} does not reshape the operand: {error}",
-                block.outer, block.red, block.inner
-            ))
-        })?;
-    let seed_from_first_row = identity.is_none();
-    let mut out = Vec::with_capacity(block.out_len());
-    for group in groups.axis_iter(Axis(0)) {
-        let mut acc = match identity {
-            Some(init) => Array1::from_elem(block.inner, init),
-            None => group.index_axis(Axis(0), 0).to_owned(),
-        };
-        let mut rows = group.axis_iter(Axis(0));
-        if seed_from_first_row {
-            // The first row already seeded the accumulators.
-            rows.next();
-        }
-        for row in rows {
-            Zip::from(&mut acc)
-                .and(&row)
-                .for_each(|slot, &value| *slot = op(*slot, value));
-        }
-        out.extend(acc.iter().copied());
-    }
     Ok(out)
 }
 
@@ -592,8 +543,9 @@ mod tests {
         .collect()
     }
 
-    /// The general (ndarray) reference fold — the same per-lane sequential fold
-    /// the specialization replaced, kept here as the independent oracle.
+    /// The general (ndarray) reference fold — one sequential per-lane fold, kept
+    /// here as the independent oracle for the kernels' flat block fold
+    /// ([`super::flat::fold_block`]) as well as for the lane walk itself.
     fn general<T: Num + FoldSelect + NdScalar>(
         kind: Kind,
         values: &[T],
