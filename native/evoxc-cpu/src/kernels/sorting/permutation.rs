@@ -4,12 +4,23 @@
 //! scalar type produces the axis-local position vector, and
 //! [`permuted_storage`] / [`index_storage`] turn it into the `sort` /
 //! `argsort` result storage.
+//!
+//! The axis/layout walk is ndarray's: the operand and the permutation are
+//! viewed as [`ndarray::ArrayViewD`] (a zero-copy borrow of the C-contiguous
+//! storage) and the work runs lane by lane over `lanes(Axis(axis))` — one 1-D
+//! view per axis segment, yielded in C order — so no hand-written segment
+//! base/stride arithmetic lives here.  A contiguous lane (the last-axis case)
+//! is read straight off its `as_slice`; any other lane is gathered once per
+//! call into one reused scratch, exactly as before.  The order-preserving `u64`
+//! key table ([`RowKey`]) and the Batcher network ([`order_keys`]) are the ordering
+//! algorithms ndarray does not provide and stay as their own specializations.
 
 use evoxc_core::{DType, Error, Result};
 use half::f16;
+use ndarray::{ArrayView1, ArrayViewMut1, Axis};
 use num_complex::Complex;
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::{array_view, array_view_mut, Buffer, NdScalar, Storage};
 
 #[cfg(doc)]
 use super::network::{NETWORK_MAX, PAD_KEY};
@@ -25,28 +36,27 @@ use super::complex_unordered;
 ///
 /// Each entry of the returned vector is, at the output's flat position, the
 /// operand's index WITHIN its sorted axis segment — numpy's `argsort` result;
-/// [`gather_segments`] turns it into the operand's flat offset for `sort`.
+/// [`sorted_values`] turns it into the operand's flat offset for `sort`.
 /// Ties keep first-occurrence order (`sort_unstable` over keys that carry the
 /// original index, so the order is total and reproducible), and `descending`
 /// reverses every segment, exactly the reference's ascending result flipped
 /// along the axis.
-fn sorted_positions<T: RowKey>(
+fn sorted_positions<T: RowKey + NdScalar>(
     all: &[T],
     shape: &[usize],
     axis: usize,
     descending: bool,
-) -> Vec<u32> {
+) -> Result<Vec<u32>> {
     let extent = shape[axis];
-    let inner: usize = shape[axis + 1..].iter().product();
-    let outer: usize = shape[..axis].iter().product();
     // Positions are axis-local, so `u32` suffices for any axis the caller
     // accepted ([`permutation`] rejects an extent above `u32::MAX`); the narrow
     // width halves this buffer's traffic, which measurably beats `usize` here.
     let mut perm = vec![0u32; all.len()];
     // A zero- or one-element axis segment is already sorted and reversing it is
-    // a no-op, so the zero-initialized permutation is the answer.
-    if extent < 2 || inner == 0 || outer == 0 {
-        return perm;
+    // a no-op, so the zero-initialized permutation (identity for `extent <= 1`)
+    // is the answer.
+    if extent < 2 || all.is_empty() {
+        return Ok(perm);
     }
     // Scratch, sized once per call and reused for every segment: on the stack
     // for the extents this engine sees most, on the heap beyond that.  The key
@@ -75,27 +85,34 @@ fn sorted_positions<T: RowKey>(
         heap_positions.resize(extent, 0);
         (&mut heap_keys[..], &mut heap_order[..], &mut heap_positions[..])
     };
+    // A gathered (non-contiguous) lane lands in this one scratch, reused across
+    // every segment; a contiguous lane is read straight off its `as_slice`.
     let mut scratch: Vec<T> = Vec::new();
-    let segment_len = extent * inner;
-    for segment in 0..outer * inner {
-        let base = (segment / inner) * segment_len + segment % inner;
-        let segment: &[T] = if inner == 1 {
-            &all[base..base + extent]
-        } else {
-            scratch.clear();
-            scratch.extend((0..extent).map(|position| all[base + position * inner]));
-            &scratch
+    let view = array_view::<T>(all, shape)?;
+    let mut perm_view = array_view_mut::<u32>(&mut perm, shape)?;
+    for (out_lane, in_lane) in perm_view
+        .lanes_mut(Axis(axis))
+        .into_iter()
+        .zip(view.lanes(Axis(axis)))
+    {
+        let segment: &[T] = match in_lane.as_slice() {
+            Some(slice) => slice,
+            None => {
+                scratch.clear();
+                scratch.extend(in_lane.iter().copied());
+                &scratch
+            }
         };
         segment_positions(segment, positions, descending, keys, order);
-        if inner == 1 {
-            perm[base..base + extent].copy_from_slice(positions);
-        } else {
-            for (position, index) in positions.iter().enumerate() {
-                perm[base + position * inner] = *index;
-            }
-        }
+        assign_positions(out_lane, positions);
     }
-    perm
+    Ok(perm)
+}
+
+/// Write one lane's sorted positions into the output lane (a view assignment,
+/// so a strided middle axis and a contiguous last axis take the same path).
+fn assign_positions(mut out_lane: ArrayViewMut1<'_, u32>, positions: &[u32]) {
+    out_lane.assign(&ArrayView1::from(positions));
 }
 
 /// Order one gathered segment into `positions`: `positions[p]` is the segment's
@@ -163,18 +180,18 @@ pub(crate) fn permutation(
         )));
     }
     let perm = match &input.storage {
-        Storage::Bool(values) => sorted_positions(values, shape, axis, descending),
-        Storage::I8(values) => sorted_positions(values, shape, axis, descending),
-        Storage::I16(values) => sorted_positions(values, shape, axis, descending),
-        Storage::I32(values) => sorted_positions(values, shape, axis, descending),
-        Storage::I64(values) => sorted_positions(values, shape, axis, descending),
-        Storage::U8(values) => sorted_positions(values, shape, axis, descending),
-        Storage::U16(values) => sorted_positions(values, shape, axis, descending),
-        Storage::U32(values) => sorted_positions(values, shape, axis, descending),
-        Storage::U64(values) => sorted_positions(values, shape, axis, descending),
-        Storage::F16(values) => sorted_positions(values, shape, axis, descending),
-        Storage::F32(values) => sorted_positions(values, shape, axis, descending),
-        Storage::F64(values) => sorted_positions(values, shape, axis, descending),
+        Storage::Bool(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::I8(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::I16(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::I32(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::I64(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::U8(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::U16(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::U32(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::U64(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::F16(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::F32(values) => sorted_positions(values, shape, axis, descending)?,
+        Storage::F64(values) => sorted_positions(values, shape, axis, descending)?,
         Storage::C64(_) | Storage::C128(_) => return Err(complex_unordered(op, input.dtype)),
     };
     Ok(perm)
@@ -192,53 +209,76 @@ pub(crate) fn permuted_storage(
     axis: usize,
     op: &str,
 ) -> Result<Storage> {
-    let extent = shape[axis];
-    let inner: usize = shape[axis + 1..].iter().product();
     let storage = match &input.storage {
-        Storage::Bool(values) => Storage::Bool(gather_segments(values, perm, extent, inner)),
-        Storage::I8(values) => Storage::I8(gather_segments(values, perm, extent, inner)),
-        Storage::I16(values) => Storage::I16(gather_segments(values, perm, extent, inner)),
-        Storage::I32(values) => Storage::I32(gather_segments(values, perm, extent, inner)),
-        Storage::I64(values) => Storage::I64(gather_segments(values, perm, extent, inner)),
-        Storage::U8(values) => Storage::U8(gather_segments(values, perm, extent, inner)),
-        Storage::U16(values) => Storage::U16(gather_segments(values, perm, extent, inner)),
-        Storage::U32(values) => Storage::U32(gather_segments(values, perm, extent, inner)),
-        Storage::U64(values) => Storage::U64(gather_segments(values, perm, extent, inner)),
-        Storage::F16(values) => Storage::F16(gather_segments(values, perm, extent, inner)),
-        Storage::F32(values) => Storage::F32(gather_segments(values, perm, extent, inner)),
-        Storage::F64(values) => Storage::F64(gather_segments(values, perm, extent, inner)),
+        Storage::Bool(values) => Storage::Bool(sorted_values(values, perm, shape, axis)?),
+        Storage::I8(values) => Storage::I8(sorted_values(values, perm, shape, axis)?),
+        Storage::I16(values) => Storage::I16(sorted_values(values, perm, shape, axis)?),
+        Storage::I32(values) => Storage::I32(sorted_values(values, perm, shape, axis)?),
+        Storage::I64(values) => Storage::I64(sorted_values(values, perm, shape, axis)?),
+        Storage::U8(values) => Storage::U8(sorted_values(values, perm, shape, axis)?),
+        Storage::U16(values) => Storage::U16(sorted_values(values, perm, shape, axis)?),
+        Storage::U32(values) => Storage::U32(sorted_values(values, perm, shape, axis)?),
+        Storage::U64(values) => Storage::U64(sorted_values(values, perm, shape, axis)?),
+        Storage::F16(values) => Storage::F16(sorted_values(values, perm, shape, axis)?),
+        Storage::F32(values) => Storage::F32(sorted_values(values, perm, shape, axis)?),
+        Storage::F64(values) => Storage::F64(sorted_values(values, perm, shape, axis)?),
         Storage::C64(_) | Storage::C128(_) => return Err(complex_unordered(op, input.dtype)),
     };
     Ok(storage)
 }
 
-/// The `sort` result: each output slot reads `values[base + index * inner]`,
-/// where `index` is the slot's axis-local position from the permutation.
-fn gather_segments<T: Copy>(values: &[T], perm: &[u32], extent: usize, inner: usize) -> Vec<T> {
-    let mut out = Vec::with_capacity(perm.len());
-    if extent == 0 || inner == 0 || values.is_empty() {
-        return out;
+/// The `sort` result: every lane of the output is the operand's lane gathered
+/// through that lane's positions.
+///
+/// The last axis is the common hot path — its lanes are contiguous and appear
+/// in C order, so gathering them lane by lane appends the result straight into
+/// a fresh allocation with no fill pass.  Any other axis writes each gathered
+/// lane into the output's own (strided) lane through an ndarray view
+/// assignment, starting from a copy of the values so every slot is defined.
+fn sorted_values<T: NdScalar>(
+    values: &[T],
+    perm: &[u32],
+    shape: &[usize],
+    axis: usize,
+) -> Result<Vec<T>> {
+    if values.is_empty() {
+        return Ok(Vec::new());
     }
-    if inner == 1 {
-        // Contiguous rows: one chunk of `extent` positions per segment.
-        for (outer_index, positions) in perm.chunks_exact(extent).enumerate() {
-            let base = outer_index * extent;
-            out.extend(positions.iter().map(|&index| values[base + index as usize]));
+    let view = array_view::<T>(values, shape)?;
+    let perm_view = array_view::<u32>(perm, shape)?;
+    let mut scratch: Vec<T> = Vec::new();
+    if axis + 1 == shape.len() {
+        let mut out: Vec<T> = Vec::with_capacity(values.len());
+        for (in_lane, perm_lane) in view
+            .lanes(Axis(axis))
+            .into_iter()
+            .zip(perm_view.lanes(Axis(axis)))
+        {
+            let segment: &[T] = match in_lane.as_slice() {
+                Some(slice) => slice,
+                None => {
+                    scratch.clear();
+                    scratch.extend(in_lane.iter().copied());
+                    &scratch
+                }
+            };
+            out.extend(perm_lane.iter().map(|&index| segment[index as usize]));
         }
-        return out;
+        return Ok(out);
     }
-    // A strided axis: the segments' output slots interleave, so start from a
-    // copy and assign every slot (each one is written exactly once).
     let mut out = values.to_vec();
-    let segment_len = extent * inner;
-    for segment in 0..perm.len() / extent {
-        let base = (segment / inner) * segment_len + segment % inner;
-        for position in 0..extent {
-            let slot = base + position * inner;
-            out[slot] = values[base + perm[slot] as usize * inner];
-        }
+    let mut out_view = array_view_mut::<T>(&mut out, shape)?;
+    for ((mut out_lane, in_lane), perm_lane) in out_view
+        .lanes_mut(Axis(axis))
+        .into_iter()
+        .zip(view.lanes(Axis(axis)))
+        .zip(perm_view.lanes(Axis(axis)))
+    {
+        scratch.clear();
+        scratch.extend(perm_lane.iter().map(|&index| in_lane[index as usize]));
+        out_lane.assign(&ArrayView1::from(&scratch[..]));
     }
-    out
+    Ok(out)
 }
 
 /// The `argsort` result storage: the axis-local positions cast into `dtype`

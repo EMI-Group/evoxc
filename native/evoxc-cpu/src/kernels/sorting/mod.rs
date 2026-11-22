@@ -576,4 +576,83 @@ mod tests {
         let err = sort_err(&x, &[("stable", AttrValue::Int(1))]);
         assert_eq!(err.kind_str(), "VerificationError");
     }
+
+    /// Pin the ndarray lane walk (contiguous last-axis append AND strided
+    /// middle/first-axis view assignment) against the independent per-segment
+    /// reference walk on a deterministic pseudo-random multi-axis input, in
+    /// several dtypes including `f16`, `bool` and NaN/signed-zero `f32`.
+    #[test]
+    fn ndarray_lane_walk_matches_the_manual_segment_reference() {
+        // A three-axis shape exercises every lane layout: the last axis is
+        // contiguous (fresh-append path), the first and middle axes are strided
+        // (view-assignment path).
+        let shape = [6usize, 5, 7];
+        let count: usize = shape.iter().product();
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // f32 with duplicates, NaN and both signed zeros mixed in, so the key
+        // transform's NaN-last / -0.0==+0.0 ties are exercised.
+        let floats: Vec<f32> = (0..count)
+            .map(|slot| match slot % 11 {
+                0 => f32::NAN,
+                1 => -0.0,
+                2 => 0.0,
+                3 | 4 => 2.5,
+                _ => (next() % 41) as f32 - 20.0,
+            })
+            .collect();
+        assert_matches_reference(&floats, &shape);
+        let half: Vec<f16> = floats.iter().map(|&value| f16::from_f32(value)).collect();
+        assert_matches_reference(&half, &shape);
+        let ints: Vec<i64> = (0..count).map(|_| (next() % 101) as i64 - 50).collect();
+        assert_matches_reference(&ints, &shape);
+        let bools: Vec<bool> = (0..count).map(|_| next() & 1 == 0).collect();
+        assert_matches_reference(&bools, &shape);
+    }
+
+    /// Measurement aid (never asserts a speed): prints ns per segment for the
+    /// contiguous last-axis path and the strided first/middle-axis path.
+    /// Run with `cargo test --release -p evoxc-cpu bench_lane_walk -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement aid: prints ns/segment for the ndarray lane walk"]
+    fn bench_lane_walk() {
+        use std::time::Instant;
+        fn run_case(shape: &[usize], axis: usize) {
+            let count: usize = shape.iter().product();
+            let segments: usize = count / shape[axis];
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let values: Vec<f32> = (0..count)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % 1000) as f32 * 0.01
+                })
+                .collect();
+            let input = buffer(DType::Float32, shape, Storage::F32(values));
+            for _ in 0..5 {
+                let _ = sorted_with(&input, axis as i64, false);
+            }
+            let mut best = f64::INFINITY;
+            let reps = 20;
+            for _ in 0..reps {
+                let start = Instant::now();
+                let _ = sorted_with(&input, axis as i64, false);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            println!(
+                "{shape:?} axis {axis}: {segments} segments, {:.1} ns/segment",
+                best * 1e9 / segments as f64
+            );
+        }
+        run_case(&[262_144, 2], 1);
+        run_case(&[131_072, 8], 1);
+        run_case(&[131_072, 4, 2], 1);
+        run_case(&[8_192, 4], 0);
+    }
 }
