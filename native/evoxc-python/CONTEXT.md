@@ -86,9 +86,9 @@ Input arity/dtype/shape are validated by the engine at the run boundary (`Backen
 
 ### numpy interop
 
-There is deliberately no `numpy` crate: the newest one (0.28) needs pyo3 0.28 while this crate pins pyo3 0.30, so the boundary carries raw little-endian bytes and numpy is reached only as a lazily imported Python module (`NUMPY: PyOnceLock<Py<PyModule>>`, imported once per process and never by `import evoxc`).
-`half` and `num-complex` are direct dependencies only to type the `Storage` variants (same semver as `evoxc-cpu`, so cargo unifies them).
-The borrowed view in, the bulk copy out, the size threshold, the `unsafe` arguments and the measured floor are the "Buffer hand-off (native CPU engine)" section below.
+Arrays cross through the `numpy` 0.30 crate as TYPED payloads (`numpy = { version = "0.30", features = ["half"] }` + `ndarray = "0.17"`): numpy 0.30 pairs with this crate's pyo3 0.30, and its C-API is imported lazily on the first array use, so `import evoxc` still touches neither numpy nor the crate.
+`half` and `num-complex` stay direct dependencies because they type the `Storage` variants — the same crates and semver numpy and `evoxc-cpu` use, so `f16`/`Complex<f32>`/`Complex<f64>` are the very types numpy expects.
+There is no `PyBuffer` byte marshalling, no `numpy.ascontiguousarray` call, no `numpy` Python-module import outside the tests, and no `unsafe` of the crate's own; the per-direction design is "Buffer hand-off (native CPU engine)" below.
 
 ### Host callbacks (the `resolver`)
 
