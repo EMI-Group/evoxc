@@ -45,6 +45,13 @@
 //! hand-written Householder implementation stays the production factorization.
 //! The evaluation is pinned as `#[ignore]`d evidence tests (`faer_qr_evidence`,
 //! `bench_faer_vs_reference_qr`) at the bottom of this file.
+//!
+//! The speed the KEEP decision forgoes (release, fixed-seed dense operands,
+//! `bench_faer_vs_reference_qr`; faer under its default global parallelism,
+//! whose per-call `Par` is unreachable from outside faer — see `cholesky.rs`):
+//! 64x64 `1.116 ms` here vs `3.651 ms` raw / `4.196 ms` sign-adapted, 256x256
+//! `46.949` vs `15.578` / `18.303`, 1024x1024 `5160.428` vs `89.352` / `316.994`
+//! — i.e. 0.31x at 64² and 57.8x (16.3x once the sign sweep is added) at 1024².
 
 use evoxc_core::Result;
 use ndarray::{s, Array1, Array2, ArrayView2, Zip};

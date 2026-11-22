@@ -38,7 +38,10 @@
 // (8.2x), 256x256 `10.100 ms` vs `1466.839 ms` (145x), 512x512 `46.069 ms` vs
 // `14389.911 ms` (312x).  1024x1024 was skipped for time: the Jacobi leg
 // extrapolates to roughly two minutes per run, so warmup plus three runs would
-// not fit a couple of minutes.
+// not fit a couple of minutes.  The faer leg runs under faer's default global
+// parallelism (all cores); a per-call `Par` is unreachable from outside faer
+// (see `cholesky.rs`'s module doc), and the verdict rests on the degenerate
+// basis, not on these numbers.
 //
 // Non-finite behaviour, measured: the production sweeps zero an off-diagonal
 // pair before re-summing, so a NaN in the lower triangle can "converge" in the
