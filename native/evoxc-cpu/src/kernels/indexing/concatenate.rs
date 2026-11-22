@@ -94,14 +94,14 @@ pub(super) fn concatenate(
     join(&parts, axis, shape)
 }
 
-/// Elements per contiguous copy below which one `memcpy` per outer block costs
-/// more than walking the block element by element.
+/// Elements per contiguous copy below which one `copy_from_slice` per outer
+/// block costs more than walking the block with a running cursor.
 ///
 /// A part's rows inside one outer block are a single contiguous source run of
 /// `extent * inner` elements, so a WIDE run is one `copy_from_slice` per outer
 /// block while a NARROW one (a last-axis join of 1-wide parts: `inner == 1`)
-/// would be one `memcpy` call per ELEMENT — there ndarray's stride-aware `Zip`
-/// wins.  8 elements is where the call's fixed cost stops dominating.
+/// would be one `memcpy` call per ELEMENT.  8 elements is where the call's
+/// fixed cost stops dominating the walk (see `bench_concatenate`).
 const BULK_RUN_ELEMENTS: usize = 8;
 
 /// Assemble the (already same-dtype) operands into ONE pooled, C-contiguous
@@ -113,14 +113,19 @@ const BULK_RUN_ELEMENTS: usize = 8;
 /// the trailing one, and part `p` owns the axis slots its predecessors do not
 /// take.  Every operand is C-contiguous, so inside one outer block a part's
 /// rows are one contiguous source run and its destination slots are one
-/// contiguous destination range — a wide run is a single `copy_from_slice` per
-/// outer block (the fast path), and a narrow one takes ndarray's `Zip` over the
-/// destination region (`slice_axis_mut`), which is the reference expression the
-/// fast path is pinned against.
+/// contiguous destination range.  Three arms, each chosen from that geometry:
+///
+/// * the UNIT family — every part contributes exactly one element per outer
+///   block — is one exact interleave, assembled block-at-a-time with the part
+///   count unrolled ([`interleave`]);
+/// * a WIDE run is one `copy_from_slice` per outer block;
+/// * a NARROW run is a running-cursor element walk over the part's rows.
 ///
 /// Nothing here standardizes a layout: the destination is built in C order from
 /// the start, so no transposing copy is ever paid (which is what ndarray's own
-/// last-axis `concatenate` hands back — an F-order array — used to cost).
+/// last-axis `concatenate` hands back — an F-order array — used to cost).  Every
+/// arm is pinned against ndarray's assembly, which is the reference expression,
+/// by the tests below.
 fn join(parts: &[&Buffer], axis: usize, shape: Vec<usize>) -> Result<Buffer> {
     let dtype = parts[0].dtype;
     macro_rules! join_typed {
