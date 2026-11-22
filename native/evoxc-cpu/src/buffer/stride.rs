@@ -268,10 +268,76 @@ pub fn apply2<T: Copy, U: Copy, R: Copy>(
     }
 }
 
+/// The two shapes of the run loop, chosen once per call.
+///
+/// `block == span` means the block IS the run — every streamed operand's period
+/// equals `span`, so no base ever wraps and each outer step is a single
+/// contiguous pass. That case is worth its own arm because it is the common
+/// broadcasting shape (`(n, m) + (n, 1)`: one outer step per row, `m` elements
+/// each) and the repeat machinery — `chunks_exact_mut` plus two `advance`
+/// calls — costs more than the pass itself over a short block.
+fn run2<T: Copy, U: Copy, R: Copy>(
+    out: &mut [R],
+    a: &[T],
+    b: &[U],
+    plan: &Plan,
+    f: impl Fn(T, U) -> R + Copy,
+) {
+    if plan.block == plan.span {
+        run2_once(out, a, b, plan, f);
+    } else {
+        run2_repeats(out, a, b, plan, f);
+    }
+}
+
+/// One contiguous block per outer step (`block == span`): each pattern
+/// combination is its own monomorphized zip over `span` elements, so `f` (and
+/// therefore the op kind) is dispatched once, never per element.
+fn run2_once<T: Copy, U: Copy, R: Copy>(
+    out: &mut [R],
+    a: &[T],
+    b: &[U],
+    plan: &Plan,
+    f: impl Fn(T, U) -> R + Copy,
+) {
+    let span = plan.span;
+    match (plan.patterns[0], plan.patterns[1]) {
+        (Pattern::Streamed { .. }, Pattern::Streamed { .. }) => {
+            drive(plan, |slot, offsets| {
+                let left = &a[offsets[0]..offsets[0] + span];
+                let right = &b[offsets[1]..offsets[1] + span];
+                for ((value, x), y) in out[slot..slot + span].iter_mut().zip(left).zip(right) {
+                    *value = f(*x, *y);
+                }
+            });
+        }
+        (Pattern::Streamed { .. }, Pattern::Constant) => {
+            drive(plan, |slot, offsets| {
+                let right = b[offsets[1]];
+                let left = &a[offsets[0]..offsets[0] + span];
+                for (value, x) in out[slot..slot + span].iter_mut().zip(left) {
+                    *value = f(*x, right);
+                }
+            });
+        }
+        (Pattern::Constant, Pattern::Streamed { .. }) => {
+            drive(plan, |slot, offsets| {
+                let left = a[offsets[0]];
+                let right = &b[offsets[1]..offsets[1] + span];
+                for (value, y) in out[slot..slot + span].iter_mut().zip(right) {
+                    *value = f(left, *y);
+                }
+            });
+        }
+        // Both constant: the repeat loop runs exactly once either way.
+        (Pattern::Constant, Pattern::Constant) => run2_repeats(out, a, b, plan, f),
+    }
+}
+
 /// The four pattern combinations of [`apply2`], each its own monomorphized
 /// block loop: `f` (and therefore the op kind) is dispatched once, never per
 /// element.
-fn run2<T: Copy, U: Copy, R: Copy>(
+fn run2_repeats<T: Copy, U: Copy, R: Copy>(
     out: &mut [R],
     a: &[T],
     b: &[U],
@@ -623,8 +689,9 @@ mod tests {
             (&[500, 50, 4], &[500, 50, 4], &[4]),
             // c: per-row bias (streamed, streamed with a short block).
             (&[500, 50, 4], &[500, 50, 4], &[500, 1, 4]),
-            // d: both operands broadcast on different axes.
-            (&[500, 1, 50], &[500, 1, 50], &[500, 4, 50]),
+            // d: both operands broadcast on different axes (the result is the
+            // wider one: `a` is constant along the middle axis, `b` streams it).
+            (&[500, 4, 50], &[500, 1, 50], &[500, 4, 50]),
             // A rank-1 operand repeating inside the run (period < span).
             (&[2, 3, 4], &[3, 4], &[2, 1, 1]),
             // Mixed repeat + streaming.
@@ -669,6 +736,29 @@ mod tests {
         assert_eq!(plan.patterns[0], Pattern::Constant);
         // The left operand is constant here; the right one streams its 3 rows.
         assert_eq!(plan.patterns[1], Pattern::Streamed { period: 3 });
+    }
+
+    #[test]
+    fn one_contiguous_pass_per_outer_step_and_repeated_blocks_both_agree() {
+        // The two loop shapes the driver picks between, and the shapes that put
+        // it on each: `(n, m) + (n, 1)` is one `m`-element pass per row
+        // (`block == span`, `run2_once`), a trailing bias repeats a 4-element
+        // block through one long run (`block < span`, `run2_repeats`).
+        let plan = Plan::build(&[500, 100], &[&[500, 100], &[500, 1]], &[50000, 500]).unwrap();
+        assert_eq!((plan.block, plan.span), (100, 100));
+        let plan = Plan::build(&[500, 50, 4], &[&[500, 50, 4], &[4]], &[100000, 4]).unwrap();
+        assert_eq!((plan.block, plan.span), (4, 100000));
+        let plan =
+            Plan::build(&[500, 4, 50], &[&[500, 1, 50], &[500, 4, 50]], &[25000, 100000]).unwrap();
+        assert_eq!((plan.block, plan.span), (50, 200));
+        for (out_shape, a_shape, b_shape) in [
+            (&[500usize, 100][..], &[500usize, 100][..], &[500usize, 1][..]),
+            (&[500, 50, 4][..], &[500, 50, 4][..], &[4][..]),
+            (&[500, 50, 4][..], &[500, 50, 4][..], &[500, 1, 4][..]),
+            (&[500, 4, 50][..], &[500, 1, 50][..], &[500, 4, 50][..]),
+        ] {
+            assert_apply2_agrees(out_shape, a_shape, b_shape);
+        }
     }
 
     #[test]
