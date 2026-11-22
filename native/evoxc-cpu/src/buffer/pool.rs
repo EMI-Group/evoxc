@@ -249,7 +249,7 @@ impl Drop for Storage {
 /// A retained result vector of exactly `count` elements of `R`, or `None`.
 ///
 /// The caller must overwrite every element before the vector becomes visible.
-pub(super) fn take_pooled_vec<R: Scalar>(count: usize) -> Option<Vec<R>> {
+pub(crate) fn take_pooled_vec<R: Scalar>(count: usize) -> Option<Vec<R>> {
     let storage = STORAGE_POOL
         .try_with(|pool| pool.try_borrow_mut().ok()?.take(R::DTYPE, count))
         .ok()

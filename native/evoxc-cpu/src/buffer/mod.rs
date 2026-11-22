@@ -34,6 +34,7 @@ pub use broadcast::{
 pub use storage::Storage;
 pub use stride::{fill_broadcast, apply2 as apply2_runs, apply3 as apply3_runs};
 pub use zipmap::{map1, map2, map2_runs, map3, map3_runs, zip1, zip2, zip2_accumulate, zip3};
+pub use pool::take_pooled_vec;
 
 use self::storage::{cast_storage, decode_storage};
 
