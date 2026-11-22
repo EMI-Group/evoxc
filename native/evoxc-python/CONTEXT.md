@@ -80,18 +80,15 @@ No `Bound<PyAny>` crosses into native code and no native type is captured from a
 
 `native_compile(envelope)` decodes with `evoxc_core::envelope::decode` (GIL held), times and runs `evoxc_cpu::plan::compile(&program)` detached, and returns an immutable `NativeProgram` owning the `Program`, the `Arc<Plan>` and the measured `compile_ms: f64`.
 `entry()` is the plan's entry function name and `plan_text()` is `Plan::text()`; `output_types()` is `evoxc_core::wire::value_types_to_json(plan.entry_function().output_types)` through `py_from_json`; `stats()` and `required_ops()` build one `serde_json` object each and return it through `py_from_json`.
-`stats()` has exactly `ops`, `dispatched_ops` (equal to `ops` — this engine dispatches every planned op), `blocks` (`plan.block_count`), `plan_entries` (the planned `Step` count), `compile_ms`, `unsupported` (`plan.unsupported`, the dense ops the engine does not implement), `required_blocks`, `required_external` and `required_runtime`; `required_ops()` has `blocks`, `external` and `runtime_calls`.
+`stats()` has exactly `ops`, `dispatched_ops` (equal to `ops` — this engine dispatches every planned op), `blocks` (`plan.block_count`), `plan_entries` (`plan.op_count`, the planned step count), `compile_ms`, `unsupported` (`plan.unsupported`, the dense ops the engine does not implement), `required_blocks`, `required_external` and `required_runtime`; `required_ops()` has `blocks`, `external` and `runtime_calls`.
 `run(flat_inputs, resolver=None)` converts the flat numpy inputs while holding the GIL, preflights the resolver, runs `evoxc_cpu::run_program(program, &plan, inputs, RunOptions::default(), callbacks)` detached, then builds fresh numpy arrays with the GIL re-acquired.
 Input arity/dtype/shape are validated by the engine at the run boundary (`BackendError`/`DTypeError`/`ShapeError`); an op without a native kernel is the plan's own `BackendError` at compile time.
 
-### numpy interop is copy-through-bytes
+### numpy interop
 
-There is deliberately no `numpy` crate: the newest one (0.28) needs pyo3 0.28 while this crate pins pyo3 0.30.
-**In**: `arr.dtype.name` → `evoxc_core::DType::parse`, `arr.shape` → the shape, and `arr.flags.c_contiguous` decides whether `numpy.ascontiguousarray` is applied first (a strided array is copied, never misread; the caller's array is only borrowed).
-The bytes come from `arr.data.cast("B")` read through `pyo3::buffer::PyBuffer<u8>::to_vec`, and `evoxc_cpu::Buffer::from_payload` decodes them into the matching `Storage` variant and validates the byte length.
-A non-native byte order (`arr.dtype.isnative == False`) is an explicit `BackendError`, because those raw bytes would otherwise be read as little-endian.
-**Out**: `storage_to_bytes` flattens little-endian (`to_le_bytes`; `half::f16::to_bits`; bool as `0x00`/`0x01`; complex as interleaved real/imaginary), `PyByteArray::new` owns the copy and `numpy.frombuffer(bytearray, dtype=<name>).reshape(shape)` yields a fresh, writable, C-contiguous array that shares nothing with the engine.
+There is deliberately no `numpy` crate: the newest one (0.28) needs pyo3 0.28 while this crate pins pyo3 0.30, so the boundary carries raw little-endian bytes and numpy is reached only as a lazily imported Python module (`NUMPY: PyOnceLock<Py<PyModule>>`, imported once per process and never by `import evoxc`).
 `half` and `num-complex` are direct dependencies only to type the `Storage` variants (same semver as `evoxc-cpu`, so cargo unifies them).
+The borrowed view in, the bulk copy out, the size threshold, the `unsafe` arguments and the measured floor are the "Buffer hand-off (native CPU engine)" section below.
 
 ### Host callbacks (the `resolver`)
 
@@ -100,6 +97,57 @@ Preflight (GIL held, before the detach) requires `resolver` whenever `plan.requi
 Call shape is `call_block(name, args)` plus — when the engine's `static_args` is non-null and non-empty — the static args payload as a third positional argument (converted with `crate::convert::py_from_json`); `call_external(name, args)` and `call_runtime(name, args)` always take exactly two arguments.
 `args` is a Python list of numpy arrays and the answer must be a list/tuple of numpy arrays (converted back through the same array→`Buffer` path).
 A resolver exception, an un-iterable answer or an unconvertible array becomes `BackendError("resolver.<method>(<name>) raised: <interpreter text>")`; nothing panics and nothing is silently skipped.
+
+## Buffer hand-off (native CPU engine)
+
+`src/cpu.rs` moves tensor payloads as raw little-endian bytes in one pass per direction — a marshalling copy, never an element-at-a-time conversion through intermediate Python objects.
+
+### Inbound (Python → engine)
+
+`decode_inputs` walks the `flat_inputs` sequence and hands each element to `array_to_buffer(py, obj, path)` with `path = "flat_inputs[<index>]"`, so every inbound failure names the input index.
+`array_to_buffer` validates an array once: `dtype.name` → `DType::parse` (the 14 evoxc dtypes), `dtype.isnative` (a swapped byte order is an explicit `BackendError` naming the path, because those raw bytes would otherwise be read as little-endian), `shape` → `Vec<usize>` (a negative extent is a `ShapeError` naming the path), and `flags.c_contiguous`; a non-array argument is a `TypeError` (`<path>: expected a numpy array, got <type>`).
+A C-contiguous array is used as-is, while a strided view is first copied by `numpy.ascontiguousarray` into a contiguous temporary — copied, never misread, and the caller's object is only borrowed.
+`byte_view` takes `array.data.cast("B")` and wraps it as a `PyBuffer<u8>`, and `borrowed_bytes` turns that into a borrowed `&[u8]` through `PyBuffer::as_slice_ptr()` — a pointer/slice view, not a byte copy; a buffer numpy will not hand out contiguously is an explicit `BackendError` naming the path.
+The borrow is valid only while the `view` owned by `array_to_buffer` is alive and no Python code runs meanwhile (a Python call could resize the exporting array).
+`decode_bytes(dtype, bytes, split_threads(bytes.len()))` decodes the borrowed slice straight into the typed `evoxc_cpu::Storage` variant — `bool` as `word[0] != 0`, `float16` via `f16::from_bits`, complex as an `re`/`im` pair, every other dtype via `from_le_bytes` — with no intermediate `Vec<u8>`.
+A byte count that disagrees with `shape` × `dtype.itemsize()` is an explicit `VerificationError` naming the path, and `Buffer::new` re-checks dtype and dims before the run starts.
+The caller's array is borrowed for the duration of the conversion and never mutated (`the_returned_array_is_fresh_writable_and_does_not_alias_the_input` writes into the result and asserts the input's bytes are unchanged).
+
+### Outbound (engine → Python)
+
+`buffer_to_array` allocates the destination ONCE with `numpy.empty(shape, dtype.name())` — it therefore owns writable, C-contiguous bytes — and fills it with one bulk copy of the whole payload.
+`storage_bytes_le` hands out the storage's own bytes as a borrowed `&[u8]` (a shared `&[T]` reinterpreted over exactly `size_of_val`), which on a little-endian target already IS the numpy layout for all 14 dtypes (`f16` as its 2-byte bit pattern, `Complex` as `repr(C) {re, im}`, `bool` as one byte holding 0 or 1).
+The little-endian gate is `cfg!(target_endian = "little")`: on a little-endian host `fill_bytes` is fed that borrowed view with no flattening, and on a big-endian host `storage_to_bytes` first flattens the payload elementwise (`to_le_bytes`; `f16::to_bits`; `bool` as `0x00`/`0x01`; complex as interleaved real/imaginary) into a `Vec<u8>`.
+`fill_bytes` copies with `PyBuffer::copy_from_slice` when the split is a single thread and otherwise writes through the destination's `as_slice_ptr()`; a non-contiguous destination or a byte-count mismatch is an explicit `PyBufferError`.
+The result shares nothing with the engine, so writing into it never reaches a caller's input array.
+
+### Wide copies (one size threshold, at most four threads)
+
+`split_threads(bytes)` is the single threshold: below `SPLIT_MIN_BYTES` (`1 << 20`, 1 MiB) a copy runs on the calling thread, and at or above it the thread count is `std::thread::available_parallelism()` clamped to `1..=SPLIT_MAX_THREADS` (4) and then capped by `bytes / SPLIT_PER_THREAD` (`1 << 19`, 512 KiB per extra thread).
+So a wide copy never uses more than 4 threads, and the threshold exists because a scoped spawn costs ~12 µs here — spawning for a smaller payload loses more than it gains.
+`copy_bytes(dst, src, threads)` splits `dst` with `chunks_mut(len.div_ceil(threads))`, spawns one scoped thread per trailing chunk over that chunk's disjoint destination range with the matching `src` window, and copies the leading chunk on the calling thread instead of idling.
+`decode_words` (the inbound decode) splits the same way: `chunk = count.div_ceil(threads.max(1))`, one scoped thread per trailing index range, the leading range on the calling thread, and `set_len(count)` only after the join.
+Both paths are value-identical to the single-threaded copy, which `large_payloads_take_the_threaded_path_bit_identically` asserts bit-for-bit.
+
+### `unsafe` surface
+
+The crate's `unsafe` is confined to this marshalling code in `src/cpu.rs`; everything else is PyO3's own FFI glue, and no SIMD intrinsics are used (`std::arch` and `core::simd` appear nowhere).
+`borrowed_bytes`'s pointer→slice view carries the SAFETY argument that the pointer addresses the buffer's own `item_count()` bytes, that `view` keeps them exported for the slice's lifetime, that `u8` has no validity or alignment requirement, and that nothing writes through the shared slice.
+`fill_bytes`'s bytes→destination copy carries the SAFETY argument that `dest` is the `B`-cast view of an array this call just allocated with `numpy.empty` and has not returned or shared, so an exclusive borrow of its `bytes.len()` bytes cannot alias anything, that no Python code runs while it lives, and that `copy_bytes` splits it into disjoint chunks.
+`storage_bytes_le`'s `view` carries the SAFETY argument that a shared, initialized `&[T]` reinterpreted as a `&[u8]` of exactly its bytes is sound because `u8` has no validity or alignment requirement and the lifetime is the source's.
+The threaded decode adds the raw-pointer writes: `OutPtr<T>`'s `unsafe impl Send`/`Sync` are justified by `decode_words` handing out disjoint output ranges only, `OutPtr::write` documents that its index is inside the allocation and written by exactly one thread, and `decode_words`'s own block documents that the allocation is exclusively ours, that writing through the raw pointer into uninitialized memory is fine for a `Copy` type, and that `set_len` runs only after the join.
+
+### Measured FFI floor
+
+A round trip is two passes over the payload — the inbound decode and the outbound bulk copy — plus the Python-side `numpy.empty` allocation: a measured ~0.20 ms for an 8 MB payload on this host.
+A small-graph `run` is therefore dominated by the kernels and the plan dispatch, not by marshalling.
+`NativeProgram` keeps the decoded `Program` and the compiled `Arc<Plan>` across calls, so a repeated run pays only input validation + marshalling + execution, never a re-compile or a re-decode.
+
+### Inbound integer attributes (`convert.rs`)
+
+`encode_value` tests `bool` before `int` (`bool` is an `int` subclass, so `True` never becomes `1`) and then takes a `PyInt` as `i64` first and as `u64` second.
+An unsigned 64-bit attribute above `i64::MAX` therefore encodes verbatim — `random_key_mix`'s splitmix64 salt `0x9E3779B97F4A7C15` (11400714819323198485) reaches the envelope as exactly that number — and only an integer that fits neither is rejected, with a `TypeError` naming the attribute path and "the envelope's 64-bit number range".
+Negative values keep their sign (the `i64` arm), and `number_to_py` on the way back returns a Python `int` for every `i64`/`u64` (`as_i64` first, then an unsigned value above `i64::MAX` as the Python `int` of that value), so a 64-bit unsigned attribute round-trips exactly.
 
 ## Error mapping
 
@@ -173,7 +221,7 @@ A malformed response is a `TransformError` naming the op and the field (unknown 
 | `./src/infer_context.rs` | The `infer` `module` argument: `decode_module` maps a full envelope or a signature-only context onto one `Program` (the dual-shape decoding, entry validation, the synthesized body-less `"signature-context"` functions), plus the argument-shape message helpers (`json_kind`, `json_keys`) and their interpreter-free tests. |
 | `./src/batch_ops.rs` | The `batch_functions` entry point: program/envelope decoding (one `programs[i]` context each), config-dict walk + callable extraction, `Python::detach` merge under the shared extension bridge, `{"module", "batch_report"}` result encoding. |
 | `./src/transform_config.rs` | Interpreter-free `transform` + `batch_functions` config/response decoding and request/response JSON (unit-tested without a Python interpreter). |
-| `./src/cpu.rs` | `native_compile` + the `NativeProgram` pyclass: envelope decode → `evoxc_cpu::plan::compile`, the numpy⇄`Buffer` byte interop, the resolver preflight and the `Callbacks` bridge. |
+| `./src/cpu.rs` | `native_compile` + the `NativeProgram` pyclass: envelope decode → `evoxc_cpu::plan::compile`, the borrowed-bytes numpy⇄`Buffer` hand-off (`as_slice_ptr` in, one `numpy.empty` + bulk copy out, the `split_threads` threshold), the resolver preflight and the `Callbacks` bridge. |
 | `./src/convert.rs` | Python ⇄ envelope JSON conversion (one pass per call, path-tagged `TypeError`s, number/`bool` fidelity). |
 | `./src/error.rs` | `NativeError` (`create_exception!`), `KINDS`, `raise`/`from_core`/`type_error`/`object_error`. |
 | `./Cargo.toml` | cdylib crate, the `extension-module`/`auto-init` feature split. |
@@ -181,7 +229,8 @@ A malformed response is a `TransformError` naming the op and the field (unknown 
 ## Test strategy
 
 `cargo test --manifest-path native/Cargo.toml --workspace` is the always-on gate: it compiles this crate with `extension-module` and runs the interpreter-free tests (32: the error-family closure, the transform-kind list, the whole `transform_config` decode/encode surface — axes shapes, `out_axes`, batch-dim name, index lists, the `batch_functions` config (axis broadcast/per-leaf, every `switch_ops`/`bands`/`alignment` form, unknown-key rejection), request JSON, response parsing and its malformed-response diagnostics — the `infer` module-argument decoding: full envelope, signature-only `call` resolution in all three entry forms, unknown callee, every malformed argument shape, and a malformed type; `batch_ops::arity`; and the `cpu` helpers — the 14-dtype name round trip, `storage_to_bytes` for integers/floats/bool/f16/complex, a bad envelope discriminator surfacing `PersistenceError`, and an empty module decoding).
-`cargo test --manifest-path native/Cargo.toml -p evoxc-python --no-default-features --features auto-init` runs that same set plus the 16 interpreter-backed tests (48 total): scalar/bool/int/float fidelity, nested dict/list/tuple round trips, ndarray-payload base64 through `wire::array_from_json`, out-of-range ints, NaN, non-string keys, unsupported-type and index path messages, `NativeError` kind/message/`str`, `from_core` family preservation, `object_error` context chaining, `parse_config` for every key and both `axes` shapes, unknown-key/non-callable rejection, the `PyExtensionRule` bridge (`None` / dict response / exception text), the end-to-end `infer` module contexts (signature-only 2-tuple + full envelope resolve `call`, an unknown callee and the malformed-context `TypeError`s), and the `batch_functions` argument-shape rejections (`programs[i]` / `config` non-dict, unknown config key).
+`cargo test --manifest-path native/Cargo.toml -p evoxc-python --no-default-features --features auto-init` runs that same set plus the 24 interpreter-backed tests (56 total): scalar/bool/int/float fidelity, nested dict/list/tuple round trips, ndarray-payload base64 through `wire::array_from_json`, out-of-range ints, NaN, non-string keys, unsupported-type and index path messages, `NativeError` kind/message/`str`, `from_core` family preservation, `object_error` context chaining, `parse_config` for every key and both `axes` shapes, unknown-key/non-callable rejection, the `PyExtensionRule` bridge (`None` / dict response / exception text), the end-to-end `infer` module contexts (signature-only 2-tuple + full envelope resolve `call`, an unknown callee and the malformed-context `TypeError`s), the `batch_functions` argument-shape rejections (`programs[i]` / `config` non-dict, unknown config key), and the `cpu::marshalling` numpy hand-off suite (bit-identical round trips for all 14 dtypes, bool normalization, the threaded large-payload path, freshness/non-aliasing, a strided input copied contiguous, 0-d and empty arrays, and the `split_threads` threshold).
+The interpreter-backed set needs `numpy` importable by the linked interpreter (the `cpu::marshalling` helpers build their arrays with `numpy.frombuffer`).
 End-to-end verification is `source scripts/dev-env.sh && scripts/build-native.sh [--debug]` (builds the cdylib, installs it into `evoxc/` and smoke-tests `version()` through `.venv/bin/python`), then loading the installed `.so` with `importlib.util.spec_from_file_location("evoxc._evoxc_native", "evoxc/_evoxc_native.abi3.so")` — that avoids `import evoxc`, which would pull the whole Python frontend.
 No test needs a GPU, the network, or (for the always-on gate) a linked libpython.
 
