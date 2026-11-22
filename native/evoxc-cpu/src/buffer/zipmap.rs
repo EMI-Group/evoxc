@@ -37,8 +37,12 @@ pub fn zip1<T: Copy + Sync, R: Copy + Send>(
 
 /// The serial arm of [`zip1`] over slices whose shortest common length bounds
 /// the loop (`f` by reference, so the callers stay monomorphized).
+///
+/// The strided-run driver calls the `*_slice` arms DIRECTLY: it makes one call
+/// per outer step, so it must not pay the thread gate ([`parallel_threads`])
+/// per step, and its threading decision is the run's, not one block's.
 #[inline]
-fn zip1_slice<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: &impl Fn(T) -> R) {
+pub(super) fn zip1_slice<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: &impl Fn(T) -> R) {
     let len = out.len().min(source.len());
     let (out, source) = (&mut out[..len], &source[..len]);
     for index in 0..len {
@@ -67,7 +71,7 @@ pub fn zip2<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
 
 /// The serial arm of [`zip2`].
 #[inline]
-fn zip2_slice<T: Copy, U: Copy, R: Copy>(
+pub(super) fn zip2_slice<T: Copy, U: Copy, R: Copy>(
     out: &mut [R],
     left: &[T],
     right: &[U],
@@ -142,7 +146,7 @@ pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
 
 /// The serial arm of [`zip3`].
 #[inline]
-fn zip3_slice<P: Copy, T: Copy, R: Copy>(
+pub(super) fn zip3_slice<P: Copy, T: Copy, R: Copy>(
     out: &mut [R],
     first: &[P],
     second: &[T],

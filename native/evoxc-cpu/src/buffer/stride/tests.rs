@@ -369,3 +369,84 @@ fn a_short_operand_falls_back_instead_of_reading_past_the_slice() {
     assert!(Plan::build(&out_shape, &[&[2, 3], &[3]], &[6, 2]).is_none());
     assert!(Plan::build(&out_shape, &[&[2, 3], &[3]], &[6, 3]).is_some());
 }
+
+#[test]
+fn the_periodic_block_loop_covers_every_specialised_width() {
+    // A period inside the const-generic set takes the unrolled tile loop, and
+    // the run length leaves a tail that does not divide by `4 * period`, so
+    // both the four-tile body and its scalar tail must agree with `walk`.
+    for period in [2usize, 3, 4, 5, 6, 8] {
+        let out_shape = [2, 3, period];
+        let a_shape = [2, 3, period];
+        let b_shape = [period];
+        let plan = Plan::build(&out_shape, &[&a_shape, &b_shape], &[6 * period, period]).unwrap();
+        assert_eq!(plan.block, period);
+        assert_eq!(plan.span, 6 * period);
+        assert_eq!(plan.patterns[1], Pattern::Streamed { period });
+        assert_apply2_agrees(&out_shape, &a_shape, &b_shape);
+        // The same period with the tile on the LEFT and a wider run: the tail
+        // is `6p - 4p = 2p` here, the widest tail the unroll can leave.
+        assert_apply2_agrees(
+            &[2, 3, period],
+            &[period],
+            &[2, 3, period],
+        );
+    }
+}
+#[test]
+fn a_short_period_reads_element_i_modulo_the_period_across_the_whole_run() {
+    // Distinct ranges make any reordering or a stale tile visible: the left
+    // operand counts up, the tile counts by a different stride, so a run that
+    // restarted its tile or reused the previous step's would not match.
+    let out_shape = [3usize, 4];
+    let left: Vec<i32> = (0..12).collect();
+    let tile = [7i32, 1000, -3, 55];
+    let mut out = [0i32; 12];
+    // The right operand is right-aligned, so a `(4,)` tile rides the trailing
+    // axis and repeats three times inside the run of twelve.
+    let plan = Plan::build(&out_shape, &[&out_shape, &[4]], &[12, 4]).unwrap();
+    assert_eq!((plan.block, plan.span), (4, 12));
+    apply2(&mut out, &out_shape, &left, &out_shape, &tile, &[4], |x, y| {
+        x * 10 + y
+    });
+    let expected: Vec<i32> = (0..12).map(|i| i as i32 * 10 + tile[i % 4]).collect();
+    assert_eq!(out.to_vec(), expected);
+    // A one-element run and a period equal to the run are the two edges of the
+    // tile path (the latter falls back to the contiguous one).
+    assert_apply2_agrees(&[3], &[3], &[3]);
+    assert_apply2_agrees(&[5], &[1], &[5]);
+    assert_apply2_agrees(&[7, 6], &[7, 6], &[6]);
+}
+#[test]
+fn a_short_period_fill_matches_broadcast_to() {
+    // The exponential-doubling fill covers spans that are not a power-of-two
+    // multiple of the period and periods that do not divide the source length.
+    let cases: &[(&[usize], &[usize])] = &[
+        (&[5], &[7, 5]),
+        (&[3], &[499, 3]),
+        (&[1], &[9, 4, 1]),
+        (&[6], &[2, 3, 6]),
+    ];
+    for (shape, out_shape) in cases {
+        let source = values(product(shape), 17);
+        let buffer =
+            Buffer::new(DType::Int32, shape.to_vec(), Storage::I32(source.clone())).unwrap();
+        let expected = broadcast_to(&buffer, out_shape).unwrap();
+        let filled = fill_broadcast(&source, shape, out_shape);
+        assert_eq!(Storage::I32(filled), expected.storage, "{shape:?} -> {out_shape:?}");
+    }
+}
+#[test]
+fn a_long_run_over_many_outer_steps_agrees_with_walk() {
+    // A run wide enough to matter (2^18 elements, the flat driver's split
+    // threshold) with one short block per outer step, both with the broadcast
+    // operand on the trailing axis and as a per-row scalar.
+    assert_apply2_agrees(&[4096, 64], &[4096, 64], &[4096, 1]);
+    assert_apply2_agrees(&[1000, 1000], &[1000, 1000], &[1000]);
+    assert_apply3_agrees(
+        &[1024, 256],
+        &[1024, 1],
+        &[1024, 256],
+        &[256],
+    );
+}

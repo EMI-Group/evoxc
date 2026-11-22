@@ -50,7 +50,7 @@ use crate::scalar::Scalar;
 
 use super::broadcast::{apply2 as walk_apply2, apply3 as walk_apply3, broadcast_strides};
 use super::pool::take_pooled_vec;
-use super::zipmap::{zip1, zip2, zip3};
+use super::zipmap::{zip1_slice, zip2_slice, zip3_slice};
 
 /// The operand count the run plans embed in fixed-size arrays (`apply2` uses
 /// two, `apply3` three).
@@ -474,21 +474,21 @@ fn run2_once<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
             drive(plan, |slot, offsets| {
                 let left = &a[offsets[0]..offsets[0] + span];
                 let right = &b[offsets[1]..offsets[1] + span];
-                zip2(&mut out[slot..slot + span], left, right, f);
+                zip2_slice(&mut out[slot..slot + span], left, right, &f);
             });
         }
         (Pattern::Streamed { .. }, Pattern::Constant) => {
             drive(plan, |slot, offsets| {
                 let right = b[offsets[1]];
                 let left = &a[offsets[0]..offsets[0] + span];
-                zip1(&mut out[slot..slot + span], left, |x| f(x, right));
+                zip1_slice(&mut out[slot..slot + span], left, &|x| f(x, right));
             });
         }
         (Pattern::Constant, Pattern::Streamed { .. }) => {
             drive(plan, |slot, offsets| {
                 let left = a[offsets[0]];
                 let right = &b[offsets[1]..offsets[1] + span];
-                zip1(&mut out[slot..slot + span], right, |y| f(left, y));
+                zip1_slice(&mut out[slot..slot + span], right, &|y| f(left, y));
             });
         }
         // Both constant: the repeat loop runs exactly once either way.
@@ -523,7 +523,7 @@ fn run2_repeats<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let left = &a[ao..ao + block];
                     let right = &b[bo..bo + block];
-                    zip2(chunk, left, right, f);
+                    zip2_slice(chunk, left, right, &f);
                     advance(&mut ao, start.0, block, pa);
                     advance(&mut bo, start.1, block, pb);
                 }
@@ -536,7 +536,7 @@ fn run2_repeats<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
                 let right = b[offsets[1]];
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let left = &a[ao..ao + block];
-                    zip1(chunk, left, |x| f(x, right));
+                    zip1_slice(chunk, left, &|x| f(x, right));
                     advance(&mut ao, start, block, pa);
                 }
             });
@@ -548,7 +548,7 @@ fn run2_repeats<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
                 let left = a[offsets[0]];
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let right = &b[bo..bo + block];
-                    zip1(chunk, right, |y| f(left, y));
+                    zip1_slice(chunk, right, &|y| f(left, y));
                     advance(&mut bo, start, block, pb);
                 }
             });
@@ -649,7 +649,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let picks = &pred[offsets[0]..offsets[0] + span];
                 let left = &on_true[offsets[1]..offsets[1] + span];
                 let right = &on_false[offsets[2]..offsets[2] + span];
-                zip3(&mut out[slot..slot + span], picks, left, right, f);
+                zip3_slice(&mut out[slot..slot + span], picks, left, right, &f);
             });
         }
         (Pattern::Constant, Pattern::Streamed { .. }, Pattern::Streamed { .. }) => {
@@ -657,7 +657,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let pick = pred[offsets[0]];
                 let left = &on_true[offsets[1]..offsets[1] + span];
                 let right = &on_false[offsets[2]..offsets[2] + span];
-                zip2(&mut out[slot..slot + span], left, right, |x, y| f(pick, x, y));
+                zip2_slice(&mut out[slot..slot + span], left, right, &|x, y| f(pick, x, y));
             });
         }
         (Pattern::Streamed { .. }, Pattern::Constant, Pattern::Streamed { .. }) => {
@@ -665,7 +665,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let picks = &pred[offsets[0]..offsets[0] + span];
                 let left = on_true[offsets[1]];
                 let right = &on_false[offsets[2]..offsets[2] + span];
-                zip2(&mut out[slot..slot + span], picks, right, |pick, y| f(pick, left, y));
+                zip2_slice(&mut out[slot..slot + span], picks, right, &|pick, y| f(pick, left, y));
             });
         }
         (Pattern::Streamed { .. }, Pattern::Streamed { .. }, Pattern::Constant) => {
@@ -673,7 +673,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let picks = &pred[offsets[0]..offsets[0] + span];
                 let left = &on_true[offsets[1]..offsets[1] + span];
                 let right = on_false[offsets[2]];
-                zip2(&mut out[slot..slot + span], picks, left, |pick, x| f(pick, x, right));
+                zip2_slice(&mut out[slot..slot + span], picks, left, &|pick, x| f(pick, x, right));
             });
         }
         (Pattern::Constant, Pattern::Constant, Pattern::Streamed { .. }) => {
@@ -681,7 +681,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let pick = pred[offsets[0]];
                 let left = on_true[offsets[1]];
                 let right = &on_false[offsets[2]..offsets[2] + span];
-                zip1(&mut out[slot..slot + span], right, |y| f(pick, left, y));
+                zip1_slice(&mut out[slot..slot + span], right, &|y| f(pick, left, y));
             });
         }
         (Pattern::Constant, Pattern::Streamed { .. }, Pattern::Constant) => {
@@ -689,7 +689,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let pick = pred[offsets[0]];
                 let left = &on_true[offsets[1]..offsets[1] + span];
                 let right = on_false[offsets[2]];
-                zip1(&mut out[slot..slot + span], left, |x| f(pick, x, right));
+                zip1_slice(&mut out[slot..slot + span], left, &|x| f(pick, x, right));
             });
         }
         (Pattern::Streamed { .. }, Pattern::Constant, Pattern::Constant) => {
@@ -697,7 +697,7 @@ fn run3_once<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let picks = &pred[offsets[0]..offsets[0] + span];
                 let left = on_true[offsets[1]];
                 let right = on_false[offsets[2]];
-                zip1(&mut out[slot..slot + span], picks, |pick| f(pick, left, right));
+                zip1_slice(&mut out[slot..slot + span], picks, &|pick| f(pick, left, right));
             });
         }
         // Nothing streams: the repeat loop runs exactly once either way.
@@ -732,7 +732,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                     let picks = &pred[po..po + block];
                     let left = &on_true[ao..ao + block];
                     let right = &on_false[bo..bo + block];
-                    zip3(chunk, picks, left, right, f);
+                    zip3_slice(chunk, picks, left, right, &f);
                     advance(&mut po, start.0, block, pp);
                     advance(&mut ao, start.1, block, pa);
                     advance(&mut bo, start.2, block, pb);
@@ -751,7 +751,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let left = &on_true[ao..ao + block];
                     let right = &on_false[bo..bo + block];
-                    zip2(chunk, left, right, |x, y| f(pick, x, y));
+                    zip2_slice(chunk, left, right, &|x, y| f(pick, x, y));
                     advance(&mut ao, start.0, block, pa);
                     advance(&mut bo, start.1, block, pb);
                 }
@@ -769,7 +769,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let picks = &pred[po..po + block];
                     let right = &on_false[bo..bo + block];
-                    zip2(chunk, picks, right, |pick, y| f(pick, left, y));
+                    zip2_slice(chunk, picks, right, &|pick, y| f(pick, left, y));
                     advance(&mut po, start.0, block, pp);
                     advance(&mut bo, start.1, block, pb);
                 }
@@ -787,7 +787,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let picks = &pred[po..po + block];
                     let left = &on_true[ao..ao + block];
-                    zip2(chunk, picks, left, |pick, x| f(pick, x, right));
+                    zip2_slice(chunk, picks, left, &|pick, x| f(pick, x, right));
                     advance(&mut po, start.0, block, pp);
                     advance(&mut ao, start.1, block, pa);
                 }
@@ -805,7 +805,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let left = on_true[offsets[1]];
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let right = &on_false[bo..bo + block];
-                    zip1(chunk, right, |y| f(pick, left, y));
+                    zip1_slice(chunk, right, &|y| f(pick, left, y));
                     advance(&mut bo, start, block, pb);
                 }
             });
@@ -822,7 +822,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let right = on_false[offsets[2]];
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let left = &on_true[ao..ao + block];
-                    zip1(chunk, left, |x| f(pick, x, right));
+                    zip1_slice(chunk, left, &|x| f(pick, x, right));
                     advance(&mut ao, start, block, pa);
                 }
             });
@@ -839,7 +839,7 @@ fn run3_repeats<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
                 let right = on_false[offsets[2]];
                 for chunk in out[slot..slot + span].chunks_exact_mut(block) {
                     let picks = &pred[po..po + block];
-                    zip1(chunk, picks, |pick| f(pick, left, right));
+                    zip1_slice(chunk, picks, &|pick| f(pick, left, right));
                     advance(&mut po, start, block, pp);
                 }
             });
