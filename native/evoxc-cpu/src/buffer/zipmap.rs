@@ -10,6 +10,16 @@ use super::pool::take_pooled_vec;
 use super::Buffer;
 
 /// Flat unary map: `out[i] = f(source[i])`.
+///
+/// The UNARY arm keeps the iterator form.  An indexed loop (`for i in 0..len {
+/// out[i] = f(source[i]) }` over slices of one common length) was measured
+/// against it on this host and lost: the `erf`/`gelu`/`tanh` chain over 1e6 f32
+/// ran 19.3-19.4 ms indexed vs 17.7-18.2 ms iterating (`ew_transcendental_1e6`,
+/// interleaved A/B, three rounds), while the bandwidth-bound flat cases are
+/// identical (0.11 ns/element either way) — so a unary loop whose body is one
+/// opaque per-element call prefers the iterator.  The binary and ternary arms
+/// ([`zip2`], [`zip3`]) keep the indexed form; both measured at or above the
+/// iterator form there.
 pub fn zip1<T: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     source: &[T],
@@ -19,39 +29,58 @@ pub fn zip1<T: Copy + Sync, R: Copy + Send>(
     if threads > 1 {
         split_parallel(out, threads, |offset, chunk| {
             let len = chunk.len();
-            for (slot, value) in chunk.iter_mut().zip(window(source, offset, len)) {
-                *slot = f(*value);
-            }
+            zip1_slice(chunk, window(source, offset, len), &f);
         });
         return;
     }
-    for (slot, value) in out.iter_mut().zip(source.iter()) {
-        *slot = f(*value);
+    zip1_slice(out, source, &f);
+}
+
+/// The serial arm of [`zip1`]: an iterator chain over the shortest common
+/// length (`f` by reference, so the callers stay monomorphized).  See [`zip1`]
+/// for why the unary arm is NOT indexed like the binary/ternary ones.
+///
+/// The strided-run driver calls the `*_slice` arms DIRECTLY: it makes one call
+/// per outer step, so it must not pay the thread gate ([`parallel_threads`])
+/// per step, and its threading decision is the run's, not one block's.
+#[inline]
+pub(super) fn zip1_slice<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: &impl Fn(T) -> R) {
+    for (target, value) in out.iter_mut().zip(source) {
+        *target = f(*value);
     }
 }
-/// Flat binary map: `out[i] = f(left[i], right[i])`.
-pub fn zip2<T: Copy + Sync, R: Copy + Send>(
+
+/// Flat binary map: `out[i] = f(left[i], right[i])` (indexed inner loop, see
+/// [`zip1`]).
+pub fn zip2<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     left: &[T],
-    right: &[T],
-    f: impl Fn(T, T) -> R + Sync,
+    right: &[U],
+    f: impl Fn(T, U) -> R + Sync,
 ) {
     let threads = parallel_threads(out.len());
     if threads > 1 {
         split_parallel(out, threads, |offset, chunk| {
             let len = chunk.len();
-            for ((slot, x), y) in chunk
-                .iter_mut()
-                .zip(window(left, offset, len))
-                .zip(window(right, offset, len))
-            {
-                *slot = f(*x, *y);
-            }
+            zip2_slice(chunk, window(left, offset, len), window(right, offset, len), &f);
         });
         return;
     }
-    for ((slot, x), y) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
-        *slot = f(*x, *y);
+    zip2_slice(out, left, right, &f);
+}
+
+/// The serial arm of [`zip2`].
+#[inline]
+pub(super) fn zip2_slice<T: Copy, U: Copy, R: Copy>(
+    out: &mut [R],
+    left: &[T],
+    right: &[U],
+    f: &impl Fn(T, U) -> R,
+) {
+    let len = out.len().min(left.len()).min(right.len());
+    let (out, left, right) = (&mut out[..len], &left[..len], &right[..len]);
+    for index in 0..len {
+        out[index] = f(left[index], right[index]);
     }
 }
 /// Flat in-place binary accumulate: `slot[i] = f(slot[i], other[i])`, writing
@@ -72,19 +101,25 @@ pub fn zip2_accumulate<T: Copy + Sync + Send>(
             let len = chunk.len();
             // The other operand is only READ: every chunk owns a disjoint part
             // of `slot`, so the views never overlap a write.
-            let other = window(other, offset, len);
-            for (value, rhs) in chunk.iter_mut().zip(other) {
-                *value = f(*value, *rhs);
-            }
+            zip2_accumulate_slice(chunk, window(other, offset, len), &f);
         });
         return;
     }
-    for (value, rhs) in slot.iter_mut().zip(other.iter()) {
-        *value = f(*value, *rhs);
+    zip2_accumulate_slice(slot, other, &f);
+}
+
+/// The serial arm of [`zip2_accumulate`] (indexed inner loop, see [`zip1`]).
+#[inline]
+fn zip2_accumulate_slice<T: Copy>(slot: &mut [T], other: &[T], f: &impl Fn(T, T) -> T) {
+    let len = slot.len().min(other.len());
+    let (slot, other) = (&mut slot[..len], &other[..len]);
+    for index in 0..len {
+        slot[index] = f(slot[index], other[index]);
     }
 }
+
 /// Flat ternary map: `out[i] = f(first[i], second[i], third[i])` (the `select`
-/// shape: predicate, on-true, on-false).
+/// shape: predicate, on-true, on-false), indexed like [`zip1`].
 pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     first: &[P],
@@ -96,24 +131,33 @@ pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
     if threads > 1 {
         split_parallel(out, threads, |offset, chunk| {
             let len = chunk.len();
-            for (((slot, p), x), y) in chunk
-                .iter_mut()
-                .zip(window(first, offset, len))
-                .zip(window(second, offset, len))
-                .zip(window(third, offset, len))
-            {
-                *slot = f(*p, *x, *y);
-            }
+            zip3_slice(
+                chunk,
+                window(first, offset, len),
+                window(second, offset, len),
+                window(third, offset, len),
+                &f,
+            );
         });
         return;
     }
-    for (((slot, p), x), y) in out
-        .iter_mut()
-        .zip(first.iter())
-        .zip(second.iter())
-        .zip(third.iter())
-    {
-        *slot = f(*p, *x, *y);
+    zip3_slice(out, first, second, third, &f);
+}
+
+/// The serial arm of [`zip3`].
+#[inline]
+pub(super) fn zip3_slice<P: Copy, T: Copy, R: Copy>(
+    out: &mut [R],
+    first: &[P],
+    second: &[T],
+    third: &[T],
+    f: &impl Fn(P, T, T) -> R,
+) {
+    let len = out.len().min(first.len()).min(second.len()).min(third.len());
+    let (out, first) = (&mut out[..len], &first[..len]);
+    let (second, third) = (&second[..len], &third[..len]);
+    for index in 0..len {
+        out[index] = f(first[index], second[index], third[index]);
     }
 }
 
@@ -188,6 +232,77 @@ pub fn map3<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
         .zip(third.iter())
         .map(|((p, x), y)| f(*p, *x, *y))
         .collect();
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
+/// Broadcast binary builder: `out[i] = f(a[i], b[i])` over `out_shape`'s
+/// elements, where `a`/`b` are read through their own (possibly broadcast)
+/// shapes — the strided-run counterpart of [`map2`], for a result that is not
+/// broadcast-free.
+///
+/// Like [`map1`]/[`map2`] it never zero-fills a result first (a pooled vector
+/// of the exact length is taken when one is available), and the run
+/// decomposition plus the per-element address arithmetic live in
+/// [`super::stride::apply2`], which falls back to the general broadcast driver
+/// for shapes it cannot express.
+#[allow(clippy::too_many_arguments)]
+pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    left: &[T],
+    left_shape: &[usize],
+    right: &[U],
+    right_shape: &[usize],
+    f: impl Fn(T, U) -> R + Copy + Sync,
+) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
+    super::stride::apply2(
+        &mut values,
+        out_shape,
+        left,
+        left_shape,
+        right,
+        right_shape,
+        f,
+    );
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
+/// Broadcast ternary builder: `out[i] = f(p[i], x[i], y[i])` over `out_shape`'s
+/// elements, where each operand is read through its own (possibly broadcast)
+/// shape — the [`map3`] counterpart of [`map2_runs`], for `select` with a
+/// broadcast predicate or branch.
+///
+/// Like [`map2_runs`] it takes a pooled vector of the exact result length when
+/// one is available (never zero-filling first), and the run decomposition plus
+/// the per-element address arithmetic live in [`super::stride::apply3`], which
+/// falls back to the general broadcast driver for shapes it cannot express.
+#[allow(clippy::too_many_arguments)]
+pub fn map3_runs<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    pred: &[P],
+    pred_shape: &[usize],
+    on_true: &[T],
+    on_true_shape: &[usize],
+    on_false: &[T],
+    on_false_shape: &[usize],
+    f: impl Fn(P, T, T) -> R + Copy + Sync,
+) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
+    super::stride::apply3(
+        &mut values,
+        out_shape,
+        pred,
+        pred_shape,
+        on_true,
+        on_true_shape,
+        on_false,
+        on_false_shape,
+        f,
+    );
     Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
 }
 
@@ -358,6 +473,56 @@ mod tests {
         let short: Vec<f32> = vec![1.0; count - 1];
         assert!(map1(DType::Float32, &[count], &short, |value| value).is_err());
         assert!(map2(DType::Float32, &[count], &short, &short, |a, b| a + b).is_err());
+    }
+
+    #[test]
+    fn the_broadcast_ternary_builder_agrees_with_the_flat_one() {
+        // `select` over a broadcast predicate and a scalar branch: the run
+        // builder must place `if p { x } else { y }` element for element,
+        // matching the flat builder fed explicitly broadcast operands.
+        let out_shape = [2usize, 3];
+        let pred = [true, false, true];
+        let on_true = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let on_false = [-1.0f32];
+        let pick = |p: bool, x: f32, y: f32| if p { x } else { y };
+        let runs = map3_runs(
+            DType::Float32,
+            &out_shape,
+            &pred,
+            &[3],
+            &on_true,
+            &[2, 3],
+            &on_false,
+            &[1],
+            pick,
+        )
+        .unwrap();
+        let flat = map3(
+            DType::Float32,
+            &out_shape,
+            &[true, false, true, true, false, true],
+            &on_true,
+            &[-1.0f32; 6],
+            pick,
+        )
+        .unwrap();
+        assert_eq!(runs.storage, flat.storage);
+        assert_eq!(runs.storage, Storage::F32(vec![1.0, -1.0, 3.0, 4.0, -1.0, 6.0]));
+        assert_eq!(runs.shape, vec![2, 3]);
+        // An empty target writes nothing.
+        let empty = map3_runs(
+            DType::Float32,
+            &[0, 3],
+            &pred,
+            &[3],
+            &on_true,
+            &[2, 3],
+            &on_false,
+            &[1],
+            pick,
+        )
+        .unwrap();
+        assert!(matches!(&empty.storage, Storage::F32(values) if values.is_empty()));
     }
 
     #[test]

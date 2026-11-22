@@ -22,6 +22,7 @@ mod broadcast;
 mod parallel;
 mod pool;
 mod storage;
+mod stride;
 #[cfg(test)]
 mod test_support;
 mod zipmap;
@@ -31,7 +32,8 @@ pub use broadcast::{
     apply1, apply2, apply3, broadcast_shape, broadcast_strides, broadcast_to, walk,
 };
 pub use storage::Storage;
-pub use zipmap::{map1, map2, map3, zip1, zip2, zip2_accumulate, zip3};
+pub use stride::{fill_broadcast, apply2 as apply2_runs, apply3 as apply3_runs};
+pub use zipmap::{map1, map2, map2_runs, map3, map3_runs, zip1, zip2, zip2_accumulate, zip3};
 
 use self::storage::{cast_storage, decode_storage};
 

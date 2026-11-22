@@ -47,6 +47,7 @@ mod gather;
 mod reshape;
 mod scatter;
 mod slice;
+mod stride_copy;
 
 #[cfg(test)]
 mod test_support;
@@ -119,7 +120,7 @@ fn offset_error(offset: impl std::fmt::Display, len: usize, op: &str) -> Error {
 
 /// The block-copy bounds diagnostic [`copy_blocks`](crate::buffer::copy_blocks)
 /// raises, with its wording (both entries say the same thing).
-fn block_error(op: &str) -> Error {
+pub(super) fn block_error(op: &str) -> Error {
     Error::verification(format!(
         "op '{op}': a block copy reads outside the operand (internal engine error)"
     ))

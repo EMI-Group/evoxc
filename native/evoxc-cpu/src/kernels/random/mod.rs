@@ -37,6 +37,7 @@ use key::Algorithm;
 mod bits;
 mod key;
 mod permutation;
+mod sampled;
 mod sampling;
 
 #[cfg(test)]

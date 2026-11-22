@@ -18,14 +18,14 @@ use super::{
 
 // --- stream-conversion scales ----------------------------------------------
 
-const INV_2P53: f64 = 1.0 / 9_007_199_254_740_992.0; // 2^-53, exact
-const INV_2P32: f64 = 1.0 / 4_294_967_296.0; // 2^-32, exact
-const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
+pub(super) const INV_2P53: f64 = 1.0 / 9_007_199_254_740_992.0; // 2^-53, exact
+pub(super) const INV_2P32: f64 = 1.0 / 4_294_967_296.0; // 2^-32, exact
+pub(super) const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 
 /// f32 fast-path constants (the exact f32 values the numpy kernel uses).
-const INV_2P53_F32: f32 = 1.0 / 9_007_199_254_740_992.0; // 2^-53 as f32
-const INV_2P32_F32: f32 = 1.0 / 4_294_967_296.0; // 2^-32 as f32
-const NEG_TWO_F32: f32 = -2.0;
+pub(super) const INV_2P53_F32: f32 = 1.0 / 9_007_199_254_740_992.0; // 2^-53 as f32
+pub(super) const INV_2P32_F32: f32 = 1.0 / 4_294_967_296.0; // 2^-32 as f32
+pub(super) const NEG_TWO_F32: f32 = -2.0;
 
 // --- word conversion -------------------------------------------------------
 
@@ -43,7 +43,7 @@ pub(super) fn word_uniforms(words: &Words) -> Vec<f64> {
 // --- operand plumbing ------------------------------------------------------
 
 /// Convert one broadcast operand to f64 values (numpy promotion to float64).
-fn broadcast_f64(op: &str, operand: &Buffer, shape: &[usize]) -> Result<Vec<f64>> {
+pub(super) fn broadcast_f64(op: &str, operand: &Buffer, shape: &[usize]) -> Result<Vec<f64>> {
     let expanded = broadcast_to(operand, shape).map_err(|err| {
         Error::shape(format!(
             "op '{op}': operand cannot broadcast to the draw shape: {err}"
@@ -54,7 +54,7 @@ fn broadcast_f64(op: &str, operand: &Buffer, shape: &[usize]) -> Result<Vec<f64>
 
 /// `(high - low)` per element, computed in the operands' promoted dtype
 /// exactly as numpy does before the float64 scaling.
-fn promoted_span(op: &str, low: &Buffer, high: &Buffer, shape: &[usize]) -> Result<Vec<f64>> {
+pub(super) fn promoted_span(op: &str, low: &Buffer, high: &Buffer, shape: &[usize]) -> Result<Vec<f64>> {
     let left = broadcast_to(low, shape)
         .map_err(|err| Error::shape(format!("op '{op}': low cannot broadcast: {err}")))?;
     let right = broadcast_to(high, shape)
@@ -71,7 +71,7 @@ fn promoted_span(op: &str, low: &Buffer, high: &Buffer, shape: &[usize]) -> Resu
 }
 
 /// `a - b` in `dtype` (wrapping ints, rounded floats), returned as f64.
-fn span_scalar(a: ScalarValue, b: ScalarValue, dtype: DType, op: &str) -> Result<f64> {
+pub(super) fn span_scalar(a: ScalarValue, b: ScalarValue, dtype: DType, op: &str) -> Result<f64> {
     Ok(match dtype {
         DType::Int8 => (as_i64(a) as i8).wrapping_sub(as_i64(b) as i8) as f64,
         DType::Int16 => (as_i64(a) as i16).wrapping_sub(as_i64(b) as i16) as f64,
@@ -155,6 +155,21 @@ pub(super) fn uniform_kernel(
     let dtype = result_dtype(spec);
     require_kind(&spec.name, dtype, true)?;
     let key = extract_key(&spec.name, algorithm, &operands[0])?;
+    // The typed fast path covers a draw shape that already IS the result shape
+    // (no broadcast, scalar or result-shaped parameters); anything else keeps
+    // the generic broadcast-form arithmetic below.
+    if let Some(buffer) = super::sampled::uniform(
+        &spec.name,
+        algorithm,
+        &key,
+        dtype,
+        &draw,
+        &shape,
+        &operands[1],
+        &operands[2],
+    )? {
+        return single(buffer);
+    }
     // The stream is drawn for the attribute shape, then broadcast.
     let draw_words = word_uniforms(&stream_words(algorithm, &key, SALT_UNIFORM, numel(&draw))?);
     let u = gather(&draw_words, &broadcast_offsets(&draw, &shape));
@@ -181,6 +196,20 @@ pub(super) fn normal_kernel(
     require_kind(&spec.name, dtype, true)?;
     let key = extract_key(&spec.name, algorithm, &operands[0])?;
     let draw = draw_shape(ctx, spec)?;
+    // Typed fast path: a result-shaped draw writes each Box–Muller pair
+    // straight into the output array (see `sampled.rs`).
+    if let Some(buffer) = super::sampled::normal(
+        &spec.name,
+        algorithm,
+        &key,
+        dtype,
+        &draw,
+        &shape,
+        &operands[1],
+        &operands[2],
+    )? {
+        return single(buffer);
+    }
     // One Box–Muller pair per draw element; the z values broadcast to the
     // result shape afterwards.
     let draw_count = numel(&draw);
@@ -272,6 +301,20 @@ pub(super) fn randint_kernel(
     let dtype = result_dtype(spec);
     require_kind(&spec.name, dtype, false)?;
     let key = extract_key(&spec.name, algorithm, &operands[0])?;
+    // Typed fast path: a result-shaped draw needs no broadcast and no
+    // dtype-erased output vector (see `sampled.rs`).
+    if let Some(buffer) = super::sampled::randint(
+        &spec.name,
+        algorithm,
+        &key,
+        dtype,
+        &draw,
+        &shape,
+        &operands[1],
+        &operands[2],
+    )? {
+        return single(buffer);
+    }
     // Python casts both bounds to int64 before subtracting them; the bounds
     // and the draws broadcast against the result shape in the arithmetic.
     let low_raw: Vec<i64> = scalar_values(&operands[1])
@@ -304,7 +347,7 @@ pub(super) fn randint_kernel(
 }
 
 /// The source index of every element of a C-order broadcast to `shape`.
-fn broadcast_offsets(source: &[usize], shape: &[usize]) -> Vec<usize> {
+pub(super) fn broadcast_offsets(source: &[usize], shape: &[usize]) -> Vec<usize> {
     let strides = broadcast_stride_map(source, shape);
     let count = numel(shape);
     let mut offsets = Vec::with_capacity(count);
@@ -323,7 +366,7 @@ fn broadcast_offsets(source: &[usize], shape: &[usize]) -> Vec<usize> {
 }
 
 /// Gather one flat vector through broadcast offsets.
-fn gather<T: Copy>(values: &[T], offsets: &[usize]) -> Vec<T> {
+pub(super) fn gather<T: Copy>(values: &[T], offsets: &[usize]) -> Vec<T> {
     offsets.iter().map(|offset| values[*offset]).collect()
 }
 

@@ -6,14 +6,15 @@
 //! doc in [`super`] carries the shared declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::Buffer;
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
-use super::{block_storage_from, for_each_index, operand, read_checked, reconcile};
+use super::stride_copy::{CopyAxis, CopyPlan};
+use super::{for_each_index, operand, read_checked, reconcile};
 
 /// One operand axis mapped onto a Python `slice(start, stop, step)`.
 #[derive(Debug, Clone, Copy)]
@@ -123,14 +124,19 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
     let derived: Vec<usize> = ranges.iter().map(|range| range.extent).collect();
     let shape = reconcile("slice", declared, derived)?;
     let source_strides = util::c_strides(&source.shape);
+    if let Some(plan) = copy_plan(ranges, &source_strides) {
+        let total = util::numel(&shape);
+        let storage = with_type!(source, |values| plan.copy(values, total, "slice"))?;
+        return Buffer::new(source.dtype, shape, storage);
+    }
+    // A backwards walk (a negative step over an axis that keeps more than one
+    // element) is the only plan the collapsed-stride copy declines: it stays on
+    // the signed general driver.
     let mut base = 0i64;
     let mut steps = Vec::with_capacity(ranges.len());
     for (range, stride) in ranges.iter().zip(&source_strides) {
         base += range.start * *stride as i64;
         steps.push(range.step * *stride as i64);
-    }
-    if let Some(storage) = slice_row_blocks(source, ranges, &shape, base, &steps)? {
-        return Buffer::new(source.dtype, shape, storage);
     }
     with_type!(source, |values| slice_typed(
         values,
@@ -141,61 +147,40 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
     ))
 }
 
-/// `slice`'s contiguous fast path.
+/// The collapsed-stride copy plan for a slice, or `None` when the mapping
+/// walks backwards (a negative step along an axis that keeps two or more
+/// elements) — [`CopyPlan`] only describes a forward, non-negative walk, so
+/// that case stays on the signed general driver.
 ///
-/// The trailing axes a slice selects WHOLE (`start == 0`, `step == 1`, the whole
-/// extent) are one contiguous run per block, so the result is `copy_blocks` over
-/// the leading axes' offsets instead of one source index per output element.
-/// Only a non-negative step plan qualifies; anything else (negative strides,
-/// per-axis steps, an empty result) stays on the general driver.
-fn slice_row_blocks(
-    source: &Buffer,
-    ranges: &[DimSlice],
-    out_shape: &[usize],
-    base: i64,
-    steps: &[i64],
-) -> Result<Option<Storage>> {
-    let rank = ranges.len();
-    if util::numel(out_shape) == 0 || steps.iter().any(|step| *step < 0) {
-        return Ok(None);
-    }
-    let mut trailing = 0usize;
-    while trailing < rank {
-        let axis = rank - 1 - trailing;
-        let range = &ranges[axis];
-        if range.start != 0 || range.step != 1 || range.extent != source.shape[axis] {
-            break;
+/// Each axis contributes `(extent, step × source stride)`; [`CopyPlan::new`]
+/// then collapses the axes whose strides line up, so the whole slice is one
+/// contiguous run, one strided run, or a handful of short blocks.
+fn copy_plan(ranges: &[DimSlice], source_strides: &[usize]) -> Option<CopyPlan> {
+    let mut base = 0usize;
+    let mut axes = Vec::with_capacity(ranges.len());
+    for (range, stride) in ranges.iter().zip(source_strides) {
+        if range.extent == 0 {
+            continue; // an empty result reads nothing
         }
-        trailing += 1;
-    }
-    let inner: usize = out_shape[rank - trailing..].iter().product();
-    if inner == 0 {
-        return Ok(None);
-    }
-    let start = usize::try_from(base).map_err(|_| {
-        Error::verification("slice: a negative base offset reached the row copy (internal engine error)")
-    })?;
-    let leading_shape = &out_shape[..rank - trailing];
-    let mut offsets = Vec::with_capacity(util::numel(leading_shape));
-    for_each_index(leading_shape, |index| {
-        let mut offset = start as i128;
-        for (coordinate, step) in index.iter().zip(steps) {
-            offset += *coordinate as i128 * *step as i128;
+        // A one-element axis (which `CopyPlan` drops again) contributes its
+        // start offset only, so even a negative step there is a forward walk.
+        let start = usize::try_from(range.start).ok()?;
+        base = base.checked_add(start.checked_mul(*stride)?)?;
+        if range.extent == 1 {
+            continue;
         }
-        match usize::try_from(offset) {
-            Ok(offset) => {
-                offsets.push(offset);
-                Ok(())
-            }
-            Err(_) => Err(Error::verification(
-                "slice: a negative source offset reached the row copy (internal engine error)",
-            )),
+        if range.step < 0 {
+            return None;
         }
-    })?;
-    let storage = with_type!(source, |values| {
-        block_storage_from(values, out_shape, &offsets, inner, "slice")
-    })?;
-    Ok(Some(storage))
+        let step = usize::try_from(range.step).ok()?;
+        axes.push(CopyAxis {
+            extent: range.extent,
+            stride: step.checked_mul(*stride)?,
+        });
+    }
+    // `axes` is outermost-first, the plan wants innermost-first.
+    axes.reverse();
+    Some(CopyPlan::new(base, axes))
 }
 
 fn slice_typed<T: Scalar>(
@@ -311,6 +296,97 @@ mod tests {
             err.message.contains("start_indices has 1 entries for rank 2"),
             "{}",
             err.message
+        );
+    }
+
+    /// The frame-free reference: normalize the ranges, then read every output
+    /// element with plain `i64` offset arithmetic and nested loops.
+    fn reference(values: &[f32], strides: &[usize], ranges: &[DimSlice]) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut index = vec![0usize; ranges.len()];
+        let total: usize = ranges.iter().map(|range| range.extent).product();
+        for _ in 0..total {
+            let mut offset = 0i64;
+            for (axis, range) in ranges.iter().enumerate() {
+                offset += (range.start + index[axis] as i64 * range.step) * strides[axis] as i64;
+            }
+            out.push(values[offset as usize]);
+            for axis in (0..ranges.len()).rev() {
+                index[axis] += 1;
+                if index[axis] < ranges[axis].extent {
+                    break;
+                }
+                index[axis] = 0;
+            }
+        }
+        out
+    }
+
+    /// Every fast-path shape the collapsed-stride copy takes — one column of a
+    /// 3-D operand (ONE strided run), a partially selected trailing axis (short
+    /// contiguous runs), a stepped middle axis and a fully contiguous block —
+    /// must reproduce the plain offset walk element for element.
+    #[test]
+    fn slice_fast_paths_match_an_elementwise_reference() {
+        /// `(starts, limits, steps, expected result shape)`.
+        type Case = (&'static [i64], &'static [i64], &'static [i64], &'static [usize]);
+        let shape = [4usize, 3, 5];
+        let values: Vec<f32> = (0..60).map(|value| value as f32 * 0.5).collect();
+        let x = f32_buffer(&shape, &values);
+        let strides = util::c_strides(&shape);
+        let cases: [Case; 6] = [
+            // one column of a 3-D operand: a single 12-element stride-15 run
+            (&[0, 0, 2], &[4, 3, 3], &[1, 1, 1], &[4, 3, 1]),
+            // three of five trailing elements: 12 runs of 3
+            (&[0, 0, 1], &[4, 3, 5], &[1, 1, 1], &[4, 3, 4]),
+            // a stepped middle axis on top of a whole trailing axis
+            (&[0, 0, 0], &[4, 3, 5], &[1, 2, 1], &[4, 2, 5]),
+            // a stepped trailing axis (a strided gather, not a contiguous run)
+            (&[0, 0, 0], &[4, 3, 5], &[1, 1, 2], &[4, 3, 3]),
+            // fully contiguous interior block
+            (&[1, 0, 0], &[3, 2, 5], &[1, 1, 1], &[2, 2, 5]),
+            // a negative step over a one-element axis stays on the fast path
+            (&[0, 0, 4], &[4, 3, 3], &[1, 1, -1], &[4, 3, 1]),
+        ];
+        for (starts, limits, steps, declared_shape) in cases {
+            let op = spec(attrs(&[
+                ("start_indices", evoxc_core::AttrValue::Ints(starts.to_vec())),
+                ("limit_indices", evoxc_core::AttrValue::Ints(limits.to_vec())),
+                ("strides", evoxc_core::AttrValue::Ints(steps.to_vec())),
+            ]));
+            let ranges = slice_ranges(&op, &shape).unwrap();
+            let out = slice(&x, &ranges, &declared(declared_shape)).unwrap();
+            assert_eq!(out.shape, declared_shape, "cases {starts:?}/{steps:?}");
+            match &out.storage {
+                Storage::F32(copied) => {
+                    assert_eq!(*copied, reference(&values, &strides, &ranges), "cases {starts:?}/{steps:?}");
+                }
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
+    }
+
+    /// A nonzero `start` on every axis of the plan still lands on the right
+    /// element: the base offset is the sum of `start x source stride`.
+    #[test]
+    fn slice_offsets_are_relative_to_every_axis_start() {
+        let shape = [3usize, 4];
+        let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let x = f32_buffer(&shape, &values);
+        let op = spec(attrs(&[
+            ("start_indices", evoxc_core::AttrValue::Ints(vec![1, 2])),
+            ("limit_indices", evoxc_core::AttrValue::Ints(vec![3, 4])),
+            ("strides", evoxc_core::AttrValue::Null),
+        ]));
+        let ranges = slice_ranges(&op, &shape).unwrap();
+        let out = slice(&x, &ranges, &declared(&[2, 2])).unwrap();
+        assert_eq!(out.storage, Storage::F32(vec![6., 7., 10., 11.]));
+        assert_eq!(
+            match &out.storage {
+                Storage::F32(copied) => copied.clone(),
+                other => panic!("unexpected storage {other:?}"),
+            },
+            reference(&values, &util::c_strides(&shape), &ranges)
         );
     }
 

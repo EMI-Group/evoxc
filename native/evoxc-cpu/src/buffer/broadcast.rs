@@ -3,7 +3,7 @@
 
 use evoxc_core::{Error, Result};
 
-use super::{shape_text, Buffer, Storage};
+use super::{shape_text, stride::fill_broadcast, Buffer, Storage};
 
 // ---------------------------------------------------------------------------
 // Broadcasting
@@ -154,26 +154,35 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
             shape_text(shape)
         )));
     }
+    // The copy itself is the strided-run driver's block copy
+    // (`super::stride::fill_broadcast`), which hands back a pooled vector of the
+    // exact length and divides the work into contiguous per-repeat blocks; it
+    // accepts every broadcastable pair and falls back to [`broadcast_vec`] for
+    // anything its run decomposition cannot express, so the result is the same
+    // bytes either way.
     let storage = match &buffer.storage {
-        Storage::Bool(v) => Storage::Bool(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I8(v) => Storage::I8(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I16(v) => Storage::I16(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I32(v) => Storage::I32(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I64(v) => Storage::I64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U8(v) => Storage::U8(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U16(v) => Storage::U16(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U32(v) => Storage::U32(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U64(v) => Storage::U64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::F16(v) => Storage::F16(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::F32(v) => Storage::F32(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::F64(v) => Storage::F64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::C64(v) => Storage::C64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::C128(v) => Storage::C128(broadcast_vec(v, &buffer.shape, shape)),
+        Storage::Bool(v) => Storage::Bool(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I8(v) => Storage::I8(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I16(v) => Storage::I16(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I32(v) => Storage::I32(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I64(v) => Storage::I64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U8(v) => Storage::U8(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U16(v) => Storage::U16(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U32(v) => Storage::U32(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U64(v) => Storage::U64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::F16(v) => Storage::F16(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::F32(v) => Storage::F32(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::F64(v) => Storage::F64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::C64(v) => Storage::C64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::C128(v) => Storage::C128(fill_broadcast(v, &buffer.shape, shape)),
     };
     Buffer::new(buffer.dtype, shape.to_vec(), storage)
 }
 
-fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
+/// The general broadcast copy: one odometer offset per element. Kept as the
+/// fallback of the strided-run driver (`super::stride::fill_broadcast`), which
+/// serves every shape a run decomposition covers.
+pub(super) fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];
     walk(out_shape.len(), out_shape, &strides, |offsets| {
@@ -200,6 +209,81 @@ mod tests {
         let mut out = vec![0i32; 6];
         apply2(&mut out, &[2, 3], &[1, 2, 3], &[1, 3], &[1, 2], &[2, 1], |a, b| a + b);
         assert_eq!(out, vec![2, 3, 4, 3, 4, 5]);
+    }
+
+    #[test]
+    fn broadcast_to_rejects_what_it_always_rejected() {
+        let buffer = Buffer::new(DType::Int32, vec![3], Storage::I32(vec![1, 2, 3])).unwrap();
+        // Right-aligned only: a length-3 axis cannot serve a length-2 target.
+        let error = broadcast_to(&buffer, &[2]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ShapeError: operand shapes cannot broadcast: (3) vs (2)"
+        );
+        // A target that the source would widen into is refused by the strict
+        // equality check (the broadcast of `(1, 3)` is `(1, 3)`, not `(3,)`).
+        let row = Buffer::new(DType::Int32, vec![1, 3], Storage::I32(vec![1, 2, 3])).unwrap();
+        let error = broadcast_to(&row, &[3]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ShapeError: operand shape (1, 3) cannot be broadcast to target shape (3)"
+        );
+        // An equal shape short-circuits to a clone, values untouched.
+        let same = broadcast_to(&buffer, &[3]).unwrap();
+        assert_eq!(same.storage, Storage::I32(vec![1, 2, 3]));
+    }
+
+    /// Element `i` of a broadcast result is element `slots[i]` of the source.
+    fn same_sequence<A: Copy, B: Copy>(
+        out: &[A],
+        source: &[B],
+        slots: &[usize],
+        eq: impl Fn(A, B) -> bool,
+    ) {
+        assert_eq!(out.len(), slots.len());
+        for (index, slot) in slots.iter().enumerate() {
+            assert!(eq(out[index], source[*slot]), "element {index} (slot {slot})");
+        }
+    }
+
+    #[test]
+    fn every_dtype_materializes_through_the_block_copy() {
+        // The pooled block copy serves all 14 storages; bool and the complex
+        // and float pairs are the ones a per-dtype arm could silently drop.
+        let cases: [(Storage, Vec<usize>, Vec<usize>); 3] = [
+            (Storage::Bool(vec![true, false]), vec![2], vec![3, 2]),
+            (
+                Storage::C64(vec![
+                    num_complex::Complex::new(1.0, 2.0),
+                    num_complex::Complex::new(-0.0, 0.5),
+                ]),
+                vec![1, 2],
+                vec![2, 3, 2],
+            ),
+            (Storage::F64(vec![1.5, -0.0, f64::NAN]), vec![3, 1], vec![3, 4]),
+        ];
+        for (storage, shape, out_shape) in cases {
+            let dtype = storage.dtype();
+            let buffer = Buffer::new(dtype, shape.clone(), storage).unwrap();
+            let expanded = broadcast_to(&buffer, &out_shape).unwrap();
+            assert_eq!(expanded.shape, out_shape);
+            // The general odometer is the reference: same slot per element.
+            let mut slots = Vec::new();
+            let strides = broadcast_strides(&shape, &out_shape);
+            walk(out_shape.len(), &out_shape, &[strides], |offsets| slots.push(offsets[0]));
+            match (&expanded.storage, &buffer.storage) {
+                (Storage::Bool(out), Storage::Bool(source)) => {
+                    same_sequence(out, source, &slots, |a, b| a == b)
+                }
+                (Storage::C64(out), Storage::C64(source)) => {
+                    same_sequence(out, source, &slots, |a, b| a == b)
+                }
+                (Storage::F64(out), Storage::F64(source)) => {
+                    same_sequence(out, source, &slots, |a, b| a.to_bits() == b.to_bits())
+                }
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
     }
 
     #[test]

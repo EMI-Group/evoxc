@@ -7,12 +7,13 @@
 //! error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{shape_text, Buffer};
+use crate::buffer::{shape_text, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
-use crate::scalar::Scalar;
+use crate::scalar::{Scalar, ScalarValue};
 use crate::with_same_type;
+use crate::with_type;
 
 use super::{
     for_each_index, index_values, offset_error, operand, reconcile, require_integer_indices,
@@ -34,11 +35,10 @@ pub(super) fn scatter_kernel(
         "scatter",
     )?;
     let declared = ctx.result_shape(spec, 0)?;
-    let index_values = index_values(indices)?;
     let cast = updates_for(source, updates)?;
     single(scatter(
         source,
-        &index_values,
+        indices,
         &indices.shape,
         cast.as_ref().unwrap_or(updates),
         axis,
@@ -98,7 +98,7 @@ fn selection_shape(source: &Buffer, index_shape: &[usize], axis: usize) -> Resul
 
 fn scatter(
     source: &Buffer,
-    indices: &[i128],
+    indices: &Buffer,
     index_shape: &[usize],
     updates: &Buffer,
     axis: usize,
@@ -115,6 +115,17 @@ fn scatter(
         )));
     }
     let shape = reconcile("scatter", declared, source.shape.clone())?;
+    // The overwhelmingly common shape of a `put_along_axis` — a fully-shaped
+    // index tensor with a matching `updates` — takes a typed path that reads
+    // the index buffer directly (no `i128` widening) and has no per-element
+    // stride odometers; every other (broadcast) selection keeps the general
+    // driver below, which is the only place the widened indices are built.
+    if let Some(storage) =
+        scatter_full_rank(source, indices, &index_shape, updates, axis, &selection)?
+    {
+        return Buffer::new(source.dtype, shape, storage);
+    }
+    let widened = index_values(indices)?;
     with_same_type!(source, updates, |data, values| scatter_typed(
         data,
         values,
@@ -122,11 +133,128 @@ fn scatter(
         &source.shape,
         axis,
         &index_shape,
-        indices,
+        &widened,
         &selection,
         &updates.shape,
         &shape
     ))
+}
+
+/// The no-broadcast `scatter` fast path: a full-rank index tensor whose shape
+/// equals the data's, with `updates` exactly the advanced-indexing selection.
+///
+/// The general path walks every selected element through three rank-deep
+/// stride loops (index, source, update) with a bounds-checked read and a
+/// bounds-checked write per element, on top of a whole-tensor `i128` widening
+/// of the index operand.  Here the typed index buffer is resolved ONCE into a
+/// compact `Vec<usize>` (numpy's negative-index and bounds rules, unchanged
+/// error wording) and the walk is one flat loop in the result's C order —
+/// which is what keeps numpy's duplicate-index rule (the LAST write in C order
+/// wins).  `Ok(None)` when this decomposition does not apply (a padded or
+/// broadcast index/update shape, an empty operand) — the general driver owns
+/// those.
+fn scatter_full_rank(
+    source: &Buffer,
+    indices: &Buffer,
+    index_shape: &[usize],
+    updates: &Buffer,
+    axis: usize,
+    selection: &[usize],
+) -> Result<Option<Storage>> {
+    if index_shape != source.shape.as_slice() || updates.shape.as_slice() != selection {
+        return Ok(None);
+    }
+    let Some(&extent) = source.shape.get(axis) else {
+        return Ok(None);
+    };
+    let inner: usize = source.shape[axis + 1..].iter().product();
+    let total = source.numel();
+    if total == 0 || extent == 0 || inner == 0 || indices.numel() != total {
+        return Ok(None);
+    }
+    let Some(band) = extent.checked_mul(inner) else {
+        return Ok(None);
+    };
+    if total % band != 0 {
+        return Ok(None);
+    }
+    let outer = total / band;
+    let built: Result<Storage> = with_type!(indices, |raw| {
+        with_same_type!(source, updates, |data, values| scatter_into(
+            data, values, raw, outer, extent, inner, band, axis
+        ))
+    });
+    built.map(Some)
+}
+
+/// Apply the resolved full-rank selection to a copy of `data` — one flat typed
+/// loop per `inner` regime, in C order so the LAST write wins.
+///
+/// `resolved[block × band + axis_position × inner + offset]` is the selected
+/// axis coordinate for that element, so every destination below lies inside
+/// `out` and every source read inside `values` by construction.
+#[allow(clippy::too_many_arguments)]
+fn scatter_into<I: Scalar, T: Scalar>(
+    data: &[T],
+    values: &[T],
+    indices: &[I],
+    outer: usize,
+    extent: usize,
+    inner: usize,
+    band: usize,
+    axis: usize,
+) -> Result<Storage> {
+    // Resolve every index exactly once, in the C order the general driver
+    // visits it, so the first out-of-range index reported is the same one.
+    let mut out = data.to_vec();
+    if outer == 1 && inner == 1 {
+        // The whole-axis full-selection form (`put_along_axis` on a rank-1
+        // operand, the hot scatter shape): resolve each index where it is used,
+        // so there is no intermediate `Vec<usize>` at all.
+        for (position, raw) in indices.iter().enumerate() {
+            let selected = resolve_index(index_as_i128(*raw), extent, axis, "scatter")?;
+            out[selected] = values[position];
+        }
+        return Ok(T::into_storage(out));
+    }
+    let mut resolved = Vec::with_capacity(indices.len());
+    for raw in indices {
+        resolved.push(resolve_index(index_as_i128(*raw), extent, axis, "scatter")?);
+    }
+    if inner == 1 {
+        for block in 0..outer {
+            let base = block * extent;
+            for position in base..base + extent {
+                out[base + resolved[position]] = values[position];
+            }
+        }
+    } else {
+        for block in 0..outer {
+            let base = block * band;
+            // `inner` trailing elements follow each axis position, each with its
+            // OWN index, so the write stays per element — only the odometer and
+            // the per-element bounds checks are gone.
+            for axis_position in 0..extent {
+                let run = base + axis_position * inner;
+                for offset in 0..inner {
+                    let position = run + offset;
+                    out[base + resolved[position] * inner + offset] = values[position];
+                }
+            }
+        }
+    }
+    Ok(T::into_storage(out))
+}
+
+/// The `i128` view of one typed index scalar — exactly [`index_values`]'s
+/// per-element conversion, without materializing the whole widened vector.
+fn index_as_i128<I: Scalar>(value: I) -> i128 {
+    match value.to_scalar() {
+        ScalarValue::I(value) => value as i128,
+        ScalarValue::U(value) => value as i128,
+        ScalarValue::F(value) => value as i128,
+        ScalarValue::C(value) => value.re as i128,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,14 +330,15 @@ fn scatter_typed<T: Scalar>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::indexing::test_support::{attrs, declared, f32_buffer, spec};
+    use crate::kernels::indexing::test_support::{attrs, declared, f32_buffer, i64_buffer, spec};
     use crate::Storage;
 
     #[test]
     fn scatter_updates_a_copy_of_the_input() {
         let x = f32_buffer(&[3, 2], &[0.; 6]);
         let updates = f32_buffer(&[2, 2], &[1., 2., 3., 4.]);
-        let out = scatter(&x, &[2, 0], &[2], &updates, 0, &declared(&[3, 2])).unwrap();
+        let indices = i64_buffer(&[2], &[2, 0]);
+        let out = scatter(&x, &indices, &[2], &updates, 0, &declared(&[3, 2])).unwrap();
         assert_eq!(out.storage, Storage::F32(vec![3., 4., 0., 0., 1., 2.]));
         assert_eq!(x.storage, Storage::F32(vec![0.; 6]), "the input must not be mutated");
     }
@@ -218,7 +347,8 @@ mod tests {
     fn scatter_duplicate_indices_keep_the_last_write() {
         let x = f32_buffer(&[3], &[0., 0., 0.]);
         let updates = f32_buffer(&[2], &[1., 2.]);
-        let out = scatter(&x, &[0, 0], &[2], &updates, 0, &declared(&[3])).unwrap();
+        let indices = i64_buffer(&[2], &[0, 0]);
+        let out = scatter(&x, &indices, &[2], &updates, 0, &declared(&[3])).unwrap();
         assert_eq!(out.storage, Storage::F32(vec![2., 0., 0.]));
     }
 
@@ -226,7 +356,8 @@ mod tests {
     fn scatter_rank_zero_indices_write_one_row() {
         let x = f32_buffer(&[3, 2], &[0.; 6]);
         let updates = f32_buffer(&[2], &[7., 8.]);
-        let out = scatter(&x, &[1], &[], &updates, 0, &declared(&[3, 2])).unwrap();
+        let indices = i64_buffer(&[], &[1]);
+        let out = scatter(&x, &indices, &[], &updates, 0, &declared(&[3, 2])).unwrap();
         assert_eq!(out.storage, Storage::F32(vec![0., 0., 7., 8., 0., 0.]));
     }
 
@@ -242,7 +373,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(axis, 1);
-        let out = scatter(&x, &[2, 0], &[2], &updates, axis, &declared(&[2, 3])).unwrap();
+        let indices = i64_buffer(&[2], &[2, 0]);
+        let out = scatter(&x, &indices, &[2], &updates, axis, &declared(&[2, 3])).unwrap();
         // The rank-1 index tensor pads to (1, 2) around axis 1, so it
         // broadcasts across rows: every row writes columns 2 then 0.
         assert_eq!(out.storage, Storage::F32(vec![2., 0., 1., 4., 0., 3.]));
@@ -252,11 +384,109 @@ mod tests {
     fn scatter_rejects_out_of_range_indices_and_bad_updates() {
         let x = f32_buffer(&[3], &[0.; 3]);
         let updates = f32_buffer(&[1], &[1.]);
-        let err = scatter(&x, &[7], &[1], &updates, 0, &declared(&[3])).unwrap_err();
+        let indices = i64_buffer(&[1], &[7]);
+        let err = scatter(&x, &indices, &[1], &updates, 0, &declared(&[3])).unwrap_err();
         assert!(err.message.contains("index 7 is out of bounds"), "{}", err.message);
 
         let updates = f32_buffer(&[5], &[0.; 5]);
-        let err = scatter(&x, &[1], &[1], &updates, 0, &declared(&[3])).unwrap_err();
+        let indices = i64_buffer(&[1], &[1]);
+        let err = scatter(&x, &indices, &[1], &updates, 0, &declared(&[3])).unwrap_err();
         assert!(err.message.contains("shape mismatch"), "{}", err.message);
+    }
+
+    /// The flat index of `position`'s multi-index with the axis coordinate
+    /// replaced by `selected` — the independent oracle for the duplicate-index
+    /// assertion below (deliberately NOT the kernel's own arithmetic).
+    fn flat_destination(shape: &[usize], axis: usize, mut position: usize, selected: usize) -> usize {
+        let mut coordinates = vec![0usize; shape.len()];
+        for dim in (0..shape.len()).rev() {
+            coordinates[dim] = position % shape[dim];
+            position /= shape[dim];
+        }
+        coordinates[axis] = selected;
+        coordinates
+            .iter()
+            .zip(shape)
+            .fold(0usize, |flat, (coordinate, extent)| flat * extent + coordinate)
+    }
+
+    fn f32_slot(storage: &Storage, slot: usize) -> f32 {
+        match storage {
+            Storage::F32(values) => values[slot],
+            other => panic!("the fixture is f32, got {:?}", other.dtype()),
+        }
+    }
+
+    /// The general (broadcast-capable) driver, for the same-dtype test inputs.
+    fn general_scatter(
+        source: &Buffer,
+        updates: &Buffer,
+        axis: usize,
+        shape: &[usize],
+        indices: &[i128],
+    ) -> Result<Buffer> {
+        with_same_type!(source, updates, |data, update_data| scatter_typed(
+            data,
+            update_data,
+            source.dtype,
+            &source.shape,
+            axis,
+            shape,
+            indices,
+            shape,
+            shape,
+            shape,
+        ))
+    }
+
+    #[test]
+    fn scatter_full_rank_fast_path_agrees_with_the_general_path() {
+        // A full-rank (== data-shaped) index tensor with duplicates, in the
+        // three decomposition regimes: inner == 1 (rank-1 full selection),
+        // inner == 4 (axis 0 of a matrix) and inner == 2 (a middle axis of a
+        // rank-3 operand).  (`shape`, index multiplier, axis extent, `axis`).
+        let cases: [(Vec<usize>, u64, u64, usize); 3] = [
+            (vec![37], 7, 5, 0),
+            (vec![3, 4], 5, 3, 0),
+            (vec![2, 3, 2], 2, 3, 1),
+        ];
+        for (in_shape, step, extent, axis) in cases {
+            let total: usize = in_shape.iter().product();
+            // A pattern with guaranteed duplicates along the scattered axis.
+            let indices: Vec<i128> = (0..total)
+                .map(|position| ((position as u64 * step + 1) % extent) as i128)
+                .collect();
+            let values: Vec<f32> = (0..total).map(|value| value as f32).collect();
+            let update_values: Vec<f32> =
+                (0..total).map(|value| 100.0 + value as f32).collect();
+            let x = f32_buffer(&in_shape, &values);
+            let updates = f32_buffer(&in_shape, &update_values);
+            let declared_dims = declared(&in_shape);
+
+            let narrowed: Vec<i64> = indices.iter().map(|&raw| raw as i64).collect();
+            let index_buffer = i64_buffer(&in_shape, &narrowed);
+            let fast = scatter(&x, &index_buffer, &in_shape, &updates, axis, &declared_dims)
+                .expect("the fast path succeeds");
+            let general = general_scatter(&x, &updates, axis, &in_shape, &indices)
+                .expect("the general path succeeds");
+            assert_eq!(fast, general, "shape {in_shape:?} axis {axis}");
+            assert_eq!(x.storage, Storage::F32(values), "the input must not be mutated");
+
+            // Duplicate indices: the LAST write in C order wins.
+            let scattered = (0..extent as usize).find(|&selected| {
+                indices.iter().filter(|&&raw| raw as usize == selected).count() > 1
+            });
+            let selected = scattered.expect("the pattern has duplicate indices");
+            let last = indices
+                .iter()
+                .rposition(|&raw| raw as usize == selected)
+                .expect("at least one occurrence");
+            let destination = flat_destination(&in_shape, axis, last, selected);
+            assert_eq!(
+                f32_slot(&fast.storage, destination),
+                update_values[last],
+                "shape {in_shape:?} axis {axis}: the last write must win at index {selected}"
+            );
+        }
     }
 }

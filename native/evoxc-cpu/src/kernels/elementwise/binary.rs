@@ -7,7 +7,7 @@ use evoxc_core::{DType, Error, Result};
 use std::rc::Rc;
 
 use crate::buffer::{
-    apply2, broadcast_shape, map1, map2, shape_text, zip2_accumulate, Buffer, Storage,
+    broadcast_shape, map1, map2, map2_runs, shape_text, zip2_accumulate, Buffer, Storage,
 };
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::pow;
@@ -383,13 +383,15 @@ fn typed_binary<T: Num>(
         (Layout::Scalar, Layout::Flat) if !left.is_empty() => {
             dense_binary_left_scalar(kind, out_dtype, out_shape, left[0], right)
         }
-        _ => {
-            let mut out = T::zeros(util::numel(out_shape));
-            apply2(&mut out, out_shape, left, left_shape, right, right_shape, |a, b| {
-                apply_bin(kind, a, b)
-            });
-            Buffer::new(out_dtype, out_shape.to_vec(), T::into_storage(out))
-        }
+        _ => broadcast_binary(
+            kind,
+            out_dtype,
+            out_shape,
+            left,
+            left_shape,
+            right,
+            right_shape,
+        ),
     }
 }
 
@@ -463,6 +465,25 @@ macro_rules! dense_binary_drivers {
             match kind {
                 $(BinKind::$kind => map1(dtype, out_shape, left, |a| apply_bin(BinKind::$kind, a, right)),)*
                 _ => map1(dtype, out_shape, left, |a| apply_bin(kind, a, right)),
+            }
+        }
+
+        /// The broadcast-operand driver: the general run decomposition of
+        /// `buffer::stride` with the op kind dispatched once per arm, exactly
+        /// as the broadcast-free drivers above.
+        #[allow(clippy::too_many_arguments)]
+        fn broadcast_binary<T: Num>(
+            kind: BinKind,
+            dtype: DType,
+            out_shape: &[usize],
+            left: &[T],
+            left_shape: &[usize],
+            right: &[T],
+            right_shape: &[usize],
+        ) -> Result<Buffer> {
+            match kind {
+                $(BinKind::$kind => map2_runs(dtype, out_shape, left, left_shape, right, right_shape, |a, b| apply_bin(BinKind::$kind, a, b)),)*
+                _ => map2_runs(dtype, out_shape, left, left_shape, right, right_shape, |a, b| apply_bin(kind, a, b)),
             }
         }
     };
