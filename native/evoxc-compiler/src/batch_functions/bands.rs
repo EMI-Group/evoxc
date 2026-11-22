@@ -1,6 +1,7 @@
 //! Banded ("clustered") merge for `batch_functions`.
 //!
-//! Port of `evoxc/transforms/_bands.py`: the population is split into
+//! Banding and its static cost model are owned here (native only — there is no
+//! Python counterpart): the population is split into
 //! CONTIGUOUS bands, each band is merged independently into the SAME builder
 //! with band-local input views, and the per-band outputs are glued together
 //! with one `concatenate` (plus one row re-permutation when the bands are not
@@ -32,7 +33,8 @@
 //! `rows` is the band size for a class whose variant ops are row-dependent
 //! (propagated through operand slots and seeded by a mapped input leaf, a
 //! switch class and a stacked constant) and 1 otherwise. A multi-band
-//! partition adds `BAND_OVERHEAD * band_count`.
+//! partition (`band_count > 1`) adds `BAND_OVERHEAD * band_count` (one per
+//! band, the first included; a single band adds nothing).
 //!
 //! Everything stays STATIC: the function axis and every band size is an
 //! `int`, and no symbolic `Dim` is ever introduced.

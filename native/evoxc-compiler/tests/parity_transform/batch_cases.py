@@ -9,10 +9,13 @@ harness derives its runtime arrays from.
 
 Two lists are exported:
 
-* ``CASES`` — populations the Python merge must accept and the native FFI (once
-  wired) must reproduce structurally, numerically and in its report.
+* ``CASES`` — populations the Python merge must accept and the native FFI must
+  reproduce structurally, numerically and in its report.
 * ``DEFERRALS`` — populations/option combinations the documented v1 contract
   rejects with ``core.TransformError`` on BOTH engines.
+
+The banding and cost model under test are native-only, owned by
+``native/evoxc-compiler/src/batch_functions/bands.rs``.
 
 `run_batch_parity.py` owns the execution/comparison; this module only builds
 programs, so it stays import-light and deterministic.
