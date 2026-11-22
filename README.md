@@ -34,41 +34,35 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 
 ## Four words
 
-**Minimal** — `numpy` is the only hard dependency; pure Python, no native code, no device runtime, no code generator, no kernel library. The default backend interprets the IR with numpy kernels. *So what: no compiler toolchain stands between you and a running graph.*
+**Minimal** — pure Python with NumPy as the only required dependency. The built-in interpreter runs graphs without a compiler toolchain.
 
-**Explicit** — every stage is a public function (`trace`, `lower`, `compile`, `load`, `run`) and every object a distinct public type (`Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor`); convenience APIs are documented shorthand whose exact expansion is in their docstrings. *So what: you can stop at any stage, inspect it, save it, or ship it.*
+**Explicit** — each pipeline stage is a public function with a distinct result type. Inspect, save, or transfer intermediate objects at any stage.
 
-**Compiler-neutral** — the contract with the backend world is EvoXIR in the frontend and StableHLO MLIR at the boundary. No vendor IR is the definition of the IR; no adapter is privileged. *So what: swapping IREE for XLA or TVM is a `backend=` argument, not a rewrite.*
+**Compiler-neutral** — EvoXIR represents the program; StableHLO connects it to IREE, XLA, and TVM. Select an available backend with `backend=`.
 
-**Simple** — one obvious way per thing: `vmap` is sugar over `vectorize`, `bind` is argument-passing sugar, `build` is `trace → lower → compile → load`. No eager mode, no second semantics behind a flag. *So what: when the code surprises you, the surprise is in your graph.*
+**Simple** — convenience APIs compose the pipeline: `vmap` uses `vectorize`, `bind` passes arguments, and `build` combines `trace → lower → compile → load`.
 
 ## The stack: from a Python graph to an ML compiler
 
 <img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-stack.svg" alt="The explicit evoxc (EvoX Compiler) stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="100%">
 
-| stage | public function | resulting object | what it produces | what it never does silently |
-|---|---|---|---|---|
-| graph function | `@evoxc.defn` | `Defn` | a Python callable marked as a graph *definition* | run eagerly — calling it on concrete tensors raises `TraceError` |
-| trace | `evoxc.trace(fn, *specs)` | `Graph` | EvoXIR: a region-based SSA module + input/output trees + snapshotted static values | compile, optimize, or turn a symbolic `Dim` into a constant |
-| transform | `evoxc.vectorize` / `vmap` / `batch_functions` / `grad` / `jvp` / `vjp` | `Graph` | an ordinary graph of ordinary ops | execute, or leave a `vmap`/`grad` op for a backend to interpret |
-| lower | `evoxc.lower(graph, backend=…)` | `LoweredProgram` | StableHLO MLIR text, or the backend's own payload | optimize or compile; an unsupported op is an explicit `BackendError` |
-| compile | `evoxc.compile(lowered, **opts)` | `CompiledArtifact` | the compiler's artifact (vmfb, PJRT executable, serialized program) | get replaced at load — a version/ABI mismatch is a `PersistenceError` |
-| load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called | move your data onto the device, or recompile for another target |
-| run | `evoxc.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in | copy results to the host, cast, reshard, or insert communication |
+| stage | public function | resulting object | what it produces |
+|---|---|---|---|
+| graph function | `@evoxc.defn` | `Defn` | a Python callable marked as a graph *definition* |
+| trace | `evoxc.trace(fn, *specs)` | `Graph` | EvoXIR: a region-based SSA module + input/output trees + snapshotted static values |
+| transform | `evoxc.vectorize` / `vmap` / `batch_functions` / `grad` / `jvp` / `vjp` | `Graph` | an ordinary graph of ordinary ops |
+| lower | `evoxc.lower(graph, backend=…)` | `LoweredProgram` | StableHLO MLIR text, or the backend's own payload |
+| compile | `evoxc.compile(lowered, **opts)` | `CompiledArtifact` | the compiler's artifact (vmfb, PJRT executable, serialized program) |
+| load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called |
+| run | `evoxc.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in |
 
-**Two backends below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
+The default **NumPy interpreter** executes EvoXIR with NumPy kernels. Compiler backends receive StableHLO: **IREE** targets llvm-cpu, CUDA, ROCm, and Vulkan-SPIRV; **XLA** uses a PJRT plugin; **TVM** uses its StableHLO frontend and Relax VM.
 
-**Layer discipline** — a strict one-way import DAG, so every problem has one owner:
-
-```
-core  ←  ir  ←  ops  ←  { trace, numpy }  ←  { block, transforms, backends, dist, sparse, pipeline, persist }
-```
-
-<sub>`core` imports nothing from evoxc (numpy only) · `ir` imports `core` · `ops` imports `core`, `ir`, `trace`'s builder hook · `trace` imports `core`, `ir` (never `ops`) · each module to the right imports only what is to its left.</sub>
+See [CONTEXT.md](CONTEXT.md#architecture-overview) for module dependencies and architecture details.
 
 ## Quickstart — sixty seconds
 
-The explicit pipeline; every intermediate is a real object you can keep:
+Each pipeline stage returns an object you can inspect and reuse:
 
 ```python
 import evoxc
@@ -88,14 +82,14 @@ print(y.numpy())     # [3.999999 3.999999 3.999999 3.999999]
 print(graph)         # <Graph 2 tensor inputs, 0 static values>
 ```
 
-The same thing in one call — *documented shorthand, no extra semantics*:
+Use `build` or `evaluate` for the same pipeline in one call:
 
 ```python
 exe = evoxc.build(f, spec_x, spec_w, device="cpu")          # trace → lower → compile → load
 y   = evoxc.evaluate(f, evoxc.ones((4, 8)), evoxc.ones((8, 4))) # derive specs → build → run
 ```
 
-Same graph, real compiler (`pip install evoxc[iree]`, or `evoxc[tvm]`, or `pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt` for `xla`):
+Run the same graph with a compiler backend (`pip install evoxc[iree]`, or `evoxc[tvm]`, or `pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt` for `xla`):
 
 ```python
 exe = evoxc.build(f, spec_x, spec_w, backend="iree", device=evoxc.Device("cuda", 0),
@@ -103,7 +97,7 @@ exe = evoxc.build(f, spec_x, spec_w, backend="iree", device=evoxc.Device("cuda",
 y   = evoxc.run(exe, evoxc.ones((4, 8)).to(exe.device), evoxc.ones((8, 4)).to(exe.device))
 ```
 
-**The payoff: transforms are graph → graph, so they compose.** A batched per-sample gradient is a `vmap` of a `grad` — no backend ever learns what either word means:
+**Graph transforms compose.** Combine `vmap` and `grad` to compute batched per-sample gradients:
 
 ```python
 @evoxc.defn
@@ -134,22 +128,24 @@ host = state.to(evoxc.Device("cpu", 0)).numpy() # the only way back
 
 ## The value model
 
-Four concepts, deliberately not three. Python values *specialize* a graph, symbolic values are *program* values, and only a `Tensor` has storage.
+Python values specialize a graph, symbolic values describe its computation, and `Tensor` holds runtime data:
 
 | concept | meaning | has storage? | guarantees |
 |---|---|---|---|
-| Python/static value | `None`, bool, int, float, str, `Enum`, dtype, `slice`, config objects | n/a | evaluated at trace time and snapshotted into the graph; changing it means a *new* graph — no hidden guards, no recompile-on-change |
+| Python/static value | `None`, bool, int, float, str, `Enum`, dtype, `slice`, config objects | n/a | evaluated at trace time and snapshotted into the graph; changing a static value requires tracing a new graph |
 | `TensorSpec` | describes a future runtime tensor: `shape` (symbolic dims allowed), `dtype`, optional `device` | no | the only thing you can pass as a trace input besides static values |
-| `SymbolicTensor` | an SSA value inside a graph | **no** | `dtype`, symbolic shape, source location, SSA identity — and deliberately **no** `numpy()`, `data_ptr()` or `__dlpack__` |
+| `SymbolicTensor` | an SSA value inside a graph | **no** | `dtype`, symbolic shape, source location, SSA identity |
 | `Tensor` | a materialized runtime tensor | yes | concrete shape/dtype and a **physical** `device`: numpy host data is `Device('cpu', 0)`, a device payload reports its real device |
 
-Because storage exists only on the last row, misuse fails where the mistake is: `evoxc.constant` is the single, warned way to embed host data into a graph; capturing a `Tensor` in a closure is a `TraceError`; `.numpy()` on a non-cpu tensor raises `DeviceError` (`.to(cpu)` first), so no API can copy your data behind your back.
+Pass runtime tensors as graph inputs. Capturing a `Tensor` in a closure raises `TraceError`; use `evoxc.constant` to embed host data explicitly (this emits a warning).
 
 ## Features
 
-### Explicit graph construction — and no eager mode
+<a id="explicit-graph-construction--and-no-eager-mode"></a>
 
-`@evoxc.defn` marks a graph definition; it does not make the function callable on real data — calling it with a `Tensor` raises `TraceError` pointing at `evoxc.trace`/`evoxc.evaluate`. `evoxc.trace` turns the definition into a `Graph` you can print, verify, save, transform and lower:
+### Explicit graph construction
+
+`@evoxc.defn` defines a graph. Use `evoxc.trace` to construct it or `evoxc.evaluate` to execute it; calling the definition directly with a `Tensor` raises `TraceError`. A traced `Graph` can be printed, verified, saved, transformed, and lowered:
 
 ```python
 graph = evoxc.trace(f, spec_x, spec_w)
@@ -171,7 +167,7 @@ module @"main" version 1 {
 
 ### Graph → graph transforms
 
-`evoxc.vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` are functions on graphs: a `Graph` in, a `Graph` out; a function/`Defn` in, a callable that builds one from specs out. The result is ordinary ops, so **a backend never sees `vmap`** — it sees the vectorized arithmetic a hand-written batched graph would have. An op with no batching or derivative rule is a `TransformError` naming the op, never a silent Python-loop fallback.
+`evoxc.vectorize`, `vmap`, `grad`, `jvp`, `vjp`, and `batch_functions` transform graphs into ordinary operations that backends can execute. Given a function or `Defn`, they return a callable that builds a graph from specs. Missing batching or derivative rules raise `TransformError` naming the operation.
 
 ```python
 @evoxc.defn
@@ -192,7 +188,7 @@ An outer loop that writes a *different static program* every iteration — neura
 evoxc.batch_functions(fns, axes=0, out_axes=0, *, switch_ops=None, bands=None, alignment="variant")
 ```
 
-`fns` is a non-empty list of programs that share their input AND output specs: traced `Graph`s, or callables/`Defn`s — never a mix. The result is a single `Graph` whose leading axis is a **static**, length-N *function axis*: row `i` evaluates program `i`, a mapped input (`axes=0`) supplies its own row, and an unmapped one (`axes=None`) is shared by every program.
+`fns` is a non-empty list of programs that share their input AND output specs: traced `Graph`s, or callables/`Defn`s — use one representation consistently. The result is a single `Graph` whose leading axis is a **static**, length-N *function axis*: row `i` evaluates program `i`, a mapped input (`axes=0`) supplies its own row, and an unmapped one (`axes=None`) is shared by every program.
 
 Programs are aligned by an occurrence-indexed structural skeleton signature. A position where every program has the same op collapses into **one** batched op, rebuilt through the same per-op batching rules `vmap` uses — identical programs emit zero `select`s. A same-skeleton position whose op differs merges into one switch class once `switch_ops` opts in (`True` = the `elementwise` + `comparison` categories; an explicit list names categories or op-name sets), emitting one op per variant plus a static per-row `select` cascade. All remaining divergence is `select`-muxed at the consumers and the outputs, so **any** same-signature program list merges correctly, and per-program constants stack into one `(N, …)` constant.
 
@@ -213,13 +209,13 @@ Two keyword-only knobs tune the merge, and neither can change a row's value:
 
 The recipe follows the hardware: **CPU → `bands="auto"`; GPU → `bands=16` or `bands=None`**, because on a GPU dispatch is cheap and the flat (or a fixed-band) merge wins where `"auto"`'s CPU-calibrated dispatch constant misjudges.
 
-The payoff is measured, not argued. 32 programs of a 10-deep elementwise chain over a shared length-64 vector: **544 program ops collapse into 133 merged ops**, bit-identical to running the 32 programs separately, **2.8× faster per evaluation on numpy** (0.78 vs 2.18 ms) and **2.1× on `iree`/llvm-cpu** (0.63 vs 1.31 ms) — and **one merged IREE compile (0.45 s) replaces 32 (6.7 s, 15×)**. At N=100 unrelated expression trees over two `(64,)` inputs, separate → flat → banded is 5.4 → 3.32 → **2.24 ms** on numpy, and 4.7 → 18.73 → **0.386 ms** on `iree`/llvm-cpu: flat is 4× *worse* than not merging there, and banding recovers 12×.
+32 programs of a 10-deep elementwise chain over a shared length-64 vector: **544 program ops collapse into 133 merged ops**, bit-identical to running the 32 programs separately, **2.8× faster per evaluation on numpy** (0.78 vs 2.18 ms) and **2.1× on `iree`/llvm-cpu** (0.63 vs 1.31 ms) — and **one merged IREE compile (0.45 s) replaces 32 (6.7 s, 15×)**. At N=100 unrelated expression trees over two `(64,)` inputs, separate → flat → banded is 5.4 → 3.32 → **2.24 ms** on numpy, and 4.7 → 18.73 → **0.386 ms** on `iree`/llvm-cpu: flat is 4× *worse* than not merging there, and banding recovers 12×.
 
-**Inspectable, like everything else.** `graph.batch_report` is a `BatchReport` — `value_classes`, `shared_classes`, `switched` (a `SwitchRecord` per switch class: its variants and the rows that use them), `output_muxes`, `emitted_ops`, `bands`, `band_sizes`, `cost_estimate`, … — so the merge is data you can read rather than magic you have to trust. It is transform metadata, not part of the saved graph. **The rule is the usual one:** an op without a registered batching rule — control flow, a `runtime_call`/`external_call` without its namespaced rule, collectives, `random_*`, a few structural ops — raises an explicit `TransformError` naming the op, never a silent Python-loop fallback.
+Inspect the merge through `graph.batch_report`: it records value classes, shared and switched operations, output muxes, emitted operations, band sizes, and cost estimates. This transform metadata is available in memory and is not saved with the graph. See [current limitations](#status--deferrals) for unsupported batching rules.
 
 ### In-graph control flow
 
-`evoxc.cond`, `evoxc.while_loop` and `evoxc.scan` trace their branch and body functions into IR regions, so control flow is part of the persisted program. Python control flow over a symbolic value fails loudly instead of tracing something you did not write.
+`evoxc.cond`, `evoxc.while_loop` and `evoxc.scan` trace their branch and body functions into IR regions, so control flow is part of the persisted program.
 
 ```python
 @evoxc.defn
@@ -261,7 +257,7 @@ out = evoxc.run(exe, {"w1": evoxc.ones((4, 8)), "b1": evoxc.zeros((8,)), "w2": e
 
 ### Explicit collectives and physical placement
 
-Collectives are ops in the graph (`evoxc.dist.*`); a compiler may optimize them, never invent them. Multi-device *data preparation* (`split_tensor`, `replicate_tensor`) is a separate, explicit host-memory utility. Placement is physical: a `Tensor`'s `device` is where its data actually is, `Tensor.to(device)` is the only transfer primitive, run outputs stay where they ran, and a mismatched input is a `DeviceError` **before** dispatch.
+Declare communication with `evoxc.dist.*` operations in the graph. `split_tensor` and `replicate_tensor` prepare data in host memory; use `Tensor.to(device)` to transfer it. See [hardware support](#hardware-support) for device placement and [current limitations](#status--deferrals) for compiled collectives.
 
 ```python
 @evoxc.defn
@@ -320,7 +316,7 @@ def triton_add_iree(x):
     ...
 ```
 
-evoxc contains no Triton (or any other) kernel code — kernels are written against this interface in another repo, and graphs carry only the name, so a process that loads a saved graph must re-register its kernels. Backends without host dispatch fall back to a registered portable decomposition (`@handle.portable` over an `@evoxc.defn`) with a warning, or raise an explicit `BackendError`. Worked examples: [`tests/ops/test_external_call.py`](tests/ops/test_external_call.py) (default slot) and [`tests/backends/test_external_call_iree.py`](tests/backends/test_external_call_iree.py) (IREE host and device-resident dispatch).
+Register custom kernels in each process that loads the graph; saved graphs store their names. Backends without host dispatch use a registered portable decomposition (`@handle.portable` over `@evoxc.defn`) with a warning, or raise `BackendError`. Worked examples: [`tests/ops/test_external_call.py`](tests/ops/test_external_call.py) and [`tests/backends/test_external_call_iree.py`](tests/backends/test_external_call_iree.py).
 
 ### Custom ops
 
@@ -340,11 +336,11 @@ def _l2norm_numpy(x):
     return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
 ```
 
-The numpy backend keeps a registered impl as a `block_call` and dispatches it, and inlines the portable when a block has no numpy impl. Compiler adapters declare `custom_blocks=False` in v1 and reject a block graph with an explicit `BackendError` — never a silent reinterpretation.
+The numpy backend keeps a registered impl as a `block_call` and dispatches it, and inlines the portable when a block has no numpy impl. Compiler adapters declare `custom_blocks=False` in v1 and reject a block graph with an explicit `BackendError`.
 
 ### Inspectable and persistable graphs
 
-Every stage object round-trips: a `Graph` as `.evoxcgraph`, a StableHLO `LoweredProgram` as `.mlir` text, a `CompiledArtifact` as `.evoxcartifact`. Loading with a mismatched backend, device or ABI is a `PersistenceError`, never a silent recompile. `evoxc.persist.Cache`/`FileCache` are the explicit caching primitives, and `build_cached` + `CompileCache` memoize the whole `trace → lower → compile → load` composition for meta-level loops (NAS, genetic programming, algorithm synthesis) that emit a different static program per outer iteration:
+Every stage object round-trips: a `Graph` as `.evoxcgraph`, a StableHLO `LoweredProgram` as `.mlir` text, a `CompiledArtifact` as `.evoxcartifact`. Loading with a mismatched backend, device or ABI is a `PersistenceError`. `evoxc.persist.Cache`/`FileCache` are the explicit caching primitives, and `build_cached` + `CompileCache` memoize the whole `trace → lower → compile → load` composition for meta-level loops (NAS, genetic programming, algorithm synthesis) that emit a different static program per outer iteration:
 
 ```python
 cache = evoxc.CompileCache(maxsize=64)             # in-memory LRU; keys computed BEFORE tracing
@@ -386,26 +382,26 @@ Committed results, raw records and the probe scripts live in [`evoxc/bench/`](ev
 | **XLA** | `backend="xla"` — no path plumbing: it discovers an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`), else `EVOXC_PJRT_PLUGIN` / `plugin_path` | PJRT C API via ctypes over an auto-discovered plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
 | **TVM** | `pip install evoxc[tvm]`, `backend="tvm"` | StableHLO frontend + Relax VM (jaxlib only for its MLIR bindings) | CPU end-to-end; ROCm compile-only |
 
-**`opt_level`** is a first-class compile option (`"O0"`–`"O3"`, `"0"`–`"3"`, ints), one spelling, env `EVOXC_OPT_LEVEL`, per-adapter mapping — and an explicit raw compiler flag with the same name always wins over the derived one, never both. **`Capabilities`** lets an adapter state what it can and cannot do (custom calls, blocks, native RNG algorithms, …), so callers read the limits instead of finding them by crashing. And **a backend that cannot do something raises an explicit `BackendError` naming the op** and suggesting the remedy — never a silent fallback. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`; `evoxc.devices()` enumerates what this host actually has.
+Set optimization with `opt_level` (`"O0"`–`"O3"`, `"0"`–`"3"`, or integers) or `EVOXC_OPT_LEVEL`. An explicit raw compiler flag takes precedence over the mapped option. Backend `Capabilities` describe supported features; unsupported operations raise `BackendError` with the operation name and a suggested remedy.
 
 ## Hardware support
 
 <img src="https://raw.githubusercontent.com/EMI-Group/evoxc/main/assets/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through IREE (llvm-cpu, NVIDIA CUDA, AMD ROCm, Vulkan-SPIRV), XLA through a PJRT plugin it discovers (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`; NVIDIA CUDA and AMD ROCm; cpu only through a compiled test plugin) or TVM (cpu end-to-end, AMD ROCm compile-only)." width="100%">
 
-The same graph runs on CPU, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV — what changes is a `backend=` and a `device=`, never a rewrite. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`, and `evoxc.devices()` enumerates what this host actually has.
+Select the execution target with `backend=` and `device=`. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`), and `vulkan`; `evoxc.devices()` lists devices available on this host. Validated configurations are listed below.
 
-- **numpy interpreter** — the default backend and the always-available CPU fallback: no compiler, no codegen, every symbolic shape. `pip install evoxc` (numpy only) is the whole install.
+- **NumPy interpreter** — CPU execution with symbolic-shape support, included in `pip install evoxc`.
 - **IREE** — llvm-cpu, NVIDIA CUDA, AMD ROCm/HIP and Vulkan-SPIRV, all validated end-to-end (the Vulkan path on Mesa lavapipe, a software device). The `evoxc[iree]` pin is `iree-base` 3.13.0, on which the llvm-cpu and ROCm/HIP legs were re-validated device-resident — `while_loop`, `scan`, `while` nested in `cond` and the MO/NSGA2-class `non_dominate_rank` loop now compile and run with bit-exact integers, and the compile-crash class of 3.10/3.11 is gone (0 crashes in 30 compiles; records in [`evoxc/bench/iree313_rocm_findings.md`](evoxc/bench/iree313_rocm_findings.md)). CUDA was validated on the 3.11 release and is not re-exercised on 3.13 here (no NVIDIA GPU on the validating host). `pip install evoxc[iree]`.
 - **XLA** — the PJRT C API driven directly over a plugin `.so` the adapter **discovers**: the `plugin_path` option, `EVOXC_PJRT_PLUGIN`, the fixed well-known paths, then an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`; `jax-rocm7-pjrt==0.10.2` validated on ROCm with no env var and no path), so a pip-installed plugin needs no wiring — `EVOXC_PJRT_PLUGIN_DISCOVERY=0` opts out of that last step. The plugin's platform must physically serve the requested device kind, so accelerator use is `backend="xla", device="rocm"` (or `"cuda"`) with explicit placement, and a ROCm/CUDA plugin against `Device("cpu", 0)` is refused. CUDA and ROCm validated against real plugins, CPU plumbing validated with a compiled test plugin. No `jax`/`jaxlib`.
 - **TVM** — CPU end-to-end; ROCm compile-only, because the wheel is built `USE_ROCM=OFF`. `pip install evoxc[tvm]`.
 
-Placement is physical and explicit: `Tensor.to(device)` is the only transfer primitive, `run` outputs stay on the device they ran on, host inputs to a non-cpu executable are a `DeviceError` at the run boundary, and `.numpy()` on a non-cpu tensor raises `DeviceError` (`.to(cpu)` first). No API moves your data behind your back.
+Move data with `Tensor.to(device)`. Inputs must match the executable's device; mismatches raise `DeviceError`. Outputs remain on that device. To read a GPU result as NumPy, call `.to(evoxc.Device("cpu", 0)).numpy()`. Execution preserves placement and dtype; supply casts, resharding, and communication explicitly.
 
 ## Built on evoxc: `evoxc_hf`
 
-[`evoxc_hf`](evoxc_hf/CONTEXT.md) — the **`evoxc-hf` distribution** (`pip install evoxc-hf`) — loads a real HuggingFace checkpoint and runs the **whole model forward as ONE evoxc graph** — a 124M-parameter GPT-2, or a 14B-parameter Qwen3, goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a **separate distribution published independently from this same repository** (a `uv` workspace member with its own version, release tag and PyPI release), built only on evoxc's public API: the import name stays `evoxc_hf`, no `evoxc` wheel or sdist contains it, and `import evoxc` never imports it, `torch` or `transformers`.
+[`evoxc_hf`](evoxc_hf/CONTEXT.md) loads HuggingFace checkpoints and runs a model's forward pass as one evoxc graph. Models from GPT-2 (124M parameters) to Qwen3 (14B) use the same `trace → lower → compile → load → run` pipeline. Install it with `pip install evoxc-hf`.
 
-The API follows evoxc's value model in three layers that never blur: checkpoint IO produces **data** (`load_config` → frozen `ModelConfig`, `load_params` → `dict[str, np.ndarray]`, `load_hf` → a plain `LoadedModel` record); `forward_fn` is the pure **compute function** `(params, input_ids) -> logits` that captures no weights — every parameter is an ordinary graph input, never `evoxc.constant`; and `build`/`run` are the **staging** stages, `build` being `trace → lower → compile → load` via `build_cached`.
+The API has three steps: load configuration and weights with `load_config`, `load_params`, or `load_hf`; construct `(params, input_ids) -> logits` with `forward_fn`; then `build` and `run` the executable. Parameters are graph inputs. `build` uses `build_cached` to reuse compiled programs.
 
 ```python
 import numpy as np
@@ -426,19 +422,22 @@ oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy
 
 - **Families:** `llama` (also `mistral`/`qwen2`/`qwen3` — RMSNorm, RoPE, GQA, SwiGLU; Qwen3 adds per-head QK-Norm) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
 - **Parity** against real `torch`/`transformers` logits on eight checkpoints (`tiny_llama`, `tiny_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`, `qwen3_0_6b`, `qwen3_1_7b`, `qwen3_8b`) and against the independent numpy oracle at 14B: ≤2e-4 max-abs / ≈5e-6 relative on the largest fp32 legs — fp32 accumulation order only.
-- **Device-resident on ROCm, and measured against PyTorch honestly:** weights and ids are placed once (`place_params`/`place_ids`) and the device outputs feed back in (re-placing per call measured 2.4×–11.7× slower); every timed device call is `run` + the explicit `Executable.synchronize()` (the xla device-resident `run` only enqueues), so the head-to-head against eager **and** compiled `torch-rocm` is apples-to-apples — `xla`/rocm beats eager torch in 13 of 14 GPU cells (up to 8.3×, tightening to parity and then losing at Qwen3-14B) at `seq_len` 32/128, while `torch.compile` — carried as its own baseline — wins the 8–14B short-sequence cells; `iree`/rocm wins 6 of 14 and trails badly at 8B+. Numbers: `hf_bench_results.md`, archived in the separate `evoxc-bench` repository.
+- **ROCm performance:** weights and ids are placed once (`place_params`/`place_ids`) and the device outputs feed back in (re-placing per call measured 2.4×–11.7× slower); every timed device call is `run` + the explicit `Executable.synchronize()` (the xla device-resident `run` only enqueues), with eager and compiled `torch-rocm` measured as separate baselines: `xla`/rocm beats eager torch in 13 of 14 GPU cells (up to 8.3×, tightening to parity and then losing at Qwen3-14B) at `seq_len` 32/128, while `torch.compile` — carried as its own baseline — wins the 8–14B short-sequence cells; `iree`/rocm wins 6 of 14 and trails badly at 8B+. Numbers: `hf_bench_results.md`, archived in the separate `evoxc-bench` repository.
 - **Opt-in weight packing** (`pack_weights=True`, `pack_params`) collapses the weight tree into ~4 graph inputs — bit-identical, and it works around IREE's llvm-cpu SIGSEGV above ~161 distinct inputs (an unpacked 124M model has 196).
-- **Deferred by design:** exact-`erf` GELU configs are numpy-only (`erf` is a StableHLO v1 deferral); dynamic shapes, kv-cache/incremental decode and generation loops are out of scope — this is the forward graph, not a serving stack.
+- **Current coverage:** model forward passes with static shapes. Exact-`erf` GELU uses the NumPy backend. Dynamic shapes, KV cache, incremental decoding, and generation loops are not yet supported.
 
 ## How evoxc compares
 
-**evoxc is a compiler frontend and runtime, not a framework.** PyTorch and JAX are complete numerical ecosystems; Nx is the Elixir-native equivalent whose graph semantics evoxc deliberately mirrors (explicit `defn` graphs, `block`, `vectorize`, pluggable backends). evoxc does not try to replace them and borrows freely: numpy ergonomics, Nx's graph semantics, JAX's key-based RNG and function transforms.
+evoxc focuses on inspectable computation graphs and a public compilation pipeline. Its API draws on NumPy's array operations, Nx's graph model, and JAX's key-based RNG and function transforms.
 
-**The one real difference: the program is a first-class object.** No eager mode, no implicit tracing, no mode switch, no compiler-owned semantics. Whatever a framework has to derive internally — by tracing at every call, by capturing a graph on a guard, by compiling behind an annotation — evoxc hands you directly: the graph is what you wrote, an inspectable, diffable, saveable, transformable value, and every stage from `trace` to `run` is a public function returning a public type you can stop at, keep, or ship.
+Use evoxc to:
 
-**Choose evoxc when…** you want the program itself as an artifact (inspect, diff, save, transform, ship it to a device, hand it to another process); you need compiler neutrality — the same graph on a numpy interpreter, IREE, XLA or TVM, with no vendor IR in your source; you build meta-level or graph-generating workloads (NAS, genetic programming, algorithm synthesis) where a static program is data, `build_cached` is the compile boundary and `batch_functions` turns a whole population into one graph; or you want numpy-only deployment, a pure-Python dependency tree, and no compiler in the loop.
+- Inspect, transform, save, and transfer programs as graph objects.
+- Run compatible graphs through NumPy, IREE, XLA, or TVM.
+- Build graph-generating workloads such as neural architecture search, genetic programming, and algorithm synthesis with `build_cached` and `batch_functions`.
+- Deploy numerical programs with a NumPy-only runtime.
 
-**Reach for something else when…** you need an ecosystem (layers, optimizers, pretrained models, serving), the most mature vendor GPU kernel coverage, fast eager iteration on dynamic Python control flow over tensors, or tens of thousands of users' worth of battle-testing. Those are real gaps in evoxc, not opinions — but they are also not reasons to accept a compiler that owns your program's meaning. If the library you would reach for does not itself run on evoxc, and **its license permits**, the concrete move is to rewrite or port that library onto evoxc with **EvoX Genesis** ([EMI-Group/genesis](https://github.com/EMI-Group/genesis)): the graph, the staging pipeline and the compiler adapters are already here, so the port adds the ecosystem instead of a second runtime.
+PyTorch and JAX provide broader libraries for model development and eager execution. When choosing evoxc, check the [backend coverage](#backends) and [current limitations](#status--deferrals) against the operations and hardware your application needs.
 
 ## Install
 
@@ -451,7 +450,7 @@ pip install evoxc-hf            # the HuggingFace layer — a separate distribut
 pip install "evoxc-hf[hf]"      # + torch/transformers reference oracles for evoxc-hf (never runtime requirements)
 ```
 
-`evoxc` and `evoxc-hf` are two **independent distributions** built from this one repository (one `uv` workspace, one `uv.lock`, one version per project); each is installed and upgrades on its own, and neither contains the other.
+`evoxc` and `evoxc-hf` are independently versioned packages in this repository. Install and upgrade them separately. The optional `evoxc-hf[hf]` extra adds PyTorch and Transformers for reference tests and benchmarks.
 
 From source — the checkout, for development (`requires-python >= 3.11`):
 
@@ -465,7 +464,7 @@ pip install -e ".[dev]"              # editable install + pytest
 pytest
 ```
 
-**A plain `uv sync` is not enough for development:** it installs the root project only and *uninstalls* the workspace member, leaving `evoxc_hf/` in the checkout looking importable as a namespace package — so `import evoxc_hf` silently resolves to the wrong, unbuilt thing. Always pass `--all-packages` (add `--all-extras` to install every optional extra of both projects: the adapters and the `evoxc-hf` oracles).
+For development, use `uv sync --all-packages` to install both packages. Plain `uv sync` removes the `evoxc-hf` workspace member and can leave an incomplete namespace import. Add `--all-extras` to install all optional adapters and reference-test dependencies.
 
 | extra | installs | enables |
 |---|---|---|
@@ -473,15 +472,13 @@ pytest
 | `interop` | `torch` | DLPack interop tests |
 | `bench` | `torch` | `evoxc.bench`'s PyTorch comparison column |
 | `iree` | `iree-base-compiler` + `iree-base-runtime` (3.13.x) | the IREE adapter on llvm-cpu / cuda / rocm / vulkan |
-| `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib only for its bundled MLIR bindings; `jax` is never imported) |
+| `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib supplies the MLIR bindings) |
 | `compilers` | IREE + TVM | both adapters at once |
 | *(xla)* | **no extra** | the XLA adapter auto-discovers a PJRT C API plugin `.so` — an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`) or an explicit `plugin_path`/`EVOXC_PJRT_PLUGIN` |
 
-`torch` and `transformers` are **not** an `evoxc` extra any more — the HuggingFace reference oracles live on the `evoxc-hf` distribution: `pip install "evoxc-hf[hf]"`. `evoxc`'s hard dependency stays numpy-only.
-
 | `evoxc-hf` extra | installs | enables |
 |---|---|---|
-| `hf` | `torch`, `transformers` | the reference oracles that validate and benchmark `evoxc-hf` — never runtime requirements |
+| `hf` | `torch`, `transformers` | the reference oracles that validate and benchmark `evoxc-hf` |
 | `dev` | `pytest` | the `evoxc-hf` test suite |
 
 ```
@@ -500,10 +497,10 @@ CONTEXT.md      architecture, contracts and status (root, the source of truth)
 
 Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, graph transforms, `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `evoxc.bench` harness.
 
-Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **6965 passed, 80 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, **6551 passed, 112 skipped, 4 xfailed, 0 failed** with an auto-discovered PJRT plugin and no compiler adapter, and the colocated `./evoxc_hf/tests/` suite adds **709 passed, 18 skipped**. Every skip is a host or dependency guard (no NVIDIA CUDA device, no `tvm`/`torch` in the recorded venv, no `uv` build toolchain, no PJRT plugin, a torch-present inverse pin, the io pristine-process guard).
+Recorded test results: **6965 passed, 80 skipped, 4 xfailed, 0 failed** with IREE installed; **6551 passed, 112 skipped, 4 xfailed, 0 failed** with an auto-discovered PJRT plugin and no compiler adapter. The `evoxc_hf` suite adds **709 passed, 18 skipped**. See [`tests/CONTEXT.md`](tests/CONTEXT.md) for environments and per-file inventories.
 
 <details>
-<summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
+<summary><strong>Current limitations</strong></summary>
 
 - Vectorizing control-flow regions; `conv` VJP (there is no transposed-conv op); symbolic-length `scan`.
 - `linalg.inv`, `norm` beyond vector norms, `det`; non-constant `pad` modes; symbolic-bound `arange`/`linspace`.
@@ -511,9 +508,9 @@ Test suite (`./tests/`, with its recorded baseline and per-file inventories in [
 - Sparse on compiler backends (densify with `evoxc.sparse.to_dense`), `sparse@sparse` matmul, sparse constants, whole-sparse `bind`.
 - Collectives and `runtime_call` are not compiled by any adapter in v1 (multi-rank runtime channels are not wired).
 - Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
-- `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`, never a Python-loop fallback.
+- `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`.
 
-**The guarantee: a deferral is an explicit `BackendError` (or `TransformError`) naming the op and suggesting the remedy — never a silent fallback.**
+Unsupported operations raise `BackendError` or `TransformError` with the operation name and a suggested remedy. Execution does not silently fall back to another backend or a Python loop.
 
 </details>
 
@@ -523,4 +520,5 @@ evoxc is written solely with **EvoX Genesis** ([EMI-Group/genesis](https://githu
 
 ## License
 
-Apache-2.0. evoxc is part of the **EvoX** ecosystem: the compiler, frontend and graph runtime underneath evolutionary computation workloads, deliberately small enough to read.
+Apache-2.0. evoxc is part of the **EvoX** ecosystem: the compiler, frontend and graph runtime underneath evolutionary computation workloads.
+
