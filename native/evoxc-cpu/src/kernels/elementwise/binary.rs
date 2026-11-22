@@ -490,9 +490,12 @@ macro_rules! dense_binary_drivers {
             }
         }
 
-        /// The broadcast-operand driver: the general run decomposition of
-        /// `buffer::stride` with the op kind dispatched once per arm, exactly
-        /// as the broadcast-free drivers above.
+        /// The broadcast-operand driver: `buffer::zipmap`'s pooled broadcast
+        /// builder `map2_runs` — one [`crate::buffer::broadcast`] `apply2` (an
+        /// ndarray `Zip` pass over the operands' broadcast views), a result taken
+        /// from the storage pool, and `buffer::rowsplit` cutting a wide result
+        /// along its outermost axis — with the op kind dispatched once per arm,
+        /// exactly as the broadcast-free drivers above.
         #[allow(clippy::too_many_arguments)]
         fn broadcast_binary<T: Num>(
             kind: BinKind,
@@ -520,7 +523,121 @@ mod tests {
     use super::*;
     use evoxc_core::{Dim, ValueType};
 
-    use crate::kernels::elementwise::test_support::{binary, buffer, spec};
+    use crate::kernels::elementwise::test_support::{
+        binary, buffer, spec, zip2_reference,
+    };
+
+    /// The flat `add` arm pinned against the INDEPENDENT ndarray reference
+    /// ([`zip2_reference`]): `reference` is the per-element operation written out
+    /// by the test, so the pin never re-runs a `buffer` driver as its oracle.
+    fn assert_flat_add_matches_reference<T: Num + crate::buffer::NdScalar>(
+        dtype: DType,
+        shape: &[usize],
+        left: &[T],
+        right: &[T],
+        reference: impl Fn(T, T) -> T,
+    ) {
+        let got = dense_binary::<T>(BinKind::Add, dtype, shape, left, right)
+            .unwrap_or_else(|err| panic!("flat add: {}", err.message));
+        assert_eq!(got.dtype, dtype);
+        assert_eq!(got.shape, shape);
+        assert_eq!(
+            got.storage,
+            <T as crate::scalar::Scalar>::into_storage(zip2_reference(
+                left, shape, right, shape, shape, reference
+            )),
+            "flat add {dtype:?} {shape:?}"
+        );
+    }
+
+    #[test]
+    fn the_flat_add_path_matches_an_ndarray_zip_expression() {
+        // The broadcast-free fast path (`dense_binary`, one typed-slice map) over
+        // a few dtypes and shapes, integer wraparound included — asserted element
+        // for element against a plain `ndarray` `Zip` pass.
+        let f32_left = [1.5f32, -2.0, 3.25, 0.0, 7.5, -0.5];
+        let f32_right = [2.5f32, 4.0, -1.25, 9.0, -3.0, 0.25];
+        for shape in [vec![6], vec![2, 3], vec![1, 2, 3]] {
+            assert_flat_add_matches_reference(
+                DType::Float32,
+                &shape,
+                &f32_left,
+                &f32_right,
+                |a, b| a + b,
+            );
+        }
+        let f64_left = [0.1f64, -2.5, 1.0e300];
+        let f64_right = [0.2f64, 2.5, 1.0e300];
+        assert_flat_add_matches_reference(DType::Float64, &[3, 1], &f64_left, &f64_right, |a, b| a + b);
+        let i32_left = [i32::MAX, -7, 0, 42];
+        let i32_right = [1i32, 7, -1, -42];
+        assert_flat_add_matches_reference(
+            DType::Int32,
+            &[2, 2],
+            &i32_left,
+            &i32_right,
+            |a, b| a.wrapping_add(b),
+        );
+        let i64_left = [i64::MIN, 5, -11];
+        let i64_right = [-1i64, 5, 11];
+        assert_flat_add_matches_reference(
+            DType::Int64,
+            &[3],
+            &i64_left,
+            &i64_right,
+            |a, b| a.wrapping_add(b),
+        );
+        let u8_left = [250u8, 0, 3, 128];
+        let u8_right = [10u8, 255, 254, 128];
+        assert_flat_add_matches_reference(
+            DType::UInt8,
+            &[4],
+            &u8_left,
+            &u8_right,
+            |a, b| a.wrapping_add(b),
+        );
+        // A rank-0 pair is flat against the empty shape, not a broadcast.
+        assert_flat_add_matches_reference(
+            DType::Int32,
+            &[],
+            &[7i32],
+            &[5i32],
+            |a, b| a.wrapping_add(b),
+        );
+    }
+
+    #[test]
+    fn the_broadcast_add_path_matches_an_ndarray_zip_expression() {
+        // `broadcast_binary` is `map2_runs` (the pooled ndarray broadcast
+        // builder); the reference broadcasts the operand views itself, so the pin
+        // is the builder against a plain `Zip` expression rather than against the
+        // same driver.
+        let matrix = [1.0f32, -2.0, 3.0, 0.5, -1.5, 2.5];
+        let row = [0.25f32, -0.5, 2.0];
+        let column = [1.5f32, -3.0];
+        let out = [2usize, 3];
+        for (left, left_shape, right, right_shape) in [
+            (&matrix[..], &[2usize, 3][..], &row[..], &[3usize][..]),
+            (&row[..], &[3usize][..], &matrix[..], &[2usize, 3][..]),
+            (&column[..], &[2usize, 1][..], &matrix[..], &[2usize, 3][..]),
+        ] {
+            let got = broadcast_binary(
+                BinKind::Add,
+                DType::Float32,
+                &out,
+                left,
+                left_shape,
+                right,
+                right_shape,
+            )
+            .unwrap();
+            let expected = zip2_reference(left, left_shape, right, right_shape, &out, |a: f32, b: f32| {
+                a + b
+            });
+            assert_eq!(got.shape, out);
+            assert_eq!(got.storage, Storage::F32(expected), "{left_shape:?} + {right_shape:?}");
+        }
+    }
 
     #[test]
     fn only_the_safe_binary_ops_have_an_in_place_implementation() {
@@ -789,8 +906,9 @@ mod tests {
     #[test]
     fn the_logical_pair_on_flat_bools_matches_the_general_path() {
         // `logical_and`/`logical_or` map onto `Mul`/`Add` on bool; the flat pair
-        // takes the shared one-byte builder, a broadcast operand keeps the
-        // general run driver — both must place the same bools.
+        // takes the shared one-byte builder, a broadcast operand keeps
+        // `map2_runs` (the pooled ndarray broadcast builder) — both must place
+        // the same bools.
         let left = buffer(DType::Bool, &[2, 2], Storage::Bool(vec![true, true, false, false]));
         let right = buffer(DType::Bool, &[2, 2], Storage::Bool(vec![true, false, true, false]));
         let dims = [Dim::int(2), Dim::int(2)];
