@@ -263,7 +263,6 @@ dependencies = [
  "faer",
  "half",
  "libm",
- "matrixmultiply",
  "ndarray",
  "num-complex",
  "serde_json",
