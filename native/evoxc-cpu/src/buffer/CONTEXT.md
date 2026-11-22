@@ -55,16 +55,19 @@ Measured typed-slice specializations, deliberately kept:
 
 Protocol: `cargo test --release -p evoxc-cpu --lib bench_ -- --ignored --nocapture` (3 warmups, 15 iterations, median, 400 000 elements, shared host — expect run-to-run spread).
 `bench_broadcast_zip` times `map2_runs` for out `(2000, 50, 4)` f32 (the `xor_p500` population shape) with an `add` closure; the driver's cost is closure-independent.
-`bench_broadcast_zip_threads` A/Bs the identical code with the row split forced off and on (`rowsplit`'s `#[cfg(test)] SPLIT_DISABLED`) in one process, so the thread effect is separated from host drift.
+It prints each case twice: the production `map2_runs` (the repeating-run driver where it takes the layout, the row-split `Zip` otherwise) against the reference `ndarray` path with the specialization forced off (`broadcast`'s `#[cfg(test)] RUNS_DISABLED`), and then the same pair with the row split also forced off (`rowsplit`'s `SPLIT_DISABLED`), so the driver's own inner loop is visible without the thread count in the way.
+All instruments take one `bench_guard()` mutex, because they flip those process-wide switches and `cargo test` runs them in parallel threads — unserialized they timed each other's mode.
+Recorded run: loadavg 2.0, 2026-11-23, one process.
 
-| right operand | single result (split off) | default (row split, 3 chunks) | old hand-written run driver |
-|---|---|---|---|
-| `(4,)` bias | 1.11 ns/element, 0.444 ms | **0.455 ns/element, 0.182 ms** | 0.098 |
-| `(50, 1)` per-row scalar | 1.14 ns/element, 0.455 ms | **0.439 ns/element, 0.176 ms** | 1.104 |
-| `()` scalar | 0.088 ns/element, 0.035 ms | 0.096 ns/element, 0.039 ms | 0.093 |
+| right operand | production `map2_runs` | `Zip`, row split (3 chunks) | `Zip`, single-threaded | old hand-written run driver |
+|---|---|---|---|---|
+| `(4,)` innermost bias | **0.116 ns/element, 0.047 ms** | 0.443 ns/element, 0.177 ms | 0.868 ns/element, 0.347 ms | 0.098 |
+| `(50, 1)` per-row scalar | 0.421 ns/element, 0.168 ms | 0.423 ns/element, 0.169 ms | 0.919 ns/element, 0.368 ms | 1.104 |
+| `()` scalar | 0.093 ns/element, 0.037 ms | 0.094 ns/element, 0.038 ms | 0.094 ns/element, 0.038 ms | 0.093 |
 
-`bench_walk` times the fallback/reference offset driver: rank 1 `[1000000]` contiguous 0.92, rank 2 `[1000,1000]` contiguous 1.20, rank 2 column-strided 1.02, rank 3 `[100,100,100]` contiguous 1.50 ns/element (the deleted odometer was 1.06–1.60).
-Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, which puts the per-row shape ahead of the deleted driver (0.44 vs 1.10) and leaves only the `(4,)` bias ~4.6x behind its memory-bandwidth tiling (ndarray's generic `Zip` cannot express that tiling); the scalar case is memory-bound and pays ~8 % (~4 µs) of thread setup for nothing, which is small against the 0.26 ms the same change buys. `walk` and the scalar case are at or better than the deleted driver.
+The `(4,)` row is the regression this driver exists for: the specialization takes it at 0.116 ns/element where the production path before it was the row-split `Zip` at 0.443–0.455 (3.8x) and the un-split `Zip` at 0.868–1.25 (7.8–10x), so the case is back at the memory-bandwidth floor — 400 000 f32 elements is 1.6 MB read + 1.6 MB written in 0.047 ms ≈ 68 GB/s, with the `()` scalar control at 0.093 ns/element (0.10 of the same bandwidth). The per-row scalar's period (50) is past the tile cap, so it declines and keeps the row split (0.42 here; the earlier 0.44 figure), and the plain scalar declines for the same reason the `Zip` already captures it as a constant (0.093, unchanged).
+Reading the two columns: the row split still buys 2.2x on the per-row shape and is neutral on the `(4,)` and scalar shapes, and the repeating-run driver preempts it there deliberately — with the driver in place the split would cost ~0.05 ns/element on `(4,)` (0.17 vs 0.12 measured through the earlier hook) for work it already does at bandwidth.
+`bench_walk` times the fallback/reference offset driver: rank 1 `[1000000]` contiguous 0.92, rank 2 `[1000,1000]` contiguous 1.20, rank 2 column-strided 1.02, rank 3 `[100,100,100]` contiguous 1.50 ns/element (the deleted odometer was 1.06–1.60), so `walk` stays at or better than the deleted driver.
 
 ## Constraints
 
