@@ -21,13 +21,13 @@
 //! runs.
 
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use evoxc_core::{DType, Result};
 
 use super::broadcast::RUNS_DISABLED;
 use super::rowsplit::SPLIT_DISABLED;
+use super::test_support::switch;
 use super::{map2_runs, walk, Buffer, NdScalar};
 
 /// The result shape every case computes (and the `xor_p500` population shape).
@@ -90,12 +90,13 @@ fn call(left: &[f32], right: &[f32], right_shape: &[usize]) -> Result<Buffer> {
     )
 }
 
-/// Serializes the instruments in this file: they flip the process-wide A/B
-/// switches ([`RUNS_DISABLED`], [`SPLIT_DISABLED`]) while `cargo test` runs them
-/// in parallel threads, so two instruments at once would time each other's mode.
+/// The one lock shared with every `buffer` test that reads or flips a
+/// process-wide A/B switch: these instruments force [`RUNS_DISABLED`] and
+/// [`SPLIT_DISABLED`] while `cargo test` runs the tests in parallel threads, so
+/// an instrument must neither time another instrument's mode nor change a
+/// test's code path.
 fn bench_guard() -> std::sync::MutexGuard<'static, ()> {
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GUARD.lock().unwrap_or_else(|poison| poison.into_inner())
+    super::test_support::switch_guard()
 }
 /// Chunks one row split of [`OUT_SHAPE`] spans (the leading chunk stays on the
 /// calling thread, so this is chunks rather than spawned threads).
@@ -114,8 +115,8 @@ fn split_threads() -> usize {
 fn median_ms(case: &Case, left: &[f32], split_disabled: bool, generic: bool) -> f64 {
     // Correctness first: a timing of the wrong values would be worthless.
     let expected = reference(left, &case.right, &case.right_shape);
-    let runs = RUNS_DISABLED.swap(generic, Ordering::Relaxed);
-    let split = SPLIT_DISABLED.swap(split_disabled, Ordering::Relaxed);
+    let _runs = switch(&RUNS_DISABLED, generic);
+    let _split = switch(&SPLIT_DISABLED, split_disabled);
     let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
     let produced = <f32 as NdScalar>::slice_of(&result.storage).expect("an f32 result");
     let threaded = !split_disabled;
@@ -145,8 +146,6 @@ fn median_ms(case: &Case, left: &[f32], split_disabled: bool, generic: bool) -> 
         black_box(&result);
         samples.push(elapsed);
     }
-    RUNS_DISABLED.store(runs, Ordering::Relaxed);
-    SPLIT_DISABLED.store(split, Ordering::Relaxed);
     samples.sort_unstable();
     samples[ITERATIONS / 2].as_secs_f64() * 1e3
 }

@@ -3,6 +3,7 @@
 //! [`fill_broadcast`](super::fill_broadcast).
 
 use super::*;
+use crate::buffer::test_support::{switch, switch_guard};
 use crate::buffer::{Buffer, Storage};
 use evoxc_core::DType;
 
@@ -495,6 +496,9 @@ fn a_one_element_operand_whose_shape_claims_two_is_not_a_scalar() {
 
 #[test]
 fn fill_broadcast_agrees_with_the_reference() {
+    // `fill_broadcast` consults the A/B switch through `copy_runs`, so no
+    // instrument (or sibling test) may flip it mid-run.
+    let _serialized = switch_guard();
     // Not compared against `broadcast_to`: that is `fill_broadcast` now, so
     // the reference has to be independent.
     let cases: &[(&[usize], &[usize])] = &[
@@ -517,6 +521,9 @@ fn fill_broadcast_agrees_with_the_reference() {
 
 #[test]
 fn a_pooled_broadcast_result_is_fully_overwritten() {
+    // `map2_runs` consults both A/B switches, so no instrument may hold one
+    // while this runs.
+    let _serialized = switch_guard();
     // A parked garbage stock of the result's exact size must not leak a
     // single NaN into the result: the broadcast map writes every element.
     let out_shape = [2000usize, 50, 4];
@@ -591,14 +598,6 @@ fn the_view_path_agrees_with_the_flat_fast_path() {
 // The repeating-run specialization
 // ---------------------------------------------------------------------------
 
-/// Serializes the tests that drive the specialization or flip its A/B switch:
-/// the switch is process-wide while the tests run in parallel, so one test
-/// measuring the reference path must not decide another test's code path.
-fn runs_guard() -> std::sync::MutexGuard<'static, ()> {
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GUARD.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
 /// The layout cases the repeating-run driver must cover: an innermost `(n,)`
 /// bias, a `(1, ..., 1, n)` operand, a whole-storage repeat, two operands with
 /// different short periods, and a rank-1 result.  Every one of them is checked
@@ -607,7 +606,7 @@ fn runs_guard() -> std::sync::MutexGuard<'static, ()> {
 /// with the reference driver are pinned.
 #[test]
 fn the_repeating_run_driver_covers_the_innermost_broadcast_family() {
-    let _serialized = runs_guard();
+    let _serialized = switch_guard();
     type Case<'a> = (&'a [usize], &'a [usize], &'a [usize]);
     let cases: &[Case<'_>] = &[
         // The xor_p500 shape: a `(4,)` bias beside a (pop, m, n) result.
@@ -640,10 +639,11 @@ fn the_repeating_run_driver_covers_the_innermost_broadcast_family() {
 
         // The reference driver's answer first, with the specialization
         // disabled, and then the specialized answer.
-        RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut generic = vec![0i32; count];
-        apply2(&mut generic, out_shape, &a, a_shape, &b, b_shape, f);
-        RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        {
+            let _generic = switch(&RUNS_DISABLED, true);
+            apply2(&mut generic, out_shape, &a, a_shape, &b, b_shape, f);
+        }
         let mut specialized = vec![0i32; count];
         apply2(&mut specialized, out_shape, &a, a_shape, &b, b_shape, f);
 
@@ -668,7 +668,7 @@ fn the_repeating_run_driver_covers_the_innermost_broadcast_family() {
 /// it produces must still agree with the independent reference.
 #[test]
 fn the_repeating_run_driver_declines_what_it_does_not_cover() {
-    let _serialized = runs_guard();
+    let _serialized = switch_guard();
     // A middle-axis broadcast is not a repetition of the operand's storage, and
     // a per-row scalar's period is past the tile cap.
     type Case<'a> = (&'a [usize], &'a [usize], &'a [usize]);
@@ -724,7 +724,7 @@ fn the_repeating_run_driver_declines_what_it_does_not_cover() {
 /// pinned to `(predicate, on-true, on-false)`.
 #[test]
 fn the_repeating_run_driver_covers_select() {
-    let _serialized = runs_guard();
+    let _serialized = switch_guard();
     let out_shape = [64usize, 8, 4];
     let count = product(&out_shape);
     let pred: Vec<bool> = (0..count).map(|index| index % 5 < 2).collect();
@@ -733,20 +733,21 @@ fn the_repeating_run_driver_covers_select() {
     let b: Vec<i32> = values(4, 13);
     let f = |pick: bool, x: i32, y: i32| if pick { x } else { y };
 
-    RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut generic = vec![0i32; count];
-    apply3(
-        &mut generic,
-        &out_shape,
-        &pred,
-        &out_shape,
-        &a,
-        &out_shape,
-        &b,
-        &[4],
-        f,
-    );
-    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    {
+        let _generic = switch(&RUNS_DISABLED, true);
+        apply3(
+            &mut generic,
+            &out_shape,
+            &pred,
+            &out_shape,
+            &a,
+            &out_shape,
+            &b,
+            &[4],
+            f,
+        );
+    }
     let mut specialized = vec![0i32; count];
     assert!(runs3(
         &mut specialized,
@@ -763,7 +764,7 @@ fn the_repeating_run_driver_covers_select() {
 
     // The predicate itself may be the tiled operand.
     let mut from_predicate = vec![0i32; count];
-    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _enabled = switch(&RUNS_DISABLED, false);
     apply3(
         &mut from_predicate,
         &out_shape,
@@ -881,24 +882,25 @@ fn check_repeating_run_dtype<T: Slot + Send + Sync>() {
         );
     }
     // And the ndarray `Zip` reference produces exactly the same elements.
-    RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut generic = vec![T::at(0); count];
-    apply2(
-        &mut generic,
-        &out_shape,
-        &left,
-        &out_shape,
-        &bias,
-        &[4],
-        T::combine,
-    );
-    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    {
+        let _generic = switch(&RUNS_DISABLED, true);
+        apply2(
+            &mut generic,
+            &out_shape,
+            &left,
+            &out_shape,
+            &bias,
+            &[4],
+            T::combine,
+        );
+    }
     assert_eq!(specialized, generic);
 }
 
 #[test]
 fn the_repeating_run_driver_is_dtype_generic() {
-    let _serialized = runs_guard();
+    let _serialized = switch_guard();
     // All 14 evoxc dtypes through the same driver: it addresses elements and
     // never touches a value, so every dtype rides the same code.
     check_repeating_run_dtype::<bool>();
@@ -921,7 +923,7 @@ fn the_repeating_run_driver_is_dtype_generic() {
 /// (the closure owns every semantic, the driver only supplies addresses).
 #[test]
 fn the_repeating_run_driver_keeps_nan_and_signed_zeros() {
-    let _serialized = runs_guard();
+    let _serialized = switch_guard();
     let out_shape = [16usize, 8, 4];
     let count = product(&out_shape);
     let rows: Vec<f32> = (0..count)
@@ -936,10 +938,11 @@ fn the_repeating_run_driver_keeps_nan_and_signed_zeros() {
     let bias = [1.0f32, -1.0, f32::NAN, 2.0];
     let f = |x: f32, y: f32| if x.is_nan() || y.is_nan() { f32::NAN } else { x * y };
 
-    RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut generic = vec![0.0f32; count];
-    apply2(&mut generic, &out_shape, &rows, &out_shape, &bias, &[4], f);
-    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    {
+        let _generic = switch(&RUNS_DISABLED, true);
+        apply2(&mut generic, &out_shape, &rows, &out_shape, &bias, &[4], f);
+    }
     let mut specialized = vec![0.0f32; count];
     assert!(runs2(
         &mut specialized,
@@ -963,7 +966,7 @@ fn the_repeating_run_driver_keeps_nan_and_signed_zeros() {
 /// of one tile, and a whole-storage source is one plain copy.
 #[test]
 fn the_repeating_copy_covers_fill_broadcast() {
-    let _serialized = runs_guard();
+    let _serialized = switch_guard();
     // A `(4,)` source tiled across a (32, 8, 4) target.
     let source = [1i64, -2, 3, 4];
     let filled = fill_broadcast(&source, &[4], &[32, 8, 4]);
