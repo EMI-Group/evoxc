@@ -68,7 +68,7 @@ Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, whi
 - Never a second layout engine: new N-dimensional addressing is expressed with ndarray views/`Zip`/`indices`, never with a hand-written increment/decrement odometer.
 - `Buffer`/`Storage` keep their owned representation and public fields; result buffers are always fresh C-contiguous `Vec`s (a shape-only op copies — that is the documented cost of having no views in `Storage`).
 - Errors are explicit `Result` values with the crate's message conventions; no `unwrap`/`expect` on user input, no silent truncation of a short operand.
-- Threads are scoped inside one call only (never a pool, never `rayon`), gated by the measured thresholds, and each thread owns a disjoint output range so results stay bit-identical.
+- Threads are scoped inside one call only (never a pool, never `rayon`), gated by the measured thresholds (element count for a flat map, row count for the pooled broadcast builders), and each thread owns a disjoint output range so results stay bit-identical.
 - Pooled results are never zero-filled on the hot paths; a pooled stock is only taken when it is fully overwritten.
 - One concern per file, target <~1000 lines including tests: the broadcast driver's independent reference tests live in `broadcast/tests.rs` as a sibling file.
 
