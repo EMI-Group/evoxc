@@ -273,8 +273,12 @@ fn dot_run<T: Num + NdScalar>(
     let b_blocks = broadcast_blocks(&b_view, &g.batch, k, n)?;
     let mut out = vec![T::zero(); m * n * util::numel(&g.batch)];
     let mut owned = (None, None);
-    for (slot, position) in ndarray::indices(&g.batch[..]).into_iter().enumerate() {
-        let out_block = &mut out[slot * m * n..(slot + 1) * m * n];
+    // The result is C-order, so `chunks_exact_mut` walks the batch blocks in
+    // exactly `ndarray::indices`' C-order position sequence: each pair is one
+    // batch position and the output block it owns.
+    for (out_block, position) in
+        out.chunks_exact_mut(m * n).zip(ndarray::indices(&g.batch[..]))
+    {
         with_block_pair(&a_blocks, &b_blocks, &position, &mut owned, |a_run, b_run| {
             for row in 0..m {
                 let a_row = &a_run[row * k..(row + 1) * k];
@@ -361,9 +365,10 @@ impl FaerGemm for f64 {
 /// True when the batch axes of one operand select CONTIGUOUS trailing blocks
 /// (`operand_batch ++ [rows, cols]` in C order): a broadcast axis carries the
 /// `0` stride [`broadcast_strides`] gives it (one shared block), every other
-/// axis the natural C-order stride.  `strides` are the BLOCK-unit strides the
-/// batch traversal indexes with (one unit = one `rows x cols` matrix), so the
-/// natural strides compared against are those of the operand's batch shape.
+/// axis the natural C-order stride.  `strides` are BLOCK-unit strides (one unit
+/// = one `rows x cols` matrix), compared against the operand's own batch shape —
+/// this is the fast path's ACCEPTANCE question only, never how a block is
+/// addressed (that is [`batch_block`]).
 fn blocks_contiguous(operand_batch: &[usize], batch: &[usize], strides: &[usize]) -> bool {
     if operand_batch.len() > batch.len() || strides.len() != batch.len() {
         return false;
@@ -525,8 +530,9 @@ fn gemm_run_threads<T: FaerGemm>(
     let par = gemm_par(threads);
     let mut out = vec![T::zero(); block * util::numel(&g.batch)];
     let mut owned = (None, None);
-    for (slot, position) in ndarray::indices(&g.batch[..]).into_iter().enumerate() {
-        let dest = &mut out[slot * block..(slot + 1) * block];
+    // `chunks_exact_mut` and `ndarray::indices` are both C order, so each pair
+    // is one batch position and the contiguous output block it owns.
+    for (dest, position) in out.chunks_exact_mut(block).zip(ndarray::indices(&g.batch[..])) {
         with_block_pair(&a_blocks, &b_blocks, &position, &mut owned, |lhs, rhs| {
             T::gemm_block(m, k, n, lhs, rhs, dest, par);
         })?;
