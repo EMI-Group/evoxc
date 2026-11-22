@@ -38,6 +38,27 @@
 //!
 //! Complex inputs are rejected explicitly by every kernel here: this engine
 //! computes real factorizations and never guesses a complex one.
+//!
+//! # `faer` was evaluated and is not adopted for any of them
+//!
+//! Each factorization carries a test-only A/B against `faer` 0.24 (the oracle
+//! functions `*_faer*`/`cholesky_via_faer` in the sibling modules, plus the
+//! `#[ignore]`d `--record` style evidence and timing benches): the numpy
+//! conventions above are the contract, and `faer` differs from them where the
+//! reference is degenerate or where its per-call entry cannot be tuned.
+//!
+//! | op | verdict | measured | reason |
+//! |---|---|---|---|
+//! | `cholesky` | kept | agrees to 1e-10 over the corpus; 6.6x SLOWER at 256² (7.748 vs 1.171 ms) | `Llt::new` always reads faer's global parallelism (default all cores) and the `Par`-taking low-level entry is unreachable (`MemStack` is crate-private, no `dyn-stack` dependency) |
+//! | `qr` | kept | full rank ≤2.3e-15; rank-deficient max abs difference 1.295 (`Q`) / 4.720 (`R`) | a null-space basis has no sign convention to reproduce, so a rank-deficient `Q` cannot be matched deterministically |
+//! | `svd` | kept | full rank ≤1.2e-13 (`U`) / 5.9e-14 (`Vt`), signs and order equal; rank-deficient 8.5e-1 / 1.41 | this kernel completes a rank-deficient `U` with a unit diagonal entry faer replaces by a true null vector; a NaN operand yields NaN factors here and `SvdError::NoConvergence` in faer |
+//! | `eigh` | kept | matches on distinct spectra; an exactly degenerate pair rotates the basis by 9.226e-2 | an eigenspace basis is arbitrary when eigenvalues tie, so no sign/order convention can reproduce the reference there (faer is 8–312x faster, which does not buy a parity failure) |
+//! | `matrix_rank` | kept | inherits `svd` | it counts `svd`'s spectrum, so it inherits the `svd` verdict; its tolerance rule is numpy's and unchanged |
+//! | `matrix_exp` | kept | n/a | `faer` 0.24 has no matrix exponential at all |
+//!
+//! The `ndarray` plumbing (matrix extraction, batched iteration, result
+//! materialization) is shared by all six and is the reason the module is a
+//! directory of small per-op files.
 
 use evoxc_core::{DType, Error, Result};
 

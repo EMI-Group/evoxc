@@ -9,36 +9,37 @@
 //! triangle of `a` (numpy's `UPLO='L'` default; the upper triangle is ignored),
 //! and a matrix that is not positive definite is an explicit `BackendError`
 //! naming the failing leading minor.
+//! A NON-finite operand keeps numpy's (LAPACK `potrf`) behaviour: an `inf`
+//! pivot passes an infinite factor through and a NaN pivot is the frozen
+//! non-positive-definite error.
 //!
-//! The factor comes from `faer`'s `LLᵀ` solver (`faer::linalg::solvers::Llt`
-//! with `Side::Lower`): `Llt` copies only the requested triangle, zeroes the
-//! strict upper triangle of its result, and reports
-//! `LltError::NonPositivePivot { index }` for the first column whose pivot is
-//! not strictly positive (a NaN pivot included).
+//! KEPT hand-written, measured against `faer`'s `LLᵀ` solver
+//! (`faer::linalg::solvers::Llt` with `Side::Lower`, kept as the test-only A/B
+//! oracle `cholesky_via_faer`):
+//! - the factor agrees to 1e-10 absolute over a deterministic corpus (1x1, a
+//!   well-conditioned 6x6, Hilbert 6x6, a clustered-eigenvalue 5x5, and an
+//!   f32-rounded 4x4 at 1e-6), the upper triangle of the input changes nothing,
+//!   `L` is lower triangular with exact zeros above a positive diagonal, and
+//!   the non-positive-definite inputs yield the identical message
+//!   (`faer_cholesky_matches_the_production_kernel`);
+//! - but `Llt::new` is the only reachable per-call entry and always reads
+//!   faer's PROCESS-GLOBAL parallelism (default: all cores). With that default
+//!   the factor costs 0.016 / 7.748 / 57.642 ms at 64² / 256² / 1024² against
+//!   this kernel's 0.016 / 1.171 / 76.173 ms — a 6.6x REGRESSION at 256², the
+//!   size a CPU graph engine meets most. Sequential faer is 3.0x (256²) and
+//!   3.7x (1024²) faster, but the low-level
+//!   `faer::linalg::cholesky::llt::factor::cholesky_in_place`, which takes an
+//!   explicit `Par`, is unreachable from outside faer: its `&mut MemStack`
+//!   argument's type is re-exported only from faer's crate-private
+//!   `internal_prelude`, and `dyn-stack` is not a dependency of this crate.
+//!   Pinning the global to `Par::Seq` once would be a process-wide faer policy
+//!   decision (it governs any future faer kernel here too), so this kernel does
+//!   not mutate it.
 //!
-//! Measured, not assumed: the faer factor matches the hand-written algorithm
-//! kept below as the test oracle ([`cholesky_lower_reference`], arithmetic
-//! untouched) to 1e-10 absolute over a deterministic corpus (1x1, a
-//! well-conditioned 6x6, Hilbert 6x6, a clustered-eigenvalue 5x5, and an
-//! f32-rounded 4x4 at 1e-6), the upper triangle of the input changes nothing,
-//! `L` is lower triangular with exact zeros above a positive diagonal, and six
-//! non-positive-definite inputs yield the identical `BackendError` message.
-//!
-//! One documented divergence: a non-finite pivot (`+inf` on the diagonal) is an
-//! error here, while the reference (and LAPACK's `potrf`) passes an infinite
-//! factor through — see `cholesky_lower_rejects_a_non_finite_pivot`.
-//!
-//! Timing (release, min of 3–5 runs, `bench_faer_vs_reference_cholesky`):
-//! 64x64 0.014 vs 0.016 ms, 256x256 0.67 vs 1.18 ms, 1024x1024 22.5 vs 76.2 ms
-//! in faer's favour with its global parallelism set to `Par::Seq`.
-//! `Llt::new` reads faer's GLOBAL parallelism, whose default is all cores, and
-//! that default costs 4.7–9.7 ms at 256x256 on this host against 0.67 ms
-//! sequential (a per-call `Par` does not exist on `Llt::new`): the setting is an
-//! engine-wide decision, so this kernel does not mutate it.
-
+//! `bench_cholesky_variants` records the full table (both global settings and
+//! this kernel); run it with `--release ... -- --ignored --nocapture
+//! --test-threads=1`.
 use evoxc_core::{Error, Result};
-use faer::linalg::solvers::{Llt, LltError};
-use faer::{MatRef, Side};
 use ndarray::{Array2, ArrayView2};
 
 /// Lower-triangular `L` with `A = L Lᵀ`, read from the LOWER triangle of `a`
@@ -46,48 +47,12 @@ use ndarray::{Array2, ArrayView2};
 /// explicit error naming the op and the failing leading minor.
 pub(super) fn cholesky_lower(a: ArrayView2<f64>) -> Result<Array2<f64>> {
     let n = a.nrows();
-    // `faer` asserts a square matrix: return the empty factor without calling
-    // it, and keep a malformed view from panicking.
-    if n == 0 {
-        return Ok(Array2::<f64>::zeros((0, 0)));
-    }
     if a.ncols() != n {
         return Err(Error::shape(format!(
             "op 'cholesky': matrix must be square, got {n} vs {}",
             a.ncols()
         )));
     }
-    // Column-major copy of the LOWER triangle only (the upper one is ignored,
-    // exactly as `Llt`'s `Side::Lower` reads it).
-    let mut input = vec![0.0f64; n * n];
-    for col in 0..n {
-        for row in col..n {
-            input[col * n + row] = a[(row, col)];
-        }
-    }
-    let factor = Llt::new(MatRef::from_column_major_slice(&input, n, n), Side::Lower).map_err(
-        |error| match error {
-            LltError::NonPositivePivot { index } => Error::backend(format!(
-                "op 'cholesky': matrix is not positive definite (leading minor of order {} is not positive)",
-                index + 1
-            )),
-        },
-    )?;
-    // `L()` is a full `n × n` view whose strict upper triangle is exactly zero,
-    // so writing the lower triangle into a zeroed result keeps those zeros.
-    let mut lower = Array2::<f64>::zeros((n, n));
-    for (col, column) in factor.L().col_iter().enumerate() {
-        for (row, value) in column.iter().enumerate().skip(col) {
-            lower[(row, col)] = *value;
-        }
-    }
-    Ok(lower)
-}
-
-/// The pre-`faer` hand-written algorithm, kept verbatim as the test oracle.
-#[cfg(test)]
-fn cholesky_lower_reference(a: ArrayView2<f64>) -> Result<Array2<f64>> {
-    let n = a.nrows();
     let mut lower = Array2::<f64>::zeros((n, n));
     for col in 0..n {
         let mut diagonal = a[(col, col)];
@@ -111,6 +76,40 @@ fn cholesky_lower_reference(a: ArrayView2<f64>) -> Result<Array2<f64>> {
         }
     }
     Ok(lower)
+}
+#[cfg(test)]
+/// The `faer` counterpart, kept as the A/B oracle (see the module doc for why
+/// it is not the production path). `Llt` copies only the requested triangle,
+/// zeroes the strict upper triangle of its result, and reports
+/// `LltError::NonPositivePivot { index }` for the first column whose pivot is
+/// not strictly positive (a NaN pivot included).
+fn cholesky_via_faer(a: ArrayView2<f64>) -> Result<Array2<f64>> {
+    use faer::linalg::solvers::{Llt, LltError};
+    use faer::Side;
+
+    let n = a.nrows();
+    if n == 0 {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+    // `faer` fills its own column-major matrix from the closure, so the layout
+    // conversion stays on faer's side; the strict upper triangle stays zero,
+    // exactly as `Llt`'s `Side::Lower` reads it.
+    let matrix = faer::Mat::from_fn(n, n, |row, col| if col <= row { a[(row, col)] } else { 0.0 });
+    let factor = Llt::new(matrix.as_ref(), Side::Lower).map_err(|error| match error {
+        LltError::NonPositivePivot { index } => Error::backend(format!(
+            "op 'cholesky': matrix is not positive definite (leading minor of order {} is not positive)",
+            index + 1
+        )),
+    })?;
+    // `L()` is a full `n × n` view whose strict upper triangle is exactly zero.
+    let l = factor.L();
+    Ok(Array2::from_shape_fn((n, n), |(row, col)| {
+        if col <= row {
+            l[(row, col)]
+        } else {
+            0.0
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -294,12 +293,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn faer_cholesky_matches_the_reference() {
+    fn faer_cholesky_matches_the_production_kernel() {
         for (name, a, tol) in corpus() {
             let n = a.nrows();
-            let got = cholesky_lower(a.view())
+            let got = cholesky_via_faer(a.view())
                 .unwrap_or_else(|error| panic!("{name}: {}", error.message));
-            let want = cholesky_lower_reference(a.view())
+            let want = cholesky_lower(a.view())
                 .unwrap_or_else(|error| panic!("{name}: {}", error.message));
             assert_matrix_close(&got, &want, tol, name);
             assert_lower_triangular(&got, name);
@@ -314,16 +313,16 @@ mod tests {
             }
             let ignored = cholesky_lower(garbage.view())
                 .unwrap_or_else(|error| panic!("{name}: {}", error.message));
-            assert_eq!(ignored, got, "{name}: the upper triangle changed the factor");
+            assert_eq!(ignored, want, "{name}: the upper triangle changed the factor");
         }
     }
 
     #[test]
-    fn cholesky_lower_reports_non_positive_definite_like_the_reference() {
-        let cases: Vec<(&str, Array2<f64>)> = vec![
-            ("negative 1x1", matrix(1, 1, &[-1.0])),
-            ("zero 1x1", matrix(1, 1, &[0.0])),
-            ("indefinite 2x2", matrix(2, 2, &[1.0, 2.0, 2.0, 1.0])),
+    fn cholesky_reports_the_failing_leading_minor() {
+        let cases: Vec<(&str, Array2<f64>, usize)> = vec![
+            ("negative 1x1", matrix(1, 1, &[-1.0]), 1),
+            ("zero 1x1", matrix(1, 1, &[0.0]), 1),
+            ("indefinite 2x2", matrix(2, 2, &[1.0, 2.0, 2.0, 1.0]), 2),
             (
                 "late failure 4x4",
                 matrix(
@@ -334,36 +333,49 @@ mod tests {
                         2.0, 1.0,
                     ],
                 ),
+                4,
             ),
-            ("nan diagonal", matrix(2, 2, &[f64::NAN, 0.0, 0.0, 1.0])),
+            ("nan diagonal", matrix(2, 2, &[f64::NAN, 0.0, 0.0, 1.0]), 1),
             (
                 "singular 3x3",
                 matrix(3, 3, &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+                2,
             ),
         ];
-        for (name, a) in cases {
-            let got = cholesky_lower(a.view()).expect_err(name);
-            let want = cholesky_lower_reference(a.view()).expect_err(name);
-            assert_eq!(got.kind, want.kind, "{name}: error family");
-            assert_eq!(got.kind, ErrorKind::Backend, "{name}: not a BackendError");
-            assert_eq!(got.message, want.message, "{name}: message");
+        for (name, a, order) in cases {
+            let err = cholesky_lower(a.view()).expect_err(name);
+            assert_eq!(err.kind, ErrorKind::Backend, "{name}: not a BackendError");
+            assert_eq!(
+                err.message,
+                format!(
+                    "op 'cholesky': matrix is not positive definite (leading minor of order {order} is not positive)"
+                ),
+                "{name}: message"
+            );
         }
     }
-
-    /// Documented divergence: a non-finite pivot is an error here, while the
-    /// reference (and LAPACK's `potrf`) passes an infinite factor through.
+    /// numpy (LAPACK `potrf`) passes a non-finite pivot through: an `inf`
+    /// diagonal yields an `inf` factor, a NaN pivot is the frozen error.
     #[test]
-    fn cholesky_lower_rejects_a_non_finite_pivot() {
-        let a = matrix(2, 2, &[f64::INFINITY, 0.0, 0.0, 1.0]);
-        let err = cholesky_lower(a.view()).expect_err("a non-finite pivot");
+    fn cholesky_non_finite_operands_keep_numpy_behaviour() {
+        let got = cholesky_lower(matrix(2, 2, &[f64::INFINITY, 0.0, 0.0, 1.0]).view())
+            .expect("an infinite factor passes through");
+        assert_eq!(got[(0, 0)], f64::INFINITY);
+        assert_eq!(got[(1, 0)], 0.0);
+        assert_eq!(got[(1, 1)], 1.0);
+        assert!(!got.iter().any(|value| value.is_nan()));
+        let err = cholesky_lower(matrix(2, 2, &[f64::NAN, 0.0, 0.0, 1.0]).view())
+            .expect_err("a NaN pivot");
         assert_eq!(err.kind, ErrorKind::Backend);
         assert_eq!(
             err.message,
             "op 'cholesky': matrix is not positive definite (leading minor of order 1 is not positive)"
         );
-        assert!(
-            cholesky_lower_reference(a.view()).is_ok(),
-            "the reference passes an infinite factor through"
+        // A non-finite value in the IGNORED upper triangle changes nothing.
+        let garbage = matrix(2, 2, &[4.0, f64::INFINITY, 2.0, 3.0]);
+        assert_eq!(
+            cholesky_lower(garbage.view()).unwrap(),
+            cholesky_lower(matrix(2, 2, &[4.0, 0.0, 2.0, 3.0]).view()).unwrap()
         );
     }
 
@@ -399,13 +411,14 @@ mod tests {
     // Measurement aid
     // -----------------------------------------------------------------------
 
-    /// Times the faer factor against the reference on 64/256/1024 SPD
-    /// matrices, with faer's default (globally parallel) and sequential global
-    /// settings; run with `--release ... -- --ignored --nocapture
-    /// --test-threads=1`.
+    /// Times the faer factor (with faer's default, globally parallel, setting
+    /// and with `Par::Seq`) against this kernel on 64/256/1024 SPD matrices;
+    /// run with `--release ... -- --ignored --nocapture --test-threads=1`.
+    /// It mutates faer's process-global parallelism, so it restores the default
+    /// (`Par::rayon(0)`) before returning.
     #[test]
     #[ignore]
-    fn bench_faer_vs_reference_cholesky() {
+    fn bench_cholesky_variants() {
         fn best(mut run: impl FnMut(), warmups: usize, reps: usize) -> f64 {
             for _ in 0..warmups {
                 run();
@@ -418,7 +431,7 @@ mod tests {
             }
             best
         }
-        println!("     n | faer (default par) | faer (seq) |  reference | par/ref | seq/ref");
+        println!("     n | faer (default par) | faer (seq) |     kernel | par/ref | seq/ref");
         for (n, reps) in [(64usize, 5usize), (256, 5), (1024, 3)] {
             let a = spd(n, 0xA11CE ^ n as u64);
             let view = a.view();
@@ -426,7 +439,7 @@ mod tests {
             faer::set_global_parallelism(faer::Par::rayon(0));
             let parallel = best(
                 || {
-                    black_box(cholesky_lower(view).unwrap());
+                    black_box(cholesky_via_faer(view).unwrap());
                 },
                 1,
                 reps,
@@ -434,14 +447,14 @@ mod tests {
             faer::set_global_parallelism(faer::Par::Seq);
             let sequential = best(
                 || {
-                    black_box(cholesky_lower(view).unwrap());
+                    black_box(cholesky_via_faer(view).unwrap());
                 },
                 1,
                 reps,
             );
             let reference = best(
                 || {
-                    black_box(cholesky_lower_reference(view).unwrap());
+                    black_box(cholesky_lower(view).unwrap());
                 },
                 1,
                 reps,
@@ -455,5 +468,6 @@ mod tests {
                 reference / sequential
             );
         }
+        faer::set_global_parallelism(faer::Par::rayon(0));
     }
 }
