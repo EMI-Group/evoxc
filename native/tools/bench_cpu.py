@@ -1,6 +1,6 @@
 """Benchmark: native CPU engine vs the numpy backend, plus native compile time.
 
-Four workloads, each one ``@evoxc.defn`` graph:
+Seven workloads, each one ``@evoxc.defn`` graph:
 
 ``ew_chain_1e6``    an 8-op ARITHMETIC elementwise f32 chain over 1e6 elements
 ``ew_transcendental_1e6``  four transcendental ops (tanh/sigmoid/gelu/erf) over
