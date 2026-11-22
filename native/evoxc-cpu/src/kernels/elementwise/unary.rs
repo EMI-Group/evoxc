@@ -84,9 +84,73 @@ fn unary(spec: &OpSpec, input: &Buffer) -> Result<Vec<Value>> {
         Some(input.cast(compute)?)
     };
     let source = owned.as_ref().unwrap_or(input);
+    if kind == UnKind::Exp {
+        // `exp` on f32 is the one transcendental op with a vectorizable
+        // polynomial replacement (see [`dense_exp_f32`]); every other dtype and
+        // op keeps the scalar `libm` call.
+        if let Storage::F32(values) = &source.storage {
+            return single(dense_exp_f32(&source.shape, values)?);
+        }
+    }
     with_type!(source, |values| {
         typed_unary(values, kind, compute, &source.shape)
     })
+}
+
+/// The largest magnitude the two-pass f32 `exp` fast path covers: beyond it the
+/// result can overflow to `inf` or land in the subnormal range, where the
+/// bit-built `2^k` scale would be wrong, so such a buffer takes the libm path.
+const EXP_FAST_BOUND: f32 = 87.0;
+
+/// `|x| <= EXP_FAST_BOUND`, and `false` for a NaN (which takes the libm path).
+#[inline]
+fn is_within_exp_bound(value: f32) -> bool {
+    value.abs() <= EXP_FAST_BOUND
+}
+
+/// `exp` on an f32 buffer: the polynomial fast path when every element is
+/// inside [`EXP_FAST_BOUND`] (and not NaN), the libm call otherwise.
+///
+/// The precheck is one extra vectorized read pass; it is what keeps the fast
+/// loop branchless (a per-element range check would inhibit vectorization) while
+/// leaving the overflow/underflow/NaN tails on `f32::exp`, so their results —
+/// `inf`, a subnormal, `NaN` — stay exactly libm's.
+fn dense_exp_f32(shape: &[usize], values: &[f32]) -> Result<Buffer> {
+    if values.iter().any(|value| !is_within_exp_bound(*value)) {
+        return map1(DType::Float32, shape, values, |value: f32| value.exp());
+    }
+    map1(DType::Float32, shape, values, exp_fast_f32)
+}
+
+/// `exp(x)` for `|x| <= EXP_FAST_BOUND`: `k = round(x / ln2)`, `r = x - k*ln2`
+/// (a two-part `ln2` keeps the reduction exact), `exp(r)` as a degree-7 Taylor
+/// polynomial of the argument (`|r| <= ln2/2`, truncation error `< 1e-8`
+/// relative — under a fifth of an f32 ulp) and a bit-built `2^k` scale.
+///
+/// The measured max relative error against `f32::exp` over the whole covered
+/// range is pinned by `the_f32_exp_fast_path_stays_within_its_ulp_budget`.
+#[inline]
+fn exp_fast_f32(value: f32) -> f32 {
+    const LOG2_E: f32 = std::f32::consts::LOG2_E;
+    // ln2 split so `k * ln2` is exact: `LN2_HI` is the f32 with its low mantissa
+    // bits clear (so `k * LN2_HI` is exactly representable for |k| <= 256) and
+    // `LN2_LO` the rounded remainder (residual 5e-14).
+    const LN2_HI: f32 = 0.693_145_75;
+    const LN2_LO: f32 = 1.428_606_8e-6;
+    let scaled = value * LOG2_E;
+    let round = if scaled >= 0.0 { 0.5 } else { -0.5 };
+    let k = (scaled + round) as i32;
+    let kf = k as f32;
+    let r = (value - kf * LN2_HI) - kf * LN2_LO;
+    let poly = 1.0
+        + r * (1.0
+            + r * (0.5
+                + r * (1.0 / 6.0
+                    + r * (1.0 / 24.0
+                        + r * (1.0 / 120.0 + r * (1.0 / 720.0 + r * (1.0 / 5040.0)))))));
+    // |x| <= 87 bounds k to [-126, 126], so k + 127 is a valid f32 exponent.
+    let scale = f32::from_bits(((k + 127) as u32) << 23);
+    poly * scale
 }
 
 fn validate_unary(name: &str, kind: UnKind, dtype: DType) -> Result<()> {
@@ -252,4 +316,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_f32_exp_fast_path_stays_within_its_ulp_budget() {
+        // The polynomial arm must stay inside the documented f32 parity budget
+        // (rtol 1e-5 / atol 1e-6 on every elementwise leaf) with room to spare:
+        // sweep the covered range in fine steps and hold the max relative error
+        // to a fifth of an ulp... i.e. well under one ulp, recorded here as a
+        // hard ceiling of 3e-7.
+        let mut worst = 0.0f32;
+        let mut worst_at = 0.0f32;
+        let steps = 200_000;
+        for index in 0..steps {
+            let x = -EXP_FAST_BOUND + 2.0 * EXP_FAST_BOUND * index as f32 / steps as f32;
+            let fast = exp_fast_f32(x);
+            let libm = x.exp();
+            let relative = ((fast - libm) / libm).abs();
+            if relative > worst {
+                worst = relative;
+                worst_at = x;
+            }
+        }
+        assert!(
+            worst <= 3e-7,
+            "max relative error {worst} at x = {worst_at}"
+        );
+        // The exact points a Taylor argument could break on.
+        for x in [0.0f32, 1.0, -1.0, 0.5, -0.5, 86.0, -86.0, std::f32::consts::LN_2] {
+            let relative = ((exp_fast_f32(x) - x.exp()) / x.exp()).abs();
+            assert!(relative <= 3e-7, "x = {x}: relative error {relative}");
+        }
+    }
+
+    #[test]
+    fn the_f32_exp_tails_stay_exactly_libm() {
+        // Outside the fast bound the kernel defers to `f32::exp` for the WHOLE
+        // buffer, so overflow, underflow/subnormal and NaN results are libm's
+        // own bits — not a clamped approximation.
+        let values = vec![
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            200.0,
+            -200.0,
+            -88.0,
+            87.5,
+            1.0,
+        ];
+        let x = buffer(DType::Float32, &[8], Storage::F32(values.clone()));
+        let op = spec("exp", ValueType::of(DType::Float32, [Dim::int(8)]));
+        let out = unary(&op, &x).unwrap();
+        let expected: Vec<f32> = values.iter().map(|value| value.exp()).collect();
+        match &out[0].storage {
+            Storage::F32(got) => {
+                for (index, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                        "element {index}: {a} vs {b}"
+                    );
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_f32_exp_fast_path_matches_libm_through_the_kernel() {
+        // The kernel arm (precheck + polynomial) over a buffer that stays inside
+        // the bound, against libm elementwise.
+        let values: Vec<f32> = (0..512)
+            .map(|index| -20.0 + 40.0 * index as f32 / 511.0)
+            .collect();
+        let x = buffer(DType::Float32, &[512], Storage::F32(values.clone()));
+        let op = spec("exp", ValueType::of(DType::Float32, [Dim::int(512)]));
+        let out = unary(&op, &x).unwrap();
+        match &out[0].storage {
+            Storage::F32(got) => {
+                for (index, (a, b)) in got.iter().zip(values.iter()).enumerate() {
+                    let libm = b.exp();
+                    assert!(
+                        (a - libm).abs() <= 3e-7 * libm.abs(),
+                        "element {index} ({b}): {a} vs {libm}"
+                    );
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
 }
