@@ -15,6 +15,8 @@ Every kernel pays Python overhead proportional to op count, and the op count of 
 - **Unbound ndarray methods replace module-level numpy wrappers** (`np.ndarray.sum`/`max`/`min`/`mean`/`prod`, `arr.reshape`, `arr.transpose`, `arr.take`, `arr.argsort`, `arr.argmax`/`argmin`, `arr.cumprod`) — identical computation, minus numpy's Python-level dispatch layer (~0.25–1 µs/call). `np.sort` stays a module function because it is the non-mutating form (`arr.sort` sorts in place).
 - `Tensor.numpy()` / `.dtype` / `.shape` are grabbed ONCE per operand per kernel; `core` property overhead is not re-paid inside a kernel.
 - Static per-rank / per-op data is cached at module level (e.g. `indexing._slice_defaults(rank)`), never rebuilt per call.
+- **The shape ops are numpy VIEWS, never copies**: `reshape` (`arr.reshape`), `transpose` (`arr.transpose`) and `broadcast` (`np.broadcast_to`) hand the result straight to `core.Tensor`, which stores the ndarray by reference (no copy, no contiguity or writability check), so a shape-only graph allocates just the `core.Tensor` wrappers; the copy, when one is unavoidable, happens inside numpy (a `reshape` of a non-contiguous/0-stride view, or materialization of a broadcast view by a consumer kernel).
+- **Constants are shared, never re-copied**: `_constant` wraps `op.attributes["value"]` (a plain dict field on `ir.Op`) in a NEW `core.Tensor` on every execution of that step but reuses the one snapshot payload array — no per-use copy, no array cache needed.
 - 0-d normalization stays `np.asarray(...)` on the numpy result (numpy returns bare scalars for 0-d ufunc/take/slice results; `np.asarray` is a no-op for real arrays and never changes the dtype).
 
 ## Constraints
