@@ -399,7 +399,7 @@ mod tests {
     use crate::buffer::parallel::PARALLEL_MIN_ELEMS;
     use crate::buffer::pool::POOL_MIN_BYTES;
     use crate::buffer::rowsplit::{rider, Rider, RowSplit, SPLIT_DISABLED};
-    use crate::buffer::test_support::garbage_f32;
+    use crate::buffer::test_support::{garbage_f32, switch, switch_guard};
     use crate::buffer::Storage;
     use evoxc_core::DType;
 
@@ -558,6 +558,8 @@ mod tests {
 
     #[test]
     fn the_broadcast_ternary_builder_agrees_with_the_flat_one() {
+        // Goes through `map3_runs`, which consults both A/B switches.
+        let _serialized = switch_guard();
         // `select` over a broadcast predicate and a scalar branch: the run
         // builder must place `if p { x } else { y }` element for element,
         // matching the flat builder fed explicitly broadcast operands.
@@ -711,16 +713,19 @@ mod tests {
             .unwrap_or_else(|| "non-string panic payload".to_string())
     }
 
-    /// Run `run` with the split forced off (the pre-split driver) and back on.
+    /// Run `run` with the split forced off (the pre-split driver) and restored
+    /// afterwards — even when `run` panics. The caller must hold
+    /// [`switch_guard`], because `SPLIT_DISABLED` is process-wide.
     fn split_disabled<T>(run: impl FnOnce() -> T) -> T {
-        let previous = SPLIT_DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed);
-        let outcome = run();
-        SPLIT_DISABLED.store(previous, std::sync::atomic::Ordering::Relaxed);
-        outcome
+        let _restore = switch(&SPLIT_DISABLED, true);
+        run()
     }
 
     #[test]
     fn the_row_split_covers_whole_rows_or_stays_whole() {
+        // This test READS the switch (through `RowSplit::new`), so it must not
+        // run while another test forces the split off.
+        let _serialized = switch_guard();
         // The geometry: 2^18 f32 (a `(4096, 64)` result) is the smallest result
         // that splits at all, and `[4, 0]`/`[]`/a single row/one axis of length 1
         // keep the single-threaded driver.
@@ -775,6 +780,8 @@ mod tests {
 
     #[test]
     fn the_row_split_agrees_with_the_per_element_reference() {
+        // Exercises the split itself: no sibling test may force it off.
+        let _serialized = switch_guard();
         // Result shapes: 2^18 (the smallest split), two that do not divide by
         // the thread count (a short last chunk), 1e6 and a rank-1 result whose
         // one axis simply becomes the chunk axis.  Operand kinds: the result's
@@ -826,6 +833,7 @@ mod tests {
 
     #[test]
     fn the_row_split_agrees_with_the_per_element_reference_for_select() {
+        let _serialized = switch_guard();
         // `select` with a per-row broadcast predicate over a 2x2^18-element
         // result and a trailing bias as the false branch: `pred (2000,1)` must
         // ride the row split while the bias broadcasts onto every chunk.
@@ -883,6 +891,7 @@ mod tests {
 
     #[test]
     fn an_operand_that_cannot_ride_the_split_keeps_the_single_threaded_behaviour() {
+        let _serialized = switch_guard();
         // A rank-equal operand whose outer extent is neither 1 nor the result's
         // row count: the builder must fall back to the whole-result `apply2`,
         // which reads this malformed operand out of bounds.  The split must not
@@ -962,6 +971,7 @@ mod tests {
 
     #[test]
     fn a_split_result_is_fully_overwritten_from_the_pool() {
+        let _serialized = switch_guard();
         // 2^18 elements in a two-axis shape whose rows are cut into chunks, with
         // a garbage stock of exactly that size parked in the pool: every element
         // must be written by exactly one chunk.
