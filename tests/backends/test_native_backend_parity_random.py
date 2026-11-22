@@ -34,9 +34,12 @@ Keys are graph VALUES: a concrete ``evoxc.random.key(7)`` Tensor cannot be a
 trace input, so every key is created INSIDE the traced function (the
 ``key()`` creator builds a graph Constant there) — the pattern below.
 
-CPU only, fixed seeds, tiny shapes, no timing, no network. One real gap is
-pinned as a strict ``xfail`` (see the ``BUG(evoxc)`` markers on the
-``split``/``split_n`` legs) and reported rather than papered over.
+CPU only, fixed seeds, tiny shapes, no timing, no network.
+
+``random.split``/``split_n`` stamp the SplitMix64 golden-gamma salt (and its
+multiples, masked to 64 bits) as an unsigned 64-bit attribute; the native
+envelope carries those salts and decodes them back to the same words, so those
+legs are bit-exact vs numpy like every other op.
 """
 import numpy as np
 import pytest
@@ -377,31 +380,6 @@ def test_split_n_yields_n_subkeys(algorithm):
     assert nu.evaluate_numpy(_split_n(algorithm, 0)) == ()
 
 
-# BUG(evoxc): the native envelope cannot carry the unsigned RNG salt.
-# ``random.split`` stamps ``salt = 0x9E3779B97F4A7C15`` (the SplitMix64 golden
-# gamma, 11400714819323198485 > i64::MAX) on its second ``random_key_mix`` op,
-# so ``native_compile`` rejects the graph at envelope decode —
-#   VerificationError: envelope: op 'random_key_mix' attribute "salt":
-#   expected an int, got 11400714819323198485
-# — and ``split_n(k, 3)`` (salt 2 * golden, above u64::MAX) fails even
-# earlier: ``NativeError: integer 22801429638646396970 does not fit the
-# envelope's 64-bit number range``. ``../../native/evoxc-cpu/CONTEXT.md``
-# documents random as BIT-EXACT with the numpy kernels "(key handling, salt
-# folding, ...)", and ``native/tools/parity_cpu.py:114`` papers over the same
-# gap with ``narrow_unsigned_int_attrs`` (reported, not fixed there), so the
-# documented contract is violated. Unreachable-op pruning does NOT help: both
-# subkey ops live in the module, so even a graph that samples from the FIRST
-# subkey only is rejected. Repro:
-#     @evoxc.defn
-#     def f():
-#         k = evoxc.random.key(7)
-#         a, b = evoxc.random.split(k)
-#         return evoxc.random.uniform(a, shape=(8,), dtype="float32")
-#     evoxc.evaluate(f, backend="native")   # VerificationError (above)
-#     evoxc.evaluate(f, backend="numpy")    # fine
-# Keep the CORRECT documented expectation asserted (strict xfail ⇒ an XPASS
-# is the signal that the encoding gap is fixed and this marker can go).
-@pytest.mark.xfail(strict=True, reason="BUG(evoxc): native envelope cannot encode the unsigned RNG salt")
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
 def test_split_matches_numpy_on_native(algorithm):
     got = nu.evaluate_native(_split(algorithm))
@@ -413,17 +391,52 @@ def test_split_matches_numpy_on_native(algorithm):
         )
 
 
-# BUG(evoxc): same encoding gap as above (the parent key's free ``salt``
-# attribute) — a graph that samples from the FIRST subkey only is still
-# rejected, because the SECOND subkey's ``random_key_mix`` op stays in the
-# module. See the marker above for the message and the repro.
-@pytest.mark.xfail(strict=True, reason="BUG(evoxc): native envelope cannot encode the unsigned RNG salt")
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
 def test_first_subkey_sampling_matches_numpy_on_native(algorithm):
     fn = _first_subkey_uniform(algorithm)
     got = np.asarray(nu.evaluate_native(fn))
     expected = np.asarray(nu.evaluate_numpy(fn))
     np.testing.assert_array_equal(got, expected)
+
+
+def _high_index_subkey_uniform(algorithm, n=8):
+    """Sample from the LAST (high-index) subkey of ``split_n(k, n)``.
+
+    ``split_n`` stamps ``i * GOLDEN mod 2**64`` salts; the high indices are
+    the ones whose unmasked value used to overflow 64 bits, so this is the
+    regression that proves the masked salt reaches the native engine intact.
+    """
+
+    @evoxc.defn
+    def high_index_subkey_uniform():
+        key = evoxc.random.key(7, algorithm=algorithm)
+        subkeys = evoxc.random.split_n(key, n)
+        return evoxc.random.uniform(subkeys[n - 1], shape=(8,), dtype="float32")
+
+    return high_index_subkey_uniform
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_high_index_split_n_subkey_sampling_matches_numpy_on_native(algorithm):
+    """``split_n(k, 8)``'s high-index subkey draws bit-identically on native."""
+    fn = _high_index_subkey_uniform(algorithm)
+    got = np.asarray(nu.evaluate_native(fn))
+    expected = np.asarray(nu.evaluate_numpy(fn))
+    assert got.shape == expected.shape == (8,)
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_split_n_full_key_tree_matches_numpy_on_native(algorithm):
+    """All 8 ``split_n`` subkeys agree with numpy bit-for-bit."""
+    fn = _split_n(algorithm, 8)
+    got = nu.evaluate_native(fn)
+    expected = nu.evaluate_numpy(fn)
+    assert len(got) == len(expected) == 8
+    for index, (g, e) in enumerate(zip(got, expected)):
+        np.testing.assert_array_equal(
+            np.asarray(g), np.asarray(e), err_msg=f"subkey {index} {algorithm}"
+        )
 
 
 # ---------------------------------------------------------------------------

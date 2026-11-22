@@ -619,22 +619,6 @@ class TestStructural:
             got, np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         )
 
-    # BUG(evoxc): the native engine rejects a NULL attribute value while
-    # decoding the `nan_to_num` op — the DEFAULT call (and any call that leaves
-    # `posinf`/`neginf` at their `None` default) fails at `lower()` with
-    # `VerificationError: op 'nan_to_num': attribute "posinf" must be a number
-    # or null, got null`, whereas the numpy reference backend accepts it.
-    # Minimal repro:
-    #   evoxc.evaluate(lambda t: evoxc.nan_to_num(t),
-    #                  np.array([np.nan, np.inf], np.float32), backend="native")
-    # The assertions encode the DOCUMENTED contract (numpy's nan_to_num
-    # defaults: NaN -> 0.0, +inf -> dtype max, -inf -> dtype min), so this pin
-    # XPASSes — failing loudly — the day the native side is fixed.
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG(evoxc): native engine rejects a null `posinf`/`neginf` "
-        "attribute, so default nan_to_num fails at lower()",
-    )
     @pytest.mark.parametrize("kwargs", [{}, {"nan": 2.0}], ids=["defaults", "nan-only"])
     def test_nan_to_num_default_infinities_match_numpy(self, kwargs):
         x = np.array([[np.nan, np.inf, -np.inf, 1.0]], np.float32)

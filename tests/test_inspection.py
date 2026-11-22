@@ -105,6 +105,12 @@ def _digest_probe_graph():
     return evoxc.trace(_digest_probe, evoxc.TensorSpec((4,), evoxc.float32))
 
 
+@evoxc.defn
+def _probe_add_relu(x):
+    """The same body the two-file digest pin writes to disk."""
+    return evoxc.relu(evoxc.add(x, x))
+
+
 #: ``Graph.summary()``'s documented key set (evoxc/CONTEXT.md "Inspection").
 GRAPH_SUMMARY_KEYS = {
     "functions",
@@ -179,6 +185,19 @@ def _run_python(script, *args):
     env = {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}
     return subprocess.run(
         [sys.executable, "-c", script, *args],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+
+
+def _run_python_file(path):
+    """Run the script FILE at ``path`` in a fresh interpreter (no ``-c``)."""
+    env = {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}
+    return subprocess.run(
+        [sys.executable, str(path)],
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=True,
@@ -359,20 +378,13 @@ def test_graph_digest_stable_across_processes():
     assert digests[0] == digests[1] == local
 
 
-# BUG(evoxc): Graph.digest() hashes ir.serialize_module(), whose op entries carry
-# each op's source location (file/line/col), so the documented "structure + I/O
-# signature only" digest changes when the IDENTICAL graph is defined in another
-# file — contradicting "Identical graphs in different processes digest
-# identically" (evoxc/trace/graph.py digest docstring). Minimal repro: this test
-# writes the same module source to two paths and compares the digests.
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG(evoxc): the digest embeds per-op source locations (file path), so "
-        "an identical graph defined in a different file digests differently"
-    ),
-)
 def test_graph_digest_ignores_source_file_path(tmp_path):
+    """The SAME module source in two files digests identically (fresh processes).
+
+    ``Graph.digest()`` covers structure + I/O only: each op's ``file:line``
+    source location (and the location-derived payload hash) is excluded, so an
+    identical graph defined in another FILE or PROCESS digests identically.
+    """
     source = (
         "import evoxc\n"
         "@evoxc.defn\n"
@@ -385,10 +397,53 @@ def test_graph_digest_ignores_source_file_path(tmp_path):
     for name in ("first_location.py", "second_location.py"):
         script = tmp_path / name
         script.write_text(source)
-        result = _run_python(str(script))
+        result = _run_python_file(script)
         assert result.returncode == 0, result.stderr
         digests.append(result.stdout.strip())
     assert digests[0] == digests[1]
+    # ... and it is the same digest as the in-process graph of that source.
+    local = evoxc.trace(_probe_add_relu, evoxc.TensorSpec((4,), evoxc.float32))
+    assert local.digest() == digests[0]
+
+
+def test_graph_digest_survives_save_load(tmp_path):
+    """``save`` → ``load`` round-trips to the SAME structural digest."""
+    graph = _graph()
+    path = tmp_path / "graph.evoxcgraph"
+    graph.save(str(path))
+    loaded = evoxc.Graph.load(str(path))
+    assert loaded.digest() == graph.digest()
+
+
+def test_graph_digest_changes_when_an_op_attribute_changes():
+    """A different ATTRIBUTE on the same op is a different digest.
+
+    ``nan_to_num``'s ``nan`` replacement is a pure attribute (same op, same
+    operands, same result type), so this isolates the attribute from every
+    other structural input to the digest.
+    """
+
+    def traced(nan):
+        @evoxc.defn
+        def f(x):
+            return evoxc.nan_to_num(x, nan=nan)
+
+        return evoxc.trace(f, evoxc.TensorSpec((2, 3), evoxc.float32))
+
+    graph = traced(0.0)
+    before = graph.digest()
+    changed = traced(2.0)
+    assert changed.digest() != before
+    # Same ops, same operand/result layout — only the attribute value differs.
+    assert [op.name for op in graph.module.functions[0].entry_block.ops] == [
+        op.name for op in changed.module.functions[0].entry_block.ops
+    ]
+    assert (
+        graph.module.functions[0].entry_block.ops[0].attributes["nan"] == 0.0
+    )
+    assert (
+        changed.module.functions[0].entry_block.ops[0].attributes["nan"] == 2.0
+    )
 
 
 def test_graph_text_is_the_pretty_printed_ir():
