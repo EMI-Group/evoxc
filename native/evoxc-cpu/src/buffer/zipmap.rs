@@ -225,6 +225,43 @@ pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
     Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
 }
 
+/// Broadcast ternary builder: `out[i] = f(p[i], x[i], y[i])` over `out_shape`'s
+/// elements, where each operand is read through its own (possibly broadcast)
+/// shape — the [`map3`] counterpart of [`map2_runs`], for `select` with a
+/// broadcast predicate or branch.
+///
+/// Like [`map2_runs`] it takes a pooled vector of the exact result length when
+/// one is available (never zero-filling first), and the run decomposition plus
+/// the per-element address arithmetic live in [`super::stride::apply3`], which
+/// falls back to the general broadcast driver for shapes it cannot express.
+#[allow(clippy::too_many_arguments)]
+pub fn map3_runs<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    pred: &[P],
+    pred_shape: &[usize],
+    on_true: &[T],
+    on_true_shape: &[usize],
+    on_false: &[T],
+    on_false_shape: &[usize],
+    f: impl Fn(P, T, T) -> R + Copy + Sync,
+) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
+    super::stride::apply3(
+        &mut values,
+        out_shape,
+        pred,
+        pred_shape,
+        on_true,
+        on_true_shape,
+        on_false,
+        on_false_shape,
+        f,
+    );
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
 /// Element count of a concrete shape (`buffer.rs` cannot reach
 /// `kernels::util`, which is a higher layer than the value type).
 #[inline]
@@ -392,6 +429,56 @@ mod tests {
         let short: Vec<f32> = vec![1.0; count - 1];
         assert!(map1(DType::Float32, &[count], &short, |value| value).is_err());
         assert!(map2(DType::Float32, &[count], &short, &short, |a, b| a + b).is_err());
+    }
+
+    #[test]
+    fn the_broadcast_ternary_builder_agrees_with_the_flat_one() {
+        // `select` over a broadcast predicate and a scalar branch: the run
+        // builder must place `if p { x } else { y }` element for element,
+        // matching the flat builder fed explicitly broadcast operands.
+        let out_shape = [2usize, 3];
+        let pred = [true, false, true];
+        let on_true = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let on_false = [-1.0f32];
+        let pick = |p: bool, x: f32, y: f32| if p { x } else { y };
+        let runs = map3_runs(
+            DType::Float32,
+            &out_shape,
+            &pred,
+            &[3],
+            &on_true,
+            &[2, 3],
+            &on_false,
+            &[1],
+            pick,
+        )
+        .unwrap();
+        let flat = map3(
+            DType::Float32,
+            &out_shape,
+            &[true, false, true, true, false, true],
+            &on_true,
+            &[-1.0f32; 6],
+            pick,
+        )
+        .unwrap();
+        assert_eq!(runs.storage, flat.storage);
+        assert_eq!(runs.storage, Storage::F32(vec![1.0, -1.0, 3.0, 4.0, -1.0, 6.0]));
+        assert_eq!(runs.shape, vec![2, 3]);
+        // An empty target writes nothing.
+        let empty = map3_runs(
+            DType::Float32,
+            &[0, 3],
+            &pred,
+            &[3],
+            &on_true,
+            &[2, 3],
+            &on_false,
+            &[1],
+            pick,
+        )
+        .unwrap();
+        assert!(matches!(&empty.storage, Storage::F32(values) if values.is_empty()));
     }
 
     #[test]

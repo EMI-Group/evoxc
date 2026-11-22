@@ -3,7 +3,7 @@
 
 use evoxc_core::{Error, Result};
 
-use super::{shape_text, Buffer, Storage};
+use super::{shape_text, stride::fill_broadcast, Buffer, Storage};
 
 // ---------------------------------------------------------------------------
 // Broadcasting
@@ -154,21 +154,27 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
             shape_text(shape)
         )));
     }
+    // The copy itself is the strided-run driver's block copy
+    // (`super::stride::fill_broadcast`), which hands back a pooled vector of the
+    // exact length and divides the work into contiguous per-repeat blocks; it
+    // accepts every broadcastable pair and falls back to [`broadcast_vec`] for
+    // anything its run decomposition cannot express, so the result is the same
+    // bytes either way.
     let storage = match &buffer.storage {
-        Storage::Bool(v) => Storage::Bool(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I8(v) => Storage::I8(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I16(v) => Storage::I16(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I32(v) => Storage::I32(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::I64(v) => Storage::I64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U8(v) => Storage::U8(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U16(v) => Storage::U16(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U32(v) => Storage::U32(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::U64(v) => Storage::U64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::F16(v) => Storage::F16(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::F32(v) => Storage::F32(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::F64(v) => Storage::F64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::C64(v) => Storage::C64(broadcast_vec(v, &buffer.shape, shape)),
-        Storage::C128(v) => Storage::C128(broadcast_vec(v, &buffer.shape, shape)),
+        Storage::Bool(v) => Storage::Bool(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I8(v) => Storage::I8(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I16(v) => Storage::I16(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I32(v) => Storage::I32(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::I64(v) => Storage::I64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U8(v) => Storage::U8(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U16(v) => Storage::U16(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U32(v) => Storage::U32(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::U64(v) => Storage::U64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::F16(v) => Storage::F16(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::F32(v) => Storage::F32(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::F64(v) => Storage::F64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::C64(v) => Storage::C64(fill_broadcast(v, &buffer.shape, shape)),
+        Storage::C128(v) => Storage::C128(fill_broadcast(v, &buffer.shape, shape)),
     };
     Buffer::new(buffer.dtype, shape.to_vec(), storage)
 }

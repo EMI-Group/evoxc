@@ -2,9 +2,8 @@
 use evoxc_core::{DType, Error, Result};
 use num_complex::Complex;
 
-use crate::buffer::{apply2, apply3, broadcast_shape, map1, map2, map3, Buffer, Storage};
+use crate::buffer::{broadcast_shape, map1, map2, map2_runs, map3, map3_runs, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
-use crate::kernels::util;
 use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_same_type;
@@ -102,13 +101,7 @@ fn compare_typed<T: Orderable + Copy>(
         (Layout::Scalar, Layout::Flat) if !left.is_empty() => {
             dense_compare_left_scalar(kind, out_shape, left[0], right)
         }
-        _ => {
-            let mut out = vec![false; util::numel(out_shape)];
-            apply2(&mut out, out_shape, left, left_shape, right, right_shape, |p, q| {
-                compare_op(kind, p, q)
-            });
-            Buffer::new(DType::Bool, out_shape.to_vec(), Storage::Bool(out))
-        }
+        _ => broadcast_compare(kind, out_shape, left, left_shape, right, right_shape),
     }?;
     single(out)
 }
@@ -164,6 +157,24 @@ macro_rules! dense_compare_drivers {
             match kind {
                 $(BinKind::$kind => map1(DType::Bool, out_shape, left, |p| compare_op(BinKind::$kind, p, right)),)*
                 _ => map1(DType::Bool, out_shape, left, |p| compare_op(kind, p, right)),
+            }
+        }
+
+        /// The broadcast-operand comparison: the general run decomposition of
+        /// `buffer::stride` (`map2_runs`) with the kind dispatched once per arm,
+        /// exactly as the broadcast-free drivers above — no per-element odometer
+        /// and no zero-filled result.
+        fn broadcast_compare<T: Orderable + Copy>(
+            kind: BinKind,
+            out_shape: &[usize],
+            left: &[T],
+            left_shape: &[usize],
+            right: &[T],
+            right_shape: &[usize],
+        ) -> Result<Buffer> {
+            match kind {
+                $(BinKind::$kind => map2_runs(DType::Bool, out_shape, left, left_shape, right, right_shape, |p, q| compare_op(BinKind::$kind, p, q)),)*
+                _ => map2_runs(DType::Bool, out_shape, left, left_shape, right, right_shape, |p, q| compare_op(kind, p, q)),
             }
         }
     };
@@ -262,9 +273,12 @@ where
         // Broadcast-free: one flat three-way map into a freshly built result.
         return map3(dtype, out_shape, pred, a, b, |p, x, y| if p { x } else { y });
     }
-    let mut out = vec![T::zero(); util::numel(out_shape)];
-    apply3(
-        &mut out,
+    // A broadcast predicate and/or branch: the run decomposition of
+    // `buffer::stride` (`map3_runs`), which allocates no zero-filled result and
+    // runs one contiguous pass per outer step, with the branch selection (a
+    // constant, not a per-element `match`) dispatched once per pass.
+    map3_runs(
+        dtype,
         out_shape,
         pred,
         &predicate.shape,
@@ -273,8 +287,7 @@ where
         b,
         &b_buf.shape,
         |p, x, y| if p { x } else { y },
-    );
-    Buffer::new(dtype, out_shape.to_vec(), T::into_storage(out))
+    )
 }
 
 #[cfg(test)]
@@ -291,6 +304,93 @@ mod tests {
         let op = spec("less", ValueType::of(DType::Bool, [Dim::int(3)]));
         let out = binary(&op, &a, &b).unwrap();
         assert_eq!(out[0].storage, Storage::Bool(vec![true, false, false]));
+    }
+
+    /// The broadcast contract: the run driver and the general `walk` driver
+    /// place the same bools.
+    fn assert_broadcast_compare_agrees(
+        kind_name: &str,
+        kind: BinKind,
+        left: &[f32],
+        left_shape: &[usize],
+        right: &[f32],
+        right_shape: &[usize],
+        out_shape: &[usize],
+    ) {
+        let a = buffer(DType::Float32, left_shape, Storage::F32(left.to_vec()));
+        let b = buffer(DType::Float32, right_shape, Storage::F32(right.to_vec()));
+        let dims: Vec<Dim> = out_shape.iter().map(|dim| Dim::int(*dim as i64)).collect();
+        let op = spec(kind_name, ValueType::of(DType::Bool, dims));
+        let got = binary(&op, &a, &b).unwrap();
+        let mut expected = vec![false; out_shape.iter().product()];
+        crate::buffer::apply2(
+            &mut expected,
+            out_shape,
+            left,
+            left_shape,
+            right,
+            right_shape,
+            |p, q| compare_op(kind, p, q),
+        );
+        assert_eq!(
+            got[0].storage,
+            Storage::Bool(expected),
+            "{kind_name}: {out_shape:?} {left_shape:?} vs {right_shape:?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_comparisons_agree_with_the_general_driver() {
+        // A row scalar against full rows (the `(n, m) < (n, 1)` shape a GP graph
+        // produces), a trailing bias, a per-axis vector and a rank-0 operand —
+        // with a NaN and signed zeros, so a reordering could not pass.
+        let rows = [f32::NAN, -0.0, 1.0, 0.0, -1.0, 2.0];
+        let column = [1.0f32, f32::NAN];
+        let bias = [1.0f32, -0.0, 2.0];
+        for (kind_name, kind) in [
+            ("less", BinKind::Lt),
+            ("less_equal", BinKind::Le),
+            ("greater", BinKind::Gt),
+            ("greater_equal", BinKind::Ge),
+            ("equal", BinKind::Eq),
+            ("not_equal", BinKind::Ne),
+        ] {
+            assert_broadcast_compare_agrees(kind_name, kind, &rows, &[2, 3], &column, &[2, 1], &[2, 3]);
+            assert_broadcast_compare_agrees(kind_name, kind, &rows, &[2, 3], &bias, &[3], &[2, 3]);
+            assert_broadcast_compare_agrees(kind_name, kind, &rows, &[2, 3], &[0.0], &[], &[2, 3]);
+            assert_broadcast_compare_agrees(kind_name, kind, &rows, &[1, 2, 3], &column, &[2, 1], &[1, 2, 3]);
+            assert_broadcast_compare_agrees(kind_name, kind, &bias, &[3], &rows, &[2, 3], &[2, 3]);
+        }
+    }
+
+    #[test]
+    fn complex_comparisons_keep_their_contract() {
+        // `equal`/`not_equal` work on complex (a broadcast operand too), while an
+        // ordering kind stays rejected with the documented message.
+        let left = [
+            Complex::new(1.0f32, 2.0),
+            Complex::new(2.0, 2.0),
+            Complex::new(3.0, 2.0),
+            Complex::new(0.0, 0.0),
+            Complex::new(1.0, 2.0),
+            Complex::new(-0.0, 0.0),
+        ];
+        let right = [Complex::new(1.0f32, 2.0), Complex::new(0.0, 0.0)];
+        let a = buffer(DType::Complex64, &[2, 3], Storage::C64(left.to_vec()));
+        let b = buffer(DType::Complex64, &[2, 1], Storage::C64(right.to_vec()));
+        let out_shape = [2usize, 3];
+        let dims: Vec<Dim> = out_shape.iter().map(|dim| Dim::int(*dim as i64)).collect();
+        let op = spec("equal", ValueType::of(DType::Bool, dims.clone()));
+        let out = binary(&op, &a, &b).unwrap();
+        // Row 0 against `(1, 2)`, row 1 against `(0, 0)` — where `-0.0` equals
+        // `0.0` componentwise, as complex `PartialEq` says.
+        assert_eq!(out[0].storage, Storage::Bool(vec![true, false, false, true, false, true]));
+        let op = spec("less", ValueType::of(DType::Bool, dims));
+        let error = binary(&op, &a, &b).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "BackendError: op 'less': ordering comparisons are not defined for complex numbers"
+        );
     }
 
     #[test]
