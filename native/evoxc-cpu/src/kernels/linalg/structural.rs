@@ -1,19 +1,26 @@
 //! Index/structure kernels over a matrix's last two dims: `diagonal` (numpy
 //! `np.diagonal`, offset + axis1/axis2, diagonal last) and `tril`/`triu`
 //! (numpy `np.tril`/`np.triu`).  Both copy the operand dtype unchanged.
+//!
+//! Every N-dimensional traversal goes through `ndarray`: `diagonal` permutes
+//! `axis1`/`axis2` last ([`ndarray::ArrayBase::permuted_axes`]), slices the
+//! offset window off and copies each `diag()` view into the trailing axis of
+//! the result, while `tril`/`triu` copy the operand and zero the excluded
+//! triangle with one two-axis `slice_axis_mut` + `fill` per row — no
+//! hand-written offset or stride walk appears here.
 
 use evoxc_core::{DType, Error, Result};
+use ndarray::{Axis, Ix1, Ix2, Slice};
 
-use crate::buffer::Buffer;
+use crate::buffer::{array_view, array_view_mut, take_pooled_vec, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
-use crate::kernels::util::{self, c_strides};
+use crate::kernels::util;
 use crate::kernels::KernelMap;
 use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
-use super::common::{attr_int, check_result_shape, each_index, expect_arity};
-use super::solve::batch_offset;
+use super::common::{attr_int, check_result_shape, expect_arity};
 
 pub(super) fn register(map: &mut KernelMap) {
     map.insert("diagonal", diagonal_kernel);
@@ -62,17 +69,20 @@ fn diagonal_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Re
     expected.push(diagonal_len);
     check_result_shape("diagonal", &out_shape, &expected)?;
 
-    let strides = c_strides(&input.shape);
+    // The diagonal's first element: `offset > 0` starts it `offset` columns in,
+    // `offset < 0` starts it `-offset` rows down.
+    let row_start = start as usize;
+    let column_start = if offset > 0 { offset as usize } else { 0 };
     let dtype = spec.result_types[0].dtype;
     let buffer = with_type!(input, |values| diagonal_run(
         values,
-        &strides,
+        &input.shape,
         &rest_axes,
         &rest_shape,
         axis1,
         axis2,
-        offset,
-        start as usize,
+        row_start,
+        column_start,
         diagonal_len,
         dtype,
         out_shape
@@ -80,32 +90,78 @@ fn diagonal_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Re
     single(buffer)
 }
 
+/// Materialize numpy's `diagonal`: `permuted_axes` brings `axis1`/`axis2` last
+/// (the remaining axes keep their original order), the offset window is sliced
+/// off, and each trailing `(L, L)` matrix's `diag()` view is assigned into the
+/// trailing axis of the result.
 #[allow(clippy::too_many_arguments)]
-fn diagonal_run<T: Scalar>(
+fn diagonal_run<T: Scalar + NdScalar>(
     values: &[T],
-    strides: &[usize],
+    in_shape: &[usize],
     rest_axes: &[usize],
     rest_shape: &[usize],
     axis1: usize,
     axis2: usize,
-    offset: i64,
-    start: usize,
+    row_start: usize,
+    column_start: usize,
     diagonal_len: usize,
     dtype: DType,
     out_shape: Vec<usize>,
 ) -> Result<Buffer> {
-    let mut out: Vec<T> = Vec::with_capacity(util::numel(&out_shape));
-    let rest_strides: Vec<usize> = rest_axes.iter().map(|axis| strides[*axis]).collect();
-    each_index(rest_shape, |index| {
-        let base = batch_offset(index, &rest_strides);
-        for step in 0..diagonal_len {
-            let first = start + step;
-            let second = (first as i64).saturating_add(offset) as usize;
-            out.push(values[base + first * strides[axis1] + second * strides[axis2]]);
-        }
-        Ok(())
-    })?;
-    Buffer::new(dtype, out_shape, T::into_storage(out))
+    let total = util::numel(&out_shape);
+    let mut out = take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total]);
+    if diagonal_len == 0 {
+        // A fully saturated `offset` (i64::MIN/MAX) lands here with start
+        // indices no slice could express; the result is simply empty.
+        return Buffer::new(dtype, out_shape, <T as NdScalar>::into_storage(out));
+    }
+    let rank = in_shape.len();
+    let mut permutation = rest_axes.to_vec();
+    permutation.push(axis1);
+    permutation.push(axis2);
+    let permuted = array_view::<T>(values, in_shape)?.permuted_axes(ndarray::IxDyn(&permutation));
+    let rows_window = permuted.slice_axis(
+        Axis(rank - 2),
+        Slice::from(row_start..row_start + diagonal_len),
+    );
+    let window = rows_window.slice_axis(
+        Axis(rank - 1),
+        Slice::from(column_start..column_start + diagonal_len),
+    );
+    {
+        let mut dest = array_view_mut::<T>(&mut out, &out_shape)?;
+        write_diagonals(&window, &mut dest, rest_shape, 0)?;
+    }
+    Buffer::new(dtype, out_shape, <T as NdScalar>::into_storage(out))
+}
+
+/// Copy every trailing `(L, L)` matrix's diagonal of `src` into the trailing
+/// axis of `dst`, descending the shared leading (rest) axes one
+/// [`ndarray::Axis`] at a time — the ndarray traversal, no offset arithmetic.
+fn write_diagonals<T: NdScalar>(
+    src: &ndarray::ArrayViewD<'_, T>,
+    dst: &mut ndarray::ArrayViewMutD<'_, T>,
+    rest_shape: &[usize],
+    depth: usize,
+) -> Result<()> {
+    if depth == rest_shape.len() {
+        let matrix = src.view().into_dimensionality::<Ix2>().map_err(internal)?;
+        let mut line = dst.view_mut().into_dimensionality::<Ix1>().map_err(internal)?;
+        line.assign(&matrix.diag());
+        return Ok(());
+    }
+    for position in 0..rest_shape[depth] {
+        let sub_src = src.index_axis(Axis(0), position);
+        let mut sub_dst = dst.index_axis_mut(Axis(0), position);
+        write_diagonals(&sub_src, &mut sub_dst, rest_shape, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn internal(_: ndarray::ShapeError) -> Error {
+    Error::verification(
+        "diagonal: the permuted/diagonal view does not compose (internal engine error)",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -139,42 +195,54 @@ fn triangle_impl(
     }
     check_result_shape(name, &out_shape, &input.shape)?;
     let k = attr_int(&spec.attrs, "k", 0)?;
-    let rows = input.shape[rank - 2];
-    let columns = input.shape[rank - 1];
-    let batch = util::numel(&input.shape[..rank - 2]);
     let dtype = spec.result_types[0].dtype;
     let buffer = with_type!(input, |values| triangle_run(
-        values, batch, rows, columns, k, dtype, out_shape, lower
+        values,
+        &input.shape,
+        k,
+        dtype,
+        out_shape,
+        lower
     ))?;
     single(buffer)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn triangle_run<T: Scalar>(
+/// numpy's `tril`/`triu`: the operand is copied and the excluded triangle of
+/// every trailing matrix is zeroed with one `slice_axis_mut` + `fill` per row
+/// (both trailing axes sliced, so every leading batch row is covered at once).
+fn triangle_run<T: Scalar + NdScalar>(
     values: &[T],
-    batch: usize,
-    rows: usize,
-    columns: usize,
+    in_shape: &[usize],
     k: i64,
     dtype: DType,
     out_shape: Vec<usize>,
     lower: bool,
 ) -> Result<Buffer> {
-    let matrix = rows * columns;
-    let mut out = vec![T::zero(); values.len()];
-    for item in 0..batch {
-        let base = item * matrix;
-        for row in 0..rows {
-            for column in 0..columns {
-                let diagonal = column as i64 - row as i64;
-                let keep = if lower { diagonal <= k } else { diagonal >= k };
-                if keep {
-                    out[base + row * columns + column] = values[base + row * columns + column];
-                }
-            }
+    let rank = in_shape.len();
+    let rows = in_shape[rank - 2];
+    let columns = in_shape[rank - 1];
+    let mut out = array_view::<T>(values, in_shape)?.to_owned();
+    let column_limit = columns as i64;
+    for row in 0..rows {
+        // `column - row <= k` is kept by `tril` (so the zeros start at
+        // `row + k + 1`), `column - row >= k` by `triu` (zeros end at
+        // `row + k`).  Saturating: `k` is user data.
+        let boundary = (row as i64).saturating_add(k);
+        let (first, last) = if lower {
+            let first = boundary.saturating_add(1).clamp(0, column_limit) as usize;
+            (first, columns)
+        } else {
+            (0, boundary.clamp(0, column_limit) as usize)
+        };
+        if first >= last {
+            continue;
         }
+        out.slice_axis_mut(Axis(rank - 2), Slice::from(row..row + 1))
+            .slice_axis_mut(Axis(rank - 1), Slice::from(first..last))
+            .fill(T::zero());
     }
-    Buffer::new(dtype, out_shape, T::into_storage(out))
+    let (flat, _offset) = out.into_raw_vec_and_offset();
+    Buffer::new(dtype, out_shape, <T as NdScalar>::into_storage(flat))
 }
 
 #[cfg(test)]
@@ -229,6 +297,23 @@ mod tests {
         assert_close(&floats(&out[0]), &[6., 14., 7., 15.]);
     }
 
+    #[test]
+    fn diagonal_keeps_the_rest_axes_in_order_behind_the_offset() {
+        // (2, 3, 4) with axis1=0, axis2=2, offset=1: the surviving rest axis is
+        // axis 1, the diagonal is appended LAST and starts at column 1.
+        let data: Vec<f64> = (0..24).map(|i| i as f64).collect();
+        let x = value(DType::Float64, &[2, 3, 4], Storage::F64(data));
+        let attrs = Attrs::from_pairs([
+            ("offset", AttrValue::Int(1)),
+            ("axis1", AttrValue::Int(0)),
+            ("axis2", AttrValue::Int(2)),
+        ]);
+        let op = spec("diagonal", DType::Float64, &[3, 2], attrs);
+        let out = diagonal_impl(&[x], &op, vec![3, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![3, 2]);
+        assert_close(&floats(&out[0]), &[1., 14., 5., 18., 9., 22.]);
+    }
+
     // --- tril / triu -------------------------------------------------------
 
     #[test]
@@ -253,6 +338,33 @@ mod tests {
             let attrs = Attrs::from_pairs([("k", AttrValue::Int(k))]);
             let op = spec(name, DType::Float64, &[3, 3], attrs);
             let out = triangle_impl(std::slice::from_ref(&x), &op, vec![3, 3], lower).unwrap();
+            assert_close(&floats(&out[0]), &expected);
+        }
+    }
+
+    #[test]
+    fn tril_and_triu_clamp_a_saturating_k_on_a_non_square_input() {
+        // [[1, 2, 3], [4, 5, 6]] — `k` far outside the matrix must clamp to
+        // "keep everything" / "zero everything", never overflow the row bound.
+        let x = value(
+            DType::Float64,
+            &[2, 3],
+            Storage::F64(vec![1., 2., 3., 4., 5., 6.]),
+        );
+        let cases: [(&str, i64, [f64; 6]); 6] = [
+            ("tril", i64::MAX, [1., 2., 3., 4., 5., 6.]),
+            ("tril", i64::MIN, [0., 0., 0., 0., 0., 0.]),
+            ("tril", 1, [1., 2., 0., 4., 5., 6.]),
+            ("triu", i64::MAX, [0., 0., 0., 0., 0., 0.]),
+            ("triu", i64::MIN, [1., 2., 3., 4., 5., 6.]),
+            ("triu", 1, [0., 2., 3., 0., 0., 6.]),
+        ];
+        for (name, k, expected) in cases {
+            let lower = name == "tril";
+            let attrs = Attrs::from_pairs([("k", AttrValue::Int(k))]);
+            let op = spec(name, DType::Float64, &[2, 3], attrs);
+            let out = triangle_impl(std::slice::from_ref(&x), &op, vec![2, 3], lower).unwrap();
+            assert_eq!(out[0].shape, vec![2, 3]);
             assert_close(&floats(&out[0]), &expected);
         }
     }

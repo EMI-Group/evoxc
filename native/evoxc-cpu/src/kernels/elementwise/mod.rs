@@ -138,6 +138,10 @@ fn stop_gradient_kernel(
 }
 
 fn cast_kernel(_ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
+    // `astype` is shape-preserving, so a cast has no layout to address: the
+    // whole operand is one flat typed slice, converted by `Buffer::cast`'s
+    // `convert_generic` (pooled, one pass per element), and a same-dtype cast
+    // is the identity.  No broadcast/offset handling is involved.
     let target = spec.attrs.dtype("dtype")?;
     let input = &operands[0];
     if input.dtype == target {
@@ -151,6 +155,9 @@ fn broadcast_kernel(
     spec: &OpSpec,
     operands: &[Value],
 ) -> Result<Vec<Value>> {
+    // The layout work is ndarray's: `broadcast_to` materializes the target shape
+    // through an ndarray broadcast view (`buffer::broadcast::fill_broadcast`),
+    // never a hand-written offset walk.
     let target = spec.attrs.shape("shape")?;
     let shape = ctx.eval_shape_strict(target).map_err(|err| {
         err.context("op 'broadcast': cannot evaluate the target shape")
@@ -171,8 +178,9 @@ fn broadcast_kernel(
 #[cfg(test)]
 pub(super) mod test_support {
     use evoxc_core::{Attrs, DType, Result, ValueType};
+    use ndarray::{IxDyn, Zip};
 
-    use crate::buffer::{Buffer, Storage};
+    use crate::buffer::{array_view, Buffer, NdScalar, Storage};
     use crate::exec::Value;
     use crate::plan::OpSpec;
 
@@ -197,4 +205,162 @@ pub(super) mod test_support {
     pub(super) fn binary(spec: &OpSpec, a: &Buffer, b: &Buffer) -> Result<Vec<Value>> {
         super::binary::binary(spec, &std::rc::Rc::new(a.clone()), &std::rc::Rc::new(b.clone()))
     }
+
+    /// An INDEPENDENT two-operand reference: one plain [`ndarray::Zip`] pass over
+    /// the operands' broadcast views, with the per-element operation written out
+    /// by the test itself.
+    ///
+    /// The engine's own broadcast path ([`crate::buffer::map2_runs`]) is
+    /// `buffer::broadcast`'s `apply2` — a `Zip` pass over the same views — plus
+    /// the pooled result and the row split, so a reference built from those
+    /// drivers would only re-run the code under test.  Here the views are
+    /// broadcast by hand and the result is collected into a flat `Vec`, which is
+    /// what the flat/broadcast path pins compare against.
+    pub(super) fn zip2_reference<T, U, R, F>(
+        left: &[T],
+        left_shape: &[usize],
+        right: &[U],
+        right_shape: &[usize],
+        out_shape: &[usize],
+        f: F,
+    ) -> Vec<R>
+    where
+        T: NdScalar,
+        U: NdScalar,
+        R: NdScalar,
+        F: Fn(T, U) -> R,
+    {
+        let shape = IxDyn(out_shape);
+        let left_view = array_view(left, left_shape).expect("reference: left operand view");
+        let right_view = array_view(right, right_shape).expect("reference: right operand view");
+        let left_broadcast = left_view.broadcast(shape.clone()).expect("reference: left broadcast");
+        let right_broadcast = right_view
+            .broadcast(shape)
+            .expect("reference: right broadcast");
+        let collected = Zip::from(&left_broadcast)
+            .and(&right_broadcast)
+            .map_collect(|a, b| f(*a, *b));
+        collected.into_raw_vec_and_offset().0
+    }
+
+    /// The three-operand counterpart of [`zip2_reference`] (the `select` shape:
+    /// a predicate plus the two branches).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn zip3_reference<P, T, R, F>(
+        pred: &[P],
+        pred_shape: &[usize],
+        on_true: &[T],
+        on_true_shape: &[usize],
+        on_false: &[T],
+        on_false_shape: &[usize],
+        out_shape: &[usize],
+        f: F,
+    ) -> Vec<R>
+    where
+        P: NdScalar,
+        T: NdScalar,
+        R: NdScalar,
+        F: Fn(P, T, T) -> R,
+    {
+        let shape = IxDyn(out_shape);
+        let pred_view = array_view(pred, pred_shape).expect("reference: predicate view");
+        let true_view = array_view(on_true, on_true_shape).expect("reference: on_true view");
+        let false_view = array_view(on_false, on_false_shape).expect("reference: on_false view");
+        let pred_broadcast = pred_view.broadcast(shape.clone()).expect("reference: predicate broadcast");
+        let true_broadcast = true_view.broadcast(shape.clone()).expect("reference: on_true broadcast");
+        let false_broadcast = false_view.broadcast(shape).expect("reference: on_false broadcast");
+        let collected = Zip::from(&pred_broadcast)
+            .and(&true_broadcast)
+            .and(&false_broadcast)
+            .map_collect(|p, x, y| f(*p, *x, *y));
+        collected.into_raw_vec_and_offset().0
+    }
+
+    /// The one-operand counterpart of [`zip2_reference`] (the `cast` shape: one
+    /// elementwise conversion that keeps the operand's shape).
+    pub(super) fn map_reference<T, R, F>(values: &[T], shape: &[usize], f: F) -> Vec<R>
+    where
+        T: NdScalar,
+        R: NdScalar,
+        F: FnMut(T) -> R,
+    {
+        let view = array_view(values, shape).expect("reference: operand view");
+        view.mapv(f).into_raw_vec_and_offset().0
+    }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{buffer, map_reference};
+    use super::*;
+
+    /// The cast conversion is `Buffer::cast` (`cast_kernel`'s whole body once the
+    /// target dtype is known), so an independent `ndarray` `mapv` over the same
+    /// elements is the reference.  `astype` keeps the operand's shape, so a cast
+    /// has no broadcast arm: the shapes below are the flat fast path itself, and
+    /// the multi-axis and rank-0 cases pin that they are all flat.
+    #[test]
+    fn cast_matches_an_ndarray_map_expression() {
+        // f32 -> f64 (exact widening) over a rank-1, a rank-2 and a rank-3 shape.
+        let floats = [1.5f32, -2.0, 3.25, 0.0, 0.5, -0.125];
+        for shape in [vec![6], vec![2, 3], vec![1, 2, 3]] {
+            let source = buffer(DType::Float32, &shape, Storage::F32(floats.to_vec()));
+            let got = source.cast(DType::Float64).unwrap();
+            assert_eq!(got.dtype, DType::Float64);
+            assert_eq!(got.shape, shape);
+            assert_eq!(
+                got.storage,
+                Storage::F64(map_reference(&floats, &shape, |value: f32| value as f64)),
+                "f32 -> f64 {shape:?}"
+            );
+        }
+
+        // f64 -> f32 and i32 -> f32 round to nearest, exactly like the `as` in
+        // the reference (the engine converts through its `ScalarValue`).
+        let doubles = [0.1f64, -2.5, 3.0e10, f64::NAN];
+        let got = buffer(DType::Float64, &[2, 2], Storage::F64(doubles.to_vec()))
+            .cast(DType::Float32)
+            .unwrap();
+        match (&got.storage, map_reference(&doubles, &[2, 2], |value: f64| value as f32)) {
+            (Storage::F32(actual), expected) => {
+                for (index, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "f64 -> f32 element {index}");
+                }
+            }
+            (other, _) => panic!("unexpected storage {other:?}"),
+        }
+
+        let ints = [1i32, -3, 16_777_217, 0];
+        let got = buffer(DType::Int32, &[2, 2], Storage::I32(ints.to_vec()))
+            .cast(DType::Float32)
+            .unwrap();
+        assert_eq!(
+            got.storage,
+            Storage::F32(map_reference(&ints, &[2, 2], |value: i32| value as f32))
+        );
+
+        // i64 -> i32 is the wrapping `as` cast, matching numpy's C cast.
+        let wide = [1i64 << 40, -1, 7, -(1i64 << 33)];
+        let got = buffer(DType::Int64, &[4], Storage::I64(wide.to_vec()))
+            .cast(DType::Int32)
+            .unwrap();
+        assert_eq!(
+            got.storage,
+            Storage::I32(map_reference(&wide, &[4], |value: i64| value as i32))
+        );
+
+        // A rank-0 operand converts its one element (f32 2.5 truncates to i64 2).
+        let scalar = buffer(DType::Float32, &[], Storage::F32(vec![2.5]));
+        let got = scalar.cast(DType::Int64).unwrap();
+        assert_eq!(got.shape, Vec::<usize>::new());
+        assert_eq!(
+            got.storage,
+            Storage::I64(map_reference(&[2.5f32], &[], |value: f32| value as i64))
+        );
+
+        // A same-dtype cast is the identity, not a conversion.
+        let same = buffer(DType::Float32, &[2], Storage::F32(vec![1.0, -0.0]));
+        assert_eq!(same.cast(DType::Float32).unwrap().storage, same.storage);
+    }
+}
+

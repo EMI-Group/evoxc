@@ -3,11 +3,18 @@
 //!
 //! The factorization runs in f64/complex128 work space; the declared dtype is
 //! what the result is stored in, which only removes rounding.
+//!
+//! The N-dimensional plumbing is `ndarray`'s: both operands are broadcast over
+//! the batch dims ([`ndarray::ArrayBase::broadcast`], the same right-aligned
+//! rule as [`crate::buffer::broadcast_shape`]) and each batch element is picked
+//! with one `slice` over [`ndarray::SliceInfoElem`]s, so no hand-written offset
+//! or stride walk touches the matrices.
 
 use evoxc_core::{DType, Error, Result};
+use ndarray::{ArrayView2, ArrayViewD, Ix1, Ix2, SliceInfoElem};
 use num_complex::Complex;
 
-use crate::buffer::{broadcast_shape, broadcast_strides, Buffer};
+use crate::buffer::{broadcast_shape, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
@@ -15,7 +22,7 @@ use crate::plan::OpSpec;
 use crate::scalar::{Scalar, ScalarValue};
 use crate::with_same_type;
 
-use super::common::{attr_bool, check_result_shape, each_index, expect_arity};
+use super::common::{attr_bool, check_result_shape, expect_arity};
 
 pub(super) fn register(map: &mut KernelMap) {
     map.insert("solve", solve_kernel);
@@ -33,8 +40,6 @@ struct SolveGeom {
     b_vec: bool,
     left_side: bool,
     batch: Vec<usize>,
-    a_strides: Vec<usize>,
-    b_strides: Vec<usize>,
 }
 
 /// The work-space scalar the factorization runs in (f64 / complex128).
@@ -144,13 +149,13 @@ fn solve_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Resul
         k,
         b_vec,
         left_side,
-        a_strides: broadcast_strides(a_batch, &batch),
-        b_strides: broadcast_strides(b_batch, &batch),
         batch,
     };
     let buffer = with_same_type!(left, right, |a_values, b_values| solve_run(
         a_values,
         b_values,
+        &a.shape,
+        &b.shape,
         &geometry,
         dtype,
         out_shape
@@ -158,9 +163,12 @@ fn solve_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Resul
     single(buffer)
 }
 
-fn solve_run<T: Scalar>(
+#[allow(clippy::too_many_arguments)]
+fn solve_run<T: Scalar + NdScalar>(
     a: &[T],
     b: &[T],
+    a_shape: &[usize],
+    b_shape: &[usize],
     g: &SolveGeom,
     dtype: DType,
     out_shape: Vec<usize>,
@@ -180,101 +188,136 @@ fn solve_run<T: Scalar>(
                 other => Complex::new(other.real(), 0.0),
             })
             .collect();
-        let solved = solve_work(&left, &right, g)?;
+        let solved = solve_work(&left, &right, a_shape, b_shape, g)?;
         let typed: Vec<T> = solved
             .iter()
             .map(|value| T::from_scalar(ScalarValue::C(*value)))
             .collect();
-        T::into_storage(typed)
+        <T as NdScalar>::into_storage(typed)
     } else {
         let left: Vec<f64> = a.iter().map(|value| value.to_scalar().real()).collect();
         let right: Vec<f64> = b.iter().map(|value| value.to_scalar().real()).collect();
-        let solved = solve_work(&left, &right, g)?;
+        let solved = solve_work(&left, &right, a_shape, b_shape, g)?;
         let typed: Vec<T> = solved
             .iter()
             .map(|value| T::from_scalar(ScalarValue::F(*value)))
             .collect();
-        T::into_storage(typed)
+        <T as NdScalar>::into_storage(typed)
     };
     Buffer::new(dtype, out_shape, storage)
 }
 
-fn solve_work<W: SolveNum>(a: &[W], b: &[W], g: &SolveGeom) -> Result<Vec<W>> {
+fn solve_work<W: SolveNum>(
+    a: &[W],
+    b: &[W],
+    a_shape: &[usize],
+    b_shape: &[usize],
+    g: &SolveGeom,
+) -> Result<Vec<W>> {
     let n = g.n;
-    let a_step = n * n;
     let b_step = if g.b_vec { n } else { n * g.k };
     let mut out: Vec<W> = Vec::with_capacity(util::numel(&g.batch) * b_step);
-    let mut lu = vec![W::zero(); a_step];
+
+    // Both operands broadcast over the batch dims with zero strides (numpy's
+    // right-aligned rule), so one batch element is a plain `slice` away.
+    let mut a_target = g.batch.clone();
+    a_target.push(n);
+    a_target.push(n);
+    let a_matrix = ArrayViewD::<W>::from_shape(ndarray::IxDyn(a_shape), a)
+        .map_err(|error| malformed("a", error))?;
+    let a_full = a_matrix
+        .broadcast(ndarray::IxDyn(&a_target))
+        .ok_or_else(|| uncomposable("a"))?;
+    let mut b_target = g.batch.clone();
+    b_target.push(n);
+    if !g.b_vec {
+        b_target.push(g.k);
+    }
+    let b_matrix = ArrayViewD::<W>::from_shape(ndarray::IxDyn(b_shape), b)
+        .map_err(|error| malformed("b", error))?;
+    let b_full = b_matrix
+        .broadcast(ndarray::IxDyn(&b_target))
+        .ok_or_else(|| uncomposable("b"))?;
+
+    // One selector per batch axis (an index), then the trailing matrix axes
+    // taken whole — a `slice` drops the selected axes.
+    let full = SliceInfoElem::Slice {
+        start: 0,
+        end: None,
+        step: 1,
+    };
+    let mut a_select: Vec<SliceInfoElem> = vec![SliceInfoElem::Index(0); g.batch.len()];
+    a_select.extend([full, full]);
+    let mut b_select: Vec<SliceInfoElem> = vec![SliceInfoElem::Index(0); g.batch.len()];
+    b_select.extend(std::iter::repeat_n(full, if g.b_vec { 1 } else { 2 }));
+
+    let mut lu = vec![W::zero(); n * n];
     let mut pivots = vec![0usize; n];
     let mut rhs: Vec<W> = Vec::new();
-    each_index(&g.batch, |batch_index| {
-        let a_base = batch_offset(batch_index, &g.a_strides) * a_step;
-        let b_base = batch_offset(batch_index, &g.b_strides) * b_step;
+    for index in ndarray::indices(ndarray::IxDyn(&g.batch)) {
+        for axis in 0..g.batch.len() {
+            a_select[axis] = SliceInfoElem::Index(index[axis] as isize);
+            b_select[axis] = SliceInfoElem::Index(index[axis] as isize);
+        }
+        let matrix = a_full
+            .slice(&a_select[..])
+            .into_dimensionality::<Ix2>()
+            .map_err(|error| malformed("a", error))?;
+        let right = b_full.slice(&b_select[..]);
         // The system matrix (transposed for the `X A = B` form).
-        for row in 0..n {
-            for column in 0..n {
-                let source = if g.left_side {
-                    a_base + row * n + column
-                } else {
-                    a_base + column * n + row
-                };
-                lu[row * n + column] = a[source];
-            }
+        lu.clear();
+        if g.left_side {
+            lu.extend(matrix.iter().copied());
+        } else {
+            lu.extend(matrix.t().iter().copied());
         }
         if !lu_factor(&mut lu, n, &mut pivots) {
             return Err(Error::backend(format!(
                 "solve: singular matrix (numpy LinAlgError: Singular matrix) — a batch element of the {n}x{n} coefficient matrix is not invertible"
             )));
         }
-        let nrhs = if g.b_vec {
-            1
-        } else if g.left_side {
-            g.k
-        } else {
-            n
-        };
         rhs.clear();
-        rhs.resize(nrhs * n, W::zero());
-        if g.left_side && !g.b_vec {
-            // One right-hand side per column of b.
-            for column in 0..g.k {
-                for row in 0..n {
-                    rhs[column * n + row] = b[b_base + row * g.k + column];
-                }
-            }
-        } else if !g.left_side && !g.b_vec {
-            // Each ROW of b is one system: Aᵀ x = b[row, :].
-            for row in 0..n {
-                rhs[row * n..(row + 1) * n]
-                    .copy_from_slice(&b[b_base + row * n..b_base + (row + 1) * n]);
-            }
+        if g.b_vec {
+            let vector = right.into_dimensionality::<Ix1>().map_err(|error| malformed("b", error))?;
+            rhs.extend(vector.iter().copied());
         } else {
-            rhs[..n].copy_from_slice(&b[b_base..b_base + n]);
+            let matrix = right.into_dimensionality::<Ix2>().map_err(|error| malformed("b", error))?;
+            if g.left_side {
+                // One right-hand side per COLUMN of b.
+                rhs.extend(matrix.t().iter().copied());
+            } else {
+                // Each ROW of b is one system: Aᵀ x = b[row, :].
+                rhs.extend(matrix.iter().copied());
+            }
         }
-        for column in 0..nrhs {
-            lu_solve(&lu, n, &pivots, &mut rhs[column * n..(column + 1) * n]);
+        for system in rhs.chunks_exact_mut(n) {
+            lu_solve(&lu, n, &pivots, system);
         }
         if g.left_side && !g.b_vec {
-            for row in 0..n {
-                for column in 0..g.k {
-                    out.push(rhs[column * n + row]);
-                }
-            }
+            // The systems were b's columns; the result stores them row-wise.
+            let solved =
+                ArrayView2::from_shape((g.k, n), &rhs[..]).map_err(|error| malformed("b", error))?;
+            out.extend(solved.t().iter().copied());
         } else {
             out.extend_from_slice(&rhs);
         }
-        Ok(())
-    })?;
+    }
     Ok(out)
 }
 
-/// Element offset of one multi-index against broadcast (batch) strides.
-pub(super) fn batch_offset(index: &[usize], strides: &[usize]) -> usize {
-    index
-        .iter()
-        .zip(strides)
-        .map(|(position, stride)| position * stride)
-        .sum()
+/// The operand shape does not hold the elements its view needs (an engine
+/// invariant, never a user input).
+fn malformed(operand: &str, error: ndarray::ShapeError) -> Error {
+    Error::verification(format!(
+        "solve: operand '{operand}' does not view as its declared shape (internal engine error): {error}"
+    ))
+}
+
+/// The validated broadcast did not compose (an engine invariant).
+fn uncomposable(operand: &str) -> Error {
+    Error::verification(format!(
+        "solve: operand '{operand}' does not broadcast over the batch dims (internal engine error)"
+    ))
 }
 
 /// In-place LU factorization with partial pivoting; `false` = singular.
@@ -378,6 +421,87 @@ mod tests {
         );
         let out = solve_impl(&[a, vector], &right, vec![2]).unwrap();
         assert_close(&floats(&out[0]), &[0.5, 1.0 / 6.0]);
+    }
+
+    #[test]
+    fn solve_broadcasts_the_batch_dims_of_both_operands() {
+        // a has no batch dim, b has one: `a` broadcasts over it (ndarray
+        // `broadcast`, the same right-aligned rule as numpy).
+        let a = value(DType::Float64, &[2, 2], Storage::F64(vec![2., 1., 0., 3.]));
+        let b = value(
+            DType::Float64,
+            &[3, 2, 2],
+            Storage::F64(vec![1., 0., 0., 1., 2., 1., 0., 2., 4., 0., 1., 1.]),
+        );
+        let op = spec("solve", DType::Float64, &[3, 2, 2], Attrs::new());
+        let out = solve_impl(&[a, b], &op, vec![3, 2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![3, 2, 2]);
+        assert_close(
+            &floats(&out[0]),
+            &[
+                0.5,
+                -1.0 / 6.0,
+                0.0,
+                1.0 / 3.0,
+                1.0,
+                1.0 / 6.0,
+                0.0,
+                2.0 / 3.0,
+                11.0 / 6.0,
+                -1.0 / 6.0,
+                1.0 / 3.0,
+                1.0 / 3.0,
+            ],
+        );
+
+        // a is batched, b is a bare vector: `b` broadcasts over the batch.
+        let a = value(
+            DType::Float64,
+            &[2, 2, 2],
+            Storage::F64(vec![2., 1., 1., 3., 1., 0., 0., 2.]),
+        );
+        let vector = value(DType::Float64, &[2], Storage::F64(vec![3., 5.]));
+        let op = spec("solve", DType::Float64, &[2, 2], Attrs::new());
+        let out = solve_impl(&[a, vector], &op, vec![2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![2, 2]);
+        assert_close(&floats(&out[0]), &[0.8, 1.4, 3.0, 2.5]);
+    }
+
+    #[test]
+    fn solve_batched_right_side_matrix_rhs() {
+        // X A = B with a single A and a batch of square B matrices: each batch
+        // element is its own right-sided system.
+        let a = value(DType::Float64, &[2, 2], Storage::F64(vec![2., 1., 0., 3.]));
+        let b = value(
+            DType::Float64,
+            &[3, 2, 2],
+            Storage::F64(vec![1., 0., 0., 1., 2., 1., 0., 2., 4., 0., 1., 1.]),
+        );
+        let right = spec(
+            "solve",
+            DType::Float64,
+            &[3, 2, 2],
+            Attrs::from_pairs([("left_side", AttrValue::Bool(false))]),
+        );
+        let out = solve_impl(&[a, b], &right, vec![3, 2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![3, 2, 2]);
+        assert_close(
+            &floats(&out[0]),
+            &[
+                0.5,
+                -1.0 / 6.0,
+                0.0,
+                1.0 / 3.0,
+                1.0,
+                0.0,
+                0.0,
+                2.0 / 3.0,
+                2.0,
+                -2.0 / 3.0,
+                0.5,
+                1.0 / 6.0,
+            ],
+        );
     }
 
     #[test]
