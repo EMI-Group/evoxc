@@ -1,13 +1,18 @@
 //! Structure kernels: `tile`, `flip`, `roll`, `pad` and `diag`.
 //!
-//! All five are pure relabellings of the operand's elements (plus fill values
-//! for `pad` and a rank-1 `diag`), so one shape-driven index map plus one
-//! typed copy serves them all:
+//! `tile`, `flip`, `roll` and `diag` are pure relabellings of the operand's
+//! elements (a rank-1 `diag` adds zeros), so one shape-driven index map plus
+//! one typed copy serves them all:
 //!
 //! * the map is built from the DECLARED result shape ([`util::result_shape`]),
 //!   never re-derived, and holds exactly one entry per result element;
 //! * `Some(offset)` copies the operand element at C-order `offset`, `None`
-//!   leaves the destination's fill value (the constant-pad value, or zero).
+//!   leaves the destination's zero.
+//!
+//! `pad` is the exception: constant padding is a row-wise copy (fill the pad
+//! cells, then one `copy_from_slice` per operand row — see [`pad`]), because a
+//! per-element index map costs a full odometer per pad cell and a second pass
+//! over the whole result.
 //!
 //! numpy semantics reproduced exactly (the reference is
 //! `evoxc/backends/numpy/kernels/structural.py` + `_pad` in `indexing.py`):
@@ -60,7 +65,7 @@ mod test_support;
 
 use diag::diag_map;
 use flip_roll::{flip_axes, flip_map, roll_map};
-use pad::{pad_map, pad_value, padding};
+use pad::{pad_result, pad_value, padding};
 use tile::{reps, tile_blocks, tile_map, tile_whole_repeat};
 
 pub fn register(map: &mut KernelMap) {
@@ -105,10 +110,11 @@ fn structural(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<
             None,
         ),
         "roll" => (roll_map(name, &input.shape, out_shape, spec)?, None),
-        "pad" => (
-            pad_map(name, &input.shape, out_shape, &padding(spec)?)?,
-            Some(pad_value(spec)?),
-        ),
+        // Constant padding is a row-wise memcpy, not an index map: it fills the
+        // pad cells and copies each operand row whole.
+        "pad" => {
+            return pad_result(name, input, out_shape, &padding(spec)?, pad_value(spec)?)
+        }
         "diag" => (diag_map(name, &input.shape, out_shape)?, None),
         other => {
             return Err(Error::verification(format!(

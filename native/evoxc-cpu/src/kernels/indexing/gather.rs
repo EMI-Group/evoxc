@@ -8,7 +8,7 @@
 //! declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::{take_pooled_vec, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
@@ -16,8 +16,8 @@ use crate::scalar::Scalar;
 use crate::with_type;
 
 use super::{
-    for_each_index, index_values, offset_error, operand, reconcile, render_ints,
-    require_integer_indices, resolve_index,
+    for_each_index, index_as_i128, index_values, offset_error, operand, reconcile, render_ints,
+    require_integer_indices, resolve_index, resolve_index_fast,
 };
 
 pub(super) fn gather_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
@@ -26,14 +26,7 @@ pub(super) fn gather_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Val
     require_integer_indices("gather", indices)?;
     let axis = gather_axis(spec, source.rank())?;
     let declared = ctx.result_shape(spec, 0)?;
-    let index_values = index_values(indices)?;
-    single(gather(
-        source,
-        &index_values,
-        &indices.shape,
-        axis,
-        &declared,
-    )?)
+    single(gather(source, indices, axis, &declared)?)
 }
 
 /// `axes` must name exactly one gathered axis. A multi-axis tuple is the
@@ -63,11 +56,11 @@ fn gather_axis(spec: &OpSpec, rank: usize) -> Result<usize> {
 
 fn gather(
     source: &Buffer,
-    indices: &[i128],
-    index_shape: &[usize],
+    indices: &Buffer,
     axis: usize,
     declared: &[Option<usize>],
 ) -> Result<Buffer> {
+    let index_shape = indices.shape.as_slice();
     let mut derived: Vec<usize> = source.shape[..axis].to_vec();
     derived.extend_from_slice(index_shape);
     derived.extend_from_slice(&source.shape[axis + 1..]);
@@ -75,13 +68,16 @@ fn gather(
     if let Some(storage) = gather_blocks(source, indices, axis, &shape)? {
         return Buffer::new(source.dtype, shape, storage);
     }
+    // Only the general path needs the widened index vector: the block fast path
+    // reads the typed index buffer directly (see `gather_blocks`).
+    let widened = index_values(indices)?;
     with_type!(source, |values| gather_typed(
         values,
         source.dtype,
         &source.shape,
         axis,
         index_shape,
-        indices,
+        &widened,
         &shape
     ))
 }
@@ -91,98 +87,127 @@ fn gather(
 /// Only the gathered axis selects anything, so the result is `outer × n` runs
 /// of `inner` whole elements copied verbatim out of the operand (`outer` = the
 /// extents before the axis, `n` = the index count, `inner` = the extents after
-/// it — exactly the C order the spliced result shape has).  The indices are
-/// resolved ONCE into a compact `Vec<usize>` through [`resolve_index`] (numpy's
-/// negative-index and bounds rules, unchanged error wording) and the result is
-/// then written straight into one typed `Vec`, so neither the per-index
-/// `outer × n` offset vector nor the `i128` re-read per output element exists
-/// any more.  The `inner == 1` cases — the hot ones, where the old per-run
-/// `values.get(start..start + 1)` was one bounds-checked single-element copy
-/// per output element — now read a flat element (or a `band`-strided one, for
-/// a single scalar index).  `None` for an empty result or a shape this
+/// it — exactly the C order the spliced result shape has).  The typed index
+/// buffer is read directly (no whole-tensor `i128` widening) and the indices
+/// are resolved ONCE into a compact `Vec<usize>` when several output runs share
+/// an index; a run that uses each index exactly once (`outer == 1`) resolves
+/// and writes in the same pass, so nothing is materialized between the two.
+/// The result is one preallocated typed vector — a recycled allocation from the
+/// storage pool when one of that exact size is available, every element
+/// overwritten — so neither `Vec::push`'s growth test nor a fresh allocation
+/// per call remains on the path.  `None` for an empty result or a shape this
 /// decomposition does not cover — the general path owns those.
 fn gather_blocks(
     source: &Buffer,
-    indices: &[i128],
+    indices: &Buffer,
     axis: usize,
     out_shape: &[usize],
 ) -> Result<Option<Storage>> {
     let outer: usize = source.shape[..axis].iter().product();
     let inner: usize = source.shape[axis + 1..].iter().product();
     let total = util::numel(out_shape);
-    if total == 0 || indices.is_empty() || inner == 0 {
+    let index_count = indices.numel();
+    if total == 0 || index_count == 0 || inner == 0 {
         return Ok(None);
     }
     let extent = source.shape[axis];
     let band = extent * inner;
-    let count = outer * indices.len();
+    let count = outer * index_count;
     if count.checked_mul(inner) != Some(total) {
         return Ok(None);
     }
-    // Resolve every index exactly once: this is the ONLY place the `i128` index
-    // tensor is read, so no output element re-reads it or re-does the wrapping.
-    let mut resolved = Vec::with_capacity(indices.len());
-    for raw in indices {
-        resolved.push(resolve_index(*raw, extent, axis, "gather")?);
-    }
-    let storage = with_type!(source, |values| gather_into(
-        values, outer, inner, band, total, &resolved
-    ));
-    Ok(Some(storage))
+    // The index tensor is read exactly once, into the typed driver of its own
+    // dtype, so no output element re-reads it or re-does the wrapping.
+    let built = with_type!(indices, |raw| {
+        with_type!(source, |values| gather_into(
+            values, raw, outer, extent, inner, band, total, axis
+        ))
+    });
+    Ok(Some(built?))
 }
 
 /// Write the gathered result into one typed vector of exactly `total` elements.
 ///
-/// The caller has already checked `total == outer × resolved.len() × inner`,
-/// every entry of `resolved` is inside the gathered extent, and `values` holds
-/// exactly `outer × band = outer × extent × inner` elements, so every read and
-/// write below is in bounds by construction.
-fn gather_into<T: Scalar>(
+/// The caller has already checked `total == outer × raw.len() × inner`, every
+/// entry resolves inside the gathered extent, and `values` holds exactly
+/// `outer × band = outer × extent × inner` elements, so every read and write
+/// below is in bounds by construction.
+#[allow(clippy::too_many_arguments)]
+fn gather_into<T: Scalar, I: Scalar>(
     values: &[T],
+    raw: &[I],
     outer: usize,
+    extent: usize,
     inner: usize,
     band: usize,
     total: usize,
-    resolved: &[usize],
-) -> Storage {
-    let mut out: Vec<T> = Vec::with_capacity(total);
+    axis: usize,
+) -> Result<Storage> {
+    // A pooled vector is exactly `total` long and fully overwritten below; the
+    // length check keeps a mismatched recycled stock from ever reaching a
+    // result (a fresh zeroed vector is one memset, and only on the first call).
+    let mut out = take_pooled_vec::<T>(total)
+        .filter(|out| out.len() == total)
+        .unwrap_or_else(|| T::zeros(total));
     if inner == 1 {
         if outer == 1 {
-            // The operand is exactly the gathered axis: one flat read per index.
-            for &selected in resolved {
-                out.push(values[selected]);
+            // The operand is exactly the gathered axis: one flat read per index
+            // (and each index is used once, so it is resolved where it is used).
+            for (slot, raw) in out.iter_mut().zip(raw.iter()) {
+                let selected = resolve_index_fast(index_as_i128(*raw), extent, axis, "gather")?;
+                *slot = values[selected];
             }
-        } else if resolved.len() == 1 {
+        } else if raw.len() == 1 {
             // A scalar index selects the same offset out of every `band`-wide
             // block — a pure strided read (`x[:, :, i]`-shaped gathers).
-            let mut position = resolved[0];
-            for _ in 0..outer {
-                out.push(values[position]);
+            let mut position = resolve_index_fast(index_as_i128(raw[0]), extent, axis, "gather")?;
+            for slot in out.iter_mut() {
+                *slot = values[position];
                 position += band;
             }
         } else {
-            // One element per block per index, in the result's C order.
-            for block in values.chunks_exact(band) {
-                for &selected in resolved {
-                    out.push(block[selected]);
+            // One element per block per index, in the result's C order: the
+            // index list is resolved once and reused by every block.
+            let resolved = resolve_all(raw, extent, axis)?;
+            let count = resolved.len();
+            for (block, chunk) in out.chunks_exact_mut(count).enumerate() {
+                let start = block * band;
+                let source = &values[start..start + band];
+                for (slot, &selected) in chunk.iter_mut().zip(&resolved) {
+                    *slot = source[selected];
                 }
             }
         }
     } else if outer == 1 {
         // No leading block: each index copies its `inner`-element run.
-        for &selected in resolved {
+        let resolved = resolve_all(raw, extent, axis)?;
+        for (run, &selected) in out.chunks_exact_mut(inner).zip(&resolved) {
             let start = selected * inner;
-            out.extend_from_slice(&values[start..start + inner]);
+            run.copy_from_slice(&values[start..start + inner]);
         }
     } else {
-        for block in values.chunks_exact(band) {
-            for &selected in resolved {
+        let resolved = resolve_all(raw, extent, axis)?;
+        let count = resolved.len() * inner;
+        for (block, chunk) in out.chunks_exact_mut(count).enumerate() {
+            let source = &values[block * band..(block + 1) * band];
+            for (run, &selected) in chunk.chunks_exact_mut(inner).zip(&resolved) {
                 let start = selected * inner;
-                out.extend_from_slice(&block[start..start + inner]);
+                run.copy_from_slice(&source[start..start + inner]);
             }
         }
     }
-    T::into_storage(out)
+    Ok(T::into_storage(out))
+}
+
+/// Resolve every index of the gathered axis once, in the tensor's own C order
+/// (so the first out-of-range index reported is the same one the general
+/// per-element path would report).
+fn resolve_all<I: Scalar>(raw: &[I], extent: usize, axis: usize) -> Result<Vec<usize>> {
+    let mut resolved = Vec::with_capacity(raw.len());
+    for raw in raw {
+        resolved.push(resolve_index_fast(index_as_i128(*raw), extent, axis, "gather")?);
+    }
+    Ok(resolved)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -227,13 +252,15 @@ fn gather_typed<T: Scalar>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::indexing::test_support::{attrs, declared, f32_buffer, spec};
+    use crate::kernels::indexing::test_support::{
+        attrs, declared, f32_buffer, i64_buffer, spec,
+    };
     use crate::Storage;
 
     #[test]
     fn gather_takes_rows_along_the_axis() {
         let x = f32_buffer(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
-        let out = gather(&x, &[2, 0], &[2], 0, &declared(&[2, 2])).unwrap();
+        let out = gather(&x, &i64_buffer(&[2], &[2, 0]), 0, &declared(&[2, 2])).unwrap();
         assert_eq!(out.shape, vec![2, 2]);
         assert_eq!(out.storage, Storage::F32(vec![5., 6., 1., 2.]));
     }
@@ -241,7 +268,7 @@ mod tests {
     #[test]
     fn gather_negative_indices_count_from_the_end() {
         let x = f32_buffer(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
-        let out = gather(&x, &[-1, 0, -3], &[3], 0, &declared(&[3, 2])).unwrap();
+        let out = gather(&x, &i64_buffer(&[3], &[-1, 0, -3]), 0, &declared(&[3, 2])).unwrap();
         assert_eq!(out.storage, Storage::F32(vec![5., 6., 1., 2., 1., 2.]));
     }
 
@@ -249,7 +276,8 @@ mod tests {
     fn gather_splices_the_index_shape_at_the_gathered_axis() {
         let x = f32_buffer(&[2, 3, 2], &(0..12).map(|value| value as f32).collect::<Vec<_>>());
         // axis 1: result is (2, 2, 2, 2) — the index tensor's own rank is 2.
-        let out = gather(&x, &[0, 2, 1, 1], &[2, 2], 1, &declared(&[2, 2, 2, 2])).unwrap();
+        let out = gather(&x, &i64_buffer(&[2, 2], &[0, 2, 1, 1]), 1, &declared(&[2, 2, 2, 2]))
+            .unwrap();
         assert_eq!(out.shape, vec![2, 2, 2, 2]);
         assert_eq!(
             out.storage,
@@ -262,7 +290,7 @@ mod tests {
     #[test]
     fn gather_rank_zero_indices_drop_the_axis() {
         let x = f32_buffer(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
-        let out = gather(&x, &[1], &[], 0, &declared(&[2])).unwrap();
+        let out = gather(&x, &i64_buffer(&[], &[1]), 0, &declared(&[2])).unwrap();
         assert_eq!(out.shape, vec![2]);
         assert_eq!(out.storage, Storage::F32(vec![3., 4.]));
     }
@@ -298,7 +326,9 @@ mod tests {
             derived.extend_from_slice(index_shape);
             derived.extend_from_slice(&in_shape[axis + 1..]);
             let shape = derived.clone();
-            let fast = gather_blocks(&x, indices, axis, &shape)
+            let narrowed: Vec<i64> = indices.iter().map(|&raw| raw as i64).collect();
+            let index_buffer = i64_buffer(index_shape, &narrowed);
+            let fast = gather_blocks(&x, &index_buffer, axis, &shape)
                 .expect("the fast path succeeds")
                 .expect("the fast path applies");
             let general = with_type!(x, |values| gather_typed(
@@ -306,6 +336,34 @@ mod tests {
             ))
             .expect("the general path succeeds");
             assert_eq!(fast, general.storage, "shapes {in_shape:?} axis {axis}");
+        }
+    }
+
+    #[test]
+    fn gather_fast_path_agrees_for_every_index_dtype() {
+        // The fast path reads the index buffer in its own dtype (no `i128`
+        // widening), so every integer index dtype must select identically —
+        // including unsigned ones, where the resolved value is what counts.
+        use crate::kernels::indexing::test_support::buffer;
+        let x = buffer(
+            evoxc_core::DType::Int8,
+            &[3, 4],
+            Storage::I8((0..12).map(|value| value as i8).collect()),
+        );
+        let expected = Storage::I8(vec![4, 5, 6, 7, 0, 1, 2, 3]);
+        let indices = [
+            buffer(evoxc_core::DType::Int8, &[2], Storage::I8(vec![1, 0])),
+            buffer(evoxc_core::DType::Int16, &[2], Storage::I16(vec![1, 0])),
+            buffer(evoxc_core::DType::Int32, &[2], Storage::I32(vec![1, 0])),
+            buffer(evoxc_core::DType::Int64, &[2], Storage::I64(vec![1, 0])),
+            buffer(evoxc_core::DType::UInt8, &[2], Storage::U8(vec![1, 0])),
+            buffer(evoxc_core::DType::UInt16, &[2], Storage::U16(vec![1, 0])),
+            buffer(evoxc_core::DType::UInt32, &[2], Storage::U32(vec![1, 0])),
+            buffer(evoxc_core::DType::UInt64, &[2], Storage::U64(vec![1, 0])),
+        ];
+        for index_buffer in indices {
+            let out = gather(&x, &index_buffer, 0, &declared(&[2, 4])).unwrap();
+            assert_eq!(out.storage, expected, "index dtype {}", index_buffer.dtype.name());
         }
     }
 
@@ -325,13 +383,13 @@ mod tests {
     #[test]
     fn gather_out_of_bounds_index_is_an_error() {
         let x = f32_buffer(&[3], &[1., 2., 3.]);
-        let err = gather(&x, &[5], &[1], 0, &declared(&[1])).unwrap_err();
+        let err = gather(&x, &i64_buffer(&[1], &[5]), 0, &declared(&[1])).unwrap_err();
         assert!(
             err.message.contains("index 5 is out of bounds for axis 0 with size 3"),
             "{}",
             err.message
         );
-        let err = gather(&x, &[-4], &[1], 0, &declared(&[1])).unwrap_err();
+        let err = gather(&x, &i64_buffer(&[1], &[-4]), 0, &declared(&[1])).unwrap_err();
         assert!(err.message.contains("index -4 is out of bounds"), "{}", err.message);
     }
 
@@ -341,11 +399,33 @@ mod tests {
         // a static sibling dim is still checked — the fast path copies rows but
         // never re-derives the declared shape's static dims.
         let x = f32_buffer(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
-        let out = gather(&x, &[2, 0], &[2], 0, &[None, Some(2)]).unwrap();
+        let indices = i64_buffer(&[2], &[2, 0]);
+        let out = gather(&x, &indices, 0, &[None, Some(2)]).unwrap();
         assert_eq!(out.shape, vec![2, 2]);
         assert_eq!(out.storage, Storage::F32(vec![5., 6., 1., 2.]));
-        let err = gather(&x, &[2, 0], &[2], 0, &[None, Some(3)]).unwrap_err();
+        let err = gather(&x, &indices, 0, &[None, Some(3)]).unwrap_err();
         assert_eq!(err.kind, evoxc_core::ErrorKind::Shape);
         assert!(err.message.contains("declared type says 3"), "{}", err.message);
+    }
+
+    #[test]
+    fn gather_fully_overwrites_a_recycled_result_allocation() {
+        // A pooled vector MUST be overwritten in full: leave a stock of the
+        // exact result size holding a sentinel in this thread's pool, then run
+        // a gather of that size and check every element came from the operand.
+        let total = 1 << 16; // 256 KiB f32 — above the pool's minimum size
+        let sentinel = 9.0e30f32;
+        drop(Storage::F32(vec![sentinel; total]));
+        let source: Vec<f32> = (0..total).map(|value| value as f32).collect();
+        let x = f32_buffer(&[total], &source);
+        let indices: Vec<i64> = (0..total).map(|value| (value * 7919 % total) as i64).collect();
+        let out = gather(&x, &i64_buffer(&[total], &indices), 0, &declared(&[total])).unwrap();
+        let Storage::F32(result) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert!(
+            !result.contains(&sentinel),
+            "a recycled result vector leaked a stale element"
+        );
     }
 }

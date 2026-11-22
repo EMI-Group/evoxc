@@ -231,17 +231,53 @@ fn index_values(indices: &Buffer) -> Result<Vec<i128>> {
     })
 }
 
+/// The `i128` view of one typed index scalar — exactly [`index_values`]'s
+/// per-element conversion, without materializing the whole widened vector.
+fn index_as_i128<I: Scalar>(value: I) -> i128 {
+    match value.to_scalar() {
+        ScalarValue::I(value) => value as i128,
+        ScalarValue::U(value) => value as i128,
+        ScalarValue::F(value) => value as i128,
+        ScalarValue::C(value) => value.re as i128,
+    }
+}
+
+/// The hot half of [`resolve_index`]: a non-negative in-range index, decided
+/// with 64-bit arithmetic (every extent a contiguous operand can have fits
+/// `i64`).  Everything else — a negative index that wraps, and every
+/// out-of-range diagnostic — falls through to [`resolve_index`], so the error
+/// wording stays exactly that function's.  [`resolve_index`] on `i128` per
+/// element is measurably slower in the flat gather/scatter loops (128-bit
+/// compares on the hot path), which is why the fast decision is 64-bit.
+#[inline]
+fn resolve_index_fast(raw: i128, extent: usize, axis: usize, op: &str) -> Result<usize> {
+    if let Ok(value) = i64::try_from(raw) {
+        if value >= 0 && (value as usize) < extent {
+            return Ok(value as usize);
+        }
+    }
+    resolve_index(raw, extent, axis, op)
+}
+
 /// numpy index semantics: a negative index counts from the end, anything else
 /// outside `[0, extent)` is an explicit `ShapeError` with numpy's wording.
 fn resolve_index(raw: i128, extent: usize, axis: usize, op: &str) -> Result<usize> {
     let length = extent as i128;
     let wrapped = if raw < 0 { raw + length } else { raw };
     if wrapped < 0 || wrapped >= length {
-        return Err(Error::shape(format!(
-            "{op}: index {raw} is out of bounds for axis {axis} with size {extent}"
-        )));
+        return Err(out_of_bounds(raw, extent, axis, op));
     }
     Ok(wrapped as usize)
+}
+
+/// The out-of-bounds diagnostic, outlined so the hot resolve loop above carries
+/// no formatting machinery (the message text is unchanged).
+#[cold]
+#[inline(never)]
+fn out_of_bounds(raw: i128, extent: usize, axis: usize, op: &str) -> Error {
+    Error::shape(format!(
+        "{op}: index {raw} is out of bounds for axis {axis} with size {extent}"
+    ))
 }
 
 #[cfg(test)]
