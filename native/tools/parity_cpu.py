@@ -60,9 +60,8 @@ import evoxc
 from evoxc import core, ir
 from evoxc._native_codec import encode_module
 
-#: i64 range / u64 span — see :func:`narrow_unsigned_int_attrs`.
-I64_MAX = 2**63 - 1
-U64_SPAN = 2**64
+#: The envelope's widest integer (see :func:`reduce_wide_int_attrs`).
+U64_MAX = 2**64 - 1
 #: (rtol, atol) per floating dtype family (see the module docstring).
 TOL_F32 = (1e-5, 1e-6)
 TOL_F64 = (1e-12, 1e-13)
@@ -114,22 +113,24 @@ class Outcome:
 # ---------------------------------------------------------------------------
 
 
-def narrow_unsigned_int_attrs(envelope: dict) -> dict:
-    """Re-encode ``int``-tagged attribute values above ``i64::MAX`` as signed.
+def reduce_wide_int_attrs(envelope: dict) -> dict:
+    """Reduce an ``int``-tagged attribute wider than ``u64`` modulo ``2**64``.
 
-    The frontend stamps the true unsigned per-op RNG salts
-    (``0x9E3779B97F4A7C15`` = 11400714819323198485) on ``random_*`` ops as
-    plain Python ints, while the native envelope codec decodes an ``int``
-    attribute with ``serde_json::Value::as_i64`` and rejects anything above
-    ``i64::MAX`` ("expected an int, got 11400714819323198485").  The engine
-    casts the decoded ``i64`` back with ``as u64``, so writing the
-    two's-complement value preserves the salt bit-for-bit and keeps the
-    comparison honest.  Harness-side workaround for that encoding gap —
-    reported, not fixed here (``evoxc/`` and ``native/evoxc-core`` are out of
-    this task's write scope).
+    The frontend stamps the per-op RNG salts as plain Python ints; a single
+    salt (the SplitMix64 golden gamma ``0x9E3779B97F4A7C15``) now travels
+    verbatim, because ``evoxc-core`` decodes an ``int`` attribute with
+    ``as_u64`` (``as_i64`` fallback) and the engine reads it back through an
+    ``as u64`` cast.
+
+    ``random_split_n`` derives its salts as ``i * 0x9E3779B97F4A7C15``, which
+    for ``i >= 2`` exceeds ``u64`` (``2 * GOLDEN`` = 22801429638646396970) and
+    so has no 64-bit envelope encoding at all.  The numpy backend applies the
+    salt with ``np.uint64`` arithmetic, i.e. modulo ``2**64``, so reducing here
+    is the same 64-bit salt and keeps the comparison honest.  Harness-side
+    workaround for a frontend encoding gap — the fix belongs to
+    ``evoxc/ops/random.py`` (out of this task's write scope).
     """
     from evoxc.ir.op_defs import opdef
-
     for op in envelope.get("ops", ()):
         attrs = op.get("attributes") or {}
         if not attrs:
@@ -140,15 +141,13 @@ def narrow_unsigned_int_attrs(envelope: dict) -> dict:
                 tags.get(key) == "int"
                 and isinstance(value, int)
                 and not isinstance(value, bool)
-                and value > I64_MAX
+                and value > U64_MAX
             ):
-                attrs[key] = value - U64_SPAN
+                attrs[key] = value % (1 << 64)
     return envelope
-
-
 def encode_graph(graph) -> dict:
-    """The native envelope for ``graph``, with the u64-attribute narrowing."""
-    return narrow_unsigned_int_attrs(encode_module(graph.module))
+    """The native envelope for ``graph``, with the >u64 attribute reduction."""
+    return reduce_wide_int_attrs(encode_module(graph.module))
 
 
 # ---------------------------------------------------------------------------
