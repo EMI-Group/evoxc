@@ -1,82 +1,78 @@
-//! The fold and accumulator machinery every reduce kind shares.
+//! The ndarray-driven fold and accumulator machinery every reduce kind shares.
 //!
-//! [`Layout`] is the general C-order iteration plan (kept positions address the
-//! output positions, `red_offsets` the reduced ones) and [`Block`] the
-//! contiguous fast path; the `fold_*` helpers plus [`FoldSelect`] are the
-//! accumulator vocabulary both paths fold through.  They are deliberately one
-//! unit: the two paths must stay bit-for-bit equivalent for integer, bool,
-//! float16 and complex folds, and only float32/float64 sums may move inside the
-//! documented parity window.
+//! [`for_each_lane`] is the ONE layout walk: it lends the operand to
+//! [`ndarray`], permutes the kept axes (ascending, in original order) before the
+//! reduced axes (ascending), then recurses `axis_iter` down the leading kept
+//! axes so every output lane is handed to the caller as a C-order view of
+//! exactly its reduced positions.  [`fold_all`] / [`fold_first`] fold each lane
+//! through [`fold_lane`], which keeps the 8-accumulator lane split on a
+//! contiguous slice and reproduces the identical rotation element-by-element on
+//! a strided lane.
+//!
+//! [`fold_contiguous_block`] is the one documented SPECIALIZATION: a contiguous
+//! reduced block with `inner > 1` (a leading / middle-axis reduction) that the
+//! general walk would visit as long strided lanes instead accumulates its
+//! `inner` output lanes row by row.  Both paths implement the SAME semantics and
+//! must stay bit-for-bit equivalent for integer, bool, float16 and complex folds;
+//! only float32/float64 sums may move inside the documented parity window (the
+//! per-lane 8-accumulator reassociation).
 use evoxc_core::{DType, Error, Result};
+use ndarray::{Array1, ArrayViewD, Axis, Zip};
 use num_complex::Complex;
 
-use crate::buffer::shape_text;
+use crate::buffer::{array_view, shape_text, NdScalar};
 use crate::kernels::util;
-use crate::scalar::Num;
+use crate::scalar::{Num, Scalar};
 
 // ---------------------------------------------------------------------------
-// Shared layout: C-order iteration over kept and reduced positions
+// Axis classification (kept-first permutation, extents)
 // ---------------------------------------------------------------------------
 
-/// C-order iteration plan for one reduction.
-///
-/// `kept_strides`/`kept_dims` describe the output positions and map each one
-/// to its base input offset; `red_offsets` lists every reduced position's
-/// offset relative to that base.  Both together address the reduction with no
-/// per-element division, and an empty reduced set (rank 0, or a reduction over
-/// no axes) yields exactly one offset — which is why an "all-axes" reduction
-/// of a scalar is the identity fold.
-pub(super) struct Layout {
-    kept_strides: Vec<usize>,
-    kept_dims: Vec<usize>,
-    pub(super) red_offsets: Vec<usize>,
+/// The permutation that puts the kept axes first and the reduced axes last,
+/// each group ascending in the original axis order.  `result_axis[i]` of a
+/// `permuted_axes(perm)` view is the operand's axis `perm[i]`.
+pub(super) fn axis_permutation(rank: usize, reduced: &[bool]) -> Vec<usize> {
+    let kept = reduced
+        .iter()
+        .enumerate()
+        .take(rank)
+        .filter(|(_, is_reduced)| !**is_reduced)
+        .map(|(axis, _)| axis);
+    let red = reduced
+        .iter()
+        .enumerate()
+        .take(rank)
+        .filter(|(_, is_reduced)| **is_reduced)
+        .map(|(axis, _)| axis);
+    let mut perm = Vec::with_capacity(rank);
+    perm.extend(kept);
+    perm.extend(red);
+    perm
 }
 
-impl Layout {
-    pub(super) fn new(shape: &[usize], reduced: &[bool]) -> Layout {
-        let strides = util::c_strides(shape);
-        let mut kept_strides = Vec::new();
-        let mut kept_dims = Vec::new();
-        let mut red_strides = Vec::new();
-        let mut red_dims = Vec::new();
-        for (axis, dim) in shape.iter().enumerate() {
-            if reduced[axis] {
-                red_strides.push(strides[axis]);
-                red_dims.push(*dim);
-            } else {
-                kept_strides.push(strides[axis]);
-                kept_dims.push(*dim);
-            }
-        }
-        let mut red_offsets = Vec::with_capacity(util::numel(&red_dims));
-        let mut index = vec![0usize; red_dims.len()];
-        for _ in 0..util::numel(&red_dims) {
-            red_offsets.push(util::flat_index(&index, &red_strides));
-            advance(&mut index, &red_dims);
-        }
-        Layout {
-            kept_strides,
-            kept_dims,
-            red_offsets,
-        }
-    }
+fn extent(shape: &[usize], reduced: &[bool], flag: bool) -> usize {
+    shape
+        .iter()
+        .zip(reduced)
+        .filter(|(_, is_reduced)| **is_reduced == flag)
+        .map(|(dim, _)| *dim)
+        .product()
+}
 
-    pub(super) fn out_len(&self) -> usize {
-        util::numel(&self.kept_dims)
-    }
+/// Product of the KEPT axes' lengths — the number of output lanes (1 for a
+/// fully reduced operand).
+pub(super) fn kept_extent(shape: &[usize], reduced: &[bool]) -> usize {
+    extent(shape, reduced, false)
+}
 
-    /// Visit every output position in C-order with its base input offset.
-    pub(super) fn for_each_output(&self, mut visit: impl FnMut(usize, usize)) {
-        let mut index = vec![0usize; self.kept_dims.len()];
-        for position in 0..self.out_len() {
-            visit(position, util::flat_index(&index, &self.kept_strides));
-            advance(&mut index, &self.kept_dims);
-        }
-    }
+/// Product of the REDUCED axes' lengths — the number of positions folded into
+/// each output lane (1 when nothing is reduced).
+pub(super) fn reduced_extent(shape: &[usize], reduced: &[bool]) -> usize {
+    extent(shape, reduced, true)
 }
 
 // ---------------------------------------------------------------------------
-// Contiguous-block fast path
+// Contiguous-block classification
 // ---------------------------------------------------------------------------
 
 /// A reduction whose reduced axes form ONE contiguous block in C order.
@@ -84,16 +80,10 @@ impl Layout {
 /// Such an operand is `outer` consecutive groups of `red * inner` elements, and
 /// each group is `red` interleaved runs of `inner` consecutive lanes: the
 /// elements folded into output lane `i` of a group are `group[k * inner + i]`
-/// for `k in 0..red`.  That covers every shape real graphs reduce — a full
-/// reduction, a trailing-axis row reduction, a leading column reduction and any
-/// contiguous multi-axis block — with one flat walk and no per-element offset
-/// table, which is exactly the cost the generic [`Layout`] pays (it allocates
-/// and re-indexes an offset vector, and re-derives the output offsets with a
-/// division-free odometer per output).
-///
-/// `inner == 1` means each output sits on one contiguous run (the case a plain
-/// fold can vectorize); `inner > 1` means a group reduces into `inner` lanes at
-/// once (the column-sum / outer-product shape).
+/// for `k in 0..red`.  Only the `inner > 1` case is worth specialising
+/// ([`fold_contiguous_block`], [`fold_lane`]'s caller); `inner == 1` (a trailing
+/// axis or full reduction) is a contiguous per-lane run the general walk already
+/// folds through [`fold_run`].
 pub(super) struct Block {
     /// Groups of `red * inner` elements, one group per `inner` outputs.
     pub(super) outer: usize,
@@ -105,9 +95,7 @@ pub(super) struct Block {
 
 impl Block {
     /// The block of `reduced`, or `None` when the reduced axes are NOT
-    /// contiguous (a gap inside them forces the general [`Layout`] path) or when
-    /// nothing is reduced at all (an identity reduction keeps the operand shape
-    /// and values, which the general path handles with one zero offset).
+    /// contiguous (a gap inside them) or when nothing is reduced at all.
     pub(super) fn new(shape: &[usize], reduced: &[bool]) -> Option<Block> {
         let first = reduced.iter().position(|flag| *flag)?;
         let last = reduced.iter().rposition(|flag| *flag)?;
@@ -115,9 +103,9 @@ impl Block {
             return None;
         }
         Some(Block {
-            outer: util::numel(&shape[..first]),
-            red: util::numel(&shape[first..=last]),
-            inner: util::numel(&shape[last + 1..]),
+            outer: shape[..first].iter().product(),
+            red: shape[first..=last].iter().product(),
+            inner: shape[last + 1..].iter().product(),
         })
     }
 
@@ -125,6 +113,56 @@ impl Block {
         self.outer * self.inner
     }
 }
+
+// ---------------------------------------------------------------------------
+// The lane walk
+// ---------------------------------------------------------------------------
+
+/// Visit every output lane's reduced sub-view, in C output order.
+///
+/// The operand is viewed as `shape`, permuted so the kept axes lead (ascending)
+/// and the reduced axes trail (ascending), and the leading `kept` axes are
+/// walked recursively; each leaf view is one output lane, its reduced positions
+/// in C order.  A fully reduced operand (rank 0, or `reduced` over every axis)
+/// has a single leaf: the whole operand.
+pub(super) fn for_each_lane<T, F>(
+    values: &[T],
+    shape: &[usize],
+    reduced: &[bool],
+    mut visit: F,
+) -> Result<()>
+where
+    T: NdScalar,
+    F: FnMut(ArrayViewD<'_, T>) -> Result<()>,
+{
+    let view = array_view(values, shape)?;
+    let permuted = view.permuted_axes(axis_permutation(shape.len(), reduced));
+    let kept = reduced.iter().filter(|flag| !**flag).count();
+    walk_lanes(permuted, 0, kept, &mut visit)
+}
+
+fn walk_lanes<'a, T, F>(
+    view: ArrayViewD<'a, T>,
+    depth: usize,
+    kept: usize,
+    visit: &mut F,
+) -> Result<()>
+where
+    T: NdScalar,
+    F: FnMut(ArrayViewD<'_, T>) -> Result<()>,
+{
+    if depth == kept {
+        return visit(view);
+    }
+    for sub in view.axis_iter(Axis(0)) {
+        walk_lanes(sub, depth + 1, kept, visit)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The per-lane fold
+// ---------------------------------------------------------------------------
 
 /// Independent accumulator lanes per contiguous fold run.
 ///
@@ -134,18 +172,15 @@ impl Block {
 /// independent, which is what lets the loop reach the memory bound.
 const LANE_COUNT: usize = 8;
 
-/// Lanes one contiguous fold run uses for an accumulator of `dtype`.
+/// Lanes one lane fold uses for an accumulator of `dtype`.
 ///
 /// Integer and bool folds are exact under any association (wrapping adds and
 /// multiplies are associative), so they take the multi-accumulator path too.
 /// Float16 folds IN float16 and complex in complex, where the parity contract's
 /// ulp window is tighter than a reassociated sum can honour, so those keep the
-/// interpreter's exact sequential order (and neither is on a large workload).
+/// interpreter's exact sequential order.
 fn fold_lanes(dtype: DType) -> usize {
-    if matches!(
-        dtype,
-        DType::Float16 | DType::Complex64 | DType::Complex128
-    ) {
+    if matches!(dtype, DType::Float16 | DType::Complex64 | DType::Complex128) {
         1
     } else {
         LANE_COUNT
@@ -187,51 +222,186 @@ fn fold_run_lanes<T: Num, F: Fn(T, T) -> T, const LANES: usize>(values: &[T], in
     total
 }
 
-/// Fold every output of a contiguous block, in C output order.
+/// Fold an arbitrary iterator with `lanes` accumulators, arithmetically
+/// IDENTICAL to [`fold_run_lanes`]: the first `full = len / lanes * lanes`
+/// elements rotate through the accumulators by `index % lanes`, the accumulators
+/// are then combined in lane order, and the remainder folds sequentially.
+#[inline]
+fn fold_iter<T: Num, I: Iterator<Item = T>, F: Fn(T, T) -> T + Copy>(
+    iter: I,
+    len: usize,
+    init: T,
+    op: F,
+    lanes: usize,
+) -> T {
+    if lanes == LANE_COUNT {
+        fold_iter_lanes::<T, I, F, LANE_COUNT>(iter, len, init, op)
+    } else {
+        fold_iter_lanes::<T, I, F, 1>(iter, len, init, op)
+    }
+}
+
+#[inline]
+fn fold_iter_lanes<T: Num, I: Iterator<Item = T>, F: Fn(T, T) -> T, const LANES: usize>(
+    mut iter: I,
+    len: usize,
+    init: T,
+    op: F,
+) -> T {
+    let full = (len / LANES) * LANES;
+    let mut acc = [init; LANES];
+    for (index, value) in iter.by_ref().take(full).enumerate() {
+        acc[index % LANES] = op(acc[index % LANES], value);
+    }
+    let mut total = acc[0];
+    for value in acc.iter().skip(1) {
+        total = op(total, *value);
+    }
+    for value in iter {
+        total = op(total, value);
+    }
+    total
+}
+
+/// Fold one lane's reduced sub-view from `init` with `lanes` accumulators.
+fn fold_lane<T, F>(view: &ArrayViewD<'_, T>, init: T, op: F, lanes: usize) -> T
+where
+    T: Num + NdScalar,
+    F: Fn(T, T) -> T + Copy,
+{
+    match view.as_slice() {
+        Some(slice) => fold_run(slice, init, op, lanes),
+        None => fold_iter(view.iter().copied(), view.len(), init, op, lanes),
+    }
+}
+
+/// Fold one lane starting from its FIRST element (the shape of a max/min
+/// reduction, which has no identity element).
+fn fold_first_lane<T, F>(view: &ArrayViewD<'_, T>, op: F, lanes: usize) -> T
+where
+    T: Num + NdScalar,
+    F: Fn(T, T) -> T + Copy,
+{
+    if let Some(slice) = view.as_slice() {
+        let first = slice[0];
+        return fold_run(&slice[1..], first, op, lanes);
+    }
+    let mut iter = view.iter().copied();
+    let first = match iter.next() {
+        Some(value) => value,
+        // The caller checks the reduced extent is non-zero, so every lane is
+        // non-empty; this branch never runs.
+        None => return T::zero(),
+    };
+    fold_iter(iter, view.len().saturating_sub(1), first, op, lanes)
+}
+
+// ---------------------------------------------------------------------------
+// The per-op folds (general lane walk + the contiguous-block specialization)
+// ---------------------------------------------------------------------------
+
+/// Fold every output lane into its slot, starting from `init` (the reduction's
+/// identity: `0` for sum, `1` for prod).
+pub(super) fn fold_all<T, F>(
+    values: &[T],
+    shape: &[usize],
+    reduced: &[bool],
+    init: T,
+    op: F,
+) -> Result<Vec<T>>
+where
+    T: Num + NdScalar,
+    F: Fn(T, T) -> T + Copy,
+{
+    let lanes = fold_lanes(<T as Scalar>::DTYPE);
+    let mut out = Vec::with_capacity(kept_extent(shape, reduced));
+    for_each_lane(values, shape, reduced, |view| {
+        out.push(fold_lane(&view, init, op, lanes));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Fold every output lane starting from its FIRST element — the shape of a
+/// max/min reduction, which has no identity element.
+pub(super) fn fold_first<T, F>(
+    name: &str,
+    what: &str,
+    values: &[T],
+    shape: &[usize],
+    reduced: &[bool],
+    op: F,
+) -> Result<Vec<T>>
+where
+    T: Num + NdScalar,
+    F: Fn(T, T) -> T + Copy,
+{
+    if reduced_extent(shape, reduced) == 0 {
+        return Err(Error::shape(format!(
+            "op '{name}': zero-size reduction — a reduced axis has extent 0, and numpy's {what} \
+             has no identity element for an empty reduction"
+        )));
+    }
+    let lanes = fold_lanes(<T as Scalar>::DTYPE);
+    let mut out = Vec::with_capacity(kept_extent(shape, reduced));
+    for_each_lane(values, shape, reduced, |view| {
+        out.push(fold_first_lane(&view, op, lanes));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The contiguous-block specialization: fold every output of a `Block` whose
+/// `inner > 1`, accumulating the `inner` output lanes of each group row by row.
 ///
 /// `identity` is the reduction's identity element (`0` for sum, `1` for prod);
-/// `None` seeds each group from its FIRST element, which is how max/min fold
-/// without an identity (the caller has already rejected an empty reduction).
-pub(super) fn fold_groups<T: Num, F: Fn(T, T) -> T + Copy>(
+/// `None` seeds each group from its FIRST row, which is how max/min fold without
+/// an identity.  Output order is C order (outer, then inner).
+pub(super) fn fold_contiguous_block<T, F>(
     values: &[T],
+    shape: &[usize],
     block: &Block,
     identity: Option<T>,
     op: F,
-) -> Vec<T> {
+) -> Result<Vec<T>>
+where
+    T: Num + NdScalar,
+    F: Fn(T, T) -> T + Copy,
+{
+    let view = array_view(values, shape)?;
+    let groups = view
+        .to_shape((block.outer, block.red, block.inner))
+        .map_err(|error| {
+            Error::shape(format!(
+                "contiguous reduction block {}x{}x{} does not reshape the operand: {error}",
+                block.outer, block.red, block.inner
+            ))
+        })?;
+    let seed_from_first_row = identity.is_none();
     let mut out = Vec::with_capacity(block.out_len());
-    if block.red == 0 || block.inner == 0 {
-        // An empty reduction has no group to walk; `reduce_*` rejects a
-        // zero-size max/min before this point and the identity folds below have
-        // nothing to produce when there is no output lane.
-        return out;
-    }
-    let lanes = fold_lanes(T::DTYPE);
-    for group in values.chunks_exact(block.red * block.inner) {
-        if block.inner == 1 {
-            let init = identity.unwrap_or(group[0]);
-            out.push(fold_run(group, init, op, lanes));
-        } else {
-            // One accumulator per lane: the identity when the reduction has one,
-            // otherwise the group's first row (max/min have no identity).
-            let mut acc: Vec<T> = match identity {
-                Some(value) => vec![value; block.inner],
-                None => group[..block.inner].to_vec(),
-            };
-            let mut rows = group.chunks_exact(block.inner);
-            if identity.is_none() {
-                // The first row already seeded the accumulators.
-                rows.next();
-            }
-            for row in rows {
-                for (slot, value) in acc.iter_mut().zip(row) {
-                    *slot = op(*slot, *value);
-                }
-            }
-            out.append(&mut acc);
+    for group in groups.axis_iter(Axis(0)) {
+        let mut acc = match identity {
+            Some(init) => Array1::from_elem(block.inner, init),
+            None => group.index_axis(Axis(0), 0).to_owned(),
+        };
+        let mut rows = group.axis_iter(Axis(0));
+        if seed_from_first_row {
+            // The first row already seeded the accumulators.
+            rows.next();
         }
+        for row in rows {
+            Zip::from(&mut acc)
+                .and(&row)
+                .for_each(|slot, &value| *slot = op(*slot, value));
+        }
+        out.extend(acc.iter().copied());
     }
-    out
+    Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// The per-element comparison a max/min fold uses
+// ---------------------------------------------------------------------------
 
 /// The per-element comparison a max/min fold uses.
 ///
@@ -321,16 +491,9 @@ macro_rules! fold_select_identity {
 
 fold_select_identity!(Complex<f32>, Complex<f64>);
 
-/// Increment a C-order odometer (the last axis varies fastest).
-fn advance(index: &mut [usize], dims: &[usize]) {
-    for axis in (0..dims.len()).rev() {
-        index[axis] += 1;
-        if index[axis] < dims[axis] {
-            return;
-        }
-        index[axis] = 0;
-    }
-}
+// ---------------------------------------------------------------------------
+// Mask and rank helpers
+// ---------------------------------------------------------------------------
 
 /// The reduced-axis mask of a `reduce_*` op; an empty `axes` attribute means
 /// ALL axes (numpy's `axis=None`), exactly as `infer_reduction` reads it.
@@ -367,51 +530,6 @@ pub(super) fn expect_rank(
     Ok(())
 }
 
-/// Fold every reduced position into its output slot, starting from `init`
-/// (the reduction's identity: `0` for sum, `1` for prod).
-pub(super) fn fold_all<T: Copy>(
-    layout: &Layout,
-    values: &[T],
-    init: T,
-    combine: impl Fn(T, T) -> T,
-) -> Vec<T> {
-    let mut out = Vec::with_capacity(layout.out_len());
-    layout.for_each_output(|_, base| {
-        let mut acc = init;
-        for offset in &layout.red_offsets {
-            acc = combine(acc, values[base + offset]);
-        }
-        out.push(acc);
-    });
-    out
-}
-
-/// Fold every reduced position starting from the FIRST element — the shape of
-/// a max/min reduction, which has no identity element.
-pub(super) fn fold_first<T: Copy>(
-    name: &str,
-    what: &str,
-    layout: &Layout,
-    values: &[T],
-    combine: impl Fn(T, T) -> T,
-) -> Result<Vec<T>> {
-    if layout.red_offsets.is_empty() {
-        return Err(Error::shape(format!(
-            "op '{name}': zero-size reduction — a reduced axis has extent 0, and numpy's {what} \
-             has no identity element for an empty reduction"
-        )));
-    }
-    let mut out = Vec::with_capacity(layout.out_len());
-    layout.for_each_output(|_, base| {
-        let mut acc = values[base + layout.red_offsets[0]];
-        for offset in layout.red_offsets.iter().skip(1) {
-            acc = combine(acc, values[base + offset]);
-        }
-        out.push(acc);
-    });
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -422,17 +540,61 @@ mod tests {
     use super::*;
     use crate::buffer::Storage;
     use crate::plan::OpSpec;
+    use crate::scalar::ScalarValue;
     use half::f16;
     use num_complex::Complex;
 
     // -----------------------------------------------------------------------
-    // The contiguous fast path (see `Block`) against the retained offset-table
-    // path: bit-exact for integers/bool/float16, tolerance-equal for f32/f64.
+    // The independent ndarray reference: permute kept-first, reshape to
+    // (kept, red), and fold each lane sequentially with `fold_axis`.
     // -----------------------------------------------------------------------
 
-    /// The general (offset-table) fold — the implementation the fast path
-    /// replaced, kept here as the reference.
-    fn general<T: Num + FoldSelect>(
+    fn lane_matrix<T: Num + NdScalar>(
+        values: &[T],
+        shape: &[usize],
+        reduced: &[bool],
+    ) -> ndarray::Array2<T> {
+        let view = array_view::<T>(values, shape).expect("operand view");
+        let permuted = view.permuted_axes(axis_permutation(shape.len(), reduced));
+        let kept = kept_extent(shape, reduced);
+        let red = reduced_extent(shape, reduced);
+        permuted
+            .to_shape((kept, red))
+            .expect("reduced lanes")
+            .into_owned()
+    }
+
+    /// One lane per output, folded sequentially from `init` in operand order.
+    fn reference_identity<T, F>(flat: &ndarray::Array2<T>, init: T, op: F) -> Vec<T>
+    where
+        T: Num + NdScalar,
+        F: Fn(T, T) -> T + Copy,
+    {
+        flat.fold_axis(Axis(1), init, move |acc, &value| op(*acc, value))
+            .into_raw_vec_and_offset()
+            .0
+    }
+
+    /// One lane per output, folded sequentially from its FIRST element.
+    fn reference_first<T, F>(flat: &ndarray::Array2<T>, op: F) -> Vec<T>
+    where
+        T: Num + NdScalar,
+        F: Fn(T, T) -> T + Copy,
+    {
+        flat.fold_axis(Axis(1), None::<T>, move |acc: &Option<T>, &value| {
+            Some(match *acc {
+                None => value,
+                Some(prev) => op(prev, value),
+            })
+        })
+        .iter()
+        .map(|slot| slot.unwrap_or_else(T::zero))
+        .collect()
+    }
+
+    /// The general (ndarray) reference fold — the same per-lane sequential fold
+    /// the specialization replaced, kept here as the independent oracle.
+    fn general<T: Num + FoldSelect + NdScalar>(
         kind: Kind,
         values: &[T],
         shape: &[usize],
@@ -440,19 +602,15 @@ mod tests {
         count: usize,
         acc_dtype: DType,
     ) -> Vec<T> {
-        let layout = Layout::new(shape, reduced);
+        let flat = lane_matrix(values, shape, reduced);
         match kind {
-            Kind::Sum => fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
-            Kind::Prod => fold_all(&layout, values, T::one(), |a, b| a.mul(b)),
-            Kind::Max => {
-                fold_first("reference", "maximum", &layout, values, |a, b| a.select_max(b)).unwrap()
-            }
-            Kind::Min => {
-                fold_first("reference", "minimum", &layout, values, |a, b| a.select_min(b)).unwrap()
-            }
+            Kind::Sum => reference_identity(&flat, T::zero(), |a, b| a.add(b)),
+            Kind::Prod => reference_identity(&flat, T::one(), |a, b| a.mul(b)),
+            Kind::Max => reference_first(&flat, |a, b| a.select_max(b)),
+            Kind::Min => reference_first(&flat, |a, b| a.select_min(b)),
             Kind::Mean => divide_by(
                 acc_dtype,
-                fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
+                reference_identity(&flat, T::zero(), |a, b| a.add(b)),
                 count,
             ),
         }
@@ -564,12 +722,7 @@ mod tests {
             let input = buffer(DType::Int64, &shape, Storage::I64(values.clone()));
             let reduced = reduce_mask(&axes, shape.len(), "reference").unwrap();
             let declared = out_shape_of(&shape, &axes, keepdims);
-            let reduced_count: usize = reduced
-                .iter()
-                .zip(&shape)
-                .filter(|(flag, _)| **flag)
-                .map(|(_, dim)| *dim)
-                .product();
+            let reduced_count = reduced_extent(&shape, &reduced);
             for (name, attribute, kind) in kind_cases() {
                 // Mean of integers accumulates (and stores) float64, so it is
                 // pinned by the float test instead.
@@ -603,12 +756,7 @@ mod tests {
             let input = buffer(DType::Float32, &shape, Storage::F32(values.clone()));
             let reduced = reduce_mask(&axes, shape.len(), "reference").unwrap();
             let declared = out_shape_of(&shape, &axes, keepdims);
-            let reduced_count: usize = reduced
-                .iter()
-                .zip(&shape)
-                .filter(|(flag, _)| **flag)
-                .map(|(_, dim)| *dim)
-                .product();
+            let reduced_count = reduced_extent(&shape, &reduced);
             for (name, attribute, kind) in kind_cases() {
                 let op = reduce_op(name, attribute, &axes, keepdims, DType::Float32, &declared);
                 let got = reduce(&op, &input, &declared).unwrap().remove(0);
@@ -643,7 +791,7 @@ mod tests {
     fn float16_and_complex_folds_keep_the_sequential_order() {
         // The lane policy skips float16/complex, where the parity contract's ulp
         // window cannot absorb a reassociated sum — so those stay BIT-identical
-        // to the offset-table path, even on a long run.
+        // to the ndarray reference, even on a long run.
         let count = 1000;
         let values: Vec<f16> = (0..count).map(|index| f16::from_f32(index as f32 * 0.01)).collect();
         let input = buffer(DType::Float16, &[count], Storage::F16(values.clone()));
@@ -658,6 +806,113 @@ mod tests {
         let op = reduce_op("reduce_sum", "sum", &[], false, DType::Complex64, &[]);
         let got = reduce(&op, &input, &[]).unwrap().remove(0);
         assert_eq!(got.storage, Storage::C64(general(Kind::Sum, &values, &[count], &[true], count, DType::Complex64)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Every dtype against the independent ndarray reference.
+    // -----------------------------------------------------------------------
+
+    fn sample<T: Num + NdScalar>(index: usize) -> T {
+        let dtype = <T as Scalar>::DTYPE;
+        let value = if dtype.is_float() || dtype.is_complex() {
+            // Fractional, sign-varying: exercises the float reassociation.
+            ((index * 37 % 101) as f64) * 0.125 - 6.0
+        } else {
+            // Small integers (a 0 in the mix keeps products tame).
+            (index * 7 % 13) as f64
+        };
+        T::from_scalar(ScalarValue::F(value))
+    }
+
+    fn check_dtype<T>(label: &str)
+    where
+        T: Num + FoldSelect + NdScalar + std::fmt::Debug,
+    {
+        let dtype = <T as Scalar>::DTYPE;
+        // (shape, axes): full reduction, a long trailing axis, a short trailing
+        // axis, a leading contiguous block (inner > 1), a middle block and a
+        // gapped pair that forces the general strided lane.
+        let cases: [(&[usize], &[i64]); 6] = [
+            (&[40], &[]),
+            (&[4, 40], &[1]),
+            (&[6, 5], &[1]),
+            (&[9, 5], &[0]),
+            (&[3, 4, 5], &[1]),
+            (&[3, 4, 5], &[0, 2]),
+        ];
+        let kinds: &[(&str, &str, Kind)] = if dtype.is_bool() {
+            &[("reduce_max", "max", Kind::Max), ("reduce_min", "min", Kind::Min)]
+        } else if dtype.is_complex() {
+            &[("reduce_sum", "sum", Kind::Sum)]
+        } else {
+            &[
+                ("reduce_sum", "sum", Kind::Sum),
+                ("reduce_max", "max", Kind::Max),
+                ("reduce_min", "min", Kind::Min),
+            ]
+        };
+        for (shape, axes) in cases {
+            let count: usize = shape.iter().product();
+            let values: Vec<T> = (0..count).map(sample::<T>).collect();
+            let input = buffer(dtype, shape, <T as Scalar>::into_storage(values.clone()));
+            let reduced = reduce_mask(axes, shape.len(), "reference").unwrap();
+            let declared = out_shape_of(shape, axes, false);
+            let reduced_count = reduced_extent(shape, &reduced);
+            // Integer/bool are exact under reassociation; float16/complex stay in
+            // one sequential lane. float32/float64 lanes longer than the 8-lane
+            // chunk are reassociated, so only those relax to the tolerance.
+            let exact = dtype.is_bool()
+                || dtype.is_int()
+                || dtype == DType::Float16
+                || dtype.is_complex();
+            let short_lane = reduced_count <= LANE_COUNT;
+            for (name, attribute, kind) in kinds {
+                let op = reduce_op(name, attribute, axes, false, dtype, &declared);
+                let got = reduce(&op, &input, &declared).unwrap().remove(0);
+                let got_values = <T as NdScalar>::slice_of(&got.storage)
+                    .unwrap_or_else(|| panic!("{label}: unexpected result storage {:?}", got.storage));
+                let want = general(*kind, &values, shape, &reduced, reduced_count, dtype);
+                assert_eq!(got_values.len(), want.len(), "{label} {name} shape {shape:?}");
+                for (index, (left, right)) in got_values.iter().zip(&want).enumerate() {
+                    if exact || short_lane {
+                        assert_eq!(
+                            left, right,
+                            "{label} {name} shape {shape:?} axes {axes:?} element {index}: \
+                             {left:?} vs {right:?}"
+                        );
+                    } else {
+                        // The per-lane 8-accumulator reassociation is the reason a
+                        // long float lane may miss a bit-identical result; the
+                        // documented parity window is the acceptance.
+                        let l = <T as Scalar>::to_scalar(*left).real();
+                        let r = <T as Scalar>::to_scalar(*right).real();
+                        assert!(
+                            left == right || (l - r).abs() <= 1e-6 + 1e-5 * r.abs(),
+                            "{label} {name} shape {shape:?} axes {axes:?} element {index}: \
+                             {left:?} vs {right:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ndarray_reference_matches_the_kernel_for_every_dtype() {
+        check_dtype::<bool>("bool");
+        check_dtype::<i8>("int8");
+        check_dtype::<i16>("int16");
+        check_dtype::<i32>("int32");
+        check_dtype::<i64>("int64");
+        check_dtype::<u8>("uint8");
+        check_dtype::<u16>("uint16");
+        check_dtype::<u32>("uint32");
+        check_dtype::<u64>("uint64");
+        check_dtype::<f16>("float16");
+        check_dtype::<f32>("float32");
+        check_dtype::<f64>("float64");
+        check_dtype::<Complex<f32>>("complex64");
+        check_dtype::<Complex<f64>>("complex128");
     }
 
     #[test]
