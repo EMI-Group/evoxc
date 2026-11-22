@@ -60,6 +60,8 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 - `shape` decodes each item with `wire::dim_from_json` (`{"int": ...}`/`{"dim": ...}`/`{"expr": ...}`/`null`).
 - `any` keeps `AttrValue::Tuple` of generic `AttrValue::Any` members and re-emits the marker.
 - A scalar tag (`bool`/`int`/`float`/`str`/`dtype`/`ndarray`) rejects a tuple with an explicit `VerificationError` naming the tag.
+- `int` accepts a JSON integer that fits `u64` (decoded through `as_u64`) with an `as_i64` fallback, so a 64-bit unsigned value above `i64::MAX` such as the splitmix64 salt `0x9E3779B97F4A7C15` (11400714819323198485) decodes from its true bit pattern — the bit pattern the engine reads back with an `as u64` cast and feeds to the splitmix kernel — while a negative value keeps its sign and re-encodes as a negative JSON integer.
+- A JSON float, bool or string under the `int` tag is an explicit `VerificationError` ("expected an int"), and a value outside both 64-bit ranges never reaches this crate because the Python-side conversion rejects it first.
 - Typed sequence variants (`Ints`/`Floats`/`Strs`/`NestedInts`/`Shape`) re-encode as plain lists (semantically identical for typed attributes), and `AttrValue::Tuple` matches only the `any` tag, so a malformed envelope that bypasses decoding is still rejected.
 
 ## Envelope cost model (decode / encode)
@@ -96,9 +98,10 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 
 ## Test strategy
 
-- `cargo test --manifest-path native/Cargo.toml -p evoxc-core` runs 217 in-crate tests plus the 2-test parity integration test; no GPU, network or Python interpreter is needed.
+- `cargo test --manifest-path native/Cargo.toml -p evoxc-core` runs 227 in-crate lib tests plus the 2-test parity integration test (`tests/parity.rs`); no GPU, network or Python interpreter is needed.
 - Per-module in-file `#[cfg(test)]` tests cover dims/dtypes/attrs/wire, graph construction and use tracking, envelope round-trips (symbolic dims, nested `if`/`while` regions, tuple/ndarray attributes, every validation error), helper parity (broadcasting, count folding/division, axis normalization, reduce dtypes, default filling) and each inference category ported case-by-case from `tests/ir/test_inference.py`.
 - `verify.rs` tests construct small programs and assert one violation each (terminator, dominance, arity, dtype/shape disagreement, constant payload, `if` branches, use records, location annotation).
+- `src/attr.rs` pins the `int` tag with three regression tests — `int_attribute_decodes_unsigned_values_above_i64_max` (the splitmix64 salt above `i64::MAX`, also through the `random_key_mix` schema), `negative_int_attribute_still_decodes_and_roundtrips` (a negative value's decode and round-trip, plus `0` and `i64::MAX` exactness) and `int_attribute_rejects_non_integers` (a JSON float, bool and string each a `VerificationError`) — alongside the existing encode-determinism and round-trip coverage.
 - `tests/parity.rs` replays 518 committed cases over all 113 shape-fn ops (461 successful, 57 explicit-rejection) and requires exact result types for the successes and error-ness for the rejections; `KNOWN_DIVERGENCES` is empty.
 - `tests/parity/generate.py` is dev-only and needs a venv with numpy + evoxc; regenerate the fixture whenever `evoxc/ir/inference.py` or `evoxc/ir/op_defs/**` changes, then re-run `gen_opdefs.py` for the schema table.
 - The Python-free gates are `cargo test -p evoxc-core`, `cargo build -p evoxc-python` and `cargo test --workspace`.
