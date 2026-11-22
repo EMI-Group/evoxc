@@ -8,8 +8,8 @@
 <p>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
-  <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, IREE, XLA, TVM"></a>
-  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7738%20passing-4c9a72?style=flat-square" alt="tests: 7738 passing"></a>
+  <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20native%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, native, IREE, XLA, TVM"></a>
+  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7818%20passing-4c9a72?style=flat-square" alt="tests: 7818 passing"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
@@ -56,7 +56,7 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 | load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called | move your data onto the device, or recompile for another target |
 | run | `evoxc.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in | copy results to the host, cast, reshard, or insert communication |
 
-**Two backends below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
+**Three execution paths below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The optional **`native`** backend runs the same EvoXIR on the in-process Rust CPU engine, compiled to immutable plans over typed host buffers. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
 
 **Layer discipline** — a strict one-way import DAG, so every problem has one owner:
 
@@ -85,7 +85,7 @@ artifact = evoxc.compile(lowered)                               # CompiledArtifa
 exe      = evoxc.load(artifact, device="cpu")                   # Executable
 y        = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))   # Tensor
 print(y.numpy())     # [3.999999 3.999999 3.999999 3.999999]
-print(graph)         # <Graph 2 tensor inputs, 0 static values>
+print(graph)         # <Graph 4 ops, 1 function, 2 tensor inputs, 0 static values, 1 output>
 ```
 
 The same thing in one call — *documented shorthand, no extra semantics*:
@@ -367,20 +367,16 @@ evoxc.io.wait_all()
 
 ### A conformance and benchmark harness
 
-`evoxc.bench` ships 98 curated example programs — operation-level, small-block and end-to-end — stages every one through the explicit pipeline, and compares against pure-numpy references (plus PyTorch when installed) while reporting precision and speed.
+The `evoxc.bench` conformance/benchmark harness — a curated set of operation-level, small-block and end-to-end example programs, staged through the explicit pipeline and compared against pure-numpy references (plus PyTorch when installed) — lives in the separate `evoxc-bench` repository together with the wider campaign records and generated reports; none of its paths exist in this tree.
 
-```bash
-python -m evoxc.bench                              # 98 examples, numpy/cpu conformance in ~10 s
-python -m evoxc.bench --examples matmul,attention  # filter by name, category, or tag
-```
-
-Committed results, raw records and the probe scripts live in [`evoxc/bench/`](evoxc/bench); the wider campaign records and generated reports are archived in the separate `evoxc-bench` repository.
+The in-tree [`evoxc/bench/`](evoxc/bench) is the committed evidence cited above: the deterministic probe scripts, their raw JSON records and the narrated findings for dispatch formation, compile/staging cost, the native engine, IREE 3.13 on ROCm and Intel Vulkan.
 
 ## Backends
 
 | backend | how to enable | what it owns | validated on |
 |---|---|---|---|
 | **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
+| **`native`** | `backend="native"` — optional, shipped in the wheel | the in-process Rust CPU engine: immutable plans over typed host buffers, numpy-mirroring staging | CPU (this host; `native/tools/parity_cpu.py` 71/71 bit-identical to numpy) |
 | **StableHLO export** | nothing — `evoxc.backends.stablehlo.export(graph)` | MLIR text emission; also the lowering input for every compiler | n/a (text) |
 | **IREE** | `pip install evoxc[iree]`, `lower(..., backend="iree")` | IREE compile + HAL runtime, external-kernel host dispatch, device-resident payloads | llvm-cpu, CUDA, ROCm, Vulkan-SPIRV |
 | **XLA** | `backend="xla"` — no path plumbing: it discovers an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`), else `EVOXC_PJRT_PLUGIN` / `plugin_path` | PJRT C API via ctypes over an auto-discovered plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
@@ -505,13 +501,13 @@ assets/         the diagrams in this README
 CONTEXT.md      architecture, contracts and status (root, the source of truth)
 ```
 
-`python -m evoxc.bench` runs the harness. Docs map: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchmark status) · [`./evoxc/CONTEXT.md`](evoxc/CONTEXT.md) (the binding public API contract) · [`./evoxc_hf/CONTEXT.md`](evoxc_hf/CONTEXT.md) · [`./tests/CONTEXT.md`](tests/CONTEXT.md) — every package directory carries its own `CONTEXT.md` describing its purpose, API surface and constraints.
+Docs map: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchmark status) · [`./evoxc/CONTEXT.md`](evoxc/CONTEXT.md) (the binding public API contract) · [`./evoxc_hf/CONTEXT.md`](evoxc_hf/CONTEXT.md) · [`./tests/CONTEXT.md`](tests/CONTEXT.md) — every package directory carries its own `CONTEXT.md` describing its purpose, API surface and constraints.
 
 ## Status & deferrals
 
-Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `evoxc.bench` harness.
+Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the optional `native` Rust CPU-engine backend, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the committed bench evidence under [`evoxc/bench/`](evoxc/bench).
 
-Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **7033 passed, 86 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, plus **705 passed, 22 skipped** in the colocated `./evoxc_hf/tests/` suite. Every skip is a host or dependency guard (no NVIDIA CUDA or AMD ROCm device on the recorded host, `tvm`/`torch`/`transformers`/`jaxlib`/PJRT plugin absent from the recorded venv, no `uv`/`maturin` build toolchain in it, the io pristine-process guard), so a host carrying those extras turns them into passes.
+Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **7818 passed, 88 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, plus **695 passed, 33 skipped** in the colocated `./evoxc_hf/tests/` suite. Every skip is a host or dependency guard (no NVIDIA CUDA or AMD ROCm device on the recorded host, `tvm`/`torch`/`transformers`/`jaxlib`/PJRT plugin absent from the recorded venv, the io pristine-process guard), so a host carrying those extras turns them into passes.
 
 <details>
 <summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
