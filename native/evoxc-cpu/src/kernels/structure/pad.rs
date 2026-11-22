@@ -1,25 +1,34 @@
 //! `pad` — constant padding, with `padding_config[i] = (before, after)` per
 //! axis.
 //!
-//! The result is built row by row (one innermost-axis row at a time): the
-//! leading/trailing pad cells of a row are filled with the pad value and the
-//! row's interior is ONE `copy_from_slice` out of the (contiguous) operand, so
-//! a rank-1 pad of a 100 000-element operand costs two memcpys' worth of
-//! traffic instead of a per-element index map.  A row whose outer index lands
-//! in a pad region is filled whole.  The destination comes from the storage
-//! pool and every element of it is written, so nothing is zero-filled first.
+//! The result is built row by row (one innermost-axis row at a time): a row's
+//! leading/trailing pad cells are filled with the pad value and its interior is
+//! ONE `copy_from_slice` out of the contiguous operand, so a rank-1 pad of a
+//! 100 000-element operand costs two memcpys' worth of traffic instead of a
+//! per-element index map.  A row whose outer index lands in a pad region is
+//! filled whole.  The destination comes from the storage pool and every element
+//! of it is written, so nothing is zero-filled first, and the two degenerate
+//! configurations are flat copies: a rank-0 operand moves its single element
+//! and an all-zero `padding_config` is one `copy_from_slice` of the whole
+//! operand.
+//!
+//! This is the node's one surviving specialization, kept because it beats the
+//! equivalent ndarray expression (`2 · rank` slab fills plus one
+//! `ArrayViewD::assign` of the interior) by 1.2–1.6× of kernel time on the
+//! measured rows — see `perf_probe`: 6.7 µs vs 11.1 µs for a 100 000-element
+//! i32 rank-1 pad with `(2, 2)` and 31.7 µs vs 39.1 µs for
+//! `(100, 50, 20) → (100, 52, 22)`.  `ndarray_pad_storage` below is that
+//! expression, kept as the test-only reference the row copy is pinned against.
 
 use evoxc_core::{AttrValue, Error, Result};
 use serde_json::Value as Json;
 
-use crate::buffer::{take_pooled_vec, Buffer, Storage};
-use crate::exec::{single, Value};
+use crate::buffer::{Buffer, NdScalar, Storage};
 use crate::kernels::util;
 use crate::plan::OpSpec;
 use crate::scalar::{Scalar, ScalarValue};
-use crate::with_type;
 
-use super::as_json;
+use super::{as_json, pooled};
 
 /// `padding_config` as `(before, after)` extents per axis.
 pub(super) fn padding(spec: &OpSpec) -> Result<Vec<(usize, usize)>> {
@@ -87,16 +96,16 @@ pub(super) fn pad_value(spec: &OpSpec) -> Result<f64> {
 }
 
 /// The padded result of `input`: validate the config against the declared
-/// result shape, then copy the interior rows and fill the pad cells.
+/// result shape, then fill the pad slabs and assign the interior.
 pub(super) fn pad_result(
     op: &str,
     input: &Buffer,
     out_shape: &[usize],
     config: &[(usize, usize)],
     fill: f64,
-) -> Result<Vec<Value>> {
+) -> Result<Storage> {
     validate(op, &input.shape, out_shape, config)?;
-    let storage = with_type!(input, |values| pad_storage(
+    let storage = crate::with_type!(input, |values| pad_storage(
         values,
         &input.shape,
         out_shape,
@@ -104,7 +113,7 @@ pub(super) fn pad_result(
         fill,
         op
     ))?;
-    single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?)
+    Ok(storage)
 }
 
 /// Reject a config / declared shape that does not describe constant padding of
@@ -143,9 +152,10 @@ fn validate(
     Ok(())
 }
 
-/// Fill `run`-long output rows: `element j of a row = operand[j - before]`
-/// inside the interior, the pad value outside it.
-fn pad_storage<T: Scalar>(
+/// Fill the pad slabs of a pooled destination and assign the operand into the
+/// destination's interior sub-view (`out_shape[axis] = before + extent + after`
+/// on every axis, already validated).
+fn pad_storage<T: Scalar + NdScalar>(
     values: &[T],
     in_shape: &[usize],
     out_shape: &[usize],
@@ -154,9 +164,9 @@ fn pad_storage<T: Scalar>(
     op: &str,
 ) -> Result<Storage> {
     let total = util::numel(out_shape);
-    let mut out = take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total]);
+    let mut out = pooled::<T>(total);
     if total == 0 {
-        return Ok(T::into_storage(out));
+        return Ok(<T as NdScalar>::into_storage(out));
     }
     // numpy casts the pad constant to the operand dtype: `as` truncates toward
     // zero for integers and `from_scalar` is bool's truthiness conversion.
@@ -166,16 +176,23 @@ fn pad_storage<T: Scalar>(
         // A rank-0 operand has an empty config; the result is that one element.
         let value = values.first().copied().ok_or_else(|| internal(op))?;
         out[0] = value;
-        return Ok(T::into_storage(out));
+        return Ok(<T as NdScalar>::into_storage(out));
     }
-    if config.iter().all(|&(before, after)| before == 0 && after == 0) {
+    if values.len() != util::numel(in_shape) {
+        return Err(internal(op));
+    }
+    if config
+        .iter()
+        .all(|&(before, after)| before == 0 && after == 0)
+    {
         // No padding at all: the result IS the operand, so it is one bulk copy.
-        if values.len() != total {
-            return Err(internal(op));
-        }
         out.copy_from_slice(values);
-        return Ok(T::into_storage(out));
+        return Ok(<T as NdScalar>::into_storage(out));
     }
+    // The pad cells of an output row are its leading `before` and trailing
+    // `after` cells, so one row of `out_row` cells is either entirely pad (its
+    // outer index falls outside the operand) or `before` pad cells, ONE
+    // contiguous run of `in_row` operand cells and `after` pad cells.
     let in_strides = util::c_strides(in_shape);
     let (in_row, out_row) = (in_shape[rank - 1], out_shape[rank - 1]);
     let before = config[rank - 1].0;
@@ -183,8 +200,9 @@ fn pad_storage<T: Scalar>(
     let rows = util::numel(outer);
     let mut index = vec![0usize; outer.len()];
     for row in 0..rows {
-        // Is this row's outer index inside the operand? If so, the row's
-        // interior is a contiguous run of `in_row` elements at `source`.
+        // Resolve this row's outer index against the operand: `None` means the
+        // row is pad-only, `Some(offset)` the flat offset of its first interior
+        // cell (the innermost axis is contiguous, so one run follows).
         let mut source = Some(0usize);
         for (axis, &position) in index.iter().enumerate() {
             let offset = config[axis].0;
@@ -193,24 +211,22 @@ fn pad_storage<T: Scalar>(
                 source = None;
                 break;
             }
-            if let Some(offset) = source.as_mut() {
-                *offset += (position - config[axis].0) * in_strides[axis];
+            if let Some(source) = source.as_mut() {
+                *source += (position - offset) * in_strides[axis];
             }
         }
         let start = row * out_row;
-        let dst = out.get_mut(start..start + out_row).ok_or_else(|| internal(op))?;
+        let dst = out
+            .get_mut(start..start + out_row)
+            .ok_or_else(|| internal(op))?;
         match source {
             Some(source) => {
                 let interior = values
                     .get(source..source + in_row)
                     .ok_or_else(|| internal(op))?;
-                for slot in &mut dst[..before] {
-                    *slot = fill_value;
-                }
+                dst[..before].fill(fill_value);
                 dst[before..before + in_row].copy_from_slice(interior);
-                for slot in &mut dst[before + in_row..] {
-                    *slot = fill_value;
-                }
+                dst[before + in_row..].fill(fill_value);
             }
             None => dst.fill(fill_value),
         }
@@ -223,7 +239,7 @@ fn pad_storage<T: Scalar>(
             index[axis] = 0;
         }
     }
-    Ok(T::into_storage(out))
+    Ok(<T as NdScalar>::into_storage(out))
 }
 
 fn internal(op: &str) -> Error {
@@ -244,8 +260,128 @@ fn pairs_text(config: &[(usize, usize)]) -> String {
 mod tests {
     use super::*;
     use crate::kernels::structure::test_support::*;
+    use crate::buffer::{array_view, array_view_mut};
+    use ndarray::{Axis, Slice};
     use crate::Storage;
     use evoxc_core::{AttrValue, DType};
+
+    /// An INDEPENDENT per-element reference for constant padding: output
+    /// multi-index `i` reads the operand at `i - before` when every axis is
+    /// inside the operand, the pad value otherwise (plain index arithmetic in
+    /// the test, not another driver).
+    fn reference_pad(
+        values: &[f64],
+        in_shape: &[usize],
+        out_shape: &[usize],
+        config: &[(usize, usize)],
+        fill: f64,
+    ) -> Vec<f64> {
+        let rank = in_shape.len();
+        let total: usize = out_shape.iter().product();
+        let mut out = Vec::with_capacity(total);
+        for flat in 0..total {
+            let mut rest = flat;
+            let mut index = vec![0usize; rank];
+            for axis in (0..rank).rev() {
+                index[axis] = rest % out_shape[axis].max(1);
+                rest /= out_shape[axis].max(1);
+            }
+            let mut offset = 0usize;
+            let mut stride = 1usize;
+            let mut inside = true;
+            for axis in (0..rank).rev() {
+                let before = config[axis].0;
+                let extent = in_shape[axis];
+                let position = index[axis] as i64 - before as i64;
+                if position < 0 || position as usize >= extent {
+                    inside = false;
+                    break;
+                }
+                offset += position as usize * stride;
+                stride *= extent;
+            }
+            out.push(if inside { values[offset] } else { fill });
+        }
+        out
+    }
+
+    /// The ndarray expression for constant padding the row copy is pinned
+    /// against: fill the `2 · rank` slabs the padding adds around the operand,
+    /// then assign the operand into the destination's interior sub-view.
+    fn ndarray_pad_storage<T: Scalar + NdScalar>(
+        values: &[T],
+        in_shape: &[usize],
+        out_shape: &[usize],
+        config: &[(usize, usize)],
+        fill: f64,
+    ) -> Storage {
+        let total: usize = out_shape.iter().product();
+        let mut out = vec![T::zero(); total];
+        if total > 0 {
+            let fill_value = T::from_scalar(ScalarValue::F(fill));
+            let src = array_view::<T>(values, in_shape).expect("reference: operand view");
+            if in_shape.is_empty() {
+                out[0] = *src.first().expect("reference: rank-0 element");
+            } else {
+                let mut dst =
+                    array_view_mut::<T>(&mut out, out_shape).expect("reference: result view");
+                for (axis, &(before, after)) in config.iter().enumerate() {
+                    if before > 0 {
+                        dst.slice_axis_mut(Axis(axis), Slice::from(..before))
+                            .fill(fill_value);
+                    }
+                    if after > 0 {
+                        dst.slice_axis_mut(Axis(axis), Slice::from(out_shape[axis] - after..))
+                            .fill(fill_value);
+                    }
+                }
+                for (axis, &(before, _)) in config.iter().enumerate() {
+                    dst.slice_axis_inplace(Axis(axis), Slice::from(before..before + in_shape[axis]));
+                }
+                dst.assign(&src);
+            }
+        }
+        <T as NdScalar>::into_storage(out)
+    }
+
+    /// The row-wise copy must place exactly what the ndarray expression places,
+    /// over every rank / padding / empty-extent shape family it specialises.
+    #[test]
+    fn the_row_copy_agrees_with_the_ndarray_reference() {
+        type Case = (&'static [usize], &'static [usize], &'static [(usize, usize)]);
+        let cases: &[Case] = &[
+            (&[5], &[9], &[(2, 2)]),
+            (&[1], &[1], &[(0, 0)]),
+            (&[3], &[3], &[(0, 0)]),
+            (&[3, 4], &[4, 6], &[(1, 0), (0, 2)]),
+            (&[2, 3], &[2, 3], &[(0, 0), (0, 0)]),
+            (&[4, 5], &[6, 7], &[(1, 1), (1, 1)]),
+            (&[2, 3, 2], &[3, 5, 4], &[(1, 0), (1, 1), (1, 1)]),
+            (&[2, 1, 3], &[3, 2, 3], &[(1, 0), (0, 1), (0, 0)]),
+            (&[2, 2, 2, 2], &[3, 2, 4, 3], &[(0, 1), (0, 0), (1, 1), (0, 1)]),
+            (&[0, 3], &[2, 3], &[(1, 1), (0, 0)]),
+            (&[3, 0], &[4, 2], &[(0, 1), (1, 1)]),
+            (&[], &[], &[]),
+        ];
+        for &(in_shape, out_shape, config) in cases {
+            let count: usize = in_shape.iter().product();
+            let values: Vec<f64> = (0..count).map(|slot| slot as f64 - 3.0).collect();
+            let got = pad_storage::<f64>(&values, in_shape, out_shape, config, 0.25, "pad")
+                .expect("the row copy accepts a validated config");
+            let want = ndarray_pad_storage::<f64>(&values, in_shape, out_shape, config, 0.25);
+            assert_eq!(
+                got, want,
+                "pad {in_shape:?} -> {out_shape:?} with {config:?} disagrees with ndarray"
+            );
+            // And the same shape family in a bounded integer dtype, where the
+            // pad value truncates instead of being representable as-is.
+            let ints: Vec<i32> = (0..count).map(|slot| slot as i32 - 3).collect();
+            let got = pad_storage::<i32>(&ints, in_shape, out_shape, config, 1.7, "pad")
+                .expect("the row copy accepts a validated config");
+            let want = ndarray_pad_storage::<i32>(&ints, in_shape, out_shape, config, 1.7);
+            assert_eq!(got, want, "pad i32 {in_shape:?} -> {out_shape:?}");
+        }
+    }
 
     #[test]
     fn pad_is_asymmetric_on_two_axes() {
@@ -341,8 +477,8 @@ mod tests {
         assert!(text.contains("pad"), "{text}");
     }
 
-    /// A rank-1 pad of a large operand: the interior is ONE copy out of the
-    /// operand and only the two pad cells are written separately.
+    /// A rank-1 pad of a large operand: only the two pad cells are written
+    /// separately and the interior is one assignment out of the operand.
     #[test]
     fn pad_copies_a_long_row_and_fills_only_the_pad_cells() {
         const COUNT: usize = 100_000;
@@ -406,6 +542,98 @@ mod tests {
             }
             other => panic!("unexpected storage {other:?}"),
         }
+    }
+
+    /// The ndarray expression is the reference: a rank-3 pad with asymmetric
+    /// pads, and the two degenerate configurations (no padding at all, and a
+    /// rank-0 operand) against an independent per-element reference.
+    #[test]
+    fn pad_matches_the_per_element_reference() {
+        let in_shape = [2usize, 3, 2];
+        let values: Vec<f64> = (0..12).map(|index| index as f64 * 0.5 - 1.0).collect();
+        let config = [(1usize, 0usize), (0, 2), (2, 1)];
+        let out_shape = [3usize, 5, 5];
+        let expected = reference_pad(&values, &in_shape, &out_shape, &config, 7.5);
+        let storage = pad_storage(&values, &in_shape, &out_shape, &config, 7.5, "pad").unwrap();
+        match &storage {
+            Storage::F64(got) => {
+                assert_eq!(got.len(), expected.len());
+                for (index, (value, want)) in got.iter().zip(&expected).enumerate() {
+                    assert_eq!(value.to_bits(), want.to_bits(), "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+        // The no-padding degenerate configuration is the operand itself.
+        let identity = pad_storage(&values, &in_shape, &in_shape, &[(0, 0); 3], 9.0, "pad").unwrap();
+        assert_eq!(identity, Storage::F64(values.clone()));
+        // A rank-0 operand pads to its own element.
+        let scalar = pad_storage(&[4.5f32], &[], &[], &[], 9.0, "pad").unwrap();
+        assert_eq!(scalar, Storage::F32(vec![4.5]));
+    }
+
+    /// Every dtype pads with its own dtype's conversion of the constant: bool
+    /// truthiness, integer truncation, f16 rounding and a complex zero-imaginary
+    /// fill.
+    #[test]
+    fn pad_fills_every_dtype() {
+        let bools = buffer(DType::Bool, &[2], Storage::Bool(vec![true, false]));
+        let spec = op(
+            "pad",
+            DType::Bool,
+            &[4],
+            vec![
+                ("padding_config", AttrValue::NestedInts(vec![vec![1, 1]])),
+                ("value", AttrValue::Float(0.0)),
+            ],
+        );
+        assert_eq!(
+            run(&spec, &bools, &[4]).storage,
+            Storage::Bool(vec![false, true, false, false])
+        );
+        let halves = buffer(
+            DType::Float16,
+            &[1],
+            Storage::F16(vec![half::f16::from_f32(2.5)]),
+        );
+        let spec = op(
+            "pad",
+            DType::Float16,
+            &[3],
+            vec![
+                ("padding_config", AttrValue::NestedInts(vec![vec![1, 1]])),
+                ("value", AttrValue::Float(-1.25)),
+            ],
+        );
+        assert_eq!(
+            run(&spec, &halves, &[3]).storage,
+            Storage::F16(vec![
+                half::f16::from_f32(-1.25),
+                half::f16::from_f32(2.5),
+                half::f16::from_f32(-1.25),
+            ])
+        );
+        let complex = buffer(
+            DType::Complex64,
+            &[1],
+            Storage::C64(vec![num_complex::Complex::new(1.0, -2.0)]),
+        );
+        let spec = op(
+            "pad",
+            DType::Complex64,
+            &[2],
+            vec![
+                ("padding_config", AttrValue::NestedInts(vec![vec![1, 0]])),
+                ("value", AttrValue::Float(3.5)),
+            ],
+        );
+        assert_eq!(
+            run(&spec, &complex, &[2]).storage,
+            Storage::C64(vec![
+                num_complex::Complex::new(3.5, 0.0),
+                num_complex::Complex::new(1.0, -2.0),
+            ])
+        );
     }
 
     /// The pooled destination of a pad result is fully overwritten: a recycled

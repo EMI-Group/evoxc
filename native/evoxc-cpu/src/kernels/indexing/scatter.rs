@@ -7,7 +7,7 @@
 //! error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{shape_text, take_pooled_vec, Buffer, Storage};
+use crate::buffer::{array_view, shape_text, take_pooled_vec, Buffer, NdScalar, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
@@ -16,8 +16,8 @@ use crate::with_same_type;
 use crate::with_type;
 
 use super::{
-    for_each_index, index_as_i128, index_values, offset_error, operand, reconcile,
-    require_integer_indices, resolve_index, resolve_index_fast,
+    index_as_i128, offset_error, operand, pooled_total, reconcile, require_integer_indices,
+    resolve_index_fast,
 };
 
 pub(super) fn scatter_kernel(
@@ -124,18 +124,17 @@ fn scatter(
     if let Some(storage) = scatter_selection(source, indices, &index_shape, updates, axis)? {
         return Buffer::new(source.dtype, shape, storage);
     }
-    let widened = index_values(indices)?;
     with_same_type!(source, updates, |data, values| scatter_typed(
         data,
         values,
         source.dtype,
         &source.shape,
         axis,
+        indices,
         &index_shape,
-        &widened,
         &selection,
         &updates.shape,
-        &shape
+        shape.clone()
     ))
 }
 
@@ -276,74 +275,85 @@ fn scatter_into<I: Scalar, T: Scalar>(
     Ok(T::into_storage(out))
 }
 
+/// The general (broadcast-capable) scatter, driven by ndarray views.
+///
+/// A pooled copy of the data is written in place; the destination strides come
+/// from an ndarray view of that copy, and the index and `updates` operands are
+/// lent as views BROADCAST onto the selection shape (`updates` against the
+/// trailing dims), so a 1-extent index/data/update dim is ndarray's zero-stride
+/// axis rather than a hand-written coordinate conditional. Iterating the
+/// selection in ndarray's own C order keeps numpy's duplicate-index rule (the
+/// LAST write wins) and the first-out-of-range-index diagnostic order.
 #[allow(clippy::too_many_arguments)]
-fn scatter_typed<T: Scalar>(
+fn scatter_typed<T: Scalar + NdScalar>(
     source: &[T],
     updates: &[T],
     dtype: DType,
     source_shape: &[usize],
     axis: usize,
+    indices: &Buffer,
     index_shape: &[usize],
-    indices: &[i128],
     selection: &[usize],
     update_shape: &[usize],
-    shape: &[usize],
+    shape: Vec<usize>,
 ) -> Result<Buffer> {
-    let mut out = source.to_vec();
-    let capacity = out.len();
-    let update_len = updates.len();
-    let source_strides = util::c_strides(source_shape);
-    let index_strides = util::c_strides(index_shape);
-    let update_strides = util::c_strides(update_shape);
+    let mut out = pooled_total::<T>(source.len());
+    out.copy_from_slice(source);
     let extent = source_shape[axis];
-    // `updates` broadcasts against the advanced-indexing result, so it aligns
-    // with the TRAILING selection dims.
-    let offset_rank = selection.len() - update_shape.len();
-    for_each_index(selection, |index| {
-        let mut index_offset = 0usize;
-        for (position, stride) in index_strides.iter().enumerate() {
-            let coordinate = if index_shape[position] == 1 {
-                0
-            } else {
-                index[position]
-            };
-            index_offset += coordinate * stride;
+    let rank = source_shape.len();
+    let source_strides: Vec<isize> = {
+        let view = array_view(&out, source_shape)?;
+        (0..rank)
+            .map(|position| view.stride_of(ndarray::Axis(position)))
+            .collect()
+    };
+    // `updates` aligns with the TRAILING selection dims.
+    let mut padded = vec![1usize; selection.len() - update_shape.len()];
+    padded.extend_from_slice(update_shape);
+    let dimensions = ndarray::IxDyn(selection);
+    let update_flat = array_view(updates, &padded)?;
+    let update_view = update_flat
+        .broadcast(dimensions.clone())
+        .ok_or_else(|| broadcast_mismatch(update_shape, selection))?;
+    with_type!(indices, |raw| {
+        let index_flat = array_view(raw, index_shape)?;
+        let index_view = index_flat
+            .broadcast(dimensions.clone())
+            .ok_or_else(|| broadcast_mismatch(index_shape, selection))?;
+        for coordinate in ndarray::indices(dimensions.clone()) {
+            let raw = index_view[&coordinate];
+            let selected = resolve_index_fast(index_as_i128(raw), extent, axis, "scatter")?;
+            let mut offset = 0isize;
+            for position in 0..rank {
+                let taken = if position == axis {
+                    selected
+                } else if source_shape[position] == 1 {
+                    0
+                } else {
+                    coordinate[position]
+                };
+                offset += taken as isize * source_strides[position];
+            }
+            let capacity = out.len();
+            let slot = out
+                .get_mut(offset as usize)
+                .ok_or_else(|| offset_error(offset, capacity, "scatter"))?;
+            *slot = update_view[&coordinate];
         }
-        let raw = *indices
-            .get(index_offset)
-            .ok_or_else(|| offset_error(index_offset, indices.len(), "scatter"))?;
-        let selected = resolve_index(raw, extent, axis, "scatter")?;
-        let mut destination = 0usize;
-        for (position, stride) in source_strides.iter().enumerate() {
-            let coordinate = if position == axis {
-                selected
-            } else if source_shape[position] == 1 {
-                0
-            } else {
-                index[position]
-            };
-            destination += coordinate * stride;
-        }
-        let mut update_offset = 0usize;
-        for (part, stride) in update_strides.iter().enumerate() {
-            let coordinate = if update_shape[part] == 1 {
-                0
-            } else {
-                index[offset_rank + part]
-            };
-            update_offset += coordinate * stride;
-        }
-        let value = updates
-            .get(update_offset)
-            .copied()
-            .ok_or_else(|| offset_error(update_offset, update_len, "scatter"))?;
-        let slot = out
-            .get_mut(destination)
-            .ok_or_else(|| offset_error(destination, capacity, "scatter"))?;
-        *slot = value;
         Ok(())
     })?;
-    Buffer::new(dtype, shape.to_vec(), T::into_storage(out))
+    Buffer::new(dtype, shape, <T as NdScalar>::into_storage(out))
+}
+
+/// numpy's shape-mismatch diagnostic for an operand ndarray cannot broadcast
+/// onto the selection (the pre-check above already rejects the invalid ones, so
+/// this is the defensive path that never panics).
+fn broadcast_mismatch(operand_shape: &[usize], selection: &[usize]) -> Error {
+    Error::shape(format!(
+        "scatter: shape mismatch: value array of shape {} could not be broadcast to indexing result of shape {}",
+        shape_text(operand_shape),
+        shape_text(selection)
+    ))
 }
 
 #[cfg(test)]
@@ -444,7 +454,7 @@ mod tests {
         updates: &Buffer,
         axis: usize,
         shape: &[usize],
-        indices: &[i128],
+        indices: &Buffer,
     ) -> Result<Buffer> {
         with_same_type!(source, updates, |data, update_data| scatter_typed(
             data,
@@ -452,11 +462,11 @@ mod tests {
             source.dtype,
             &source.shape,
             axis,
-            shape,
             indices,
             shape,
             shape,
             shape,
+            shape.to_vec(),
         ))
     }
 
@@ -469,7 +479,7 @@ mod tests {
         axis: usize,
         index_shape: &[usize],
         selection: &[usize],
-        indices: &[i128],
+        indices: &Buffer,
     ) -> Result<Buffer> {
         with_same_type!(source, updates, |data, update_data| scatter_typed(
             data,
@@ -477,11 +487,11 @@ mod tests {
             source.dtype,
             &source.shape,
             axis,
-            index_shape,
             indices,
+            index_shape,
             selection,
             &updates.shape,
-            &source.shape,
+            source.shape.clone(),
         ))
     }
 
@@ -513,7 +523,7 @@ mod tests {
             let index_buffer = i64_buffer(&in_shape, &narrowed);
             let fast = scatter(&x, &index_buffer, &in_shape, &updates, axis, &declared_dims)
                 .expect("the fast path succeeds");
-            let general = general_scatter(&x, &updates, axis, &in_shape, &indices)
+            let general = general_scatter(&x, &updates, axis, &in_shape, &index_buffer)
                 .expect("the general path succeeds");
             assert_eq!(fast, general, "shape {in_shape:?} axis {axis}");
             assert_eq!(x.storage, Storage::F32(values), "the input must not be mutated");
@@ -573,7 +583,7 @@ mod tests {
                 axis,
                 &index_shape,
                 &index_shape,
-                &indices,
+                &index_buffer,
             )
             .expect("the general path succeeds");
             assert_eq!(
@@ -603,8 +613,7 @@ mod tests {
             let fast = scatter_selection(&source, &indices, &[2], &updates, 0)
                 .expect("the fast path succeeds")
                 .expect("the fast path applies");
-            let widened = index_values(&indices).unwrap();
-            let general = general_scatter_shaped(&source, &updates, 0, &[2], &[2], &widened)
+            let general = general_scatter_shaped(&source, &updates, 0, &[2], &[2], &indices)
                 .expect("the general path succeeds");
             assert_eq!(fast, general.storage, "dtype {}", dtype.name());
         }

@@ -5,21 +5,12 @@
 //! doc in [`super`] carries the shared declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::Buffer;
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
 
 use super::reconcile;
-
-/// The C-order three-part view of a concatenate along `axis`: `outer` blocks of
-/// `total` axis rows, each row `inner` elements wide.
-struct Layout {
-    outer: usize,
-    axis: usize,
-    total: usize,
-    inner: usize,
-}
 
 pub(super) fn concatenate_kernel(
     ctx: &mut RunCtx<'_>,
@@ -99,91 +90,60 @@ fn concatenate(
         .enumerate()
         .map(|(position, value)| casts[position].as_ref().unwrap_or(value))
         .collect();
-    let layout = Layout {
-        outer: shape[..axis].iter().product(),
-        axis,
-        total: shape[axis],
-        inner: shape[axis + 1..].iter().product(),
-    };
-    let mut out = Buffer::zeros(dtype, shape);
-    let mut column = 0usize;
-    for part in &parts {
-        copy_part(&mut out, part, &layout, column)?;
-        column += part.shape[axis];
-    }
-    Ok(out)
+    join(&parts, axis, shape)
 }
 
-/// Copy one operand's block of rows into the output at `column` (an element
-/// offset along the concatenation axis).
-fn copy_part(out: &mut Buffer, part: &Buffer, layout: &Layout, column: usize) -> Result<()> {
-    let width = part.shape[layout.axis];
-    let dtype = out.dtype;
-    macro_rules! copy {
-        ($variant:ident) => {{
-            let Storage::$variant(out_values) = &mut out.storage else {
-                unreachable!()
-            };
-            let Storage::$variant(part_values) = &part.storage else {
-                return Err(Error::dtype(format!(
-                    "concatenate: the {} payload does not match the declared result dtype {}",
-                    stringify!($variant),
-                    dtype.name()
-                )));
-            };
-            copy_strided(out_values, part_values, layout, column, width)?;
+/// Join the (already same-dtype) operands with ndarray's own concatenate.
+///
+/// The shape checks above have already rejected every rank/axis mismatch, so
+/// ndarray's axis assembly is the reference behaviour here: it lays the operand
+/// views out along the concatenation axis in C order, one contiguous run per
+/// axis position, and hands back a standard-layout array this crate wraps back
+/// into a `Buffer`.
+fn join(parts: &[&Buffer], axis: usize, shape: Vec<usize>) -> Result<Buffer> {
+    macro_rules! join_typed {
+        ($ty:ty) => {{
+            let mut views: Vec<ndarray::ArrayViewD<'_, $ty>> = Vec::with_capacity(parts.len());
+            for part in parts {
+                views.push(part.as_array::<$ty>()?);
+            }
+            let joined = ndarray::concatenate(ndarray::Axis(axis), &views)
+                .map_err(|error| Error::shape(format!("concatenate: {error}")))?;
+            Buffer::from_array(joined)
         }};
     }
-    match dtype {
-        DType::Bool => copy!(Bool),
-        DType::Int8 => copy!(I8),
-        DType::Int16 => copy!(I16),
-        DType::Int32 => copy!(I32),
-        DType::Int64 => copy!(I64),
-        DType::UInt8 => copy!(U8),
-        DType::UInt16 => copy!(U16),
-        DType::UInt32 => copy!(U32),
-        DType::UInt64 => copy!(U64),
-        DType::Float16 => copy!(F16),
-        DType::Float32 => copy!(F32),
-        DType::Float64 => copy!(F64),
-        DType::Complex64 => copy!(C64),
-        DType::Complex128 => copy!(C128),
+    let dtype = parts[0].dtype;
+    let buffer = match dtype {
+        DType::Bool => join_typed!(bool),
+        DType::Int8 => join_typed!(i8),
+        DType::Int16 => join_typed!(i16),
+        DType::Int32 => join_typed!(i32),
+        DType::Int64 => join_typed!(i64),
+        DType::UInt8 => join_typed!(u8),
+        DType::UInt16 => join_typed!(u16),
+        DType::UInt32 => join_typed!(u32),
+        DType::UInt64 => join_typed!(u64),
+        DType::Float16 => join_typed!(half::f16),
+        DType::Float32 => join_typed!(f32),
+        DType::Float64 => join_typed!(f64),
+        DType::Complex64 => join_typed!(num_complex::Complex<f32>),
+        DType::Complex128 => join_typed!(num_complex::Complex<f64>),
+    }?;
+    // `shape` already passed `reconcile`; restating it keeps the result's
+    // declared shape authoritative over ndarray's derived one.
+    if buffer.shape != shape {
+        return Err(Error::shape(format!(
+            "concatenate: derived result shape {} does not match the declared shape {}",
+            crate::buffer::shape_text(&buffer.shape),
+            crate::buffer::shape_text(&shape)
+        )));
     }
-    Ok(())
+    Ok(buffer)
 }
-
-fn copy_strided<T: Copy>(
-    out: &mut [T],
-    part: &[T],
-    layout: &Layout,
-    column: usize,
-    width: usize,
-) -> Result<()> {
-    let part_span = width * layout.inner;
-    let out_span = layout.total * layout.inner;
-    let count = part_span;
-    for block in 0..layout.outer {
-        let source = block * part_span;
-        let destination = block * out_span + column * layout.inner;
-        let (Some(source_slice), Some(destination_slice)) = (
-            part.get(source..source + count),
-            out.get_mut(destination..destination + count),
-        ) else {
-            return Err(Error::shape(format!(
-                "concatenate: computed slice {destination}..{} is outside the {}-element result — the declared result type does not match the operands",
-                destination + count,
-                out.len()
-            )));
-        };
-        destination_slice.copy_from_slice(source_slice);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Storage;
     use crate::kernels::indexing::test_support::{buffer, declared, f32_buffer};
 
     #[test]
