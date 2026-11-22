@@ -24,6 +24,7 @@ mod bench_broadcast;
 mod ndarray_views;
 mod parallel;
 mod pool;
+mod rowsplit;
 mod storage;
 #[cfg(test)]
 mod test_support;

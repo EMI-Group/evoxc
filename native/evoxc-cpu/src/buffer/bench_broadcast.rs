@@ -21,10 +21,12 @@
 //! runs.
 
 use std::hint::black_box;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use evoxc_core::{DType, Result};
 
+use super::rowsplit::SPLIT_DISABLED;
 use super::{map2_runs, walk, Buffer, NdScalar};
 
 /// The result shape every case computes (and the `xor_p500` population shape).
@@ -129,13 +131,11 @@ fn measure(case: &Case, left: &[f32]) {
     );
 }
 
-#[test]
-#[ignore = "benchmark instrument: prints the broadcast map2_runs cost, never asserts"]
-fn bench_broadcast_zip() {
-    // Deterministic operands: a repeating pattern, no RNG, no allocation jitter
-    // beyond the two operand vectors themselves.
-    let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
-    let cases = [
+/// The three broadcast cases every instrument in this file times (deterministic
+/// operands: a repeating pattern, no RNG, no allocation jitter beyond the two
+/// operand vectors themselves).
+fn cases() -> [Case; 3] {
+    [
         Case {
             name: "right (4,) bias",
             right_shape: vec![4],
@@ -151,7 +151,16 @@ fn bench_broadcast_zip() {
             right_shape: Vec::new(),
             right: vec![1.75],
         },
-    ];
+    ]
+}
+
+#[test]
+#[ignore = "benchmark instrument: prints the broadcast map2_runs cost, never asserts"]
+fn bench_broadcast_zip() {
+    // Deterministic operands: a repeating pattern, no RNG, no allocation jitter
+    // beyond the two operand vectors themselves.
+    let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
+    let cases = cases();
     println!("broadcast map2_runs (current impl)");
     println!(
         "  out shape {:?}, left {:?}, f32 `add`",
@@ -159,6 +168,77 @@ fn bench_broadcast_zip() {
     );
     for case in &cases {
         measure(case, &left);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The row split: the same three cases, split against its own baseline
+// ---------------------------------------------------------------------------
+
+/// Chunks one row split of [`OUT_SHAPE`] spans (the leading chunk stays on the
+/// calling thread, so this is chunks rather than spawned threads).
+fn split_threads() -> usize {
+    super::parallel::parallel_threads(ELEMENTS).min(OUT_SHAPE[0])
+}
+
+/// Verify `case` against the naive reference, then time it with the row split
+/// forced off (`disabled`) or on and return the median total ms.
+///
+/// Forcing the switch keeps the comparison inside ONE process and one host
+/// state, which is what the ns/element figures need: they move by 2-3x between
+/// processes on a shared host.
+fn median_ms(case: &Case, left: &[f32], disabled: bool) -> f64 {
+    let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
+    let produced = <f32 as NdScalar>::slice_of(&result.storage).expect("an f32 result");
+    assert_eq!(
+        produced,
+        reference(left, &case.right, &case.right_shape).as_slice(),
+        "case '{}' does not match the per-element reference",
+        case.name
+    );
+    drop(result);
+    let previous = SPLIT_DISABLED.swap(disabled, Ordering::Relaxed);
+    for _ in 0..WARMUPS {
+        let warmup = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
+        black_box(&warmup);
+    }
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
+        let elapsed = start.elapsed();
+        black_box(&result);
+        samples.push(elapsed);
+    }
+    SPLIT_DISABLED.store(previous, Ordering::Relaxed);
+    samples.sort_unstable();
+    samples[ITERATIONS / 2].as_secs_f64() * 1e3
+}
+
+#[test]
+#[ignore = "benchmark instrument: prints the row-split broadcast map2_runs cost, never asserts"]
+fn bench_broadcast_zip_threads() {
+    let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
+    let threads = split_threads();
+    println!("broadcast map2_runs (row split over {threads} chunk(s), f32 `add`)");
+    println!(
+        "  out shape {:?}, left {:?}",
+        OUT_SHAPE, OUT_SHAPE
+    );
+    println!("  single = the same builder with the split disabled, in this process");
+    for case in &cases() {
+        let single = median_ms(case, &left, true);
+        let split = median_ms(case, &left, false);
+        println!(
+            "  {:<28} split {:>2}t {:>8.3} ms total {:>6.3} ns/element   |   single 1t {:>8.3} ms total {:>6.3} ns/element   |   {:.2}x",
+            case.name,
+            threads,
+            split,
+            split * 1e6 / ELEMENTS as f64,
+            single,
+            single * 1e6 / ELEMENTS as f64,
+            single / split
+        );
     }
 }
 
