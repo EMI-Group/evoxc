@@ -141,6 +141,8 @@ The threaded decode adds the raw-pointer writes: `OutPtr<T>`'s `unsafe impl Send
 
 A round trip is two passes over the payload — the inbound decode and the outbound bulk copy — plus the Python-side `numpy.empty` allocation: a measured ~0.20 ms for an 8 MB payload on this host.
 A small-graph `run` is therefore dominated by the kernels and the plan dispatch, not by marshalling.
+`run`'s per-call cost is O(input bytes + output bytes) and INDEPENDENT of op count: every input array is decoded into a fresh typed `Storage` once per call, outputs are bulk-copied once each, and no Python code runs during the planned loop (the GIL is released at `cpu.rs:186`), so a performance gap that scales with op count is inside `evoxc_cpu::run_program`, never in this seam.
+`stats()['compile_ms']` times ONLY `evoxc_cpu::plan::compile` — the timer starts after `json_from_py` and `envelope::decode` (`src/cpu.rs:100-108`) — so a `native_compile` wall time is decode + plan compile (at 2000 ops: 5.421 ms of envelope decode/FFI vs 0.860 ms of engine compile, `../CONTEXT.md` "Known gap (CPU FFI)").
 `NativeProgram` keeps the decoded `Program` and the compiled `Arc<Plan>` across calls, so a repeated run pays only input validation + marshalling + execution, never a re-compile or a re-decode.
 
 ### Inbound integer attributes (`convert.rs`)
