@@ -211,6 +211,8 @@ Its numerical-authority rule is implemented for the graph transformations: `vect
 Python keeps only frontend duties — executing `defn` bodies, adapting trees/specs, and serving extension rules (`block:*`, `external:*`, `sparse_*`) through the native extension-rule bridge.
 Python shape inference/verification at trace time, lowering/StableHLO export, and the backend adapters remain Python; the native ports of inference/verification exist and are parity-tested but are not yet on the Python hot path, and the native runtime crate is a skeleton.
 Do not reintroduce a builtin batching/AD/merge implementation in Python: extend the native engine and expose it through the bridge.
+Do not reintroduce a second CPU kernel implementation either: the numpy interpreter (`./evoxc/backends/numpy/`) is the *reference behaviour*, `./native/evoxc-cpu` is the fast engine, and the two must stay bit-identical wherever the contract says so (`native/tools/parity_cpu.py` is the gate; the 3 f32-`normal` 1-ulp cells are the documented exception).
+New op work lands in three places in this order: the op schema/inference, the numpy reference kernel, and the native kernel — a native-only op or a numpy-only op is a bug.
 
 **README (`./README.md`) is the front page and a derived document.**
 It states the four defining properties (simple / minimal / explicit / compiler-neutral), the pipeline `defn → trace → Graph → transform → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor`, and the per-feature sections.
