@@ -84,7 +84,7 @@ Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, whi
 - The `(4,)` bias broadcast elementwise case is still slower than the deleted hand-written tiled driver (0.455 vs 0.098 ns/element); recovering it needs a specialized tiling driver, which the ndarray-only mandate excludes, so the trade is documented rather than fixed. The per-row-scalar case is now ahead of it (0.439 vs 1.104).
 - A size-1 operand is only captured when its shape's element count is 1 AND its slice length is 1; a one-element slice with a larger declared shape is a malformed operand and keeps the `walk` fallback (which panics exactly as before).
 - Result rank > 6 dispatches to the `IxDyn` arm: correct but slow, and no real graph reaches it.
-- `map2_runs`/`map3_runs` run on the calling thread (no outermost-axis split); only the flat `map1..3`/`zip*` paths split over scoped threads.
+- The broadcast builders' row split is capped at `PARALLEL_MAX_THREADS` (4) chunks regardless of result size, and it costs ~4 µs of thread setup on a memory-bound result (the `()` scalar case, −8 %); the flat `map1..3`/`zip*` paths split over `split_parallel` on element counts, the pooled broadcast builders over row-aligned chunks.
 - `walk`'s index iteration costs 0.9–1.5 ns/element, which is what a non-identity `transpose` (in `../kernels/indexing/reshape.rs`) now pays per element.
 - Shape-only ops copy because `Storage` owns plain `Vec`s (`reshape`, identity `transpose`, same-shape `broadcast`, a `constant` step's payload clone).
 - The stride-copy machinery for `slice`/`gather` lives in `../kernels/indexing/stride_copy.rs` and is not part of this module.
