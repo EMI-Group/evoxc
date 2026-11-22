@@ -35,21 +35,16 @@
 //! strict helper.
 use evoxc_core::{Error, Result};
 
-use crate::buffer::Buffer;
-#[cfg(test)]
-use crate::buffer::Storage;
+use crate::buffer::{take_pooled_vec, Buffer};
 use crate::exec::Value;
-use crate::kernels::util;
 use crate::kernels::KernelMap;
 use crate::scalar::{Scalar, ScalarValue};
-use crate::with_type;
 
 mod concatenate;
 mod gather;
 mod reshape;
 mod scatter;
 mod slice;
-mod stride_copy;
 
 #[cfg(test)]
 mod test_support;
@@ -120,77 +115,17 @@ fn offset_error(offset: impl std::fmt::Display, len: usize, op: &str) -> Error {
     ))
 }
 
-/// The block-copy bounds diagnostic [`copy_blocks`](crate::buffer::copy_blocks)
-/// raises, with its wording (both entries say the same thing).
-pub(super) fn block_error(op: &str) -> Error {
-    Error::verification(format!(
-        "op '{op}': a block copy reads outside the operand (internal engine error)"
-    ))
-}
-
-/// A [`Storage`] built by a block copy WITHOUT the zero fill
-/// [`block_storage`](crate::buffer::block_storage) performs.
+/// A recycled destination vector of EXACTLY `total` elements, or a fresh zeroed
+/// one when the thread-local storage pool has no stock of that size.
 ///
-/// The result is exactly that helper's — output run `b` is the `inner`-element
-/// run starting at `values[offsets[b]]` — but the elements are pushed straight
-/// into the result, so a block copy never first writes a full zero buffer it is
-/// about to overwrite. That matters for the large-result fast paths (`tile`-,
-/// `gather`- and `slice`-shaped results), where the fill is a second pass over
-/// the whole output. The element-count and bounds contract is `copy_blocks`'
-/// (same checks, same error wording): a short or long offset list is an
-/// explicit error, never a silently truncated result.
-#[cfg(test)]
-fn block_storage_from<T: Scalar>(
-    values: &[T],
-    out_shape: &[usize],
-    offsets: &[usize],
-    inner: usize,
-    op: &str,
-) -> Result<Storage> {
-    let total = util::numel(out_shape);
-    if offsets.len().saturating_mul(inner) != total {
-        return Err(block_error(op));
-    }
-    if inner == 0 {
-        return Ok(T::into_storage(Vec::new()));
-    }
-    let mut out: Vec<T> = Vec::with_capacity(total);
-    for offset in offsets {
-        let start = *offset;
-        let run = values
-            .get(start..start + inner)
-            .ok_or_else(|| block_error(op))?;
-        out.extend_from_slice(run);
-    }
-    Ok(T::into_storage(out))
-}
-
-/// Read `values[offset]` with a SIGNED offset (slice strides may be negative).
-fn read_checked<T: Copy>(values: &[T], offset: i64, op: &str) -> Result<T> {
-    usize::try_from(offset)
-        .ok()
-        .and_then(|slot| values.get(slot).copied())
-        .ok_or_else(|| offset_error(offset, values.len(), op))
-}
-
-/// Visit every C-order multi-index of `shape`: a rank-0 shape visits the empty
-/// index once and an empty shape dimension visits nothing.
-fn for_each_index(shape: &[usize], mut body: impl FnMut(&[usize]) -> Result<()>) -> Result<()> {
-    if shape.is_empty() {
-        return body(&[]);
-    }
-    let mut index = vec![0usize; shape.len()];
-    for _ in 0..util::numel(shape) {
-        body(&index)?;
-        for axis in (0..shape.len()).rev() {
-            index[axis] += 1;
-            if index[axis] < shape[axis] {
-                break;
-            }
-            index[axis] = 0;
-        }
-    }
-    Ok(())
+/// Every caller overwrites all `total` elements (a contiguous `copy_from_slice`
+/// or an ndarray `assign` over a same-sized destination view), so a recycled
+/// stock can never leak a stale value. The exact-length filter keeps a
+/// mismatched recycled stock from ever reaching a result.
+fn pooled_total<T: Scalar>(total: usize) -> Vec<T> {
+    take_pooled_vec::<T>(total)
+        .filter(|values| values.len() == total)
+        .unwrap_or_else(|| T::zeros(total))
 }
 
 /// A tuple rendering for diagnostics (numpy's `(0, 1)` spelling).
@@ -215,24 +150,8 @@ fn require_integer_indices(op: &str, indices: &Buffer) -> Result<()> {
     Ok(())
 }
 
-/// Read an index tensor as widened integers (any integer dtype, numpy accepts
-/// them all; `require_integer_indices` has already rejected the rest).
-fn index_values(indices: &Buffer) -> Result<Vec<i128>> {
-    with_type!(indices, |values| {
-        Ok(values
-            .iter()
-            .map(|value| match value.to_scalar() {
-                ScalarValue::I(value) => value as i128,
-                ScalarValue::U(value) => value as i128,
-                ScalarValue::F(value) => value as i128,
-                ScalarValue::C(value) => value.re as i128,
-            })
-            .collect())
-    })
-}
-
-/// The `i128` view of one typed index scalar — exactly [`index_values`]'s
-/// per-element conversion, without materializing the whole widened vector.
+/// The `i128` view of one typed index scalar: every integer dtype numpy
+/// accepts, widened to one comparison domain.
 fn index_as_i128<I: Scalar>(value: I) -> i128 {
     match value.to_scalar() {
         ScalarValue::I(value) => value as i128,
@@ -295,48 +214,6 @@ mod tests {
         assert_eq!(reconcile("gather", &[None, Some(3)], vec![2, 3]).unwrap(), vec![2, 3]);
     }
 
-    /// The zero-fill-free block copy must produce exactly the same storage as
-    /// `buffer::block_storage` (which zero-fills and then copies), including the
-    /// empty case and single-element runs.
-    #[test]
-    fn block_rows_without_zero_fill_match_the_general_helper() {
-        let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
-        let cases: [(&[usize], &[usize], usize); 3] = [
-            (&[2, 3], &[1, 3], 3),
-            (&[0, 3], &[], 3),
-            (&[4], &[0, 1, 2, 3], 1),
-        ];
-        for (out_shape, offsets, inner) in cases {
-            let fast = block_storage_from(&values, out_shape, offsets, inner, "test").unwrap();
-            let general =
-                crate::buffer::block_storage(&values, out_shape, offsets, inner, "test").unwrap();
-            assert_eq!(fast, general, "shape {out_shape:?} offsets {offsets:?}");
-        }
-        // A run of two starts at offset 3: [3, 4].
-        let storage = block_storage_from(&values, &[2], &[3, 7], 1, "test").unwrap();
-        assert_eq!(storage, Storage::F32(vec![3., 7.]));
-    }
-    #[test]
-    fn block_rows_reject_an_offset_outside_the_operand() {
-        let values: Vec<f32> = (0..4).map(|value| value as f32).collect();
-        // A count mismatch between the offset list and the result element count.
-        let err = block_storage_from(&values, &[2], &[0], 1, "gather").unwrap_err();
-        assert!(
-            err.message.contains("a block copy reads outside the operand"),
-            "{}",
-            err.message
-        );
-        // A run past the end of the operand.
-        let err = block_storage_from(&values, &[2, 2], &[0, 3], 2, "gather").unwrap_err();
-        assert!(
-            err.message.contains("op 'gather': a block copy reads outside the operand"),
-            "{}",
-            err.message
-        );
-        // Zero-width runs need no source data at all.
-        let empty = block_storage_from::<f32>(&[], &[3, 0], &[0, 0, 0], 0, "gather").unwrap();
-        assert_eq!(empty, Storage::F32(Vec::new()));
-    }
     #[test]
     fn gather_requires_an_integer_index_dtype() {
         let indices = f32_buffer(&[1], &[0.]);

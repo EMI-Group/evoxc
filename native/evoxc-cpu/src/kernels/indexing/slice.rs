@@ -6,22 +6,49 @@
 //! doc in [`super`] carries the shared declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::Buffer;
+use crate::buffer::{array_view, array_view_mut, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
-use super::stride_copy::{CopyAxis, CopyPlan};
-use super::{for_each_index, operand, read_checked, reconcile};
+use super::{operand, pooled_total, reconcile};
 
 /// One operand axis mapped onto a Python `slice(start, stop, step)`.
 #[derive(Debug, Clone, Copy)]
 struct DimSlice {
     start: i64,
+    /// The normalized, clamped Python STOP bound (exclusive): the low bound of a
+    /// negative step, the high bound of a positive one.
+    stop: i64,
     step: i64,
     extent: usize,
+}
+
+impl DimSlice {
+    /// The equivalent [`ndarray::Slice`] for this axis.
+    ///
+    /// The bounds are already Python-normalized and clamped, so they are
+    /// non-negative here except for a negative step's exclusive low bound; that
+    /// one is shifted to the inclusive `stop + 1` ndarray reverses from.
+    fn to_ndarray(self) -> ndarray::Slice {
+        if self.extent == 0 {
+            // An empty axis selects nothing regardless of the bounds.
+            return ndarray::Slice::new(0, Some(0), 1);
+        }
+        if self.step > 0 {
+            ndarray::Slice::new(self.start as isize, Some(self.stop as isize), self.step as isize)
+        } else {
+            // A negative step walks `start, start+step, ... down to stop+1`, which
+            // ndarray expresses as the range `[stop+1, start+1)` reversed.
+            ndarray::Slice::new(
+                (self.stop + 1) as isize,
+                Some((self.start + 1) as isize),
+                self.step as isize,
+            )
+        }
+    }
 }
 
 pub(super) fn slice_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
@@ -117,95 +144,55 @@ fn plan_slice_dim(
             0
         }
     };
-    Ok(DimSlice { start, step, extent })
+    Ok(DimSlice { start, stop, step, extent })
 }
 
 fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Result<Buffer> {
     let derived: Vec<usize> = ranges.iter().map(|range| range.extent).collect();
     let shape = reconcile("slice", declared, derived)?;
-    let source_strides = util::c_strides(&source.shape);
-    if let Some(plan) = copy_plan(ranges, &source_strides) {
-        let total = util::numel(&shape);
-        let storage = with_type!(source, |values| plan.copy(values, total, "slice"))?;
-        return Buffer::new(source.dtype, shape, storage);
-    }
-    // A backwards walk (a negative step over an axis that keeps more than one
-    // element) is the only plan the collapsed-stride copy declines: it stays on
-    // the signed general driver.
-    let mut base = 0i64;
-    let mut steps = Vec::with_capacity(ranges.len());
-    for (range, stride) in ranges.iter().zip(&source_strides) {
-        base += range.start * *stride as i64;
-        steps.push(range.step * *stride as i64);
-    }
     with_type!(source, |values| slice_typed(
         values,
         source.dtype,
-        &shape,
-        base,
-        &steps
+        &source.shape,
+        ranges,
+        shape
     ))
 }
 
-/// The collapsed-stride copy plan for a slice, or `None` when the mapping
-/// walks backwards (a negative step along an axis that keeps two or more
-/// elements) — [`CopyPlan`] only describes a forward, non-negative walk, so
-/// that case stays on the signed general driver.
+/// Materialize the sliced view through ndarray.
 ///
-/// Each axis contributes `(extent, step × source stride)`; [`CopyPlan::new`]
-/// then collapses the axes whose strides line up, so the whole slice is one
-/// contiguous run, one strided run, or a handful of short blocks.
-fn copy_plan(ranges: &[DimSlice], source_strides: &[usize]) -> Option<CopyPlan> {
-    let mut base = 0usize;
-    let mut axes = Vec::with_capacity(ranges.len());
-    for (range, stride) in ranges.iter().zip(source_strides) {
-        if range.extent == 0 {
-            continue; // an empty result reads nothing
-        }
-        // A one-element axis (which `CopyPlan` drops again) contributes its
-        // start offset only, so even a negative step there is a forward walk.
-        let start = usize::try_from(range.start).ok()?;
-        base = base.checked_add(start.checked_mul(*stride)?)?;
-        if range.extent == 1 {
-            continue;
-        }
-        if range.step < 0 {
-            return None;
-        }
-        let step = usize::try_from(range.step).ok()?;
-        axes.push(CopyAxis {
-            extent: range.extent,
-            stride: step.checked_mul(*stride)?,
-        });
-    }
-    // `axes` is outermost-first, the plan wants innermost-first.
-    axes.reverse();
-    Some(CopyPlan::new(base, axes))
-}
-
-fn slice_typed<T: Scalar>(
+/// One [`ndarray::Slice`] per axis is applied to a borrowed view with
+/// `slice_axis_inplace` (Python's bounds/steps, including a negative step), so
+/// the addressing is ndarray's — no per-axis offset table and no per-element
+/// odometer. A view that lands C-contiguous (a whole-array or interior-block
+/// slice) copies with ONE `copy_from_slice` into the pooled destination; every
+/// other layout receives it through a single `assign`.
+fn slice_typed<T: Scalar + NdScalar>(
     values: &[T],
     dtype: DType,
-    shape: &[usize],
-    base: i64,
-    steps: &[i64],
+    source_shape: &[usize],
+    ranges: &[DimSlice],
+    shape: Vec<usize>,
 ) -> Result<Buffer> {
-    let mut out = Vec::with_capacity(util::numel(shape));
-    for_each_index(shape, |index| {
-        let mut offset = base;
-        for (coordinate, step) in index.iter().zip(steps) {
-            offset += *coordinate as i64 * *step;
-        }
-        out.push(read_checked(values, offset, "slice")?);
-        Ok(())
-    })?;
-    Buffer::new(dtype, shape.to_vec(), T::into_storage(out))
+    let mut view = array_view(values, source_shape)?;
+    for (axis, range) in ranges.iter().enumerate() {
+        view.slice_axis_inplace(ndarray::Axis(axis), range.to_ndarray());
+    }
+    let total = util::numel(&shape);
+    let mut out = pooled_total::<T>(total);
+    if let Some(source) = view.as_slice() {
+        out.copy_from_slice(source);
+    } else {
+        let mut dest = array_view_mut(&mut out, &shape)?;
+        dest.assign(&view);
+    }
+    Buffer::new(dtype, shape, <T as NdScalar>::into_storage(out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::indexing::test_support::{attrs, declared, f32_buffer, spec};
+    use crate::kernels::indexing::test_support::{attrs, buffer, declared, f32_buffer, spec};
     use crate::Storage;
 
     #[test]
@@ -367,14 +354,15 @@ mod tests {
     }
 
     /// The `(500, 50, 4) -> (500, 50, 1)` family — one element out of every
-    /// 4-element innermost run — is ONE strided run for every selected offset,
-    /// which is the lane-grouped copy path (never a per-element walk).
+    /// 4-element innermost run — must read exactly the reference's elements for
+    /// every selected offset; the ndarray view is non-contiguous here, so this
+    /// pins the `assign` path against the independent per-element oracle.
     #[test]
-    fn the_last_axis_single_element_family_is_one_strided_run() {
+    fn the_last_axis_single_element_family_matches_the_reference() {
         let shape = [500usize, 50, 4];
         let values: Vec<f32> = (0..util::numel(&shape)).map(|index| index as f32).collect();
         let x = f32_buffer(&shape, &values);
-        let source_strides = util::c_strides(&shape);
+        let strides = util::c_strides(&shape);
         for start in [0i64, 1, 2, 3] {
             let op = spec(attrs(&[
                 ("start_indices", evoxc_core::AttrValue::Ints(vec![0, 0, start])),
@@ -385,67 +373,48 @@ mod tests {
                 ("strides", evoxc_core::AttrValue::Null),
             ]));
             let ranges = slice_ranges(&op, &shape).unwrap();
-            let plan = copy_plan(&ranges, &source_strides).expect("a forward plan");
-            assert_eq!(
-                plan.axes,
-                vec![CopyAxis {
-                    extent: 25_000,
-                    stride: 4
-                }],
-                "start {start}"
-            );
-            assert_eq!(plan.base, start as usize);
             let out = slice(&x, &ranges, &declared(&[500, 50, 1])).unwrap();
             assert_eq!(out.shape, vec![500, 50, 1]);
             match &out.storage {
                 Storage::F32(copied) => {
                     assert_eq!(copied.len(), 25_000);
-                    for (index, value) in copied.iter().enumerate() {
-                        assert_eq!(
-                            *value,
-                            values[index * 4 + start as usize],
-                            "start {start}, element {index}"
-                        );
-                    }
+                    assert_eq!(*copied, reference(&values, &strides, &ranges), "start {start}");
                 }
                 other => panic!("unexpected storage {other:?}"),
             }
         }
     }
 
-    /// An identity (or whole-array) slice is ONE contiguous run: a single bulk
-    /// `copy_from_slice` into a pooled result, for every dtype.
+    /// A whole-array slice lands C-contiguous, so it takes the single
+    /// `copy_from_slice` fast path (`as_slice()` is `Some`) and reproduces the
+    /// operand's element order for every dtype.
     #[test]
     fn a_whole_array_slice_is_one_contiguous_run() {
         let shape = [4usize, 3];
-        let strides = util::c_strides(&shape);
         let op = spec(attrs(&[
             ("start_indices", evoxc_core::AttrValue::Ints(vec![0, 0])),
             ("limit_indices", evoxc_core::AttrValue::Ints(vec![4, 3])),
             ("strides", evoxc_core::AttrValue::Null),
         ]));
-        let ranges = slice_ranges(&op, &[4, 3]).unwrap();
-        let plan = copy_plan(&ranges, &strides).expect("a forward plan");
-        assert_eq!(
-            plan.axes,
-            vec![CopyAxis {
-                extent: 12,
-                stride: 1
-            }]
+        let ranges = slice_ranges(&op, &shape).unwrap();
+        // Pin the bulk-memcpy gate: the sliced ndarray view is standard layout.
+        let plane: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let mut view = array_view::<f32>(&plane, &shape).expect("a view");
+        for (axis, range) in ranges.iter().enumerate() {
+            view.slice_axis_inplace(ndarray::Axis(axis), range.to_ndarray());
+        }
+        assert!(view.as_slice().is_some(), "a whole-array slice is contiguous");
+        // f32, i32 and bool keep the same element order through `slice`.
+        let floats = f32_buffer(&shape, &(0..12).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(slice(&floats, &ranges, &declared(&shape)).unwrap().storage, floats.storage);
+        let ints = buffer(evoxc_core::DType::Int32, &shape, Storage::I32((0..12).collect()));
+        assert_eq!(slice(&ints, &ranges, &declared(&shape)).unwrap().storage, ints.storage);
+        let flags = buffer(
+            evoxc_core::DType::Bool,
+            &shape,
+            Storage::Bool((0..12).map(|index| index % 3 == 0).collect()),
         );
-        assert_eq!(plan.base, 0);
-        // i32 and bool keep the same plan and the same element order.
-        let ints: Vec<i32> = (0..12).collect();
-        let plan = CopyPlan::new(0, vec![CopyAxis { extent: 12, stride: 1 }]);
-        assert_eq!(
-            plan.copy(&ints, 12, "slice").unwrap(),
-            Storage::I32(ints.clone())
-        );
-        let flags: Vec<bool> = (0..12).map(|index| index % 3 == 0).collect();
-        assert_eq!(
-            plan.copy(&flags, 12, "slice").unwrap(),
-            Storage::Bool(flags.clone())
-        );
+        assert_eq!(slice(&flags, &ranges, &declared(&shape)).unwrap().storage, flags.storage);
     }
 
     /// A nonzero `start` on every axis of the plan still lands on the right
