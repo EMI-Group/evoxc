@@ -52,7 +52,9 @@ Must-expose names (re-exported from `evoxc/backends/__init__.py` and from `evoxc
 
 ## Constraints (binding)
 
-- **Import acyclicity** (from `../CONTEXT.md`): top-level imports restricted to `evoxc.core` and `evoxc.ir`.
+- **Import acyclicity** (from `../CONTEXT.md`): top-level imports restricted to `evoxc.core` and `evoxc.ir`, with ONE documented exception — the only allowed `backends → dist` edge.
+  The numpy interpreter's own modules (`numpy/__init__.py`, `numpy/collectives.py`, `numpy/exec_context.py`) import `evoxc.dist.context` at module level to install and drive the single-process collective-executor and rank-context hooks.
+  `evoxc.dist` imports only `core`/`ir`/`trace` and must NEVER import `evoxc.backends` (that would close the cycle).
   `evoxc.ops` may be imported ONLY inside function bodies (block-impl registration).
   `evoxc.persist` may be imported ONLY inside function bodies (persist sits ABOVE backends in the DAG — a top-level import would be a cycle).
   NEVER import `evoxc.pipeline` (pipeline imports backends).
@@ -62,13 +64,15 @@ Must-expose names (re-exported from `evoxc/backends/__init__.py` and from `evoxc
   Runtime shape failures raise `core.ShapeError`.
   No silent fallbacks or partial semantics.
 - **No hidden staging**: `load()` never traces/lowers/compiles.
-  Artifacts are self-describing (backend name/version, target, signature, required custom ops, IR format version).
+  Artifacts are self-describing (metadata list: "Serialization compliance").
 - **Files < ~1000 lines** — kernel modules are pre-split by category (`numpy/kernels/`); stablehlo mapping data lives separately from the writer (the writer itself is the known exception — see `./stablehlo/CONTEXT.md`).
 - **CPU only in v1**: the numpy backend never requires or touches GPU.
 
 ## Numpy backend design (reference CPU interpreter)
 
 **Capabilities**: name `"numpy"`; `dynamic_shapes=True`; `dtypes=` all numpy dtypes; `collectives=True` (single-process simulation); `runtime_calls=True`; `external_calls=True` (host-mode slots only — a resolved numpy slot registered `device_resident=True` raises `BackendError`); `custom_blocks=True`; `async_collectives=False` (simulation is synchronous); `sparse_ops=True` (the ONLY backend with sparse support in v1 — the 16 `sparse_*`/`dense_dot_sparse` ops are numpy-implemented only).
+
+Collectives are emulated single-process here through `dist.context`'s executor/rank hooks — the only allowed `backends → dist` edge; the reverse import is forbidden.
 
 **Staging flow** (see `numpy/__init__.py`):
 - `lower(graph, options=None)`: (1) `graph.verify()`; (2) `kernels.register_all()` (idempotent) + capability flags pre-check on the current module state (kernel-table membership is checked AFTER inlining as the drift net); (3) inline `block_call` portable decompositions as a graph→graph expansion via the SHARED fixpoint `inline.py::inline_portables(module, keep_backend_impls="numpy")` (a block with neither portable nor registered numpy impl ⇒ `BackendError` naming the block); (4) ONE post-inline capability walk that also COLLECTS the sorted `required_custom_ops` names (`block_call` block names + `external_call` kernel names) in the same `iter_ops` loop, plus the defensive post-inline `graph.verify()` ONLY when `inline_portables` reported a non-zero expansion count (a zero count means the module is byte-for-byte the one already verified — same proof as `compiler.py`); (5) record `Signature` from the Graph's LIVE attributes; (6) `payload` = versioned self-describing `ir.Module` serialization (`ir.serialize_module`).
@@ -140,7 +144,7 @@ On the reference host (16 cpus, loadavg ≈4) a 100-op `tanh` chain on `(64,)` f
 The remainder is deliberate: one `graph.verify`, `encode_module`'s pre-emit verify, the Rust `native_compile` and `ir.serialize_module`'s verify (≈29 ms at 2000 ops) all live in `evoxc/ir`, `evoxc/_native_codec` and `native/`; per-stage table and breakdown: `./native/CONTEXT.md` ("Single-decode staging", "Staging cost").
 
 ## Lower-stage cost model
-Scope: `CompilerBackend.lower()` — `NumpyBackend.lower` keeps its unconditional post-inline `graph.verify()` and serializes the module instead of exporting text.
+Scope: `CompilerBackend.lower()` — `NumpyBackend.lower` serializes the module instead of exporting text.
 
 `lower()` on `batch_functions`-merged population graphs, measured on an AMD MI300X-era box with iree-base 3.11.0, `EVOXC_DISABLE_LOCATIONS=1`, iree backend, one shared `(1024,)` f32 input, random expression programs, median of 3.
 The `verify walks` column counts the `ir.verify` passes `lower()` performs: the two `lower()` columns are the same code path with three walks (explicit verify + post-inline verify + the export's own verify) and with the current single walk.
@@ -195,7 +199,7 @@ Every pipeline stage — `lower`, `compile`, `load`, `run` (plus the `build`/`ev
   Details: `./adapters/CONTEXT.md`.
 - **`opt_level` — the first evoxc-defined, evoxc-validated option** (compile stage, all compiler adapters; `normalize_opt_level` + the `OPT_LEVEL` constant in `./options.py`, also used for `EVOXC_OPT_LEVEL`): `"O0"`..`"O3"` (case-insensitive, whitespace-stripped), `"0"`..`"3"` or ints 0..3 (bool rejected) — anything else is a loud `core.BackendError` naming the accepted forms, and an unset value is byte-for-byte unchanged behavior on every backend.
   Per-backend translation and the raw-flag-wins conflict rule (iree `--iree-opt-level=O{N}` — O-form required on the 3.13 pin; xla `CompileOptionsProto` `executable_build_options` field 24 via `xla_util.set_opt_level`; tvm's version-adaptive `build_vm_executable(..., opt_level=N)`, which raises rather than dropping it on an installed TVM without the kwarg; numpy documents-ignores it): `./adapters/CONTEXT.md`; the binding contract is `../CONTEXT.md`.
-- **Lower-stage backend-agnostic env spellings.** The two reserved exporter lower options have per-backend env rows in `evoxc/pipeline_options.py::ENV_OPTION_TABLE` — `EVOXC_EIGH_ALGORITHM` (`eigh_algorithm`: `"jacobi"` | `"jacobi_batched"`, case-insensitive, whitespace-stripped, default `"jacobi_batched"`) and `EVOXC_SPLIT_REDUCTION` (`split_reduction`: bool — `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`, case-insensitive, default `True`) — registered for all three compiler adapters with ONE option key each.
+- **Lower-stage backend-agnostic env spellings.** The two reserved exporter lower options have per-backend env rows in `evoxc/pipeline_options.py::ENV_OPTION_TABLE` — `EVOXC_EIGH_ALGORITHM` and `EVOXC_SPLIT_REDUCTION` — registered for all three compiler adapters with ONE option key each.
   These are not raw pass-through values: `eigh_algorithm` is validated by the Writer (`stablehlo/writer.py::_normalize_eigh_algorithm`) and `split_reduction` is coerced by `options.normalize_bool_option`, so a malformed env/pipeline value raises a loud `core.BackendError` naming the option, the value and the accepted forms (precedence unchanged: explicit kwarg > env var > adapter class default).
 - **`normalize_bool_option(option, value) -> bool`** is the shared coercion for BOOL-valued options: real bools, ints 0/1, and case-insensitive `"true"`/`"false"`/`"yes"`/`"no"`/`"on"`/`"off"`/`"1"`/`"0"`; anything else raises a loud `BackendError` naming the option, the value and the accepted forms.
   It is a TYPE COERCION, not a per-backend semantic mapping.
@@ -229,7 +233,7 @@ Every pipeline stage — `lower`, `compile`, `load`, `run` (plus the `build`/`ev
 - `registry`: register/get/duplicate/unknown-name behavior + optional-adapter auto-activation (`test_adapters_optional.py`).
 - numpy interpreter: per-op coverage per kernel category; symbolic-dim binding at run time; dynamic control flow; `runtime_call` sync execution; block impl dispatch (impl vs portable decomposition vs missing ⇒ `BackendError`); collectives — single-rank identity AND multi-rank in-process simulation via the `CollectiveExecutor` hook; `external_call` dispatch incl. the device-resident numpy slot rejection; persistence round-trips (artifact save/load, backend mismatch ⇒ `PersistenceError`).
 - stablehlo: golden-text exports, deferred ops ⇒ `BackendError` naming the op, dynamic-dims rejections, exporter-option goldens (`test_stablehlo.py`); emitter parity (gather/sort/argsort/argmin/argmax/tile/scatter, bit-exact random, scan-through-while, shifts) vs numpy through iree-llvm-cpu, plus GPU-guarded iree-cuda smoke tests on `Device("cuda", 5)` (`test_iree_emitters_parity.py`).
-  The iree GPU-guarded tests branch on `nvidia-smi`; rocm coverage is rocm-guarded via `_rocm_guard.py` (`require_rocm`/`rocm_available`/`pick_rocm_device_index`/`rocm_device`), running against a real MI300X gfx942 when present, else skipping.
+  The iree GPU-guarded tests branch on `nvidia-smi`; rocm coverage is rocm-guarded via `_rocm_guard.py`, running against a real MI300X gfx942 when present, else skipping.
 - Option contract: `test_options_override.py` (union-of-stages semantics, unknown keys, env precedence) and `test_opt_level.py` (per-backend normalization/translation, conflict rule).
 - CPU only, pytest, numpy-only deps.
 
