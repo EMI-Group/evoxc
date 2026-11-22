@@ -9,9 +9,9 @@
 //! body stay generic (`T: Num`) while the storage enum is matched once per
 //! call site, so a new op costs a generic function, not 14 copies.
 //!
-//! The pieces live in submodules (`storage`, `broadcast`, `pool`, `parallel`,
-//! `zipmap`, `blocks`) and are re-exported here, so every item keeps its
-//! `crate::buffer::…` path.
+//! The pieces live in submodules (`storage`, `broadcast`, `ndarray_views`,
+//! `pool`, `parallel`, `zipmap`, `blocks`) and are re-exported here, so every
+//! item keeps its `crate::buffer::…` path.
 
 use evoxc_core::{ArrayPayload, DType, Error, Result};
 use half::f16;

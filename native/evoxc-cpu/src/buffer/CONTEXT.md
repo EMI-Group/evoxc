@@ -1,0 +1,105 @@
+# buffer — the engine's value representation and its ndarray layout substrate
+
+## Intent
+
+`buffer` owns the execution engine's materialized value ([`Buffer`]) and every N-dimensional addressing rule the kernels use.
+A `Buffer` is a dtype, a concrete shape and exactly that dtype's typed `Vec` — always C-contiguous, never a view, so a kernel is a flat loop over plain slices.
+`ndarray` is the ONLY N-dimensional layout engine in this module: there is no hand-written stride odometer anywhere under `src/buffer/`.
+The kernels in `../kernels/` keep their hand-written contiguous typed-slice fast paths; everything that has to address a broadcast or strided layout goes through the drivers here.
+The reference behaviour is the numpy interpreter in `../../../evoxc/backends/numpy/`; this module must reproduce it bit for bit where the contract says so.
+
+## API surface
+
+`Buffer { pub dtype: DType, pub shape: Vec<usize>, pub storage: Storage }` is the public representation and must stay exactly those three fields (the PyO3 node builds and reads them).
+- `Buffer::new` validates dtype-vs-storage and element count; `zeros`, `from_payload` (little-endian envelope constants), `cast` (numpy `astype`), `with_shape` (relabel only), `numel`, `rank`, `is_flat_for(shape)` (the flat-fast-path gate).
+- `Storage` is one `Vec<T>` variant per one of the 14 dtypes (`bool`, `i8/i16/i32/i64`, `u8/u16/u32/u64`, `f16`, `f32`, `f64`, `Complex<f32>`, `Complex<f64>`).
+- Shape algebra: `broadcast_shape(shapes) -> Result<Vec<usize>>` (numpy right-aligned rule, message `"operand shapes cannot broadcast: (3) vs (2)"`) and `broadcast_strides(shape, out_shape) -> Vec<usize>` (0 on broadcast axes). Both are pure arithmetic, deliberately not ndarray.
+- `broadcast_to(&Buffer, shape) -> Result<Buffer>`: equal shape returns a clone; otherwise it errors unless `broadcast_shape` of the pair is exactly `shape` (message `"operand shape (1, 3) cannot be broadcast to target shape (3)"`), then materializes per storage variant through `fill_broadcast`.
+- Layout drivers, all `crate::buffer::…` paths: `walk(rank, out_shape, strides, body)`, `apply1/apply2/apply3(out, out_shape, operands + their shapes, f)`, `fill_broadcast<T: Scalar>(values, shape, out_shape) -> Vec<T>`, plus the compatibility aliases `apply2_runs`/`apply3_runs`.
+- Flat typed-slice fast paths (measured specializations, not layout engines): `zip1/zip2/zip3` (write into caller memory), `zip2_accumulate` (in-place), `map1/map2/map3` (allocate or pool a fresh result), `map2_runs`/`map3_runs` (broadcast operands, pooled result through `apply2`/`apply3`).
+- Block/repeat copy builders: `block_storage`, `block_storage_filled`, `copy_blocks`, `repeat_storage`.
+- Thread split (module-private): `parallel_threads`, `split_parallel`, `window`, with the measured thresholds `PARALLEL_MIN_ELEMS` (2^18), `PARALLEL_MIN_PER_THREAD` (2^17), `PARALLEL_MAX_THREADS` (4).
+- Storage pool (module-private, crate-visible `take_pooled_vec`): a thread-local free list with `POOL_MIN_BYTES` (4 KiB) admission, `POOL_MAX_ENTRIES` (64), `POOL_MAX_BYTES` (64 MiB) and `POOL_MAX_PER_SIZE` (8) per exact size class; `Drop for Storage` is the admission hook.
+- ndarray seam: `trait NdScalar` (14 impls) and `Buffer::{as_array, as_array_mut, as_array2, from_array, into_array}`, plus the free `array_view`/`array_view_mut(values, shape)` for a kernel that already holds a dispatched typed slice.
+- Dispatch macros: `with_type!`, `with_same_type!`, `with_same_type_mut!` (they match the storage enum once and keep a kernel body generic over `T: Num`).
+
+## The ndarray view seam (`ndarray_views.rs`)
+
+`Storage` stays owned and `Vec`-backed, so a view is a transient borrow: `as_array`/`as_array_mut`/`as_array2` borrow the buffer, `from_array` standardizes a non-standard layout (`.as_standard_layout().into_owned()`) and takes ownership, `into_array` MOVES the `Vec` into `ArrayD::from_shape_vec` (no copy for a C-contiguous buffer).
+`NdScalar` is the per-dtype bridge the seam needs: `DTYPE`, `into_storage`, `take_storage` (by-value extraction — `Storage` implements `Drop`, so a `Vec` is taken with `std::mem::take`, still a move), `slice_of`, `slice_of_mut`.
+A dtype mismatch is always `Error::dtype` naming both dtypes; a shape/length mismatch is `Error::shape`; none of these functions panics.
+This seam exists for the PyO3 FFI handoff and for kernels that hold a typed slice and want ndarray semantics; nothing in the engine's hot path depends on it.
+
+## Which path is which
+
+ndarray-reference paths (the layout authority):
+- `walk` iterates `ndarray::indices(shape)` and reads each position via `Dimension::slice`, mapping the strides to one offset per operand — the single fallback and the reference for strided addressing.
+- `apply1`/`apply2`/`apply3` are one `ndarray::Zip` pass over static-dimension broadcast views writing an `ArrayViewMut`; `a[i]` reads element `i` of each broadcast operand, so the caller's closure owns every semantic (NaN propagation, signed zeros, wrapping).
+- `fill_broadcast` and `broadcast_vec` build one broadcast view and materialize it with `ArrayViewMut::assign` / an iterator collect; `broadcast_to` dispatches them per storage variant.
+- `map2_runs`/`map3_runs` are `apply2`/`apply3` with a pooled result vector of the exact length (never zero-filled).
+
+Measured typed-slice specializations, deliberately kept:
+- `zip1..3` / `zip2_accumulate` / `map1..3` are monomorphized indexed or iterator loops over contiguous slices, with the closure (and therefore the op kind) dispatched once per call; a map result comes from the pool when an exact-size stock exists.
+- A flat map over ≥ 2^18 elements is split over scoped threads (one per 2^17 elements, at most four); below that the calling thread runs it.
+- `blocks.rs` copies whole contiguous runs (`copy_blocks` walks the destination with `chunks_exact_mut(inner)`), and `repeat_storage` fills a whole-source `tile` one run at a time.
+- `pool.rs` recycles large result storages per thread with an LRU eviction policy; a pooled vector is only handed out for a full overwrite.
+- `apply*` dispatch on the result rank to `Ix0..Ix6`, and a size-1 operand (rank 0 or an all-ones shape) is captured as a scalar and dropped from the `Zip`, leaving a single pass over the destination; `IxDyn` survives only in the one-per-call operand base view and the rank > 6 fallback.
+- Any layout a view cannot express (a slice whose length disagrees with its shape, an operand of higher rank than the result, a non-broadcastable shape, an `out` slice of the wrong length) falls back to the `walk` loop, which keeps the pre-existing accept/reject/panic behaviour byte-identical.
+
+## Measured cost
+
+Protocol: `cargo test --release -p evoxc-cpu --lib bench_ -- --ignored --nocapture` (3 warmups, 15 iterations, median, 400 000 elements, shared host — expect run-to-run spread).
+`bench_broadcast_zip` times `map2_runs` for out `(2000, 50, 4)` f32 (the `xor_p500` population shape) with an `add` closure; the driver's cost is closure-independent.
+
+| right operand | ns/element | total ms | old hand-written run driver |
+|---|---|---|---|
+| `(4,)` bias | 1.3 (1.35–2.8 run-to-run) | 0.53–1.1 | 0.098 |
+| `(50, 1)` per-row scalar | 1.31 | 0.52 | 1.104 |
+| `()` scalar | 0.097 | 0.039 | 0.093 |
+
+`bench_walk` times the fallback/reference offset driver: rank 1 `[1000000]` contiguous 0.92, rank 2 `[1000,1000]` contiguous 1.20, rank 2 column-strided 1.02, rank 3 `[100,100,100]` contiguous 1.50 ns/element (the deleted odometer was 1.06–1.60).
+Reading: the scalar case and `walk` are at or better than the deleted driver; the `(4,)` bias and `(50,1)` per-row cases are ~1.2–13x slower than its memory-bandwidth tiling, which ndarray's generic `Zip` cannot express — the absolute cost is 0.5–1.1 ms per 400 000-element call, and the scalar/bias cases are the ones on the downstream `xor_p500` hot path.
+
+## Constraints
+
+- Depends on `evoxc-core`, `ndarray`, `half` and `num-complex`; no Python, no `unsafe`, no SIMD intrinsics.
+- Never a second layout engine: new N-dimensional addressing is expressed with ndarray views/`Zip`/`indices`, never with a hand-written increment/decrement odometer.
+- `Buffer`/`Storage` keep their owned representation and public fields; result buffers are always fresh C-contiguous `Vec`s (a shape-only op copies — that is the documented cost of having no views in `Storage`).
+- Errors are explicit `Result` values with the crate's message conventions; no `unwrap`/`expect` on user input, no silent truncation of a short operand.
+- Threads are scoped inside one call only (never a pool, never `rayon`), gated by the measured thresholds, and each thread owns a disjoint output range so results stay bit-identical.
+- Pooled results are never zero-filled on the hot paths; a pooled stock is only taken when it is fully overwritten.
+- One concern per file, target <~1000 lines including tests: the broadcast driver's independent reference tests live in `broadcast/tests.rs` as a sibling file.
+
+## Test strategy
+
+- `cargo test -p evoxc-cpu --lib` → 314 passed, 3 ignored (`bench_thread_crossover`, `bench_broadcast_zip`, `bench_walk`).
+- `broadcast/tests.rs`: every driver is pinned against an INDEPENDENT naive per-element reference (`reference_slot`, plain index arithmetic) — never against another driver — over i32 and f32 and a rank/shape matrix (`[2,3]`, `[2,2,2]`, `[4,3,5]`, `[4096,64]`, `[1000,1000]`, `[3]`, `[7,6]`, `[5]`, rank 0, zero-length axes); ordering pins that make a transposed or shifted read visible; NaN/signed-zero/i32-wrapping pass-through; the size-1 arms for `apply2`, `apply3` and `fill_broadcast`; a one-element operand whose shape claims two elements must still fall back (its pre-existing panic is pinned); a pooled garbage stock of the exact result size is fully overwritten by `map2_runs`; and the view path agrees with the flat fast path (`map2`/`apply2`, `map3`/`apply3`).
+- `ndarray_views.rs` tests: all 14 dtypes round-trip through `from_array`/`into_array`/`as_array`; a rank-0 buffer; a zero-element shape; a dtype mismatch naming both dtypes; a non-standard-layout `from_array`; and `into_array` moving the allocation (pointer identity).
+- `pool.rs`, `blocks.rs`, `zipmap.rs`, `parallel.rs` and `storage.rs` keep their own pins (retention/eviction, in-place accumulation vs the allocating map, wide-vs-narrow bit identity, thread windows, LE decode).
+
+## Known Issues
+
+- The `(4,)` bias and `(50,1)` per-row broadcast elementwise cases are slower than the deleted hand-written tiled driver (1.3 vs 0.1 / 1.1 ns/element); recovering that needs a specialized tiling driver, which the ndarray-only mandate excludes, so the trade is documented rather than fixed.
+- A size-1 operand is only captured when its shape's element count is 1 AND its slice length is 1; a one-element slice with a larger declared shape is a malformed operand and keeps the `walk` fallback (which panics exactly as before).
+- Result rank > 6 dispatches to the `IxDyn` arm: correct but slow, and no real graph reaches it.
+- `map2_runs`/`map3_runs` run on the calling thread (no outermost-axis split); only the flat `map1..3`/`zip*` paths split over scoped threads.
+- `walk`'s index iteration costs 0.9–1.5 ns/element, which is what a non-identity `transpose` (in `../kernels/indexing/reshape.rs`) now pays per element.
+- Shape-only ops copy because `Storage` owns plain `Vec`s (`reshape`, identity `transpose`, same-shape `broadcast`, a `constant` step's payload clone).
+- The stride-copy machinery for `slice`/`gather` lives in `../kernels/indexing/stride_copy.rs` and is not part of this module.
+- Stale doc links in `../kernels/elementwise/{binary,compare}.rs` still say the broadcast path is `buffer::stride`; that module no longer exists (kernels are out of this node's write scope).
+
+## Routing Table
+
+| Path | Area |
+|---|---|
+| `./mod.rs` | `Buffer` + inherent impl, `shape_text`, the three dispatch macros, the module wiring and every `crate::buffer::…` re-export. |
+| `./storage.rs` | `Storage` over the 14 dtypes, little-endian payload decode, `cast_storage`/`convert_generic`. |
+| `./broadcast.rs` | `broadcast_shape`/`broadcast_strides`, the static-dimension rank dispatch, `walk`, `apply1..3`, `broadcast_to`, `broadcast_vec`, `fill_broadcast`. |
+| `./broadcast/tests.rs` | The independent-reference pins for every driver in `broadcast.rs`. |
+| `./ndarray_views.rs` | `NdScalar` and the zero-copy `Buffer`↔`ndarray` seam (`as_array*`, `from_array`, `into_array`, `array_view[_mut]`). |
+| `./zipmap.rs` | The flat `zip1..3`/`zip2_accumulate`/`map1..3` fast paths and the pooled broadcast builders `map2_runs`/`map3_runs`. |
+| `./parallel.rs` | `PARALLEL_*`, `parallel_threads`, `split_parallel`, `window` and their crossover pins. |
+| `./pool.rs` | The thread-local recycled-storage pool, its caps/LRU policy and `take_pooled_vec`. |
+| `./blocks.rs` | Contiguous block copies (`copy_blocks`, `block_storage`, `block_storage_filled`, `repeat_storage`) behind the structure/indexing kernels. |
+| `./bench_broadcast.rs` | The `#[ignore]`d `bench_broadcast_zip` and `bench_walk` measurement instruments (evidence, never asserts speed). |
+| `./test_support.rs` | The shared `#[cfg(test)]` garbage-stock fixture. |
