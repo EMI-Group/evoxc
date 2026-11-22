@@ -103,7 +103,7 @@ fn measure(case: &Case, left: &[f32]) {
 
     for _ in 0..WARMUPS {
         let warmup = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
-        black_box(warmup.storage.len());
+        black_box(&warmup);
     }
 
     let mut samples = Vec::with_capacity(ITERATIONS);
@@ -111,10 +111,12 @@ fn measure(case: &Case, left: &[f32]) {
         let start = Instant::now();
         let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
         let elapsed = start.elapsed();
-        // Keep the result (and its storage length) observable so the call is
-        // not optimized away; the result then dies inside the timed window,
-        // exactly as a caller's temporary would.
-        black_box(result.storage.len());
+        // Escape the WHOLE value to an opaque call: reading only its length
+        // leaves the compiler free to drop the element stores into a `Vec` that
+        // dies inside the timed window, which would time a call it elided.  The
+        // result then still dies inside the window, as a caller's temporary
+        // would.
+        black_box(&result);
         samples.push(elapsed);
     }
     samples.sort_unstable();

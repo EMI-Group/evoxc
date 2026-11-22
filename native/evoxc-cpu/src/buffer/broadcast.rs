@@ -6,11 +6,13 @@
 //! its shape.  ndarray's broadcast views are the ONLY N-dimensional layout
 //! engine here: [`walk`] is a thin index iteration, `apply1..3` are `Zip` passes
 //! and [`fill_broadcast`] is one `assign` of a broadcast view, so no hand-rolled
-//! stride odometer remains.  Every driver falls back to the [`walk`] loop for a
-//! layout a view cannot express (an operand slice whose length disagrees with
-//! its shape, an operand of higher rank than the result, a result slice whose
-//! length disagrees with its shape), which keeps the pre-existing
-//! accept/reject/panic behaviour byte-identical.
+//! stride odometer remains.  A size-1 operand is captured as a scalar and dropped
+//! from that `Zip` ([`fill_broadcast`] becomes one `fill`), so it costs no
+//! per-element zero-stride producer work.  Every driver falls back to the
+//! [`walk`] loop for a layout a view cannot express (an operand slice whose
+//! length disagrees with its shape, an operand of higher rank than the result, a
+//! result slice whose length disagrees with its shape), which keeps the
+//! pre-existing accept/reject/panic behaviour byte-identical.
 //!
 //! The dimensions are STATIC (`Ix0..Ix6`), dispatched once per call from the
 //! result's rank: `IxDyn` is heap-backed, so an `IxDyn` `indices` iteration
@@ -90,6 +92,24 @@ fn base_view<'a, T: Copy>(values: &'a [T], shape: &[usize]) -> Option<ArrayViewD
     ArrayViewD::from_shape(IxDyn(shape), values).ok()
 }
 
+/// The value of a SIZE-1 operand: exactly one element whose own shape is also a
+/// single element (rank 0, or any `[1, 1, ...]`).
+///
+/// Such an operand broadcasts to a constant, so the elementwise drivers capture
+/// its value and drop that zero-stride `Zip` producer instead of paying its
+/// offset arithmetic once per result element.  The SHAPE is consulted as well as
+/// the slice length on purpose: a one-element slice whose shape claims more than
+/// one element is a malformed operand, not a scalar, so it keeps the [`walk`]
+/// fallback's behaviour (never a silent fill).
+#[inline]
+fn size_one_value<T: Copy>(values: &[T], shape: &[usize]) -> Option<T> {
+    if values.len() == 1 && shape.iter().product::<usize>() == 1 {
+        Some(values[0])
+    } else {
+        None
+    }
+}
+
 /// Dispatch one generic static-dimension helper on the result's rank.
 ///
 /// The helper takes the `Dimension` as its first argument (and may take any
@@ -158,6 +178,9 @@ pub fn walk(rank: usize, out_shape: &[usize], strides: &[Vec<usize>], mut body: 
 /// `out[i] = f(a[i])` via one ndarray `Zip` pass over static dims, or `false`
 /// when the layout cannot be expressed as views (the caller then takes the
 /// [`walk`] loop).
+///
+/// A size-1 source ([`size_one_value`]) is captured as a constant and dropped
+/// from the `Zip`, so the pass is a plain write of `f(value)` over `out`.
 fn apply1_static<T: Copy, R, D: Dimension>(
     out_shape: D,
     out: &mut [R],
@@ -168,19 +191,30 @@ fn apply1_static<T: Copy, R, D: Dimension>(
     if out.len() != out_shape.size() {
         return false;
     }
+    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape.clone(), out) else {
+        return false;
+    };
+    if let Some(value) = size_one_value(a, a_shape) {
+        ndarray::Zip::from(dest).for_each(|o| *o = f(value));
+        return true;
+    }
     let Some(a_base) = base_view(a, a_shape) else {
         return false;
     };
-    let Some(av) = a_base.broadcast(out_shape.clone()) else {
-        return false;
-    };
-    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape, out) else {
+    let Some(av) = a_base.broadcast(out_shape) else {
         return false;
     };
     ndarray::Zip::from(dest).and(av).for_each(|o, x| *o = f(*x));
     true
 }
 
+/// `out[i] = f(a[i], b[i])` via one ndarray `Zip` pass over static dims (`false`
+/// when the layout cannot be expressed as views).
+///
+/// A size-1 operand ([`size_one_value`]) is captured as a constant and dropped
+/// from the `Zip`, so a rank-0 or `[1, 1]` operand costs no per-element offset
+/// work; `a` stays the left (true-branch) argument and `b` the right in every
+/// arm.
 fn apply2_static<T: Copy, U: Copy, R, D: Dimension>(
     out_shape: D,
     out: &mut [R],
@@ -193,28 +227,55 @@ fn apply2_static<T: Copy, U: Copy, R, D: Dimension>(
     if out.len() != out_shape.size() {
         return false;
     }
+    // A size-1 operand always views and broadcasts successfully, so these two
+    // base views can be built unconditionally: the reachable outcomes (view,
+    // or the `walk` fallback) are exactly the pre-existing ones.
     let Some(a_base) = base_view(a, a_shape) else {
-        return false;
-    };
-    let Some(av) = a_base.broadcast(out_shape.clone()) else {
         return false;
     };
     let Some(b_base) = base_view(b, b_shape) else {
         return false;
     };
-    let Some(bv) = b_base.broadcast(out_shape.clone()) else {
+    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape.clone(), out) else {
         return false;
     };
-    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape, out) else {
-        return false;
-    };
-    ndarray::Zip::from(dest)
-        .and(av)
-        .and(bv)
-        .for_each(|o, x, y| *o = f(*x, *y));
+    match (size_one_value(a, a_shape), size_one_value(b, b_shape)) {
+        (Some(x), Some(y)) => {
+            ndarray::Zip::from(dest).for_each(|o| *o = f(x, y));
+        }
+        (Some(x), None) => {
+            let Some(bv) = b_base.broadcast(out_shape) else {
+                return false;
+            };
+            ndarray::Zip::from(dest).and(bv).for_each(|o, y| *o = f(x, *y));
+        }
+        (None, Some(y)) => {
+            let Some(av) = a_base.broadcast(out_shape) else {
+                return false;
+            };
+            ndarray::Zip::from(dest).and(av).for_each(|o, x| *o = f(*x, y));
+        }
+        (None, None) => {
+            let (Some(av), Some(bv)) = (a_base.broadcast(out_shape.clone()), b_base.broadcast(out_shape))
+            else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(av)
+                .and(bv)
+                .for_each(|o, x, y| *o = f(*x, *y));
+        }
+    }
     true
 }
 
+/// `out[i] = f(a[i], b[i], c[i])` via one ndarray `Zip` pass over static dims
+/// (`false` when the layout cannot be expressed as views).
+///
+/// Each size-1 operand ([`size_one_value`]) is captured as a constant and
+/// dropped from the `Zip` — the seven arms are the seven non-empty
+/// combinations — and the argument order `f(pred, on_true, on_false)` holds in
+/// every one of them.
 #[allow(clippy::too_many_arguments)]
 fn apply3_static<T: Copy, U: Copy, V: Copy, R, D: Dimension>(
     out_shape: D,
@@ -230,32 +291,98 @@ fn apply3_static<T: Copy, U: Copy, V: Copy, R, D: Dimension>(
     if out.len() != out_shape.size() {
         return false;
     }
+    // See `apply2_static`: a size-1 operand can never fail to view/broadcast.
     let Some(a_base) = base_view(a, a_shape) else {
-        return false;
-    };
-    let Some(av) = a_base.broadcast(out_shape.clone()) else {
         return false;
     };
     let Some(b_base) = base_view(b, b_shape) else {
         return false;
     };
-    let Some(bv) = b_base.broadcast(out_shape.clone()) else {
-        return false;
-    };
     let Some(c_base) = base_view(c, c_shape) else {
         return false;
     };
-    let Some(cv) = c_base.broadcast(out_shape.clone()) else {
+    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape.clone(), out) else {
         return false;
     };
-    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape, out) else {
-        return false;
-    };
-    ndarray::Zip::from(dest)
-        .and(av)
-        .and(bv)
-        .and(cv)
-        .for_each(|o, x, y, z| *o = f(*x, *y, *z));
+    // `(pred, on_true, on_false)` — `Some` is a captured scalar, `None` keeps
+    // that operand's broadcast view in the `Zip`.
+    match (
+        size_one_value(a, a_shape),
+        size_one_value(b, b_shape),
+        size_one_value(c, c_shape),
+    ) {
+        (Some(x), Some(y), Some(z)) => {
+            ndarray::Zip::from(dest).for_each(|o| *o = f(x, y, z));
+        }
+        (Some(x), Some(y), None) => {
+            let Some(cv) = c_base.broadcast(out_shape) else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(cv)
+                .for_each(|o, z| *o = f(x, y, *z));
+        }
+        (Some(x), None, Some(z)) => {
+            let Some(bv) = b_base.broadcast(out_shape) else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(bv)
+                .for_each(|o, y| *o = f(x, *y, z));
+        }
+        (None, Some(y), Some(z)) => {
+            let Some(av) = a_base.broadcast(out_shape) else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(av)
+                .for_each(|o, x| *o = f(*x, y, z));
+        }
+        (Some(x), None, None) => {
+            let (Some(bv), Some(cv)) = (b_base.broadcast(out_shape.clone()), c_base.broadcast(out_shape))
+            else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(bv)
+                .and(cv)
+                .for_each(|o, y, z| *o = f(x, *y, *z));
+        }
+        (None, Some(y), None) => {
+            let (Some(av), Some(cv)) = (a_base.broadcast(out_shape.clone()), c_base.broadcast(out_shape))
+            else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(av)
+                .and(cv)
+                .for_each(|o, x, z| *o = f(*x, y, *z));
+        }
+        (None, None, Some(z)) => {
+            let (Some(av), Some(bv)) = (a_base.broadcast(out_shape.clone()), b_base.broadcast(out_shape))
+            else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(av)
+                .and(bv)
+                .for_each(|o, x, y| *o = f(*x, *y, z));
+        }
+        (None, None, None) => {
+            let (Some(av), Some(bv), Some(cv)) = (
+                a_base.broadcast(out_shape.clone()),
+                b_base.broadcast(out_shape.clone()),
+                c_base.broadcast(out_shape),
+            ) else {
+                return false;
+            };
+            ndarray::Zip::from(dest)
+                .and(av)
+                .and(bv)
+                .and(cv)
+                .for_each(|o, x, y, z| *o = f(*x, *y, *z));
+        }
+    }
     true
 }
 
@@ -488,6 +615,9 @@ pub fn fill_broadcast<T: Scalar>(values: &[T], shape: &[usize], out_shape: &[usi
 /// `fill_broadcast`'s view path: ONE `assign` of the broadcast view into `out`
 /// (`false` when the layout is not expressible, which is the caller's cue to run
 /// [`broadcast_vec`]).
+///
+/// A size-1 source ([`size_one_value`]) is one `fill` of its single value
+/// instead of a broadcast `assign`.
 fn fill_broadcast_static<T: Copy, D: Dimension>(
     out_shape: D,
     values: &[T],
@@ -496,6 +626,13 @@ fn fill_broadcast_static<T: Copy, D: Dimension>(
 ) -> bool {
     if out.len() != out_shape.size() {
         return false;
+    }
+    if let Some(value) = size_one_value(values, shape) {
+        let Ok(mut dest) = ArrayViewMut::<T, D>::from_shape(out_shape, out) else {
+            return false;
+        };
+        dest.fill(value);
+        return true;
     }
     let Some(base) = base_view(values, shape) else {
         return false;
@@ -879,6 +1016,128 @@ mod tests {
         for (out_shape, p_shape, a_shape, b_shape) in cases {
             check_apply3_select(out_shape, p_shape, a_shape, b_shape);
         }
+    }
+
+    #[test]
+    fn a_size_one_operand_is_a_captured_scalar() {
+        // A rank-0 operand, a `[1, 1]` operand and two size-1 operands at once
+        // all broadcast to a constant; the drivers capture that value and drop
+        // the operand from the `Zip`. Every case is still checked against the
+        // independent `reference_slot` reading, so a captured scalar that landed
+        // in the wrong slot would show up.
+        let cases: &[(&[usize], &[usize], &[usize])] = &[
+            (&[2, 3], &[], &[2, 3]),             // rank-0 left
+            (&[2, 3], &[2, 3], &[1, 1]),         // `[1, 1]` right
+            (&[5], &[], &[]),                    // both size-1, rank-0
+            (&[2, 3, 4], &[1, 1], &[1, 1, 1]),   // both size-1, shaped
+            (&[500, 50, 4], &[1, 1, 1], &[4]),   // the xor_p500 bias shapes
+            (&[], &[], &[]),                     // one element in total
+        ];
+        for (out_shape, a_shape, b_shape) in cases {
+            check_apply2_i32(out_shape, a_shape, b_shape);
+            check_apply2_f32(out_shape, a_shape, b_shape);
+        }
+        // Argument order is `f(left, right)` in every arm, so a captured scalar
+        // cannot silently swap sides.
+        let mut out = [0i32; 4];
+        apply2(&mut out, &[2, 2], &[7], &[], &[1, 2], &[2], |x, y| x * 10 + y);
+        assert_eq!(out, [71, 72, 71, 72]);
+        let mut out = [0i32; 4];
+        apply2(&mut out, &[2, 2], &[1, 2], &[2], &[9], &[], |x, y| x * 10 + y);
+        assert_eq!(out, [19, 29, 19, 29]);
+        let mut out = [0i32; 3];
+        apply2(&mut out, &[3], &[4], &[1, 1], &[5], &[], |x, y| x * 10 + y);
+        assert_eq!(out, [45, 45, 45]);
+    }
+
+    #[test]
+    fn a_size_one_operand_is_a_captured_scalar_in_select() {
+        // (out, predicate, on-true, on-false): a rank-0 predicate, a `[1, 1]`
+        // on-true, a rank-0 on-false, and all three size-1 at once.
+        type SelectCase<'a> = (&'a [usize], &'a [usize], &'a [usize], &'a [usize]);
+        let cases: &[SelectCase<'_>] = &[
+            (&[2, 3], &[], &[2, 3], &[2, 3]),
+            (&[2, 3], &[2, 1], &[1, 1], &[2, 3]),
+            (&[2, 3], &[2, 1], &[2, 3], &[]),
+            (&[2, 3], &[], &[2, 3], &[]),
+            (&[2, 3, 4], &[1, 1], &[1, 1, 1], &[]),
+            (&[5, 5], &[1, 1], &[1, 1], &[1, 1]),
+        ];
+        for (out_shape, p_shape, a_shape, b_shape) in cases {
+            check_apply3_select(out_shape, p_shape, a_shape, b_shape);
+        }
+        // The predicate is operand 0 and the branches keep their order:
+        // `true` picks the on-true side, `false` the captured on-false scalar.
+        let mut out = [0i32; 3];
+        apply3(
+            &mut out,
+            &[3],
+            &[true],
+            &[],
+            &[1, 2, 3],
+            &[3],
+            &[9],
+            &[1, 1],
+            |pick, x, y| if pick { x } else { y },
+        );
+        assert_eq!(out, [1, 2, 3]);
+        let mut out = [0i32; 3];
+        apply3(
+            &mut out,
+            &[3],
+            &[false],
+            &[1, 1],
+            &[1, 2, 3],
+            &[3],
+            &[9],
+            &[1, 1],
+            |pick, x, y| if pick { x } else { y },
+        );
+        assert_eq!(out, [9, 9, 9]);
+    }
+
+    #[test]
+    fn fill_broadcast_from_a_size_one_source_is_one_fill() {
+        // A rank-0 source and a shaped-but-size-1 source both broadcast to a
+        // constant; the pooled destination is still written in full.  Each
+        // source shape is paired only with targets of at least its own rank
+        // (a broadcast never lowers the rank, and `reference_slot` right-aligns
+        // the source).
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[], &[7]),
+            (&[], &[2, 3]),
+            (&[], &[5, 1, 4]),
+            (&[], &[2000, 50, 4]),
+            (&[1], &[7]),
+            (&[1], &[2, 3]),
+            (&[1], &[5, 1, 4]),
+            (&[1, 1], &[2, 3]),
+            (&[1, 1], &[5, 1, 4]),
+            (&[1, 1], &[2000, 50, 4]),
+            (&[1, 1, 1], &[5, 1, 4]),
+            (&[1, 1, 1], &[2000, 50, 4]),
+        ];
+        for (shape, out_shape) in cases {
+            check_fill(shape, out_shape);
+        }
+        // The value is the source's single element, not a zero fill.
+        let filled = fill_broadcast(&[2.5f32], &[1, 1], &[3, 2]);
+        assert_eq!(filled, vec![2.5f32; 6]);
+        let filled = fill_broadcast(&[-7i64], &[], &[2, 2]);
+        assert_eq!(filled, vec![-7i64; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn a_one_element_operand_whose_shape_claims_two_is_not_a_scalar() {
+        // `[9]` with shape `[2]` is a MALFORMED operand, not a scalar: the
+        // size-1 arms validate the shape's element count too, so this keeps the
+        // pre-existing fallback (which reads the second element the slice does
+        // not have) instead of silently filling both result elements with `9`.
+        // A fast path keyed on the slice length alone would make this call
+        // succeed and this test fail with "test did not panic".
+        let mut out = [0i32; 2];
+        apply2(&mut out, &[2], &[9], &[2], &[10, 20], &[2], |a, b| a + b);
     }
 
     #[test]
