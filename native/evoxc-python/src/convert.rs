@@ -181,8 +181,13 @@ impl<'py, 'json> PyCache<'py, 'json> {
 
     /// One shared `int` per value (CPython's own small-int singletons are used
     /// as-is rather than copied into the table).
+    ///
+    /// The table is indexed by the value itself, so only the strictly positive
+    /// band above CPython's `-5..=256` singletons has a slot; every other value
+    /// (a negative one, or one at/above [`INT_CACHE_LIMIT`]) goes straight
+    /// through `PyInt::new`.
     fn int(&mut self, py: Python<'py>, value: i64) -> Bound<'py, PyInt> {
-        if !(-5..257).contains(&value) && value < INT_CACHE_LIMIT {
+        if (257..INT_CACHE_LIMIT).contains(&value) {
             let index = value as usize;
             if index >= self.ints.len() {
                 let grown = (index + 1).max(self.ints.len() * 2).max(64);
@@ -550,6 +555,22 @@ mod tests {
             assert!(float.as_f64().is_some() && float.as_i64().is_none());
             let text = encode(py, |py| PyString::new(py, "f32").into_any());
             assert_eq!(text, Json::String("f32".to_string()));
+        });
+    }
+    #[test]
+    fn a_negative_int_bypasses_the_shared_int_table() {
+        Python::attach(|py| {
+            let mut cache = PyCache::new();
+            // The boundary values around CPython's small-int singletons and the
+            // table's own limit, plus the extremes: the table is indexed by the
+            // value, so a negative one must never reach it.
+            for value in [-8_i64, -6, -5, -1, 0, 256, 257, 8_191, 8_192, i64::MIN, i64::MAX] {
+                let bound = number_to_py(py, &Number::from(value), &mut cache);
+                assert_eq!(bound.extract::<i64>().unwrap(), value);
+            }
+            let first = number_to_py(py, &Number::from(300_i64), &mut cache);
+            let second = number_to_py(py, &Number::from(300_i64), &mut cache);
+            assert!(first.is(&second), "an in-band value is one shared object");
         });
     }
     #[test]
