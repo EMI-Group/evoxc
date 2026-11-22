@@ -65,7 +65,7 @@ Eight workloads, `--iterations 15 --warmup 3` in one process:
 | `dot_sum_256` (256² f32 `dot` + row sum) | 3 | 0.023 | 0.380 | 0.117 | 0.31× (isolated 4.8×) |
 | `gp_gather_4096` (GP-shaped gather/select chain, 4096×64) | 80 | 0.290 | 1.512 | 0.719 | 0.48× (isolated 1.39–1.59×) |
 | `gp_sort_4096` (row argsort + sort + two-axis gather + broadcast select + reductions) | 14 | 0.072 | 3.827 | 2.049 | 0.54× |
-| `tf_softmax_8x128x384` (per-row softmax + tanh/gelu mix) | 15 | 0.073 | 3.576 | 30.692 | 8.58× |
+| `tf_softmax_8x128x384` (per-row softmax + tanh/gelu mix) | 15 | 0.073 | 3.258 | 31.232 | 9.59× |
 | `chain_2000` (2000-op elementwise chain) | 2000 | 6.281 | 0.114 | 1.280 | 11.25× |
 | `tn_step_pop500` (2249 static ops, shape-faithful TensorNEAT `Pipeline.step`) | 2249 | 10.4 | 67.190 | 56.325 | 0.84× |
 
@@ -78,7 +78,7 @@ Two rows are process-state artifacts rather than graph costs:
 
 Reading of the numbers, which is load- and shape-dependent:
 - The contiguous elementwise fast paths beat numpy on a 1e6-element mixed chain (1.6–1.9×) because per-op overhead is lower than numpy's ufunc dispatch, even though numpy fuses a whole expression into fewer passes.
-- The transcendental chain wins by 9× because `erf`/`gelu`/`tanh` go through scalar `libm` calls while numpy composes them from several ufuncs.
+- The transcendental chain wins by 9× because `erf`/`gelu`/`tanh` go through scalar `libm` calls while numpy composes them from several ufuncs, and `exp` runs libm `expf` too (no polynomial arm), which is what keeps the softmax-shaped row at 9.6×.
 - `dot` at 256² runs the `matrixmultiply` BLAS-3 kernel at ~58 GFLOP/s single-threaded but loses to numpy's threaded OpenBLAS on a matrix this small, because the engine's scoped threading only engages above its work thresholds.
 - numpy still wins where it has SIMD kernels safe Rust cannot express (`sort`/`argsort`, `astype`, `expf`) and on threaded BLAS; native wins where per-op dispatch dominates (`chain_2000` at ~0.06 µs/op), on transcendental compositions, and on every real many-small-op graph whose op mix includes control flow.
 - Compiled plans are reusable across runs (`Arc<Plan>`), so a caller that keeps the plan pays only `run`.
