@@ -292,6 +292,14 @@ impl<'a, T: Copy> Source<'a, T> for Spans<'a, T> {
 // Drivers
 // ---------------------------------------------------------------------------
 
+/// The super-block a driver hands [`run_chunks`]: a whole number of runs, so a
+/// chunk start stays a multiple of `run`, sized so the per-body-call
+/// bookkeeping disappears into the run loop instead of dominating a small run.
+fn super_block(run: usize) -> usize {
+    const TARGET: usize = 1024;
+    run * TARGET.div_ceil(run)
+}
+
 /// Drive `out[i] = f(a[i], b[i])` in runs of `run` elements, over a chunk of the
 /// result that starts at result element `start`.
 #[allow(clippy::too_many_arguments)]
@@ -310,30 +318,99 @@ fn drive2<'a, A, B, T, U, R, F>(
     R: Copy + Send,
     F: Fn(T, U) -> R + Sync,
 {
-    run_chunks(out, run, threads, |start, region| {
+    run_chunks(out, super_block(run), threads, |start, region| {
         let mut left = A::at(a, run, start);
         let mut right = B::at(b, run, start);
-        for dest in region.chunks_exact_mut(run) {
-            match (left.next(run), right.next(run)) {
-                (Feed::Value(x), Feed::Value(y)) => dest.fill(f(x, y)),
-                (Feed::Value(x), Feed::Slice(ys)) => {
-                    for (slot, y) in dest.iter_mut().zip(ys) {
-                        *slot = f(x, *y);
-                    }
+        match run {
+            2 => fixed2::<2, _, _, _, _, _, _>(region, &mut left, &mut right, f),
+            4 => fixed2::<4, _, _, _, _, _, _>(region, &mut left, &mut right, f),
+            8 => fixed2::<8, _, _, _, _, _, _>(region, &mut left, &mut right, f),
+            _ => runs2_body(region, &mut left, &mut right, run, f),
+        }
+    });
+}
+
+/// One chunk of [`drive2`] with a runtime run length (the general body).
+fn runs2_body<'a, A, B, T, U, R, F>(
+    region: &mut [R],
+    left: &mut A,
+    right: &mut B,
+    run: usize,
+    f: &F,
+) where
+    A: Source<'a, T>,
+    B: Source<'a, U>,
+    T: Copy + 'a,
+    U: Copy + 'a,
+    R: Copy,
+    F: Fn(T, U) -> R,
+{
+    for dest in region.chunks_exact_mut(run) {
+        match (left.next(run), right.next(run)) {
+            (Feed::Value(x), Feed::Value(y)) => dest.fill(f(x, y)),
+            (Feed::Value(x), Feed::Slice(ys)) => {
+                for (slot, y) in dest.iter_mut().zip(ys) {
+                    *slot = f(x, *y);
                 }
-                (Feed::Slice(xs), Feed::Value(y)) => {
-                    for (slot, x) in dest.iter_mut().zip(xs) {
-                        *slot = f(*x, y);
-                    }
+            }
+            (Feed::Slice(xs), Feed::Value(y)) => {
+                for (slot, x) in dest.iter_mut().zip(xs) {
+                    *slot = f(*x, y);
                 }
-                (Feed::Slice(xs), Feed::Slice(ys)) => {
-                    for ((slot, x), y) in dest.iter_mut().zip(xs).zip(ys) {
-                        *slot = f(*x, *y);
-                    }
+            }
+            (Feed::Slice(xs), Feed::Slice(ys)) => {
+                for ((slot, x), y) in dest.iter_mut().zip(xs).zip(ys) {
+                    *slot = f(*x, *y);
                 }
             }
         }
-    });
+    }
+}
+
+/// One chunk of [`drive2`] for a run length known at compile time: every run is a
+/// fixed-size array, so the per-run body is a constant-length statement LLVM
+/// unrolls and vectorizes (the generic body's trip count is a runtime value, so
+/// it stays scalar).
+fn fixed2<'a, const N: usize, A, B, T, U, R, F>(
+    region: &mut [R],
+    left: &mut A,
+    right: &mut B,
+    f: &F,
+) where
+    A: Source<'a, T>,
+    B: Source<'a, U>,
+    T: Copy + 'a,
+    U: Copy + 'a,
+    R: Copy,
+    F: Fn(T, U) -> R,
+{
+    for dest in region.chunks_exact_mut(N) {
+        let Ok(dest) = <&mut [R; N]>::try_from(dest) else { return };
+        match (left.next(N), right.next(N)) {
+            (Feed::Value(x), Feed::Value(y)) => dest.fill(f(x, y)),
+            (Feed::Value(x), Feed::Slice(ys)) => {
+                let Ok(ys) = <&[U; N]>::try_from(ys) else { return };
+                for index in 0..N {
+                    dest[index] = f(x, ys[index]);
+                }
+            }
+            (Feed::Slice(xs), Feed::Value(y)) => {
+                let Ok(xs) = <&[T; N]>::try_from(xs) else { return };
+                for index in 0..N {
+                    dest[index] = f(xs[index], y);
+                }
+            }
+            (Feed::Slice(xs), Feed::Slice(ys)) => {
+                let (Ok(xs), Ok(ys)) = (<&[T; N]>::try_from(xs), <&[U; N]>::try_from(ys))
+                else {
+                    return;
+                };
+                for index in 0..N {
+                    dest[index] = f(xs[index], ys[index]);
+                }
+            }
+        }
+    }
 }
 
 /// The three-operand counterpart of [`drive2`] (the `select` shape).
@@ -355,52 +432,180 @@ fn drive3<'a, A, B, C, P, T, R, F>(
     R: Copy + Send,
     F: Fn(P, T, T) -> R + Sync,
 {
-    run_chunks(out, run, threads, |start, region| {
+    run_chunks(out, super_block(run), threads, |start, region| {
         let mut pred = A::at(a, run, start);
         let mut on_true = B::at(b, run, start);
         let mut on_false = C::at(c, run, start);
-        for dest in region.chunks_exact_mut(run) {
-            let run = dest.len();
-            match (pred.next(run), on_true.next(run), on_false.next(run)) {
-                (Feed::Value(p), Feed::Value(x), Feed::Value(y)) => dest.fill(f(p, x, y)),
-                (Feed::Value(p), Feed::Value(x), Feed::Slice(ys)) => {
-                    for (slot, y) in dest.iter_mut().zip(ys) {
-                        *slot = f(p, x, *y);
-                    }
+        match run {
+            2 => fixed3::<2, _, _, _, _, _, _, _>(
+                region,
+                &mut pred,
+                &mut on_true,
+                &mut on_false,
+                f,
+            ),
+            4 => fixed3::<4, _, _, _, _, _, _, _>(
+                region,
+                &mut pred,
+                &mut on_true,
+                &mut on_false,
+                f,
+            ),
+            8 => fixed3::<8, _, _, _, _, _, _, _>(
+                region,
+                &mut pred,
+                &mut on_true,
+                &mut on_false,
+                f,
+            ),
+            _ => runs3_body(region, &mut pred, &mut on_true, &mut on_false, run, f),
+        }
+    });
+}
+
+/// One chunk of [`drive3`] with a runtime run length (the general body).
+#[allow(clippy::too_many_arguments)]
+fn runs3_body<'a, A, B, C, P, T, R, F>(
+    region: &mut [R],
+    pred: &mut A,
+    on_true: &mut B,
+    on_false: &mut C,
+    run: usize,
+    f: &F,
+) where
+    A: Source<'a, P>,
+    B: Source<'a, T>,
+    C: Source<'a, T>,
+    P: Copy + 'a,
+    T: Copy + 'a,
+    R: Copy,
+    F: Fn(P, T, T) -> R,
+{
+    for dest in region.chunks_exact_mut(run) {
+        let run = dest.len();
+        match (pred.next(run), on_true.next(run), on_false.next(run)) {
+            (Feed::Value(p), Feed::Value(x), Feed::Value(y)) => dest.fill(f(p, x, y)),
+            (Feed::Value(p), Feed::Value(x), Feed::Slice(ys)) => {
+                for (slot, y) in dest.iter_mut().zip(ys) {
+                    *slot = f(p, x, *y);
                 }
-                (Feed::Value(p), Feed::Slice(xs), Feed::Value(y)) => {
-                    for (slot, x) in dest.iter_mut().zip(xs) {
-                        *slot = f(p, *x, y);
-                    }
+            }
+            (Feed::Value(p), Feed::Slice(xs), Feed::Value(y)) => {
+                for (slot, x) in dest.iter_mut().zip(xs) {
+                    *slot = f(p, *x, y);
                 }
-                (Feed::Value(p), Feed::Slice(xs), Feed::Slice(ys)) => {
-                    for ((slot, x), y) in dest.iter_mut().zip(xs).zip(ys) {
-                        *slot = f(p, *x, *y);
-                    }
+            }
+            (Feed::Value(p), Feed::Slice(xs), Feed::Slice(ys)) => {
+                for ((slot, x), y) in dest.iter_mut().zip(xs).zip(ys) {
+                    *slot = f(p, *x, *y);
                 }
-                (Feed::Slice(ps), Feed::Value(x), Feed::Value(y)) => {
-                    for (slot, p) in dest.iter_mut().zip(ps) {
-                        *slot = f(*p, x, y);
-                    }
+            }
+            (Feed::Slice(ps), Feed::Value(x), Feed::Value(y)) => {
+                for (slot, p) in dest.iter_mut().zip(ps) {
+                    *slot = f(*p, x, y);
                 }
-                (Feed::Slice(ps), Feed::Value(x), Feed::Slice(ys)) => {
-                    for ((slot, p), y) in dest.iter_mut().zip(ps).zip(ys) {
-                        *slot = f(*p, x, *y);
-                    }
+            }
+            (Feed::Slice(ps), Feed::Value(x), Feed::Slice(ys)) => {
+                for ((slot, p), y) in dest.iter_mut().zip(ps).zip(ys) {
+                    *slot = f(*p, x, *y);
                 }
-                (Feed::Slice(ps), Feed::Slice(xs), Feed::Value(y)) => {
-                    for ((slot, p), x) in dest.iter_mut().zip(ps).zip(xs) {
-                        *slot = f(*p, *x, y);
-                    }
+            }
+            (Feed::Slice(ps), Feed::Slice(xs), Feed::Value(y)) => {
+                for ((slot, p), x) in dest.iter_mut().zip(ps).zip(xs) {
+                    *slot = f(*p, *x, y);
                 }
-                (Feed::Slice(ps), Feed::Slice(xs), Feed::Slice(ys)) => {
-                    for (((slot, p), x), y) in dest.iter_mut().zip(ps).zip(xs).zip(ys) {
-                        *slot = f(*p, *x, *y);
-                    }
+            }
+            (Feed::Slice(ps), Feed::Slice(xs), Feed::Slice(ys)) => {
+                for (((slot, p), x), y) in dest.iter_mut().zip(ps).zip(xs).zip(ys) {
+                    *slot = f(*p, *x, *y);
                 }
             }
         }
-    });
+    }
+}
+
+/// One chunk of [`drive3`] for a run length known at compile time (see
+/// [`fixed2`]): every run is a fixed-size array, so each branch is a
+/// constant-length vectorized statement.
+#[allow(clippy::too_many_arguments)]
+fn fixed3<'a, const N: usize, A, B, C, P, T, R, F>(
+    region: &mut [R],
+    pred: &mut A,
+    on_true: &mut B,
+    on_false: &mut C,
+    f: &F,
+) where
+    A: Source<'a, P>,
+    B: Source<'a, T>,
+    C: Source<'a, T>,
+    P: Copy + 'a,
+    T: Copy + 'a,
+    R: Copy,
+    F: Fn(P, T, T) -> R,
+{
+    for dest in region.chunks_exact_mut(N) {
+        let Ok(dest) = <&mut [R; N]>::try_from(dest) else { return };
+        match (pred.next(N), on_true.next(N), on_false.next(N)) {
+            (Feed::Value(p), Feed::Value(x), Feed::Value(y)) => dest.fill(f(p, x, y)),
+            (Feed::Value(p), Feed::Value(x), Feed::Slice(ys)) => {
+                let Ok(ys) = <&[T; N]>::try_from(ys) else { return };
+                for index in 0..N {
+                    dest[index] = f(p, x, ys[index]);
+                }
+            }
+            (Feed::Value(p), Feed::Slice(xs), Feed::Value(y)) => {
+                let Ok(xs) = <&[T; N]>::try_from(xs) else { return };
+                for index in 0..N {
+                    dest[index] = f(p, xs[index], y);
+                }
+            }
+            (Feed::Value(p), Feed::Slice(xs), Feed::Slice(ys)) => {
+                let (Ok(xs), Ok(ys)) = (<&[T; N]>::try_from(xs), <&[T; N]>::try_from(ys))
+                else {
+                    return;
+                };
+                for index in 0..N {
+                    dest[index] = f(p, xs[index], ys[index]);
+                }
+            }
+            (Feed::Slice(ps), Feed::Value(x), Feed::Value(y)) => {
+                let Ok(ps) = <&[P; N]>::try_from(ps) else { return };
+                for index in 0..N {
+                    dest[index] = f(ps[index], x, y);
+                }
+            }
+            (Feed::Slice(ps), Feed::Value(x), Feed::Slice(ys)) => {
+                let (Ok(ps), Ok(ys)) = (<&[P; N]>::try_from(ps), <&[T; N]>::try_from(ys))
+                else {
+                    return;
+                };
+                for index in 0..N {
+                    dest[index] = f(ps[index], x, ys[index]);
+                }
+            }
+            (Feed::Slice(ps), Feed::Slice(xs), Feed::Value(y)) => {
+                let (Ok(ps), Ok(xs)) = (<&[P; N]>::try_from(ps), <&[T; N]>::try_from(xs))
+                else {
+                    return;
+                };
+                for index in 0..N {
+                    dest[index] = f(ps[index], xs[index], y);
+                }
+            }
+            (Feed::Slice(ps), Feed::Slice(xs), Feed::Slice(ys)) => {
+                let (Ok(ps), Ok(xs), Ok(ys)) = (
+                    <&[P; N]>::try_from(ps),
+                    <&[T; N]>::try_from(xs),
+                    <&[T; N]>::try_from(ys),
+                ) else {
+                    return;
+                };
+                for index in 0..N {
+                    dest[index] = f(ps[index], xs[index], ys[index]);
+                }
+            }
+        }
+    }
 }
 
 /// The periodic-pattern specialization of the pooled broadcast builders

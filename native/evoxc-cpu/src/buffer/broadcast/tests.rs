@@ -1033,6 +1033,69 @@ fn check_periodic2(out_shape: &[usize], a_shape: &[usize], b_shape: &[usize]) {
     }
 }
 
+/// The three-operand counterpart of [`check_periodic2`]: `select` with a chunky
+/// predicate (one predicate value per inner run) and two full operands.
+fn check_periodic3(out_shape: &[usize], pred_shape: &[usize]) {
+    let count = product(out_shape);
+    let a: Vec<i32> = values(count, 3);
+    let b: Vec<i32> = values(count, 13);
+    let pred: Vec<bool> = (0..product(pred_shape)).map(|index| index % 7 < 3).collect();
+    let f = |pick: bool, x: i32, y: i32| if pick { x } else { y };
+
+    let mut generic = vec![0i32; count];
+    {
+        let _generic = switch(&RUNS_DISABLED, true);
+        apply3(&mut generic, out_shape, &pred, pred_shape, &a, out_shape, &b, out_shape, f);
+    }
+    let mut specialized = vec![0i32; count];
+    assert!(
+        patterns::runs3(
+            &mut specialized,
+            out_shape,
+            &pred,
+            pred_shape,
+            &a,
+            out_shape,
+            &b,
+            out_shape,
+            &f
+        ),
+        "out {out_shape:?}, pred {pred_shape:?}: the driver must take the layout"
+    );
+    assert_eq!(
+        specialized, generic,
+        "out {out_shape:?}, pred {pred_shape:?}: the driver disagrees with the ndarray Zip"
+    );
+    for (flat, produced) in specialized.iter().enumerate() {
+        let expected = f(
+            pred[reference_slot(out_shape, pred_shape, flat)],
+            a[reference_slot(out_shape, out_shape, flat)],
+            b[reference_slot(out_shape, out_shape, flat)],
+        );
+        assert_eq!(
+            *produced, expected,
+            "out {out_shape:?}, pred {pred_shape:?}: element {flat}"
+        );
+    }
+}
+
+/// Every run length the driver dispatches on: 2, 4 and 8 take the fixed-size
+/// chunk bodies ([`super::patterns`]' `fixed2`/`fixed3`), 3, 5 and 16 the
+/// runtime-bounded one, so all of them must agree with the ndarray reference
+/// and with the per-element formula.
+#[test]
+fn the_periodic_driver_covers_every_run_length() {
+    let _serialized = switch_guard();
+    for run in [2usize, 3, 4, 5, 8, 16] {
+        let out_shape = [48, run];
+        let chunky = [48, 1];
+        check_periodic2(&out_shape, &out_shape, &chunky);
+        check_periodic2(&out_shape, &chunky, &out_shape);
+        check_periodic2(&out_shape, &chunky, &chunky);
+        check_periodic3(&out_shape, &chunky);
+    }
+}
+
 /// The per-block constant family (`(a, 1, ..., 1)` — one source value per inner
 /// run), the small-period tile family (`(a, ..., 1)` — the innermost axis
 /// broadcast, a period-`n` tile) and the hoisted scalar.

@@ -150,10 +150,16 @@ fn median_ms(case: &Case, left: &[f32], split_disabled: bool, generic: bool) -> 
     samples[ITERATIONS / 2].as_secs_f64() * 1e3
 }
 
-/// The three broadcast cases every instrument in this file times (deterministic
+/// The broadcast cases every instrument in this file times (deterministic
 /// operands: a repeating pattern, no RNG, no allocation jitter beyond the two
 /// operand vectors themselves).
-fn cases() -> [Case; 3] {
+///
+/// The first three are the `i % period` repetition family the repeating-run
+/// driver proves; the last three are the PERIODIC-PATTERN family (`patterns`):
+/// a per-block constant (`(2000,1,1)`, one value per 200-element run), a
+/// last-axis extent-1 tile (`(2000,50,1)`, a period-4 tile) and the hoisted
+/// scalar.
+fn cases() -> [Case; 6] {
     [
         Case {
             name: "right (4,) bias",
@@ -169,6 +175,21 @@ fn cases() -> [Case; 3] {
             name: "right () scalar",
             right_shape: Vec::new(),
             right: vec![1.75],
+        },
+        Case {
+            name: "right (2000,1,1) per-block constant",
+            right_shape: vec![2000, 1, 1],
+            right: (0..2000).map(|index| index as f32 * 0.0625 - 3.0).collect(),
+        },
+        Case {
+            name: "right (2000,50,1) period-4 tile",
+            right_shape: vec![2000, 50, 1],
+            right: (0..2000 * 50).map(|index| index as f32 * 0.03125 - 3.0).collect(),
+        },
+        Case {
+            name: "right (1,1,4) inner tile",
+            right_shape: vec![1, 1, 4],
+            right: vec![0.5, -1.5, 2.0, 3.25],
         },
     ]
 }
