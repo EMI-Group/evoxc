@@ -44,11 +44,12 @@ evoxc learns from Nx (explicit numerical language, `block`, `vectorize`, `runtim
   native Rust core (in-process)      trace-time inference (Python)
   schemas · promotion                backends (Python)
   vectorize/vmap · AD · batch_       StableHLO export · numpy interpreter
-  functions  →  evoxc._evoxc_native  iree / xla / tvm adapters
+  functions · CPU engine             iree / xla / tvm adapters
+  →  evoxc._evoxc_native             (+ the "native" backend over that engine)
 ────────────────── runtime boundary ──────────────────
                      Tensor  +  DLPack
 ```
-Builtin graph transformations are one Rust implementation, reached through the `evoxc._evoxc_native` PyO3 extension (built by maturin, shipped in the `evoxc` wheel).
+Builtin graph transformations and the optional CPU execution engine are one Rust implementation, reached through the `evoxc._evoxc_native` PyO3 extension (built by maturin, shipped in the `evoxc` wheel).
 
 **Pipeline objects (public types):** `Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor`. Each is a distinct public type; functions never silently consume an earlier-stage object and perform missing steps.
 
