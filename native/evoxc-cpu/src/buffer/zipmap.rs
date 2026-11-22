@@ -11,14 +11,15 @@ use super::Buffer;
 
 /// Flat unary map: `out[i] = f(source[i])`.
 ///
-/// The inner loop is the INDEXED form over slices of one common length, not a
-/// chain of iterators: `zip` makes the trip count the minimum of three lengths,
-/// which LLVM cannot prove equal, while `0..len` over `&mut out[..len]` /
-/// `&left[..len]` both drops the per-element bounds checks (the slice length is
-/// the loop bound) and lets the vectorizer unroll it like numpy's typed ufunc
-/// inner loop.  That is the whole point of these drivers — see
-/// [`super::parallel`] — so keep them indexed; a `zip` here measures ~2x
-/// slower per element.
+/// The UNARY arm keeps the iterator form.  An indexed loop (`for i in 0..len {
+/// out[i] = f(source[i]) }` over slices of one common length) was measured
+/// against it on this host and lost: the `erf`/`gelu`/`tanh` chain over 1e6 f32
+/// ran 19.3-19.4 ms indexed vs 17.7-18.2 ms iterating (`ew_transcendental_1e6`,
+/// interleaved A/B, three rounds), while the bandwidth-bound flat cases are
+/// identical (0.11 ns/element either way) — so a unary loop whose body is one
+/// opaque per-element call prefers the iterator.  The binary and ternary arms
+/// ([`zip2`], [`zip3`]) keep the indexed form; both measured at or above the
+/// iterator form there.
 pub fn zip1<T: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     source: &[T],
@@ -35,18 +36,17 @@ pub fn zip1<T: Copy + Sync, R: Copy + Send>(
     zip1_slice(out, source, &f);
 }
 
-/// The serial arm of [`zip1`] over slices whose shortest common length bounds
-/// the loop (`f` by reference, so the callers stay monomorphized).
+/// The serial arm of [`zip1`]: an iterator chain over the shortest common
+/// length (`f` by reference, so the callers stay monomorphized).  See [`zip1`]
+/// for why the unary arm is NOT indexed like the binary/ternary ones.
 ///
 /// The strided-run driver calls the `*_slice` arms DIRECTLY: it makes one call
 /// per outer step, so it must not pay the thread gate ([`parallel_threads`])
 /// per step, and its threading decision is the run's, not one block's.
 #[inline]
 pub(super) fn zip1_slice<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: &impl Fn(T) -> R) {
-    let len = out.len().min(source.len());
-    let (out, source) = (&mut out[..len], &source[..len]);
-    for index in 0..len {
-        out[index] = f(source[index]);
+    for (target, value) in out.iter_mut().zip(source) {
+        *target = f(*value);
     }
 }
 
