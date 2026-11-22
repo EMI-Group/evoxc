@@ -5,7 +5,7 @@
 //! doc in [`super`] carries the shared declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{array_view_mut, Buffer, NdScalar};
+use crate::buffer::{Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
@@ -176,6 +176,8 @@ fn assemble<T: Scalar + NdScalar>(
         )));
     }
     let mut offset = 0usize;
+    // (axis offset, contiguous elements per outer block, the operand's data)
+    let mut slots: Vec<(usize, usize, &[T])> = Vec::with_capacity(parts.len());
     for part in parts {
         let extent = part.shape[axis];
         if extent == 0 {
@@ -186,13 +188,7 @@ fn assemble<T: Scalar + NdScalar>(
                 "concatenate: the operand shapes add up to more than the declared concatenated extent {total_axis}"
             )));
         }
-        let source = T::slice_of(&part.storage).ok_or_else(|| {
-            Error::dtype(format!(
-                "concatenate: operand dtype {} does not match the result dtype {}",
-                part.dtype.name(),
-                <T as NdScalar>::DTYPE.name()
-            ))
-        })?;
+        let source = part_slice::<T>(part)?;
         let run = extent * inner;
         if source.len() != outer * run {
             return Err(Error::shape(format!(
@@ -202,6 +198,24 @@ fn assemble<T: Scalar + NdScalar>(
                 outer * run
             )));
         }
+        slots.push((offset, run, source));
+        offset += extent;
+    }
+    if offset != total_axis {
+        return Err(Error::shape(format!(
+            "concatenate: the operand shapes add up to {offset}, not the declared concatenated extent {total_axis}"
+        )));
+    }
+    // The unit family — every part contributes exactly one element per outer
+    // block — is one exact interleave, so it is assembled block-at-a-time with
+    // the part count unrolled: contiguous destination stores, one streaming
+    // read per part, and no per-block iterator machinery.
+    if inner == 1 && slots.iter().all(|(_, run, _)| *run == 1) {
+        let sources: Vec<&[T]> = slots.iter().map(|(_, _, source)| *source).collect();
+        interleave(&sources, out);
+        return Ok(());
+    }
+    for (offset, run, source) in slots {
         if run >= BULK_RUN_ELEMENTS {
             // One contiguous run per outer block: the block's `extent` rows are
             // adjacent in the operand and adjacent in the destination region.
@@ -211,28 +225,102 @@ fn assemble<T: Scalar + NdScalar>(
                 out[dst..dst + run].copy_from_slice(&source[src..src + run]);
             }
         } else {
-            // Narrow run (a last-axis join of 1-wide parts): a stride-aware
-            // element walk over the destination region beats one memcpy per
-            // element.  This is the reference expression, pinned against the
-            // fast path in the tests below.
-            let mut dest = array_view_mut(out, shape)?;
-            let region = dest.slice_axis_mut(
-                ndarray::Axis(axis),
-                ndarray::Slice::new(offset as isize, Some((offset + extent) as isize), 1),
-            );
-            let view = part.as_array::<T>()?;
-            ndarray::Zip::from(region)
-                .and(&view)
-                .for_each(|destination, value| *destination = *value);
+            // Narrow run (a few elements per outer block, e.g. a last-axis join
+            // of 1-wide parts with a remaining-width axis): a running-cursor
+            // element walk.  One `memcpy` per block would pay the call's fixed
+            // cost on every one of them, and ndarray's `Zip` over the sliced
+            // DESTINATION region walks the outer axes element by element when the
+            // innermost extent is 1 (measured ~14 ns/element against this loop's
+            // ~2 on `concatenate f32 (500,50,1)x4` — see `bench_concatenate`).
+            // Inside one outer block the part's rows are contiguous on both
+            // sides (a run of `run` elements), so the walk is: copy `run`
+            // elements, then jump to the next block.
+            let mut src = 0usize;
+            let mut dst = offset * inner;
+            for _ in 0..outer {
+                let end = dst + run;
+                while dst < end {
+                    out[dst] = source[src];
+                    dst += 1;
+                    src += 1;
+                }
+                dst += block - run;
+            }
         }
-        offset += extent;
-    }
-    if offset != total_axis {
-        return Err(Error::shape(format!(
-            "concatenate: the operand shapes add up to {offset}, not the declared concatenated extent {total_axis}"
-        )));
     }
     Ok(())
+}
+
+/// One operand's C-contiguous elements, or the dtype diagnostic.
+fn part_slice<T: Scalar + NdScalar>(part: &Buffer) -> Result<&[T]> {
+    T::slice_of(&part.storage).ok_or_else(|| {
+        Error::dtype(format!(
+            "concatenate: operand dtype {} does not match the result dtype {}",
+            part.dtype.name(),
+            <T as NdScalar>::DTYPE.name()
+        ))
+    })
+}
+
+/// The unit family: every part contributes exactly one element per outer block,
+/// so the destination is their exact interleave.
+///
+/// The loop runs over whole destination blocks with each part's stream read
+/// forward, and the part count is unrolled for the common 1–4 so the block's
+/// elements are written through fixed slots (no per-element bounds check, no
+/// iterator setup per element).  More parts take a running-cursor fallback with
+/// the same result.
+fn interleave<T: Scalar>(sources: &[&[T]], out: &mut [T]) {
+    match sources {
+        [only] => {
+            for (block, value) in out.chunks_exact_mut(1).zip(only.iter()) {
+                block[0] = *value;
+            }
+        }
+        [first, second] => {
+            let rows = first.iter().zip(second.iter());
+            for (block, (a, b)) in out.chunks_exact_mut(2).zip(rows) {
+                let [d0, d1] = block else { continue };
+                *d0 = *a;
+                *d1 = *b;
+            }
+        }
+        [first, second, third] => {
+            let rows = first.iter().zip(second.iter()).zip(third.iter());
+            for (block, ((a, b), c)) in out.chunks_exact_mut(3).zip(rows) {
+                let [d0, d1, d2] = block else { continue };
+                *d0 = *a;
+                *d1 = *b;
+                *d2 = *c;
+            }
+        }
+        [first, second, third, fourth] => {
+            let rows = first
+                .iter()
+                .zip(second.iter())
+                .zip(third.iter().zip(fourth.iter()));
+            for (block, ((a, b), (c, d))) in out.chunks_exact_mut(4).zip(rows) {
+                let [d0, d1, d2, d3] = block else { continue };
+                *d0 = *a;
+                *d1 = *b;
+                *d2 = *c;
+                *d3 = *d;
+            }
+        }
+        _ => {
+            let width = sources.len();
+            if width == 0 {
+                return;
+            }
+            for (block_index, block) in out.chunks_exact_mut(width).enumerate() {
+                for (slot, source) in block.iter_mut().zip(sources.iter()) {
+                    if let Some(value) = source.get(block_index) {
+                        *slot = *value;
+                    }
+                }
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -539,6 +627,30 @@ mod tests {
         .unwrap();
         assert_eq!(out.shape, vec![2, 0]);
         assert_eq!(out.storage, Storage::F32(Vec::new()));
+    }
+
+    /// The unit family's unrolled part counts (1..=4) and the fallback past
+    /// them: last-axis joins of 1-wide parts against the ndarray reference.
+    #[test]
+    fn concatenate_unit_family_covers_every_unrolled_part_count() {
+        for parts in 1..=6usize {
+            let shape = [3usize, 4, 1];
+            let shapes: Vec<&[usize]> = (0..parts).map(|_| shape.as_slice()).collect();
+            let label = format!("unit family with {parts} part(s)");
+            let out = check_against_reference::<i64>(&label, &shapes, 2, |position| {
+                ramp::<i64>(numel(&shape), 1 + position as i64 * 101)
+            });
+            assert_eq!(out.shape, vec![3, 4, parts], "{label}: shape");
+        }
+        // The same unrolled counts over a rank-1 join (every part 1-wide).
+        for parts in 1..=5usize {
+            let shapes: Vec<&[usize]> = (0..parts).map(|_| [1usize].as_slice()).collect();
+            let label = format!("rank 1 unit family with {parts} part(s)");
+            let out = check_against_reference::<f64>(&label, &shapes, 0, |position| {
+                ramp::<f64>(1, 1 + position as i64 * 37)
+            });
+            assert_eq!(out.shape, vec![parts], "{label}: shape");
+        }
     }
 
     /// The destination is recycled from the thread-local pool, so it must be
