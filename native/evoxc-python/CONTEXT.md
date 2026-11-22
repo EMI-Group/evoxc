@@ -229,6 +229,8 @@ A malformed response is a `TransformError` naming the op and the field (unknown 
 The interpreter-backed set needs `numpy` importable by the linked interpreter (the `cpu::marshalling` helpers build their arrays with the `numpy` Python module).
 End-to-end verification is `source scripts/dev-env.sh && scripts/build-native.sh [--debug]` (builds the cdylib, installs it into `evoxc/` and smoke-tests `version()` through `.venv/bin/python`), then loading the installed `.so` with `importlib.util.spec_from_file_location("evoxc._evoxc_native", "evoxc/_evoxc_native.abi3.so")` — that avoids `import evoxc`, which would pull the whole Python frontend.
 No test needs a GPU, the network, or (for the always-on gate) a linked libpython.
+The `auto-init` binary links whatever interpreter pyo3 discovers at build time, so build it with `.venv/bin/python` on `PATH` (`source scripts/dev-env.sh` after the venv exists) or with `PYO3_PYTHON=<venv>/bin/python`; a numpy-less interpreter fails every `cpu::marshalling` test with `ModuleNotFoundError: No module named 'numpy'`, which is an environment fault, not a port defect.
+The sibling pytest native suite (`../../tests/backends/test_native_backend*.py`, `../../tests/native`) needs a RELEASE extension (`scripts/build-native.sh` without `--debug`): its `TestPerformanceSanity` check fails with a debug build because the unoptimized Rust kernels run ~8× the numpy interpreter.
 
 ## Manual harnesses
 
