@@ -8,7 +8,7 @@
 <p>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
-  <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, IREE, XLA, TVM"></a>
+  <a href="#backends"><img src="https://img.shields.io/badge/backends-native%20%C2%B7%20numpy%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: native, numpy, IREE, XLA, TVM"></a>
   <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7738%20passing-4c9a72?style=flat-square" alt="tests: 7738 passing"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
@@ -56,7 +56,7 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 | load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called | move your data onto the device, or recompile for another target |
 | run | `evoxc.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in | copy results to the host, cast, reshard, or insert communication |
 
-**Two backends below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
+**Three execution paths below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. `backend="native"` runs the same program on the in-process **Rust CPU engine** (immutable plans over typed host buffers, no numpy in the inner loop; bit-identical to the interpreter, faster on real workloads). The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
 
 **Layer discipline** — a strict one-way import DAG, so every problem has one owner:
 
@@ -351,6 +351,22 @@ cache = evoxc.CompileCache(maxsize=64)             # in-memory LRU; keys compute
 exe_a = evoxc.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
 exe_b = evoxc.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
 print(exe_a is exe_b, cache.hits, cache.misses)  # True 1 1
+```
+
+Inspection is pure reads at every stage: `graph.summary()` (counts, input/output trees, static values), `graph.digest()` (a structural hash that ignores source locations, so it is stable across processes and `save`/`load`), `graph.text()`, `program.summary()`/`source_text()`, and `exe.summary()`/`plan_text()` — the last renders the backend's actual plan, numpy or native.
+
+### Tensor containers: safetensors and GGUF
+
+`evoxc.formats` reads and writes the tensor half of the common checkpoint formats, with no model semantics attached: `load_safetensors`/`save_safetensors` (mmap zero-copy, 15 dtypes) and `load_gguf`/`GGUFFile` (GGUF v2/v3, 14 ggml types with Q4_0…Q6_K block dequantization). Everything comes back as host tensors you pass into a graph as explicit inputs.
+
+```python
+from evoxc.formats import load_safetensors, load_gguf
+
+ckpt = load_safetensors("model.safetensors")                    # mmap, zero-copy
+w = ckpt.tensor("model.embed.weight")                           # Device("cpu", 0)
+gguf = load_gguf("model.gguf")
+q4 = gguf.tensor("blk.0.attn_q.weight")                         # dequantized f32
+print(sorted(gguf.metadata)[:3], q4.shape, q4.dtype)
 ```
 
 ### Async host ↔ device copies
