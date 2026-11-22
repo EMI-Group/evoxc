@@ -274,6 +274,20 @@ pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
     if super::broadcast::runs2(&mut values, out_shape, left, left_shape, right, right_shape, &f) {
         return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
     }
+    // Then the periodic-pattern driver (a per-block constant `(a,1,...,1)` bias,
+    // a small-period tile, a scalar): the same run driver, generalized from
+    // `i % period` to `values[(i / stretch) % span]`.
+    if super::broadcast::periodic2(
+        &mut values,
+        out_shape,
+        left,
+        left_shape,
+        right,
+        right_shape,
+        &f,
+    ) {
+        return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+    }
     match (
         RowSplit::new(out_shape, count),
         rider(left, left_shape, out_shape),
@@ -335,6 +349,20 @@ pub fn map3_runs<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
     // The repeating-run specialization, as in `map2_runs` (and before the row
     // split for the same reason).
     if super::broadcast::runs3(
+        &mut values,
+        out_shape,
+        pred,
+        pred_shape,
+        on_true,
+        on_true_shape,
+        on_false,
+        on_false_shape,
+        &f,
+    ) {
+        return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+    }
+    // The periodic-pattern driver, as in `map2_runs`.
+    if super::broadcast::periodic3(
         &mut values,
         out_shape,
         pred,
