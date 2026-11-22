@@ -86,7 +86,7 @@ Input arity/dtype/shape are validated by the engine at the run boundary (`Backen
 
 ### numpy interop
 
-Arrays cross through the `numpy` 0.30 crate as TYPED payloads (`numpy = { version = "0.30", features = ["half"] }` + `ndarray = "0.17"`): numpy 0.30 pairs with this crate's pyo3 0.30, and its C-API is imported lazily on the first array use, so `import evoxc` still touches neither numpy nor the crate.
+Arrays cross through the `numpy` 0.30 crate as TYPED payloads (`numpy = { version = "0.30", features = ["half"] }` + `ndarray = "0.17"`): numpy 0.30 pairs with this crate's pyo3 0.30, and its C-API is imported lazily on the first array use, so loading the extension still imports neither numpy nor PyPI helpers (verified: `numpy` is absent from `sys.modules` after loading only `evoxc/_evoxc_native.abi3.so`).
 `half` and `num-complex` stay direct dependencies because they type the `Storage` variants — the same crates and semver numpy and `evoxc-cpu` use, so `f16`/`Complex<f32>`/`Complex<f64>` are the very types numpy expects.
 There is no `PyBuffer` byte marshalling, no `numpy.ascontiguousarray` call, no `numpy` Python-module import outside the tests, and no `unsafe` of the crate's own; the per-direction design is "Buffer hand-off (native CPU engine)" below.
 
