@@ -366,6 +366,88 @@ mod tests {
         }
     }
 
+    /// The `(500, 50, 4) -> (500, 50, 1)` family — one element out of every
+    /// 4-element innermost run — is ONE strided run for every selected offset,
+    /// which is the lane-grouped copy path (never a per-element walk).
+    #[test]
+    fn the_last_axis_single_element_family_is_one_strided_run() {
+        let shape = [500usize, 50, 4];
+        let values: Vec<f32> = (0..util::numel(&shape)).map(|index| index as f32).collect();
+        let x = f32_buffer(&shape, &values);
+        let source_strides = util::c_strides(&shape);
+        for start in [0i64, 1, 2, 3] {
+            let op = spec(attrs(&[
+                ("start_indices", evoxc_core::AttrValue::Ints(vec![0, 0, start])),
+                (
+                    "limit_indices",
+                    evoxc_core::AttrValue::Ints(vec![500, 50, start + 1]),
+                ),
+                ("strides", evoxc_core::AttrValue::Null),
+            ]));
+            let ranges = slice_ranges(&op, &shape).unwrap();
+            let plan = copy_plan(&ranges, &source_strides).expect("a forward plan");
+            assert_eq!(
+                plan.axes,
+                vec![CopyAxis {
+                    extent: 25_000,
+                    stride: 4
+                }],
+                "start {start}"
+            );
+            assert_eq!(plan.base, start as usize);
+            let out = slice(&x, &ranges, &declared(&[500, 50, 1])).unwrap();
+            assert_eq!(out.shape, vec![500, 50, 1]);
+            match &out.storage {
+                Storage::F32(copied) => {
+                    assert_eq!(copied.len(), 25_000);
+                    for (index, value) in copied.iter().enumerate() {
+                        assert_eq!(
+                            *value,
+                            values[index * 4 + start as usize],
+                            "start {start}, element {index}"
+                        );
+                    }
+                }
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
+    }
+
+    /// An identity (or whole-array) slice is ONE contiguous run: a single bulk
+    /// `copy_from_slice` into a pooled result, for every dtype.
+    #[test]
+    fn a_whole_array_slice_is_one_contiguous_run() {
+        let shape = [4usize, 3];
+        let strides = util::c_strides(&shape);
+        let op = spec(attrs(&[
+            ("start_indices", evoxc_core::AttrValue::Ints(vec![0, 0])),
+            ("limit_indices", evoxc_core::AttrValue::Ints(vec![4, 3])),
+            ("strides", evoxc_core::AttrValue::Null),
+        ]));
+        let ranges = slice_ranges(&op, &[4, 3]).unwrap();
+        let plan = copy_plan(&ranges, &strides).expect("a forward plan");
+        assert_eq!(
+            plan.axes,
+            vec![CopyAxis {
+                extent: 12,
+                stride: 1
+            }]
+        );
+        assert_eq!(plan.base, 0);
+        // i32 and bool keep the same plan and the same element order.
+        let ints: Vec<i32> = (0..12).collect();
+        let plan = CopyPlan::new(0, vec![CopyAxis { extent: 12, stride: 1 }]);
+        assert_eq!(
+            plan.copy(&ints, 12, "slice").unwrap(),
+            Storage::I32(ints.clone())
+        );
+        let flags: Vec<bool> = (0..12).map(|index| index % 3 == 0).collect();
+        assert_eq!(
+            plan.copy(&flags, 12, "slice").unwrap(),
+            Storage::Bool(flags.clone())
+        );
+    }
+
     /// A nonzero `start` on every axis of the plan still lands on the right
     /// element: the base offset is the sum of `start x source stride`.
     #[test]
