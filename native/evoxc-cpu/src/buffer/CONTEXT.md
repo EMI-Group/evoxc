@@ -81,7 +81,7 @@ Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, whi
 
 ## Known Issues
 
-- The `(4,)` bias and `(50,1)` per-row broadcast elementwise cases are slower than the deleted hand-written tiled driver (1.3 vs 0.1 / 1.1 ns/element); recovering that needs a specialized tiling driver, which the ndarray-only mandate excludes, so the trade is documented rather than fixed.
+- The `(4,)` bias broadcast elementwise case is still slower than the deleted hand-written tiled driver (0.455 vs 0.098 ns/element); recovering it needs a specialized tiling driver, which the ndarray-only mandate excludes, so the trade is documented rather than fixed. The per-row-scalar case is now ahead of it (0.439 vs 1.104).
 - A size-1 operand is only captured when its shape's element count is 1 AND its slice length is 1; a one-element slice with a larger declared shape is a malformed operand and keeps the `walk` fallback (which panics exactly as before).
 - Result rank > 6 dispatches to the `IxDyn` arm: correct but slow, and no real graph reaches it.
 - `map2_runs`/`map3_runs` run on the calling thread (no outermost-axis split); only the flat `map1..3`/`zip*` paths split over scoped threads.
