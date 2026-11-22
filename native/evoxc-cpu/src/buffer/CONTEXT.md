@@ -105,5 +105,5 @@ Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, whi
 | `./parallel.rs` | `PARALLEL_*`, `parallel_threads`, `split_parallel`, `window` and their crossover pins. |
 | `./pool.rs` | The thread-local recycled-storage pool, its caps/LRU policy and `take_pooled_vec`. |
 | `./blocks.rs` | Contiguous block copies (`copy_blocks`, `block_storage`, `block_storage_filled`, `repeat_storage`) behind the structure/indexing kernels. |
-| `./bench_broadcast.rs` | The `#[ignore]`d `bench_broadcast_zip` and `bench_walk` measurement instruments (evidence, never asserts speed). |
+| `./bench_broadcast.rs` | The `#[ignore]`d `bench_broadcast_zip` (three operand shapes), `bench_broadcast_zip_threads` (the same cases with the row split forced off and on) and `bench_walk` measurement instruments (evidence, never asserts speed). |
 | `./test_support.rs` | The shared `#[cfg(test)]` garbage-stock fixture. |
