@@ -90,6 +90,13 @@ fn call(left: &[f32], right: &[f32], right_shape: &[usize]) -> Result<Buffer> {
     )
 }
 
+/// Serializes the instruments in this file: they flip the process-wide A/B
+/// switches ([`RUNS_DISABLED`], [`SPLIT_DISABLED`]) while `cargo test` runs them
+/// in parallel threads, so two instruments at once would time each other's mode.
+fn bench_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 /// Chunks one row split of [`OUT_SHAPE`] spans (the leading chunk stays on the
 /// calling thread, so this is chunks rather than spawned threads).
 fn split_threads() -> usize {
@@ -190,6 +197,7 @@ fn print_pair(title: &str, split_disabled: bool) {
 #[test]
 #[ignore = "benchmark instrument: prints the broadcast map2_runs cost, never asserts"]
 fn bench_broadcast_zip() {
+    let _serialized = bench_guard();
     let threads = split_threads();
     println!("broadcast map2_runs: the repeating-run specialization against the ndarray Zip");
     println!(
@@ -221,6 +229,7 @@ fn median_split_ms(case: &Case, left: &[f32], disabled: bool) -> f64 {
 #[test]
 #[ignore = "benchmark instrument: prints the row-split broadcast map2_runs cost, never asserts"]
 fn bench_broadcast_zip_threads() {
+    let _serialized = bench_guard();
     let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
     let threads = split_threads();
     println!("broadcast map2_runs (row split over {threads} chunk(s), f32 `add`)");
@@ -313,6 +322,7 @@ fn measure_walk(name: &str, out_shape: &[usize], strides: &[Vec<usize>]) {
 #[test]
 #[ignore = "benchmark instrument: prints the walk cost, never asserts"]
 fn bench_walk() {
+    let _serialized = bench_guard();
     println!("walk (strided offset driver)");
     for (name, out_shape, strides) in walk_cases() {
         measure_walk(name, &out_shape, &strides);
