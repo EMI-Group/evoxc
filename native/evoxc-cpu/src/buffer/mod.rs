@@ -19,6 +19,9 @@ use num_complex::Complex;
 
 mod blocks;
 mod broadcast;
+#[cfg(test)]
+mod bench_broadcast;
+mod ndarray_views;
 mod parallel;
 mod pool;
 mod storage;
@@ -31,6 +34,7 @@ pub use blocks::{block_storage, block_storage_filled, copy_blocks, repeat_storag
 pub use broadcast::{
     apply1, apply2, apply3, broadcast_shape, broadcast_strides, broadcast_to, walk,
 };
+pub use ndarray_views::{array_view, array_view_mut, NdScalar};
 pub use storage::Storage;
 pub use stride::{fill_broadcast, apply2 as apply2_runs, apply3 as apply3_runs};
 pub use zipmap::{map1, map2, map2_runs, map3, map3_runs, zip1, zip2, zip2_accumulate, zip3};
