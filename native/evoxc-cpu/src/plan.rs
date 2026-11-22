@@ -76,7 +76,9 @@ pub struct Step {
     /// A `constant` op's payload, decoded ONCE here so a run clones a buffer
     /// instead of re-decoding the same bytes on every call.  `None` for every
     /// other op (and the value is identical to what the `constant` kernel
-    /// would decode).
+    /// would decode).  It stays an owned `Buffer` rather than a shared handle
+    /// because `Plan` must remain `Send + Sync` (the FFI keeps it across
+    /// threads of callers), which rules out an `Rc` here.
     pub constant: Option<Buffer>,
     /// `Some` when this step may accumulate into one of its own operands (see
     /// [`InPlace`]); `None` for every op that must allocate a result.

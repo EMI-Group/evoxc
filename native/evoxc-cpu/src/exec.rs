@@ -108,7 +108,8 @@ impl<'p> RunCtx<'p> {
 
     /// Execute the entry function over flat inputs.
     pub fn run(&mut self, inputs: Vec<Buffer>) -> Result<Vec<Buffer>> {
-        let signature = self.plan.functions[self.plan.entry].clone();
+        let plan = Arc::clone(&self.plan);
+        let signature = &plan.functions[plan.entry];
         if inputs.len() != signature.input_types.len() {
             return Err(Error::backend(format!(
                 "program expects {} input(s), got {}",
@@ -194,7 +195,10 @@ impl<'p> RunCtx<'p> {
 
     /// Execute one block's plan; returns the terminator's values.
     pub fn run_block(&mut self, block_index: usize, args: Vec<Value>) -> Result<Vec<Value>> {
-        let plan = self.plan.clone();
+        // The plan is immutable and `blocks` holds an `Arc` per block, so a
+        // block entry (which every region iteration re-enters) is a reference
+        // bump, never a deep clone of the block's steps.
+        let plan = Arc::clone(&self.plan);
         let block = plan
             .blocks
             .get(block_index)
