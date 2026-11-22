@@ -237,15 +237,27 @@ pub(super) fn cast_storage(source: &Storage, target: DType) -> Storage {
 }
 
 fn convert_generic<S: Scalar>(values: &[S], target: DType) -> Storage {
+    /// One typed conversion pass into a POOLED destination: a cast overwrites
+    /// every element, which is exactly the contract `take_pooled_vec` requires,
+    /// and skipping the per-call allocation (and its page faults) is most of a
+    /// 50k-element `cast`'s remaining cost.  No stock of the exact size leaves
+    /// the plain `collect` arm.
     macro_rules! to {
-        ($ty:ty) => {
-            <$ty as Scalar>::into_storage(
-                values
+        ($ty:ty) => {{
+            let out: Vec<$ty> = match crate::buffer::take_pooled_vec::<$ty>(values.len()) {
+                Some(mut pooled) => {
+                    for (slot, value) in pooled.iter_mut().zip(values) {
+                        *slot = <$ty as Scalar>::from_scalar(value.to_scalar());
+                    }
+                    pooled
+                }
+                None => values
                     .iter()
                     .map(|value| <$ty as Scalar>::from_scalar(value.to_scalar()))
                     .collect(),
-            )
-        };
+            };
+            <$ty as Scalar>::into_storage(out)
+        }};
     }
     match target {
         DType::Bool => to!(bool),
@@ -280,5 +292,22 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|value| value.to_le_bytes()).collect();
         let storage = decode_storage(DType::Float32, &bytes).unwrap();
         assert_eq!(storage, Storage::F32(words));
+    }
+
+    #[test]
+    fn a_pooled_cast_destination_is_fully_overwritten() {
+        // The cast recycles a pooled destination, so a stock handed back by a
+        // previous conversion must be written end to end — no stale element may
+        // survive into the next result.
+        let count = POOL_MIN_BYTES / std::mem::size_of::<f32>() + 8;
+        let source: Vec<i64> = (0..count as i64).map(|index| index * 3).collect();
+        let expected: Vec<i32> = source.iter().map(|value| *value as i32).collect();
+        let first = cast_storage(&Storage::I64(source.clone()), DType::Int32);
+        assert_eq!(first, Storage::I32(expected.clone()));
+        // Dropping the first result hands its storage to the thread-local pool,
+        // so the second conversion takes the pooled arm.
+        drop(first);
+        let second = cast_storage(&Storage::I64(source), DType::Int32);
+        assert_eq!(second, Storage::I32(expected));
     }
 }
