@@ -51,15 +51,16 @@ Measured typed-slice specializations, deliberately kept:
 
 Protocol: `cargo test --release -p evoxc-cpu --lib bench_ -- --ignored --nocapture` (3 warmups, 15 iterations, median, 400 000 elements, shared host — expect run-to-run spread).
 `bench_broadcast_zip` times `map2_runs` for out `(2000, 50, 4)` f32 (the `xor_p500` population shape) with an `add` closure; the driver's cost is closure-independent.
+`bench_broadcast_zip_threads` A/Bs the identical code with the row split forced off and on (`rowsplit`'s `#[cfg(test)] SPLIT_DISABLED`) in one process, so the thread effect is separated from host drift.
 
-| right operand | ns/element | total ms | old hand-written run driver |
+| right operand | single result (split off) | default (row split, 3 chunks) | old hand-written run driver |
 |---|---|---|---|
-| `(4,)` bias | 1.3 (1.35–2.8 run-to-run) | 0.53–1.1 | 0.098 |
-| `(50, 1)` per-row scalar | 1.31 | 0.52 | 1.104 |
-| `()` scalar | 0.097 | 0.039 | 0.093 |
+| `(4,)` bias | 1.11 ns/element, 0.444 ms | **0.455 ns/element, 0.182 ms** | 0.098 |
+| `(50, 1)` per-row scalar | 1.14 ns/element, 0.455 ms | **0.439 ns/element, 0.176 ms** | 1.104 |
+| `()` scalar | 0.088 ns/element, 0.035 ms | 0.096 ns/element, 0.039 ms | 0.093 |
 
 `bench_walk` times the fallback/reference offset driver: rank 1 `[1000000]` contiguous 0.92, rank 2 `[1000,1000]` contiguous 1.20, rank 2 column-strided 1.02, rank 3 `[100,100,100]` contiguous 1.50 ns/element (the deleted odometer was 1.06–1.60).
-Reading: the scalar case and `walk` are at or better than the deleted driver; the `(4,)` bias and `(50,1)` per-row cases are ~1.2–13x slower than its memory-bandwidth tiling, which ndarray's generic `Zip` cannot express — the absolute cost is 0.5–1.1 ms per 400 000-element call, and the scalar/bias cases are the ones on the downstream `xor_p500` hot path.
+Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, which puts the per-row shape ahead of the deleted driver (0.44 vs 1.10) and leaves only the `(4,)` bias ~4.6x behind its memory-bandwidth tiling (ndarray's generic `Zip` cannot express that tiling); the scalar case is memory-bound and pays ~8 % (~4 µs) of thread setup for nothing, which is small against the 0.26 ms the same change buys. `walk` and the scalar case are at or better than the deleted driver.
 
 ## Constraints
 
