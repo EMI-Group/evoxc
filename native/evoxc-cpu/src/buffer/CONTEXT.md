@@ -36,7 +36,7 @@ ndarray-reference paths (the layout authority):
 - `walk` iterates `ndarray::indices(shape)` and reads each position via `Dimension::slice`, mapping the strides to one offset per operand — the single fallback and the reference for strided addressing.
 - `apply1`/`apply2`/`apply3` are one `ndarray::Zip` pass over static-dimension broadcast views writing an `ArrayViewMut`; `a[i]` reads element `i` of each broadcast operand, so the caller's closure owns every semantic (NaN propagation, signed zeros, wrapping).
 - `fill_broadcast` and `broadcast_vec` build one broadcast view and materialize it with `ArrayViewMut::assign` / an iterator collect; `broadcast_to` dispatches them per storage variant.
-- `map2_runs`/`map3_runs` are `apply2`/`apply3` with a pooled result vector of the exact length (never zero-filled).
+- `map2_runs`/`map3_runs` are `apply2`/`apply3` with a pooled result vector of the exact length (never zero-filled), and a result of at least 2^18 elements is split over scoped threads on its OUTERMOST axis (row-aligned chunks, the leading chunk on the calling thread; an operand that cannot ride a row chunk — a higher rank, a disagreeing outer extent, a slice whose length is not its element count — sends the whole result back to the single-threaded driver).
 
 Measured typed-slice specializations, deliberately kept:
 - `zip1..3` / `zip2_accumulate` / `map1..3` are monomorphized indexed or iterator loops over contiguous slices, with the closure (and therefore the op kind) dispatched once per call; a map result comes from the pool when an exact-size stock exists.
