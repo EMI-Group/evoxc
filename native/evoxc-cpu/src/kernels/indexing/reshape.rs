@@ -6,7 +6,7 @@
 //! declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{walk, Buffer};
+use crate::buffer::{block_storage_filled, walk, Buffer};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
@@ -29,9 +29,16 @@ pub(super) fn reshape_kernel(
     single(reshape(source, &declared)?)
 }
 
-/// Replace the shape of an already C-contiguous buffer (a pure reinterpretation
-/// — no data movement). The declared result shape is the target: inference has
+/// Replace the shape of an already C-contiguous buffer. The relabel is exact —
+/// the element ORDER is untouched — but the result still owns its own storage,
+/// so the data is copied. The declared result shape is the target: inference has
 /// already resolved a `-1` wildcard, so it must be fully static here.
+///
+/// The copy is ONE contiguous run through [`block_storage_filled`], which takes
+/// a pooled allocation of exactly the result's length and overwrites all of it
+/// (the same path `tile`/`slice`/`gather` results take): a fresh
+/// `source.storage.clone()` would instead pay a brand-new page-faulted
+/// `malloc`/`mmap` per call for every reshape temporary.
 fn reshape(source: &Buffer, declared: &[Option<usize>]) -> Result<Buffer> {
     let mut target = Vec::with_capacity(declared.len());
     for dim in declared {
@@ -51,7 +58,14 @@ fn reshape(source: &Buffer, declared: &[Option<usize>]) -> Result<Buffer> {
             render_shape(&target)
         )));
     }
-    Buffer::new(source.dtype, target, source.storage.clone())
+    // A reshape covers the whole result with one contiguous run, so the copy
+    // needs no zero fill and reuses a pooled allocation of exactly `total`
+    // elements (`inner = total`, one block at offset 0). `total == 0` is an
+    // empty buffer of the right shape, never an error.
+    let storage = with_type!(source, |values| block_storage_filled(
+        values, &target, &[0], total, "reshape"
+    ))?;
+    Buffer::new(source.dtype, target, storage)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,9 +120,14 @@ fn transpose(source: &Buffer, permutation: &[usize], declared: &[Option<usize>])
         .collect();
     let shape = reconcile("transpose", declared, derived)?;
     // An identity permutation (which is what a `null` permutation means below
-    // rank 2) moves no data: the result is the operand, re-labelled.
+    // rank 2) moves no data: the result is the operand, re-labelled — copied as
+    // one contiguous run through the pooled block builder, like `reshape`.
     if permutation.iter().enumerate().all(|(axis, target)| axis == *target) {
-        return Buffer::new(source.dtype, shape, source.storage.clone());
+        let total = util::numel(&shape);
+        let storage = with_type!(source, |values| block_storage_filled(
+            values, &shape, &[0], total, "transpose"
+        ))?;
+        return Buffer::new(source.dtype, shape, storage);
     }
     let source_strides = util::c_strides(&source.shape);
     let strides: Vec<usize> = permutation
@@ -166,7 +185,54 @@ mod tests {
     fn reshape_element_count_mismatch_is_an_error() {
         let x = f32_buffer(&[2, 3], &[0.; 6]);
         let err = reshape(&x, &declared(&[4, 2])).unwrap_err();
-        assert!(err.message.contains("cannot reshape array of size 6"), "{}", err.message);
+        // The wording is part of the engine's contract: numpy's message, byte
+        // for byte, in the ShapeError family.
+        assert_eq!(
+            err.message,
+            "reshape: cannot reshape array of size 6 into shape (4,2)"
+        );
+        assert_eq!(err.kind, evoxc_core::ErrorKind::Shape);
+    }
+
+    #[test]
+    fn reshape_copies_a_large_result_out_of_a_recycled_pool_stock() {
+        // 100_000 f32 = 400 KB, well above the pool's retention floor, so the
+        // recycled stock parked below really is the allocation the result is
+        // built in: every element must be overwritten by the copy.
+        const COUNT: usize = 100_000;
+        let garbage = f32_buffer(&[COUNT], &vec![f32::NAN; COUNT]);
+        drop(garbage);
+        let values: Vec<f32> = (0..COUNT).map(|index| index as f32 * 0.5).collect();
+        let source = f32_buffer(&[500, 50, 4], &values);
+        let out = reshape(&source, &declared(&[200, 500])).unwrap();
+        assert_eq!(out.shape, vec![200, 500]);
+        match &out.storage {
+            Storage::F32(values) => {
+                assert_eq!(values.len(), COUNT);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(*value, index as f32 * 0.5, "element {index}");
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_keeps_an_empty_buffer_empty() {
+        let empty = f32_buffer(&[0, 3], &[]);
+        let flat = reshape(&empty, &declared(&[0])).unwrap();
+        assert_eq!(flat.shape, vec![0]);
+        assert_eq!(flat.storage, Storage::F32(Vec::new()));
+        // An empty source reshaped to a shape whose 0 sits elsewhere: still an
+        // empty buffer of the right shape, never an error.
+        let out = reshape(&empty, &declared(&[3, 0])).unwrap();
+        assert_eq!(out.shape, vec![3, 0]);
+        assert_eq!(out.storage, Storage::F32(Vec::new()));
+        // Only a 0-element source can reach an empty shape: a non-empty one is
+        // the ordinary element-count mismatch.
+        let full = f32_buffer(&[4], &[1., 2., 3., 4.]);
+        let none = reshape(&full, &declared(&[2, 0])).unwrap_err();
+        assert!(none.message.contains("cannot reshape array of size 4"), "{}", none.message);
     }
 
     #[test]
@@ -177,6 +243,31 @@ mod tests {
     }
 
     // -- transpose --------------------------------------------------------
+
+    #[test]
+    fn transpose_identity_permutation_copies_the_operand_in_order() {
+        // The no-move path: an explicit identity permutation and (below rank 2)
+        // a `null` one both keep the operand's order element for element.
+        let x = f32_buffer(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let identity = transpose(&x, &[0, 1], &declared(&[2, 3])).unwrap();
+        assert_eq!(identity.shape, vec![2, 3]);
+        assert_eq!(identity.storage, Storage::F32(vec![1., 2., 3., 4., 5., 6.]));
+
+        let vector = f32_buffer(&[4], &[1.5, -0.0, 0.25, 3.5]);
+        let permutation = transpose_permutation(&spec(Attrs::new()), 1).unwrap();
+        assert_eq!(permutation, vec![0]);
+        let out = transpose(&vector, &permutation, &declared(&[4])).unwrap();
+        assert_eq!(out.shape, vec![4]);
+        assert_eq!(out.storage, vector.storage);
+
+        // A neutral-size reshaped identity transpose of a larger operand, so the
+        // pooled block builder's contract (`offsets.len() * inner == total`) is
+        // pinned on the no-move path too.
+        let big = f32_buffer(&[50, 100], &(0..5000).map(|i| i as f32).collect::<Vec<_>>());
+        let same = transpose(&big, &[0, 1], &declared(&[50, 100])).unwrap();
+        assert_eq!(same.shape, vec![50, 100]);
+        assert_eq!(same.storage, big.storage);
+    }
 
     #[test]
     fn transpose_defaults_to_reversing_every_axis() {
