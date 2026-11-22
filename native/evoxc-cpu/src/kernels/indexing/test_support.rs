@@ -20,6 +20,10 @@ pub(super) fn i64_buffer(shape: &[usize], values: &[i64]) -> Buffer {
     buffer(DType::Int64, shape, Storage::I64(values.to_vec()))
 }
 
+pub(super) fn i32_buffer(shape: &[usize], values: &[i32]) -> Buffer {
+    buffer(DType::Int32, shape, Storage::I32(values.to_vec()))
+}
+
 pub(super) fn declared(dims: &[usize]) -> Vec<Option<usize>> {
     dims.iter().map(|dim| Some(*dim)).collect()
 }

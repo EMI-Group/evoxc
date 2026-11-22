@@ -7,17 +7,17 @@
 //! error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{shape_text, Buffer, Storage};
+use crate::buffer::{shape_text, take_pooled_vec, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
-use crate::scalar::{Scalar, ScalarValue};
+use crate::scalar::Scalar;
 use crate::with_same_type;
 use crate::with_type;
 
 use super::{
-    for_each_index, index_values, offset_error, operand, reconcile, require_integer_indices,
-    resolve_index,
+    for_each_index, index_as_i128, index_values, offset_error, operand, reconcile,
+    require_integer_indices, resolve_index, resolve_index_fast,
 };
 
 pub(super) fn scatter_kernel(
@@ -115,14 +115,13 @@ fn scatter(
         )));
     }
     let shape = reconcile("scatter", declared, source.shape.clone())?;
-    // The overwhelmingly common shape of a `put_along_axis` — a fully-shaped
-    // index tensor with a matching `updates` — takes a typed path that reads
-    // the index buffer directly (no `i128` widening) and has no per-element
-    // stride odometers; every other (broadcast) selection keeps the general
-    // driver below, which is the only place the widened indices are built.
-    if let Some(storage) =
-        scatter_full_rank(source, indices, &index_shape, updates, axis, &selection)?
-    {
+    // The overwhelmingly common shape of a `put_along_axis` — an index tensor
+    // that selects whole runs (its non-axis extents equal the data's) with a
+    // matching `updates` — takes a typed path that reads the index buffer
+    // directly (no `i128` widening) and has no per-element stride odometers;
+    // every other (broadcast) selection keeps the general driver below, which
+    // is the only place the widened indices are built.
+    if let Some(storage) = scatter_selection(source, indices, &index_shape, updates, axis)? {
         return Buffer::new(source.dtype, shape, storage);
     }
     let widened = index_values(indices)?;
@@ -140,59 +139,79 @@ fn scatter(
     ))
 }
 
-/// The no-broadcast `scatter` fast path: a full-rank index tensor whose shape
-/// equals the data's, with `updates` exactly the advanced-indexing selection.
+/// The no-broadcast `scatter` fast path: a full-rank index tensor whose
+/// non-axis extents equal the data's, with `updates` exactly the
+/// advanced-indexing selection.
 ///
+/// The index tensor need NOT have full-rank-equal-to-data shape: it may select
+/// an arbitrary number of runs along `axis` (the `scatter(vec[50500],
+/// idx[25000], values[25000])` shape, where `axis` is the only extent that
+/// differs) — that is exactly numpy's `put_along_axis` on a 1-D destination.
 /// The general path walks every selected element through three rank-deep
-/// stride loops (index, source, update) with a bounds-checked read and a
-/// bounds-checked write per element, on top of a whole-tensor `i128` widening
-/// of the index operand.  Here the typed index buffer is resolved ONCE into a
-/// compact `Vec<usize>` (numpy's negative-index and bounds rules, unchanged
-/// error wording) and the walk is one flat loop in the result's C order —
-/// which is what keeps numpy's duplicate-index rule (the LAST write in C order
-/// wins).  `Ok(None)` when this decomposition does not apply (a padded or
-/// broadcast index/update shape, an empty operand) — the general driver owns
-/// those.
-fn scatter_full_rank(
+/// stride loops (index, source, update) with a bounds-checked read and write
+/// per element, on top of a whole-tensor `i128` widening of the index operand.
+/// Here the typed index buffer is resolved ONCE into a compact `Vec<usize>`
+/// (numpy's negative-index and bounds rules, unchanged error wording) and the
+/// walk is one flat loop in the result's C order — which is what keeps numpy's
+/// duplicate-index rule (the LAST write in C order wins).  `Ok(None)` when this
+/// decomposition does not apply (a padded or broadcast index/update shape, an
+/// empty operand) — the general driver owns those.
+fn scatter_selection(
     source: &Buffer,
     indices: &Buffer,
     index_shape: &[usize],
     updates: &Buffer,
     axis: usize,
-    selection: &[usize],
 ) -> Result<Option<Storage>> {
-    if index_shape != source.shape.as_slice() || updates.shape.as_slice() != selection {
+    if index_shape.len() != source.rank() || updates.shape.as_slice() != index_shape {
         return Ok(None);
+    }
+    // No broadcast anywhere but the gathered axis: an index extent of 1 against
+    // a longer data extent (or the reverse) writes whole runs from one element
+    // and keeps the general driver.
+    for (position, (data, index)) in source.shape.iter().zip(index_shape).enumerate() {
+        if position != axis && data != index {
+            return Ok(None);
+        }
     }
     let Some(&extent) = source.shape.get(axis) else {
         return Ok(None);
     };
+    let Some(&selected) = index_shape.get(axis) else {
+        return Ok(None);
+    };
     let inner: usize = source.shape[axis + 1..].iter().product();
+    let outer: usize = source.shape[..axis].iter().product();
     let total = source.numel();
-    if total == 0 || extent == 0 || inner == 0 || indices.numel() != total {
+    if total == 0 || extent == 0 || inner == 0 || selected == 0 {
         return Ok(None);
     }
     let Some(band) = extent.checked_mul(inner) else {
         return Ok(None);
     };
-    if total % band != 0 {
+    let Some(count) = outer
+        .checked_mul(selected)
+        .and_then(|count| count.checked_mul(inner))
+    else {
+        return Ok(None);
+    };
+    if count != indices.numel() || count != updates.numel() {
         return Ok(None);
     }
-    let outer = total / band;
     let built: Result<Storage> = with_type!(indices, |raw| {
         with_same_type!(source, updates, |data, values| scatter_into(
-            data, values, raw, outer, extent, inner, band, axis
+            data, values, raw, outer, extent, selected, inner, band, axis
         ))
     });
     built.map(Some)
 }
 
-/// Apply the resolved full-rank selection to a copy of `data` — one flat typed
-/// loop per `inner` regime, in C order so the LAST write wins.
+/// Apply the resolved selection to a copy of `data` — one flat typed loop per
+/// `inner` regime, in C order so the LAST write wins.
 ///
-/// `resolved[block × band + axis_position × inner + offset]` is the selected
-/// axis coordinate for that element, so every destination below lies inside
-/// `out` and every source read inside `values` by construction.
+/// `resolved[block × selected × inner + axis_position × inner + offset]` is the
+/// selected axis coordinate for that element, so every destination below lies
+/// inside `out` and every source read inside `values` by construction.
 #[allow(clippy::too_many_arguments)]
 fn scatter_into<I: Scalar, T: Scalar>(
     data: &[T],
@@ -200,61 +219,61 @@ fn scatter_into<I: Scalar, T: Scalar>(
     indices: &[I],
     outer: usize,
     extent: usize,
+    selected: usize,
     inner: usize,
     band: usize,
     axis: usize,
 ) -> Result<Storage> {
-    // Resolve every index exactly once, in the C order the general driver
-    // visits it, so the first out-of-range index reported is the same one.
-    let mut out = data.to_vec();
+    let total = data.len();
+    // Functional update: the destination is copied once (one bulk memcpy) into
+    // a preallocated vector — a recycled allocation from the storage pool when
+    // one of that exact size is available, fully written by the copy — and the
+    // selection then overwrites the selected slots in place.
+    let mut out = take_pooled_vec::<T>(total)
+        .filter(|out| out.len() == total)
+        .unwrap_or_else(|| T::zeros(total));
+    out.copy_from_slice(data);
     if outer == 1 && inner == 1 {
         // The whole-axis full-selection form (`put_along_axis` on a rank-1
         // operand, the hot scatter shape): resolve each index where it is used,
         // so there is no intermediate `Vec<usize>` at all.
         for (position, raw) in indices.iter().enumerate() {
-            let selected = resolve_index(index_as_i128(*raw), extent, axis, "scatter")?;
-            out[selected] = values[position];
+            let slot = resolve_index_fast(index_as_i128(*raw), extent, axis, "scatter")?;
+            out[slot] = values[position];
         }
         return Ok(T::into_storage(out));
     }
+    // Resolve every index exactly once, in the C order the general driver
+    // visits it, so the first out-of-range index reported is the same one.
     let mut resolved = Vec::with_capacity(indices.len());
     for raw in indices {
-        resolved.push(resolve_index(index_as_i128(*raw), extent, axis, "scatter")?);
+        resolved.push(resolve_index_fast(index_as_i128(*raw), extent, axis, "scatter")?);
     }
     if inner == 1 {
         for block in 0..outer {
-            let base = block * extent;
-            for position in base..base + extent {
-                out[base + resolved[position]] = values[position];
+            let destination = block * band;
+            let read = block * selected;
+            for position in read..read + selected {
+                out[destination + resolved[position]] = values[position];
             }
         }
     } else {
         for block in 0..outer {
-            let base = block * band;
+            let destination = block * band;
+            let read = block * selected * inner;
             // `inner` trailing elements follow each axis position, each with its
             // OWN index, so the write stays per element — only the odometer and
             // the per-element bounds checks are gone.
-            for axis_position in 0..extent {
-                let run = base + axis_position * inner;
+            for axis_position in 0..selected {
+                let run = read + axis_position * inner;
                 for offset in 0..inner {
                     let position = run + offset;
-                    out[base + resolved[position] * inner + offset] = values[position];
+                    out[destination + resolved[position] * inner + offset] = values[position];
                 }
             }
         }
     }
     Ok(T::into_storage(out))
-}
-
-/// The `i128` view of one typed index scalar — exactly [`index_values`]'s
-/// per-element conversion, without materializing the whole widened vector.
-fn index_as_i128<I: Scalar>(value: I) -> i128 {
-    match value.to_scalar() {
-        ScalarValue::I(value) => value as i128,
-        ScalarValue::U(value) => value as i128,
-        ScalarValue::F(value) => value as i128,
-        ScalarValue::C(value) => value.re as i128,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,7 +349,9 @@ fn scatter_typed<T: Scalar>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::indexing::test_support::{attrs, declared, f32_buffer, i64_buffer, spec};
+    use crate::kernels::indexing::test_support::{
+        attrs, declared, f32_buffer, i32_buffer, i64_buffer, spec,
+    };
     use crate::Storage;
 
     #[test]
@@ -439,6 +460,31 @@ mod tests {
         ))
     }
 
+    /// [`general_scatter`] with explicit index/selection/update shapes — what a
+    /// sub-shaped (not full-rank-equal-to-data) index tensor needs.
+    #[allow(clippy::too_many_arguments)]
+    fn general_scatter_shaped(
+        source: &Buffer,
+        updates: &Buffer,
+        axis: usize,
+        index_shape: &[usize],
+        selection: &[usize],
+        indices: &[i128],
+    ) -> Result<Buffer> {
+        with_same_type!(source, updates, |data, update_data| scatter_typed(
+            data,
+            update_data,
+            source.dtype,
+            &source.shape,
+            axis,
+            index_shape,
+            indices,
+            selection,
+            &updates.shape,
+            &source.shape,
+        ))
+    }
+
     #[test]
     fn scatter_full_rank_fast_path_agrees_with_the_general_path() {
         // A full-rank (== data-shaped) index tensor with duplicates, in the
@@ -488,5 +534,111 @@ mod tests {
                 "shape {in_shape:?} axis {axis}: the last write must win at index {selected}"
             );
         }
+    }
+
+    #[test]
+    fn scatter_sub_shaped_selection_fast_path_agrees_with_the_general_path() {
+        // The downstream `scatter(dst[n], idx[m], values[m])` shape: the index
+        // tensor selects only `m` of the axis positions, so its shape is NOT
+        // the data's.  Every such no-broadcast selection must take the flat
+        // fast path and agree with the general rank-deep driver, for a rank-1
+        // destination and for a 2-D/3-D `axis`-0 or `axis`-1 selection.
+        type ScatterCase = (Vec<usize>, Vec<usize>, usize, u64, u64);
+        let cases: [ScatterCase; 4] = [
+            (vec![41], vec![17], 0, 7919, 41),
+            (vec![4, 5], vec![2, 5], 0, 7, 4),
+            (vec![3, 6], vec![3, 2], 1, 5, 6),
+            (vec![2, 4, 3], vec![2, 4, 2], 2, 3, 3),
+        ];
+        for (data_shape, index_shape, axis, step, extent) in cases {
+            let count: usize = index_shape.iter().product();
+            let indices: Vec<i128> = (0..count)
+                .map(|position| ((position as u64 * step + 1) % extent) as i128)
+                .collect();
+            let narrowed: Vec<i64> = indices.iter().map(|&raw| raw as i64).collect();
+            let index_buffer = i64_buffer(&index_shape, &narrowed);
+            let data_len: usize = data_shape.iter().product();
+            let values: Vec<f32> = (0..data_len).map(|value| value as f32).collect();
+            let update_values: Vec<f32> =
+                (0..count).map(|value| 100.0 + value as f32).collect();
+            let x = f32_buffer(&data_shape, &values);
+            let updates = f32_buffer(&index_shape, &update_values);
+
+            let fast = scatter_selection(&x, &index_buffer, &index_shape, &updates, axis)
+                .expect("the fast path succeeds")
+                .expect("the fast path applies");
+            let general = general_scatter_shaped(
+                &x,
+                &updates,
+                axis,
+                &index_shape,
+                &index_shape,
+                &indices,
+            )
+            .expect("the general path succeeds");
+            assert_eq!(
+                fast,
+                general.storage,
+                "data {data_shape:?} indices {index_shape:?} axis {axis}"
+            );
+            assert_eq!(x.storage, Storage::F32(values), "the input must not be mutated");
+        }
+    }
+
+    #[test]
+    fn scatter_fast_path_covers_every_data_dtype() {
+        // The selection rewrite is dtype-generic, so integer/bool destinations
+        // must scatter exactly like the general driver.
+        use crate::kernels::indexing::test_support::buffer;
+        let cases: [(Storage, Storage); 3] = [
+            (Storage::I32(vec![0; 4]), Storage::I32(vec![7, 9])),
+            (Storage::Bool(vec![false; 4]), Storage::Bool(vec![true, true])),
+            (Storage::I8(vec![0; 4]), Storage::I8(vec![7, 9])),
+        ];
+        for (data_storage, update_storage) in cases {
+            let dtype = data_storage.dtype();
+            let source = buffer(dtype, &[4], data_storage);
+            let updates = buffer(dtype, &[2], update_storage);
+            let indices = i32_buffer(&[2], &[3, 1]);
+            let fast = scatter_selection(&source, &indices, &[2], &updates, 0)
+                .expect("the fast path succeeds")
+                .expect("the fast path applies");
+            let widened = index_values(&indices).unwrap();
+            let general = general_scatter_shaped(&source, &updates, 0, &[2], &[2], &widened)
+                .expect("the general path succeeds");
+            assert_eq!(fast, general.storage, "dtype {}", dtype.name());
+        }
+    }
+
+    #[test]
+    fn scatter_fully_overwrites_a_recycled_destination_allocation() {
+        // The destination copy MUST write every element of a recycled stock:
+        // leave a sentinel-filled buffer of the exact size in this thread's
+        // pool, scatter into it, and check no sentinel survived.
+        let total = 1 << 16; // 256 KiB f32 — above the pool's minimum size
+        let sentinel = 9.0e30f32;
+        drop(Storage::F32(vec![sentinel; total]));
+        let data: Vec<f32> = (0..total).map(|value| value as f32).collect();
+        let x = f32_buffer(&[total], &data);
+        let indices: Vec<i64> = (0..total / 2).map(|value| (value * 2) as i64).collect();
+        let updates = f32_buffer(&[total / 2], &vec![-1.0; total / 2]);
+        let out = scatter(
+            &x,
+            &i64_buffer(&[total / 2], &indices),
+            &[total / 2],
+            &updates,
+            0,
+            &declared(&[total]),
+        )
+        .unwrap();
+        let Storage::F32(result) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert!(
+            !result.contains(&sentinel),
+            "a recycled destination vector leaked a stale element"
+        );
+        assert_eq!(result[0], -1.0, "the selected slots are the updates");
+        assert_eq!(result[1], 1.0, "the unselected slots are the copied data");
     }
 }
