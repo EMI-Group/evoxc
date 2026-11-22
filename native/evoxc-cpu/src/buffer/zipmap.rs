@@ -191,6 +191,40 @@ pub fn map3<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
     Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
 }
 
+/// Broadcast binary builder: `out[i] = f(a[i], b[i])` over `out_shape`'s
+/// elements, where `a`/`b` are read through their own (possibly broadcast)
+/// shapes — the strided-run counterpart of [`map2`], for a result that is not
+/// broadcast-free.
+///
+/// Like [`map1`]/[`map2`] it never zero-fills a result first (a pooled vector
+/// of the exact length is taken when one is available), and the run
+/// decomposition plus the per-element address arithmetic live in
+/// [`super::stride::apply2`], which falls back to the general broadcast driver
+/// for shapes it cannot express.
+#[allow(clippy::too_many_arguments)]
+pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
+    dtype: DType,
+    out_shape: &[usize],
+    left: &[T],
+    left_shape: &[usize],
+    right: &[U],
+    right_shape: &[usize],
+    f: impl Fn(T, U) -> R + Copy + Sync,
+) -> Result<Buffer> {
+    let count = util_numel(out_shape);
+    let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
+    super::stride::apply2(
+        &mut values,
+        out_shape,
+        left,
+        left_shape,
+        right,
+        right_shape,
+        f,
+    );
+    Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values))
+}
+
 /// Element count of a concrete shape (`buffer.rs` cannot reach
 /// `kernels::util`, which is a higher layer than the value type).
 #[inline]

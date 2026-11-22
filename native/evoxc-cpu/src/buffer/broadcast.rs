@@ -173,7 +173,10 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
     Buffer::new(buffer.dtype, shape.to_vec(), storage)
 }
 
-fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
+/// The general broadcast copy: one odometer offset per element. Kept as the
+/// fallback of the strided-run driver (`super::stride::fill_broadcast`), which
+/// serves every shape a run decomposition covers.
+pub(super) fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];
     walk(out_shape.len(), out_shape, &strides, |offsets| {
