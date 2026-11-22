@@ -3,24 +3,23 @@
 // ---------------------------------------------------------------------------
 
 use evoxc_core::Result;
+use ndarray::{Array2, Array3, Axis, Zip};
 
 use super::MATRIX_EXP_TERMS;
 
-/// Matrix exponential of `count` stacked `n × n` blocks, mirroring the numpy
+/// Matrix exponential of a `(count, n, n)` batch, mirroring the numpy
 /// reference: one uniform scaling step for the batch, 25 Taylor terms, then
 /// repeated squaring.
-pub(super) fn matrix_exp(input: &[f64], n: usize, count: usize) -> Result<Vec<f64>> {
+pub(super) fn matrix_exp(input: &Array3<f64>) -> Result<Array3<f64>> {
+    let (count, n, _) = input.dim();
     if n == 0 || count == 0 {
-        return Ok(Vec::new());
+        return Ok(Array3::zeros((count, n, n)));
     }
     // 1-norm (max column sum of magnitudes) over the whole batch.
     let mut norm = 0.0f64;
-    for block in input.chunks_exact(n * n) {
+    for block in input.outer_iter() {
         for col in 0..n {
-            let mut sum = 0.0f64;
-            for row in 0..n {
-                sum += block[row * n + col].abs();
-            }
+            let sum: f64 = block.column(col).iter().map(|value| value.abs()).sum();
             if sum > norm {
                 norm = sum;
             }
@@ -35,50 +34,38 @@ pub(super) fn matrix_exp(input: &[f64], n: usize, count: usize) -> Result<Vec<f6
         0
     };
     let scale = 0.5f64.powi(squarings as i32);
-    let mut out = Vec::with_capacity(count * n * n);
-    for block in input.chunks_exact(n * n) {
-        let scaled: Vec<f64> = block.iter().map(|value| value * scale).collect();
-        let mut term = identity(n);
+    let mut out = Array3::<f64>::zeros((count, n, n));
+    for (index, block) in input.outer_iter().enumerate() {
+        let scaled = block.mapv(|value| value * scale);
+        let mut term = Array2::<f64>::eye(n);
         let mut result = term.clone();
         for k in 1..MATRIX_EXP_TERMS {
-            term = mat_mul(&term, &scaled, n);
+            term = mat_mul(&term, &scaled);
             let reciprocal = 1.0 / k as f64;
-            for value in term.iter_mut() {
-                *value *= reciprocal;
-            }
-            for (slot, value) in result.iter_mut().zip(term.iter()) {
-                *slot += *value;
-            }
+            term.mapv_inplace(|value| value * reciprocal);
+            Zip::from(&mut result)
+                .and(&term)
+                .for_each(|slot, &value| *slot += value);
         }
         for _ in 0..squarings {
-            result = mat_mul(&result, &result, n);
+            result = mat_mul(&result, &result);
         }
-        out.extend_from_slice(&result);
+        out.index_axis_mut(Axis(0), index).assign(&result);
     }
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// Small dense helpers
-// ---------------------------------------------------------------------------
-
-pub(super) fn identity(n: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; n * n];
-    for index in 0..n {
-        out[index * n + index] = 1.0;
-    }
-    out
-}
-
-/// C-order product of two `n × n` matrices.
-fn mat_mul(left: &[f64], right: &[f64], n: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; n * n];
+/// C-order product of two `n × n` matrices, accumulating `k` outermost just
+/// like the hand-written triple loop it replaces (same summation order).
+fn mat_mul(left: &Array2<f64>, right: &Array2<f64>) -> Array2<f64> {
+    let n = left.nrows();
+    let mut out = Array2::<f64>::zeros((n, n));
     for row in 0..n {
         for k in 0..n {
-            let factor = left[row * n + k];
-            for col in 0..n {
-                out[row * n + col] += factor * right[k * n + col];
-            }
+            let factor = left[(row, k)];
+            Zip::from(out.row_mut(row))
+                .and(right.row(k))
+                .for_each(|slot, &value| *slot += factor * value);
         }
     }
     out
@@ -87,31 +74,46 @@ fn mat_mul(left: &[f64], right: &[f64], n: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::linalg_aux::test_support::assert_matrix_close;
+    use crate::kernels::linalg_aux::test_support::{assert_matrix_close, matrix};
+
+    /// Stack `blocks` of `(n, n)` values into the `(count, n, n)` operand.
+    fn stacked(n: usize, blocks: &[f64]) -> Array3<f64> {
+        let count = blocks.len() / (n * n);
+        Array3::from_shape_vec((count, n, n), blocks.to_vec()).expect("a consistent stack")
+    }
 
     #[test]
     fn matrix_exp_matches_hand_computed_values() {
         // exp(diag(0, ln 2)) = diag(1, 2).
-        let out = matrix_exp(&[0.0, 0.0, 0.0, 2.0f64.ln()], 2, 1).unwrap();
-        assert_matrix_close(&out, &[1.0, 0.0, 0.0, 2.0], 1e-12, "exp(diag)");
-        // exp([[0, 1], [1, 0]]) = [[cosh 1, sinh 1], [sinh 1, cosh 1]].
-        let out = matrix_exp(&[0.0, 1.0, 1.0, 0.0], 2, 1).unwrap();
-        let (cosh, sinh) = (1.0f64.cosh(), 1.0f64.sinh());
-        assert_matrix_close(&out, &[cosh, sinh, sinh, cosh], 1e-12, "exp(swap)");
-        // exp(I) = e·I for a batched stack of two identical blocks.
-        let blocks = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
-        let out = matrix_exp(&blocks, 2, 2).unwrap();
-        let e = 1.0f64.exp();
-        assert_eq!(out.len(), 8);
+        let out = matrix_exp(&stacked(2, &[0.0, 0.0, 0.0, 2.0f64.ln()])).unwrap();
         assert_matrix_close(
-            &out[0..4],
-            &[e, 0.0, 0.0, e],
+            &out.index_axis(Axis(0), 0).to_owned(),
+            &matrix(2, 2, &[1.0, 0.0, 0.0, 2.0]),
+            1e-12,
+            "exp(diag)",
+        );
+        // exp([[0, 1], [1, 0]]) = [[cosh 1, sinh 1], [sinh 1, cosh 1]].
+        let out = matrix_exp(&stacked(2, &[0.0, 1.0, 1.0, 0.0])).unwrap();
+        let (cosh, sinh) = (1.0f64.cosh(), 1.0f64.sinh());
+        assert_matrix_close(
+            &out.index_axis(Axis(0), 0).to_owned(),
+            &matrix(2, 2, &[cosh, sinh, sinh, cosh]),
+            1e-12,
+            "exp(swap)",
+        );
+        // exp(I) = e·I for a batched stack of two identical blocks.
+        let out = matrix_exp(&stacked(2, &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0])).unwrap();
+        let e = 1.0f64.exp();
+        assert_eq!(out.dim(), (2, 2, 2));
+        assert_matrix_close(
+            &out.index_axis(Axis(0), 0).to_owned(),
+            &matrix(2, 2, &[e, 0.0, 0.0, e]),
             1e-12,
             "batched exp (block 0)",
         );
         assert_matrix_close(
-            &out[4..8],
-            &[e, 0.0, 0.0, e],
+            &out.index_axis(Axis(0), 1).to_owned(),
+            &matrix(2, 2, &[e, 0.0, 0.0, e]),
             1e-12,
             "batched exp (block 1)",
         );
@@ -121,8 +123,13 @@ mod tests {
     fn matrix_exp_scales_large_norms() {
         // A generator with 1-norm 4 still lands on a finite, accurate result:
         // exp([[0, 4], [-4, 0]]) = [[cos 4, sin 4], [-sin 4, cos 4]].
-        let out = matrix_exp(&[0.0, 4.0, -4.0, 0.0], 2, 1).unwrap();
+        let out = matrix_exp(&stacked(2, &[0.0, 4.0, -4.0, 0.0])).unwrap();
         let (cos, sin) = (4.0f64.cos(), 4.0f64.sin());
-        assert_matrix_close(&out, &[cos, sin, -sin, cos], 1e-12, "rotation");
+        assert_matrix_close(
+            &out.index_axis(Axis(0), 0).to_owned(),
+            &matrix(2, 2, &[cos, sin, -sin, cos]),
+            1e-12,
+            "rotation",
+        );
     }
 }

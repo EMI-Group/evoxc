@@ -2,14 +2,16 @@
 //! `matrix_rank`, `svd`, `matrix_exp`).
 //!
 //! These are the numpy backend's LAPACK-shaped kernels; they are grouped in
-//! their own file because each is a self-contained algorithm rather than a
+//! their own module because each is a self-contained algorithm rather than a
 //! strided loop.
 //!
-//! Every algorithm runs on plain `f64` slices: `int`/`bool` operands are
+//! Every algorithm runs on plain `f64` arrays: `int`/`bool` operands are
 //! `float64` results by numpy's `_commonType` rule, and single-precision inputs
 //! are upcast for the computation (the declared result dtype, which the engine
-//! validates afterwards, is authoritative).  The kernels own only the dtype and
-//! batch plumbing — one `f64` matrix per batch element.
+//! validates afterwards, is authoritative).  The operand arrives as ONE
+//! `ndarray::Array3` of `(batch elements, rows, cols)` and each batch element is
+//! factored from its own `ArrayView2`; results are materialized back through
+//! `Buffer::from_array`, so no hand-written batch/offset arithmetic remains.
 //!
 //! Conventions (each is fixed, so a repeated run is bit-identical and nothing
 //! depends on a library's internal sign choice):
@@ -24,7 +26,7 @@
 //! * `qr` is the reduced (`full_matrices=False`) factorization by Householder
 //!   reflections with the no-cancellation sign choice `alpha = -sgn(x₀)·‖x‖`
 //!   (`sgn(0) = +1`), so `Q`/`R` are deterministic; like LAPACK, `R`'s diagonal
-//!   is not sign-normalized.
+//!   is not sign-normalized beyond that choice.
 //! * `svd` is the reduced one-sided-Jacobi SVD: singular values **descending**,
 //!   each `u` column's sign fixed by making its largest-magnitude component
 //!   positive (the matching `vh` row flips with it).
@@ -89,14 +91,13 @@ fn eigh_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Resul
     let v_shape = util::result_shape(ctx, spec, 1)?;
     let input = prepare("eigh", &operands[0], true)?;
     let n = input.rows;
-    let count = input.batch_len();
-    let mut w = Vec::with_capacity(count * n);
-    let mut v = Vec::with_capacity(count * n * n);
+    let mut w = Vec::with_capacity(input.batch_len() * n);
+    let mut v = Vec::with_capacity(input.batch_len() * n * n);
     if n > 0 {
-        for block in input.data.chunks_exact(n * n) {
-            let (eigenvalues, eigenvectors) = eigh_sym(block, n)?;
-            w.extend_from_slice(&eigenvalues);
-            v.extend_from_slice(&eigenvectors);
+        for block in input.blocks() {
+            let (eigenvalues, eigenvectors) = eigh_sym(block)?;
+            w.extend(eigenvalues.iter().copied());
+            v.extend(eigenvectors.iter().copied());
         }
     }
     let w = real_result("eigh", w_shape, spec.result_types[0].dtype, w)?;
@@ -109,11 +110,11 @@ fn cholesky_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> R
     let shape = util::result_shape(ctx, spec, 0)?;
     let input = prepare("cholesky", &operands[0], true)?;
     let n = input.rows;
-    let mut factor = Vec::with_capacity(input.data.len());
+    let mut factor = Vec::with_capacity(input.batch_len() * n * n);
     if n > 0 {
-        for block in input.data.chunks_exact(n * n) {
-            let lower = cholesky_lower(block, n)?;
-            factor.extend_from_slice(&lower);
+        for block in input.blocks() {
+            let lower = cholesky_lower(block)?;
+            factor.extend(lower.iter().copied());
         }
     }
     single(real_result(
@@ -134,10 +135,10 @@ fn qr_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<
     let mut q = Vec::with_capacity(input.batch_len() * m * k);
     let mut r = Vec::with_capacity(input.batch_len() * k * n);
     if k > 0 {
-        for block in input.data.chunks_exact(m * n) {
-            let (q_block, r_block) = qr_reduced(block, m, n)?;
-            q.extend_from_slice(&q_block);
-            r.extend_from_slice(&r_block);
+        for block in input.blocks() {
+            let (q_block, r_block) = qr_reduced(block)?;
+            q.extend(q_block.iter().copied());
+            r.extend(r_block.iter().copied());
         }
     }
     let q = real_result("qr", q_shape, spec.result_types[0].dtype, q)?;
@@ -167,9 +168,10 @@ fn matrix_rank_kernel(
     if m == 0 || n == 0 {
         ranks.resize(count, 0);
     } else {
-        for block in input.data.chunks_exact(m * n) {
-            let (_, singular, _) = svd_reduced(block, m, n)?;
-            ranks.push(numerical_rank(&singular, m, n, tol, eps));
+        for block in input.blocks() {
+            let (_, singular, _) = svd_reduced(block)?;
+            let singular = singular.as_slice().expect("a standard-layout vector");
+            ranks.push(numerical_rank(singular, m, n, tol, eps));
         }
     }
     single(Buffer::new(DType::Int64, shape, Storage::I64(ranks))?)
@@ -183,16 +185,15 @@ fn svd_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result
     let input = prepare("svd", &operands[0], false)?;
     let (m, n) = (input.rows, input.cols);
     let k = m.min(n);
-    let count = input.batch_len();
-    let mut u = Vec::with_capacity(count * m * k);
-    let mut s = Vec::with_capacity(count * k);
-    let mut vh = Vec::with_capacity(count * k * n);
+    let mut u = Vec::with_capacity(input.batch_len() * m * k);
+    let mut s = Vec::with_capacity(input.batch_len() * k);
+    let mut vh = Vec::with_capacity(input.batch_len() * k * n);
     if k > 0 {
-        for block in input.data.chunks_exact(m * n) {
-            let (u_block, s_block, vh_block) = svd_reduced(block, m, n)?;
-            u.extend_from_slice(&u_block);
-            s.extend_from_slice(&s_block);
-            vh.extend_from_slice(&vh_block);
+        for block in input.blocks() {
+            let (u_block, s_block, vh_block) = svd_reduced(block)?;
+            u.extend(u_block.iter().copied());
+            s.extend(s_block.iter().copied());
+            vh.extend(vh_block.iter().copied());
         }
     }
     let u = real_result("svd", u_shape, spec.result_types[0].dtype, u)?;
@@ -209,11 +210,14 @@ fn matrix_exp_kernel(
 ) -> Result<Vec<Value>> {
     let shape = util::result_shape(ctx, spec, 0)?;
     let input = prepare("matrix_exp", &operands[0], true)?;
-    let data = matrix_exp(&input.data, input.rows, input.batch_len())?;
+    let data = matrix_exp(&input.data)?;
+    // `matrix_exp` returns a standard-layout `Array3`; move its buffer out
+    // rather than copying it back into a flat `Vec`.
+    let (values, _offset) = data.into_raw_vec_and_offset();
     single(real_result(
         "matrix_exp",
         shape,
         spec.result_types[0].dtype,
-        data,
+        values,
     )?)
 }
