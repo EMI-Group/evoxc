@@ -6,14 +6,15 @@
 //! doc in [`super`] carries the shared declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::Buffer;
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
-use super::{block_storage_from, for_each_index, operand, read_checked, reconcile};
+use super::stride_copy::{CopyAxis, CopyPlan};
+use super::{for_each_index, operand, read_checked, reconcile};
 
 /// One operand axis mapped onto a Python `slice(start, stop, step)`.
 #[derive(Debug, Clone, Copy)]
@@ -123,14 +124,19 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
     let derived: Vec<usize> = ranges.iter().map(|range| range.extent).collect();
     let shape = reconcile("slice", declared, derived)?;
     let source_strides = util::c_strides(&source.shape);
+    if let Some(plan) = copy_plan(ranges, &source_strides) {
+        let total = util::numel(&shape);
+        let storage = with_type!(source, |values| plan.copy(values, total, "slice"))?;
+        return Buffer::new(source.dtype, shape, storage);
+    }
+    // A backwards walk (a negative step over an axis that keeps more than one
+    // element) is the only plan the collapsed-stride copy declines: it stays on
+    // the signed general driver.
     let mut base = 0i64;
     let mut steps = Vec::with_capacity(ranges.len());
     for (range, stride) in ranges.iter().zip(&source_strides) {
         base += range.start * *stride as i64;
         steps.push(range.step * *stride as i64);
-    }
-    if let Some(storage) = slice_row_blocks(source, ranges, &shape, base, &steps)? {
-        return Buffer::new(source.dtype, shape, storage);
     }
     with_type!(source, |values| slice_typed(
         values,
@@ -141,61 +147,40 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
     ))
 }
 
-/// `slice`'s contiguous fast path.
+/// The collapsed-stride copy plan for a slice, or `None` when the mapping
+/// walks backwards (a negative step along an axis that keeps two or more
+/// elements) — [`CopyPlan`] only describes a forward, non-negative walk, so
+/// that case stays on the signed general driver.
 ///
-/// The trailing axes a slice selects WHOLE (`start == 0`, `step == 1`, the whole
-/// extent) are one contiguous run per block, so the result is `copy_blocks` over
-/// the leading axes' offsets instead of one source index per output element.
-/// Only a non-negative step plan qualifies; anything else (negative strides,
-/// per-axis steps, an empty result) stays on the general driver.
-fn slice_row_blocks(
-    source: &Buffer,
-    ranges: &[DimSlice],
-    out_shape: &[usize],
-    base: i64,
-    steps: &[i64],
-) -> Result<Option<Storage>> {
-    let rank = ranges.len();
-    if util::numel(out_shape) == 0 || steps.iter().any(|step| *step < 0) {
-        return Ok(None);
-    }
-    let mut trailing = 0usize;
-    while trailing < rank {
-        let axis = rank - 1 - trailing;
-        let range = &ranges[axis];
-        if range.start != 0 || range.step != 1 || range.extent != source.shape[axis] {
-            break;
+/// Each axis contributes `(extent, step × source stride)`; [`CopyPlan::new`]
+/// then collapses the axes whose strides line up, so the whole slice is one
+/// contiguous run, one strided run, or a handful of short blocks.
+fn copy_plan(ranges: &[DimSlice], source_strides: &[usize]) -> Option<CopyPlan> {
+    let mut base = 0usize;
+    let mut axes = Vec::with_capacity(ranges.len());
+    for (range, stride) in ranges.iter().zip(source_strides) {
+        if range.extent == 0 {
+            continue; // an empty result reads nothing
         }
-        trailing += 1;
-    }
-    let inner: usize = out_shape[rank - trailing..].iter().product();
-    if inner == 0 {
-        return Ok(None);
-    }
-    let start = usize::try_from(base).map_err(|_| {
-        Error::verification("slice: a negative base offset reached the row copy (internal engine error)")
-    })?;
-    let leading_shape = &out_shape[..rank - trailing];
-    let mut offsets = Vec::with_capacity(util::numel(leading_shape));
-    for_each_index(leading_shape, |index| {
-        let mut offset = start as i128;
-        for (coordinate, step) in index.iter().zip(steps) {
-            offset += *coordinate as i128 * *step as i128;
+        // A one-element axis (which `CopyPlan` drops again) contributes its
+        // start offset only, so even a negative step there is a forward walk.
+        let start = usize::try_from(range.start).ok()?;
+        base = base.checked_add(start.checked_mul(*stride)?)?;
+        if range.extent == 1 {
+            continue;
         }
-        match usize::try_from(offset) {
-            Ok(offset) => {
-                offsets.push(offset);
-                Ok(())
-            }
-            Err(_) => Err(Error::verification(
-                "slice: a negative source offset reached the row copy (internal engine error)",
-            )),
+        if range.step < 0 {
+            return None;
         }
-    })?;
-    let storage = with_type!(source, |values| {
-        block_storage_from(values, out_shape, &offsets, inner, "slice")
-    })?;
-    Ok(Some(storage))
+        let step = usize::try_from(range.step).ok()?;
+        axes.push(CopyAxis {
+            extent: range.extent,
+            stride: step.checked_mul(*stride)?,
+        });
+    }
+    // `axes` is outermost-first, the plan wants innermost-first.
+    axes.reverse();
+    Some(CopyPlan::new(base, axes))
 }
 
 fn slice_typed<T: Scalar>(

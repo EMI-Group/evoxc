@@ -87,6 +87,9 @@ impl CopyPlan {
         if total == 0 {
             return Ok(T::into_storage(Vec::new()));
         }
+        if self.total() != total {
+            return Err(block_error(op));
+        }
         if self.axes.is_empty() {
             if total != 1 {
                 return Err(block_error(op));
@@ -202,7 +205,7 @@ mod tests {
         let values: Vec<f32> = (0..100_000).map(|index| index as f32).collect();
         let plan = CopyPlan::new(3, vec![axis(1, 1), axis(50, 4), axis(500, 200)]);
         let storage = plan.copy(&values, 25000, "slice").unwrap();
-        match storage {
+        match &storage {
             Storage::F32(out) => {
                 assert_eq!(out.len(), 25000);
                 for (index, value) in out.iter().enumerate() {
@@ -216,14 +219,14 @@ mod tests {
     #[test]
     fn a_three_of_four_copy_matches_the_elementwise_reference() {
         let values: Vec<i32> = (0..100_000).collect();
-        // (500, 50, 3) out of (500, 50, 4): 2500 runs of 3, stride 4 apart.
+        // (500, 50, 3) out of (500, 50, 4): 25000 runs of 3, stride 4 apart.
         let plan = CopyPlan::new(1, vec![axis(3, 1), axis(50, 4), axis(500, 200)]);
-        assert_eq!(plan.axes, vec![axis(3, 1), axis(2500, 4)]);
+        assert_eq!(plan.axes, vec![axis(3, 1), axis(25000, 4)]);
         let storage = plan.copy(&values, 75_000, "slice").unwrap();
-        match storage {
+        match &storage {
             Storage::I32(out) => {
                 assert_eq!(out.len(), 75_000);
-                for block in 0..2500 {
+                for block in 0..25000 {
                     for slot in 0..3 {
                         assert_eq!(out[block * 3 + slot], (1 + block * 4 + slot) as i32);
                     }
