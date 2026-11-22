@@ -1,9 +1,24 @@
-//! Broadcasting: the numpy shape/stride rules, the strided `walk`/`apply`
-//! drivers and `broadcast_to`.
+//! Broadcasting: the numpy shape/stride rules, the ndarray-backed elementwise
+//! layout drivers (`walk` / `apply1..3`) and `broadcast_to`.
+//!
+//! [`Storage`] is one C-contiguous `Vec` per dtype, so an operand read through a
+//! broadcast (or any other non-contiguous) layout has to be addressed through
+//! its shape.  ndarray's broadcast views are the ONLY N-dimensional layout
+//! engine here: [`walk`] is a thin index iteration, `apply1..3` are `Zip` passes
+//! and [`fill_broadcast`] is one `assign` of a broadcast view, so no hand-rolled
+//! stride odometer remains.  Every driver falls back to the [`walk`] loop for a
+//! layout a view cannot express (an operand slice whose length disagrees with
+//! its shape, an operand of higher rank than the result, a result slice whose
+//! length disagrees with its shape), which keeps the pre-existing
+//! accept/reject/panic behaviour byte-identical.
 
 use evoxc_core::{Error, Result};
+use ndarray::{ArrayViewD, ArrayViewMutD, Dimension, IxDyn};
 
-use super::{shape_text, stride::fill_broadcast, Buffer, Storage};
+use crate::scalar::Scalar;
+
+use super::pool::take_pooled_vec;
+use super::{shape_text, Buffer, Storage};
 
 // ---------------------------------------------------------------------------
 // Broadcasting
@@ -50,42 +65,157 @@ pub fn broadcast_strides(shape: &[usize], out_shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// C-order flat iteration over `out`, computing one operand offset per entry of
-/// `strides` (a broadcast axis contributes a `0` stride, so the same loop serves
-/// every strided kernel).  `body` receives those offsets in C-order.
+// ---------------------------------------------------------------------------
+// ndarray views
+// ---------------------------------------------------------------------------
+
+/// Borrow `values` as a `shape`-shaped view.
+///
+/// `None` when a slice's length is not `shape`'s element count — the one layout
+/// the [`walk`] fallback has to answer for.  ndarray's `broadcast` borrows the
+/// view it is called on, so each driver keeps the base views in named locals and
+/// broadcasts those (`base.broadcast(out_shape)`), which is also why this helper
+/// cannot return the broadcast view itself.
+fn base_view<'a, T: Copy>(values: &'a [T], shape: &[usize]) -> Option<ArrayViewD<'a, T>> {
+    ArrayViewD::from_shape(IxDyn(shape), values).ok()
+}
+
+/// C-order flat iteration over `out_shape[..rank]`, computing one operand offset
+/// per entry of `strides` (a broadcast axis contributes a `0` stride, so the
+/// same loop serves every strided kernel).  `body` receives those offsets in
+/// C-order; `rank == 0` is ONE call with a zero-filled offsets slice and an
+/// empty result iterates not at all.
 pub fn walk(rank: usize, out_shape: &[usize], strides: &[Vec<usize>], mut body: impl FnMut(&[usize])) {
     if rank == 0 {
         body(&vec![0usize; strides.len()]);
         return;
     }
-    let total: usize = out_shape.iter().product();
-    let mut index = vec![0usize; rank];
+    let shape = &out_shape[..rank];
     let mut offsets = vec![0usize; strides.len()];
-    for _ in 0..total {
-        body(&offsets);
-        for axis in (0..rank).rev() {
-            index[axis] += 1;
-            for (slot, stride) in strides.iter().enumerate() {
-                offsets[slot] += stride[axis];
-            }
-            if index[axis] < out_shape[axis] {
-                break;
-            }
-            index[axis] = 0;
-            for (slot, stride) in strides.iter().enumerate() {
-                offsets[slot] -= stride[axis] * out_shape[axis];
-            }
+    for index in ndarray::indices(IxDyn(shape)) {
+        let position = index.slice();
+        for (slot, stride) in offsets.iter_mut().zip(strides) {
+            *slot = position.iter().zip(stride.iter()).map(|(i, s)| i * s).sum();
         }
+        body(&offsets);
     }
 }
 
-/// Apply a unary function over `source` broadcast to `out_shape`.
-pub fn apply1<T: Copy, R>(
+// ---------------------------------------------------------------------------
+// The elementwise drivers
+// ---------------------------------------------------------------------------
+
+/// `out[i] = f(a[i])` via one ndarray `Zip` pass, or `false` when the layout
+/// cannot be expressed as views (the caller then takes the [`walk`] loop).
+fn zip1_broadcast<T: Copy, R>(
+    out: &mut [R],
+    out_shape: &[usize],
+    a: &[T],
+    a_shape: &[usize],
+    f: &impl Fn(T) -> R,
+) -> bool {
+    if out.len() != out_shape.iter().product::<usize>() {
+        return false;
+    }
+    let Some(a_base) = base_view(a, a_shape) else {
+        return false;
+    };
+    let Some(av) = a_base.broadcast(IxDyn(out_shape)) else {
+        return false;
+    };
+    let Ok(dest) = ArrayViewMutD::from_shape(IxDyn(out_shape), out) else {
+        return false;
+    };
+    ndarray::Zip::from(dest).and(av).for_each(|o, x| *o = f(*x));
+    true
+}
+
+fn zip2_broadcast<T: Copy, U: Copy, R>(
+    out: &mut [R],
+    out_shape: &[usize],
+    a: &[T],
+    a_shape: &[usize],
+    b: &[U],
+    b_shape: &[usize],
+    f: &impl Fn(T, U) -> R,
+) -> bool {
+    if out.len() != out_shape.iter().product::<usize>() {
+        return false;
+    }
+    let Some(a_base) = base_view(a, a_shape) else {
+        return false;
+    };
+    let Some(av) = a_base.broadcast(IxDyn(out_shape)) else {
+        return false;
+    };
+    let Some(b_base) = base_view(b, b_shape) else {
+        return false;
+    };
+    let Some(bv) = b_base.broadcast(IxDyn(out_shape)) else {
+        return false;
+    };
+    let Ok(dest) = ArrayViewMutD::from_shape(IxDyn(out_shape), out) else {
+        return false;
+    };
+    ndarray::Zip::from(dest)
+        .and(av)
+        .and(bv)
+        .for_each(|o, x, y| *o = f(*x, *y));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn zip3_broadcast<T: Copy, U: Copy, V: Copy, R>(
+    out: &mut [R],
+    out_shape: &[usize],
+    a: &[T],
+    a_shape: &[usize],
+    b: &[U],
+    b_shape: &[usize],
+    c: &[V],
+    c_shape: &[usize],
+    f: &impl Fn(T, U, V) -> R,
+) -> bool {
+    if out.len() != out_shape.iter().product::<usize>() {
+        return false;
+    }
+    let Some(a_base) = base_view(a, a_shape) else {
+        return false;
+    };
+    let Some(av) = a_base.broadcast(IxDyn(out_shape)) else {
+        return false;
+    };
+    let Some(b_base) = base_view(b, b_shape) else {
+        return false;
+    };
+    let Some(bv) = b_base.broadcast(IxDyn(out_shape)) else {
+        return false;
+    };
+    let Some(c_base) = base_view(c, c_shape) else {
+        return false;
+    };
+    let Some(cv) = c_base.broadcast(IxDyn(out_shape)) else {
+        return false;
+    };
+    let Ok(dest) = ArrayViewMutD::from_shape(IxDyn(out_shape), out) else {
+        return false;
+    };
+    ndarray::Zip::from(dest)
+        .and(av)
+        .and(bv)
+        .and(cv)
+        .for_each(|o, x, y, z| *o = f(*x, *y, *z));
+    true
+}
+
+/// The [`walk`] loop of [`apply1`]: the view-free fallback, identical to the
+/// driver this module replaced.
+fn walk1<T: Copy, R>(
     out: &mut [R],
     out_shape: &[usize],
     source: &[T],
     source_shape: &[usize],
-    f: impl Fn(T) -> R,
+    f: &impl Fn(T) -> R,
 ) {
     let strides = [broadcast_strides(source_shape, out_shape)];
     let mut slot = 0usize;
@@ -95,15 +225,14 @@ pub fn apply1<T: Copy, R>(
     });
 }
 
-/// Apply a binary function over two operands broadcast to `out_shape`.
-pub fn apply2<T: Copy, U: Copy, R>(
+fn walk2<T: Copy, U: Copy, R>(
     out: &mut [R],
     out_shape: &[usize],
     left: &[T],
     left_shape: &[usize],
     right: &[U],
     right_shape: &[usize],
-    f: impl Fn(T, U) -> R,
+    f: &impl Fn(T, U) -> R,
 ) {
     let strides = [
         broadcast_strides(left_shape, out_shape),
@@ -116,7 +245,65 @@ pub fn apply2<T: Copy, U: Copy, R>(
     });
 }
 
-/// Apply a ternary function over three operands broadcast to `out_shape`.
+#[allow(clippy::too_many_arguments)]
+fn walk3<T: Copy, U: Copy, V: Copy, R>(
+    out: &mut [R],
+    out_shape: &[usize],
+    a: &[T],
+    a_shape: &[usize],
+    b: &[U],
+    b_shape: &[usize],
+    c: &[V],
+    c_shape: &[usize],
+    f: &impl Fn(T, U, V) -> R,
+) {
+    let strides = [
+        broadcast_strides(a_shape, out_shape),
+        broadcast_strides(b_shape, out_shape),
+        broadcast_strides(c_shape, out_shape),
+    ];
+    let mut slot = 0usize;
+    walk(out_shape.len(), out_shape, &strides, |offsets| {
+        out[slot] = f(a[offsets[0]], b[offsets[1]], c[offsets[2]]);
+        slot += 1;
+    });
+}
+
+/// Apply a unary function over `source` broadcast to `out_shape`.
+///
+/// Element `i` of the result reads element `i` of the broadcast operand, so the
+/// closure owns every semantic (NaN propagation, signed zeros, wrapping) and the
+/// driver only supplies addresses.
+pub fn apply1<T: Copy, R>(
+    out: &mut [R],
+    out_shape: &[usize],
+    source: &[T],
+    source_shape: &[usize],
+    f: impl Fn(T) -> R,
+) {
+    if !zip1_broadcast(out, out_shape, source, source_shape, &f) {
+        walk1(out, out_shape, source, source_shape, &f);
+    }
+}
+
+/// Apply a binary function over two operands broadcast to `out_shape` (see
+/// [`apply1`]).
+pub fn apply2<T: Copy, U: Copy, R>(
+    out: &mut [R],
+    out_shape: &[usize],
+    left: &[T],
+    left_shape: &[usize],
+    right: &[U],
+    right_shape: &[usize],
+    f: impl Fn(T, U) -> R,
+) {
+    if !zip2_broadcast(out, out_shape, left, left_shape, right, right_shape, &f) {
+        walk2(out, out_shape, left, left_shape, right, right_shape, &f);
+    }
+}
+
+/// Apply a ternary function over three operands broadcast to `out_shape` (see
+/// [`apply1`]).
 #[allow(clippy::too_many_arguments)]
 pub fn apply3<T: Copy, U: Copy, V: Copy, R>(
     out: &mut [R],
@@ -129,16 +316,9 @@ pub fn apply3<T: Copy, U: Copy, V: Copy, R>(
     c_shape: &[usize],
     f: impl Fn(T, U, V) -> R,
 ) {
-    let strides = [
-        broadcast_strides(a_shape, out_shape),
-        broadcast_strides(b_shape, out_shape),
-        broadcast_strides(c_shape, out_shape),
-    ];
-    let mut slot = 0usize;
-    walk(out_shape.len(), out_shape, &strides, |offsets| {
-        out[slot] = f(a[offsets[0]], b[offsets[1]], c[offsets[2]]);
-        slot += 1;
-    });
+    if !zip3_broadcast(out, out_shape, a, a_shape, b, b_shape, c, c_shape, &f) {
+        walk3(out, out_shape, a, a_shape, b, b_shape, c, c_shape, &f);
+    }
 }
 
 /// Materialize `buffer` broadcast to `shape`.
@@ -154,12 +334,9 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
             shape_text(shape)
         )));
     }
-    // The copy itself is the strided-run driver's block copy
-    // (`super::stride::fill_broadcast`), which hands back a pooled vector of the
-    // exact length and divides the work into contiguous per-repeat blocks; it
-    // accepts every broadcastable pair and falls back to [`broadcast_vec`] for
-    // anything its run decomposition cannot express, so the result is the same
-    // bytes either way.
+    // The copy is [`fill_broadcast`]: one ndarray `assign` of a broadcast view
+    // out of pooled storage, falling back to [`broadcast_vec`]'s [`walk`] loop
+    // for a shape a view cannot express. Either way the bytes are the same.
     let storage = match &buffer.storage {
         Storage::Bool(v) => Storage::Bool(fill_broadcast(v, &buffer.shape, shape)),
         Storage::I8(v) => Storage::I8(fill_broadcast(v, &buffer.shape, shape)),
@@ -179,10 +356,15 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
     Buffer::new(buffer.dtype, shape.to_vec(), storage)
 }
 
-/// The general broadcast copy: one odometer offset per element. Kept as the
-/// fallback of the strided-run driver (`super::stride::fill_broadcast`), which
-/// serves every shape a run decomposition covers.
+/// The general broadcast copy: one [`walk`] offset per element.  It is the
+/// fallback of [`fill_broadcast`] for a layout an ndarray broadcast view cannot
+/// express; every shape a real graph produces takes the view.
 pub(super) fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
+    if let Some(base) = base_view(values, shape) {
+        if let Some(view) = base.broadcast(IxDyn(out_shape)) {
+            return view.iter().copied().collect();
+        }
+    }
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];
     walk(out_shape.len(), out_shape, &strides, |offsets| {
@@ -191,11 +373,163 @@ pub(super) fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &
     out
 }
 
+/// Materialize `values` broadcast from `shape` to `out_shape` — the `broadcast`
+/// op's copy, with [`walk`]'s semantics for every shape it accepts.
+///
+/// The result comes from the storage pool when a stock of the exact size is
+/// available (never a zero fill on that path) and is written by ONE ndarray
+/// `assign` of a broadcast view of `values`, so the copy never runs the
+/// per-element odometer.  An empty target is empty; a layout no view can express
+/// falls back to [`broadcast_vec`].
+pub fn fill_broadcast<T: Scalar>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
+    let count: usize = out_shape.iter().product();
+    if count == 0 {
+        return Vec::new();
+    }
+    let Some(base) = base_view(values, shape) else {
+        return broadcast_vec(values, shape, out_shape);
+    };
+    let Some(view) = base.broadcast(IxDyn(out_shape)) else {
+        return broadcast_vec(values, shape, out_shape);
+    };
+    let mut out = take_pooled_vec::<T>(count).unwrap_or_else(|| T::zeros(count));
+    match ArrayViewMutD::from_shape(IxDyn(out_shape), out.as_mut_slice()) {
+        Ok(mut dest) => dest.assign(&view),
+        Err(_) => return broadcast_vec(values, shape, out_shape),
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::{Buffer, Storage};
     use evoxc_core::DType;
+
+    /// A deterministic value generator (no `rand` dependency).
+    fn values(count: usize, seed: i32) -> Vec<i32> {
+        let mut state = seed as u64 | 1;
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as i32) % 200 - 100
+            })
+            .collect()
+    }
+
+    fn product(shape: &[usize]) -> usize {
+        shape.iter().product()
+    }
+
+    /// Independent right-aligned C-order broadcast reference: for flat result
+    /// index `flat`, the operand element it reads.
+    ///
+    /// Deliberately NOT the implementation under test: it walks the result
+    /// coordinates one axis at a time (no ndarray views, no strides).
+    fn reference_slot(out_shape: &[usize], operand_shape: &[usize], flat: usize) -> usize {
+        let rank = out_shape.len();
+        let offset = rank - operand_shape.len();
+        let mut pos = vec![0usize; rank];
+        let mut rest = flat;
+        for axis in (0..rank).rev() {
+            pos[axis] = rest % out_shape[axis];
+            rest /= out_shape[axis];
+        }
+        let (mut slot, mut stride) = (0usize, 1usize);
+        for axis in (0..operand_shape.len()).rev() {
+            let p = if operand_shape[axis] == 1 {
+                0
+            } else {
+                pos[offset + axis]
+            };
+            slot += p * stride;
+            stride *= operand_shape[axis];
+        }
+        slot
+    }
+
+    /// `apply2` against the independent reference, for every element.
+    fn check_apply2_i32(out_shape: &[usize], a_shape: &[usize], b_shape: &[usize]) {
+        let count = product(out_shape);
+        let a = values(product(a_shape), 7);
+        let b = values(product(b_shape), 11);
+        let f = |x: i32, y: i32| x.wrapping_mul(3).wrapping_add(y.wrapping_mul(7));
+        let mut out = vec![0i32; count];
+        apply2(&mut out, out_shape, &a, a_shape, &b, b_shape, f);
+        for (flat, produced) in out.iter().enumerate() {
+            let expected = f(
+                a[reference_slot(out_shape, a_shape, flat)],
+                b[reference_slot(out_shape, b_shape, flat)],
+            );
+            assert_eq!(
+                *produced, expected,
+                "i32 out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+            );
+        }
+    }
+
+    /// The f32 counterpart (bit comparison, so signed zeros stay visible).
+    fn check_apply2_f32(out_shape: &[usize], a_shape: &[usize], b_shape: &[usize]) {
+        let count = product(out_shape);
+        let a: Vec<f32> = values(product(a_shape), 5).iter().map(|v| *v as f32 * 0.5).collect();
+        let b: Vec<f32> = values(product(b_shape), 9).iter().map(|v| *v as f32 * 0.25).collect();
+        let f = |x: f32, y: f32| x * 1.5 - y;
+        let mut out = vec![f32::NAN; count];
+        apply2(&mut out, out_shape, &a, a_shape, &b, b_shape, f);
+        for (flat, produced) in out.iter().enumerate() {
+            let expected = f(
+                a[reference_slot(out_shape, a_shape, flat)],
+                b[reference_slot(out_shape, b_shape, flat)],
+            );
+            assert_eq!(
+                produced.to_bits(),
+                expected.to_bits(),
+                "f32 out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+            );
+        }
+    }
+
+    /// `apply3` against the independent reference (a row-predicate `select`).
+    fn check_apply3_select(
+        out_shape: &[usize],
+        p_shape: &[usize],
+        a_shape: &[usize],
+        b_shape: &[usize],
+    ) {
+        let count = product(out_shape);
+        let p: Vec<bool> = values(product(p_shape), 3).iter().map(|v| *v > 0).collect();
+        let a = values(product(a_shape), 5);
+        let b = values(product(b_shape), 9);
+        let f = |pick: bool, x: i32, y: i32| if pick { x } else { y };
+        let mut out = vec![0i32; count];
+        apply3(
+            &mut out, out_shape, &p, p_shape, &a, a_shape, &b, b_shape, f,
+        );
+        for (flat, produced) in out.iter().enumerate() {
+            let expected = f(
+                p[reference_slot(out_shape, p_shape, flat)],
+                a[reference_slot(out_shape, a_shape, flat)],
+                b[reference_slot(out_shape, b_shape, flat)],
+            );
+            assert_eq!(
+                *produced, expected,
+                "select out {out_shape:?}, pred {p_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+            );
+        }
+    }
+
+    /// `fill_broadcast` against the independent reference.
+    fn check_fill(shape: &[usize], out_shape: &[usize]) {
+        let source = values(product(shape), 13);
+        let filled = fill_broadcast(&source, shape, out_shape);
+        assert_eq!(filled.len(), product(out_shape), "{shape:?} -> {out_shape:?}");
+        for (flat, produced) in filled.iter().enumerate() {
+            let expected = source[reference_slot(out_shape, shape, flat)];
+            assert_eq!(*produced, expected, "{shape:?} -> {out_shape:?}: element {flat}");
+        }
+    }
 
     #[test]
     fn broadcast_strides_align_right() {
@@ -248,8 +582,8 @@ mod tests {
 
     #[test]
     fn every_dtype_materializes_through_the_block_copy() {
-        // The pooled block copy serves all 14 storages; bool and the complex
-        // and float pairs are the ones a per-dtype arm could silently drop.
+        // The pooled copy serves all 14 storages; bool and the complex and
+        // float pairs are the ones a per-dtype arm could silently drop.
         let cases: [(Storage, Vec<usize>, Vec<usize>); 3] = [
             (Storage::Bool(vec![true, false]), vec![2], vec![3, 2]),
             (
@@ -291,5 +625,242 @@ mod tests {
         let scalar = Buffer::new(DType::Int32, vec![], Storage::I32(vec![7])).unwrap();
         let out = broadcast_to(&scalar, &[2, 2]).unwrap();
         assert_eq!(out.storage, Storage::I32(vec![7, 7, 7, 7]));
+    }
+
+    #[test]
+    fn apply2_agrees_with_the_reference_on_every_layout() {
+        // (out, left, right): the broadcast shapes a real graph produces and
+        // every alignment family the right-aligned rule has.
+        let cases: &[(&[usize], &[usize], &[usize])] = &[
+            (&[2, 3], &[1, 3], &[2, 1]),
+            (&[2, 2, 2], &[2, 1], &[2]),
+            (&[4, 3, 5], &[4, 3, 5], &[5]),
+            (&[4, 3, 5], &[1, 1, 5], &[1, 1, 1]),
+            (&[4096, 64], &[4096, 64], &[4096, 1]),
+            (&[1000, 1000], &[1000, 1000], &[1000]),
+            (&[3], &[1], &[3]),
+            (&[7, 6], &[7, 6], &[6]),
+            (&[5], &[5], &[5]),
+            // A per-row scalar, a short trailing tile and a rank-0 operand.
+            (&[500, 100], &[500, 100], &[500, 1]),
+            (&[500, 50, 4], &[500, 50, 4], &[4]),
+            (&[2, 3, 4], &[3, 4], &[2, 1, 1]),
+            (&[3, 4], &[3, 1], &[1, 4]),
+            (&[6], &[6], &[]),
+            (&[], &[], &[]),
+        ];
+        for (out_shape, a_shape, b_shape) in cases {
+            check_apply2_i32(out_shape, a_shape, b_shape);
+            check_apply2_f32(out_shape, a_shape, b_shape);
+        }
+    }
+
+    #[test]
+    fn element_i_reads_element_i_of_each_broadcast_operand() {
+        // Distinct ranges make any reordering visible: `a` counts rows, `b`
+        // counts columns, so a transposed or shifted read cannot pass.
+        let out_shape = [2usize, 3];
+        let a = [1i32, 2];
+        let b = [10i32, 20, 30];
+        let mut out = [0i32; 6];
+        apply2(&mut out, &out_shape, &a, &[2, 1], &b, &[3], |x, y| x * 100 + y);
+        assert_eq!(out, [110, 120, 130, 210, 220, 230]);
+
+        // The same for a per-axis vector against a 3-D result: a `(2, 1)`
+        // operand is right-aligned, so it rides out's MIDDLE axis and the
+        // result repeats once the middle index rolls over.
+        let out_shape = [2usize, 2, 2];
+        let a = [1i32, 2];
+        let mut out = [0i32; 8];
+        apply2(&mut out, &out_shape, &a, &[2, 1], &b[..2], &[2], |x, y| x * 100 + y);
+        assert_eq!(out, [110, 120, 210, 220, 110, 120, 210, 220]);
+    }
+
+    #[test]
+    fn a_rank_zero_operand_and_a_rank_zero_result_are_one_element() {
+        // Rank-0 views broadcast to each other and visit exactly once; the
+        // rank-1 result with a rank-0 operand agrees element for element.
+        check_apply2_i32(&[3, 2], &[1, 1], &[1, 1]);
+        check_apply2_i32(&[], &[], &[]);
+        let mut out = [0i32; 1];
+        apply2(&mut out, &[], &[4], &[], &[5], &[], |x, y| x * y);
+        assert_eq!(out, [20]);
+    }
+
+    #[test]
+    fn an_empty_result_writes_nothing() {
+        // A zero-length axis needs no work at all (and indexes no operand).
+        let mut out: Vec<i32> = Vec::new();
+        apply2(&mut out, &[2, 0, 3], &[2, 0, 3], &[2, 0, 3], &[3], &[3], |x, y| x + y);
+        assert!(out.is_empty());
+        let mut out: Vec<i32> = Vec::new();
+        let pred = [true, false, true];
+        apply3(
+            &mut out,
+            &[2, 0, 3],
+            &pred,
+            &[3],
+            &[2, 0, 3],
+            &[2, 0, 3],
+            &[3],
+            &[3],
+            |p, x, y| if p { x } else { y },
+        );
+        assert!(out.is_empty());
+        let filled: Vec<i32> = fill_broadcast(&[1, 2], &[2], &[0, 3]);
+        assert!(filled.is_empty());
+        let filled: Vec<i32> = fill_broadcast(&[1, 2], &[2], &[0, 2]);
+        assert!(filled.is_empty());
+    }
+
+    #[test]
+    fn nan_signed_zeros_and_wrapping_ride_through_untouched() {
+        // The closure owns the semantics; the driver may not reorder, drop or
+        // canonicalize a single element. `np.maximum` propagates NaN and keeps
+        // the sign of a zero, and i32 adds wrap.
+        let maximum = |x: f32, y: f32| {
+            if x.is_nan() || y.is_nan() {
+                f32::NAN
+            } else if x >= y {
+                x
+            } else {
+                y
+            }
+        };
+        // A rank-0 operand holding a NaN: every element is NaN.
+        let rows = [f32::NAN, -0.0, 1.0, 0.0, -1.0, 2.0];
+        let mut out = [0.0f32; 6];
+        apply2(&mut out, &[2, 3], &rows, &[2, 3], &[f32::NAN], &[], maximum);
+        assert!(out.iter().all(|value| value.is_nan()));
+        // A signed zero against rows: NaN stays NaN, and -0.0 / 0.0 keep
+        // their signs where they win.
+        let mut out = [0.0f32; 6];
+        apply2(&mut out, &[2, 3], &rows, &[2, 3], &[-0.0f32], &[], maximum);
+        assert!(out[0].is_nan());
+        assert_eq!(out[1].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(out[3].to_bits(), 0.0f32.to_bits());
+        // i32 wraparound on both the row-scalar and the trailing-tile layout.
+        let mut out = [0i32; 4];
+        apply2(&mut out, &[2, 2], &[i32::MAX, 1], &[2, 1], &[1, 2], &[2], |x, y| {
+            x.wrapping_add(y)
+        });
+        assert_eq!(out, [i32::MIN, i32::MIN + 1, 2, 3]);
+    }
+
+    #[test]
+    fn apply3_agrees_with_the_reference_on_every_select_layout() {
+        // (out, predicate, on-true, on-false)
+        type TernaryCase<'a> = (&'a [usize], &'a [usize], &'a [usize], &'a [usize]);
+        let cases: &[TernaryCase<'_>] = &[
+            (&[2, 3], &[3], &[2, 3], &[1]),
+            (&[2, 3], &[2, 1], &[2, 3], &[2, 3]),
+            (&[2, 3], &[2, 1], &[2, 1], &[2, 3]),
+            (&[2, 3], &[2, 1], &[2, 3], &[1, 3]),
+            (&[2, 3], &[1, 3], &[2, 1], &[2, 3]),
+            (&[2, 3], &[2, 3], &[2, 1], &[1, 3]),
+            (&[2, 3, 4], &[2, 1, 4], &[2, 3, 4], &[2, 3, 4]),
+            (&[2, 3, 4], &[3, 1], &[2, 3, 4], &[2, 1, 4]),
+            (&[2, 3], &[1, 1], &[2, 1], &[2, 3]),
+            (&[4], &[], &[4], &[4]),
+            (&[4], &[4], &[1], &[4]),
+            (&[500, 50, 4], &[500, 1, 1], &[500, 50, 4], &[500, 50, 4]),
+            (&[1024, 256], &[1024, 1], &[1024, 256], &[256]),
+        ];
+        for (out_shape, p_shape, a_shape, b_shape) in cases {
+            check_apply3_select(out_shape, p_shape, a_shape, b_shape);
+        }
+    }
+
+    #[test]
+    fn fill_broadcast_agrees_with_the_reference() {
+        // Not compared against `broadcast_to`: that is `fill_broadcast` now, so
+        // the reference has to be independent.
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[5], &[7, 5]),
+            (&[3], &[499, 3]),
+            (&[1], &[9, 4, 1]),
+            (&[6], &[2, 3, 6]),
+            (&[4], &[2000, 50, 4]),
+            (&[], &[2, 3]),
+            (&[2, 3], &[2, 3]),
+            (&[500, 1, 50], &[500, 4, 50]),
+            (&[500, 1], &[500, 100]),
+            (&[1, 1, 1], &[5, 1, 4]),
+            (&[3, 4], &[2, 3, 4]),
+        ];
+        for (shape, out_shape) in cases {
+            check_fill(shape, out_shape);
+        }
+    }
+
+    #[test]
+    fn a_pooled_broadcast_result_is_fully_overwritten() {
+        // A parked garbage stock of the result's exact size must not leak a
+        // single NaN into the result: the broadcast map writes every element.
+        let out_shape = [2000usize, 50, 4];
+        let count = product(&out_shape);
+        let left: Vec<f32> = (0..count).map(|index| (index % 97) as f32 * 0.5).collect();
+        let right = [0.5f32, -1.5, 2.0, 3.25];
+        crate::buffer::test_support::garbage_f32(count);
+        let result = crate::buffer::map2_runs(
+            DType::Float32,
+            &out_shape,
+            &left,
+            &out_shape,
+            &right,
+            &[4],
+            |a, b| a + b,
+        )
+        .unwrap();
+        match &result.storage {
+            Storage::F32(produced) => {
+                assert_eq!(produced.len(), count);
+                for (flat, value) in produced.iter().enumerate() {
+                    let expected = left[flat] + right[flat % 4];
+                    assert_eq!(
+                        value.to_bits(),
+                        expected.to_bits(),
+                        "element {flat} was not rewritten"
+                    );
+                }
+            }
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_view_path_agrees_with_the_flat_fast_path() {
+        // `map2`/`map3` are the flat typed-slice builders and `apply2`/`apply3`
+        // are the ndarray layout drivers: over full-shape operands both must
+        // produce the identical storage.
+        let out_shape = [3usize, 4];
+        let count = product(&out_shape);
+        let left: Vec<f32> = (0..count).map(|index| index as f32 * 0.5 - 3.0).collect();
+        let right: Vec<f32> = (0..count).map(|index| ((index * 7) % 11) as f32).collect();
+        let f2 = |a: f32, b: f32| a * 2.0 - b;
+        let flat = crate::buffer::map2(DType::Float32, &out_shape, &left, &right, f2).unwrap();
+        let mut driven = vec![0.0f32; count];
+        apply2(&mut driven, &out_shape, &left, &out_shape, &right, &out_shape, f2);
+        assert_eq!(flat.storage, Storage::F32(driven));
+
+        let pred: Vec<bool> = (0..count).map(|index| index % 3 == 0).collect();
+        let f3 = |p: bool, x: f32, y: f32| if p { x } else { y };
+        let flat3 = crate::buffer::map3(
+            DType::Float32, &out_shape, &pred, &left, &right, f3,
+        )
+        .unwrap();
+        let mut driven3 = vec![0.0f32; count];
+        apply3(
+            &mut driven3,
+            &out_shape,
+            &pred,
+            &out_shape,
+            &left,
+            &out_shape,
+            &right,
+            &out_shape,
+            f3,
+        );
+        assert_eq!(flat3.storage, Storage::F32(driven3));
     }
 }

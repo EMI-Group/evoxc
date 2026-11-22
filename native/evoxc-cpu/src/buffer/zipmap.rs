@@ -39,10 +39,6 @@ pub fn zip1<T: Copy + Sync, R: Copy + Send>(
 /// The serial arm of [`zip1`]: an iterator chain over the shortest common
 /// length (`f` by reference, so the callers stay monomorphized).  See [`zip1`]
 /// for why the unary arm is NOT indexed like the binary/ternary ones.
-///
-/// The strided-run driver calls the `*_slice` arms DIRECTLY: it makes one call
-/// per outer step, so it must not pay the thread gate ([`parallel_threads`])
-/// per step, and its threading decision is the run's, not one block's.
 #[inline]
 pub(super) fn zip1_slice<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: &impl Fn(T) -> R) {
     for (target, value) in out.iter_mut().zip(source) {
@@ -237,14 +233,14 @@ pub fn map3<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
 
 /// Broadcast binary builder: `out[i] = f(a[i], b[i])` over `out_shape`'s
 /// elements, where `a`/`b` are read through their own (possibly broadcast)
-/// shapes — the strided-run counterpart of [`map2`], for a result that is not
+/// shapes — the broadcast counterpart of [`map2`], for a result that is not
 /// broadcast-free.
 ///
 /// Like [`map1`]/[`map2`] it never zero-fills a result first (a pooled vector
-/// of the exact length is taken when one is available), and the run
-/// decomposition plus the per-element address arithmetic live in
-/// [`super::stride::apply2`], which falls back to the general broadcast driver
-/// for shapes it cannot express.
+/// of the exact length is taken when one is available), and the per-element
+/// layout work lives in [`super::broadcast::apply2`] (one ndarray `Zip` pass
+/// over broadcast views, falling back to `walk` for shapes a view cannot
+/// express).
 #[allow(clippy::too_many_arguments)]
 pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
     dtype: DType,
@@ -257,7 +253,7 @@ pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
 ) -> Result<Buffer> {
     let count = util_numel(out_shape);
     let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
-    super::stride::apply2(
+    super::broadcast::apply2(
         &mut values,
         out_shape,
         left,
@@ -275,9 +271,9 @@ pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
 /// broadcast predicate or branch.
 ///
 /// Like [`map2_runs`] it takes a pooled vector of the exact result length when
-/// one is available (never zero-filling first), and the run decomposition plus
-/// the per-element address arithmetic live in [`super::stride::apply3`], which
-/// falls back to the general broadcast driver for shapes it cannot express.
+/// one is available (never zero-filling first), and the per-element layout work
+/// lives in [`super::broadcast::apply3`] (one ndarray `Zip` pass over broadcast
+/// views, falling back to `walk` for shapes a view cannot express).
 #[allow(clippy::too_many_arguments)]
 pub fn map3_runs<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
     dtype: DType,
@@ -292,7 +288,7 @@ pub fn map3_runs<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
 ) -> Result<Buffer> {
     let count = util_numel(out_shape);
     let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
-    super::stride::apply3(
+    super::broadcast::apply3(
         &mut values,
         out_shape,
         pred,
