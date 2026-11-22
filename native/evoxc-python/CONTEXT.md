@@ -122,7 +122,7 @@ Nothing is shared with the engine, so writing into a result never reaches a call
 
 ### Large payloads
 
-The hand-off is single-threaded: a wide round trip is one `to_vec` (inbound) plus one zero-copy ownership move (outbound) on the calling thread, which beats the byte path's four-thread chunked copies because only one direction still copies.
+The hand-off is single-threaded: a wide round trip is one `to_vec` (inbound) plus one zero-copy ownership move (outbound) on the calling thread, so the inbound copy is the only remaining full pass over the payload.
 The `#[ignore]`d probe `an_eight_megabyte_round_trip_is_measured` (2M `f32` in + 2M `f32` out) measures **0.592 ms/round trip, 0.296 ms/direction** in a release build on this host; `--ignored --nocapture` refreshes it.
 End to end through the public pipeline with `backend="native"` (release, medians): `evoxc.run` on an identity graph over an 8 MB `f32` input is **0.43 ms**, a 1-op graph over a 16-element input is **0.006 ms** and a 100-op graph over the same input is **0.015 ms** (so ~0.09 µs per extra op).
 
