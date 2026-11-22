@@ -3,7 +3,7 @@
 Companion to `./CONTEXT.md` in the same directory.
 Everything here is REFERENCE material — measured numbers, machinery detail, probe narratives and host recipes — moved out of `CONTEXT.md` so that file stays readable in full.
 Nothing here is a second contract: the binding rules, per-adapter option surfaces, capability matrices, constraints and the numbered Known Issues live in `CONTEXT.md`.
-Known-Issue sections here use the SAME numbers as `CONTEXT.md` (`## Known Issue 3`, `## Known Issue 9`, `## Known Issue 10`, `## Known Issue 11`, `## Known Issue 13`, `## Known Issue 14`) so cross-references stay stable.
+Known-Issue sections here use the SAME numbers as `CONTEXT.md` (`## Known Issue 3`, `## Known Issue 9`, `## Known Issue 10`, `## Known Issue 11`, `## Known Issue 13`, `## Known Issue 14`, `## Known Issue 15`, `## Known Issue 16`, `## Known Issue 17`, `## Known Issue 18`, `## Known Issue 19`, `## Known Issue 20`, `## Known Issue 21`) so cross-references stay stable.
 
 ## IREE — host→device staging tiers (byte-level machinery)
 
@@ -78,7 +78,7 @@ Async execute (Known Issue 17): a same-device loop over a Qwen3-8B fp32 forward 
 
 Validation surface:
 - A throwaway fake plugin (compiled at test time from `tests/backends/_fake_pjrt_plugin.c`) pins the ABI: `sizeof(PJRT_Api)` == the ctypes 1144 plus field offsets, compile/execute/copy/serialize round-trip, error propagation, the version gate, and the missing-plugin message.
-- The REAL `jax_cuda12_pjrt` 0.10.2 CUDA plugin and the REAL `jax-rocm7-pjrt` 0.11.2 ROCm plugin (`platform_name="rocm"`) are validated by the GPU probe `bench_logs/probe_xla_gpu_validation.py`, which passes **26/26**: rank-0 staging, PSO/DE/OpenES-shaped fused steps bit-exact except the documented fp32 budgets, threefry2x32 + philox4x32_10 RNG bit-exact through the INLINE expansions, and a non-dominate-rank while_loop bit-exact.
+- The REAL `jax_cuda12_pjrt` 0.10.2 CUDA plugin and the REAL `jax-rocm7-pjrt` 0.11.2 ROCm plugin (`platform_name="rocm"`) are validated by the archived evoxc-bench GPU probe `probe_xla_gpu_validation.py`, which passes **26/26**: rank-0 staging, PSO/DE/OpenES-shaped fused steps bit-exact except the documented fp32 budgets, threefry2x32 + philox4x32_10 RNG bit-exact through the INLINE expansions, and a non-dominate-rank while_loop bit-exact.
 - Module-level plugin guard: `tests/backends/test_adapter_xla.py` SKIPS at import when no plugin is configured (collects 0 tests in a plugin-absent env); with a plugin present the in-env xla assertion counts are `test_xla_device_resident.py` 9 (fake plugin) and `test_pjrt_ctypes_plugin.py` 10 (C fake plugin, built at test time).
 
 Installed-plugin discovery (the `jax_plugins` convention): a JAX PJRT wheel installs its plugin at `<site-packages>/jax_plugins/<platform>/<name>_plugin.so` — `jax-rocm7-pjrt` installs `jax_plugins/xla_rocm7/xla_rocm_plugin.so` (the same path the environment recipes below used to spell by hand), `jax-cuda12-pjrt` installs `jax_plugins/xla_cuda12/xla_cuda_plugin.so`.
@@ -285,10 +285,105 @@ iree scheduling/module diagnostics:
 - `rocprofv3 --kernel-trace -f csv -o <out>` — per-kernel µs.
 
 iree-compile crash triage: `LLVM_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer-18` (Known Issue 10's stack).
-xla: the probe harness `bench_logs/probe_xla_gpu_validation.py` is the end-to-end validation entry point (26 checks) and documents the env recipes it needs.
+xla: the archived evoxc-bench probe harness `probe_xla_gpu_validation.py` is the end-to-end validation entry point (26 checks) and documents the env recipes it needs.
 
 ## Validation inventory
 
 - The `evoxc.bench` conformance/benchmark matrix (98 examples) exercises these adapters on numpy/cpu, iree/llvm-cpu, iree/rocm and xla/rocm; numbers in `evoxc/bench/rocm_mi300x_results.md` and `evoxc/bench/de_vs_torch_results.md`.
 - Adapter-specific numbers referenced from `CONTEXT.md` (staging tiers, hot path, version matrix, reduction diagnosis) are reproduced above with their measurement conditions.
 - The pytest note for this repo: `-q` (the configured `addopts`) suppresses the final "N passed" line — use `-v` or `-o addopts=` when a count is needed.
+
+## Known Issue 15 — per-leaf and arity cost anchors
+Binding headline (in `CONTEXT.md`): input COUNT is unbounded, per-call cost is per LEAF, and the CPU paths re-stage every input — so a many-input graph is cheap only when every input is a device-resident tensor placed ONCE.
+No adapter caps function arguments or buffers, and no adapter caches an input across calls.
+llvm-cpu iree: a plain run calls `rt.asdevicearray` once per HOST input leaf (the only plain-run host-input path).
+xla `Device("cpu", 0)`: one `PJRT_Client_BufferFromHostBuffer` create + close per leaf, every call.
+Device-resident runs pass `IreeDevicePayload`/`XlaDevicePayload` buffers straight through — zero copies, zero staging.
+Placement is the per-call cost to watch: cuda `upload_tensor` goes through `_acquire_runtime_device` with NO cache, so each placement creates a device; rocm avoids that with a thread-local cached device because a hip `create_device` measured ~46 ms/call.
+Cost anchors: per-IO-leaf ≈2–3.5 µs pipeline+adapter (the ladder and its derivation are in `## Known Issue 14`), and the plugin's `PJRT_LoadedExecutable_Execute` FFI measures ≈32 µs for 2 buffers vs ≈59 µs for 8 — arity grows the FFI cost even when nothing is staged.
+Compile-time scaling with graph size is `## Known Issue 18`; the runtime side is entirely per-leaf.
+
+## Known Issue 16 — IREE 3.11 Vulkan runtime defect narrative
+Scope: iree-base 3.11's Vulkan HAL — the historical defect family that the 3.13 pin removes or narrows. None of it is a precondition on 3.13.
+(a) Device visibility by NAME.
+The 3.11 vulkan driver hard-codes a device-name denylist in `iree_hal_vulkan_is_device_visible()`:
+`if (strstr(deviceName, "llvmpipe") == deviceName) return false;`
+There is NO flag or env override, so `query_available_devices()` returns `[]` on a host whose only Vulkan device is Mesa lavapipe.
+Making a SOFTWARE device enumerable on 3.11 needs `VK_ICD_FILENAMES` pointing at a RENAMED lavapipe ICD — a copy of `libvulkan_lvp.so` with the device-name string rewritten to `lavapipe`, kept MACHINE-LOCAL under `$TMPDIR` (never a repo path, never a hard-coded dependency).
+On 3.13.0 the denylist no longer hides lavapipe: `query_available_devices()` enumerates the software device with `VK_ICD_FILENAMES` UNSET, so the renamed-ICD recipe survives only as a 3.11 fallback and as a loader-pinning convenience.
+The device-guarded Vulkan tests discover devices in a CHILD PROCESS with a timeout, so they work with or without the variable.
+(b) Loader hang.
+With `VK_ICD_FILENAMES` unset, one recorded host's loader dlopens a wedged radeon ICD and `query_available_devices()` HANGS — wrap any Vulkan/DRM probe in `timeout`, and pinning the variable also keeps the loader away from that ICD.
+(c) Provenance.
+lavapipe reports `deviceType=CPU`, so every lavapipe number is correctness/provenance evidence, never a GPU performance measurement.
+(d) Default target profile.
+Without `vulkan_target`, codegen uses `vp_android_baseline_2022` (`max_workgroup_memory_bytes = 16384`, `max_thread_count_per_workgroup = 128`).
+The LayerNorm-shaped reductions of 124M-class transformer graphs exceed it at compile: `function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; exceeded the limit of 16384 bytes`.
+Raising the budget with `vulkan_target="<profile>"` (or the raw `--iree-vulkan-target=<profile>` flag) does not yield a running module: the wall moves from shared memory to vector-dialect legalization (`vector.from_elements` marked illegal).
+Profile budgets seen in the sweep: `rdna3`/`rdna4`/`gfx*` 64 KiB, `adreno`/`valhall*` 32 KiB, `sm_80`/`ampere` 166912 B.
+(e) MI300X-host GPU-Vulkan verdict.
+No GPU Vulkan execution is possible on the recorded MI300X host: RADV rejects CDNA3 by policy (`radv_is_gpu_supported`), AMDVLK's PAL has no CDNA IP path (`FAMILY_AI` missing), and a binary-patched RADV enumerates but fails init on the wedged amdgpu DRM device.
+Evidence, flags and the lavapipe measurements are in the archived evoxc-bench artefact `vulkan_findings.md`.
+The 3.13-era local Intel Panther Lake/ANV validation (real hardware, machine-local ICD recipe) is in `CONTEXT.md` "Intel GPU route and portability boundaries".
+
+## Known Issue 17 — xla dispatch-vs-completion measurement
+The measured gap (MI300X VF / ROCm 7.1, real `jax_rocm7_pjrt` plugin, Qwen3-8B fp32 forward in a same-device loop, `run` timed bare): best_ms 3.07 at seq_len 32 AND 3.07 at seq_len 128 — identical across a 4× work change, i.e. a bare timed loop measures only host dispatch.
+The same loop with ONE explicit `out.to(Device("cpu", 0))` readback per call measures 21.5 / 31.6 ms, so true execution latency is ~6–10× the reported dispatch time.
+Mechanism: a device-resident `run` passes `events=` into `xla_util._LoadedExecutable.execute`, which requests one per-device `PJRT_Event*` through `PJRT_LoadedExecutable_Execute_Args.device_complete_events`; `run` commits the raw handle to `_pending_events` under `_events_lock` the instant execute returns, BEFORE any output validation (so a late validation failure cannot leak a handle).
+`synchronize()` swaps the outstanding list out, awaits + destroys every popped handle OUTSIDE the lock, re-raises the FIRST error after the rest are cleaned up, is reusable/idempotent and performs zero FFI when idle; a `0`/`None` handle means the plugin violated the contract and raises an explicit `core.BackendError`; `close()` destroys pending handles WITHOUT awaiting.
+Open item: proving that a REAL plugin returns a live `PJRT_Event*` and that `PJRT_Event_Await` closes the 3.07 ms → 21.5/31.6 ms gap needs a GPU run — validated only by throwaway stub scripts and by the fake C plugin, whose `execute` ignores the event contract (so `run` records the reason and `synchronize` raises).
+
+## Known Issue 18 — large-graph compile cost table
+Scope: iree-base-compiler 3.11.0, llvm-cpu, adapter default flags, `batch_functions`-merged population graphs of shape `(N, 32)`.
+Where the time goes on a 2.9 GB-class graph:
+- `iree-compiler --compile-to=` phase split: 1.3 s parse/input, 6.6 s stream/flow, 27.5 s HAL/codegen for a ~27 s total — text parsing is a small share.
+- `evoxc.lower` 1.29 s of which `stablehlo.export` 1.10 s (≤5 % of the compile), and `evoxc.compile` adds 0 ms over raw `iree.compiler.compile_str`.
+- Artifact side: base64 of the vmfb 1.6 ms, `CompiledArtifact.save` 13 ms, `load` 8 ms — persistence is never the cost.
+Per-executable scaling: 3450 ops → 5.9–6.3 s with 230 executables, 9415 ops → 15.5 s with 434, 12804 ops → 26.5 s with 855; a median executable holds only 16–19 ops, so the ~30 ms per-executable fixed cost dominates and the ~0.3 ms/op term is secondary.
+The superlinear regime: a 2000-op elementwise CHAIN fuses into ONE dispatch and costs 11.1 s, while the SAME ops with an `optimization_barrier` every 100 ops (20 dispatches) compile in 2.3 s — mega-dispatches are superlinear, many small dispatches are linear.
+Chunk-and-parallelize is near-exactly linear: 895 ops in one chunk 1.53 s, a 256-program graph 6.32 s.
+`batch_functions(bands=32)` is −9 % (230 → 169 executables) while `switch_ops=True` is +22 %.
+Merged-graph TEXT is dominated by i1 select-mask literals (~86 %) yet parses in ~1.3 s, so compaction is not a lever — MLIR's compact `dense<"0x…">` hex form is NOT usable for i1.
+Flag sweep that does NOT help: `opt_level="O0"`/`"O1"` produce a BYTE-IDENTICAL vmfb, `--iree-opt-const-eval=false` and `--iree-codegen-enable-default-tuning-specs=false` are no-ops, `--mlir-disable-threading` is 1.8× WORSE, `opt_level="O3"` buys −10 %/−6.4 % but O2/O3 is documented-broken for some cuda graphs (Known Issue 9), and `--iree-hal-link-executables=false` is unstable per size (−26 %/+22 %).
+Levers that DO move wall clock: chunked parallel compile, `batch_functions(bands=…)`, and reuse (`CompiledArtifact.save`/`load`, `evoxc.build_cached` + `CompileCache`) — the adapter never caches a compile.
+
+## Known Issue 19 — dispatch binding wall
+The wall: the HIP and CUDA HALs cap ONE dispatch at 16 bindings and the check runs at executable LOAD, not at compile.
+Citations: `hip/native_executable.c:217-223` (inside `iree_hal_hip_native_executable_flatbuffer_verify`) rejects `exports[N] binding_flags count %zu exceeds maximum of %u` against `IREE_HAL_HIP_MAX_DISPATCH_BINDING_COUNT 16` (`hip/native_executable.h:21`, `constant_count` cap 64 at `:25`); CUDA is identical (`cuda/native_executable.c:224-230`, `cuda/native_executable.h:24`).
+The CPU local ABI allows 64 (`local/executable_library.h:380`, `local/executable_library_util.c:48`) and Vulkan has no count cap (`HALAttrs.td:581-607`, `ROCMTarget.cpp:1102-1123`, `native_executable.c:465-469`, `stream_command_buffer.c:550`, `amdgpu/executable.h:51`).
+The counted vector is the export's `#hal.pipeline.layout` binding list (a FLAT list in this version), one `BindingBits` per entry — that ONE dispatch's input + output buffers.
+Tensor CONSTANTS never consume it: measured 2 inputs + 20 distinct 4 KB constants = 4 bindings (hoisted and subranged into ONE constant-pool binding), and 20 tiny constants = 2 bindings (inlined).
+A static `stablehlo.concatenate` creates no dispatch of its own unless its pieces' producers fuse into that chain.
+Nothing raises or splits it: a 23-binding graph compiles for `rocm`/`hip` with exit 0, and `--iree-scheduling-optimize-bindings` (default ON), `--iree-stream-resource-alias-mutable-bindings` and `--iree-hal-indirect-command-buffers` leave the count unchanged; the only higher cap is the AMDGPU/HSA driver behind `--iree-rocm-container-type=amdgpu`, unreachable because the `iree-base-runtime` wheel ships no `amdgpu` driver.
+`evoxc.batch_functions` boundary: the driver is the merge's OUTPUT combine — the native merge's `combine_bands` emits ONE `stablehlo.concatenate` over all K per-band outputs, which IREE rewrites into a `flow.tensor.update` chain and fuses into ONE dispatch with one binding per piece.
+Measured worst case (every piece an elementwise-terminated 1-element column): K=15 → 16 bindings loads and runs bit-exact on `Device("rocm", 0)`, K=16 → 17 bindings raises the `core.BackendError`.
+Measured downstream GP-loss shape (pop 256 / 199 merged functions): max bindings 5 at K=32/64/100, 12 at K=105, 14 at K=106, 16 at K=107 (still loads), 18 at K=108, 20–24 for K≥112 (do not load).
+Band size 1 (K = n_functions) fails at every measured population; the count is NOT monotone in K because IREE shares pieces' source buffers (a shared input costs ONE read binding), hence the rule "K ≤ 15 unconditionally, band size ≥ 8 as the practical large-population policy" — the default band size 32 measured 5 bindings at pop 256.
+Emission-side remedies do NOT work: a balanced pairwise concat tree, ≤16-operand concat chunks and a 2-D `(1,16)` axis-1 chunk all still produce ONE wide update dispatch because IREE re-associates same-axis concat chains; `--iree-opt-outer-dim-concat` is unchanged; `--iree-scheduling-optimize-bindings=false` roughly doubles the count.
+llvm-cpu is NOT immune, only wider: it fails at K=40 (`binding count 41 > 32`) and K≥64 (`dispatch requiring 65 bindings exceeds limit of 64`) with two DIFFERENT raw errors that `_raise_if_dispatch_binding_limit` does not convert, so a caller batched on llvm-cpu caps at K=31.
+Offline count recipes (per-executable, no run needed): `--compile-to=executable-configurations`, `--iree-hal-dump-executable-sources-to`, `--iree-hal-dump-executable-configurations-to`.
+`iree-dump-module` does NOT decode the `HIP1` container, so it cannot be used to inspect a rocm vmfb's layout.
+
+## Known Issue 20 — finalizer-inside-create_client post-mortem
+Symptom: a full `pytest tests/backends` run stopped forever, and a real user-facing hang reproduced the same way.
+Faulthandler stack (bottom-up): `release_payloads` ← `weakref.__call__` ← `create_client` ← `acquire_client` — i.e. a weakref finalizer ran wherever the GC pass that freed its referent happened to be, including inside another critical section on the SAME thread.
+Old code held the non-reentrant `_shared_clients_lock` across `plugin.create_client()`, so a pending XLA payload finalizer (`release_payloads`, which takes that lock) collected during the create call re-entered and hung the thread permanently.
+Deterministic throwaway repro: a stub plugin whose `create_client` runs `gc.collect()` with a PENDING finalizer (cyclic referent + `gc.disable()`) — 50/50 reproductions before the fix.
+Fix (binding shape, now in `xla_util.acquire_client`): creation moved OUT of the state lock — double-check the cache under `_shared_clients_lock`, take the dedicated `_client_create_lock` (which NO finalizer path touches), call `plugin.create_client()` while holding no state lock, then insert under the state lock after re-checking.
+`_client_create_lock` still serializes creation process-wide because real GPU plugins grab a large BFC pool per client and abort when one cannot be allocated; `_shared_clients_lock`/`_initialized_lock` are `RLock` as a second line of defence; a stale-client identity guard keeps a late finalizer from decrementing a re-created client for the same path.
+Exercise: 8 threads × 200 cycles, 1600 clients created = 1600 closed, 1197 finalizers run, ~6.9 s, no hang.
+The binding locking discipline itself lives in `CONTEXT.md`; the committed test is still a gap (see `CONTEXT.md` "Test strategy").
+
+## Known Issue 21 — adapter-owned readback costs
+Readback cost per size/kind through `iree.py::_readback_device_array` (3.13.0, explicit `.to(cpu)`):
+
+| payload | rocm before → after | vulkan | llvm-cpu |
+|---|---|---|---|
+| 96 B | 43.6 → 37.6 µs | — | — |
+| 4 KB | 44.4 → 39.3 µs | — | — |
+| 16 MB | 0.37 → 1.51 ms | 2.44 ms | 0.001 → 0.003 ms |
+
+Small payloads are dominated by the queue/fence fixed cost; the 16 MB rocm row is the staging `queue_copy` (the old 0.37 ms was the runtime's import path that the adapter no longer uses); llvm-cpu keeps the zero-copy mapping.
+A vulkan readback pays a ~5 ms first-call host-visible allocation plus ~0.95 ms map+copy-out per 16 MB.
+Root cause of the ownership switch (`allocator.c:1985`): the runtime's `_copy_to_host` prefers `allocator.import_host_allocation` whenever `query_buffer_compatibility` reports `IMPORTABLE`, and the Vulkan allocator then rejects the very buffer it advertised — `ValueError: could not import host allocation: … allocator.c:1985: INVALID_ARGUMENT; host allocation import pointer does not satisfy Vulkan minImportedHostPointerAlignment 4096`, reproduced with PLAIN iree and no evoxc in the process.
+Hence no iree-version branch and no `try: to_host() except: …` fallback (both would silently redefine what a readback is), and host-memory IMPORT stays unused even where it works (HIP/CUDA), because one implementation serving every kind is what keeps the vulkan leg honest.
