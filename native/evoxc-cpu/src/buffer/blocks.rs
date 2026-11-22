@@ -16,6 +16,12 @@ fn block_error(op: &str) -> Error {
 /// Block copy: output block `b` is the `inner`-element run starting at
 /// `source[offsets[b]]` (the `gather`/`slice`/`tile` fast path: whole index-axis
 /// rows instead of one offset per element).
+///
+/// The destination is walked with `chunks_exact_mut`, so every block is one
+/// `copy_from_slice` at a running offset — no per-block multiply, no
+/// re-derived destination range, and a whole-array block (the identity
+/// `slice`/`reshape`/`transpose` and whole-source `tile` case, where
+/// `inner == out.len()`) is ONE bulk memcpy.
 pub fn copy_blocks<T: Copy>(
     out: &mut [T],
     source: &[T],
@@ -29,13 +35,11 @@ pub fn copy_blocks<T: Copy>(
     if inner == 0 {
         return Ok(());
     }
-    for (block, offset) in offsets.iter().enumerate() {
+    for (block, offset) in out.chunks_exact_mut(inner).zip(offsets) {
         let start = *offset;
-        let run = start..start + inner;
-        let src = source.get(run).ok_or_else(|| block_error(op))?;
-        let slot = block * inner;
-        let dst = out.get_mut(slot..slot + inner).ok_or_else(|| block_error(op))?;
-        dst.copy_from_slice(src);
+        let end = start.checked_add(inner).ok_or_else(|| block_error(op))?;
+        let src = source.get(start..end).ok_or_else(|| block_error(op))?;
+        block.copy_from_slice(src);
     }
     Ok(())
 }
