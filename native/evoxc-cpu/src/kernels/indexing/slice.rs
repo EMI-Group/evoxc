@@ -13,6 +13,7 @@ use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
+use super::strided_copy;
 use super::{operand, pooled_total, reconcile};
 
 /// One operand axis mapped onto a Python `slice(start, stop, step)`.
@@ -165,8 +166,9 @@ fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Re
 /// `slice_axis_inplace` (Python's bounds/steps, including a negative step), so
 /// the addressing is ndarray's — no per-axis offset table and no per-element
 /// odometer. A view that lands C-contiguous (a whole-array or interior-block
-/// slice) copies with ONE `copy_from_slice` into the pooled destination; every
-/// other layout receives it through a single `assign`.
+/// slice) copies with ONE `copy_from_slice` into the pooled destination; a
+/// strided one goes to [`super::strided_copy`]'s lane-grouped run copy, and
+/// every layout it declines (a backwards step) receives ndarray's `assign`.
 fn slice_typed<T: Scalar + NdScalar>(
     values: &[T],
     dtype: DType,
@@ -182,7 +184,7 @@ fn slice_typed<T: Scalar + NdScalar>(
     let mut out = pooled_total::<T>(total);
     if let Some(source) = view.as_slice() {
         out.copy_from_slice(source);
-    } else {
+    } else if !strided_copy::copy_view(values, &view, &mut out) {
         let mut dest = array_view_mut(&mut out, &shape)?;
         dest.assign(&view);
     }

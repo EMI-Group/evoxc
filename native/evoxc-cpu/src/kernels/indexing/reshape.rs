@@ -13,6 +13,7 @@ use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
+use super::strided_copy;
 use super::{operand, pooled_total, reconcile, render_ints, render_shape};
 
 // ---------------------------------------------------------------------------
@@ -141,10 +142,11 @@ fn transpose(source: &Buffer, permutation: &[usize], declared: &[Option<usize>])
 /// Materialize the transposed view through ndarray.
 ///
 /// `permuted_axes` expresses the axis order and yields a (usually strided) view;
-/// the fresh C-contiguous destination then receives it with ONE `assign`, so no
-/// hand-written permutation walk steps an offset odometer per element. A
-/// permutation that happens to leave the view C-contiguous (a size-1 axis, say)
-/// copies with a single `copy_from_slice` instead.
+/// the fresh C-contiguous destination then receives it through
+/// [`super::strided_copy`]'s lane-grouped run copy (ndarray's `assign` for any
+/// layout it declines), so no hand-written permutation walk steps an offset
+/// odometer per element. A permutation that happens to leave the view
+/// C-contiguous (a size-1 axis, say) copies with a single `copy_from_slice`.
 fn transpose_typed<T: Scalar + NdScalar>(
     values: &[T],
     dtype: DType,
@@ -157,7 +159,7 @@ fn transpose_typed<T: Scalar + NdScalar>(
     let mut out = pooled_total::<T>(total);
     if let Some(source) = view.as_slice() {
         out.copy_from_slice(source);
-    } else {
+    } else if !strided_copy::copy_view(values, &view, &mut out) {
         let mut dest = array_view_mut(&mut out, &shape)?;
         dest.assign(&view);
     }

@@ -45,6 +45,7 @@ mod gather;
 mod reshape;
 mod scatter;
 mod slice;
+mod strided_copy;
 
 #[cfg(test)]
 mod test_support;
