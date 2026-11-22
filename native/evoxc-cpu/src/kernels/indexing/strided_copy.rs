@@ -241,6 +241,25 @@ mod tests {
         assert_eq!(dest, vec![0i32; 6], "a declined copy leaves the destination untouched");
     }
 
+    /// The family the specialization exists for: `slice`'s `(500, 50, 4) ->
+    /// (500, 50, 1)` collapses to ONE axis of 25 000 elements 4 apart, so it is
+    /// a single lane-grouped run rather than 500 short strided walks.
+    #[test]
+    fn the_axis_last_single_element_family_is_one_strided_axis() {
+        let source: Vec<f32> = (0..100_000).map(|value| value as f32).collect();
+        let base = Array::from_shape_vec(IxDyn(&[500, 50, 4]), source).unwrap();
+        let storage = base.as_slice().unwrap();
+        let mut view = base.view();
+        view.slice_axis_inplace(ndarray::Axis(2), Slice::new(0, Some(1), 1));
+        assert_eq!(view.shape(), &[500, 50, 1]);
+        assert_eq!(plan_axes(&view), Some(vec![(25_000, 4)]));
+        let mut dest = vec![0f32; view.len()];
+        assert!(copy_view(storage, &view, &mut dest));
+        for (position, value) in dest.iter().enumerate() {
+            assert_eq!(*value, (position * 4) as f32, "element {position}");
+        }
+    }
+
     /// A pooled destination is fully overwritten by the strided filler: park a
     /// sentinel and confirm no element survives.
     #[test]
