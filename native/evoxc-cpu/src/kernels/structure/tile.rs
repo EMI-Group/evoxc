@@ -1,14 +1,14 @@
-//! `tile` — `np.tile`'s leading-dimension promotion, plus the two contiguous
-//! fast paths (whole-source repeat and block copy) and the general index map.
+//! `tile` — `np.tile`'s leading-dimension promotion as one ndarray broadcast,
+//! plus the whole-source repeat fast path ([`tile_whole_repeat`]).
 
 use evoxc_core::{Error, Result};
 
-use crate::buffer::{block_storage_filled, repeat_storage, Buffer, Storage};
+use crate::buffer::{array_view, array_view_mut, repeat_storage, Buffer, NdScalar, Storage};
 use crate::kernels::util;
 use crate::plan::OpSpec;
-use crate::with_type;
+use crate::scalar::Scalar;
 
-use super::{each_index, int_list, same_shape};
+use super::{int_list, pooled, same_shape};
 
 /// `reps` as non-negative extents (a negative entry is an explicit error).
 pub(super) fn reps(spec: &OpSpec) -> Result<Vec<usize>> {
@@ -75,13 +75,14 @@ fn tile_promoted(
 /// other rep 1), `tile` is exactly `np.tile(operand, [k] + [1] * (rank - 1))`,
 /// i.e. output element `i` is `operand[i % operand.len()]`.  The result is then
 /// `k` copies of the operand's whole contiguous run, which is one
-/// [`repeat_storage`] instead of one `copy_from_slice` per index row: a
-/// `(64, 64)` operand tiled to `(4096, 64)` becomes 64 copies of 16 KiB rather
-/// than 4096 copies of 256 B, into a pooled (never zero-filled) allocation.
+/// [`repeat_storage`] instead of `k` strided broadcast passes: a `(64, 64)`
+/// operand tiled to `(4096, 64)` becomes 64 copies of 16 KiB rather than a
+/// per-element read of a broadcast view, into a pooled (never zero-filled)
+/// allocation.  [`tile_storage`] is the reference it is pinned against.
 /// The workload that motivates it is a merged-GP-shaped graph, where 8 such
 /// tiles dominate the run.
 ///
-/// `None` (the block-copy path takes over) unless the promotion has already
+/// `None` (the broadcast path takes over) unless the promotion has already
 /// validated the shape and the repeat count closes exactly.
 pub(super) fn tile_whole_repeat(
     op: &str,
@@ -113,94 +114,103 @@ pub(super) fn tile_whole_repeat(
     if run == 0 || run.checked_mul(repeat) != Some(total) {
         return Ok(None);
     }
-    let storage = with_type!(input, |values| repeat_storage(values, total, run, op))?;
+    let storage = crate::with_type!(input, |values| repeat_storage(values, total, run, op))?;
     Ok(Some(storage))
 }
 
-/// `tile`'s contiguous fast path: both operands are C-contiguous, so the
-/// trailing axes that are not repeated map element-for-element onto the result
-/// and every run of `inner` output elements is one contiguous slice copy.
-/// Returns `None` (the general index map takes over) for an empty result or a
-/// shape the promotion rejects, so the error wording stays the map path's.
-pub(super) fn tile_blocks(
-    op: &str,
-    input: &Buffer,
-    out_shape: &[usize],
-    reps: &[usize],
-) -> Result<Option<Storage>> {
-    let in_shape = &input.shape;
-    if util::numel(out_shape) == 0 || input.storage.is_empty() {
-        return Ok(None);
-    }
-    tile_promoted(op, in_shape, out_shape, reps)?;
-    let rank = in_shape.len();
-    let out_rank = out_shape.len();
-    let lead = out_rank - rank;
-    // The trailing run of axes the tiling leaves in place: one contiguous copy
-    // per block.  (`out == in` on an axis means rep 1 or extent 1, both of
-    // which the operand's own stride already handles.)
-    let mut trailing = 0usize;
-    while trailing < rank && in_shape[rank - 1 - trailing] == out_shape[out_rank - 1 - trailing] {
-        trailing += 1;
-    }
-    let inner: usize = in_shape[rank - trailing..].iter().product();
-    let leading_shape = &out_shape[..out_rank - trailing];
-    let leading_sources = rank - trailing;
-    let in_strides = util::c_strides(in_shape);
-    let mut offsets = Vec::with_capacity(util::numel(leading_shape));
-    each_index(leading_shape, |index| {
-        let mut offset = 0usize;
-        for (axis, stride) in in_strides.iter().enumerate().take(leading_sources) {
-            let extent = in_shape[axis];
-            if extent == 0 {
-                continue;
-            }
-            offset += (index[axis + lead] % extent) * stride;
-        }
-        offsets.push(offset);
-    });
-    let storage = with_type!(input, |values| {
-        // Every output element is covered by one block, so the result needs no
-        // zero fill and can reuse a pooled allocation of exactly its length.
-        block_storage_filled(values, out_shape, &offsets, inner, "tile")
-    })?;
-    Ok(Some(storage))
-}
-
-/// `tile`'s index map: axis `a` of the result reads `index % extent` of the
-/// right-aligned operand axis (the operand's leading axes beyond its rank are
-/// implicit size-1 axes, so they contribute nothing).
-pub(super) fn tile_map(
-    op: &str,
+/// `tile`'s ndarray materialization (the reference for the whole-source fast
+/// path).
+///
+/// The promoted operand — leading size-1 axes added for numpy's promotion — is
+/// viewed with a size-1 axis interleaved before every axis and broadcast to
+/// `[rep, extent, rep, extent, ...]`.  That broadcast's C order IS the result's
+/// C order (`i -> i % extent` on every axis), so one assignment into a pooled
+/// destination of exactly the result's element count produces the tiling.
+pub(super) fn tile_storage<T: Scalar + NdScalar>(
+    values: &[T],
     in_shape: &[usize],
     out_shape: &[usize],
     reps: &[usize],
-) -> Result<Vec<Option<usize>>> {
-    let rank = in_shape.len();
-    let out_rank = rank.max(reps.len());
-    let lead = out_rank - rank;
-    tile_promoted(op, in_shape, out_shape, reps)?;
-    let in_strides = util::c_strides(in_shape);
-    let mut map = Vec::with_capacity(util::numel(out_shape));
-    each_index(out_shape, |index| {
-        let mut offset = 0usize;
-        for (source_axis, &extent) in in_shape.iter().enumerate() {
-            if extent == 0 {
-                continue;
-            }
-            offset += (index[source_axis + lead] % extent) * in_strides[source_axis];
-        }
-        map.push(Some(offset));
-    });
-    Ok(map)
+    op: &str,
+) -> Result<Storage> {
+    let promoted = tile_promoted(op, in_shape, out_shape, reps)?;
+    let out_rank = promoted.len();
+    let lead = out_rank - in_shape.len();
+    let rep_lead = out_rank - reps.len();
+    // The operand as the promoted shape (leading size-1 axes).
+    let mut source_shape = vec![1usize; lead];
+    source_shape.extend_from_slice(in_shape);
+    // [rep, extent] per axis: either element count times the operand's extent.
+    let mut interleaved = Vec::with_capacity(2 * out_rank);
+    for (axis, &extent) in source_shape.iter().enumerate() {
+        let rep = if axis < rep_lead {
+            1
+        } else {
+            reps[axis - rep_lead]
+        };
+        interleaved.push(rep);
+        interleaved.push(extent);
+    }
+    // The source view has the SAME rank as the interleaved target (ndarray's
+    // `broadcast` does not right-align ranks the way numpy does), with a 1 in
+    // every rep slot.
+    let repeated_slots: Vec<usize> = interleaved
+        .iter()
+        .enumerate()
+        .map(|(slot, &extent)| if slot % 2 == 0 { 1 } else { extent })
+        .collect();
+    let view = array_view::<T>(values, &repeated_slots)?;
+    let broadcast = view.broadcast(interleaved.as_slice()).ok_or_else(|| {
+        Error::shape(format!(
+            "op '{op}': cannot broadcast {source_shape:?} to the tiled shape {interleaved:?}"
+        ))
+    })?;
+    let total = util::numel(out_shape);
+    let mut out = pooled::<T>(total);
+    if total > 0 {
+        let mut dst = array_view_mut::<T>(&mut out, &interleaved)?;
+        dst.assign(&broadcast);
+    }
+    Ok(<T as NdScalar>::into_storage(out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::structure::copy_mapped;
     use crate::kernels::structure::test_support::*;
     use evoxc_core::DType;
+
+    /// An INDEPENDENT per-element reference for `np.tile`: output multi-index
+    /// `i` reads the operand at `i % extent` on every axis (plain index
+    /// arithmetic in the test, not another driver).
+    fn reference_tile(values: &[i32], in_shape: &[usize], out_shape: &[usize], reps: &[usize]) -> Vec<i32> {
+        let out_rank = out_shape.len();
+        let lead = out_rank - in_shape.len();
+        let rep_lead = out_rank - reps.len();
+        let total: usize = out_shape.iter().product();
+        let mut out = Vec::with_capacity(total);
+        for flat in 0..total {
+            // Decode the C-order multi-index, rightmost axis fastest.
+            let mut rest = flat;
+            let mut index = vec![0usize; out_rank];
+            for axis in (0..out_rank).rev() {
+                index[axis] = rest % out_shape[axis].max(1);
+                rest /= out_shape[axis].max(1);
+            }
+            let mut offset = 0usize;
+            let mut stride = 1usize;
+            for axis in (0..in_shape.len()).rev() {
+                let extent = in_shape[axis];
+                let position = index[axis + lead] % extent.max(1);
+                offset += position * stride;
+                stride *= extent;
+            }
+            // `reps` only shorten/lengthen the promotion, never the operand read.
+            let _ = rep_lead;
+            out.push(values[offset]);
+        }
+        out
+    }
 
     #[test]
     fn tile_with_equal_reps_repeats_both_axes() {
@@ -277,37 +287,67 @@ mod tests {
     }
 
     #[test]
-    fn a_tile_repeating_two_axes_takes_the_block_path_and_stays_exact() {
-        // Not a whole-source repeat (axis 1 repeats too), so the block copy --
-        // not the repeat fast path -- produces the result, and it must agree
-        // with the general index map element for element.
-        let values: Vec<i32> = (0..12).collect();
-        let input = i32_buffer(&[3, 4], &values);
-        let out_shape = [6usize, 8];
-        let reps = [2usize, 2];
-        let spec = op(
-            "tile",
-            DType::Int32,
-            &out_shape,
-            vec![("reps", ints(&[2, 2]))],
-        );
-        assert!(tile_whole_repeat("tile", &input, &out_shape, &reps)
+    fn the_whole_source_repeat_agrees_with_the_ndarray_broadcast() {
+        // The `repeat_storage` fast path takes over exactly when the promotion
+        // allows it, and it must agree with the ndarray broadcast element for
+        // element (the broadcast expression is the reference).
+        // A leading-axis rep only: `[k, 1, ...]`, and the 1-D case where the
+        // single axis IS the leading one.
+        let cases: [(&[usize], &[i64], &[usize]); 4] = [
+            (&[3, 4], &[2, 1], &[6, 4]),
+            (&[3, 4], &[3, 1], &[9, 4]),
+            (&[3, 4], &[1, 1], &[3, 4]),
+            (&[6], &[2], &[12]),
+        ];
+        for (in_shape, reps, out_shape) in cases {
+            let total: usize = in_shape.iter().product();
+            let values: Vec<i32> = (0..total as i32).collect();
+            let input = i32_buffer(in_shape, &values);
+            let reps: Vec<usize> = reps.iter().map(|rep| *rep as usize).collect();
+            let fast = tile_whole_repeat("tile", &input, out_shape, &reps)
+                .expect("the fast-path probe succeeds")
+                .expect("the whole-source repeat applies");
+            let reference = tile_storage(values.as_slice(), in_shape, out_shape, &reps, "tile")
+                .expect("the broadcast path succeeds");
+            assert_eq!(fast, reference, "reps {reps:?}");
+            let expected = reference_tile(&values, in_shape, out_shape, &reps);
+            match &fast {
+                Storage::I32(got) => assert_eq!(*got, expected, "reps {reps:?}"),
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
+        // A rep on a non-leading axis is interleaved, so the fast path declines
+        // and the broadcast expression is the only producer.
+        let input = i32_buffer(&[3, 4], &(0..12).collect::<Vec<i32>>());
+        assert!(tile_whole_repeat("tile", &input, &[6, 8], &[2, 2])
             .expect("the fast-path probe succeeds")
             .is_none());
-        let out = run(&spec, &input, &out_shape);
-        let map = tile_map("tile", &input.shape, &out_shape, &reps).unwrap();
-        match &out.storage {
-            Storage::I32(got) => {
-                assert_eq!(got.len(), map.len());
-                for (index, offset) in map.iter().enumerate() {
-                    assert_eq!(
-                        got[index],
-                        values[offset.expect("tile maps every element")],
-                        "element {index}"
-                    );
-                }
+    }
+
+    #[test]
+    fn tile_broadcast_agrees_with_the_per_element_reference() {
+        // Every tiling shape (repeats on the leading axis, both axes, a shorter
+        // reps list, a longer one that adds a leading axis) against the
+        // independent per-element `i % extent` reference.
+        let cases: [(&[usize], &[i64], &[usize]); 6] = [
+            (&[2, 3], &[2, 1], &[4, 3]),
+            (&[2, 3], &[2, 2], &[4, 6]),
+            (&[2, 3], &[1, 2], &[2, 6]),
+            (&[2, 3], &[2], &[2, 6]),
+            (&[3], &[2, 3], &[2, 9]),
+            (&[2, 2, 2], &[3, 1, 1], &[6, 2, 2]),
+        ];
+        for (in_shape, reps, out_shape) in cases {
+            let total: usize = in_shape.iter().product();
+            let values: Vec<i32> = (0..total as i32).collect();
+            let reps: Vec<usize> = reps.iter().map(|rep| *rep as usize).collect();
+            let storage = tile_storage(values.as_slice(), in_shape, out_shape, &reps, "tile")
+                .expect("the broadcast path succeeds");
+            let expected = reference_tile(&values, in_shape, out_shape, &reps);
+            match &storage {
+                Storage::I32(got) => assert_eq!(*got, expected, "shapes {in_shape:?} reps {reps:?}"),
+                other => panic!("unexpected storage {other:?}"),
             }
-            other => panic!("unexpected storage {other:?}"),
         }
     }
 
@@ -320,40 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn tile_block_fast_path_agrees_with_the_index_map() {
-        // The contiguous block copy must equal the general per-element map for
-        // every tiling shape (repeats on the leading axis, both axes, a shorter
-        // reps list, and a longer one that adds a leading axis).
-        let cases: [(&[usize], &[i64], &[usize]); 6] = [
-            (&[2, 3], &[2, 1], &[4, 3]),
-            (&[2, 3], &[2, 2], &[4, 6]),
-            (&[2, 3], &[1, 2], &[2, 6]),
-            (&[2, 3], &[2], &[2, 6]),
-            (&[3], &[2, 3], &[2, 9]),
-            (&[2, 2, 2], &[3, 1, 1], &[6, 2, 2]),
-        ];
-        for (in_shape, reps, out_shape) in cases {
-            let total: usize = in_shape.iter().product();
-            let values: Vec<i32> = (0..total as i32).collect();
-            let input = i32_buffer(in_shape, &values);
-            let reps: Vec<usize> = reps.iter().map(|rep| *rep as usize).collect();
-            let fast = tile_blocks("tile", &input, out_shape, &reps)
-                .expect("the fast path succeeds")
-                .expect("the fast path applies");
-            let map = tile_map("tile", in_shape, out_shape, &reps).expect("map builds");
-            let general = copy_mapped(&op("tile", DType::Int32, out_shape, vec![]), &input, out_shape, &map, None)
-                .expect("the map path succeeds");
-            assert_eq!(fast, general[0].storage, "shapes {in_shape:?} reps {reps:?}");
-        }
-    }
-
-    #[test]
-    fn tile_with_a_zero_rep_stays_on_the_map_path() {
-        // An empty result is the general path's: the block copy has nothing to
-        // copy and must not be asked to cover a non-empty result.
+    fn tile_with_a_zero_rep_stays_empty() {
+        // An empty result: nothing is copied and the result is empty.
         let input = i32_buffer(&[2], &[0, 1]);
         let spec = op("tile", DType::Int32, &[0], vec![("reps", ints(&[0]))]);
         let out = run(&spec, &input, &[0]);
+        assert_eq!(out.storage, Storage::I32(vec![]));
+        // An empty operand tiled to a non-empty shape is empty too.
+        let empty = i32_buffer(&[0, 3], &[]);
+        let spec = op("tile", DType::Int32, &[0, 6], vec![("reps", ints(&[2, 2]))]);
+        let out = run(&spec, &empty, &[0, 6]);
         assert_eq!(out.storage, Storage::I32(vec![]));
     }
 }
