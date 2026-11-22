@@ -128,7 +128,7 @@ End to end through the public pipeline with `backend="native"` (release, medians
 
 ### `unsafe` surface
 
-The crate now contains no `unsafe` of its own: the pointer/slice and raw-pointer machinery (`byte_view`, `borrowed_bytes`, `decode_words`, `OutPtr`, `fill_bytes`, `copy_bytes`, `storage_bytes_le`, `storage_to_bytes`, `split_threads`, `SPLIT_*`) is deleted, and `ndarray`/`numpy` own every view and every ownership transfer through their audited APIs.
+The crate contains no `unsafe` of its own: `ndarray` and `numpy` own every view and every ownership transfer through their audited APIs, so the pointer/slice machinery that the byte path needed has no replacement here.
 No SIMD intrinsics are used (`std::arch` and `core::simd` appear nowhere).
 
 ### Measured FFI floor
