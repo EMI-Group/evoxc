@@ -27,6 +27,14 @@
 //! One documented divergence: a non-finite pivot (`+inf` on the diagonal) is an
 //! error here, while the reference (and LAPACK's `potrf`) passes an infinite
 //! factor through — see `cholesky_lower_rejects_a_non_finite_pivot`.
+//!
+//! Timing (release, min of 3–5 runs, `bench_faer_vs_reference_cholesky`):
+//! 64x64 0.014 vs 0.016 ms, 256x256 0.67 vs 1.18 ms, 1024x1024 22.5 vs 76.2 ms
+//! in faer's favour with its global parallelism set to `Par::Seq`.
+//! `Llt::new` reads faer's GLOBAL parallelism, whose default is all cores, and
+//! that default costs 4.7–9.7 ms at 256x256 on this host against 0.67 ms
+//! sequential (a per-call `Par` does not exist on `Llt::new`): the setting is an
+//! engine-wide decision, so this kernel does not mutate it.
 
 use evoxc_core::{Error, Result};
 use faer::linalg::solvers::{Llt, LltError};
@@ -211,29 +219,17 @@ mod tests {
         a
     }
 
-    /// `L₀ L₀ᵀ` with a fixed-seed lower-triangular `L₀` (diagonal in `1..2`):
-    /// dense SPD, and cheap enough to build at 1024x1024 for the bench.
+    /// `C Cᵀ / n + I` from a fixed seed: dense SPD with the identity term
+    /// keeping the spectrum in `[1, 1 + n]`, so it stays numerically
+    /// positive definite at every bench size.
     fn spd(n: usize, seed: u64) -> Array2<f64> {
         let mut lcg = Lcg::new(seed);
-        let mut l0 = Array2::<f64>::zeros((n, n));
-        for col in 0..n {
-            for row in col..n {
-                l0[(row, col)] = if row == col {
-                    1.0 + lcg.unit()
-                } else {
-                    lcg.centered()
-                };
-            }
-        }
-        let mut a = Array2::<f64>::zeros((n, n));
+        let c = lcg.matrix(n);
+        let mut a = matmul(&c, &c.t());
+        let scale = n as f64;
         for row in 0..n {
-            for col in 0..=row {
-                let mut sum = 0.0f64;
-                for k in 0..=col {
-                    sum += l0[(row, k)] * l0[(col, k)];
-                }
-                a[(row, col)] = sum;
-                a[(col, row)] = sum;
+            for col in 0..n {
+                a[(row, col)] = a[(row, col)] / scale + if row == col { 1.0 } else { 0.0 };
             }
         }
         a
@@ -404,33 +400,59 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Times the faer factor against the reference on 64/256/1024 SPD
-    /// matrices; run with `--release ... -- --ignored --nocapture
+    /// matrices, with faer's default (globally parallel) and sequential global
+    /// settings; run with `--release ... -- --ignored --nocapture
     /// --test-threads=1`.
     #[test]
     #[ignore]
     fn bench_faer_vs_reference_cholesky() {
-        println!("     n |        faer |   reference | speedup");
+        fn best(mut run: impl FnMut(), warmups: usize, reps: usize) -> f64 {
+            for _ in 0..warmups {
+                run();
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let start = Instant::now();
+                run();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        }
+        println!("     n | faer (default par) | faer (seq) |  reference | par/ref | seq/ref");
         for (n, reps) in [(64usize, 5usize), (256, 5), (1024, 3)] {
             let a = spd(n, 0xA11CE ^ n as u64);
             let view = a.view();
-            // one warmup per leg
-            black_box(cholesky_lower(view).unwrap());
-            black_box(cholesky_lower_reference(view).unwrap());
-            let mut faer_best = f64::INFINITY;
-            let mut reference_best = f64::INFINITY;
-            for _ in 0..reps {
-                let start = Instant::now();
-                black_box(cholesky_lower(view).unwrap());
-                faer_best = faer_best.min(start.elapsed().as_secs_f64());
-                let start = Instant::now();
-                black_box(cholesky_lower_reference(view).unwrap());
-                reference_best = reference_best.min(start.elapsed().as_secs_f64());
-            }
+            // faer's default global setting is `Par::rayon(0)` (all cores).
+            faer::set_global_parallelism(faer::Par::rayon(0));
+            let parallel = best(
+                || {
+                    black_box(cholesky_lower(view).unwrap());
+                },
+                1,
+                reps,
+            );
+            faer::set_global_parallelism(faer::Par::Seq);
+            let sequential = best(
+                || {
+                    black_box(cholesky_lower(view).unwrap());
+                },
+                1,
+                reps,
+            );
+            let reference = best(
+                || {
+                    black_box(cholesky_lower_reference(view).unwrap());
+                },
+                1,
+                reps,
+            );
             println!(
-                "{n:>5} | {:>9.3}ms | {:>8.3}ms | {:>6.2}x",
-                faer_best * 1e3,
-                reference_best * 1e3,
-                reference_best / faer_best
+                "{n:>5} | {:>14.3}ms | {:>8.3}ms | {:>8.3}ms | {:>6.2}x | {:>6.2}x",
+                parallel * 1e3,
+                sequential * 1e3,
+                reference * 1e3,
+                reference / parallel,
+                reference / sequential
             );
         }
     }
