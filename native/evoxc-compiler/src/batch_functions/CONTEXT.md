@@ -3,8 +3,8 @@
 ## Intent
 
 `batch_functions` merges N programs with identical input/output signatures but different bodies into ONE `Program` whose leading axis is a STATIC function axis of length N (row i evaluates program i).
-It is the native port of `evoxc/transforms/batch_functions.py` + `_merge.py` + `_emit.py` + `_bands.py` and must reproduce their semantics, report and v1 deferral messages exactly.
-The Python files are the authoritative behavioral spec; `tests/transforms/test_batch_functions*.py` are the behavioral tests (read-only here).
+It is the engine behind the `evoxc/transforms/batch_functions.py` frontend and must reproduce its semantics, report and v1 deferral messages exactly.
+The Python `batch_functions` tests are the authoritative behavioral spec: `tests/transforms/test_batch_functions*.py` (read-only here).
 The merged graph is an ordinary graph of ordinary ops: it needs no new backend support and every op goes through the existing batching registry (`crate::batching::dispatch`).
 
 ## API Surface
@@ -145,7 +145,7 @@ Every deferral is a `TransformError` with the Python message text (naming the op
 
 * In-crate integration tests in `native/evoxc-compiler/tests/batch_functions.rs` build programs with `Builder` and assert: identical programs -> zero selects and one batched op per source op; divergent topology -> one output mux; `switch_ops` on/off; stacked vs shared constants; `bands` None/1 (identical op sequence)/K/auto; the three alignments; every report field; and one test per deferral asserting `TransformError` + message.
 * `native/evoxc-compiler/tests/batch_functions_bands.rs` covers the banded half: the partition rules (`even_partition` / `ladder_partitions`), `bands=1` byte-identical to the flat merge, explicit bands (band-local slices + one output `concatenate`, `switch` records with GLOBAL rows), the auto plan (single-band 1232.0/1232.0 and two-band 39168.0/43136.0 pinned, the non-contiguous fingerprint partition with `gather` views plus the inverse row permutation), and the banded deferrals.
-* `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` is the future-FFI differential harness: it compares `evoxc._evoxc_native.batch_functions(envelopes, config)` against `evoxc.batch_functions` (structural envelope comparison, numpy numerics, `BatchReport.as_dict()`). It exits 0 with an explicit SKIP line while the FFI entry does not exist, and must not disturb `run_parity.py`.
+* `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` is the differential harness for the FFI entry: it compares `evoxc._evoxc_native.batch_functions(envelopes, config)` against the `evoxc.batch_functions` frontend (structural envelope comparison, numpy numerics, `BatchReport.as_dict()`) and prints `BATCH PARITY: 25 cases, 87 checks, 0 mismatches` at this tree. It SKIPS with the missing-prerequisite message when `.venv/bin/python` or `evoxc/_evoxc_native.abi3.so` is absent, and must not disturb `run_parity.py`.
 
 ## Routing Table
 

@@ -3,7 +3,7 @@
 ## Intent
 
 `evoxc-runtime` is the native home of the runtime *ownership model*: sessions, device contexts, buffers, submissions, completions and executables.
-It exists so the Python runtime contract (`../evoxc/CONTEXT.md` "Device kinds", the `Tensor`/`Executable` placement rules, `prefetch`/`sink`/`synchronize` semantics) has a compiling, testable Rust shape BEFORE any device driver exists: the invariants live in types, and a future adapter fills in the driver side without redesigning lifetimes.
+It exists so the Python runtime contract (`../../evoxc/CONTEXT.md` "Device kinds", the `Tensor`/`Executable` placement rules, `prefetch`/`sink`/`synchronize` semantics) has a compiling, testable Rust shape BEFORE any device driver exists: the invariants live in types, and a future adapter fills in the driver side without redesigning lifetimes.
 It is deliberately a skeleton with **real types and real invariants** — no empty functions that pretend to work — and it is the only runtime crate: it never depends on `evoxc-compiler` or PyO3, and it never sees a Python object.
 
 Binding workspace contract: `../CONTEXT.md` (§12/§13 of `../../NATIVE_ARCHITECTURE_PROPOSAL.md` is the design source, this file is the crate contract).
@@ -59,7 +59,7 @@ Consequences, each pinned by a test:
 - **No `MappedView` / `ForeignExport` / DLPack surface.** Proposal §12/§15 objects that require a real payload are not modelled yet.
 - **`Session::close` is cooperative.** It checks the session tracker under the close lock, but a submission created concurrently on another thread can land after the check; close is an explicit quiescence request, not a memory-safety barrier.
 - **Thread safety is not asserted.** The skeleton uses `std::sync` primitives but makes no `Send + Sync` promise over backend handles (proposal §12: keep that adapter-qualified).
-- **Relationship to the Python contract.** `../evoxc/CONTEXT.md` remains authoritative for behavior until a Python path delegates natively; the port must match this ownership model, not invent a second one.
+- **Relationship to the Python contract.** `../../evoxc/CONTEXT.md` remains authoritative for behavior until a Python path delegates natively; the port must match this ownership model, not invent a second one.
 
 ## Test strategy
 

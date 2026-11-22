@@ -13,11 +13,11 @@ Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`.
 |---|---|
 | `./src/lib.rs` | Module declarations and the crate-level re-exports (`Program`/`Function`/`Block`/`Op`/`Value`/`Region`/`Location`/`ValueId`/`OpId`, `decode`/`encode`, `infer_op`, `verify`). |
 | `./src/dtype.rs` | The 14 dtypes with numpy-compatible names/sizes and promotion through the generated table. |
-| `./src/dtype_table.rs` | **Generated** 16384-entry `np.result_type` table (one per 14-bit dtype subset); regenerate with `native/tools/gen_dtype_promotion.py`, never hand-edit. |
+| `./src/dtype_table.rs` | **Generated** 16384-entry `np.result_type` table (one per 14-bit dtype subset); regenerate with `../tools/gen_dtype_promotion.py`, never hand-edit. |
 | `./src/dim.rs` | `Dim` (`Int`/`Named`/`Expr`/`Dynamic`), `DimExpr`, `DimOp`, structural equality and the `add`/`sub`/`mul`/`floordiv`/`modulo`/`min`/`max` builders with int folding. |
 | `./src/value_type.rs` | `ValueType { dtype, shape }`, `Shape = Vec<Dim>`, the `tensor<3xBxf32>` `Display`. |
 | `./src/attr.rs` | `AttrValue`/`Attrs`/`ArrayPayload`, the `__evoxc_ndarray__` and `__evoxc_tuple__` markers, schema validation and default filling. |
-| `./src/schema.rs` + `./src/schema_table.rs` | `OpSchema`/`AttrSchema` and the **generated** 119-op registry (arity, result count, effect, region count, terminator flag, `has_shape_fn`, attribute schema with JSON defaults); regenerate with `native/tools/gen_opdefs.py`. |
+| `./src/schema.rs` + `./src/schema_table.rs` | `OpSchema`/`AttrSchema` and the **generated** 119-op registry (arity, result count, effect, region count, terminator flag, `has_shape_fn`, attribute schema with JSON defaults); regenerate with `../tools/gen_opdefs.py`. |
 | `./src/wire.rs` | Envelope JSON conversions for dims, shapes, value types and array payloads. |
 | `./src/graph.rs` | The IR: `Program`, `Function`, `Block`, `Region`, `Op`, `Value`, `ValueOwner`, `Use`, `Location`, numeric ids, `Table<T>` arenas, id allocators, use bookkeeping. |
 | `./src/envelope/mod.rs` + `./src/envelope/tests.rs` | `decode`/`encode` of `evoxc-native-ir` v1, the tolerant attribute decoder and its round-trip/validation tests. |

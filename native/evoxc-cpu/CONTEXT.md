@@ -3,7 +3,7 @@
 ## Intent
 
 `evoxc-cpu` is the native (Rust) CPU backend: it compiles an [`evoxc_core::Program`] into an immutable execution `Plan` and runs it on typed host buffers.
-It is the numerical authority for concrete CPU execution — the Rust counterpart of the Python numpy interpreter in `../evoxc/backends/numpy/` — and it depends on `evoxc-core` only: no Python, no PyO3, no device APIs, no compiler backends.
+It is the numerical authority for concrete CPU execution — the Rust counterpart of the Python numpy interpreter in `../../evoxc/backends/numpy/` — and it depends on `evoxc-core` only: no Python, no PyO3, no device APIs, no compiler backends.
 The `evoxc-python` crate wraps it as `evoxc._evoxc_native.native_compile` / `NativeProgram`; that FFI is documented in `../evoxc-python/CONTEXT.md`.
 
 Shape/type inference is NOT re-derived here: result types come from the graph (`OpSpec.result_types`, filled by `evoxc-core` inference at trace/build time) and every produced buffer is re-validated against them at run time.
@@ -48,7 +48,7 @@ Semantics are the numpy backend's, op by op: `remainder` is floormod (sign of th
 `if` takes a 0-d bool predicate in operand 0 and passes ALL operands as region arguments; `while` has regions `[cond, body]` with no iteration limit; `call` runs the callee's entry block.
 Result validation matches the numpy interpreter's messages ("kernel for op '{op}' produced result {i} with …"), a dtype mismatch is a `BackendError` and a shape mismatch a `ShapeError`.
 Collectives are single-rank identities (`rank`/`world_size` read `RunOptions`); `world_size != 1` is an explicit `BackendError` — there is no multi-rank executor in this engine.
-Random is BIT-EXACT with `../evoxc/backends/numpy/kernels/random.py` for splitmix64, threefry2x32 and philox4x32_10 (key handling, salt folding, counter layout, uniform/randint/permutation/multinomial/normal, including the f32 Box–Muller normal fast path).
+Random is BIT-EXACT with `../../evoxc/backends/numpy/kernels/random.py` for splitmix64, threefry2x32 and philox4x32_10 (key handling, salt folding, counter layout, uniform/randint/permutation/multinomial/normal, including the f32 Box–Muller normal fast path).
 
 ## Performance (measured on this host, shared CPU)
 
@@ -189,7 +189,7 @@ The contiguous-copy paths pin their own behaviour: [`stride_copy`](src/kernels/i
 
 ## Known Issues / Notes for Agents
 
-- **`random_split_n` salts above `u64::MAX`:** `evoxc/ops/random.py` stamps `random_split_n`'s salts as `i * 0x9E3779B97F4A7C15`, which for `i >= 2` exceeds `u64` (`2 * GOLDEN` = 22801429638646396970) and so has no 64-bit envelope encoding. `native/tools/parity_cpu.py` reduces such values modulo `2**64` (the same mask the numpy kernel applies through `np.uint64` arithmetic), and the real fix belongs to the frontend, out of this node's write scope.
+- **`random_split_n` salts above `u64::MAX`:** `evoxc/ops/random.py` stamps `random_split_n`'s salts as `i * 0x9E3779B97F4A7C15`, which for `i >= 2` exceeds `u64` (`2 * GOLDEN` = 22801429638646396970) and so has no 64-bit envelope encoding. `../tools/parity_cpu.py` reduces such values modulo `2**64` (the same mask the numpy kernel applies through `np.uint64` arithmetic), and the real fix belongs to the frontend, out of this node's write scope.
 - `evoxc-core`'s `int` attribute decode accepts any value that fits `u64` (it tries `as_u64` first and falls through to `as_i64` for negatives), so a single 64-bit salt such as the SplitMix64 golden gamma travels verbatim; `evoxc-python`'s inbound integer conversion likewise accepts `i64` then `u64`, so no 64-bit unsigned value needs narrowing.
 - **`sort`/`argsort` are always stable:** with `stable=false` and duplicate values, numpy's quicksort may return a different (equally valid) permutation. One stable code path; ties are order-stable rather than numpy-quicksort-order.
 - **`sort`/`argsort` lose to numpy's AVX2/AVX-512 sorting networks:** the engine's Batcher odd-even networks are scalar, so a row-wise 4096×64 sort/argsort measures 0.39× numpy — safe Rust rules out explicit SIMD intrinsics (they would need `unsafe`).
