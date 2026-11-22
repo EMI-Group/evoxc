@@ -38,7 +38,7 @@ Design (binding — see ``evoxc/CONTEXT.md``, section "evoxc.random"):
   per-op constant (below) — different op kinds with the same key therefore
   draw decorrelated streams. ``split``/``split_n`` are sugar over the
   ``random_key_mix`` op: ``mix(key ^ salt)`` with salt ``0`` / the golden
-  gamma / ``i * golden``.
+  gamma / ``(i * golden) mod 2^64`` (masked so every salt stays a u64).
 - **Polymorphism**: ``key`` is a deterministic CREATOR — outside a trace it
   returns a concrete ``core.Tensor`` (usable as an explicit graph input);
   inside a trace it builds a Constant op. ALL other functions are graph ops:
@@ -367,7 +367,10 @@ def split_n(key, n: int):
 
     Graph op. ``n`` must be a non-negative Python int (static). Returns a
     tuple of ``n`` ``SymbolicTensor`` keys, derived as
-    ``mix(key ^ (i * GOLDEN))``.
+    ``mix(key ^ ((i * GOLDEN) mod 2^64))``. The salt is masked to 64 bits so
+    every derived salt stays a u64 (``i >= 2`` overflows the 64-bit range
+    unmasked, which no integer attribute can carry); the numpy kernels mask
+    the salt the very same way, so the derived keys are unchanged.
     """
     builder = _utils.check_in_trace()
     loc = _utils.get_location(depth=2)
@@ -379,7 +382,8 @@ def split_n(key, n: int):
     if n < 0:
         raise ValueError(f"random.split_n: n must be >= 0, got {n}")
     return tuple(
-        _key_mix(builder, key_t, i * _GOLDEN, alg, loc) for i in range(n)
+        _key_mix(builder, key_t, (i * _GOLDEN) & _MASK64, alg, loc)
+        for i in range(n)
     )
 
 

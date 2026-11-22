@@ -438,18 +438,36 @@ class Graph:
     def digest(self) -> str:
         """A process-stable SHA-256 digest of the graph's structure + I/O.
 
-        Hashes the canonical JSON of `ir.serialize_module(self.module)` and
-        of `signature_info()`, each length-prefixed so the concatenation cannot
-        collide. It identifies graph STRUCTURE and the input/output signature
-        only: `source_locations` (out-of-process unstable) and the
-        `batch_report` are deliberately excluded, while function/op names,
-        types, static values, and the I/O trees are included. Identical graphs
-        in different processes digest identically.
+        Hashes, each length-prefixed so the concatenation cannot collide:
+
+        * the module's STRUCTURE — `ir.serialize_module(self.module)` with
+          every op's source ``location`` entry and the payload's own
+          ``sha256`` field (a hash of the payload WITH those locations)
+          removed. What remains is the structural content only: the module/
+          function names and metadata, the block arguments (SSA ids + types),
+          each op's name, attributes, operand ids and result ids/types, the
+          nested regions, and the constant table;
+        * `signature_info()` — the input/output trees, the tensor specs and
+          the static values.
+
+        Nothing process- or path-dependent enters the hash: the per-op
+        `source_locations` are excluded (the ``file:line`` a graph was DEFINED
+        at is not part of it) and the module carries no memory addresses, so
+        the IDENTICAL graph defined in a different FILE or a different PROCESS
+        — or deserialized from disk — digests identically. The `batch_report`
+        is excluded too. Anything structural changes the digest: an op name, an
+        attribute value, a dtype/shape, a static value, or the I/O trees.
         """
+        payload = ir.serialize_module(self.module)
+        # Drop the two location-derived fields (the digest identifies
+        # structure, never where the source happened to live).
+        payload.pop("sha256", None)
+        for op_entry in payload["ops"]:
+            op_entry.pop("location", None)
         digest = hashlib.sha256()
-        for payload in (ir.serialize_module(self.module), self.signature_info()):
+        for part in (payload, self.signature_info()):
             encoded = json.dumps(
-                payload, sort_keys=True, separators=(",", ":")
+                part, sort_keys=True, separators=(",", ":")
             ).encode("utf-8")
             digest.update(str(len(encoded)).encode("ascii"))
             digest.update(b":")

@@ -82,7 +82,7 @@ The generic SSA machinery and the op **registry** live in `evoxc.ir`, and the ca
 | `sorting.py` | `sort argsort topk` |
 | `structural.py` | `tile stack flip roll clamp diag isnan nan_to_num eye linspace` |
 | `stats.py` | `var std median nansum` — documented compositions over ordinary ops, no dedicated IR ops |
-| `random.py` | The `evoxc.random` frontend: `key split split_n uniform normal randint permutation multinomial` (6 algorithm-aware random IR ops, re-exported via `evoxc/random.py`) |
+| `random.py` | The `evoxc.random` frontend: `key split split_n uniform normal randint permutation multinomial` (6 algorithm-aware random IR ops, re-exported via `evoxc/random.py`); `split_n(k, n)[i]` is `mix(key ^ ((i * GOLDEN) & 2^64-1))` — every derived salt is masked to 64 bits so it stays a plain unsigned-64-bit `salt` attribute (unmasked, `i >= 2` overflows the 64-bit range and no backend envelope can carry it), and the numpy kernels mask identically so the keys are bit-identical to the unmasked reference |
 | `constant.py` | `constant runtime_call stop_gradient` (+ `EVOXC_LARGE_CONSTANT_BYTES`, `constant_like`) |
 | `external.py` | `external_call` — the graph-side declaration of a named external-kernel call (see `../CONTEXT.md` "External kernels") |
 | `_registration.py` | `OPERATOR_HANDLERS` mapping, `register_operator_handlers` (implemented) |
