@@ -88,12 +88,12 @@ Reading of the numbers, which is load- and shape-dependent:
 The authoritative workload is the external TensorNEAT 0.2.0 harness: one `evoxc.build` + one warm `evoxc.run` per generation over a 500-genome population.
 Reproduce with `PYTHONPATH=<tensorneat>/src .venv/bin/python <tensorneat>/benchmarks/run_benchmark.py --impl new --backend numpy,native --cases xor_p500,cartpole_p100 --generations 8 --warmup 2 --repeats 1`.
 
-| case | numpy ms/gen | native now ms/gen | native before this round | now |
-|---|---|---|---|---|
-| `xor_p500` (2249 static ops, ~7900 executed) | 48.9–49.5 | **41.5–42.8** | 80.8 | native 1.15–1.18× faster |
-| `cartpole_p100` (2238 static ops, ~31.6 k executed) | 68.7–69.4 | **24.1–24.2** | 44.6 | native 2.9× faster |
+| case | numpy ms/gen | native ms/gen | verdict |
+|---|---|---|---|
+| `xor_p500` (2249 static ops, ~7900 executed) | 49.2–49.7 | **427.8** | native 8.6× slower — the `gather` regression (see Known Issues) |
+| `cartpole_p100` (2238 static ops, ~31.6 k executed) | 69.4–70.1 | **446.3** | native 6.4× slower — the `gather` regression (see Known Issues) |
 
-Per-op attribution at the end state (nested-aware `Instant` brackets around the `exec.rs` step-kernel call in a scratch build loaded through `EVOXC_NATIVE_LIB`, ~0.2 % overhead, median of 3 runs; the numpy leg is the numpy interpreter's own kernels wrapped the same way), kernel totals: `xor_p500` native **42.65** vs numpy **50.54 ms/run**, `cartpole_p100` native **32.80** vs numpy **82.86 ms/run**.
+Per-op attribution on the run-copy gather path (nested-aware `Instant` brackets around the `exec.rs` step-kernel call in a scratch build loaded through `EVOXC_NATIVE_LIB`, ~0.2 % overhead, median of 3 runs; the numpy leg is the numpy interpreter's own kernels wrapped the same way), kernel totals: `xor_p500` native **42.65** vs numpy **50.54 ms/run**, `cartpole_p100` native **32.80** vs numpy **82.86 ms/run**.
 The xor split is **+15.04 ms over the 146 ops where native loses** and **−22.90 ms over the 411 ops where native wins** (net −7.86); the largest single win is the many-small-op tail — 505 ops at ~2.3 µs/call against numpy's ~7 µs — i.e. interpreter and plan overhead, which is what the block-plan work targets.
 
 | xor op | calls/run | native ms | numpy ms | delta |
