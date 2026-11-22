@@ -424,6 +424,87 @@ mod tests {
     }
 
     #[test]
+    fn solve_broadcasts_the_batch_dims_of_both_operands() {
+        // a has no batch dim, b has one: `a` broadcasts over it (ndarray
+        // `broadcast`, the same right-aligned rule as numpy).
+        let a = value(DType::Float64, &[2, 2], Storage::F64(vec![2., 1., 0., 3.]));
+        let b = value(
+            DType::Float64,
+            &[3, 2, 2],
+            Storage::F64(vec![1., 0., 0., 1., 2., 1., 0., 2., 4., 0., 1., 1.]),
+        );
+        let op = spec("solve", DType::Float64, &[3, 2, 2], Attrs::new());
+        let out = solve_impl(&[a, b], &op, vec![3, 2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![3, 2, 2]);
+        assert_close(
+            &floats(&out[0]),
+            &[
+                0.5,
+                -1.0 / 6.0,
+                0.0,
+                1.0 / 3.0,
+                1.0,
+                1.0 / 6.0,
+                0.0,
+                2.0 / 3.0,
+                11.0 / 6.0,
+                -1.0 / 6.0,
+                1.0 / 3.0,
+                1.0 / 3.0,
+            ],
+        );
+
+        // a is batched, b is a bare vector: `b` broadcasts over the batch.
+        let a = value(
+            DType::Float64,
+            &[2, 2, 2],
+            Storage::F64(vec![2., 1., 1., 3., 1., 0., 0., 2.]),
+        );
+        let vector = value(DType::Float64, &[2], Storage::F64(vec![3., 5.]));
+        let op = spec("solve", DType::Float64, &[2, 2], Attrs::new());
+        let out = solve_impl(&[a, vector], &op, vec![2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![2, 2]);
+        assert_close(&floats(&out[0]), &[0.8, 1.4, 3.0, 2.5]);
+    }
+
+    #[test]
+    fn solve_batched_right_side_matrix_rhs() {
+        // X A = B with a single A and a batch of square B matrices: each batch
+        // element is its own right-sided system.
+        let a = value(DType::Float64, &[2, 2], Storage::F64(vec![2., 1., 0., 3.]));
+        let b = value(
+            DType::Float64,
+            &[3, 2, 2],
+            Storage::F64(vec![1., 0., 0., 1., 2., 1., 0., 2., 4., 0., 1., 1.]),
+        );
+        let right = spec(
+            "solve",
+            DType::Float64,
+            &[3, 2, 2],
+            Attrs::from_pairs([("left_side", AttrValue::Bool(false))]),
+        );
+        let out = solve_impl(&[a, b], &right, vec![3, 2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![3, 2, 2]);
+        assert_close(
+            &floats(&out[0]),
+            &[
+                0.5,
+                -1.0 / 6.0,
+                0.0,
+                1.0 / 3.0,
+                1.0,
+                0.0,
+                0.0,
+                2.0 / 3.0,
+                2.0,
+                -2.0 / 3.0,
+                0.5,
+                1.0 / 6.0,
+            ],
+        );
+    }
+
+    #[test]
     fn solve_complex_system() {
         let a = value(
             DType::Complex128,

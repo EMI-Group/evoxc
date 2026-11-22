@@ -297,6 +297,23 @@ mod tests {
         assert_close(&floats(&out[0]), &[6., 14., 7., 15.]);
     }
 
+    #[test]
+    fn diagonal_keeps_the_rest_axes_in_order_behind_the_offset() {
+        // (2, 3, 4) with axis1=0, axis2=2, offset=1: the surviving rest axis is
+        // axis 1, the diagonal is appended LAST and starts at column 1.
+        let data: Vec<f64> = (0..24).map(|i| i as f64).collect();
+        let x = value(DType::Float64, &[2, 3, 4], Storage::F64(data));
+        let attrs = Attrs::from_pairs([
+            ("offset", AttrValue::Int(1)),
+            ("axis1", AttrValue::Int(0)),
+            ("axis2", AttrValue::Int(2)),
+        ]);
+        let op = spec("diagonal", DType::Float64, &[3, 2], attrs);
+        let out = diagonal_impl(&[x], &op, vec![3, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![3, 2]);
+        assert_close(&floats(&out[0]), &[1., 14., 5., 18., 9., 22.]);
+    }
+
     // --- tril / triu -------------------------------------------------------
 
     #[test]
@@ -321,6 +338,33 @@ mod tests {
             let attrs = Attrs::from_pairs([("k", AttrValue::Int(k))]);
             let op = spec(name, DType::Float64, &[3, 3], attrs);
             let out = triangle_impl(std::slice::from_ref(&x), &op, vec![3, 3], lower).unwrap();
+            assert_close(&floats(&out[0]), &expected);
+        }
+    }
+
+    #[test]
+    fn tril_and_triu_clamp_a_saturating_k_on_a_non_square_input() {
+        // [[1, 2, 3], [4, 5, 6]] — `k` far outside the matrix must clamp to
+        // "keep everything" / "zero everything", never overflow the row bound.
+        let x = value(
+            DType::Float64,
+            &[2, 3],
+            Storage::F64(vec![1., 2., 3., 4., 5., 6.]),
+        );
+        let cases: [(&str, i64, [f64; 6]); 6] = [
+            ("tril", i64::MAX, [1., 2., 3., 4., 5., 6.]),
+            ("tril", i64::MIN, [0., 0., 0., 0., 0., 0.]),
+            ("tril", 1, [1., 2., 0., 4., 5., 6.]),
+            ("triu", i64::MAX, [0., 0., 0., 0., 0., 0.]),
+            ("triu", i64::MIN, [1., 2., 3., 4., 5., 6.]),
+            ("triu", 1, [0., 2., 3., 0., 0., 6.]),
+        ];
+        for (name, k, expected) in cases {
+            let lower = name == "tril";
+            let attrs = Attrs::from_pairs([("k", AttrValue::Int(k))]);
+            let op = spec(name, DType::Float64, &[2, 3], attrs);
+            let out = triangle_impl(std::slice::from_ref(&x), &op, vec![2, 3], lower).unwrap();
+            assert_eq!(out[0].shape, vec![2, 3]);
             assert_close(&floats(&out[0]), &expected);
         }
     }

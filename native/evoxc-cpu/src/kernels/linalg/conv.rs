@@ -538,6 +538,77 @@ mod tests {
     }
 
     #[test]
+    fn conv_walks_every_batch_and_channel() {
+        // NCHW (2, 2, 3, 3) against (2 out, 2 in, 2, 2) — every output channel
+        // sums both input channels of its own batch element (numpy reference
+        // values, cross-correlation).
+        let values: Vec<f64> = (0..36).map(|i| i as f64).collect();
+        let x = value(DType::Float64, &[2, 2, 3, 3], Storage::F64(values));
+        let w = value(
+            DType::Float64,
+            &[2, 2, 2, 2],
+            Storage::F64(vec![
+                1., 2., 3., 4., // out 0, in 0
+                0., 1., 1., 0., // out 0, in 1
+                2., 0., 0., 2., // out 1, in 0
+                1., 1., 1., 1., // out 1, in 1
+            ]),
+        );
+        let op = conv_op(&[2, 2, 2, 2], Attrs::new());
+        let out = conv_impl(&[x, w], &op, vec![2, 2, 2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![2, 2, 2, 2]);
+        assert_close(
+            &floats(&out[0]),
+            &[
+                49., 61., 85., 97., 52., 60., 76., 84., 265., 277., 301., 313., 196., 204., 220.,
+                228.,
+            ],
+        );
+    }
+
+    #[test]
+    fn conv_one_spatial_axis_crops_the_dilated_same_padding() {
+        // A rank-3 (N, C, L) conv: input_dilation 2 makes the effective input
+        // 9 long against a 2-long kernel, so "SAME" (out = 5) needs a NEGATIVE
+        // total padding — 2 cropped from the front, 1 from the back.
+        let x = value(DType::Float64, &[1, 1, 5], Storage::F64(vec![1., 2., 3., 4., 5.]));
+        let w = value(DType::Float64, &[1, 1, 2], Storage::F64(vec![1., -1.]));
+        let attrs = Attrs::from_pairs([
+            ("padding", AttrValue::Any(Json::String("SAME".into()))),
+            ("input_dilation", AttrValue::Ints(vec![2])),
+        ]);
+        let op = conv_op(&[1, 1, 5], attrs);
+        let out = conv_impl(&[x, w], &op, vec![1, 1, 5]).unwrap();
+        assert_eq!(out[0].shape, vec![1, 1, 5]);
+        assert_close(&floats(&out[0]), &[2., -3., 3., -4., 4.]);
+    }
+
+    #[test]
+    fn conv_combines_a_row_stride_with_a_column_dilation_and_asymmetric_padding() {
+        let values: Vec<f64> = (0..25).map(|i| i as f64).collect();
+        let x = value(DType::Float64, &[1, 1, 5, 5], Storage::F64(values));
+        let ones = value(DType::Float64, &[1, 1, 2, 2], Storage::F64(vec![1.; 4]));
+        let attrs = Attrs::from_pairs([
+            ("strides", AttrValue::Ints(vec![2, 1])),
+            ("kernel_dilation", AttrValue::Ints(vec![2, 1])),
+            (
+                "padding",
+                AttrValue::Any(Json::Array(vec![
+                    Json::Array(vec![Json::from(1), Json::from(0)]),
+                    Json::Array(vec![Json::from(0), Json::from(1)]),
+                ])),
+            ),
+        ]);
+        let op = conv_op(&[1, 1, 2, 5], attrs);
+        let out = conv_impl(&[x, ones], &op, vec![1, 1, 2, 5]).unwrap();
+        assert_eq!(out[0].shape, vec![1, 1, 2, 5]);
+        assert_close(
+            &floats(&out[0]),
+            &[11., 13., 15., 17., 9., 42., 46., 50., 54., 28.],
+        );
+    }
+
+    #[test]
     fn conv_applies_strides_and_explicit_padding_pairs() {
         let x = ramp(4, 4);
         let ones = value(DType::Float64, &[1, 1, 2, 2], Storage::F64(vec![1.; 4]));
