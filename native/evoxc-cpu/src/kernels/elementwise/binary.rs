@@ -17,6 +17,7 @@ use crate::scalar::Num;
 use crate::{with_same_type, with_same_type_mut};
 
 use super::compare::compare;
+use super::{bool_results, BOOL_RESULT_THREAD_MIN};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BinKind {
@@ -281,6 +282,27 @@ pub(crate) fn binary(spec: &OpSpec, lhs: &Value, rhs: &Value) -> Result<Vec<Valu
         // in `kernels::pow`.
         if let Some(out) = pow::scalar_power(&out_shape, left, right, left_owned.is_none(), lhs)? {
             return Ok(out);
+        }
+    }
+    // The logical pair on bool operands is the one-byte result shape the
+    // comparison family's `bool_results` builder exists for: route the
+    // broadcast-free case there below the thread crossover (the indexed `map2`
+    // loop measured ~2.5x slower on a 400k-element bool result), and keep the
+    // general drivers for everything else.
+    if compute == DType::Bool
+        && matches!(kind, BinKind::Add | BinKind::Mul)
+        && out_shape.iter().product::<usize>() < BOOL_RESULT_THREAD_MIN
+    {
+        if let (Storage::Bool(x), Storage::Bool(y)) = (&left.storage, &right.storage) {
+            if layout(&out_shape, x, &left.shape) == Layout::Flat
+                && layout(&out_shape, y, &right.shape) == Layout::Flat
+            {
+                let out = match kind {
+                    BinKind::Mul => bool_results(&out_shape, x, y, |p, q| apply_bin(BinKind::Mul, p, q)),
+                    _ => bool_results(&out_shape, x, y, |p, q| apply_bin(BinKind::Add, p, q)),
+                }?;
+                return crate::exec::single(out);
+            }
         }
     }
     with_same_type!(left, right, |x, y| {
@@ -764,4 +786,49 @@ mod tests {
         assert_eq!(binary(&op, &x, &zero).unwrap()[0].storage, Storage::Bool(vec![true, false, true, true]));
     }
 
+    #[test]
+    fn the_logical_pair_on_flat_bools_matches_the_general_path() {
+        // `logical_and`/`logical_or` map onto `Mul`/`Add` on bool; the flat pair
+        // takes the shared one-byte builder, a broadcast operand keeps the
+        // general run driver — both must place the same bools.
+        let left = buffer(DType::Bool, &[2, 2], Storage::Bool(vec![true, true, false, false]));
+        let right = buffer(DType::Bool, &[2, 2], Storage::Bool(vec![true, false, true, false]));
+        let dims = [Dim::int(2), Dim::int(2)];
+        let and = spec("logical_and", ValueType::of(DType::Bool, dims.clone()));
+        let or = spec("logical_or", ValueType::of(DType::Bool, dims));
+        assert_eq!(
+            binary(&and, &left, &right).unwrap()[0].storage,
+            Storage::Bool(vec![true, false, false, false])
+        );
+        assert_eq!(
+            binary(&or, &left, &right).unwrap()[0].storage,
+            Storage::Bool(vec![true, true, true, false])
+        );
+        // A row against the matrix is a broadcast operand: the general driver.
+        let row = buffer(DType::Bool, &[2], Storage::Bool(vec![true, false]));
+        assert_eq!(
+            binary(&and, &left, &row).unwrap()[0].storage,
+            Storage::Bool(vec![true, false, false, false])
+        );
+        assert_eq!(
+            binary(&or, &left, &row).unwrap()[0].storage,
+            Storage::Bool(vec![true, true, true, false])
+        );
+    }
+
+    #[test]
+    fn the_flat_logical_pair_is_right_across_the_thread_crossover() {
+        // Both sides of the builder switch: the pooled iterator form below the
+        // crossover and the threaded `map2` arm at it.
+        let count = crate::kernels::elementwise::BOOL_RESULT_THREAD_MIN;
+        let left: Vec<bool> = (0..count).map(|index| index % 3 == 0).collect();
+        let right: Vec<bool> = (0..count).map(|index| index % 5 == 0).collect();
+        for size in [count - 1, count] {
+            let a = buffer(DType::Bool, &[size], Storage::Bool(left[..size].to_vec()));
+            let b = buffer(DType::Bool, &[size], Storage::Bool(right[..size].to_vec()));
+            let and = spec("logical_and", ValueType::of(DType::Bool, [Dim::int(size as i64)]));
+            let expected: Vec<bool> = (0..size).map(|index| left[index] && right[index]).collect();
+            assert_eq!(binary(&and, &a, &b).unwrap()[0].storage, Storage::Bool(expected));
+        }
+    }
 }

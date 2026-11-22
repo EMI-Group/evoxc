@@ -14,9 +14,9 @@
 //! [`transcendental`] `erf`/`gelu`/`nan_to_num`; this module keeps `register`
 //! plus the ops that belong to no family (`stop_gradient`, `cast`,
 //! `broadcast`).
-use evoxc_core::{Error, Result};
+use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{broadcast_to, shape_text};
+use crate::buffer::{broadcast_to, shape_text, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::KernelMap;
 use crate::plan::OpSpec;
@@ -38,6 +38,41 @@ use binary::binary_kernel;
 use compare::select_kernel;
 use transcendental::{erf_kernel, gelu_kernel, nan_to_num_kernel};
 use unary::unary_kernel;
+
+/// Element count from which a one-byte (bool) result hands over to the threaded
+/// `map2`/`map1` builders: the scoped split only pays past the measured thread
+/// crossover (`buffer::parallel`'s 2^19-element note), and below it the spawn
+/// cost dominated a 400k-element comparison.
+pub(super) const BOOL_RESULT_THREAD_MIN: usize = 1 << 19;
+
+/// The flat boolean-result builder shared by the comparison family and the
+/// logical pair: one pooled `bool` destination filled by an iterator zip.
+///
+/// Comparisons and `logical_and`/`logical_or` produce a one-byte result, and on
+/// a 400k-element operand the INDEXED `zip2` loop measured several times slower
+/// than this iterator form (the `select`-shaped store does not vectorize in the
+/// indexed shape while it does iterating), so the whole boolean family shares
+/// the form that does.  The operands must already be broadcast-free — a caller
+/// gates on `layout(..) == Layout::Flat` — and a length that does not match the
+/// result takes the plain `collect` arm instead of a silently truncated result.
+pub(super) fn bool_results<T: Copy, U: Copy, F: Fn(T, U) -> bool>(
+    out_shape: &[usize],
+    left: &[T],
+    right: &[U],
+    f: F,
+) -> Result<Buffer> {
+    let count = out_shape.iter().product::<usize>();
+    if left.len() == count && right.len() == count {
+        if let Some(mut values) = crate::buffer::take_pooled_vec::<bool>(count) {
+            for ((slot, p), q) in values.iter_mut().zip(left).zip(right) {
+                *slot = f(*p, *q);
+            }
+            return Buffer::new(DType::Bool, out_shape.to_vec(), Storage::Bool(values));
+        }
+    }
+    let values: Vec<bool> = left.iter().zip(right).map(|(p, q)| f(*p, *q)).collect();
+    Buffer::new(DType::Bool, out_shape.to_vec(), Storage::Bool(values))
+}
 
 pub fn register(map: &mut KernelMap) {
     for name in [

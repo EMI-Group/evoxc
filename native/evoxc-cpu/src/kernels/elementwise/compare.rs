@@ -9,6 +9,31 @@ use crate::scalar::Scalar;
 use crate::with_same_type;
 
 use super::binary::{is_ordering, layout, BinKind, Layout};
+use super::{bool_results, BOOL_RESULT_THREAD_MIN};
+
+/// Test-only count of [`broadcast_compare`] entries: pins that a rank-0 (and
+/// any broadcast-free) comparison never reaches the general broadcast driver.
+#[cfg(test)]
+mod driver_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    /// The calls since the previous take (which resets the counter).
+    pub(super) fn take() -> usize {
+        CALLS.with(|calls| {
+            let seen = calls.get();
+            calls.set(0);
+            seen
+        })
+    }
+}
 
 pub(super) fn compare(
     name: &str,
@@ -124,15 +149,25 @@ fn compare_op<T: Orderable>(kind: BinKind, left: T, right: T) -> bool {
 /// flat map into a freshly built bool result.
 macro_rules! dense_compare_drivers {
     ($($kind:ident),* $(,)?) => {
+        /// The broadcast-free comparison: a pooled bool destination filled by the
+        /// iterator form (see [`bool_results`]) below the thread crossover, and
+        /// the threaded `map2` builder at or above it.  `kind` is dispatched once
+        /// per arm either way, so no `match` sits inside the element loop.
         fn dense_compare<T: Orderable + Copy>(
             kind: BinKind,
             out_shape: &[usize],
             left: &[T],
             right: &[T],
         ) -> Result<Buffer> {
+            if out_shape.iter().product::<usize>() >= BOOL_RESULT_THREAD_MIN {
+                return match kind {
+                    $(BinKind::$kind => map2(DType::Bool, out_shape, left, right, |p, q| compare_op(BinKind::$kind, p, q)),)*
+                    _ => map2(DType::Bool, out_shape, left, right, |p, q| compare_op(kind, p, q)),
+                };
+            }
             match kind {
-                $(BinKind::$kind => map2(DType::Bool, out_shape, left, right, |p, q| compare_op(BinKind::$kind, p, q)),)*
-                _ => map2(DType::Bool, out_shape, left, right, |p, q| compare_op(kind, p, q)),
+                $(BinKind::$kind => bool_results(out_shape, left, right, |p, q| compare_op(BinKind::$kind, p, q)),)*
+                _ => bool_results(out_shape, left, right, |p, q| compare_op(kind, p, q)),
             }
         }
 
@@ -172,6 +207,8 @@ macro_rules! dense_compare_drivers {
             right: &[T],
             right_shape: &[usize],
         ) -> Result<Buffer> {
+            #[cfg(test)]
+            driver_calls::bump();
             match kind {
                 $(BinKind::$kind => map2_runs(DType::Bool, out_shape, left, left_shape, right, right_shape, |p, q| compare_op(BinKind::$kind, p, q)),)*
                 _ => map2_runs(DType::Bool, out_shape, left, left_shape, right, right_shape, |p, q| compare_op(kind, p, q)),
@@ -418,4 +455,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rank_zero_comparison_visits_one_element_and_no_broadcast_driver() {
+        // The 0-d case (a `while_loop` condition in a real graph): both operands
+        // are rank 0, so the flat arm produces its single element directly — one
+        // element, one storage, no `walk` odometer and no broadcast driver.  That
+        // is what keeps a per-iteration graph comparison sub-microsecond, and it
+        // is the reason this test counts driver entries instead of timing.
+        let a = buffer(DType::Int32, &[], Storage::I32(vec![1]));
+        let b = buffer(DType::Int64, &[], Storage::I64(vec![2]));
+        driver_calls::take();
+        for (name, expected) in [
+            ("less", true),
+            ("less_equal", true),
+            ("greater", false),
+            ("greater_equal", false),
+            ("equal", false),
+            ("not_equal", true),
+        ] {
+            let op = spec(name, ValueType::of(DType::Bool, []));
+            let out = binary(&op, &a, &b).unwrap();
+            assert_eq!(out.len(), 1, "{name}");
+            assert!(out[0].shape.is_empty(), "{name}");
+            assert_eq!(out[0].storage, Storage::Bool(vec![expected]), "{name}");
+        }
+        assert_eq!(
+            driver_calls::take(),
+            0,
+            "a rank-0 comparison reached the broadcast driver"
+        );
+        // The counter is live: a broadcast operand does enter that driver once.
+        let matrix = buffer(DType::Float32, &[2, 3], Storage::F32(vec![0.0; 6]));
+        let bias = buffer(DType::Float32, &[3], Storage::F32(vec![0.0; 3]));
+        let op = spec(
+            "less",
+            ValueType::of(DType::Bool, [Dim::int(2), Dim::int(3)]),
+        );
+        binary(&op, &matrix, &bias).unwrap();
+        assert_eq!(driver_calls::take(), 1);
+    }
+
+    #[test]
+    fn the_flat_comparison_agrees_across_the_thread_crossover() {
+        // Both sides of the builder switch: the pooled iterator form below the
+        // crossover and the threaded `map2` arm at it.
+        let count = BOOL_RESULT_THREAD_MIN;
+        let left: Vec<f32> = (0..count).map(|index| index as f32).collect();
+        let right: Vec<f32> = (0..count).map(|index| index as f32 * 0.5).collect();
+        for size in [count - 1, count] {
+            let out = dense_compare(BinKind::Lt, &[size], &left[..size], &right[..size]).unwrap();
+            let expected: Vec<bool> = (0..size).map(|index| left[index] < right[index]).collect();
+            assert_eq!(out.storage, Storage::Bool(expected), "{size}");
+        }
+    }
 }
