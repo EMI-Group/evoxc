@@ -16,8 +16,8 @@ use crate::scalar::Scalar;
 use crate::with_type;
 
 use super::{
-    block_storage_from, for_each_index, index_values, offset_error, operand, reconcile,
-    render_ints, require_integer_indices, resolve_index,
+    for_each_index, index_values, offset_error, operand, reconcile, render_ints,
+    require_integer_indices, resolve_index,
 };
 
 pub(super) fn gather_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
@@ -91,11 +91,16 @@ fn gather(
 /// Only the gathered axis selects anything, so the result is `outer × n` runs
 /// of `inner` whole elements copied verbatim out of the operand (`outer` = the
 /// extents before the axis, `n` = the index count, `inner` = the extents after
-/// it — exactly the C order the spliced result shape has).  The index tensor is
-/// resolved once per row through [`resolve_index`], so numpy's negative-index
-/// and bounds rules are unchanged; only the per-ELEMENT index arithmetic and
-/// the `i128` re-read per output element are gone.  `None` for an empty result
-/// or a shape this decomposition does not cover — the general path owns those.
+/// it — exactly the C order the spliced result shape has).  The indices are
+/// resolved ONCE into a compact `Vec<usize>` through [`resolve_index`] (numpy's
+/// negative-index and bounds rules, unchanged error wording) and the result is
+/// then written straight into one typed `Vec`, so neither the per-index
+/// `outer × n` offset vector nor the `i128` re-read per output element exists
+/// any more.  The `inner == 1` cases — the hot ones, where the old per-run
+/// `values.get(start..start + 1)` was one bounds-checked single-element copy
+/// per output element — now read a flat element (or a `band`-strided one, for
+/// a single scalar index).  `None` for an empty result or a shape this
+/// decomposition does not cover — the general path owns those.
 fn gather_blocks(
     source: &Buffer,
     indices: &[i128],
@@ -114,17 +119,70 @@ fn gather_blocks(
     if count.checked_mul(inner) != Some(total) {
         return Ok(None);
     }
-    let mut offsets = Vec::with_capacity(count);
-    for block in 0..outer {
-        let base = block * band;
-        for raw in indices {
-            offsets.push(base + resolve_index(*raw, extent, axis, "gather")? * inner);
+    // Resolve every index exactly once: this is the ONLY place the `i128` index
+    // tensor is read, so no output element re-reads it or re-does the wrapping.
+    let mut resolved = Vec::with_capacity(indices.len());
+    for raw in indices {
+        resolved.push(resolve_index(*raw, extent, axis, "gather")?);
+    }
+    let storage = with_type!(source, |values| gather_into(
+        values, outer, inner, band, total, &resolved
+    ));
+    Ok(Some(storage))
+}
+
+/// Write the gathered result into one typed vector of exactly `total` elements.
+///
+/// The caller has already checked `total == outer × resolved.len() × inner`,
+/// every entry of `resolved` is inside the gathered extent, and `values` holds
+/// exactly `outer × band = outer × extent × inner` elements, so every read and
+/// write below is in bounds by construction.
+fn gather_into<T: Scalar>(
+    values: &[T],
+    outer: usize,
+    inner: usize,
+    band: usize,
+    total: usize,
+    resolved: &[usize],
+) -> Storage {
+    let mut out: Vec<T> = Vec::with_capacity(total);
+    if inner == 1 {
+        if outer == 1 {
+            // The operand is exactly the gathered axis: one flat read per index.
+            for &selected in resolved {
+                out.push(values[selected]);
+            }
+        } else if resolved.len() == 1 {
+            // A scalar index selects the same offset out of every `band`-wide
+            // block — a pure strided read (`x[:, :, i]`-shaped gathers).
+            let mut position = resolved[0];
+            for _ in 0..outer {
+                out.push(values[position]);
+                position += band;
+            }
+        } else {
+            // One element per block per index, in the result's C order.
+            for block in values.chunks_exact(band) {
+                for &selected in resolved {
+                    out.push(block[selected]);
+                }
+            }
+        }
+    } else if outer == 1 {
+        // No leading block: each index copies its `inner`-element run.
+        for &selected in resolved {
+            let start = selected * inner;
+            out.extend_from_slice(&values[start..start + inner]);
+        }
+    } else {
+        for block in values.chunks_exact(band) {
+            for &selected in resolved {
+                let start = selected * inner;
+                out.extend_from_slice(&block[start..start + inner]);
+            }
         }
     }
-    let storage = with_type!(source, |values| {
-        block_storage_from(values, out_shape, &offsets, inner, "gather")
-    })?;
-    Ok(Some(storage))
+    T::into_storage(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -217,8 +275,11 @@ mod tests {
         // Every single-axis gather on a contiguous operand takes the row-copy
         // fast path; it must equal the general element-at-a-time driver for
         // rank-1/2/3 operands, every axis, a lower- and a higher-rank index
-        // tensor, negative indices and duplicate indices.
-        let cases: [GatherCase; 7] = [
+        // tensor, a rank-0 index tensor, negative indices and duplicate
+        // indices.  The last three cases are the axis-LAST `inner == 1` family
+        // the downstream workloads spend their time in: a scalar (rank-0)
+        // index — the pure strided read — and a rank-1 index tensor.
+        let cases: [GatherCase; 9] = [
             (&[3, 2], &[2, 0], &[2], 0),
             (&[3, 2], &[-1, 0, -3], &[3], 0),
             (&[2, 3, 2], &[0, 2, 1, 1], &[2, 2], 1),
@@ -226,6 +287,8 @@ mod tests {
             (&[4, 3], &[0, 2, 2], &[3], 1),
             (&[2, 4, 3], &[3, 0], &[2], 1),
             (&[2, 2, 3], &[1, 0, 1, 1], &[2, 2], 2),
+            (&[500, 100, 2], &[1], &[], 2),
+            (&[3, 4], &[3, 0, 2], &[3], 1),
         ];
         for (in_shape, indices, index_shape, axis) in cases {
             let total: usize = in_shape.iter().product();
