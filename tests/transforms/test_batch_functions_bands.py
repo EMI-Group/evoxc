@@ -1,13 +1,17 @@
 """Tests for the ``bands=`` partition of `evoxc.batch_functions`.
 
-Binding contract: `evoxc/transforms/CONTEXT.md` § "Bands — clustered merge
-(`bands=`, `_bands.py`)" + the `bands` half of the `batch_functions` docstring
-and `_merge_graphs` validation order.
+Binding contract: `evoxc/transforms/CONTEXT.md` § "`batch_functions`" +
+`native/evoxc-compiler/src/batch_functions/CONTEXT.md` § "Bands merged graph",
+the `bands` half of the `batch_functions` docstring
+(`evoxc/transforms/batch_functions.py`) and the `_merge_graphs` validation order
+there.
 
 `bands` partitions the N programs BEFORE merging: ``None`` (the flat merge,
 byte-identical to the pre-`bands` output), ``int K`` with ``1 <= K <= N``
-(`_bands.even_partition` — K contiguous bands, sizes as even as possible,
-LARGER bands first: ``N=10, K=3`` → ``(4, 3, 3)``), or ``"auto"`` (the static
+(the native partitioner
+`native/evoxc-compiler/src/batch_functions/bands.rs::even_partition` — K
+contiguous bands, sizes as even as possible, LARGER bands first:
+``N=10, K=3`` → ``(4, 3, 3)``), or ``"auto"`` (the static
 cost model picks among the flat, structural-fingerprint and
 fingerprint-with-coalesced-singletons partitions). Bands merge independently
 and are glued with one `concatenate` along the static function axis (plus one

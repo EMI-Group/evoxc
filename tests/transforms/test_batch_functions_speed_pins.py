@@ -11,10 +11,11 @@ Contract under test (binding): `evoxc/transforms/CONTEXT.md`
 every rule-emitted op with its contributing source op's `Location` (carried
 through the native envelope from TRACING) and returns the 12-key report.
 Python keeps only validation, `Graph` reconstruction and report rehydration.
-The pre-native Python emitters — `evoxc.transforms._emit`, `_bands` and their
-`_suppress_location_capture()` hook — are gone, so the old "one call site per
-merge / suppression block" instrumentation is structurally obsolete; what
-remains true, and what this module pins, is the native contract:
+The merge runs entirely in the native engine
+(`native/evoxc-compiler/src/batch_functions/` — `bands.rs`, `emit.rs`; contract
+in `native/evoxc-compiler/src/batch_functions/CONTEXT.md`), so there is no
+Python emitter and no per-call-site location-capture suppression left; what
+this module pins is the native contract:
 
 1. **Zero merge-time Python work.** A merge calls
    `evoxc.ops._utils.get_location` ZERO times and never reaches
