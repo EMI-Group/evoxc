@@ -108,6 +108,7 @@ Reading of the numbers, which is load- and shape-dependent:
 - **Structure/indexing:** a `tile` that repeats the whole source builds its storage with `repeat_storage` (one `copy_from_slice` per run-length chunk rather than one per index row, split over the same scoped threads), and contiguous block copies (`gather`/`slice`/`tile`) go through `copy_blocks` with the pre-filled `block_storage_filled` builder instead of a zero fill plus growth.
 - **Outputs freed before extraction:** a value is released from the flat store at its last use and the run clears what is left of the store before pulling the output buffers out, so an output is moved out of its `Rc` instead of copied (a value returned twice still copies), and the intermediates released there hand their storage back to the pool.
 - No SIMD intrinsics are used (they would need `unsafe`, which this crate forbids outside the two `matrixmultiply` call sites), so elementwise throughput rests on LLVM auto-vectorizing safe slice loops.
+- **Per-run setup is small and allocation-bounded:** a run never recompiles or re-decodes the plan (`run_program` takes `&Arc<Plan>`), and only allocates one flat `store: vec![None; plan.max_value]`, one `Bindings` map and one reusable `operands` scratch `Vec` (`exec.rs` `RunCtx::new`); `RunCtx::run` additionally clones the entry `FunctionPlan` (name + type vectors) per call for its input/output validation, and the `call` kernel resolves a callee by linear name search per call op (`kernels/control.rs` `call_kernel`).
 
 ## Constraints
 
