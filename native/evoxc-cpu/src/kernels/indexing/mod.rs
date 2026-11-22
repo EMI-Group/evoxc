@@ -35,7 +35,9 @@
 //! strict helper.
 use evoxc_core::{Error, Result};
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::Buffer;
+#[cfg(test)]
+use crate::buffer::Storage;
 use crate::exec::Value;
 use crate::kernels::util;
 use crate::kernels::KernelMap;
@@ -137,6 +139,7 @@ pub(super) fn block_error(op: &str) -> Error {
 /// the whole output. The element-count and bounds contract is `copy_blocks`'
 /// (same checks, same error wording): a short or long offset list is an
 /// explicit error, never a silently truncated result.
+#[cfg(test)]
 fn block_storage_from<T: Scalar>(
     values: &[T],
     out_shape: &[usize],
