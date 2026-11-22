@@ -26,17 +26,28 @@ Staging (mirrors ``numpy/`` step for step):
   versioned, self-describing serialized ``ir.Module`` (so lowered programs and
   artifacts stay savable and portable).
 - ``compile(lowered, options)``: validate ``lowered.backend == "native"``,
-  scan the serialized module for the custom-op names it requires
-  (``block_call`` / ``external_call`` / ``runtime_call``), record
-  ``target="cpu"`` and the runtime dependencies (``numpy`` + the extension
-  version). No lowering work happens here.
-- ``load(artifact, device, options)``: accept only a CPU ``Device``; rebuild
-  the engine program from the artifact payload (never re-lower); require a
-  registered ``native`` impl for every remaining ``block_call`` (missing ⇒
+  resolve the custom-op names it requires (``block_call`` / ``external_call``
+  / ``runtime_call`` — reused from ``lower`` in-process, ONE decode + ONE scan
+  for a disk-loaded program), record ``target="cpu"`` and the runtime
+  dependencies (``numpy`` + the extension version). No lowering work happens
+  here.
+- ``load(artifact, device, options)``: accept only a CPU ``Device``; reuse the
+  artifact's in-process module/program attachments, else rebuild the engine
+  program from the artifact payload (never re-lower); require a registered
+  ``native`` impl for every remaining ``block_call`` (missing ⇒
   ``PersistenceError`` naming the block). External kernels and
   ``runtime_call`` callbacks stay LAZY (per the binding persistence contract:
   the registries are never serialized and must be re-established before RUN,
   not before load).
+
+Single-decode staging (mirroring ``numpy/``): ``lower`` attaches the live
+module, the payload object, the collected names, the encoded envelope and the
+compiled program as PRIVATE non-persisted hints, and ``compile``/``load`` reuse
+them under a payload-identity check — so one in-process
+``lower → compile → load`` chain decodes ZERO times, encodes once and compiles
+once, while a disk-loaded program/artifact takes exactly one decode + one
+encode + one ``native_compile``. Persisted container bytes are unchanged; the
+``staging_stats()`` / ``reset_staging_stats()`` counters expose the tallies.
 
 ``NativeExecutable`` satisfies the ``Executable`` protocol and adds
 ``plan_text()`` / ``stats()`` / ``required_ops()`` so the engine's dispatch
@@ -100,6 +111,9 @@ __all__ = [
     "NativeCallbackResolver",
     "native_backend",
     "register",
+    # test seam (NOT a public API for users) — single-decode staging accounting
+    "staging_stats",
+    "reset_staging_stats",
 ]
 
 #: No per-stage options exist in v1: the CPU engine is driven entirely by the
@@ -161,6 +175,57 @@ def _scan_required_ops(module: "Module") -> tuple[tuple[str, ...], tuple[str, ..
     return tuple(sorted(blocks)), tuple(sorted(external)), tuple(sorted(runtime_calls))
 
 
+# ---------------------------------------------------------------------------
+# Single-decode staging seam (test seam — not a public API for users)
+#
+# Mirrors ``evoxc.backends.numpy``'s ``decode_stats`` seam. Every payload
+# decode, envelope encode and engine compile this backend performs goes through
+# exactly ONE helper below, so the counters are exact: an in-process
+# ``lower -> compile -> load`` chain reports ``decode 0, encode 1, compile 1``
+# (``lower`` attaches the live module, the payload object, the collected names,
+# the encoded envelope and the compiled program, each reused only under a
+# payload-identity check), and a disk round trip reports ``decode 1, encode 1,
+# compile 1``.
+# ---------------------------------------------------------------------------
+
+_staging_counts = {"decode": 0, "encode": 0, "compile": 0}
+
+
+def _decode_payload(payload: Any) -> "Module":
+    """The native backend's SINGLE deserialize entry point (never persisted)."""
+    _staging_counts["decode"] += 1
+    return ir.deserialize_module(payload)
+
+
+def _encode_payload(module: "Module") -> dict:
+    """The native backend's SINGLE envelope-encode entry point."""
+    _staging_counts["encode"] += 1
+    return engine.encode_module(module)
+
+
+def _compile_program(module: "Module", envelope: dict) -> Any:
+    """The native backend's SINGLE engine-compile entry point."""
+    _staging_counts["compile"] += 1
+    return engine.compile_module(module, envelope)
+
+
+def staging_stats() -> dict:
+    """Return the staging counters, e.g. ``{"decode": 0, "encode": 1, "compile": 1}``.
+
+    TEST SEAM, not a public API for users: it exists so a test can pin "one
+    in-process ``lower -> compile -> load`` chain decodes zero times, encodes
+    once and compiles once" (``reset_staging_stats()`` first gives a clean
+    measurement window). Not re-exported from ``evoxc``.
+    """
+    return dict(_staging_counts)
+
+
+def reset_staging_stats() -> None:
+    """Zero the counters reported by ``staging_stats()`` (TEST SEAM)."""
+    for key in _staging_counts:
+        _staging_counts[key] = 0
+
+
 class NativeBackend(Backend):
     """Backend executing graphs on the in-process Rust CPU engine.
 
@@ -214,10 +279,12 @@ class NativeBackend(Backend):
         8. ``payload`` = versioned self-describing
            ``ir.serialize_module(graph.module)``.
 
-        The compiled program from step 6 is kept on the returned object as an
-        in-process-only hint (never serialized) so the common
-        build/compile/load path does not compile the same graph twice; an
-        artifact loaded from disk always recompiles from its payload.
+        The custom-op scan, the encoded envelope and the compiled program are
+        each computed ONCE here and attached to the returned object as
+        in-process-only hints (never serialized), so ``compile``/``load`` can
+        reuse them instead of decoding the payload back — the in-process chain
+        deserializes ZERO times. An artifact loaded from disk carries none of
+        them and takes the one-decode fallback.
         """
         validate_options(options, self.KNOWN_OPTIONS, self.name, "lower")
         graph.verify()
@@ -226,13 +293,26 @@ class NativeBackend(Backend):
         if expansions:
             graph.verify()  # the module changed — re-verify
             self._check_capabilities(graph.module)
-        program = self._probe_engine(graph.module)
+        # ONE custom-op scan (the artifact's ``required_custom_ops`` source of
+        # truth and the engine cross-check input) and ONE envelope encode.
+        required_ops = _scan_required_ops(graph.module)
+        envelope = _encode_payload(graph.module)
+        program = self._probe_engine(graph.module, required_ops, envelope)
         signature = _record_signature(graph, _entry_function(graph.module))
         payload = ir.serialize_module(graph.module)
         lowered = LoweredProgram(backend=self.name, signature=signature, payload=payload)
-        # In-process compile hint (documented, never serialized, never trusted
-        # across a process boundary): reused by ``compile`` only for the very
-        # same payload object.
+        # Private, RUNTIME-ONLY attachments (never declared dataclass fields, so
+        # ``LoweredProgram.save`` — which persists only the declared fields —
+        # cannot leak them; the persisted container stays byte-identical). They
+        # let ``compile``/``load`` reuse the module this method just verified,
+        # the names it just collected, the envelope it just encoded and the
+        # program it just compiled, instead of redoing any of it. Each reuse is
+        # gated on the identity of the exact payload object it was built from,
+        # so a replaced/mutated payload can never reuse a stale attachment.
+        lowered._native_module = graph.module
+        lowered._native_payload = payload
+        lowered._native_required_ops = required_ops
+        lowered._native_envelope = envelope
         lowered._native_program = (payload, program)
         return lowered
 
@@ -242,13 +322,19 @@ class NativeBackend(Backend):
         """Wrap the serialized IR into a self-describing CompiledArtifact.
 
         Validates ``lowered.backend == "native"`` (mismatch ⇒
-        ``core.BackendError``), scans the serialized module for the custom-op
-        names it requires (``required_custom_ops`` — blocks and external
-        kernels; runtime-call callback ids are recorded in
-        ``runtime_dependencies``-adjacent diagnostics only through the scan and
+        ``core.BackendError``), resolves the custom-op names it requires
+        (``required_custom_ops`` — blocks and external kernels; runtime-call
+        callback ids are recorded as a non-persisted self-description and
         resolve lazily at run time), and records ``target="cpu"`` with runtime
         dependencies ``{"numpy": ..., "evoxc-native": ...}``. No lowering or
         engine work happens here.
+
+        For an IN-PROCESS program (``lower`` attached its live module and the
+        names it already collected) they are reused as-is: no decode, no
+        rescan. A ``LoweredProgram.load``ed from disk falls back to exactly ONE
+        deserialize + ONE ``iter_ops`` scan. Either way the module, the payload
+        object, the collected names and the (identity-gated) envelope are
+        attached to the artifact so ``load`` can do the same.
         """
         validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
         if lowered.backend != self.name:
@@ -256,8 +342,28 @@ class NativeBackend(Backend):
                 f"cannot compile a LoweredProgram produced by backend "
                 f"{lowered.backend!r} with the native backend"
             )
-        module = ir.deserialize_module(lowered.payload)
-        blocks, external, runtime_calls = _scan_required_ops(module)
+        cached_module = getattr(lowered, "_native_module", None)
+        if (
+            getattr(lowered, "_native_payload", None) is lowered.payload
+            and cached_module is not None
+        ):
+            # In-process program: reuse the module ``lower`` verified, the names
+            # it collected and the envelope it encoded — no decode, no rescan,
+            # no re-encode.
+            module = cached_module
+            required_ops = getattr(lowered, "_native_required_ops", None)
+            if required_ops is None:  # defensive: attached module, no names
+                required_ops = _scan_required_ops(module)
+            envelope = getattr(lowered, "_native_envelope", None)
+        else:
+            # Disk-loaded program (or a program built by hand): the payload is
+            # the only source of truth — decode it ONCE and scan it ONCE. No
+            # envelope: this stage compiles nothing, and an envelope may only be
+            # forwarded alongside the exact payload object it was encoded from.
+            module = _decode_payload(lowered.payload)
+            required_ops = _scan_required_ops(module)
+            envelope = None
+        blocks, external, runtime_calls = required_ops
         required_custom_ops = tuple(sorted(set(blocks) | set(external)))
         artifact = CompiledArtifact(
             backend=self.name,
@@ -270,6 +376,15 @@ class NativeBackend(Backend):
                 engine.ENGINE_VERSION_KEY: engine.engine_version(),
             },
         )
+        # Private, RUNTIME-ONLY attachments (never declared fields, never
+        # persisted by ``CompiledArtifact.save``): the module ``load`` must hand
+        # to the engine, the exact payload object that identifies it, and the
+        # names it requires.
+        artifact._native_module = module
+        artifact._native_payload = lowered.payload
+        artifact._native_required_ops = required_ops
+        if envelope is not None:
+            artifact._native_envelope = envelope
         hint = getattr(lowered, "_native_program", None)
         if isinstance(hint, tuple) and len(hint) == 2 and hint[0] is lowered.payload:
             # In-process-only compile reuse: the artifact carries the program
@@ -302,10 +417,11 @@ class NativeBackend(Backend):
           them at RUN time with an explicit ``core.BackendError`` naming the
           missing registration.
 
-        The engine program is taken from the in-process hint when the artifact
-        still carries the exact payload object it was compiled from; otherwise
-        it is built from the payload here (``native_compile``) — never by
-        re-lowering the graph.
+        An IN-PROCESS artifact (``compile`` attached its live module, the
+        collected names and the program) decodes and rescans NOTHING. A
+        disk-loaded artifact decodes ONCE and scans its block names ONCE, then
+        builds the program from that module (one encode + one
+        ``native_compile``); never by re-lowering the graph.
         """
         validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
         if artifact.backend != self.name:
@@ -323,8 +439,24 @@ class NativeBackend(Backend):
                     "the native backend v1 supports CPU devices only (it "
                     f"executes host numpy data), got device kind {device.kind!r}"
                 )
-        module = ir.deserialize_module(artifact.payload)
-        self._require_block_impls(module)
+        cached_module = getattr(artifact, "_native_module", None)
+        if (
+            getattr(artifact, "_native_payload", None) is artifact.payload
+            and cached_module is not None
+        ):
+            # In-process artifact: reuse the module ``compile``/``lower``
+            # produced, the names it collected and the envelope it encoded.
+            module = cached_module
+            required_ops = getattr(artifact, "_native_required_ops", None)
+            if required_ops is None:  # defensive: attached module, no names
+                required_ops = _scan_required_ops(module)
+            envelope = getattr(artifact, "_native_envelope", None)
+        else:
+            # Disk-loaded artifact: the payload is the only source of truth.
+            module = _decode_payload(artifact.payload)
+            required_ops = _scan_required_ops(module)
+            envelope = None
+        self._require_block_impls(required_ops[0])
         hint = getattr(artifact, "_native_program", None)
         if (
             isinstance(hint, tuple)
@@ -333,7 +465,9 @@ class NativeBackend(Backend):
         ):
             program = hint[1]
         else:
-            program = engine.compile_module(module)
+            if envelope is None:
+                envelope = _encode_payload(module)
+            program = _compile_program(module, envelope)
         return NativeExecutable(
             program=program,
             signature=artifact.signature,
@@ -393,7 +527,12 @@ class NativeBackend(Backend):
             f"{sorted(d.name for d in self.capabilities.dtypes)}"
         )
 
-    def _probe_engine(self, module: "Module"):
+    def _probe_engine(
+        self,
+        module: "Module",
+        required_ops: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+        envelope: dict,
+    ):
         """Compile the module on the engine and vet the result.
 
         Returns the ``NativeProgram`` (kept as an in-process hint). Raises
@@ -402,8 +541,12 @@ class NativeBackend(Backend):
         and cross-checks the engine's ``required_ops()`` / ``output_types()``
         reports against the module (a mismatch is an FFI contract drift and
         fails loudly rather than producing wrong results later).
+
+        ``required_ops`` (the ``(blocks, external, runtime_calls)`` triple the
+        caller already scanned) and ``envelope`` (the encoding of THIS module)
+        are passed in so neither is recomputed here.
         """
-        program = engine.compile_module(module)
+        program = _compile_program(module, envelope)
         stats = engine.program_stats(program)
         unsupported = engine.unsupported_ops(stats)
         if unsupported:
@@ -413,12 +556,17 @@ class NativeBackend(Backend):
                 f"{', '.join(unsupported)} — run this graph on backend="
                 "'numpy' (the reference interpreter) or rewrite those ops"
             )
-        self._cross_check(program, module)
+        self._cross_check(program, module, required_ops)
         return program
 
-    def _cross_check(self, program: Any, module: "Module") -> None:
+    def _cross_check(
+        self,
+        program: Any,
+        module: "Module",
+        required_ops: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    ) -> None:
         """Vet the engine's self-report against the module it compiled."""
-        blocks, external, runtime_calls = _scan_required_ops(module)
+        blocks, external, runtime_calls = required_ops
         required = engine.program_required_ops(program)
         if required is not None:
             expected = {
@@ -460,15 +608,16 @@ class NativeBackend(Backend):
                         "the graph"
                     )
 
-    def _require_block_impls(self, module: "Module") -> None:
+    def _require_block_impls(self, blocks: tuple[str, ...]) -> None:
         """Every remaining ``block_call`` needs a registered ``native`` impl.
 
-        Portables were inlined at ``lower()``, so a block surviving into the
-        artifact must be dispatched at run time; a missing block/impl is a
-        ``core.PersistenceError`` naming it — never a silent re-lower and
+        ``blocks`` is the already-collected (sorted, deduplicated) block-name
+        tuple from ``_scan_required_ops`` — this method never re-walks the
+        module. Portables were inlined at ``lower()``, so a block surviving
+        into the artifact must be dispatched at run time; a missing block/impl
+        is a ``core.PersistenceError`` naming it — never a silent re-lower and
         never a fallback to another backend's impl.
         """
-        blocks, _, _ = _scan_required_ops(module)
         if not blocks:
             return
         from evoxc.block import BlockError
@@ -523,6 +672,14 @@ class NativeExecutable:
         self.device = device
         self.functions = (engine.program_entry(program),)
         self._resolver = NativeCallbackResolver()
+        # Per-executable run-path caches (pure derivations, no observable
+        # behavior change): the resolved extension module (the program can only
+        # exist once it loaded, so resolving once is enough) and the flattened
+        # signature layout, rebuilt only when ``signature`` is REPLACED (identity
+        # check) — validation and every error message stay exactly as they were.
+        self._native_module = None
+        self._input_specs_cache = None
+        self._output_specs_cache = None
 
     # ------------------------------------------------------------------- run
 
@@ -545,8 +702,18 @@ class NativeExecutable:
         """
         validate_options(options, NativeBackend.KNOWN_OPTIONS, self.backend_name, "run")
         inputs = self._validated_inputs(flat_input_tensors)
-        outputs = engine.program_run(self._program, inputs, self._resolver)
+        outputs = engine.program_run(
+            self._program, inputs, self._resolver, self._engine()
+        )
         return self._wrap_outputs(outputs)
+
+    def _engine(self):
+        """The resolved extension module, resolved ONCE per executable."""
+        module = self._native_module
+        if module is None:
+            module = engine.engine_module()
+            self._native_module = module
+        return module
 
     def synchronize(self) -> None:
         """Documented no-op: the native engine's ``run`` already blocks.
@@ -598,6 +765,37 @@ class NativeExecutable:
 
     # ------------------------------------------------------------- internals
 
+    def _input_specs(self) -> tuple:
+        """The flattened input specs, cached against the CURRENT signature object.
+
+        A pure derivation of ``signature.input_specs``; the cache is keyed on the
+        identity of ``self.signature``, so replacing the attribute is honored.
+        """
+        signature = self.signature
+        cached = self._input_specs_cache
+        if cached is None or cached[0] is not signature:
+            specs = tuple(signature.input_specs) if signature is not None else ()
+            cached = self._input_specs_cache = (signature, specs)
+        return cached[1]
+
+    def _output_specs(self) -> tuple[tuple, tuple]:
+        """``(output_specs, per-output (np.dtype, declared dims))``, cached.
+
+        Same identity-keyed derivation as :meth:`_input_specs`. The per-output
+        pairs are exactly what :meth:`_check_output_spec` compares against, so
+        the recorded ``TensorSpec``s are coerced once instead of per call —
+        validation (and every error message) is unchanged.
+        """
+        signature = self.signature
+        cached = self._output_specs_cache
+        if cached is None or cached[0] is not signature:
+            specs = tuple(signature.output_specs) if signature is not None else ()
+            prepared = tuple(
+                (np.dtype(spec.dtype), tuple(spec.shape or ())) for spec in specs
+            )
+            cached = self._output_specs_cache = (signature, specs, prepared)
+        return cached[1], cached[2]
+
     def _validated_inputs(self, flat_input_tensors: list["Tensor"]) -> list:
         """Validate the flat host inputs and return the engine's array list."""
         if not isinstance(flat_input_tensors, (list, tuple)):
@@ -605,7 +803,7 @@ class NativeExecutable:
                 "NativeExecutable.run expects a list of core.Tensor inputs, "
                 f"got {type(flat_input_tensors).__name__}"
             )
-        specs = self.signature.input_specs if self.signature is not None else ()
+        specs = self._input_specs()
         if specs and len(flat_input_tensors) != len(specs):
             raise core.BackendError(
                 f"native executable expects {len(specs)} input tensor(s), got "
@@ -638,13 +836,14 @@ class NativeExecutable:
                 f"{type(outputs).__name__} where a list of output arrays was "
                 "expected"
             )
-        outputs = list(outputs)
-        specs = self.signature.output_specs if self.signature is not None else ()
+        specs, prepared = self._output_specs()
         if specs and len(outputs) != len(specs):
             raise core.BackendError(
                 f"the native CPU engine returned {len(outputs)} output(s), the "
                 f"signature declares {len(specs)}"
             )
+        if not isinstance(outputs, list):
+            outputs = list(outputs)
         tensors = []
         for index, array in enumerate(outputs):
             if not isinstance(array, np.ndarray):
@@ -652,25 +851,30 @@ class NativeExecutable:
                     f"the native CPU engine returned {type(array).__name__} for "
                     f"output {index}, expected a numpy array"
                 )
-            if index < len(specs):
-                self._check_output_spec(index, array, specs[index])
+            if index < len(prepared):
+                dtype, declared = prepared[index]
+                self._check_output_spec(index, array, dtype, declared)
             tensors.append(core.Tensor(array))
         return tensors
 
     @staticmethod
-    def _check_output_spec(index: int, array: np.ndarray, spec: Any) -> None:
+    def _check_output_spec(
+        index: int, array: np.ndarray, dtype: np.dtype, declared: tuple
+    ) -> None:
         """Validate one output against its recorded ``TensorSpec``.
 
-        dtype must match exactly (``core.BackendError``); shape is compared
-        only on the dims the spec declares concretely (a symbolic or ``None``
-        dim is runtime-dynamic and unchecked) — ``core.ShapeError`` otherwise.
+        ``dtype``/``declared`` are the spec's coerced dtype and declared shape
+        (precomputed by :meth:`_output_specs`; ``np.dtype(spec.dtype)`` and
+        ``tuple(spec.shape or ())`` verbatim). dtype must match exactly
+        (``core.BackendError``); shape is compared only on the dims the spec
+        declares concretely (a symbolic or ``None`` dim is runtime-dynamic and
+        unchecked) — ``core.ShapeError`` otherwise.
         """
-        if np.dtype(spec.dtype) != array.dtype:
+        if dtype != array.dtype:
             raise core.BackendError(
                 f"output {index} dtype is {array.dtype.name} from the native "
-                f"engine but {np.dtype(spec.dtype).name} in the graph signature"
+                f"engine but {dtype.name} in the graph signature"
             )
-        declared = tuple(spec.shape or ())
         if not declared:
             if array.ndim != 0:
                 raise core.ShapeError(

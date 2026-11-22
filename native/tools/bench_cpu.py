@@ -1,6 +1,6 @@
 """Benchmark: native CPU engine vs the numpy backend, plus native compile time.
 
-Four workloads, each one ``@evoxc.defn`` graph:
+Seven workloads, each one ``@evoxc.defn`` graph:
 
 ``ew_chain_1e6``    an 8-op ARITHMETIC elementwise f32 chain over 1e6 elements
 ``ew_transcendental_1e6``  four transcendental ops (tanh/sigmoid/gelu/erf) over
@@ -8,6 +8,11 @@ Four workloads, each one ``@evoxc.defn`` graph:
 ``dot_sum_256``     ``dot((256,256), (256,256))`` + ``reduce_sum`` (f32)
 ``gp_gather_4096``  a gather/select-heavy GP-shaped chain over (4096, 64) f32,
                     built by a Python loop inside the defn over static indices
+``gp_sort_4096``    a selection-shaped GP graph over (4096, 64) f32: row argsort,
+                    a batched gather of the top-16 columns, a reduction and a
+                    broadcast select against the row mean
+``tf_softmax_8x128x384``  a transformer-shaped attention block over
+                    (8, 128, 384) f32: row max/sum shifts, exp, tanh and gelu
 ``chain_2000``      a ~2000-op elementwise chain over a (64,) f32 array
 
 For each workload the script measures
@@ -125,6 +130,49 @@ def gp_gather_4096(x):
 
 
 @evoxc.defn
+def gp_sort_4096(x):
+    """Selection-shaped GP graph over (4096, 64) f32.
+
+    Row argsort + row sort, a slice of the best 16 columns per row, two
+    per-row reductions, a whole-row gather of the parent candidates and a
+    broadcast select of a (4096, 1) score against the (4096, 64) population.
+    That is the op mix a genetic program's selection step actually produces:
+    sorting, a multi-axis gather, keepdims reductions and a broadcast select.
+    """
+    row_count, width = 4096, 64
+    pick = evoxc.constant(
+        evoxc.from_numpy(np.array([(step * 29) % row_count for step in range(width)], np.int32))
+    )
+    order = evoxc.argsort(x, axis=1)  # (4096, 64) int32
+    values = evoxc.sort(x, axis=1)  # (4096, 64) f32, ascending
+    head = evoxc.slice(values, (0, 0), (row_count, 16))  # (4096, 16) f32
+    score = evoxc.reduce_sum(head, axes=(1,), keepdims=True)  # (4096, 1)
+    rank = evoxc.cast(order, evoxc.float32)
+    row_rank = evoxc.reduce_sum(rank, axes=(1,), keepdims=True)  # (4096, 1)
+    parents = evoxc.gather(x, pick, axis=0)  # (64, 64) f32
+    bonus = evoxc.reduce_sum(parents, axes=(0,), keepdims=True)  # (1, 64)
+    kept = evoxc.select(evoxc.greater(score, row_rank), x, evoxc.multiply(x, 0.5))
+    return evoxc.add(kept, bonus)
+
+
+@evoxc.defn
+def tf_softmax_8x128x384(x):
+    """Transformer-shaped attention block over (8, 128, 384) f32.
+
+    A per-row max-shifted softmax (reduce_max -> subtract -> exp -> reduce_sum
+    -> divide) followed by the tanh/gelu elementwise mix a real block applies
+    to its activations.  This is the "many mid-size 3-D tensors" shape rather
+    than one flat array.
+    """
+    row_max = evoxc.reduce_max(x, axes=(2,), keepdims=True)
+    weights = evoxc.exp(evoxc.subtract(x, row_max))
+    total = evoxc.reduce_sum(weights, axes=(2,), keepdims=True)
+    probs = evoxc.divide(weights, total)
+    mixed = evoxc.add(evoxc.multiply(probs, 1.5), evoxc.tanh(evoxc.multiply(x, 0.5)))
+    return evoxc.add(mixed, evoxc.gelu(evoxc.multiply(x, 0.25)))
+
+
+@evoxc.defn
 def chain_2000(x):
     """A ~2000-op elementwise chain over a (64,) f32 array.
 
@@ -154,6 +202,7 @@ def build_workloads() -> list:
     mat = rng.standard_normal((256, 256)).astype(np.float32)
     mat_other = rng.standard_normal((256, 256)).astype(np.float32)
     rows = rng.standard_normal((4096, 64)).astype(np.float32)
+    activations = rng.standard_normal((8, 128, 384)).astype(np.float32)
     small = rng.standard_normal(64).astype(np.float32)
     return [
         Workload("ew_chain_1e6", ew_chain_1e6, (evoxc.TensorSpec((1_000_000,), f32),) * 2, (big, big_other)),
@@ -166,6 +215,20 @@ def build_workloads() -> list:
         ),
         Workload("dot_sum_256", dot_sum_256, (evoxc.TensorSpec((256, 256), f32),) * 2, (mat, mat_other)),
         Workload("gp_gather_4096", gp_gather_4096, (evoxc.TensorSpec((4096, 64), f32),), (rows,)),
+        Workload(
+            "gp_sort_4096",
+            gp_sort_4096,
+            (evoxc.TensorSpec((4096, 64), f32),),
+            (rows,),
+            note="row argsort + two-axis gather + broadcast select",
+        ),
+        Workload(
+            "tf_softmax_8x128x384",
+            tf_softmax_8x128x384,
+            (evoxc.TensorSpec((8, 128, 384), f32),),
+            (activations,),
+            note="per-row softmax + tanh/gelu mix, many mid-size 3-D tensors",
+        ),
         Workload(
             "chain_2000",
             chain_2000,

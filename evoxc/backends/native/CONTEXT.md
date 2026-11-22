@@ -54,7 +54,8 @@ call_runtime(name, args)                 -> list[numpy.ndarray]
 | `NativeCallbackResolver` | The resolver above; stateless, one per executable. |
 | `native_backend` | The registered singleton instance. |
 | `register()` | Adapter-convention activation: probes the extension (`engine.engine_module()`), raising `core.BackendError` with build instructions when the extension or its `native_compile` entry point is missing; then registers the singleton (idempotent). Called by `registry.get("native")` via `OPTIONAL_ADAPTERS`. |
-| `engine` (module) | `engine_available()`, `engine_version()`, `compile_module(module)`, `program_run/plan_text/stats/required_ops/output_types`, `unsupported_ops(stats)`, `SUPPORTED_DTYPES`, `BACKEND_NAME`, `ENGINE_VERSION_KEY` (`"evoxc-native"`). |
+| `engine` (module) | `engine_available()`, `engine_version()`, `encode_module(module)` (the `evoxc-native-ir` envelope, one `_native_codec.encode_module` call), `compile_module(module, envelope=None)` (an already-encoded envelope is used verbatim; the caller owns the "envelope belongs to this module" invariant), `program_run(program, flat_inputs, resolver=None, native=None)` (a pre-resolved extension module, else resolved with the same explicit error), `program_plan_text/stats/required_ops/output_types`, `unsupported_ops(stats)`, `SUPPORTED_DTYPES`, `BACKEND_NAME`, `ENGINE_VERSION_KEY` (`"evoxc-native"`). |
+| `staging_stats()` / `reset_staging_stats()` | TEST SEAM (module-level, `__all__`, deliberately NOT re-exported from `evoxc`): `{"decode", "encode", "compile"}` counters over this backend's single `_decode_payload` / `_encode_payload` / `_compile_program` helpers — `reset` first, then read. |
 
 `pipeline` usage is unchanged: `evoxc.build(fn, *specs, backend="native")`, `evoxc.evaluate(..., backend="native")`, `evoxc.lower/compile/load(..., backend="native")`, `EVOXC_BACKEND=native`.
 The user-facing `Executable.summary()` inspection API lives in `evoxc/pipeline.py` and reaches the engine through this executable's `plan_text()` / `stats()` (never import that module here).
@@ -71,14 +72,43 @@ The user-facing `Executable.summary()` inspection API lives in `evoxc/pipeline.p
 6. **Engine capability gate**: `native_compile` the module and read `stats()`; every op the engine reports as unsupported becomes one `core.BackendError` naming the ops and pointing at `backend="numpy"`. This is the authoritative gate — the Rust engine, not this package, knows what it implements.
 7. `Signature` recorded from the Graph's LIVE attributes, EXACTLY like `NumpyBackend.lower` (`input_tree`, `output_tree`, `input_specs` = `graph.tensor_specs`, `output_specs` from the entry function's result types, input static values, output static values).
 8. Payload = `ir.serialize_module(graph.module)` (`LoweredProgram.text()`/`save()`/`load()` therefore work through the same code paths as numpy).
+   The custom-op names, the encoded envelope and the compiled program are computed ONCE here (see "Single-decode staging").
 
-`compile(lowered, options)` — validates `lowered.backend == "native"`, deserializes the payload, scans it for `block_call`/`external_call`/`runtime_call` names, records `target="cpu"`, `required_custom_ops` = sorted(blocks ∪ external kernels) and `runtime_dependencies = {"numpy": <version>, "evoxc-native": <extension version>}`, plus the non-persisted `artifact.runtime_call_ids` self-description when the module carries `runtime_call` ops (diagnostics only — callbacks resolve lazily at run time and are never serialized). No lowering/engine work.
+`compile(lowered, options)` — validates `lowered.backend == "native"`, resolves the required `block_call`/`external_call`/`runtime_call` names (reused from `lower()` in-process; ONE decode + ONE scan for a disk-loaded program), records `target="cpu"`, `required_custom_ops` = sorted(blocks ∪ external kernels) and `runtime_dependencies = {"numpy": <version>, "evoxc-native": <extension version>}`, plus the non-persisted `artifact.runtime_call_ids` self-description when the module carries `runtime_call` ops (diagnostics only — callbacks resolve lazily at run time and are never serialized). No lowering/engine work.
 
-`load(artifact, device=None, options=None)` — backend-name mismatch ⇒ `PersistenceError`; `device` must be `None` or a CPU `Device` (non-`Device` ⇒ `DeviceError`, non-CPU kind ⇒ `BackendError` naming the kind); every remaining `block_call` needs a registered block AND a registered `native` impl, else `PersistenceError` naming the block (portables were already inlined); then the engine program is built from the payload and a `NativeExecutable` returned. Never re-lowers.
+`load(artifact, device=None, options=None)` — backend-name mismatch ⇒ `PersistenceError`; `device` must be `None` or a CPU `Device` (non-`Device` ⇒ `DeviceError`, non-CPU kind ⇒ `BackendError` naming the kind); every remaining `block_call` needs a registered block AND a registered `native` impl (`_require_block_impls(blocks)` takes the already-collected name tuple — it never re-walks the module), else `PersistenceError` naming the block (portables were already inlined); then the engine program is reused (in-process) or built from the attached module and a `NativeExecutable` returned. Never re-lowers.
 
 **External kernels and `runtime_call` callbacks are deliberately NOT required at load** — the binding persistence contract (`../../CONTEXT.md`, "External kernels"; `../program.py::_validate_required_custom_ops`) keeps both registries lazy: they are never serialized, must be re-established before RUN, and a missing registration raises `core.BackendError` naming it from the resolver. This is the ONE place the backend is more permissive than the objective's "assert external kernels at load" wording; the binding contract wins, and the failure is still explicit (just later).
 
-**In-process compile reuse**: `lower()` keeps the compiled program as `lowered._native_program = (payload, program)` and `compile()` forwards it to the artifact as `(artifact.payload, program)`. `load()` reuses it ONLY when that tuple's payload is the identical object (`is`) — a reloaded/replaced payload always recompiles from the module. The hint is never serialized and never trusted across a process boundary; it exists because `lower()` must compile once as the capability gate and the common `build` path would otherwise compile the same graph twice.
+## Single-decode staging (numpy parity)
+
+`lower()` attaches five PRIVATE, runtime-only objects to the `LoweredProgram` (never declared dataclass fields, so `LoweredProgram.save`/`CompiledArtifact.save` persist nothing of them and the container bytes stay byte-identical): `_native_module` (the live module it verified), `_native_payload` (the exact payload object), `_native_required_ops` (the `(blocks, external, runtime_calls)` triple it scanned once), `_native_envelope` (the one `engine.encode_module` result, a fresh dict per `lower`) and `_native_program = (payload, program)` (the compiled capability-gate program).
+`compile()` attaches the same triple plus the (identity-gated) envelope and forwards the program, and `load()` reads them.
+EVERY reuse is gated on the identity of the payload object the attachment was built from (`getattr(x, "_native_payload", None) is x.payload`), so a replaced/mutated payload can never reuse a stale module, envelope or program.
+Attached-but-not-yet-collected / attached-but-not-yet-encoded cases fall back defensively (one scan / one encode), never silently to a wrong graph.
+A `LoweredProgram`/`CompiledArtifact` loaded from disk carries none of them (they are never persisted) and takes the fallback: exactly ONE decode, ONE scan, ONE encode, ONE `native_compile` — never zero, never two.
+`engine.encode_module(module)` is the single encode entry point and `engine.compile_module(module, envelope=...)` accepts the pre-computed envelope, so a full in-process `lower → compile → load` chain performs `decode 0, encode 1, compile 1` (pinned by the `staging_stats()` seam, which counts calls through this backend's one `_decode_payload` / `_encode_payload` / `_compile_program` helper).
+`lower()` still compiles once as its capability gate — that is the `encode 1, compile 1`, not a redundancy.
+
+## Staging cost
+
+Measurements on a 16-cpu x86-64 box, loadavg ≈4–5, `100-op` = a chain of 100 `evoxc.tanh` ops on `(64,)` f32, `2000-op` = the same ×2000; min/median ms over 7 repeats.
+
+| Stage | 100-op before | 100-op after | 2000-op before | 2000-op after |
+|---|---|---|---|---|
+| `lower` | 1.426/1.472 | 1.473/1.499 | 27.5/28.4 | 28.4/28.9 |
+| `compile` | 0.923/0.950 | 0.002/0.002 | 18.0/18.8 | 0.002/0.002 |
+| `load` | 0.918/0.941 | 0.001/0.001 | 18.5/18.7 | 0.001/0.001 |
+| **`lower+compile+load` total** | **3.457/3.488** | **1.475/1.499** | **65.9/67.8** | **28.3/28.9** |
+| numpy total (control) | 0.785/0.802 | 0.794/0.810 | 15.4/15.7 | 15.5/15.7 |
+
+The two removed deserializations (`ir.deserialize_module` ≈0.93 ms at 100 ops / ≈18.5 ms at 2000 ops, each followed by a full `iter_ops` scan) were the whole of `compile`/`load`; the remaining `lower` cost is deliberately not removed:
+`graph.verify` 3.5 ms, `_scan_required_ops` 0.09 ms, `encode_module` 6.3 ms (it verifies the module before emitting), the Rust `native_compile` 6.0 ms, `ir.serialize_module` 11.4 ms (it verifies too), plus ≈2 ms of capability walks and `Signature` recording — at 2000 ops that sums to the measured ≈29 ms.
+Those four heavy pieces live in `evoxc/ir`, `evoxc/_native_codec` and the Rust `native/` tree, i.e. OUTSIDE this node: the persisted payload and every verification stay exactly as they are.
+A same-order-of-magnitude cost remains for the same reason at 100 ops (0.18 verify + 0.31 encode + 0.29 compile + 0.56 serialize ≈ 1.34 of the 1.50 ms `lower`).
+
+Warm `run` overhead (`evoxc.run`, best-of-300, host tensors, loadavg ≈4): 1-op graph native 7.5 µs vs numpy 6.1 µs (backend executable 5.04 vs 3.63 µs — the raw Rust `NativeProgram.run` alone is ≈3.55 µs, i.e. the engine call is already numpy's whole backend run, and the residual seam is `_validated_inputs` 0.30 + output wrapping + a 0.2 µs `core.Tensor` construction); 100-op graph native 32.0 µs vs numpy 88.2 µs.
+Caching the resolved extension module on the executable (`engine.program_run(..., native=...)`, 0.34 µs/call saved) and the identity-keyed input/output spec layout (0.3–0.4 µs/call) took the 1-op pipeline call from 8.05 → 7.5 µs with every validation and error message unchanged.
 
 ## Capability matrix (v1)
 
@@ -113,7 +143,9 @@ Top-level imports: `evoxc.core`, `evoxc.ir`, this backend's siblings (`..backend
 
 - `NativeExecutable.run` is synchronous and returns host `core.Tensor`s (`Device("cpu", 0)`), so `synchronize()` is a documented no-op and a timing measurement is a plain `run` wall-clock.
 - One executable is not required to be thread-safe for concurrent `run` calls; the resolver is stateless, but the engine's internal buffers are its own contract.
-- The engine program is compiled at `lower()` (capability gate) and again at `load()` only when the in-process hint is absent (a reloaded artifact) — report `stats()["compile_ms"]` when measuring staging cost.
+- The engine program is compiled at `lower()` (capability gate) and again at `load()` only when the in-process program attachment is absent (a reloaded artifact) — report `stats()["compile_ms"]` when measuring staging cost, and `staging_stats()` for the decode/encode/compile tallies.
+- The `run` hot path caches two pure derivations per executable — the resolved extension module and the flattened spec layout (rebuilt when `signature` is REPLACED) — so a `NativeExecutable` resolves `engine.engine_module()` once, not per call. Validation and every error message are unchanged.
+- A `random_key_mix` graph fails at `lower()` on the Rust envelope decoder (`VerificationError: attribute "salt": expected an int, got 11400714819323198485` — a u64 value above `i64::MAX`). That is an engine-side int-attribute limit (outside this node; there is no narrowing workaround here — nothing in this package touches attribute encoding), reproducible at the same boundary in every staging chain, in-process or from disk.
 - `Graph` mutation warning: like numpy/compiler `lower()`, portable inlining mutates the caller's module, so a `lower()` that fails at the engine gate (step 6) leaves blocks already inlined.
 
 ## Test strategy
@@ -127,6 +159,6 @@ No child nodes.
 
 | Path | Area |
 |---|---|
-| `./engine.py` | The ONLY FFI seam: extension lookup/`engine_available`, `compile_module`, `program_run`/`plan_text`/`stats`/`required_ops`/`output_types`, unsupported-op extraction, `NativeError` translation, `SUPPORTED_DTYPES`. |
+| `./engine.py` | The ONLY FFI seam: extension lookup/`engine_available`, `encode_module`, `compile_module` (optional pre-computed envelope), `program_run` (optional pre-resolved extension module)/`plan_text`/`stats`/`required_ops`/`output_types`, unsupported-op extraction, `NativeError` translation, `SUPPORTED_DTYPES`. |
 | `./resolver.py` | `NativeCallbackResolver` — `call_block` (static_args-aware) / `call_external` / `call_runtime`, host-array normalization and the shared output normalization. |
-| `./__init__.py` | `NativeBackend` (staging + capability checks + engine gate), `NativeExecutable` (run/output validation, diagnostics, persistence), `native_backend`, `register()`. |
+| `./__init__.py` | `NativeBackend` (staging + capability checks + engine gate + single-decode attachments), `NativeExecutable` (run/output validation, diagnostics, persistence), `native_backend`, `register()`, and the `staging_stats()`/`reset_staging_stats()` test seam with its single `_decode_payload`/`_encode_payload`/`_compile_program` helpers. |

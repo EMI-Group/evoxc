@@ -35,7 +35,7 @@
 //! strict helper.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{block_storage, shape_text, walk, Buffer, Storage};
+use crate::buffer::{shape_text, walk, Buffer, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
@@ -101,6 +101,50 @@ fn offset_error(offset: impl std::fmt::Display, len: usize, op: &str) -> Error {
     Error::backend(format!(
         "{op}: computed flat offset {offset} is outside a {len}-element buffer — the declared result type does not match the operands"
     ))
+}
+
+/// The block-copy bounds diagnostic [`copy_blocks`](crate::buffer::copy_blocks)
+/// raises, with its wording (both entries say the same thing).
+fn block_error(op: &str) -> Error {
+    Error::verification(format!(
+        "op '{op}': a block copy reads outside the operand (internal engine error)"
+    ))
+}
+
+/// A [`Storage`] built by a block copy WITHOUT the zero fill
+/// [`block_storage`](crate::buffer::block_storage) performs.
+///
+/// The result is exactly that helper's — output run `b` is the `inner`-element
+/// run starting at `values[offsets[b]]` — but the elements are pushed straight
+/// into the result, so a block copy never first writes a full zero buffer it is
+/// about to overwrite. That matters for the large-result fast paths (`tile`-,
+/// `gather`- and `slice`-shaped results), where the fill is a second pass over
+/// the whole output. The element-count and bounds contract is `copy_blocks`'
+/// (same checks, same error wording): a short or long offset list is an
+/// explicit error, never a silently truncated result.
+fn block_storage_from<T: Scalar>(
+    values: &[T],
+    out_shape: &[usize],
+    offsets: &[usize],
+    inner: usize,
+    op: &str,
+) -> Result<Storage> {
+    let total = util::numel(out_shape);
+    if offsets.len().saturating_mul(inner) != total {
+        return Err(block_error(op));
+    }
+    if inner == 0 {
+        return Ok(T::into_storage(Vec::new()));
+    }
+    let mut out: Vec<T> = Vec::with_capacity(total);
+    for offset in offsets {
+        let start = *offset;
+        let run = values
+            .get(start..start + inner)
+            .ok_or_else(|| block_error(op))?;
+        out.extend_from_slice(run);
+    }
+    Ok(T::into_storage(out))
 }
 
 /// Read `values[offset]` with a SIGNED offset (slice strides may be negative).
@@ -484,7 +528,7 @@ fn slice_row_blocks(
         }
     })?;
     let storage = with_type!(source, |values| {
-        block_storage(values, out_shape, &offsets, inner, "slice")
+        block_storage_from(values, out_shape, &offsets, inner, "slice")
     })?;
     Ok(Some(storage))
 }
@@ -614,7 +658,7 @@ fn gather_blocks(
         }
     }
     let storage = with_type!(source, |values| {
-        block_storage(values, out_shape, &offsets, inner, "gather")
+        block_storage_from(values, out_shape, &offsets, inner, "gather")
     })?;
     Ok(Some(storage))
 }
@@ -1236,6 +1280,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slice_row_copy_accepts_a_runtime_dynamic_result_dim() {
+        // The row-copy fast path is driven by the DECLARED shape, so a dynamic
+        // leading dim still takes it and a static trailing dim is still checked.
+        let x = f32_buffer(&[4, 3], &(0..12).map(|value| value as f32).collect::<Vec<_>>());
+        let op = spec(attrs(&[
+            ("start_indices", evoxc_core::AttrValue::Ints(vec![1, 0])),
+            ("limit_indices", evoxc_core::AttrValue::Ints(vec![3, 3])),
+            ("strides", evoxc_core::AttrValue::Null),
+        ]));
+        let ranges = slice_ranges(&op, &[4, 3]).unwrap();
+        let out = slice(&x, &ranges, &[None, Some(3)]).unwrap();
+        assert_eq!(out.shape, vec![2, 3]);
+        assert_eq!(out.storage, Storage::F32(vec![3., 4., 5., 6., 7., 8.]));
+        let err = slice(&x, &ranges, &[None, Some(2)]).unwrap_err();
+        assert_eq!(err.kind, evoxc_core::ErrorKind::Shape);
+    }
     // -- gather -----------------------------------------------------------
 
     #[test]
@@ -1338,6 +1399,61 @@ mod tests {
         assert!(err.message.contains("index -4 is out of bounds"), "{}", err.message);
     }
 
+    #[test]
+    fn gather_accepts_a_runtime_dynamic_result_dim() {
+        // A dynamic declared dim (`None`) takes the operand-derived extent, and
+        // a static sibling dim is still checked — the fast path copies rows but
+        // never re-derives the declared shape's static dims.
+        let x = f32_buffer(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        let out = gather(&x, &[2, 0], &[2], 0, &[None, Some(2)]).unwrap();
+        assert_eq!(out.shape, vec![2, 2]);
+        assert_eq!(out.storage, Storage::F32(vec![5., 6., 1., 2.]));
+        let err = gather(&x, &[2, 0], &[2], 0, &[None, Some(3)]).unwrap_err();
+        assert_eq!(err.kind, evoxc_core::ErrorKind::Shape);
+        assert!(err.message.contains("declared type says 3"), "{}", err.message);
+    }
+    /// The zero-fill-free block copy must produce exactly the same storage as
+    /// `buffer::block_storage` (which zero-fills and then copies), including the
+    /// empty case and single-element runs.
+    #[test]
+    fn block_rows_without_zero_fill_match_the_general_helper() {
+        let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let cases: [(&[usize], &[usize], usize); 3] = [
+            (&[2, 3], &[1, 3], 3),
+            (&[0, 3], &[], 3),
+            (&[4], &[0, 1, 2, 3], 1),
+        ];
+        for (out_shape, offsets, inner) in cases {
+            let fast = block_storage_from(&values, out_shape, offsets, inner, "test").unwrap();
+            let general =
+                crate::buffer::block_storage(&values, out_shape, offsets, inner, "test").unwrap();
+            assert_eq!(fast, general, "shape {out_shape:?} offsets {offsets:?}");
+        }
+        // A run of two starts at offset 3: [3, 4].
+        let storage = block_storage_from(&values, &[2], &[3, 7], 1, "test").unwrap();
+        assert_eq!(storage, Storage::F32(vec![3., 7.]));
+    }
+    #[test]
+    fn block_rows_reject_an_offset_outside_the_operand() {
+        let values: Vec<f32> = (0..4).map(|value| value as f32).collect();
+        // A count mismatch between the offset list and the result element count.
+        let err = block_storage_from(&values, &[2], &[0], 1, "gather").unwrap_err();
+        assert!(
+            err.message.contains("a block copy reads outside the operand"),
+            "{}",
+            err.message
+        );
+        // A run past the end of the operand.
+        let err = block_storage_from(&values, &[2, 2], &[0, 3], 2, "gather").unwrap_err();
+        assert!(
+            err.message.contains("op 'gather': a block copy reads outside the operand"),
+            "{}",
+            err.message
+        );
+        // Zero-width runs need no source data at all.
+        let empty = block_storage_from::<f32>(&[], &[3, 0], &[0, 0, 0], 0, "gather").unwrap();
+        assert_eq!(empty, Storage::F32(Vec::new()));
+    }
     #[test]
     fn gather_requires_an_integer_index_dtype() {
         let indices = f32_buffer(&[1], &[0.]);
