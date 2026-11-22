@@ -1040,6 +1040,14 @@ fn fill_broadcast_static<T: Copy, D: Dimension>(
             return true;
         }
     }
+    // A periodic pattern ([`patterns::copy_pattern`]) — a per-block constant
+    // `(a,1,...,1)` source, a small-period tile or a scalar — is one `fill` or
+    // one `copy_from_slice` per period block, without materializing a tile.
+    if let Some(pattern) = patterns::pattern_view(values, shape, out_shape.slice()) {
+        if patterns::copy_pattern(out, &pattern) {
+            return true;
+        }
+    }
     let Some(base) = base_view(values, shape) else {
         return false;
     };
@@ -1055,3 +1063,7 @@ fn fill_broadcast_static<T: Copy, D: Dimension>(
 
 #[cfg(test)]
 mod tests;
+
+mod patterns;
+
+pub(crate) use patterns::{runs2 as periodic2, runs3 as periodic3};

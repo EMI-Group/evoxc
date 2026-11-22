@@ -990,3 +990,370 @@ fn the_repeating_copy_covers_fill_broadcast() {
     }
     assert!(!copy_runs(&mut [0i32; 32], &repeat_view(&[0i32; 1], &[1], &[32]).unwrap()));
 }
+
+// ---------------------------------------------------------------------------
+// The periodic-pattern driver (`patterns`): the per-block constant, the
+// small-period tile and the hoisted scalar — the two broadcast families the
+// flat `i % period` proof cannot express.
+// ---------------------------------------------------------------------------
+
+/// `patterns::runs2` against the independent [`reference_slot`] reading, plus
+/// the ndarray `Zip` reference with the specialization forced off, and the
+/// requirement that the driver actually TAKES the layout (so the number below
+/// is the driver's, not the reference's).
+fn check_periodic2(out_shape: &[usize], a_shape: &[usize], b_shape: &[usize]) {
+    let count = product(out_shape);
+    let a: Vec<i32> = values(product(a_shape), 7);
+    let b: Vec<i32> = values(product(b_shape), 11);
+    let f = |x: i32, y: i32| x.wrapping_mul(3).wrapping_sub(y.wrapping_mul(7));
+
+    let mut generic = vec![0i32; count];
+    {
+        let _generic = switch(&RUNS_DISABLED, true);
+        apply2(&mut generic, out_shape, &a, a_shape, &b, b_shape, f);
+    }
+    let mut specialized = vec![0i32; count];
+    assert!(
+        patterns::runs2(&mut specialized, out_shape, &a, a_shape, &b, b_shape, &f),
+        "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: the driver must take the layout"
+    );
+    assert_eq!(
+        specialized, generic,
+        "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: the driver disagrees with the ndarray Zip"
+    );
+    for (flat, produced) in specialized.iter().enumerate() {
+        let expected = f(
+            a[reference_slot(out_shape, a_shape, flat)],
+            b[reference_slot(out_shape, b_shape, flat)],
+        );
+        assert_eq!(
+            *produced, expected,
+            "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+        );
+    }
+}
+
+/// The per-block constant family (`(a, 1, ..., 1)` — one source value per inner
+/// run), the small-period tile family (`(a, ..., 1)` — the innermost axis
+/// broadcast, a period-`n` tile) and the hoisted scalar.
+#[test]
+fn the_periodic_driver_covers_the_per_block_and_tile_families() {
+    let _serialized = switch_guard();
+    type Case<'a> = (&'a [usize], &'a [usize], &'a [usize]);
+    let cases: &[Case<'_>] = &[
+        // A `(a,1,1)` bias beside a (a, b, c) result: one source value per run.
+        (&[500, 50, 4], &[500, 50, 4], &[500, 1, 1]),
+        (&[64, 8, 4], &[64, 8, 4], &[64, 1, 1]),
+        (&[64, 8, 4], &[64, 1, 1], &[64, 8, 4]),
+        // A `(a,1)` per-row scalar.
+        (&[512, 16], &[512, 16], &[512, 1]),
+        (&[512, 16], &[512, 1], &[512, 16]),
+        // A rank-0 scalar: one hoisted value for the whole result.
+        (&[64, 16], &[64, 16], &[]),
+        (&[64, 16], &[], &[64, 16]),
+        // The small-period tile: the innermost axis broadcast, so the pattern
+        // is `stretch`=4 and a span covering the whole tail.
+        (&[500, 50, 4], &[500, 50, 4], &[500, 50, 1]),
+        (&[500, 50, 4], &[500, 50, 1], &[500, 50, 4]),
+        (&[32, 8, 4], &[32, 8, 4], &[32, 8, 1]),
+        (&[32, 8, 2], &[32, 8, 2], &[32, 8, 1]),
+        // A scalar beside either family rides the constant feed.
+        (&[64, 8, 4], &[64, 1, 1], &[]),
+    ];
+    for (out_shape, a_shape, b_shape) in cases {
+        check_periodic2(out_shape, a_shape, b_shape);
+    }
+}
+
+/// The layouts the periodic driver must DECLINE (falling through to the ndarray
+/// `Zip`) — and the classifier's own answers, pinned.
+#[test]
+fn the_periodic_driver_declines_what_it_does_not_cover() {
+    let _serialized = switch_guard();
+    type Case<'a> = (&'a [usize], &'a [usize], &'a [usize]);
+    let cases: &[Case<'_>] = &[
+        // A middle-axis broadcast ABOVE a chunky axis: the source walks with a
+        // stride that is not the result's compressed C-order stride.
+        (&[32, 8, 4], &[32, 8, 4], &[32, 1, 4]),
+        (&[64, 8, 4], &[64, 1, 4], &[64, 8, 4]),
+        // Two chunky stretches cannot share one run length.
+        (&[500, 50, 4], &[500, 1, 1], &[500, 50, 1]),
+        (&[64, 8, 4], &[64, 1, 1], &[64, 8, 1]),
+        // A result under `RUN_MIN_ELEMS`.
+        (&[2, 4], &[2, 4], &[2, 1]),
+    ];
+    for (out_shape, a_shape, b_shape) in cases {
+        let count = product(out_shape);
+        let a: Vec<i32> = values(product(a_shape), 5);
+        let b: Vec<i32> = values(product(b_shape), 9);
+        let f = |x: i32, y: i32| x.wrapping_sub(y);
+        let mut out = vec![0i32; count];
+        assert!(
+            !patterns::runs2(&mut out, out_shape, &a, a_shape, &b, b_shape, &f),
+            "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: the driver should decline"
+        );
+        apply2(&mut out, out_shape, &a, a_shape, &b, b_shape, f);
+        for (flat, produced) in out.iter().enumerate() {
+            let expected = f(
+                a[reference_slot(out_shape, a_shape, flat)],
+                b[reference_slot(out_shape, b_shape, flat)],
+            );
+            assert_eq!(
+                *produced, expected,
+                "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+            );
+        }
+    }
+
+    // The classifier: `(stretch, span)` is exactly the pattern
+    // `values[(i / stretch) % span]`, derived from shapes and strides.
+    let classify = |shape: &[usize], out_shape: &[usize]| {
+        let source = vec![0f32; product(shape)];
+        patterns::pattern_view(&source, shape, out_shape).map(|p| p.shape())
+    };
+    assert_eq!(classify(&[500, 1, 1], &[500, 50, 4]), Some((200, 500)));
+    assert_eq!(classify(&[500, 50, 1], &[500, 50, 4]), Some((4, 25_000)));
+    assert_eq!(classify(&[500, 50, 4], &[500, 50, 4]), Some((1, 100_000)));
+    assert_eq!(classify(&[4], &[2000, 50, 4]), Some((1, 4)));
+    assert_eq!(classify(&[], &[2000, 50, 4]), Some((400_000, 1)));
+    assert_eq!(classify(&[3], &[64, 3, 4]), None); // 3 cannot serve a 4-wide axis
+    assert_eq!(classify(&[3], &[64, 8, 3]), Some((1, 3)));
+    assert_eq!(classify(&[6], &[64, 6]), Some((1, 6)));
+    assert_eq!(classify(&[64, 1], &[64, 6]), Some((6, 64))); // per-row scalar
+    assert_eq!(classify(&[32, 1, 4], &[32, 8, 4]), None); // middle-axis walk
+    assert_eq!(classify(&[64, 6], &[64, 6, 4]), None); // rank above the result
+    // A slice whose length disagrees with its shape, and a pair that does not
+    // broadcast at all, are both refused (the reference path's own rejection
+    // stays the one that reports them).
+    let truncated = vec![0f32; 5];
+    assert!(patterns::pattern_view(&truncated, &[64, 1], &[64, 16]).is_none());
+    let misaligned = vec![0f32; 3];
+    assert!(patterns::pattern_view(&misaligned, &[3], &[64, 3, 4]).is_none());
+
+    // The run length the driver picks for those patterns.
+    assert_eq!(patterns::block_run(&[(200, 500), (1, 100_000)], 100_000), Some(200));
+    assert_eq!(patterns::block_run(&[(4, 25_000), (1, 100_000)], 100_000), Some(4));
+    assert_eq!(patterns::block_run(&[(200, 500), (4, 25_000)], 100_000), None);
+    assert_eq!(patterns::block_run(&[(100_000, 1), (100_000, 1)], 100_000), Some(100_000));
+    assert_eq!(patterns::block_run(&[(200, 500), (1, 300)], 100_000), None);
+}
+
+/// `select` rides the same driver, including the per-block constant predicate
+/// and the period tile.
+#[test]
+fn the_periodic_driver_covers_select() {
+    let _serialized = switch_guard();
+    let out_shape = [500usize, 50, 4];
+    let count = product(&out_shape);
+    let a: Vec<i32> = values(count, 3);
+    let b: Vec<i32> = values(count, 13);
+    let row_pred: Vec<bool> = (0..500).map(|index| index % 3 == 0).collect();
+    // `(500,50,1)` covers one predicate per innermost run.
+    let col_pred: Vec<bool> = (0..500 * 50).map(|index| index % 7 < 3).collect();
+    let f = |pick: bool, x: i32, y: i32| if pick { x } else { y };
+
+    // A `(500,1,1)` predicate: one predicate value per inner run.
+    for (pred, pred_shape) in [
+        (&row_pred, &[500usize, 1, 1][..]),
+        (&col_pred, &[500usize, 50, 1][..]),
+    ] {
+        let mut generic = vec![0i32; count];
+        {
+            let _generic = switch(&RUNS_DISABLED, true);
+            apply3(
+                &mut generic,
+                &out_shape,
+                pred,
+                pred_shape,
+                &a,
+                &out_shape,
+                &b,
+                &out_shape,
+                f,
+            );
+        }
+        let mut specialized = vec![0i32; count];
+        assert!(
+            patterns::runs3(
+                &mut specialized,
+                &out_shape,
+                pred,
+                pred_shape,
+                &a,
+                &out_shape,
+                &b,
+                &out_shape,
+                &f
+            ),
+            "pred {pred_shape:?}: the driver must take the layout"
+        );
+        assert_eq!(specialized, generic, "pred {pred_shape:?} vs the Zip");
+        for (flat, produced) in specialized.iter().enumerate() {
+            let expected = f(
+                pred[reference_slot(&out_shape, pred_shape, flat)],
+                a[flat],
+                b[flat],
+            );
+            assert_eq!(*produced, expected, "pred {pred_shape:?}: element {flat}");
+        }
+    }
+}
+
+/// The new families are dtype-generic (the driver addresses elements and never
+/// touches a value) and keep NaN / signed zeros bit for bit.
+fn check_periodic_dtype<T: Slot + Send + Sync>() {
+    let out_shape = [32usize, 8, 4];
+    let count = product(&out_shape);
+    let left: Vec<T> = (0..count).map(T::at).collect();
+    // The `(32,1,1)` per-block constant and the `(32,8,1)` period tile.
+    for bias_shape in [&[32usize, 1, 1][..], &[32usize, 8, 1][..]] {
+        let bias: Vec<T> = (0..product(bias_shape)).map(T::at).collect();
+        let mut specialized = vec![T::at(0); count];
+        assert!(
+            patterns::runs2(
+                &mut specialized,
+                &out_shape,
+                &left,
+                &out_shape,
+                &bias,
+                bias_shape,
+                &T::combine
+            ),
+            "bias {bias_shape:?} of {} must take the driver",
+            std::any::type_name::<T>()
+        );
+        for (flat, produced) in specialized.iter().enumerate() {
+            assert_eq!(
+                *produced,
+                T::combine(left[flat], bias[reference_slot(&out_shape, bias_shape, flat)]),
+                "element {flat} of {:?} with bias {bias_shape:?}",
+                std::any::type_name::<T>()
+            );
+        }
+        let mut generic = vec![T::at(0); count];
+        {
+            let _generic = switch(&RUNS_DISABLED, true);
+            apply2(
+                &mut generic,
+                &out_shape,
+                &left,
+                &out_shape,
+                &bias,
+                bias_shape,
+                T::combine,
+            );
+        }
+        assert_eq!(specialized, generic);
+    }
+}
+
+#[test]
+fn the_periodic_driver_is_dtype_generic() {
+    let _serialized = switch_guard();
+    check_periodic_dtype::<bool>();
+    check_periodic_dtype::<i32>();
+    check_periodic_dtype::<u64>();
+    check_periodic_dtype::<half::f16>();
+    check_periodic_dtype::<f32>();
+    check_periodic_dtype::<f64>();
+    check_periodic_dtype::<num_complex::Complex<f32>>();
+    check_periodic_dtype::<num_complex::Complex<f64>>();
+}
+
+#[test]
+fn the_periodic_driver_keeps_nan_and_signed_zeros() {
+    let _serialized = switch_guard();
+    let out_shape = [500usize, 50, 4];
+    let count = product(&out_shape);
+    let rows: Vec<f32> = (0..count)
+        .map(|index| match index % 6 {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f32::NAN,
+            3 => f32::INFINITY,
+            _ => (index % 11) as f32 - 5.0,
+        })
+        .collect();
+    let bias: Vec<f32> = (0..500)
+        .map(|index| match index % 4 {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f32::NAN,
+            _ => -1.0,
+        })
+        .collect();
+    let f = |x: f32, y: f32| if x.is_nan() || y.is_nan() { f32::NAN } else { x * y };
+
+    let mut generic = vec![0.0f32; count];
+    {
+        let _generic = switch(&RUNS_DISABLED, true);
+        apply2(&mut generic, &out_shape, &rows, &out_shape, &bias, &[500, 1, 1], f);
+    }
+    let mut specialized = vec![0.0f32; count];
+    assert!(patterns::runs2(
+        &mut specialized,
+        &out_shape,
+        &rows,
+        &out_shape,
+        &bias,
+        &[500, 1, 1],
+        &f
+    ));
+    for (flat, (produced, reference)) in specialized.iter().zip(&generic).enumerate() {
+        let expected = f(rows[flat], bias[flat / 200]);
+        assert_eq!(produced.to_bits(), reference.to_bits(), "element {flat} vs the Zip");
+        assert_eq!(produced.to_bits(), expected.to_bits(), "element {flat} vs the closure");
+    }
+    assert!(specialized.iter().any(|value| value.to_bits() == (-0.0f32).to_bits()));
+}
+
+/// The periodic copy behind `fill_broadcast`: a per-block constant is one `fill`
+/// per run, a period tile is one `copy_from_slice` per period block, a scalar is
+/// one `fill`, and a layout outside the proof keeps the ndarray `assign`.
+#[test]
+fn the_periodic_copy_covers_fill_broadcast() {
+    let _serialized = switch_guard();
+    // `(500,1,1)` onto a (500, 50, 4) target: 200 elements per source value.
+    let column: Vec<i16> = (0..500).map(|index| index as i16 - 250).collect();
+    let filled = fill_broadcast(&column, &[500, 1, 1], &[500, 50, 4]);
+    assert_eq!(filled.len(), 500 * 50 * 4);
+    for (flat, produced) in filled.iter().enumerate() {
+        assert_eq!(*produced, column[flat / 200], "column element {flat}");
+    }
+    // `(500,50,1)` onto the same target: a period-4 tile.
+    let last: Vec<u8> = (0..500 * 50).map(|index| index as u8).collect();
+    let filled = fill_broadcast(&last, &[500, 50, 1], &[500, 50, 4]);
+    for (flat, produced) in filled.iter().enumerate() {
+        assert_eq!(*produced, last[flat / 4], "last-axis element {flat}");
+    }
+    // A rank-0 source is one hoisted fill.
+    let filled = fill_broadcast(&[7i64], &[], &[64, 16]);
+    assert_eq!(filled, vec![7i64; 64 * 16]);
+    // A layout outside the proof keeps the ndarray `assign`: a middle-axis
+    // broadcast above a contiguous innermost run does not step the source the
+    // way the proof needs.
+    let middle: Vec<u8> = (0..32).map(|index| index as u8 + 1).collect();
+    assert!(patterns::pattern_view(&middle, &[8, 1, 4], &[8, 3, 4]).is_none());
+    let filled = fill_broadcast(&middle, &[8, 1, 4], &[8, 3, 4]);
+    for (flat, produced) in filled.iter().enumerate() {
+        assert_eq!(
+            *produced,
+            middle[reference_slot(&[8, 3, 4], &[8, 1, 4], flat)],
+            "middle-axis element {flat}"
+        );
+    }
+    // A middle-axis wrap also holds exactly (`(8,3,1)` onto `(8,3,4)`:
+    // `stretch`=4 over the innermost axis, the `(3,1)` tail walking one value
+    // per row).
+    let rows: Vec<u8> = (0..24).map(|index| index as u8).collect();
+    assert_eq!(
+        patterns::pattern_view(&rows, &[8, 3, 1], &[8, 3, 4]).map(|p| p.shape()),
+        Some((4, 24))
+    );
+    let filled = fill_broadcast(&rows, &[8, 3, 1], &[8, 3, 4]);
+    for (flat, produced) in filled.iter().enumerate() {
+        assert_eq!(*produced, rows[flat / 4], "period row {flat}");
+    }
+}
+
+
