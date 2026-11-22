@@ -10,6 +10,15 @@ use super::pool::take_pooled_vec;
 use super::Buffer;
 
 /// Flat unary map: `out[i] = f(source[i])`.
+///
+/// The inner loop is the INDEXED form over slices of one common length, not a
+/// chain of iterators: `zip` makes the trip count the minimum of three lengths,
+/// which LLVM cannot prove equal, while `0..len` over `&mut out[..len]` /
+/// `&left[..len]` both drops the per-element bounds checks (the slice length is
+/// the loop bound) and lets the vectorizer unroll it like numpy's typed ufunc
+/// inner loop.  That is the whole point of these drivers — see
+/// [`super::parallel`] — so keep them indexed; a `zip` here measures ~2x
+/// slower per element.
 pub fn zip1<T: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     source: &[T],
@@ -19,39 +28,55 @@ pub fn zip1<T: Copy + Sync, R: Copy + Send>(
     if threads > 1 {
         split_parallel(out, threads, |offset, chunk| {
             let len = chunk.len();
-            for (slot, value) in chunk.iter_mut().zip(window(source, offset, len)) {
-                *slot = f(*value);
-            }
+            zip1_slice(chunk, window(source, offset, len), &f);
         });
         return;
     }
-    for (slot, value) in out.iter_mut().zip(source.iter()) {
-        *slot = f(*value);
+    zip1_slice(out, source, &f);
+}
+
+/// The serial arm of [`zip1`] over slices whose shortest common length bounds
+/// the loop (`f` by reference, so the callers stay monomorphized).
+#[inline]
+fn zip1_slice<T: Copy, R: Copy>(out: &mut [R], source: &[T], f: &impl Fn(T) -> R) {
+    let len = out.len().min(source.len());
+    let (out, source) = (&mut out[..len], &source[..len]);
+    for index in 0..len {
+        out[index] = f(source[index]);
     }
 }
-/// Flat binary map: `out[i] = f(left[i], right[i])`.
-pub fn zip2<T: Copy + Sync, R: Copy + Send>(
+
+/// Flat binary map: `out[i] = f(left[i], right[i])` (indexed inner loop, see
+/// [`zip1`]).
+pub fn zip2<T: Copy + Sync, U: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     left: &[T],
-    right: &[T],
-    f: impl Fn(T, T) -> R + Sync,
+    right: &[U],
+    f: impl Fn(T, U) -> R + Sync,
 ) {
     let threads = parallel_threads(out.len());
     if threads > 1 {
         split_parallel(out, threads, |offset, chunk| {
             let len = chunk.len();
-            for ((slot, x), y) in chunk
-                .iter_mut()
-                .zip(window(left, offset, len))
-                .zip(window(right, offset, len))
-            {
-                *slot = f(*x, *y);
-            }
+            zip2_slice(chunk, window(left, offset, len), window(right, offset, len), &f);
         });
         return;
     }
-    for ((slot, x), y) in out.iter_mut().zip(left.iter()).zip(right.iter()) {
-        *slot = f(*x, *y);
+    zip2_slice(out, left, right, &f);
+}
+
+/// The serial arm of [`zip2`].
+#[inline]
+fn zip2_slice<T: Copy, U: Copy, R: Copy>(
+    out: &mut [R],
+    left: &[T],
+    right: &[U],
+    f: &impl Fn(T, U) -> R,
+) {
+    let len = out.len().min(left.len()).min(right.len());
+    let (out, left, right) = (&mut out[..len], &left[..len], &right[..len]);
+    for index in 0..len {
+        out[index] = f(left[index], right[index]);
     }
 }
 /// Flat in-place binary accumulate: `slot[i] = f(slot[i], other[i])`, writing
@@ -72,19 +97,25 @@ pub fn zip2_accumulate<T: Copy + Sync + Send>(
             let len = chunk.len();
             // The other operand is only READ: every chunk owns a disjoint part
             // of `slot`, so the views never overlap a write.
-            let other = window(other, offset, len);
-            for (value, rhs) in chunk.iter_mut().zip(other) {
-                *value = f(*value, *rhs);
-            }
+            zip2_accumulate_slice(chunk, window(other, offset, len), &f);
         });
         return;
     }
-    for (value, rhs) in slot.iter_mut().zip(other.iter()) {
-        *value = f(*value, *rhs);
+    zip2_accumulate_slice(slot, other, &f);
+}
+
+/// The serial arm of [`zip2_accumulate`] (indexed inner loop, see [`zip1`]).
+#[inline]
+fn zip2_accumulate_slice<T: Copy>(slot: &mut [T], other: &[T], f: &impl Fn(T, T) -> T) {
+    let len = slot.len().min(other.len());
+    let (slot, other) = (&mut slot[..len], &other[..len]);
+    for index in 0..len {
+        slot[index] = f(slot[index], other[index]);
     }
 }
+
 /// Flat ternary map: `out[i] = f(first[i], second[i], third[i])` (the `select`
-/// shape: predicate, on-true, on-false).
+/// shape: predicate, on-true, on-false), indexed like [`zip1`].
 pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
     out: &mut [R],
     first: &[P],
@@ -96,24 +127,33 @@ pub fn zip3<P: Copy + Sync, T: Copy + Sync, R: Copy + Send>(
     if threads > 1 {
         split_parallel(out, threads, |offset, chunk| {
             let len = chunk.len();
-            for (((slot, p), x), y) in chunk
-                .iter_mut()
-                .zip(window(first, offset, len))
-                .zip(window(second, offset, len))
-                .zip(window(third, offset, len))
-            {
-                *slot = f(*p, *x, *y);
-            }
+            zip3_slice(
+                chunk,
+                window(first, offset, len),
+                window(second, offset, len),
+                window(third, offset, len),
+                &f,
+            );
         });
         return;
     }
-    for (((slot, p), x), y) in out
-        .iter_mut()
-        .zip(first.iter())
-        .zip(second.iter())
-        .zip(third.iter())
-    {
-        *slot = f(*p, *x, *y);
+    zip3_slice(out, first, second, third, &f);
+}
+
+/// The serial arm of [`zip3`].
+#[inline]
+fn zip3_slice<P: Copy, T: Copy, R: Copy>(
+    out: &mut [R],
+    first: &[P],
+    second: &[T],
+    third: &[T],
+    f: &impl Fn(P, T, T) -> R,
+) {
+    let len = out.len().min(first.len()).min(second.len()).min(third.len());
+    let (out, first) = (&mut out[..len], &first[..len]);
+    let (second, third) = (&second[..len], &third[..len]);
+    for index in 0..len {
+        out[index] = f(first[index], second[index], third[index]);
     }
 }
 
