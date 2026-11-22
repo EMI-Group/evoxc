@@ -7,8 +7,15 @@ CPU only and self-contained: no test here requires the Rust crate or a built ext
 
 ## API under test
 
-- `evoxc._native_codec`: `ENVELOPE_FORMAT`, `encode_module`, `decode_module`, `encode_type`, `decode_type`.
+- `evoxc._native_codec`: `ENVELOPE_FORMAT`, `encode_module`, `decode_module`, `decode_native_module`, `encode_type`, `decode_type`.
 - `evoxc._native`: `available`, `require`, `version`, `infer`, `transform`, `batch_functions`, `batching_rule_keys`, `NATIVE_LIB_ENV`, `EXTENSION_MODULE_NAME`.
+
+## Test files
+
+| File | Covers | Tests |
+|---|---|---|
+| `test_codec.py` | envelope format 1: type/`Dim`/`DimExpr` round-trips, the FLAT envelope with inline `__evoxc_ndarray__` payloads (no `constants` table, no `sha256`), SSA ids/uses preserved, attrs (incl. Builder-normalized), locations (`None` stays `None`), constants incl. byte order and zero-dim, regions/control flow and multi-block, encode non-mutation, malformed-envelope errors naming the missing field, duplicate value ids, and the trusted (`decode_native_module`) vs validated decode | 36 |
+| `test_native_loader.py` | the loader/façade: absent extension → `available()` False, `require()`'s remedy message and a raising `version()`; `NATIVE_LIB_ENV` override missing/unloadable paths; present extension via an injected fake module (`version`, `infer` type encode/decode and explicit result types, `transform` module round-trip + extra keys); `NativeError.kind` → evoxc error mapping (and unknown kinds re-raising unchanged); `import evoxc` never needs the extension | 20 |
 
 ## Constraints
 

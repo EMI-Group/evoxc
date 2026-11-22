@@ -14,12 +14,11 @@ Covers the binding contract from ``evoxc/block/CONTEXT.md``:
 * Structured portable returns: a portable body may return a namedtuple or a
   dataclass of SymbolicTensors (including a namedtuple nested around plain
   tuples). The return annotation is NOT part of the pinned contract, so
-  structured-return blocks declare ``outputs=`` explicitly. Direct
-  evaluate/lowering works for both shapes; vmap works through the
-  namedtuple return, and through the dataclass return once the parallel
-  ``evoxc/block`` implementation lands — at base the dataclass-through-vmap
-  case fails with ``BlockError`` from ``evoxc/block/rules.py::_flatten_outputs``
-  (see the ``BUG(evoxc)`` marker on ``test_vmap_through_dataclass_portable``).
+  structured-return blocks declare ``outputs=`` explicitly. Both shapes work
+  through evaluate/lowering AND through vmap: the batching fallback flattens
+  the portable's return with ``core.flatten``, so every container core
+  supports (namedtuple, dataclass, registered pytree node) aligns with the
+  declared output specs.
 
 Notes:
 
@@ -323,12 +322,10 @@ def test_vmap_through_namedtuple_portable():
     assert np.allclose(b.numpy(), ref_b, rtol=1e-6)
 
 
-# BUG(evoxc): dataclass portable returns are rejected by the portable batching
-# fallback in evoxc/block/rules.py::_flatten_outputs — it only accepts
-# SymbolicTensor / tuple / list / dict, so a dataclass raises BlockError at
-# vmap time. The pinned contract requires dataclass returns to work through
-# vmap; this test passes once the parallel evoxc implementation lands. Do NOT
-# skip/xfail/weaken it.
+# Contract: a portable may return any pytree of symbolic tensors — the batching
+# fallback flattens it with core.flatten (evoxc/block/rules.py::_flatten_outputs),
+# so a dataclass batches exactly like a namedtuple/tuple and aligns leaf-for-leaf
+# with the declared output specs.
 def test_vmap_through_dataclass_portable():
     """vmap through a dataclass-returning portable == per-row reference."""
     tf = evoxc.vmap(port_dc_fn, out_axes=(0, 0))
