@@ -100,7 +100,8 @@ Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, whi
 | `./broadcast.rs` | `broadcast_shape`/`broadcast_strides`, the static-dimension rank dispatch, `walk`, `apply1..3`, `broadcast_to`, `broadcast_vec`, `fill_broadcast`. |
 | `./broadcast/tests.rs` | The independent-reference pins for every driver in `broadcast.rs`. |
 | `./ndarray_views.rs` | `NdScalar` and the zero-copy `Buffer`↔`ndarray` seam (`as_array*`, `from_array`, `into_array`, `array_view[_mut]`). |
-| `./zipmap.rs` | The flat `zip1..3`/`zip2_accumulate`/`map1..3` fast paths and the pooled broadcast builders `map2_runs`/`map3_runs`. |
+| `./zipmap.rs` | The flat `zip1..3`/`zip2_accumulate`/`map1..3` fast paths and the pooled broadcast builders `map2_runs`/`map3_runs` (with their per-element-reference and pool pins). |
+| `./rowsplit.rs` | `RowSplit`/`Rider`/`split_rows`/`chunk_shape`: the row-aligned outermost-axis split the pooled broadcast builders use, plus the `#[cfg(test)]` `SPLIT_DISABLED` switch the A/B bench uses. |
 | `./parallel.rs` | `PARALLEL_*`, `parallel_threads`, `split_parallel`, `window` and their crossover pins. |
 | `./pool.rs` | The thread-local recycled-storage pool, its caps/LRU policy and `take_pooled_vec`. |
 | `./blocks.rs` | Contiguous block copies (`copy_blocks`, `block_storage`, `block_storage_filled`, `repeat_storage`) behind the structure/indexing kernels. |
