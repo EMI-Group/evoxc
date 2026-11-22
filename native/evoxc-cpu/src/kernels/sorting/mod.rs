@@ -577,15 +577,15 @@ mod tests {
         assert_eq!(err.kind_str(), "VerificationError");
     }
 
-    /// Pin the ndarray lane walk (contiguous last-axis append AND strided
-    /// middle/first-axis view assignment) against the independent per-segment
-    /// reference walk on a deterministic pseudo-random multi-axis input, in
-    /// several dtypes including `f16`, `bool` and NaN/signed-zero `f32`.
+    /// Pin `sort`/`argsort` against the independent per-segment reference walk
+    /// on a deterministic pseudo-random multi-axis input, in several dtypes
+    /// including `f16`, `bool` and NaN/signed-zero `f32`.
+    ///
+    /// The three-axis shape exercises every lane layout: a contiguous last axis
+    /// (one `copy_from_slice`/extend per segment) and strided first/middle axes
+    /// (gathered per segment into the reused scratch).
     #[test]
-    fn ndarray_lane_walk_matches_the_manual_segment_reference() {
-        // A three-axis shape exercises every lane layout: the last axis is
-        // contiguous (fresh-append path), the first and middle axes are strided
-        // (view-assignment path).
+    fn sort_and_argsort_match_the_reference_across_layouts() {
         let shape = [6usize, 5, 7];
         let count: usize = shape.iter().product();
         let mut state = 0x1234_5678_9ABC_DEF0u64;
@@ -616,11 +616,13 @@ mod tests {
     }
 
     /// Measurement aid (never asserts a speed): prints ns per segment for the
-    /// contiguous last-axis path and the strided first/middle-axis path.
-    /// Run with `cargo test --release -p evoxc-cpu bench_lane_walk -- --ignored --nocapture`.
+    /// contiguous last-axis path and the strided first/middle-axis path.  Its
+    /// numbers are why the segment walk stays hand-written rather than an
+    /// ndarray lane walk (see the `permutation` module note).
+    /// Run with `cargo test --release -p evoxc-cpu bench_segment_walk -- --ignored --nocapture`.
     #[test]
-    #[ignore = "measurement aid: prints ns/segment for the ndarray lane walk"]
-    fn bench_lane_walk() {
+    #[ignore = "measurement aid: prints ns/segment for the segment walk"]
+    fn bench_segment_walk() {
         use std::time::Instant;
         fn run_case(shape: &[usize], axis: usize) {
             let count: usize = shape.iter().product();
