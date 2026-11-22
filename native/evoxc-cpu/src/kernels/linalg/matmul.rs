@@ -87,8 +87,12 @@ fn dot_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result<
     check_result_shape("dot", &out_shape, &expected)?;
 
     let dtype = spec.result_types[0].dtype;
-    let left = a.cast(dtype)?;
-    let right = b.cast(dtype)?;
+    // A same-dtype operand is BORROWED — `Buffer::cast` would copy it whole for
+    // nothing — and only a genuinely differing dtype is converted.
+    let cast_left;
+    let cast_right;
+    let left: &Buffer = if a.dtype == dtype { a } else { cast_left = a.cast(dtype)?; &cast_left };
+    let right: &Buffer = if b.dtype == dtype { b } else { cast_right = b.cast(dtype)?; &cast_right };
     let geometry = MatMul {
         m,
         k: ka,
@@ -97,7 +101,7 @@ fn dot_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result<
         b_strides: broadcast_strides(b_batch, &batch),
         batch,
     };
-    let buffer = if let Some(fast) = dot_gemm(&left, &right, &geometry, dtype, &out_shape)? {
+    let buffer = if let Some(fast) = dot_gemm(left, right, &geometry, dtype, &out_shape)? {
         fast
     } else {
         with_same_type!(left, right, |left_values, right_values| dot_run(
@@ -630,6 +634,43 @@ mod tests {
         assert_relative(&f32s(&fast[0]), &expected, 1e-5, "f32 3x5 @ 5x7");
         let general = general_dot(&a, &b, DType::Float32, vec![3, 7]);
         assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "3x5 @ 5x7 fast vs general");
+    }
+
+
+    #[test]
+    fn dot_borrows_same_dtype_operands_and_casts_only_a_differing_one() {
+        // (2, 3) @ (3, 2) with values exact in f16/f32/f64, so the hand-computed
+        // product [[-9, -5.125], [26.125, -11.5]] is what every dtype combination
+        // below must return (the blocked association included).
+        let (m, k, n) = (2usize, 3usize, 2usize);
+        let a32 = value(DType::Float32, &[m, k], Storage::F32(vec![1.0, -2.0, 3.5, 4.0, 0.5, -6.0]));
+        let b32 = value(DType::Float32, &[k, n], Storage::F32(vec![2.0, -1.5, 0.25, 4.0, -3.0, 1.25]));
+        let a64 = value(DType::Float64, &[m, k], Storage::F64(vec![1.0, -2.0, 3.5, 4.0, 0.5, -6.0]));
+        let b64 = value(DType::Float64, &[k, n], Storage::F64(vec![2.0, -1.5, 0.25, 4.0, -3.0, 1.25]));
+        let b16 = value(DType::Float16, &[k, n], Storage::F16(
+            [2.0f32, -1.5, 0.25, 4.0, -3.0, 1.25].iter().map(|v| half::f16::from_f32(*v)).collect(),
+        ));
+        let hand32 = [-9.0f32, -5.125, 26.125, -11.5];
+        let hand64 = [-9.0f64, -5.125, 26.125, -11.5];
+        let f32_op = spec("dot", DType::Float32, &[m, n], Attrs::new());
+        let f64_op = spec("dot", DType::Float64, &[m, n], Attrs::new());
+
+        // Same dtype: NOTHING is cast, and the result is bit-identical to what
+        // the cloning (always-cast) path produced.
+        let out = dot_impl(&[a64.clone(), b64.clone()], &f64_op, vec![m, n]).unwrap();
+        let cast = general_dot(&a64, &b64, DType::Float64, vec![m, n]);
+        assert_bits_identical_f64(&floats(&out[0]), &floats(&cast), "same-dtype f64 vs cast");
+
+        // Exactly one operand casts: f16 -> f32, then f32 <-> f64 both ways.
+        let cases = [(&a32, &b16, &f32_op), (&a32, &b64, &f64_op), (&a64, &b32, &f64_op)];
+        for (a, b, op) in cases {
+            let out = dot_impl(&[a.clone(), b.clone()], op, vec![m, n]).unwrap();
+            if op.result_types[0].dtype == DType::Float32 {
+                assert_bit_identical(&f32s(&out[0]), &hand32, "f32 mixed-dtype dot");
+            } else {
+                assert_eq!(floats(&out[0]), hand64, "f64 mixed-dtype dot");
+            }
+        }
     }
 
     #[test]
