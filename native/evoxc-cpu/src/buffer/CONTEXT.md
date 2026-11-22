@@ -69,7 +69,7 @@ Reading: the row split buys 2.4–2.6x on the two CPU-bound broadcast cases, whi
 ## Constraints
 
 - Depends on `evoxc-core`, `ndarray`, `half` and `num-complex`; no Python, no `unsafe`, no SIMD intrinsics.
-- Never a second layout engine: new N-dimensional addressing is expressed with ndarray views/`Zip`/`indices`, never with a hand-written increment/decrement odometer.
+- Never a second layout engine: new N-dimensional addressing is expressed with ndarray views/`Zip`/`indices`, never with a hand-written increment/decrement odometer. The one exception is by construction not an odometer: the repeating-run driver addresses whole contiguous runs (one materialized tile per block plus a `copy_from_slice` per block, no per-element stride or offset arithmetic at all), and it only runs on layouts [`repeat_view`] proves to be an exact `i % period` repetition.
 - `Buffer`/`Storage` keep their owned representation and public fields; result buffers are always fresh C-contiguous `Vec`s (a shape-only op copies — that is the documented cost of having no views in `Storage`).
 - Errors are explicit `Result` values with the crate's message conventions; no `unwrap`/`expect` on user input, no silent truncation of a short operand.
 - Threads are scoped inside one call only (never a pool, never `rayon`), gated by the measured thresholds (element count for a flat map, row count for the pooled broadcast builders), and each thread owns a disjoint output range so results stay bit-identical.
