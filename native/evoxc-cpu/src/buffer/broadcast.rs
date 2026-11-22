@@ -11,9 +11,17 @@
 //! its shape, an operand of higher rank than the result, a result slice whose
 //! length disagrees with its shape), which keeps the pre-existing
 //! accept/reject/panic behaviour byte-identical.
+//!
+//! The dimensions are STATIC (`Ix0..Ix6`), dispatched once per call from the
+//! result's rank: `IxDyn` is heap-backed, so an `IxDyn` `indices` iteration
+//! clones an owned index on every outer step and an `IxDyn` [`walk`] allocates
+//! once per element.  `IxDyn` survives in exactly two places — the single
+//! per-call view construction of an operand's own (possibly lower) rank, and the
+//! rank > 6 fallback arm, which is correct but slow and which no real graph
+//! reaches.
 
 use evoxc_core::{Error, Result};
-use ndarray::{ArrayViewD, ArrayViewMutD, Dimension, IxDyn};
+use ndarray::{ArrayViewD, ArrayViewMut, Dimension, IntoDimension, IxDyn};
 
 use crate::scalar::Scalar;
 
@@ -69,15 +77,64 @@ pub fn broadcast_strides(shape: &[usize], out_shape: &[usize]) -> Vec<usize> {
 // ndarray views
 // ---------------------------------------------------------------------------
 
-/// Borrow `values` as a `shape`-shaped view.
+/// Borrow `values` as a `shape`-shaped view of its OWN rank.
 ///
 /// `None` when a slice's length is not `shape`'s element count — the one layout
-/// the [`walk`] fallback has to answer for.  ndarray's `broadcast` borrows the
-/// view it is called on, so each driver keeps the base views in named locals and
-/// broadcasts those (`base.broadcast(out_shape)`), which is also why this helper
-/// cannot return the broadcast view itself.
+/// the [`walk`] fallback has to answer for.  This `IxDyn` is the ONE dynamic dim
+/// a call still builds: an operand's rank is not the result's rank (a `(4,)`
+/// bias beside a `(2000, 50, 4)` result), so the base view is created at the
+/// operand's own rank and then broadcast onto the result's static dim.  ndarray's
+/// `broadcast` borrows the view it is called on, so each driver keeps its base
+/// views in named locals and broadcasts those.
 fn base_view<'a, T: Copy>(values: &'a [T], shape: &[usize]) -> Option<ArrayViewD<'a, T>> {
     ArrayViewD::from_shape(IxDyn(shape), values).ok()
+}
+
+/// Dispatch one generic static-dimension helper on the result's rank.
+///
+/// The helper takes the `Dimension` as its first argument (and may take any
+/// further arguments after it), so every driver stays ONE generic
+/// implementation over `D: Dimension` and the only per-rank difference is the
+/// `Ix0..Ix6` value the dispatch hands it.  Above six axes the dynamic `IxDyn`
+/// arm keeps the code correct; no real graph reaches it.
+macro_rules! dispatch_rank {
+    ($shape:expr, $helper:ident $(, $arg:expr)*) => {
+        match $shape.len() {
+            0 => $helper(ndarray::Ix0() $(, $arg)*),
+            1 => $helper(ndarray::Ix1($shape[0]) $(, $arg)*),
+            2 => $helper(ndarray::Ix2($shape[0], $shape[1]) $(, $arg)*),
+            3 => $helper(ndarray::Ix3($shape[0], $shape[1], $shape[2]) $(, $arg)*),
+            4 => $helper(ndarray::Ix4($shape[0], $shape[1], $shape[2], $shape[3]) $(, $arg)*),
+            5 => $helper(
+                ndarray::Ix5($shape[0], $shape[1], $shape[2], $shape[3], $shape[4])
+                $(, $arg)*
+            ),
+            6 => $helper(
+                ndarray::Ix6($shape[0], $shape[1], $shape[2], $shape[3], $shape[4], $shape[5])
+                $(, $arg)*
+            ),
+            _ => $helper(ndarray::IxDyn($shape) $(, $arg)*),
+        }
+    };
+}
+
+/// C-order iteration over one static `shape`, computing one operand offset per
+/// entry of `strides` (a broadcast axis contributes a `0` stride, so the same
+/// loop serves every strided kernel).
+///
+/// `ndarray::indices` supplies the counter and `Dimension::slice` its position
+/// — allocation-free for every static dim (an inline array, and `Ix1`'s single
+/// `usize`) — so a step costs one increment plus one multiply-add per operand.
+fn walk_static<D: Dimension>(shape: D, strides: &[Vec<usize>], body: &mut impl FnMut(&[usize])) {
+    let mut offsets = vec![0usize; strides.len()];
+    for index in ndarray::indices(shape) {
+        let position = index.into_dimension();
+        let position = position.slice();
+        for (slot, stride) in offsets.iter_mut().zip(strides) {
+            *slot = position.iter().zip(stride.iter()).map(|(i, s)| i * s).sum();
+        }
+        body(&offsets);
+    }
 }
 
 /// C-order flat iteration over `out_shape[..rank]`, computing one operand offset
@@ -91,70 +148,64 @@ pub fn walk(rank: usize, out_shape: &[usize], strides: &[Vec<usize>], mut body: 
         return;
     }
     let shape = &out_shape[..rank];
-    let mut offsets = vec![0usize; strides.len()];
-    for index in ndarray::indices(IxDyn(shape)) {
-        let position = index.slice();
-        for (slot, stride) in offsets.iter_mut().zip(strides) {
-            *slot = position.iter().zip(stride.iter()).map(|(i, s)| i * s).sum();
-        }
-        body(&offsets);
-    }
+    dispatch_rank!(shape, walk_static, strides, &mut body);
 }
 
 // ---------------------------------------------------------------------------
 // The elementwise drivers
 // ---------------------------------------------------------------------------
 
-/// `out[i] = f(a[i])` via one ndarray `Zip` pass, or `false` when the layout
-/// cannot be expressed as views (the caller then takes the [`walk`] loop).
-fn zip1_broadcast<T: Copy, R>(
+/// `out[i] = f(a[i])` via one ndarray `Zip` pass over static dims, or `false`
+/// when the layout cannot be expressed as views (the caller then takes the
+/// [`walk`] loop).
+fn apply1_static<T: Copy, R, D: Dimension>(
+    out_shape: D,
     out: &mut [R],
-    out_shape: &[usize],
     a: &[T],
     a_shape: &[usize],
     f: &impl Fn(T) -> R,
 ) -> bool {
-    if out.len() != out_shape.iter().product::<usize>() {
+    if out.len() != out_shape.size() {
         return false;
     }
     let Some(a_base) = base_view(a, a_shape) else {
         return false;
     };
-    let Some(av) = a_base.broadcast(IxDyn(out_shape)) else {
+    let Some(av) = a_base.broadcast(out_shape.clone()) else {
         return false;
     };
-    let Ok(dest) = ArrayViewMutD::from_shape(IxDyn(out_shape), out) else {
+    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape, out) else {
         return false;
     };
     ndarray::Zip::from(dest).and(av).for_each(|o, x| *o = f(*x));
     true
 }
 
-fn zip2_broadcast<T: Copy, U: Copy, R>(
+fn apply2_static<T: Copy, U: Copy, R, D: Dimension>(
+    out_shape: D,
     out: &mut [R],
-    out_shape: &[usize],
     a: &[T],
     a_shape: &[usize],
     b: &[U],
     b_shape: &[usize],
     f: &impl Fn(T, U) -> R,
 ) -> bool {
-    if out.len() != out_shape.iter().product::<usize>() {
+    if out.len() != out_shape.size() {
         return false;
     }
     let Some(a_base) = base_view(a, a_shape) else {
         return false;
     };
-    let Some(av) = a_base.broadcast(IxDyn(out_shape)) else {
+    let Some(av) = a_base.broadcast(out_shape.clone()) else {
         return false;
     };
     let Some(b_base) = base_view(b, b_shape) else {
         return false;
     };
-    let Some(bv) = b_base.broadcast(IxDyn(out_shape)) else {
+    let Some(bv) = b_base.broadcast(out_shape.clone()) else {
         return false;
     };
-    let Ok(dest) = ArrayViewMutD::from_shape(IxDyn(out_shape), out) else {
+    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape, out) else {
         return false;
     };
     ndarray::Zip::from(dest)
@@ -165,9 +216,9 @@ fn zip2_broadcast<T: Copy, U: Copy, R>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn zip3_broadcast<T: Copy, U: Copy, V: Copy, R>(
+fn apply3_static<T: Copy, U: Copy, V: Copy, R, D: Dimension>(
+    out_shape: D,
     out: &mut [R],
-    out_shape: &[usize],
     a: &[T],
     a_shape: &[usize],
     b: &[U],
@@ -176,28 +227,28 @@ fn zip3_broadcast<T: Copy, U: Copy, V: Copy, R>(
     c_shape: &[usize],
     f: &impl Fn(T, U, V) -> R,
 ) -> bool {
-    if out.len() != out_shape.iter().product::<usize>() {
+    if out.len() != out_shape.size() {
         return false;
     }
     let Some(a_base) = base_view(a, a_shape) else {
         return false;
     };
-    let Some(av) = a_base.broadcast(IxDyn(out_shape)) else {
+    let Some(av) = a_base.broadcast(out_shape.clone()) else {
         return false;
     };
     let Some(b_base) = base_view(b, b_shape) else {
         return false;
     };
-    let Some(bv) = b_base.broadcast(IxDyn(out_shape)) else {
+    let Some(bv) = b_base.broadcast(out_shape.clone()) else {
         return false;
     };
     let Some(c_base) = base_view(c, c_shape) else {
         return false;
     };
-    let Some(cv) = c_base.broadcast(IxDyn(out_shape)) else {
+    let Some(cv) = c_base.broadcast(out_shape.clone()) else {
         return false;
     };
-    let Ok(dest) = ArrayViewMutD::from_shape(IxDyn(out_shape), out) else {
+    let Ok(dest) = ArrayViewMut::<R, D>::from_shape(out_shape, out) else {
         return false;
     };
     ndarray::Zip::from(dest)
@@ -281,7 +332,8 @@ pub fn apply1<T: Copy, R>(
     source_shape: &[usize],
     f: impl Fn(T) -> R,
 ) {
-    if !zip1_broadcast(out, out_shape, source, source_shape, &f) {
+    let accepted = dispatch_rank!(out_shape, apply1_static, out, source, source_shape, &f);
+    if !accepted {
         walk1(out, out_shape, source, source_shape, &f);
     }
 }
@@ -297,7 +349,16 @@ pub fn apply2<T: Copy, U: Copy, R>(
     right_shape: &[usize],
     f: impl Fn(T, U) -> R,
 ) {
-    if !zip2_broadcast(out, out_shape, left, left_shape, right, right_shape, &f) {
+    if !dispatch_rank!(
+        out_shape,
+        apply2_static,
+        out,
+        left,
+        left_shape,
+        right,
+        right_shape,
+        &f
+    ) {
         walk2(out, out_shape, left, left_shape, right, right_shape, &f);
     }
 }
@@ -316,7 +377,18 @@ pub fn apply3<T: Copy, U: Copy, V: Copy, R>(
     c_shape: &[usize],
     f: impl Fn(T, U, V) -> R,
 ) {
-    if !zip3_broadcast(out, out_shape, a, a_shape, b, b_shape, c, c_shape, &f) {
+    if !dispatch_rank!(
+        out_shape,
+        apply3_static,
+        out,
+        a,
+        a_shape,
+        b,
+        b_shape,
+        c,
+        c_shape,
+        &f
+    ) {
         walk3(out, out_shape, a, a_shape, b, b_shape, c, c_shape, &f);
     }
 }
@@ -360,10 +432,8 @@ pub fn broadcast_to(buffer: &Buffer, shape: &[usize]) -> Result<Buffer> {
 /// fallback of [`fill_broadcast`] for a layout an ndarray broadcast view cannot
 /// express; every shape a real graph produces takes the view.
 pub(super) fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
-    if let Some(base) = base_view(values, shape) {
-        if let Some(view) = base.broadcast(IxDyn(out_shape)) {
-            return view.iter().copied().collect();
-        }
+    if let Some(collected) = dispatch_rank!(out_shape, broadcast_collect, values, shape) {
+        return collected;
     }
     let mut out = Vec::with_capacity(out_shape.iter().product());
     let strides = [broadcast_strides(shape, out_shape)];
@@ -373,31 +443,71 @@ pub(super) fn broadcast_vec<T: Copy>(values: &[T], shape: &[usize], out_shape: &
     out
 }
 
+/// `broadcast_vec`'s view path: the broadcast view of `values` on the result's
+/// static dim, collected in C order (`None` when the layout is not expressible,
+/// which is the caller's cue to run the [`walk`] loop).
+fn broadcast_collect<T: Copy, D: Dimension>(
+    out_shape: D,
+    values: &[T],
+    shape: &[usize],
+) -> Option<Vec<T>> {
+    let base = base_view(values, shape)?;
+    let view = base.broadcast(out_shape)?;
+    let mut out = Vec::with_capacity(view.len());
+    out.extend(view.iter().copied());
+    Some(out)
+}
+
 /// Materialize `values` broadcast from `shape` to `out_shape` — the `broadcast`
 /// op's copy, with [`walk`]'s semantics for every shape it accepts.
 ///
 /// The result comes from the storage pool when a stock of the exact size is
 /// available (never a zero fill on that path) and is written by ONE ndarray
-/// `assign` of a broadcast view of `values`, so the copy never runs the
-/// per-element odometer.  An empty target is empty; a layout no view can express
-/// falls back to [`broadcast_vec`].
+/// `assign` of a broadcast view of `values` on the result's static dim, so the
+/// copy never runs the per-element odometer.  An empty target is empty; a layout
+/// no view can express falls back to [`broadcast_vec`].
 pub fn fill_broadcast<T: Scalar>(values: &[T], shape: &[usize], out_shape: &[usize]) -> Vec<T> {
     let count: usize = out_shape.iter().product();
     if count == 0 {
         return Vec::new();
     }
-    let Some(base) = base_view(values, shape) else {
-        return broadcast_vec(values, shape, out_shape);
-    };
-    let Some(view) = base.broadcast(IxDyn(out_shape)) else {
-        return broadcast_vec(values, shape, out_shape);
-    };
     let mut out = take_pooled_vec::<T>(count).unwrap_or_else(|| T::zeros(count));
-    match ArrayViewMutD::from_shape(IxDyn(out_shape), out.as_mut_slice()) {
-        Ok(mut dest) => dest.assign(&view),
-        Err(_) => return broadcast_vec(values, shape, out_shape),
+    let filled = dispatch_rank!(
+        out_shape,
+        fill_broadcast_static,
+        values,
+        shape,
+        out.as_mut_slice()
+    );
+    if !filled {
+        return broadcast_vec(values, shape, out_shape);
     }
     out
+}
+
+/// `fill_broadcast`'s view path: ONE `assign` of the broadcast view into `out`
+/// (`false` when the layout is not expressible, which is the caller's cue to run
+/// [`broadcast_vec`]).
+fn fill_broadcast_static<T: Copy, D: Dimension>(
+    out_shape: D,
+    values: &[T],
+    shape: &[usize],
+    out: &mut [T],
+) -> bool {
+    if out.len() != out_shape.size() {
+        return false;
+    }
+    let Some(base) = base_view(values, shape) else {
+        return false;
+    };
+    let Some(view) = base.broadcast(out_shape.clone()) else {
+        return false;
+    };
+    let Ok(mut dest) = ArrayViewMut::<T, D>::from_shape(out_shape, out) else {
+        return false;
+    };
+    dest.assign(&view);
+    true
 }
 
 #[cfg(test)]

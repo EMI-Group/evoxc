@@ -12,15 +12,20 @@
 //! Run it with:
 //!
 //! ```text
-//! cargo test --release -p evoxc-cpu --lib bench_broadcast_zip -- --ignored --nocapture
+//! cargo test --release -p evoxc-cpu --lib bench_ -- --ignored --nocapture
 //! ```
+//!
+//! [`bench_walk`] is the second instrument in the same file: it times the
+//! strided offset driver [`walk`] itself (rank 1-3, contiguous and
+//! column-strided layouts), which is what every fallback of the view drivers
+//! runs.
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use evoxc_core::{DType, Result};
 
-use super::{map2_runs, Buffer, NdScalar};
+use super::{map2_runs, walk, Buffer, NdScalar};
 
 /// The result shape every case computes (and the `xor_p500` population shape).
 const OUT_SHAPE: [usize; 3] = [2000, 50, 4];
@@ -152,5 +157,81 @@ fn bench_broadcast_zip() {
     );
     for case in &cases {
         measure(case, &left);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `walk`: the strided offset driver
+// ---------------------------------------------------------------------------
+
+/// One `walk` case: its name, its result shape and the stride layout of each
+/// operand it reads.
+type WalkCase = (&'static str, Vec<usize>, Vec<Vec<usize>>);
+
+/// The stride layouts [`bench_walk`] times.
+///
+/// A broadcast axis carries a `0` stride, so this covers the contiguous walk a
+/// flat view already handles (one stride, all-`1`), the axis-transposed read
+/// (`strides = [1, 1000]` over `[1000, 1000]`, the column-strided family) and
+/// the rank-3 C-order interior.
+fn walk_cases() -> Vec<WalkCase> {
+    vec![
+        ("rank 1 [1000000] contiguous", vec![1_000_000], vec![vec![1]]),
+        (
+            "rank 2 [1000,1000] contiguous",
+            vec![1000, 1000],
+            vec![vec![1000, 1]],
+        ),
+        (
+            "rank 2 [1000,1000] column-strided",
+            vec![1000, 1000],
+            vec![vec![1, 1000]],
+        ),
+        (
+            "rank 3 [100,100,100] contiguous",
+            vec![100, 100, 100],
+            vec![vec![10_000, 100, 1]],
+        ),
+    ]
+}
+
+/// Time one [`walk`] over `case`: 3 warmups, 15 iterations, median ns/element.
+///
+/// The `body` accumulates the first offset, which is `black_box`ed afterwards,
+/// so the walk cannot be optimized away and its inner bookkeeping stays live.
+fn measure_walk(name: &str, out_shape: &[usize], strides: &[Vec<usize>]) {
+    let elements: usize = out_shape.iter().product();
+    let accum = || {
+        let mut sum = 0usize;
+        walk(out_shape.len(), out_shape, strides, |offsets| {
+            sum = sum.wrapping_add(offsets[0]);
+        });
+        black_box(sum);
+    };
+    for _ in 0..WARMUPS {
+        accum();
+    }
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        accum();
+        samples.push(start.elapsed());
+    }
+    samples.sort_unstable();
+    let median = samples[ITERATIONS / 2];
+    let ms = median.as_secs_f64() * 1e3;
+    let ns_per_element = median.as_nanos() as f64 / elements as f64;
+    println!(
+        "  {:<32} {:>8.3} ms total   {:>6.3} ns/element   ({} elements, median of {})",
+        name, ms, ns_per_element, elements, ITERATIONS
+    );
+}
+
+#[test]
+#[ignore = "benchmark instrument: prints the walk cost, never asserts"]
+fn bench_walk() {
+    println!("walk (strided offset driver)");
+    for (name, out_shape, strides) in walk_cases() {
+        measure_walk(name, &out_shape, &strides);
     }
 }
