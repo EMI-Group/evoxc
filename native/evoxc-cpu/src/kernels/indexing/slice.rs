@@ -328,11 +328,13 @@ mod tests {
     /// must reproduce the plain offset walk element for element.
     #[test]
     fn slice_fast_paths_match_an_elementwise_reference() {
+        /// `(starts, limits, steps, expected result shape)`.
+        type Case = (&'static [i64], &'static [i64], &'static [i64], &'static [usize]);
         let shape = [4usize, 3, 5];
         let values: Vec<f32> = (0..60).map(|value| value as f32 * 0.5).collect();
         let x = f32_buffer(&shape, &values);
         let strides = util::c_strides(&shape);
-        let cases: [(&[i64], &[i64], &[i64], &[usize]); 6] = [
+        let cases: [Case; 6] = [
             // one column of a 3-D operand: a single 12-element stride-15 run
             (&[0, 0, 2], &[4, 3, 3], &[1, 1, 1], &[4, 3, 1]),
             // three of five trailing elements: 12 runs of 3
