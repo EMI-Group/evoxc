@@ -87,8 +87,10 @@ pub enum AttrValue {
 impl AttrValue {
     /// Does this value satisfy the declared attribute type tag?
     ///
-    /// [`AttrValue::Null`] is the explicit `None` value the Python registry
-    /// models (`default=None`), so it satisfies every declared tag.
+    /// [`AttrValue::Null`] passes every tag at this level (it is the explicit
+    /// `None` value the Python registry models with `default=None`); the
+    /// schema-aware [`AttrSchema::accepts`] is what decides whether a given
+    /// attribute may actually carry it.
     pub fn matches_type(&self, ty: &str) -> bool {
         if matches!(self, AttrValue::Null) {
             return true;
@@ -131,10 +133,12 @@ impl AttrValue {
 
     /// Convert one JSON value under a declared attribute type tag.
     ///
-    /// JSON `null` decodes to [`AttrValue::Null`] for every tag: the Python
-    /// registry declares `default=None` on optional attributes of any type
-    /// (`slice.strides` (`ints`), `transpose.permutation` (`ints`),
-    /// `flip.axes` (`any`), …), so `None` is a legal value for every tag.
+    /// JSON `null` always decodes to [`AttrValue::Null`] (the documented
+    /// "absent / `None`" representation the Python registry models with
+    /// `default=None`); whether that is LEGAL is the schema's decision, made by
+    /// [`AttrSchema::accepts`] — `any` attributes and the optional
+    /// `int`/`ints` attributes declared `default=None` accept it, everything
+    /// else rejects it with a `VerificationError`.
     pub fn from_json(ty: &str, value: &Json) -> Result<AttrValue> {
         if value.is_null() {
             return Ok(AttrValue::Null);
@@ -650,14 +654,14 @@ impl Attrs {
 
     /// Validate against an op's declared attribute schema.
     ///
-    /// Checks unknown names, required presence, and declared types; returns the
-    /// schema-owned defaults for the attributes that are absent.
+    /// Checks unknown names, required presence, and declared types (including
+    /// the schema's null policy — see [`AttrSchema::accepts`]).
     pub fn validate(&self, op: &'static OpSchema) -> Result<()> {
         for (name, value) in self.iter() {
             let declared = op.attr(name).ok_or_else(|| {
                 Error::verification(format!("op '{}' has no attribute {name:?}", op.name))
             })?;
-            if !value.matches_type(declared.ty) {
+            if !declared.accepts(value) {
                 return Err(Error::verification(format!(
                     "op '{}' attribute {name:?} expects {} but got {}",
                     op.name,
@@ -701,7 +705,7 @@ impl Attrs {
             let converted = AttrValue::from_json(declared.ty, value).map_err(|err| {
                 err.context(format!("op '{}' attribute {name:?}", op.name))
             })?;
-            if !converted.matches_type(declared.ty) {
+            if !declared.accepts(&converted) {
                 return Err(Error::verification(format!(
                     "op '{}' attribute {name:?} expects {} but got {}",
                     op.name,
@@ -733,6 +737,37 @@ impl Attrs {
 }
 
 impl AttrSchema {
+    /// May this attribute legally carry an explicit JSON `null`?
+    ///
+    /// Mirrors the Python registry/builder acceptance policy
+    /// (`evoxc/ir/builder.py::_check_attr_value`): `None` is a legal value for
+    /// every `any` attribute (JSON-able free-form) and for the optional
+    /// `int`/`ints` attributes the registry declares `default=None` — the
+    /// documented nullable families (`argmax.axis`, `argmin.axis`, the
+    /// collective `group_size`s, `random_permutation.n`, `conv.strides` /
+    /// `input_dilation` / `kernel_dilation`, `slice.strides`,
+    /// `transpose.permutation`, `flip.axes`, `roll.axis`, `matrix_rank.tol`,
+    /// `nan_to_num.posinf` / `neginf`).  Every other attribute (a required one
+    /// included) requires a value: an explicit `null` under it is a
+    /// `VerificationError`, exactly as the Python builder rejects it.
+    pub fn accepts_null(&self) -> bool {
+        self.ty == attr_type::ANY
+            || (matches!(self.ty, attr_type::INT | attr_type::INTS)
+                && self.default_json == Some("null"))
+    }
+
+    /// Does `value` satisfy this attribute's declared contract?
+    ///
+    /// [`AttrValue::matches_type`]'s tag check, refined by the schema's own
+    /// null policy: an explicit [`AttrValue::Null`] is legal only where
+    /// [`AttrSchema::accepts_null`] says so.
+    pub fn accepts(&self, value: &AttrValue) -> bool {
+        if matches!(value, AttrValue::Null) {
+            return self.accepts_null();
+        }
+        value.matches_type(self.ty)
+    }
+
     /// Parse this attribute's declared default (JSON text) into a value.
     pub fn default_value(&self) -> Result<Option<AttrValue>> {
         match self.default_json {
@@ -1125,5 +1160,140 @@ mod tests {
         let err = AttrValue::from_json(attr_type::NESTED_INTS, &nested).unwrap_err();
         assert_eq!(err.kind_str(), "VerificationError");
         assert!(err.message.contains("item 1"), "{}", err.message);
+    }
+
+    /// Every documented nullable family decodes an explicit JSON `null` to
+    /// [`AttrValue::Null`] through BOTH decoders and re-encodes as `null`; the
+    /// same `null` under any other attribute is a `VerificationError`.
+    #[test]
+    fn null_is_accepted_exactly_where_the_schema_declares_it() {
+        // (op, attributes, the attributes carrying `null`)
+        let accepted: Vec<(&str, Json, &[&str])> = vec![
+            (
+                "nan_to_num",
+                serde_json::json!({"nan": 0.0, "posinf": null, "neginf": null}),
+                &["posinf", "neginf"],
+            ),
+            // `nan` is an `any` attribute too, so an explicit `null` (the
+            // frontend's `nan=None`) is legal as well.
+            (
+                "nan_to_num",
+                serde_json::json!({"nan": null, "posinf": null, "neginf": null}),
+                &["nan", "posinf", "neginf"],
+            ),
+            ("flip", serde_json::json!({"axes": null}), &["axes"]),
+            (
+                "roll",
+                serde_json::json!({"shift": [1], "axis": null}),
+                &["axis"],
+            ),
+            ("argmax", serde_json::json!({"axis": null}), &["axis"]),
+            (
+                "argmin",
+                serde_json::json!({"axis": null, "keepdims": true}),
+                &["axis"],
+            ),
+            (
+                "slice",
+                serde_json::json!({
+                    "start_indices": [0], "limit_indices": [2], "strides": null,
+                }),
+                &["strides"],
+            ),
+            (
+                "transpose",
+                serde_json::json!({"permutation": null}),
+                &["permutation"],
+            ),
+            ("matrix_rank", serde_json::json!({"tol": null}), &["tol"]),
+            (
+                "conv",
+                serde_json::json!({
+                    "strides": null,
+                    "padding": "VALID",
+                    "input_dilation": null,
+                    "kernel_dilation": null,
+                }),
+                &["strides", "input_dilation", "kernel_dilation"],
+            ),
+            (
+                "all_reduce",
+                serde_json::json!({"reduce_op": "sum", "group": "g", "group_size": null}),
+                &["group_size"],
+            ),
+            (
+                "all_gather",
+                serde_json::json!({"group": "g", "group_size": null}),
+                &["group_size"],
+            ),
+            (
+                "random_permutation",
+                serde_json::json!({"dtype": "int32", "n": null}),
+                &["n"],
+            ),
+        ];
+        for (name, attrs_json, null_keys) in accepted {
+            let op = require(name).unwrap();
+            let map = attrs_json.as_object().unwrap();
+            let decoded = Attrs::from_json_map(map, op).unwrap();
+            // The envelope's decoder applies the same policy.
+            let from_envelope = crate::envelope::attrs_from_json(map, op).unwrap();
+            assert_eq!(decoded, from_envelope, "{name}");
+            decoded.validate(op).unwrap();
+            for key in null_keys {
+                assert_eq!(
+                    decoded.get(key),
+                    Some(&AttrValue::Null),
+                    "op {name} attribute {key}"
+                );
+                assert_eq!(decoded.to_json()[*key], Json::Null, "op {name} {key}");
+            }
+        }
+        // A `null` under an attribute the schema does not declare nullable is a
+        // VerificationError — a required attribute (any type) and an optional
+        // one whose default is a VALUE (`sort.axis` = -1, `pad.value` = 0.0,
+        // the random `algorithm` name).
+        let rejected: Vec<(&str, Json, &str)> = vec![
+            ("reshape", serde_json::json!({"shape": null}), "shape"),
+            (
+                "reduce_sum",
+                serde_json::json!({"axes": null, "reduce_op": "sum"}),
+                "axes",
+            ),
+            ("cast", serde_json::json!({"dtype": null}), "dtype"),
+            ("concatenate", serde_json::json!({"axis": null}), "axis"),
+            ("sort", serde_json::json!({"axis": null}), "axis"),
+            (
+                "pad",
+                serde_json::json!({"padding_config": [[0, 0]], "value": null}),
+                "value",
+            ),
+            (
+                "random_normal",
+                serde_json::json!({"shape": [], "dtype": "float32", "algorithm": null}),
+                "algorithm",
+            ),
+        ];
+        for (name, attrs_json, key) in rejected {
+            let op = require(name).unwrap();
+            for err in [
+                Attrs::from_json_map(attrs_json.as_object().unwrap(), op).unwrap_err(),
+                crate::envelope::attrs_from_json(attrs_json.as_object().unwrap(), op)
+                    .unwrap_err(),
+            ] {
+                assert_eq!(err.kind_str(), "VerificationError", "{name}: {}", err.message);
+                assert!(err.message.contains(key), "{name}: {}", err.message);
+                assert!(err.message.contains("null"), "{name}: {}", err.message);
+            }
+            // The non-decoding validator agrees.
+            let mut attrs = Attrs::new();
+            for (attr, value) in attrs_json.as_object().unwrap() {
+                let declared = op.attr(attr).unwrap();
+                attrs.insert(attr, AttrValue::from_json(declared.ty, value).unwrap());
+            }
+            let err = attrs.validate(op).unwrap_err();
+            assert_eq!(err.kind_str(), "VerificationError", "{name}: {}", err.message);
+            assert!(err.message.contains(key), "{name}: {}", err.message);
+        }
     }
 }

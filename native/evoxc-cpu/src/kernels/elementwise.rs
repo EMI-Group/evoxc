@@ -1119,20 +1119,32 @@ fn gelu_kernel(_ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Resu
     single(Buffer::new(out_dtype, input.shape.clone(), storage)?)
 }
 
+/// `nan_to_num`: replace NaN / +inf / -inf entries (numpy semantics).
+///
+/// `nan`'s registry default is `0.0`, so an ABSENT attribute means "replace
+/// NaN with 0"; an explicit `null` (`nan=None` in the frontend) means "leave
+/// NaN unchanged", which is numpy's `nan_to_num(arr, nan=None)`.  The
+/// infinities are `any` attributes defaulting to `None` = the dtype's max/
+/// min finite value (numpy's own default), so `null` and absent both mean
+/// that.  Non-float storages (int/bool) have no NaN/inf and pass through, as
+/// numpy's does.
 fn nan_to_num_kernel(
     _ctx: &mut RunCtx<'_>,
     spec: &OpSpec,
     operands: &[Value],
 ) -> Result<Vec<Value>> {
     let input = &operands[0];
-    let nan = any_float(&spec.attrs, "nan")?.unwrap_or(0.0);
+    let nan = match spec.attrs.get("nan") {
+        None => Some(0.0),
+        _ => any_float(&spec.attrs, "nan")?,
+    };
     let posinf = any_float(&spec.attrs, "posinf")?;
     let neginf = any_float(&spec.attrs, "neginf")?;
     let storage = match &input.storage {
         Storage::F32(values) => Storage::F32(
             values
                 .iter()
-                .map(|value| fix_f32(*value, nan as f32, posinf, neginf, f32::MAX, f32::MIN))
+                .map(|value| fix_f32(*value, nan, posinf, neginf, f32::MAX, f32::MIN))
                 .collect(),
         ),
         Storage::F64(values) => Storage::F64(
@@ -1147,11 +1159,11 @@ fn nan_to_num_kernel(
                 .map(|value| {
                     let fixed = fix_f32(
                         value.to_f32(),
-                        nan as f32,
+                        nan,
                         posinf,
                         neginf,
                         f16::MAX.to_f32(),
-                        f16::MIN.to_f32(),
+                        -f16::MAX.to_f32(),
                     );
                     f16::from_f32(fixed)
                 })
@@ -1162,8 +1174,8 @@ fn nan_to_num_kernel(
                 .iter()
                 .map(|value| {
                     Complex::new(
-                        fix_f32(value.re, nan as f32, posinf, neginf, f32::MAX, f32::MIN),
-                        fix_f32(value.im, nan as f32, posinf, neginf, f32::MAX, f32::MIN),
+                        fix_f32(value.re, nan, posinf, neginf, f32::MAX, f32::MIN),
+                        fix_f32(value.im, nan, posinf, neginf, f32::MAX, f32::MIN),
                     )
                 })
                 .collect(),
@@ -1184,9 +1196,18 @@ fn nan_to_num_kernel(
     single(Buffer::new(input.dtype, input.shape.clone(), storage)?)
 }
 
-fn fix_f32(value: f32, nan: f32, posinf: Option<f64>, neginf: Option<f64>, max: f32, min: f32) -> f32 {
+/// Replace one f32 value per numpy's `nan_to_num` (a `None` replacement leaves
+/// the value unchanged).
+fn fix_f32(
+    value: f32,
+    nan: Option<f64>,
+    posinf: Option<f64>,
+    neginf: Option<f64>,
+    max: f32,
+    min: f32,
+) -> f32 {
     if value.is_nan() {
-        nan
+        nan.map(|v| v as f32).unwrap_or(value)
     } else if value == f32::INFINITY {
         posinf.map(|v| v as f32).unwrap_or(max)
     } else if value == f32::NEG_INFINITY {
@@ -1196,9 +1217,18 @@ fn fix_f32(value: f32, nan: f32, posinf: Option<f64>, neginf: Option<f64>, max: 
     }
 }
 
-fn fix_f64(value: f64, nan: f64, posinf: Option<f64>, neginf: Option<f64>, max: f64, min: f64) -> f64 {
+/// Replace one f64 value per numpy's `nan_to_num` (a `None` replacement leaves
+/// the value unchanged).
+fn fix_f64(
+    value: f64,
+    nan: Option<f64>,
+    posinf: Option<f64>,
+    neginf: Option<f64>,
+    max: f64,
+    min: f64,
+) -> f64 {
     if value.is_nan() {
-        nan
+        nan.unwrap_or(value)
     } else if value == f64::INFINITY {
         posinf.unwrap_or(max)
     } else if value == f64::NEG_INFINITY {
@@ -1208,11 +1238,23 @@ fn fix_f64(value: f64, nan: f64, posinf: Option<f64>, neginf: Option<f64>, max: 
     }
 }
 
+/// Read an optional numeric attribute.
+///
+/// `posinf`/`neginf` are `any` attributes whose registry default is `None`, so
+/// the frontend always sends an explicit JSON `null` for "the numpy default";
+/// the envelope decodes that to [`AttrValue::Null`], and an absent attribute
+/// reads the same way.  Integers are accepted too (a replacement may be written
+/// `nan=1`), so the reader matches what the numpy reference reads through
+/// `op.attributes`.
 fn any_float(attrs: &evoxc_core::Attrs, name: &str) -> Result<Option<f64>> {
     match attrs.get(name) {
-        None => Ok(None),
-        Some(AttrValue::Any(Json::Null)) => Ok(None),
-        Some(AttrValue::Any(Json::Number(number))) => Ok(number.as_f64()),
+        None | Some(AttrValue::Null) | Some(AttrValue::Any(Json::Null)) => Ok(None),
+        Some(AttrValue::Any(Json::Number(number))) => number.as_f64().map(Some).ok_or_else(|| {
+            Error::verification(format!(
+                "op 'nan_to_num': attribute {name:?} is not representable as a float: {number}"
+            ))
+        }),
+        Some(AttrValue::Int(value)) => Ok(Some(*value as f64)),
         Some(AttrValue::Float(value)) => Ok(Some(*value)),
         Some(other) => Err(Error::verification(format!(
             "op 'nan_to_num': attribute {name:?} must be a number or null, got {other}"
