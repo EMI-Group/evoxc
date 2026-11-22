@@ -3,19 +3,28 @@
 //! explicit per-spatial `[lo, hi]` pairs), `feature_group_count` and
 //! `batch_group_count` for rank >= 3 (N-D batched) inputs: exactly the numpy
 //! kernel's surface, with the same explicit rejections.
+//!
+//! The addressing is `ndarray`'s throughout: the dilated + padded input is one
+//! `slice_each_axis_mut` assignment of the operand (a `step` of the input
+//! dilation per spatial axis), and every output element is the contraction of
+//! the kernel row against the input patch its output position selects — one
+//! `slice_each_axis` view with a `step` of the kernel dilation on the spatial
+//! axes, folded against the contiguous kernel row.  No hand-written offset or
+//! stride walk appears here.
 
 use evoxc_core::{AttrValue, Attrs, DType, Error, Result};
+use ndarray::{Axis, Slice};
 use serde_json::Value as Json;
 
-use crate::buffer::Buffer;
+use crate::buffer::{array_view, array_view_mut, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
-use crate::kernels::util::{self, c_strides};
+use crate::kernels::util;
 use crate::kernels::KernelMap;
 use crate::plan::OpSpec;
 use crate::scalar::Num;
 use crate::with_same_type;
 
-use super::common::{attr_json, check_result_shape, each_index, expect_arity};
+use super::common::{attr_json, check_result_shape, expect_arity};
 
 pub(super) fn register(map: &mut KernelMap) {
     map.insert("conv", conv_kernel);
@@ -45,6 +54,9 @@ struct ConvGeom {
     strides: Vec<i64>,
     input_dilation: Vec<i64>,
     kernel_dilation: Vec<i64>,
+    /// Spatial extent of the dilated, padded input (dilated plus the pad pair,
+    /// clamped at 0 — the window the output positions index).
+    padded_spatial: Vec<usize>,
     /// Lower padding offset per spatial dim (negative = crop the dilated input).
     pad_lo: Vec<i64>,
 }
@@ -158,6 +170,11 @@ fn conv_group_count(attrs: &Attrs, name: &str) -> Result<usize> {
 /// Port of the numpy kernel's step 1-2: dilate (effective size
 /// `(d - 1) * dil + 1`), then pad — `"SAME"` (TF) derives `ceil(d / stride)` and
 /// may need a NEGATIVE total (cropping) when `input_dilation > 1`.
+///
+/// Returns `(pad_lo, padded_spatial, out_spatial)`: the lower pad offset, the
+/// extent of the dilated-and-padded input a window indexes into (clamped at
+/// zero for the degenerate zero-extent-kernel case the old index walk treated
+/// as an empty patch) and the output extent per spatial dim.
 fn conv_geometry(
     in_spatial: &[usize],
     kernel_spatial: &[usize],
@@ -165,9 +182,10 @@ fn conv_geometry(
     in_dil: &[i64],
     k_dil: &[i64],
     pads: &[Pad],
-) -> Result<(Vec<i64>, Vec<usize>)> {
+) -> Result<(Vec<i64>, Vec<usize>, Vec<usize>)> {
     let n_spatial = in_spatial.len();
     let mut pad_lo = Vec::with_capacity(n_spatial);
+    let mut padded_spatial = Vec::with_capacity(n_spatial);
     let mut out_spatial = Vec::with_capacity(n_spatial);
     for i in 0..n_spatial {
         // Saturating arithmetic: the dilation/stride attributes are user data,
@@ -206,9 +224,11 @@ fn conv_geometry(
             )));
         }
         pad_lo.push(lo);
+        let padded = eff_d.saturating_add(lo).saturating_add(hi);
+        padded_spatial.push(if padded < 0 { 0 } else { padded as usize });
         out_spatial.push(out_i as usize);
     }
-    Ok((pad_lo, out_spatial))
+    Ok((pad_lo, padded_spatial, out_spatial))
 }
 
 fn conv_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
@@ -280,15 +300,19 @@ fn conv_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result
     }
     let in_spatial = x.shape[2..].to_vec();
     let kernel_spatial = w.shape[2..].to_vec();
-    let (pad_lo, out_spatial) =
+    let (pad_lo, padded_spatial, out_spatial) =
         conv_geometry(&in_spatial, &kernel_spatial, &strides, &in_dil, &k_dil, &pads)?;
     let mut expected = vec![n, c_out * batch_groups];
     expected.extend(out_spatial.iter().copied());
     check_result_shape("conv", &out_shape, &expected)?;
 
     let dtype = spec.result_types[0].dtype;
-    let left = x.cast(dtype)?;
-    let right = w.cast(dtype)?;
+    // A same-dtype operand is BORROWED — `Buffer::cast` would copy it whole for
+    // nothing — and only a genuinely differing dtype is converted.
+    let cast_left;
+    let cast_right;
+    let left: &Buffer = if x.dtype == dtype { x } else { cast_left = x.cast(dtype)?; &cast_left };
+    let right: &Buffer = if w.dtype == dtype { w } else { cast_right = w.cast(dtype)?; &cast_right };
     let geometry = ConvGeom {
         n,
         c_in,
@@ -302,11 +326,14 @@ fn conv_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result
         strides,
         input_dilation: in_dil,
         kernel_dilation: k_dil,
+        padded_spatial,
         pad_lo,
     };
     let buffer = with_same_type!(left, right, |x_values, w_values| conv_run(
         x_values,
         w_values,
+        &left.shape,
+        &right.shape,
         &geometry,
         dtype,
         out_shape
@@ -314,73 +341,136 @@ fn conv_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result
     single(buffer)
 }
 
-fn conv_run<T: Num>(
+/// Materialize the correlation through `ndarray`.
+///
+/// 1. The dilated + padded input is one `slice_each_axis_mut` assignment of the
+///    operand onto a zero-filled window: on spatial axis `i` the destination
+///    runs `Slice::new(start, end, input_dilation)` and the source is the
+///    contiguous operand, so the inserted dilation zeros and the pad slabs are
+///    the only untouched cells (numpy's dilate-then-pad order).
+/// 2. Every output element is the contraction of its kernel row against the
+///    patch its output position selects: one `slice_each_axis` view with
+///    `Slice::new(position * stride, end, kernel_dilation)` on the spatial axes,
+///    folded in the operand's own C order (`gin`, then kernel taps) against the
+///    contiguous kernel row — the same products in the same order as the numpy
+///    kernel's tensordot contract.
+#[allow(clippy::too_many_arguments)]
+fn conv_run<T: Num + NdScalar>(
     x: &[T],
     w: &[T],
+    x_shape: &[usize],
+    w_shape: &[usize],
     g: &ConvGeom,
     dtype: DType,
     out_shape: Vec<usize>,
 ) -> Result<Buffer> {
-    let out_spatial_count = util::numel(&g.out_spatial);
-    let in_spatial_count = util::numel(&g.in_spatial);
-    let kernel_spatial_count = util::numel(&g.kernel_spatial);
+    let n_spatial = g.in_spatial.len();
     let out_channels = g.c_out * g.batch_groups;
     let per_group_n = g.n / g.batch_groups;
-    let mut out = vec![T::zero(); out_spatial_count * out_channels * g.n];
-    let in_strides = c_strides(&g.in_spatial);
-    let k_strides = c_strides(&g.kernel_spatial);
-    // (kernel spatial offset, input spatial offset) pairs that contribute.
-    let mut patch: Vec<(usize, usize)> = Vec::new();
-    for batch in 0..g.n {
-        let mut position = 0usize;
-        each_index(&g.out_spatial, |out_index| {
-            patch.clear();
-            each_index(&g.kernel_spatial, |kernel_index| {
-                let mut input_offset = 0usize;
-                let mut kernel_offset = 0usize;
-                for axis in 0..g.in_spatial.len() {
-                    let coordinate = (out_index[axis] as i64)
-                        .saturating_mul(g.strides[axis])
-                        .saturating_add(
-                            (kernel_index[axis] as i64).saturating_mul(g.kernel_dilation[axis]),
-                        )
-                        .saturating_sub(g.pad_lo[axis]);
-                    let rate = g.input_dilation[axis];
-                    if coordinate < 0 || coordinate % rate != 0 {
-                        return Ok(());
-                    }
-                    let source = coordinate / rate;
-                    if source >= g.in_spatial[axis] as i64 {
-                        return Ok(());
-                    }
-                    input_offset += source as usize * in_strides[axis];
-                    kernel_offset += kernel_index[axis] * k_strides[axis];
-                }
-                patch.push((kernel_offset, input_offset));
-                Ok(())
-            })?;
+
+    // ---- 1. the dilated + padded input ----------------------------------
+    let mut padded_shape = vec![g.n, g.c_in];
+    padded_shape.extend(g.padded_spatial.iter().copied());
+    let mut padded = vec![T::zero(); util::numel(&padded_shape)];
+    {
+        let mut target = Vec::with_capacity(x_shape.len());
+        target.push(Slice::from(..));
+        target.push(Slice::from(..));
+        let mut source = Vec::with_capacity(x_shape.len());
+        source.push(Slice::from(..));
+        source.push(Slice::from(..));
+        let mut has_interior = true;
+        for axis in 0..n_spatial {
+            let rate = g.input_dilation[axis] as usize;
+            let lo = g.pad_lo[axis];
+            // Dilated coordinate `lo + j * rate` is the operand's element `j`;
+            // keep the `j` window that lands inside the padded extent.
+            let first = if lo < 0 { ((-lo) as usize).div_ceil(rate) } else { 0 };
+            let available = g.padded_spatial[axis] as i64 - lo;
+            let last = if available <= 0 {
+                0
+            } else {
+                ((available as usize).div_ceil(rate)).min(g.in_spatial[axis])
+            };
+            if last <= first {
+                has_interior = false;
+                break;
+            }
+            let length = last - first;
+            let start = lo + (first * rate) as i64;
+            target.push(Slice::new(
+                start as isize,
+                Some((start + ((length - 1) * rate) as i64 + 1) as isize),
+                rate as isize,
+            ));
+            source.push(Slice::from(first..first + length));
+        }
+        if has_interior {
+            let mut window = array_view_mut::<T>(&mut padded, &padded_shape)?;
+            let mut dst = window.slice_each_axis_mut(|axis| target[axis.axis.index()]);
+            let operand = array_view::<T>(x, x_shape)?;
+            let src = operand.slice_each_axis(|axis| source[axis.axis.index()]);
+            dst.assign(&src);
+        }
+    }
+
+    // ---- 2. the correlation ---------------------------------------------
+    let mut out = vec![T::zero(); util::numel(&out_shape)];
+    {
+        let padded_view = array_view::<T>(&padded, &padded_shape)?;
+        let kernel_view = array_view::<T>(w, w_shape)?;
+        let mut out_view = array_view_mut::<T>(&mut out, &out_shape)?;
+        for batch in 0..g.n {
             for channel in 0..out_channels {
                 let batch_group = channel / g.c_out;
                 let kernel_channel = channel % g.c_out;
                 let feature_group = kernel_channel / g.gout;
                 let in_batch = batch_group * per_group_n + batch / g.batch_groups;
-                let x_channel_base = in_batch * g.c_in * in_spatial_count;
-                let w_channel_base = kernel_channel * g.gin * kernel_spatial_count;
-                let mut acc = T::zero();
-                for ci in 0..g.gin {
-                    let x_base = x_channel_base + (feature_group * g.gin + ci) * in_spatial_count;
-                    let w_base = w_channel_base + ci * kernel_spatial_count;
-                    for (kernel_offset, input_offset) in &patch {
-                        acc = acc.add(x[x_base + input_offset].mul(w[w_base + kernel_offset]));
-                    }
+                // The output row this channel writes: `out[batch, channel, ..]`
+                // in C order, and the input channels of its feature group.
+                let mut batch_row = out_view.index_axis_mut(Axis(0), batch);
+                let mut destination = batch_row.index_axis_mut(Axis(0), channel);
+                let batch_slice = padded_view.index_axis(Axis(0), in_batch);
+                let source = batch_slice.slice_axis(
+                    Axis(0),
+                    Slice::from(feature_group * g.gin..(feature_group + 1) * g.gin),
+                );
+                let kernel = kernel_view.index_axis(Axis(0), kernel_channel);
+                for (slot, position) in destination.iter_mut().zip(ndarray::indices(ndarray::IxDyn(&g.out_spatial))) {
+                    let patch = source.slice_each_axis(|axis| {
+                        if axis.axis.index() == 0 {
+                            Slice::from(..)
+                        } else {
+                            let spatial = axis.axis.index() - 1;
+                            let start = position[spatial] * g.strides[spatial] as usize;
+                            strided_window(
+                                start,
+                                g.kernel_spatial[spatial],
+                                g.kernel_dilation[spatial] as usize,
+                            )
+                        }
+                    });
+                    *slot = patch.iter().zip(kernel.iter()).fold(T::zero(), |acc, (x, w)| {
+                        acc.add(x.mul(*w))
+                    });
                 }
-                out[(batch * out_channels + channel) * out_spatial_count + position] = acc;
             }
-            position += 1;
-            Ok(())
-        })?;
+        }
     }
-    Buffer::new(dtype, out_shape, T::into_storage(out))
+    Buffer::new(dtype, out_shape, <T as NdScalar>::into_storage(out))
+}
+
+/// The window an output position reads: `length` taps `step` apart from
+/// `start` (numpy's dilated-kernel tap list).  A zero-length window stays a
+/// valid, empty slice so a zero-extent kernel contributes nothing.
+fn strided_window(start: usize, length: usize, step: usize) -> Slice {
+    if length == 0 {
+        return Slice::new(0, Some(0), 1);
+    }
+    let end = start
+        .saturating_add((length - 1).saturating_mul(step))
+        .saturating_add(1);
+    Slice::new(start as isize, Some(end as isize), step as isize)
 }
 
 #[cfg(test)]
