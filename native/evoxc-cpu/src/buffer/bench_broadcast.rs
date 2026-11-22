@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use evoxc_core::{DType, Result};
 
+use super::broadcast::RUNS_DISABLED;
 use super::rowsplit::SPLIT_DISABLED;
 use super::{map2_runs, walk, Buffer, NdScalar};
 
@@ -89,16 +90,32 @@ fn call(left: &[f32], right: &[f32], right_shape: &[usize]) -> Result<Buffer> {
     )
 }
 
-/// Verify `case` against the naive reference, then time it and print
-/// median total ms and ns/element.
-fn measure(case: &Case, left: &[f32]) {
+/// Chunks one row split of [`OUT_SHAPE`] spans (the leading chunk stays on the
+/// calling thread, so this is chunks rather than spawned threads).
+fn split_threads() -> usize {
+    super::parallel::parallel_threads(ELEMENTS).min(OUT_SHAPE[0])
+}
+
+/// Verify `case` against the naive reference, then time it with the row split
+/// (`split_disabled`) and the repeating-run specialization (`generic`) forced
+/// on/off, and return the median total ms.
+///
+/// Forcing the switches keeps the comparison inside ONE process and one host
+/// state, which is what the ns/element figures need: they move by 2-4x between
+/// processes on a shared host.  The values are checked in EVERY mode, so a
+/// timing of the wrong elements can never be reported.
+fn median_ms(case: &Case, left: &[f32], split_disabled: bool, generic: bool) -> f64 {
     // Correctness first: a timing of the wrong values would be worthless.
+    let expected = reference(left, &case.right, &case.right_shape);
+    let runs = RUNS_DISABLED.swap(generic, Ordering::Relaxed);
+    let split = SPLIT_DISABLED.swap(split_disabled, Ordering::Relaxed);
     let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
     let produced = <f32 as NdScalar>::slice_of(&result.storage).expect("an f32 result");
+    let threaded = !split_disabled;
     assert_eq!(
         produced,
-        reference(left, &case.right, &case.right_shape).as_slice(),
-        "case '{}' does not match the per-element reference",
+        expected.as_slice(),
+        "case '{}' does not match the per-element reference (generic: {generic}, split: {threaded})",
         case.name
     );
     drop(result);
@@ -121,14 +138,10 @@ fn measure(case: &Case, left: &[f32]) {
         black_box(&result);
         samples.push(elapsed);
     }
+    RUNS_DISABLED.store(runs, Ordering::Relaxed);
+    SPLIT_DISABLED.store(split, Ordering::Relaxed);
     samples.sort_unstable();
-    let median = samples[ITERATIONS / 2];
-    let ms = median.as_secs_f64() * 1e3;
-    let ns_per_element = median.as_nanos() as f64 / ELEMENTS as f64;
-    println!(
-        "  {:<28} {:>8.3} ms total   {:>6.3} ns/element   ({} elements, median of {})",
-        case.name, ms, ns_per_element, ELEMENTS, ITERATIONS
-    );
+    samples[ITERATIONS / 2].as_secs_f64() * 1e3
 }
 
 /// The three broadcast cases every instrument in this file times (deterministic
@@ -154,32 +167,46 @@ fn cases() -> [Case; 3] {
     ]
 }
 
+/// Print one line per case: the repeating-run specialization against the
+/// ndarray `Zip` it specializes, both in the same process.
+fn print_pair(title: &str, split_disabled: bool) {
+    let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
+    println!("{title}");
+    for case in &cases() {
+        let specialized = median_ms(case, &left, split_disabled, false);
+        let generic = median_ms(case, &left, split_disabled, true);
+        println!(
+            "  {:<28} specialized {:>8.3} ms {:>6.3} ns/element   |   ndarray Zip {:>8.3} ms {:>6.3} ns/element   |   {:.2}x",
+            case.name,
+            specialized,
+            specialized * 1e6 / ELEMENTS as f64,
+            generic,
+            generic * 1e6 / ELEMENTS as f64,
+            generic / specialized
+        );
+    }
+}
+
 #[test]
 #[ignore = "benchmark instrument: prints the broadcast map2_runs cost, never asserts"]
 fn bench_broadcast_zip() {
-    // Deterministic operands: a repeating pattern, no RNG, no allocation jitter
-    // beyond the two operand vectors themselves.
-    let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
-    let cases = cases();
-    println!("broadcast map2_runs (current impl)");
+    let threads = split_threads();
+    println!("broadcast map2_runs: the repeating-run specialization against the ndarray Zip");
     println!(
-        "  out shape {:?}, left {:?}, f32 `add`",
-        OUT_SHAPE, OUT_SHAPE
+        "  out shape {:?}, left {:?}, f32 `add`, {} elements, median of {}",
+        OUT_SHAPE, OUT_SHAPE, ELEMENTS, ITERATIONS
     );
-    for case in &cases {
-        measure(case, &left);
-    }
+    // The production shape: the row split over `threads` chunks, as `map2_runs`
+    // runs it.
+    print_pair(&format!("row split over {threads} chunk(s)"), false);
+    // The same work with the split forced off, so the specialization's own
+    // inner loop is visible without the thread count in the way.
+    print_pair("single-threaded (split disabled)", true);
 }
 
 // ---------------------------------------------------------------------------
 // The row split: the same three cases, split against its own baseline
 // ---------------------------------------------------------------------------
-
-/// Chunks one row split of [`OUT_SHAPE`] spans (the leading chunk stays on the
-/// calling thread, so this is chunks rather than spawned threads).
-fn split_threads() -> usize {
-    super::parallel::parallel_threads(ELEMENTS).min(OUT_SHAPE[0])
-}
 
 /// Verify `case` against the naive reference, then time it with the row split
 /// forced off (`disabled`) or on and return the median total ms.
@@ -187,32 +214,8 @@ fn split_threads() -> usize {
 /// Forcing the switch keeps the comparison inside ONE process and one host
 /// state, which is what the ns/element figures need: they move by 2-3x between
 /// processes on a shared host.
-fn median_ms(case: &Case, left: &[f32], disabled: bool) -> f64 {
-    let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
-    let produced = <f32 as NdScalar>::slice_of(&result.storage).expect("an f32 result");
-    assert_eq!(
-        produced,
-        reference(left, &case.right, &case.right_shape).as_slice(),
-        "case '{}' does not match the per-element reference",
-        case.name
-    );
-    drop(result);
-    let previous = SPLIT_DISABLED.swap(disabled, Ordering::Relaxed);
-    for _ in 0..WARMUPS {
-        let warmup = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
-        black_box(&warmup);
-    }
-    let mut samples = Vec::with_capacity(ITERATIONS);
-    for _ in 0..ITERATIONS {
-        let start = Instant::now();
-        let result = call(left, &case.right, &case.right_shape).expect("the broadcast map succeeds");
-        let elapsed = start.elapsed();
-        black_box(&result);
-        samples.push(elapsed);
-    }
-    SPLIT_DISABLED.store(previous, Ordering::Relaxed);
-    samples.sort_unstable();
-    samples[ITERATIONS / 2].as_secs_f64() * 1e3
+fn median_split_ms(case: &Case, left: &[f32], disabled: bool) -> f64 {
+    median_ms(case, left, disabled, false)
 }
 
 #[test]
@@ -221,14 +224,11 @@ fn bench_broadcast_zip_threads() {
     let left: Vec<f32> = (0..ELEMENTS).map(|index| (index % 97) as f32 * 0.5).collect();
     let threads = split_threads();
     println!("broadcast map2_runs (row split over {threads} chunk(s), f32 `add`)");
-    println!(
-        "  out shape {:?}, left {:?}",
-        OUT_SHAPE, OUT_SHAPE
-    );
+    println!("  out shape {:?}, left {:?}", OUT_SHAPE, OUT_SHAPE);
     println!("  single = the same builder with the split disabled, in this process");
     for case in &cases() {
-        let single = median_ms(case, &left, true);
-        let split = median_ms(case, &left, false);
+        let single = median_split_ms(case, &left, true);
+        let split = median_split_ms(case, &left, false);
         println!(
             "  {:<28} split {:>2}t {:>8.3} ms total {:>6.3} ns/element   |   single 1t {:>8.3} ms total {:>6.3} ns/element   |   {:.2}x",
             case.name,
@@ -241,6 +241,7 @@ fn bench_broadcast_zip_threads() {
         );
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // `walk`: the strided offset driver

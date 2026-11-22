@@ -586,3 +586,404 @@ fn the_view_path_agrees_with_the_flat_fast_path() {
     assert_eq!(flat3.storage, Storage::F32(driven3));
 }
 
+
+// ---------------------------------------------------------------------------
+// The repeating-run specialization
+// ---------------------------------------------------------------------------
+
+/// Serializes the tests that drive the specialization or flip its A/B switch:
+/// the switch is process-wide while the tests run in parallel, so one test
+/// measuring the reference path must not decide another test's code path.
+fn runs_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The layout cases the repeating-run driver must cover: an innermost `(n,)`
+/// bias, a `(1, ..., 1, n)` operand, a whole-storage repeat, two operands with
+/// different short periods, and a rank-1 result.  Every one of them is checked
+/// against the independent [`reference_slot`] reading AND against the ndarray
+/// `Zip` the specialization replaces, so both the values and the agreement
+/// with the reference driver are pinned.
+#[test]
+fn the_repeating_run_driver_covers_the_innermost_broadcast_family() {
+    let _serialized = runs_guard();
+    type Case<'a> = (&'a [usize], &'a [usize], &'a [usize]);
+    let cases: &[Case<'_>] = &[
+        // The xor_p500 shape: a `(4,)` bias beside a (pop, m, n) result.
+        (&[2000, 50, 4], &[2000, 50, 4], &[4]),
+        (&[64, 8, 4], &[64, 8, 4], &[4]),
+        // A shaped size-1-prefixed tile and a whole-storage repeat.
+        (&[32, 8, 4], &[32, 8, 4], &[1, 1, 4]),
+        (&[32, 8, 4], &[32, 8, 4], &[1, 8, 4]),
+        (&[32, 8, 4], &[32, 8, 4], &[8, 4]),
+        // A shorter innermost extent, and a period covering the whole result
+        // (read straight out of the operand instead of a tile).
+        (&[64, 2, 4], &[64, 2, 4], &[1, 2, 4]),
+        (&[16, 64], &[16, 64], &[16, 64]),
+        // Rank 1 on both sides, a rank-2 result with a rank-1 tile, and a
+        // tile on the LEFT.
+        (&[128, 8], &[128, 8], &[8]),
+        (&[4096], &[4096], &[4096]),
+        (&[16, 64], &[16, 64], &[64]),
+        (&[16, 64], &[1, 64], &[16, 64]),
+        (&[16, 4, 8], &[8], &[4, 8]),
+        // A rank-0 result beside rank-0 operands (one element: the driver
+        // declines and the reference answers).
+        (&[], &[], &[]),
+    ];
+    for (out_shape, a_shape, b_shape) in cases {
+        let count = product(out_shape);
+        let a: Vec<i32> = values(product(a_shape), 7);
+        let b: Vec<i32> = values(product(b_shape), 11);
+        let f = |x: i32, y: i32| x.wrapping_mul(3).wrapping_add(y.wrapping_mul(7));
+
+        // The reference driver's answer first, with the specialization
+        // disabled, and then the specialized answer.
+        RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut generic = vec![0i32; count];
+        apply2(&mut generic, out_shape, &a, a_shape, &b, b_shape, f);
+        RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut specialized = vec![0i32; count];
+        apply2(&mut specialized, out_shape, &a, a_shape, &b, b_shape, f);
+
+        assert_eq!(
+            specialized, generic,
+            "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: the specialization disagrees with the ndarray Zip"
+        );
+        for (flat, produced) in specialized.iter().enumerate() {
+            let expected = f(
+                a[reference_slot(out_shape, a_shape, flat)],
+                b[reference_slot(out_shape, b_shape, flat)],
+            );
+            assert_eq!(
+                *produced, expected,
+                "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+            );
+        }
+    }
+}
+
+/// The layouts the driver must DECLINE keep the ndarray `Zip` — and the values
+/// it produces must still agree with the independent reference.
+#[test]
+fn the_repeating_run_driver_declines_what_it_does_not_cover() {
+    let _serialized = runs_guard();
+    // A middle-axis broadcast is not a repetition of the operand's storage, and
+    // a per-row scalar's period is past the tile cap.
+    type Case<'a> = (&'a [usize], &'a [usize], &'a [usize]);
+    let cases: &[Case<'_>] = &[
+        (&[64, 3, 4], &[64, 3, 4], &[3, 1]),
+        (&[64, 6, 4], &[64, 6, 4], &[1, 6, 1]),
+        (&[512, 16], &[512, 16], &[512, 1]),
+    ];
+    for (out_shape, a_shape, b_shape) in cases {
+        let count = product(out_shape);
+        let a: Vec<i32> = values(product(a_shape), 5);
+        let b: Vec<i32> = values(product(b_shape), 9);
+        let f = |x: i32, y: i32| x.wrapping_sub(y);
+        let mut out = vec![0i32; count];
+        assert!(
+            !runs2(&mut out, out_shape, &a, a_shape, &b, b_shape, &f),
+            "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: the driver should decline"
+        );
+        apply2(&mut out, out_shape, &a, a_shape, &b, b_shape, f);
+        for (flat, produced) in out.iter().enumerate() {
+            let expected = f(
+                a[reference_slot(out_shape, a_shape, flat)],
+                b[reference_slot(out_shape, b_shape, flat)],
+            );
+            assert_eq!(
+                *produced, expected,
+                "out {out_shape:?}, a {a_shape:?}, b {b_shape:?}: element {flat}"
+            );
+        }
+    }
+
+    // The classifiers themselves: what counts as a repeat, and how long a
+    // block the driver picks.
+    assert!(repeat_view(&[0.0f32; 4], &[4], &[2, 3, 4]).is_some());
+    assert!(repeat_view(&[0.0f32; 1], &[1, 1], &[64, 16]).is_some());
+    assert!(repeat_view(&[0.0f32; 24], &[1, 6, 4], &[64, 6, 4]).is_some());
+    assert!(repeat_view(&[0.0f32; 6], &[1, 6, 1], &[64, 6]).is_none()); // rank above
+    assert!(repeat_view(&[0.0f32; 7], &[6], &[64, 6]).is_none()); // malformed slice
+    assert!(repeat_view(&[0.0f32; 64], &[64, 1], &[64, 16]).is_none()); // per-row scalar
+    assert!(repeat_view(&[0.0f32; 3], &[3], &[64, 3, 4]).is_none()); // middle axis
+
+    assert_eq!(run_block(&[4], 4000), Some(RUN_BLOCK_TARGET));
+    assert_eq!(run_block(&[4, 16], 4000), Some(RUN_BLOCK_TARGET));
+    assert_eq!(run_block(&[3], 4000), Some(66));
+    assert_eq!(run_block(&[200], 4000), Some(200));
+    assert_eq!(run_block(&[1], 4000), None); // scalars keep the Zip
+    assert_eq!(run_block(&[4000], 4000), None); // nothing is tiled
+    assert_eq!(run_block(&[300], 4000), None); // past the tile cap
+    assert_eq!(run_block(&[200, 128], 4000), None); // common block too long
+}
+
+/// `select` (`apply3`) takes the same specialization, with the argument order
+/// pinned to `(predicate, on-true, on-false)`.
+#[test]
+fn the_repeating_run_driver_covers_select() {
+    let _serialized = runs_guard();
+    let out_shape = [64usize, 8, 4];
+    let count = product(&out_shape);
+    let pred: Vec<bool> = (0..count).map(|index| index % 5 < 2).collect();
+    let tile: Vec<bool> = (0..4).map(|index| index % 2 == 0).collect();
+    let a: Vec<i32> = values(count, 3);
+    let b: Vec<i32> = values(4, 13);
+    let f = |pick: bool, x: i32, y: i32| if pick { x } else { y };
+
+    RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut generic = vec![0i32; count];
+    apply3(
+        &mut generic,
+        &out_shape,
+        &pred,
+        &out_shape,
+        &a,
+        &out_shape,
+        &b,
+        &[4],
+        f,
+    );
+    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut specialized = vec![0i32; count];
+    assert!(runs3(
+        &mut specialized,
+        &out_shape,
+        &pred,
+        &out_shape,
+        &a,
+        &out_shape,
+        &b,
+        &[4],
+        &f
+    ));
+    assert_eq!(specialized, generic);
+
+    // The predicate itself may be the tiled operand.
+    let mut from_predicate = vec![0i32; count];
+    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    apply3(
+        &mut from_predicate,
+        &out_shape,
+        &tile,
+        &[4],
+        &a,
+        &out_shape,
+        &b,
+        &[4],
+        f,
+    );
+    for (flat, produced) in from_predicate.iter().enumerate() {
+        let expected = f(tile[flat % 4], a[flat], b[flat % 4]);
+        assert_eq!(*produced, expected, "element {flat}");
+    }
+}
+
+/// One value / one combination per dtype, so the driver's dtype coverage is a
+/// generic property (it holds no dtype-specific code) rather than a claim.
+trait Slot: Copy + PartialEq + std::fmt::Debug {
+    fn at(index: usize) -> Self;
+    fn combine(left: Self, right: Self) -> Self;
+}
+
+macro_rules! integer_slot {
+    ($($ty:ty),*) => {$(
+        impl Slot for $ty {
+            fn at(index: usize) -> Self {
+                (index as i64 % 97 - 48) as $ty
+            }
+            fn combine(left: Self, right: Self) -> Self {
+                left.wrapping_add(right)
+            }
+        }
+    )*};
+}
+
+macro_rules! float_slot {
+    ($($ty:ty),*) => {$(
+        impl Slot for $ty {
+            fn at(index: usize) -> Self {
+                (index % 97) as $ty * 0.5 - 3.0
+            }
+            fn combine(left: Self, right: Self) -> Self {
+                left + right
+            }
+        }
+    )*};
+}
+
+integer_slot!(i8, i16, i32, i64, u8, u16, u32, u64);
+float_slot!(f32, f64);
+
+impl Slot for half::f16 {
+    fn at(index: usize) -> Self {
+        half::f16::from_f32((index % 97) as f32 * 0.5 - 3.0)
+    }
+    fn combine(left: Self, right: Self) -> Self {
+        left + right
+    }
+}
+
+impl Slot for num_complex::Complex<f32> {
+    fn at(index: usize) -> Self {
+        num_complex::Complex::new(index as f32 * 0.25, (index % 7) as f32 - 3.0)
+    }
+    fn combine(left: Self, right: Self) -> Self {
+        left + right
+    }
+}
+
+impl Slot for num_complex::Complex<f64> {
+    fn at(index: usize) -> Self {
+        num_complex::Complex::new(index as f64 * 0.25, (index % 7) as f64 - 3.0)
+    }
+    fn combine(left: Self, right: Self) -> Self {
+        left + right
+    }
+}
+
+impl Slot for bool {
+    fn at(index: usize) -> Self {
+        index % 3 == 0
+    }
+    fn combine(left: Self, right: Self) -> Self {
+        left | right
+    }
+}
+
+fn check_repeating_run_dtype<T: Slot + Send + Sync>() {
+    let out_shape = [32usize, 8, 4];
+    let count = product(&out_shape);
+    let left: Vec<T> = (0..count).map(T::at).collect();
+    let bias: Vec<T> = (0..4).map(|index| T::at(index * 5 + 1)).collect();
+    let mut specialized = vec![T::at(0); count];
+    assert!(
+        runs2(
+            &mut specialized,
+            &out_shape,
+            &left,
+            &out_shape,
+            &bias,
+            &[4],
+            &T::combine
+        ),
+        "the (4,) bias beside a (32, 8, 4) result must take the specialization ({})",
+        std::any::type_name::<T>()
+    );
+    for (flat, produced) in specialized.iter().enumerate() {
+        assert_eq!(
+            *produced,
+            T::combine(left[flat], bias[flat % 4]),
+            "element {flat} of {:?}",
+            std::any::type_name::<T>()
+        );
+    }
+    // And the ndarray `Zip` reference produces exactly the same elements.
+    RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut generic = vec![T::at(0); count];
+    apply2(
+        &mut generic,
+        &out_shape,
+        &left,
+        &out_shape,
+        &bias,
+        &[4],
+        T::combine,
+    );
+    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(specialized, generic);
+}
+
+#[test]
+fn the_repeating_run_driver_is_dtype_generic() {
+    let _serialized = runs_guard();
+    // All 14 evoxc dtypes through the same driver: it addresses elements and
+    // never touches a value, so every dtype rides the same code.
+    check_repeating_run_dtype::<bool>();
+    check_repeating_run_dtype::<i8>();
+    check_repeating_run_dtype::<i16>();
+    check_repeating_run_dtype::<i32>();
+    check_repeating_run_dtype::<i64>();
+    check_repeating_run_dtype::<u8>();
+    check_repeating_run_dtype::<u16>();
+    check_repeating_run_dtype::<u32>();
+    check_repeating_run_dtype::<u64>();
+    check_repeating_run_dtype::<half::f16>();
+    check_repeating_run_dtype::<f32>();
+    check_repeating_run_dtype::<f64>();
+    check_repeating_run_dtype::<num_complex::Complex<f32>>();
+    check_repeating_run_dtype::<num_complex::Complex<f64>>();
+}
+
+/// NaN and signed zeros ride through the specialization untouched, bit for bit
+/// (the closure owns every semantic, the driver only supplies addresses).
+#[test]
+fn the_repeating_run_driver_keeps_nan_and_signed_zeros() {
+    let _serialized = runs_guard();
+    let out_shape = [16usize, 8, 4];
+    let count = product(&out_shape);
+    let rows: Vec<f32> = (0..count)
+        .map(|index| match index % 6 {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f32::NAN,
+            3 => f32::INFINITY,
+            _ => (index % 11) as f32 - 5.0,
+        })
+        .collect();
+    let bias = [1.0f32, -1.0, f32::NAN, 2.0];
+    let f = |x: f32, y: f32| if x.is_nan() || y.is_nan() { f32::NAN } else { x * y };
+
+    RUNS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut generic = vec![0.0f32; count];
+    apply2(&mut generic, &out_shape, &rows, &out_shape, &bias, &[4], f);
+    RUNS_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut specialized = vec![0.0f32; count];
+    assert!(runs2(
+        &mut specialized,
+        &out_shape,
+        &rows,
+        &out_shape,
+        &bias,
+        &[4],
+        &f
+    ));
+    for (flat, (produced, reference)) in specialized.iter().zip(&generic).enumerate() {
+        let expected = f(rows[flat], bias[flat % 4]);
+        assert_eq!(produced.to_bits(), reference.to_bits(), "element {flat} vs the Zip");
+        assert_eq!(produced.to_bits(), expected.to_bits(), "element {flat} vs the closure");
+    }
+    // A signed zero really is visible in the result (not just "equal" to 0.0).
+    assert!(specialized.iter().any(|value| value.to_bits() == (-0.0f32).to_bits()));
+}
+
+/// The repeating copy behind `fill_broadcast` (`broadcast_to`): whole blocks out
+/// of one tile, and a whole-storage source is one plain copy.
+#[test]
+fn the_repeating_copy_covers_fill_broadcast() {
+    let _serialized = runs_guard();
+    // A `(4,)` source tiled across a (32, 8, 4) target.
+    let source = [1i64, -2, 3, 4];
+    let filled = fill_broadcast(&source, &[4], &[32, 8, 4]);
+    assert_eq!(filled.len(), 32 * 8 * 4);
+    for (flat, produced) in filled.iter().enumerate() {
+        assert_eq!(*produced, source[flat % 4], "element {flat}");
+    }
+    // A source that IS the target is one plain copy of its own storage.
+    let whole: Vec<u16> = (0..32 * 8 * 4).map(|index| index as u16).collect();
+    let filled = fill_broadcast(&whole, &[32, 8, 4], &[32, 8, 4]);
+    assert_eq!(filled, whole);
+    // And a layout that is not a repetition keeps the ndarray `assign`.
+    let middle: Vec<u8> = (0..3).map(|index| index as u8 + 1).collect();
+    let filled = fill_broadcast(&middle, &[3, 1], &[8, 3, 4]);
+    for (flat, produced) in filled.iter().enumerate() {
+        assert_eq!(
+            *produced,
+            middle[reference_slot(&[8, 3, 4], &[3, 1], flat) % 3],
+            "element {flat}"
+        );
+    }
+    assert!(!copy_runs(&mut [0i32; 32], &repeat_view(&[0i32; 1], &[1], &[32]).unwrap()));
+}

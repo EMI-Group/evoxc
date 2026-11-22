@@ -238,12 +238,19 @@ pub fn map3<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
 /// broadcast-free.
 ///
 /// Like [`map1`]/[`map2`] it never zero-fills a result first (a pooled vector
-/// of the exact length is taken when one is available), and the per-element
-/// layout work lives in [`super::broadcast::apply2`] (one ndarray `Zip` pass
-/// over broadcast views, falling back to `walk` for shapes a view cannot
-/// express).  A large enough result is cut along its outermost axis and the
-/// chunks are spread over scoped threads ([`split_rows`]); every element is
-/// still written by exactly one chunk, so the split is bit-identical.
+/// of the exact length is taken when one is available).
+///
+/// An innermost broadcast — a `(n,)` bias beside a `(pop, m, n)` result — goes
+/// to [`super::broadcast::runs2`] FIRST: element `i` of such a result reads one
+/// contiguous run repeating, so whole blocks are written out of one tile.  That
+/// driver is ~10x cheaper per element than the broadcast `Zip` and splits far
+/// later ([`super::broadcast`]'s `RUN_SPLIT_MIN_ELEMS`), so a layout it takes is
+/// not also cut by the row split.  Every other result takes the per-element
+/// layout work in [`super::broadcast::apply2`] (one ndarray `Zip` pass over
+/// broadcast views, falling back to `walk` for shapes a view cannot express),
+/// and a large enough result is cut along its outermost axis and the chunks are
+/// spread over scoped threads ([`split_rows`]); every element is still written
+/// by exactly one chunk, so every path is bit-identical.
 #[allow(clippy::too_many_arguments)]
 pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
     dtype: DType,
@@ -256,6 +263,17 @@ pub fn map2_runs<T: Copy + Sync, U: Copy + Sync, R: Scalar>(
 ) -> Result<Buffer> {
     let count = util_numel(out_shape);
     let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
+    // The repeating-run specialization first: an innermost broadcast (a `(n,)`
+    // bias beside a `(pop, m, n)` result) reads one contiguous run repeating, so
+    // it is written as whole blocks out of one tile instead of a per-element
+    // broadcast `Zip`.  The driver is ~10x cheaper per element than that `Zip`
+    // and splits far later (`broadcast::RUN_SPLIT_MIN_ELEMS`), so a layout it
+    // takes must NOT also be cut by the row split below — which is why the check
+    // sits in front of it.  It declines every layout it does not cover exactly
+    // as the reference driver would answer it.
+    if super::broadcast::runs2(&mut values, out_shape, left, left_shape, right, right_shape, &f) {
+        return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+    }
     match (
         RowSplit::new(out_shape, count),
         rider(left, left_shape, out_shape),
@@ -314,6 +332,21 @@ pub fn map3_runs<P: Copy + Sync, T: Copy + Sync, R: Scalar>(
 ) -> Result<Buffer> {
     let count = util_numel(out_shape);
     let mut values = take_pooled_vec::<R>(count).unwrap_or_else(|| R::zeros(count));
+    // The repeating-run specialization, as in `map2_runs` (and before the row
+    // split for the same reason).
+    if super::broadcast::runs3(
+        &mut values,
+        out_shape,
+        pred,
+        pred_shape,
+        on_true,
+        on_true_shape,
+        on_false,
+        on_false_shape,
+        &f,
+    ) {
+        return Buffer::new(dtype, out_shape.to_vec(), R::into_storage(values));
+    }
     match (
         RowSplit::new(out_shape, count),
         rider(pred, pred_shape, out_shape),
