@@ -1,6 +1,6 @@
 """Benchmark: native CPU engine vs the numpy backend, plus native compile time.
 
-Seven workloads, each one ``@evoxc.defn`` graph:
+Eight workloads, each one ``@evoxc.defn`` graph:
 
 ``ew_chain_1e6``    an 8-op ARITHMETIC elementwise f32 chain over 1e6 elements
 ``ew_transcendental_1e6``  four transcendental ops (tanh/sigmoid/gelu/erf) over
@@ -14,6 +14,12 @@ Seven workloads, each one ``@evoxc.defn`` graph:
 ``tf_softmax_8x128x384``  a transformer-shaped attention block over
                     (8, 128, 384) f32: row max/sum shifts, exp, tanh and gelu
 ``chain_2000``      a ~2000-op elementwise chain over a (64,) f32 array
+``tn_step_pop500``  a shape-faithful approximation of tensorneat 0.2.0's
+                    ``Pipeline.step`` at population 500 (2249 static ops):
+                    last-axis slices, rank-0 gathers, a (50500,) scatter,
+                    random draws, broadcast adds/select.  This is the ONE
+                    workload where the numpy interpreter beats the native
+                    engine — it pins that real regression.
 
 For each workload the script measures
 
@@ -185,6 +191,127 @@ def chain_2000(x):
     return value
 
 
+#: ``tn_step_pop500`` shape inventory — tensorneat 0.2.0's ``Pipeline.step``
+#: scale (500 genomes, 50 genome columns, 100 integer gene slots).
+TN_POP = 500
+TN_LANES = 50
+TN_WIDE = 100
+#: The flat fitness vector the generation step scatters into.
+TN_FLAT = 50_500
+#: Repetitions of the genome-shaped block: 66 lands the traced graph on 2249
+#: static IR ops, matching tensorneat's real generation step (~2245 static /
+#: ~7920 executed ops).
+TN_REPEATS = 66
+
+
+@evoxc.defn
+def tn_step_pop500(genome, genes, scores, flags, flat_pop, proj_w, gate_w):
+    """A SHAPE-FAITHFUL APPROXIMATION of tensorneat 0.2.0's ``Pipeline.step``.
+
+    Not a bit-level replica: it reproduces the per-generation op inventory at
+    the same scale (population 500, 2249 static IR ops against the real
+    graph's ~2245 static / ~7920 executed) so the downstream regression is
+    measurable without the tensorneat repository.
+
+    ``TN_REPEATS`` genome-shaped blocks are traced; one block carries the
+    per-genome work — four last-axis slices ``(500,50,4) -> (500,50,1)``
+    feeding tanh chains, a ``(500,50) @ (50,16)`` dot, a broadcast add of the
+    resulting row sums, a ``random_normal`` draw, an occasional batched
+    ``(500,50,4) @ (4,4)`` dot, and an integer lane (``(500,100,2) ->
+    (500,100,1)`` slice, a rank-0 ``gather`` along axis 2, a ``(500,1,50) ->
+    (500,4,50)`` broadcast, a ``(500,100)+(500,1)`` broadcast add and a
+    bounded integer carry).  Around them sit the once-per-generation ops:
+    ``sort``/``argsort`` over the last axis, a top-16 slice, a broadcast
+    ``select``, one ``scatter`` of a ``(50500,)`` f32 vector and the
+    ``random_uniform``/``random_normal``/``randint`` draws at the measured
+    shapes.
+
+    Every shape is static, and every index/constant array — the ``scatter``
+    index vector, the rank-0 ``gather`` slots and the integer modulus — is
+    built with ``evoxc.constant(evoxc.from_numpy(...))``, so nothing is
+    captured from a closure.  Keys come from
+    ``evoxc.random.split_n(key(seed), 8)``, so the graph is deterministic.
+
+    This is the workload where the numpy interpreter WINS: its slice/reshape
+    are views and its ufuncs/``take`` run over strides, while the native engine
+    pays its per-call slice/gather/scatter/broadcast/random cost.  It pins that
+    real downstream regression; the other seven workloads are native-favourable.
+    """
+    pop, lanes, wide = TN_POP, TN_LANES, TN_WIDE
+    keys = evoxc.random.split_n(evoxc.random.key(20261122), 8)
+    scatter_index = evoxc.constant(
+        evoxc.from_numpy(
+            np.array([(i * 7919 + 13) % TN_FLAT for i in range(TN_FLAT)], np.int32)
+        )
+    )
+    slot = (
+        evoxc.constant(evoxc.from_numpy(np.array(0, np.int32))),
+        evoxc.constant(evoxc.from_numpy(np.array(1, np.int32))),
+    )
+    gene_mod = evoxc.constant(evoxc.from_numpy(np.array(97, np.int32)))
+    acc_f = genome  # (500, 50, 4) f32 genome lane
+    acc_i = flags  # (500, 100) i32 integer lane
+    for step in range(TN_REPEATS):
+        # --- f32 lane: last-axis slices -> tanh -> concat -> small dot ------
+        t0 = evoxc.tanh(evoxc.slice(acc_f, (0, 0, 0), (pop, lanes, 1)))
+        t1 = evoxc.tanh(evoxc.slice(acc_f, (0, 0, 1), (pop, lanes, 1)))
+        t2 = evoxc.tanh(evoxc.slice(acc_f, (0, 0, 2), (pop, lanes, 1)))
+        t3 = evoxc.tanh(evoxc.slice(acc_f, (0, 0, 3), (pop, lanes, 1)))
+        noise = evoxc.random.normal(keys[step % 8], (pop, lanes, 1))
+        mixed = evoxc.add(t1, noise)
+        stacked = evoxc.concatenate((t0, mixed, t2, t3), axis=2)  # (500, 50, 4)
+        proj = evoxc.dot(evoxc.reshape(t0, (pop, lanes)), proj_w)  # (500, 16)
+        gain = evoxc.reshape(
+            evoxc.reduce_sum(proj, axes=(1,), keepdims=True), (pop, 1, 1)
+        )
+        gated = evoxc.dot(stacked, gate_w) if step % 3 == 0 else stacked
+        acc_f = evoxc.add(gated, gain)  # broadcast add -> (500, 50, 4)
+
+        # --- i32 lane: slice -> rank-0 gather -> broadcast -> broadcast add --
+        islice = evoxc.slice(genes, (0, 0, step % 2), (pop, wide, 1))
+        flat_i = evoxc.reshape(islice, (pop, wide))  # (500, 100) i32
+        gath = evoxc.gather(genes, slot[step % 2], axis=2)  # rank-0 index -> (500, 100)
+        col = evoxc.slice(acc_i, (0, 0), (pop, lanes))  # (500, 50) i32
+        bcast = evoxc.broadcast(evoxc.reshape(col, (pop, 1, lanes)), (pop, 4, lanes))
+        brow = evoxc.reshape(
+            evoxc.reduce_sum(bcast, axes=(1,), keepdims=True), (pop, lanes)
+        )
+        badd = evoxc.add(acc_i, evoxc.slice(acc_i, (0, 0), (pop, 1)))  # (500,100)+(500,1)
+        acc_i = evoxc.remainder(
+            evoxc.add(
+                evoxc.add(flat_i, gath),
+                evoxc.add(badd, evoxc.concatenate((brow, col), axis=1)),
+            ),
+            gene_mod,
+        )
+
+    # --- once-per-generation ops -------------------------------------------
+    order = evoxc.argsort(scores, axis=1)  # (500, 50) i32
+    sorted_scores = evoxc.sort(scores, axis=1)  # (500, 50) f32
+    head = evoxc.slice(sorted_scores, (0, 0), (pop, 16))  # (500, 16) f32
+    mask = evoxc.greater(evoxc.reduce_sum(acc_f, axes=(2,), keepdims=True), 0.0)
+    selected = evoxc.select(mask, acc_f, evoxc.multiply(acc_f, 0.5))  # broadcast predicate
+    refreshed = evoxc.random.uniform(keys[0], (pop, lanes, 4), -1.0, 1.0)
+    blended = evoxc.add(selected, refreshed)
+    drawn = evoxc.reshape(
+        evoxc.gather(genes, evoxc.random.randint(keys[1], (1,), 0, 2), axis=2),
+        (pop, wide),
+    )
+    scattered = evoxc.scatter(flat_pop, scatter_index, evoxc.multiply(flat_pop, 0.5))
+    wide_noise = evoxc.random.normal(keys[2], (pop, wide, 1))
+    return (
+        evoxc.reduce_sum(blended, axes=(1, 2)),
+        evoxc.reduce_sum(acc_i, axes=(1,)),
+        evoxc.reduce_sum(head, axes=(1,)),
+        evoxc.add(
+            evoxc.reduce_sum(scattered),
+            evoxc.reduce_sum(evoxc.cast(evoxc.greater(order, 0), evoxc.float32)),
+        ),
+        evoxc.reduce_sum(wide_noise, axes=(1, 2)),
+        evoxc.reduce_sum(evoxc.cast(drawn, evoxc.float32), axes=(1,)),
+    )
+
+
 @dataclass
 class Workload:
     name: str
@@ -204,6 +331,15 @@ def build_workloads() -> list:
     rows = rng.standard_normal((4096, 64)).astype(np.float32)
     activations = rng.standard_normal((8, 128, 384)).astype(np.float32)
     small = rng.standard_normal(64).astype(np.float32)
+    # tn_step_pop500 inputs (drawn AFTER the seven existing workloads, so their
+    # data stays byte-identical).
+    genome = rng.standard_normal((TN_POP, TN_LANES, 4)).astype(np.float32)
+    genes = rng.integers(0, 3, (TN_POP, TN_WIDE, 2)).astype(np.int32)
+    scores = rng.standard_normal((TN_POP, TN_LANES)).astype(np.float32)
+    flags = rng.integers(-4, 5, (TN_POP, TN_WIDE)).astype(np.int32)
+    flat_pop = rng.standard_normal(TN_FLAT).astype(np.float32)
+    proj_w = rng.standard_normal((TN_LANES, 16)).astype(np.float32)
+    gate_w = rng.standard_normal((4, 4)).astype(np.float32)
     return [
         Workload("ew_chain_1e6", ew_chain_1e6, (evoxc.TensorSpec((1_000_000,), f32),) * 2, (big, big_other)),
         Workload(
@@ -235,6 +371,21 @@ def build_workloads() -> list:
             (evoxc.TensorSpec((64,), f32),),
             (small,),
             note="the compile-time target workload",
+        ),
+        Workload(
+            "tn_step_pop500",
+            tn_step_pop500,
+            (
+                evoxc.TensorSpec((TN_POP, TN_LANES, 4), f32),
+                evoxc.TensorSpec((TN_POP, TN_WIDE, 2), evoxc.int32),
+                evoxc.TensorSpec((TN_POP, TN_LANES), f32),
+                evoxc.TensorSpec((TN_POP, TN_WIDE), evoxc.int32),
+                evoxc.TensorSpec((TN_FLAT,), f32),
+                evoxc.TensorSpec((TN_LANES, 16), f32),
+                evoxc.TensorSpec((4, 4), f32),
+            ),
+            (genome, genes, scores, flags, flat_pop, proj_w, gate_w),
+            note="tensorneat-shape generation step: slice/gather/scatter/random — native LOSES here",
         ),
     ]
 
