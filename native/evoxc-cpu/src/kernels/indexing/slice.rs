@@ -299,6 +299,95 @@ mod tests {
         );
     }
 
+    /// The frame-free reference: normalize the ranges, then read every output
+    /// element with plain `i64` offset arithmetic and nested loops.
+    fn reference(values: &[f32], strides: &[usize], ranges: &[DimSlice]) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut index = vec![0usize; ranges.len()];
+        let total: usize = ranges.iter().map(|range| range.extent).product();
+        for _ in 0..total {
+            let mut offset = 0i64;
+            for (axis, range) in ranges.iter().enumerate() {
+                offset += (range.start + index[axis] as i64 * range.step) * strides[axis] as i64;
+            }
+            out.push(values[offset as usize]);
+            for axis in (0..ranges.len()).rev() {
+                index[axis] += 1;
+                if index[axis] < ranges[axis].extent {
+                    break;
+                }
+                index[axis] = 0;
+            }
+        }
+        out
+    }
+
+    /// Every fast-path shape the collapsed-stride copy takes — one column of a
+    /// 3-D operand (ONE strided run), a partially selected trailing axis (short
+    /// contiguous runs), a stepped middle axis and a fully contiguous block —
+    /// must reproduce the plain offset walk element for element.
+    #[test]
+    fn slice_fast_paths_match_an_elementwise_reference() {
+        let shape = [4usize, 3, 5];
+        let values: Vec<f32> = (0..60).map(|value| value as f32 * 0.5).collect();
+        let x = f32_buffer(&shape, &values);
+        let strides = util::c_strides(&shape);
+        let cases: [(&[i64], &[i64], &[i64], &[usize]); 6] = [
+            // one column of a 3-D operand: a single 12-element stride-15 run
+            (&[0, 0, 2], &[4, 3, 3], &[1, 1, 1], &[4, 3, 1]),
+            // three of five trailing elements: 12 runs of 3
+            (&[0, 0, 1], &[4, 3, 5], &[1, 1, 1], &[4, 3, 4]),
+            // a stepped middle axis on top of a whole trailing axis
+            (&[0, 0, 0], &[4, 3, 5], &[1, 2, 1], &[4, 2, 5]),
+            // a stepped trailing axis (a strided gather, not a contiguous run)
+            (&[0, 0, 0], &[4, 3, 5], &[1, 1, 2], &[4, 3, 3]),
+            // fully contiguous interior block
+            (&[1, 0, 0], &[3, 2, 5], &[1, 1, 1], &[2, 2, 5]),
+            // a negative step over a one-element axis stays on the fast path
+            (&[0, 0, 4], &[4, 3, 3], &[1, 1, -1], &[4, 3, 1]),
+        ];
+        for (starts, limits, steps, declared_shape) in cases {
+            let op = spec(attrs(&[
+                ("start_indices", evoxc_core::AttrValue::Ints(starts.to_vec())),
+                ("limit_indices", evoxc_core::AttrValue::Ints(limits.to_vec())),
+                ("strides", evoxc_core::AttrValue::Ints(steps.to_vec())),
+            ]));
+            let ranges = slice_ranges(&op, &shape).unwrap();
+            let out = slice(&x, &ranges, &declared(declared_shape)).unwrap();
+            assert_eq!(out.shape, declared_shape, "cases {starts:?}/{steps:?}");
+            match &out.storage {
+                Storage::F32(copied) => {
+                    assert_eq!(*copied, reference(&values, &strides, &ranges), "cases {starts:?}/{steps:?}");
+                }
+                other => panic!("unexpected storage {other:?}"),
+            }
+        }
+    }
+
+    /// A nonzero `start` on every axis of the plan still lands on the right
+    /// element: the base offset is the sum of `start x source stride`.
+    #[test]
+    fn slice_offsets_are_relative_to_every_axis_start() {
+        let shape = [3usize, 4];
+        let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let x = f32_buffer(&shape, &values);
+        let op = spec(attrs(&[
+            ("start_indices", evoxc_core::AttrValue::Ints(vec![1, 2])),
+            ("limit_indices", evoxc_core::AttrValue::Ints(vec![3, 4])),
+            ("strides", evoxc_core::AttrValue::Null),
+        ]));
+        let ranges = slice_ranges(&op, &shape).unwrap();
+        let out = slice(&x, &ranges, &declared(&[2, 2])).unwrap();
+        assert_eq!(out.storage, Storage::F32(vec![6., 7., 10., 11.]));
+        assert_eq!(
+            match &out.storage {
+                Storage::F32(copied) => copied.clone(),
+                other => panic!("unexpected storage {other:?}"),
+            },
+            reference(&values, &util::c_strides(&shape), &ranges)
+        );
+    }
+
     #[test]
     fn slice_row_copy_accepts_a_runtime_dynamic_result_dim() {
         // The row-copy fast path is driven by the DECLARED shape, so a dynamic
