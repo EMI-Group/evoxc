@@ -1,40 +1,44 @@
-"""Differential parity harness: native `batch_functions` vs the Python merge.
+"""Differential parity harness: the native `batch_functions` FFI vs the Python merge.
 
 The native merge engine lives in `evoxc-compiler` (`src/batch_functions/`) and is
-exposed to Python as ``evoxc._evoxc_native.batch_functions``.  The PyO3 entry
-point is a SEPARATE follow-up (``native/evoxc-python``); this harness is written
-against it and runs cleanly today:
+exposed to Python as ``evoxc._evoxc_native.batch_functions`` by
+``native/evoxc-python``; this harness drives that live entry point against the
+``evoxc.batch_functions`` frontend.
 
-* **native FFI absent** — the corpus is still fully exercised on the Python
-  side: every merged graph is verified, its 12-key report is type-checked, the
-  merged graph is executed through the explicit numpy pipeline and compared
-  ROW BY ROW against the per-function runs, and the documented invariants
-  (identical programs emit no ``select``, ``bands=1`` matches ``bands=None``,
-  the pinned auto costs) are asserted.  The run ends with an explicit SKIP line.
-* **native FFI present** — every case additionally runs the SAME merge through
-  ``merge_native.batch_functions(envelopes, config)`` and compares
-  (a) the STRUCTURE of the resulting module (function name/metadata,
-      block-argument types, op-name sequence, canonicalized attributes with
-      ndarray payloads by dtype/shape/raw bytes, operand/result references
-      remapped to defining-position-or-block-argument indices, terminator
-      operand references),
-  (b) the NUMBERS (both graphs through the explicit numpy pipeline on identical
-      seeded arrays, leaf by leaf), and
-  (c) the ``BatchReport`` (the exact 12-key payload).
+Every case runs the SAME merge through
+``merge_native.batch_functions(envelopes, config)`` and the Python frontend and
+compares
 
-  ``config`` mirrors `native/evoxc-compiler/src/batch_functions::BatchFunctionsConfig`:
-  ``{"axes": [0, null, ...], "out_axes": [0, ...], "switch_ops": ..., "bands":
-  ..., "alignment": "..."}``.  The Python public API takes its axes/out_axes as
-  PYTREES, but the FFI only sees programs (no Python tree), so the harness
-  flattens them to ONE ENTRY PER TENSOR LEAF — ``0`` maps the leading function
-  axis, ``null`` leaves the value unmapped — exactly the native
-  ``Vec<Option<i64>>`` shape.  ``switch_ops`` is ``null``/``true`` or the
-  group list (``[["add", "subtract"]]`` / ``["elementwise"]``), ``bands`` is
-  ``null``/an int/``"auto"``, ``alignment`` its canonical string.
+(a) the STRUCTURE of the resulting module (function name/metadata,
+    block-argument types, op-name sequence, canonicalized attributes with
+    ndarray payloads by dtype/shape/raw bytes, operand/result references
+    remapped to defining-position-or-block-argument indices, terminator
+    operand references),
+(b) the NUMBERS (both graphs through the explicit numpy pipeline on identical
+    seeded arrays, leaf by leaf), and
+(c) the ``BatchReport`` (the exact 12-key payload).
+
+``config`` mirrors `native/evoxc-compiler/src/batch_functions::BatchFunctionsConfig`:
+``{"axes": [0, null, ...], "out_axes": [0, ...], "switch_ops": ..., "bands":
+..., "alignment": "..."}``.  The Python public API takes its axes/out_axes as
+PYTREES, but the FFI only sees programs (no Python tree), so the harness
+flattens them to ONE ENTRY PER TENSOR LEAF — ``0`` maps the leading function
+axis, ``null`` leaves the value unmapped — exactly the native
+``Vec<Option<i64>>`` shape.  ``switch_ops`` is ``null``/``true`` or the
+group list (``["add", "subtract"]`` / ``["elementwise"]``), ``bands`` is
+``null``/an int/``"auto"``, ``alignment`` its canonical string.
 
 The comparison self-checks prove the comparator can say "no" (a changed op
 name, attribute, operand reference, dtype or output reference is detected; a
 perturbed / retyped / reshaped / re-arity'd numeric leaf is detected).
+
+The only SKIP is a missing prerequisite: when the built
+``evoxc/_evoxc_native.abi3.so`` (or the ``.venv`` it is loaded through) is
+absent, the harness prints ``SKIP: ...`` and exits 0 — build it with
+``source scripts/dev-env.sh && scripts/build-native.sh --debug``.  Should a
+loaded extension expose no ``batch_functions`` symbol (a stale build), the
+corpus still runs the Python merge checks and the run reports the cases as
+skipped instead of passing silently.
 
 Run it directly (the cargo gate does exactly this)::
 
@@ -45,8 +49,10 @@ Run it directly (the cargo gate does exactly this)::
 on a usage error; the last lines are::
 
     BATCH PARITY: <cases> cases, <checks> checks, <mismatches> mismatches
-    BATCH PARITY: <n> cases skipped (native FFI not implemented)   # skip mode
-    SKIP: native evoxc._evoxc_native.batch_functions is not implemented yet; ...
+
+and, in the missing-symbol fallback only, a trailing
+``BATCH PARITY: <n> cases skipped (native FFI not implemented)`` plus a
+``SKIP:`` line.
 """
 from __future__ import annotations
 

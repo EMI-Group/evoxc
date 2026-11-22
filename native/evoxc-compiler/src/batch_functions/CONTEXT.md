@@ -117,7 +117,7 @@ impl BatchReport { pub fn to_json(&self) -> serde_json::Value; }
   A class costs `DISPATCH_COST + op_work * rows` per distinct variant plus `DISPATCH_COST + result_elements * band_size` per extra variant (the select mux), where `rows = band_size` when the variant's operands are row-dependent and 1 otherwise.
   Row dependence propagates through operand slots and is seeded by a mapped input leaf, a switch class, and a STACKED constant class.
   `CONSTANT_COST` is paid per reachable constant class.
-  A multi-band partition adds `BAND_OVERHEAD * band_count`. Memoize per-band costs in the auto planner.
+  A MULTI-band partition (`partition.len() > 1`) adds `BAND_OVERHEAD * band_count` — one overhead per band, the FIRST band included; a single-band partition adds no overhead. This is the authoritative statement of the overhead formula. Memoize per-band costs in the auto planner.
 * Band emission: every band gets its own `MergeDag` over its programs and emits into the SAME builder with band-local input views. A mapped input view is materialized lazily, once per `(band, leaf)`: a `slice` when the band is contiguous and every trailing dim is a static int, otherwise a `gather` with one int32 row-index constant. Unmapped inputs use the block argument itself. The band index map makes `SwitchRecord.rows_per_variant` global.
 * Combine: concatenate the per-band outputs along axis 0 (broadcast an unmapped band output to `(band_size, *shape)` first); when the partition's concatenation order is not `0..n-1`, re-permute once with one shared int32 inverse-index constant via `gather`.
 * `Bands != Flat` rejects any `out_axes=None` output leaf with the exact Python message (checked after the op-batchability check, before the partition).
