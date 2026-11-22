@@ -84,26 +84,26 @@ Reading of the numbers, which is load- and shape-dependent:
 
 ## Optimizations
 
-- **Recycled storage pool (`buffer.rs`):** a thread-local free list of large result storages — `impl Drop for Storage` hands an allocation of at least `POOL_MIN_BYTES` (4 KiB) back to the pool instead of to `malloc`, and `take_pooled_vec::<R>(count)` hands a stock of exactly the requested `(dtype, element count)` out again, which removes the per-op mmap/page-fault cost on many-small-op graphs.
+- **Recycled storage pool (`buffer/pool.rs`):** a thread-local free list of large result storages — `impl Drop for Storage` hands an allocation of at least `POOL_MIN_BYTES` (4 KiB) back to the pool instead of to `malloc`, and `take_pooled_vec::<R>(count)` hands a stock of exactly the requested `(dtype, element count)` out again, which removes the per-op mmap/page-fault cost on many-small-op graphs.
 - Retention is bounded per thread: at most `POOL_MAX_ENTRIES` (64) values totalling `POOL_MAX_BYTES` (64 MiB), and at most `POOL_MAX_PER_SIZE` (8) stocks of any one exact size class.
 - A full size class evicts its own least-recently-used stock rather than refusing the incoming buffer, and admission evicts across size classes by least recent use, so a preceding unrelated workload can never starve the one that is running.
 - A pooled vector is only handed to a caller that overwrites every element (the flat maps gate on an exact length match), so no stale value can reach a result; the pool is thread-local and never shared or synchronized.
 - **Plan-time specialization (`plan.rs`):** a `constant` op's payload is decoded into a `Buffer` once at compile time (`Step.constant`), so a run clones a buffer instead of re-decoding the same bytes, and a plan-time constant is permanently excluded from the in-place candidates.
 - Each result's static `(dtype, shape)` is precomputed at compile time (`Step.fast`, `None` for a symbolic or dynamic dim), so a run does not re-evaluate `Dim`s or `DimExpr`s for a static result.
 - `Step.in_place` records a dying, uniquely-ownable operand that a kernel may overwrite; the plan only marks a binary elementwise op whose two operands are distinct and whose declared types equal the result type, and never a block argument, a `return` operand or a plan-time constant.
-- **In-place accumulation (`exec.rs::try_in_place`, `kernels/elementwise.rs::accumulate_as` / `zip2_accumulate`):** the whitelisted kinds `add`, `subtract`, `multiply`, `divide`, `maximum` and `minimum` accumulate into a freed operand when liveness proves nobody else reads it, and the run falls back to the allocating kernel when the buffer is still shared.
+- **In-place accumulation (`exec.rs::try_in_place`, `kernels/elementwise/binary.rs::accumulate_as` / `buffer/zipmap.rs::zip2_accumulate`):** the whitelisted kinds `add`, `subtract`, `multiply`, `divide`, `maximum` and `minimum` accumulate into a freed operand when liveness proves nobody else reads it, and the run falls back to the allocating kernel when the buffer is still shared.
 - The kind is dispatched ONCE per call into monomorphic arms (`arm!(Add, Sub, Mul, Div, Max, Min)`), so LLVM still auto-vectorizes the loop; a per-element `match` on the kind defeats vectorization, which is why the dispatch is arm-for-arm.
-- **Contiguous dense fast paths (`kernels/elementwise.rs`):** a `Layout` probe picks `Flat`, `Scalar` or `Broadcast` per operand, and the flat arms — `dense_unary`, `dense_binary` / `dense_binary_left_scalar` / `dense_binary_right_scalar` (the 13 arithmetic, bitwise and shift kinds) and `dense_compare` / `dense_compare_right_scalar` / `dense_compare_left_scalar` — run one auto-vectorized typed-slice loop through `map1`/`map2`/`map3`, with the kind dispatched once per call.
-- `select` (`select_apply`) gates the same broadcast-free case on `Buffer::is_flat_for` and maps with `map3`, and `cast` converts whole storages elementwise (`convert_generic` in `buffer.rs`), so the whole comparison/cast/select family stays on typed slices.
+- **Contiguous dense fast paths (`kernels/elementwise/{binary,compare,unary}.rs`):** a `Layout` probe picks `Flat`, `Scalar` or `Broadcast` per operand, and the flat arms — `dense_unary`, `dense_binary` / `dense_binary_left_scalar` / `dense_binary_right_scalar` (the 13 arithmetic, bitwise and shift kinds) and `dense_compare` / `dense_compare_right_scalar` / `dense_compare_left_scalar` — run one auto-vectorized typed-slice loop through `map1`/`map2`/`map3`, with the kind dispatched once per call.
+- `select` (`select_apply`) gates the same broadcast-free case on `Buffer::is_flat_for` and maps with `map3`, and `cast` converts whole storages elementwise (`convert_generic` in `buffer/storage.rs`), so the whole comparison/cast/select family stays on typed slices.
 - Each fast path builds its result storage from the mapped iterator instead of zero-filling it first, and takes a pooled vector when one of the exact length is available.
 - Broadcasting, non-contiguous layouts and the remaining dtypes keep the general `walk`/`apply1..3` driver with identical semantics (NaN propagation, integer wraparound and complex arithmetic unchanged).
-- **Wide maps split over scoped threads (`buffer.rs::split_parallel`):** one `std::thread::scope` per wide kernel call over disjoint contiguous output ranges, gated at `PARALLEL_MIN_ELEMS` (2^18 elements) with one thread per `PARALLEL_MIN_PER_THREAD` (2^17) elements and capped at `PARALLEL_MAX_THREADS` (4).
+- **Wide maps split over scoped threads (`buffer/parallel.rs::split_parallel`):** one `std::thread::scope` per wide kernel call over disjoint contiguous output ranges, gated at `PARALLEL_MIN_ELEMS` (2^18 elements) with one thread per `PARALLEL_MIN_PER_THREAD` (2^17) elements and capped at `PARALLEL_MAX_THREADS` (4).
 - Each thread reads its own operand window at its own running offset, so results are identical to the single-threaded loop; there is no rayon and no global pool.
 - **Reductions:** a contiguous-block fast path (`Block`) where the reduced axes form one block, folding `outer × red × inner` groups with no per-element offset table, and an 8-lane (`LANE_COUNT`) unrolled `fold_run` whose independent accumulators break the sequential dependency chain (f16 and complex keep the single-lane sequential order their tolerance requires).
 - Max/min folds go through the NaN-propagating `Scalar::max`/`min`, seeded from each run's first element (`fold_groups` with no identity), and the arg reductions pick their scan by run length: `arg_run_branchless` below `ARG_BRANCHY_MIN_RUN` (1024) elements and the plain `arg_run_branchy` scan at or above it.
 - **Sorting:** a packed monotone row key `(rank_key << 32) | slot` with `u32` positions, so one `u64` comparison orders both the value and its index for `sort` and `argsort`.
 - Extents of 2..=`NETWORK_MAX` (16) run branchless Batcher odd-even networks of their own pad width (2/4/8/16 keys, `PAD_KEY = u64::MAX` sentinel) with every comparator index a literal; every extent outside that range keeps `sort_unstable`.
-- **`dot` threading (`kernels/linalg.rs`):** the BLAS-3 call splits row strips of each batch block round-robin across scoped threads — so a batch of many blocks spreads over the batch axis too — above `GEMM_PARALLEL_MIN_BLOCK_WORK` / `GEMM_PARALLEL_MIN_WORK`, one thread per `GEMM_PARALLEL_WORK_PER_THREAD` multiply-adds, capped at `GEMM_PARALLEL_MAX_THREADS` (8) below `GEMM_WIDE_WORK` and unbounded above it, and never more threads than row strips.
+- **`dot` threading (`kernels/linalg/matmul.rs`):** the BLAS-3 call splits row strips of each batch block round-robin across scoped threads — so a batch of many blocks spreads over the batch axis too — above `GEMM_PARALLEL_MIN_BLOCK_WORK` / `GEMM_PARALLEL_MIN_WORK`, one thread per `GEMM_PARALLEL_WORK_PER_THREAD` multiply-adds, capped at `GEMM_PARALLEL_MAX_THREADS` (8) below `GEMM_WIDE_WORK` and unbounded above it, and never more threads than row strips.
 - Every output element is still produced by exactly one `gemm_into` call with an untouched K axis, so the threaded result is bit-identical to the single-threaded one.
 - **Structure/indexing:** a `tile` that repeats the whole source builds its storage with `repeat_storage` (one `copy_from_slice` per run-length chunk rather than one per index row, split over the same scoped threads), and contiguous block copies (`gather`/`slice`/`tile`) go through `copy_blocks` with the pre-filled `block_storage_filled` builder instead of a zero fill plus growth.
 - **Outputs freed before extraction:** a value is released from the flat store at its last use and the run clears what is left of the store before pulling the output buffers out, so an output is moved out of its `Rc` instead of copied (a value returned twice still copies), and the intermediates released there hand their storage back to the pool.
@@ -112,12 +112,12 @@ Reading of the numbers, which is load- and shape-dependent:
 ## Constraints
 
 - Depends on `evoxc-core` only — never `evoxc-compiler`, `evoxc-runtime`, `evoxc-python` or PyO3. Third-party deps: `half` (f16), `num-complex` (complex), `libm` (`erf`, `ln_1p`), `nalgebra` (linalg), `serde_json` (`block_call.static_args`) and `matrixmultiply` — the ONE performance dependency, a pure-Rust BLAS-3 microkernel used only by `dot`'s f32/f64 fast path (its threading feature is off, so one call is single-threaded and any parallelism comes from the engine's own scoped split).
-- No `unsafe` logic of our own: the crate's only `unsafe` is the two `matrixmultiply` kernel calls, one macro-generated call site per float dtype in `kernels/linalg.rs`, each carrying a `SAFETY` argument that the three slices are exactly `m·k`/`k·n`/`m·n` long and the output is a fresh allocation that aliases neither input.
+- No `unsafe` logic of our own: the crate's only `unsafe` is the two `matrixmultiply` kernel calls, one macro-generated call site per float dtype in `kernels/linalg/matmul.rs`, each carrying a `SAFETY` argument that the three slices are exactly `m·k`/`k·n`/`m·n` long and the output is a fresh allocation that aliases neither input.
 - Threading policy: scoped threads live inside one kernel call only — never a persistent pool, never a background worker, never `rayon` — gated by the real work thresholds (`PARALLEL_MIN_ELEMS` / `PARALLEL_MIN_PER_THREAD` for flat maps, `GEMM_PARALLEL_MIN_WORK` / `GEMM_PARALLEL_MIN_BLOCK_WORK` / `GEMM_PARALLEL_WORK_PER_THREAD` for `dot`), and results are unchanged because each thread owns a disjoint output range and reads only its own operand window.
 - The storage pool is thread-local and never shared or synchronized, so no lock and no cross-thread allocation exists.
 - User errors are `Result` values — no `unwrap`/`expect` on user input, no panics on malformed graphs; a shape or dtype the fast path does not cover falls back to the general kernel, never to an error.
 - Result types and shapes come from the graph; never re-infer, and always validate produced buffers against `OpSpec.result_types`.
-- One file per op category, each around ~1000 lines (test modules included; `kernels/indexing.rs`, `kernels/elementwise.rs`, `kernels/sorting.rs`, `kernels/reductions.rs`, `kernels/random.rs` and `kernels/linalg.rs` run over it because their per-op unit tests live inline). `power`'s scalar-exponent specialisation is the one split-out category module, `kernels/pow.rs`.
+- One concern per file, target <~1000 lines including inline tests; a category that outgrows that becomes a module directory (`kernels/{elementwise,indexing,structure,sorting,reductions,linalg,linalg_aux,random}/`, `buffer/`) with a thin `mod.rs` holding `pub fn register` and the re-exports the rest of the crate reaches, one submodule per op family or shared mechanism, and a `#[cfg(test)] mod test_support`/`test_util` for fixtures sibling test modules share. `power`'s scalar-exponent specialisation is the one split-out category module, `kernels/pow.rs`.
 - `cargo test -p evoxc-cpu` and `cargo clippy --workspace --all-targets --no-deps -- -D warnings` must stay clean.
 
 ## Test strategy
@@ -126,7 +126,7 @@ Reading of the numbers, which is load- and shape-dependent:
 - In-crate `#[cfg(test)]` per module: **248 lib tests (1 ignored)** plus 13 in the `tests/nullable_attrs.rs` integration target (nullable JSON-`null` attributes end-to-end) — kernel numerics (promotions, NaN/complex/rounding edge cases, error cases), symbolic-dim binding and the `DimExpr` failure modes, control flow (nested regions, multi-carry loops, recursion depth), the bit-exact random vectors for all three algorithms, collectives, plus the two registry-inventory tests that pin `unsupported_ops()` to empty.
 - The performance paths have their own pins: the storage pool's retention and eviction policy (`stocks_are_retained_per_size_up_to_the_per_size_cap`, `a_full_size_class_keeps_its_newest_stocks`, `the_pool_evicts_the_least_recently_used_other_size_class`, `a_differently_sized_predecessor_does_not_starve_later_workloads`, `a_stock_larger_than_the_byte_cap_is_refused_and_evicts_nothing`, `a_recycled_result_is_fully_overwritten`, `stock_reuse_is_last_in_first_out`), the scoped split (`the_thread_split_hands_every_chunk_its_running_offset`, `threaded_chunks_read_their_operands_at_their_own_offset`, `the_thread_split_scales_with_the_work_per_thread`), in-place accumulation against the allocating path (`in_place_accumulation_matches_the_allocating_map`, `in_place_accumulation_is_bit_identical_to_the_allocating_path`, plus the plan's `a_dying_broadcast_free_operand_is_the_in_place_target` / `a_constant_payload_is_never_an_in_place_target`), the reduction lane and arg-scan paths (`long_integer_sums_are_bit_exact_under_the_lane_split`, `multi_accumulator_max_and_min_propagate_nan_in_a_long_run`, `the_two_arg_scans_agree_on_short_and_long_runs`) and the sorting networks against `sort_unstable` (`the_network_covers_only_the_extents_it_wins_at`, `matches_the_reference_across_the_network_extents`, `matches_the_reference_past_the_network_ceiling`).
 - The one `#[ignore]`d test is `bench_thread_crossover`, a measurement aid that prints the per-element cost of a flat `add` at several sizes and thread counts (it is what `PARALLEL_MIN_ELEMS` is chosen from), run with `cargo test --release -p evoxc-cpu bench_thread_crossover -- --ignored --nocapture`.
-- Python parity harness `../tools/parity_cpu.py` (needs `scripts/build-native.sh` first and a `.venv`): 63 cases over elementwise/reductions/indexing/linalg/control-flow/random/dynamic-shape graphs, comparing `NativeProgram` against the numpy backend — **63 passed, 0 failed**; exact for bool/int, `rtol 1e-5 / atol 1e-6` for f16/f32/c64 and `1e-12/1e-13` for f64/c128, with bit-exact RNG leaves (`PASS~` only for f32 `normal`, the documented 1-ulp Box–Muller window) and error parity when both sides raise.
+- Python parity harness `../tools/parity_cpu.py` (needs `scripts/build-native.sh` first and a `.venv`): **71 cases, 71 passed, 0 failed, 0 skipped** over elementwise/reductions/indexing/linalg/control-flow/random/dynamic-shape graphs plus the error and extension-resolver cases (elementwise 14, reductions 5, indexing 17, linalg 13, control-flow 5, random 9, dynamic 8), comparing `NativeProgram` against the numpy backend; exact for bool/int, `rtol 1e-5 / atol 1e-6` for f16/f32/c64 and `1e-12/1e-13` for f64/c128, with bit-exact RNG leaves (`PASS~` only for a f32 `normal` leaf, the documented 1-ulp Box–Muller window) and error parity when both sides raise.
 - `../tools/bench_cpu.py` reproduces the table above.
 - Tests never require a GPU, the network or Python (the Python harnesses are separate scripts, not cargo tests).
 
@@ -155,12 +155,73 @@ Reading of the numbers, which is load- and shape-dependent:
 | `./src/lib.rs` | Module wiring, `run_program` / `evaluate`, the callback-requirement pre-flight. |
 | `./src/plan.rs` | `compile(&Program) -> Plan`: `OpSpec`, `Step` (kernel, operand/result ids, liveness free list, per-result static-`(dtype, shape)` marker, plan-time decoded `constant` payload, in-place slot), `InPlace`, `BlockPlan`, `FunctionPlan`, `Plan::text()`, unsupported-op rejection. |
 | `./src/exec.rs` | `RunCtx` (flat store, last-use release, region execution, dim binding, result validation, the `try_in_place` accumulate path), `Callbacks`, `RunOptions`, `Value`. |
-| `./src/buffer.rs` | `Storage` (14 dtypes) and its recycled-storage pool (`POOL_*` caps, `take_pooled_vec`), `Buffer`, broadcasting + the `walk`/`apply1..3` drivers, the flat `zip1..3`/`zip2_accumulate`/`map1..3` builders, the scoped thread split (`split_parallel`, `PARALLEL_*`) and the block/repeat storage builders. |
+| `./src/buffer/` | The typed value representation, one submodule per mechanism: `mod.rs` (`Buffer` + impl, `shape_text`, the crate-internal re-exports), `storage.rs` (`Storage` over all 14 dtypes, little-endian decode, `cast_storage`/`convert_generic`), `broadcast.rs` (`broadcast_shape`/`broadcast_strides`/`walk`/`apply1..3`/`broadcast_to`), `zipmap.rs` (the flat `zip1..3`/`zip2_accumulate`/`map1..3` builders), `parallel.rs` (`PARALLEL_*`, `split_parallel`, `window`), `pool.rs` (`POOL_*` caps, `StoragePool`, `take_pooled_vec`, the `Drop` impls), `blocks.rs` (`copy_blocks`, `block_storage*`, `repeat_storage`), `test_support.rs` (the one shared `#[cfg(test)]` fixture). |
 | `./src/scalar.rs` | `Scalar` / `Num` / `ScalarValue` and the per-dtype numpy-semantics impls. |
 | `./src/dims.rs` | Symbolic-dim binding and `DimExpr` evaluation (the `shapes.py` contract). |
 | `./src/kernels/mod.rs` | `DENSE_OPS`, the kernel registry, `unsupported_ops()`, the registry-inventory tests. |
-| `./src/kernels/{elementwise,reductions,sorting,indexing,structure,linalg,linalg_aux,random,control,collective}.rs` | Per-category kernels (each file owns its op set and its inline unit tests). `linalg.rs` also holds `dot`'s threaded `matrixmultiply` BLAS-3 fast path and its guard. |
+| `./src/kernels/{elementwise,indexing,structure,sorting,reductions,linalg,linalg_aux,random}/` | Per-category kernels as module directories: each `mod.rs` holds `pub fn register`, the kernel-level dispatch, the re-exports other files reach and its inline tests, with one submodule per op family or shared mechanism (submodule map below). `linalg/matmul.rs` holds `dot`'s threaded `matrixmultiply` BLAS-3 fast path and its `SAFETY` guards. |
 | `./src/kernels/pow.rs` | `power`'s scalar-exponent specialisation (`PowBase`/`powi`/`PowScalar`/`pow_scalar`), the negative-integer-exponent guard and its unit tests; private to `kernels`. |
 | `./src/kernels/util.rs` | Axis normalization, dtype/shape helpers, shared result-shape lookup (genuinely shared vocabulary only). |
-| `../tools/parity_cpu.py` | Python parity harness against the numpy backend (63 cases). |
+| `../tools/parity_cpu.py` | Python parity harness against the numpy backend (71 cases). |
 | `../tools/bench_cpu.py` | Native-vs-numpy benchmark, the source of the table above. |
+
+### Module layout (one line per submodule)
+
+Each `mod.rs` keeps `pub fn register` plus the re-exports the rest of the crate reaches, so no `use` path outside a directory changed when it was split.
+
+- `buffer/mod.rs` — `Buffer` + impl, `shape_text`, the re-exports.
+- `buffer/storage.rs` — `Storage` over the 14 dtypes, LE decode, `cast_storage`/`convert_generic`.
+- `buffer/broadcast.rs` — `broadcast_shape`/`broadcast_strides`/`walk`/`apply1..3`/`broadcast_to`/`broadcast_vec`.
+- `buffer/zipmap.rs` — `zip1..3`, `zip2_accumulate`, `map1..3`.
+- `buffer/parallel.rs` — `PARALLEL_*`, `parallel_threads`, `split_parallel`, `window`.
+- `buffer/pool.rs` — `POOL_*`, `StoragePool`, `take_pooled_vec`, `Drop for Storage`.
+- `buffer/blocks.rs` — `copy_blocks`, `block_storage`, `block_storage_filled`, `repeat_storage`.
+- `buffer/test_support.rs` — the shared `#[cfg(test)]` fixture.
+- `kernels/elementwise/mod.rs` — registry, the `stop_gradient`/`cast`/`broadcast` kernels, the `in_place_kernel` re-export.
+- `kernels/elementwise/binary.rs` — `BinKind`, the dense binary drivers (arithmetic/bitwise/shift), the in-place accumulate path.
+- `kernels/elementwise/compare.rs` — the comparisons and `select`.
+- `kernels/elementwise/unary.rs` — `UnKind` and the unary drivers.
+- `kernels/elementwise/transcendental.rs` — `erf`, `gelu`, `nan_to_num` and their fixups.
+- `kernels/indexing/mod.rs` — registry plus the shared index vocabulary (bounds, integer indices, block builders).
+- `kernels/indexing/reshape.rs` — `reshape`, `transpose`.
+- `kernels/indexing/slice.rs` — `slice` (bounds, strides, row blocks).
+- `kernels/indexing/gather.rs` — `gather`.
+- `kernels/indexing/scatter.rs` — `scatter`.
+- `kernels/indexing/concatenate.rs` — `concatenate`.
+- `kernels/indexing/test_support.rs` — the shared `#[cfg(test)]` builders.
+- `kernels/structure/mod.rs` — registry, dispatch, `identity_shape`/`same_shape`, attribute helpers.
+- `kernels/structure/tile.rs` — `tile` (promoted, whole-repeat, block and general paths).
+- `kernels/structure/flip_roll.rs` — `flip`, `roll`.
+- `kernels/structure/pad.rs` — `pad` (config parsing, pad value).
+- `kernels/structure/diag.rs` — `diag`.
+- `kernels/structure/test_support.rs` — the shared `#[cfg(test)]` harness.
+- `kernels/sorting/mod.rs` — registry, sort/argsort dispatch and axis handling.
+- `kernels/sorting/keys.rs` — the dtype → order-preserving `u64` row-key table.
+- `kernels/sorting/network.rs` — the Batcher odd-even networks and `order_keys`.
+- `kernels/sorting/permutation.rs` — sorted/segment positions and the permuted-storage builders.
+- `kernels/sorting/test_support.rs` — the shared `#[cfg(test)]` reference oracle.
+- `kernels/reductions/mod.rs` — registry, `Kind`, the reduce/mean driver, `divide_by`.
+- `kernels/reductions/layout.rs` — `Layout`/`Block` and the shared fold/accumulator machinery (lane split).
+- `kernels/reductions/argmax.rs` — `argmax`/`argmin` and their scan selection.
+- `kernels/reductions/cumulative.rs` — `cumsum`/`cumprod`.
+- `kernels/linalg/mod.rs` — registry, `mod` wiring, the shared linalg test fixtures.
+- `kernels/linalg/common.rs` — arity/attribute/result-shape helpers.
+- `kernels/linalg/matmul.rs` — `dot`, the `Gemm` trait, the BLAS-3 fast path and its threading (the one file over 1000 lines, by design).
+- `kernels/linalg/conv.rs` — `conv` (padding, dilations, group counts).
+- `kernels/linalg/solve.rs` — `solve` (LU in f64 work space).
+- `kernels/linalg/structural.rs` — `diagonal`, `tril`/`triu`.
+- `kernels/linalg_aux/mod.rs` — registry and the six factorization kernels.
+- `kernels/linalg_aux/common.rs` — `Mat`/`prepare`, result materialization, rank/tolerance helpers.
+- `kernels/linalg_aux/eigh.rs` — cyclic-Jacobi `eigh`.
+- `kernels/linalg_aux/cholesky.rs` — `cholesky`.
+- `kernels/linalg_aux/qr.rs` — Householder `qr`.
+- `kernels/linalg_aux/svd.rs` — one-sided-Jacobi `svd`.
+- `kernels/linalg_aux/matrix_exp.rs` — `matrix_exp` (Taylor terms) and its helpers.
+- `kernels/linalg_aux/test_support.rs` — the shared `#[cfg(test)]` numeric assertions.
+- `kernels/random/mod.rs` — registry plus the op-level dispatch/attribute/result helpers.
+- `kernels/random/bits.rs` — the splitmix64/threefry2x32/philox4x32_10 word streams and their constants.
+- `kernels/random/key.rs` — `Algorithm`/`Key`/`Words`, key extraction and child derivation.
+- `kernels/random/sampling.rs` — `random_key_mix`, `random_uniform`, `random_normal`, `random_randint`.
+- `kernels/random/permutation.rs` — `random_permutation`, `random_multinomial`.
+- `kernels/random/test_util.rs` — the shared `#[cfg(test)]` harness.
+- `kernels/{control,collective,util,pow}.rs` — single-file modules, unchanged by the split.
