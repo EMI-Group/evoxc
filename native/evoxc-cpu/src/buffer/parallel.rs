@@ -31,12 +31,13 @@
 //   2^17 elems 0.014 / 0.038 ms   2^19 elems 0.100 / 0.049 ms
 //   1e6 elems  0.249 / 0.097 ms
 //
-// -- so the crossover sits between 2^18 and 2^19 elements: at 2^18 four threads
-// are 43 % SLOWER than the calling thread, and the 2x win only starts at 2^19
-// (which is why the threshold is 2^19 and not 2^18; the `(4096, 64)` f32 tensors
-// of a merged-GP-shaped graph are exactly 2^18 elements and belong on one
-// thread).  Small maps stay on the calling thread, where spawning would
-// dominate.
+// -- so the crossover sits between 2^18 and 2^19 elements: at 2^18 FOUR threads
+// are 43 % slower than the calling thread, while the win grows to 2x at 2^19.
+// The split therefore starts at 2^18 but hands one thread only 2^17 elements
+// (two threads at 2^18, four at 2^19+), never the full four at the crossover;
+// the `(4096, 64)` f32 tensors of a merged-GP-shaped graph are exactly 2^18
+// elements and take that two-thread split.  Small maps stay on the calling
+// thread, where spawning would dominate.
 /// Element count from which a flat map is worth splitting across threads.
 pub(super) const PARALLEL_MIN_ELEMS: usize = 1 << 18;
 /// Elements one thread should own before it earns its setup cost: a split adds

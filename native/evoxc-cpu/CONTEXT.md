@@ -52,47 +52,77 @@ Random is BIT-EXACT with `../evoxc/backends/numpy/kernels/random.py` for splitmi
 
 ## Performance (measured on this host, shared CPU)
 
-Intel Core Ultra 7 356H, 16 cpus, Python 3.14.10 / numpy 2.5.2, loadavg 0.83 / 1.18 / 1.13 at the recorded run (2026-11-22 08:22).
-Warm `run` = median of 25 iterations after 5 warmups; the numpy leg is `evoxc.build(fn, *specs, backend="numpy", device="cpu")` + `evoxc.run` (`evoxc.evaluate` re-traces per call).
+Intel Core Ultra 7 356H, 16 cpus, Python 3.14.10 / numpy 2.5.2–2.5.5, loadavg 0.7–1.2 at the recorded runs (2026-11-22).
+Warm `run` = median of 15–25 iterations after 3–5 warmups; the numpy leg is `evoxc.build(fn, *specs, backend="numpy", device="cpu")` + `evoxc.run` (`evoxc.evaluate` re-traces per call).
 Reproduce with `.venv/bin/python native/tools/bench_cpu.py` (records `model name` and loadavg itself).
-Every row of the recorded run reports `match yes`: the native and numpy results agree numerically on that workload.
+Every row of every recorded run reports `match yes`: the native and numpy results agree numerically on that workload.
+Eight workloads, `--iterations 15 --warmup 3` in one process:
 
 | workload | ops | native compile (ms) | native run (ms) | numpy run (ms) | speedup |
 |---|---|---|---|---|---|
-| `ew_chain_1e6` (8 elementwise ops, 1e6 f32) | 14 | 0.064 | 1.823 | 2.787 | 1.53× |
-| `ew_transcendental_1e6` (`erf`/`gelu`/`tanh` chain) | 7 | 0.036 | 18.048 | 162.057 | 8.98× |
-| `dot_sum_256` (256² f32 `dot` + row sum) | 3 | 0.025 | 0.575 | 0.109 | 0.19× |
-| `gp_gather_4096` (GP-shaped gather/select chain, 4096×64) | 80 | 0.298 | 0.601 | 0.684 | 1.14× |
-| `gp_sort_4096` (row argsort + sort + two-axis gather + broadcast select + reductions, 4096×64) | 14 | 0.074 | 5.131 | 1.988 | 0.39× |
-| `tf_softmax_8x128x384` (per-row softmax + tanh/gelu mix) | 15 | 0.073 | 6.017 | 30.439 | 5.06× |
-| `chain_2000` (2000-op elementwise chain) | 2000 | 6.281 | 0.117 | 1.333 | 11.41× |
+| `ew_chain_1e6` (8 elementwise ops, 1e6 f32) | 14 | 0.064 | 1.584 | 2.763 | 1.74× |
+| `ew_transcendental_1e6` (`erf`/`gelu`/`tanh` chain) | 7 | 0.036 | 17.675 | 160.351 | 9.07× |
+| `dot_sum_256` (256² f32 `dot` + row sum) | 3 | 0.023 | 0.380 | 0.117 | 0.31× (isolated 4.8×) |
+| `gp_gather_4096` (GP-shaped gather/select chain, 4096×64) | 80 | 0.290 | 1.512 | 0.719 | 0.48× (isolated 1.39–1.59×) |
+| `gp_sort_4096` (row argsort + sort + two-axis gather + broadcast select + reductions) | 14 | 0.072 | 3.827 | 2.049 | 0.54× |
+| `tf_softmax_8x128x384` (per-row softmax + tanh/gelu mix) | 15 | 0.073 | 3.576 | 30.692 | 8.58× |
+| `chain_2000` (2000-op elementwise chain) | 2000 | 6.281 | 0.114 | 1.280 | 11.25× |
+| `tn_step_pop500` (2249 static ops, shape-faithful TensorNEAT `Pipeline.step`) | 2249 | 10.4 | 67.190 | 56.325 | 0.84× |
 
-`native_compile_ms` is one full `native_compile(envelope)` call (envelope decode + FFI + engine plan compile); the engine's own plan compile is printed per workload by the harness (`ew_chain_1e6` 0.012 ms, `gp_gather_4096` 0.044 ms, `gp_sort_4096` 0.013 ms, `tf_softmax_8x128x384` 0.013 ms, `chain_2000` 0.860 ms).
-
-Three further full runs on a busier host (loadavg ~3) measured `ew_chain_1e6` 1.78/1.78/1.88×, `ew_transcendental_1e6` 8.90/8.89/8.94×, `gp_gather_4096` 1.15/1.06/0.66×, `tf_softmax_8x128x384` 5.02/5.33/5.15× and `chain_2000` 11.2–12.5×, so treat single-row deltas under ~30 % as host noise.
-`gp_gather_4096` is the process-state-sensitive row: run ALONE in a fresh process (`--filter gp_gather`) it is 0.55–0.59 ms against numpy's 0.86 ms in three consecutive runs (1.46–1.56×), while in the seven-workload sequence it lands anywhere in 0.60–1.05 ms (0.80–1.5×) with numpy's own leg moving 0.68–0.86 ms.
-Its absolute time depends on thread-wake latency and core state rather than on the graph: the 2^18-element maps split across two scoped threads per op, so a run that follows the transcendental workload sees slower spawns, and a run pinned to four cores (`taskset -c 0-3`) holds 0.84–0.88×.
-`dot_sum_256`'s numpy leg is the unstable one (a threaded BLAS).
+`native_compile_ms` is one full `native_compile(envelope)` call (envelope decode + FFI + engine plan compile); the engine's own plan compile is printed per workload by the harness (0.012–0.044 ms on every synthetic row, 0.86 ms on `chain_2000` and ~8 ms on `tn_step_pop500`, whose 2249 ops are mostly region-bearing).
+`tn_step_pop500` is a synthetic approximation of the real downstream graph, not the acceptance measurement: it under-weights exactly what the engine wins on (the many-small-op tail and the `while`/`if` region machinery) and over-weights large per-call shapes, so its native/numpy ratio (0.84×) is worse than the real graph's — the next section is the authoritative number.
+Two rows are process-state artifacts rather than graph costs:
+`gp_gather_4096` alone in a fresh process (`--filter gp_gather --iterations 25`) is 0.51–0.54 ms against numpy's 0.71–0.86 ms (1.39–1.59×), and only inside the eight-row sequence does the preceding 1e6-element work leave the thread and core state in a shape that costs it ~1.5 ms; it is bimodal on BOTH legs there (the pre-round-2 build measured 0.80–2.77 ms in consecutive rounds).
+`dot_sum_256`'s numpy leg is the unstable one (threaded OpenBLAS: 0.117 ms in sequence, 1.8 ms isolated in the same session), so only its isolated ratio (native 0.377 ms, 4.8× faster) means anything.
+`gp_sort_4096` is the honest loss: 0.54–0.60×, because `sort`/`argsort` are scalar Batcher networks against numpy's AVX2/AVX-512 sorting networks.
 
 Reading of the numbers, which is load- and shape-dependent:
-- The contiguous elementwise fast paths beat numpy on a 1e6-element mixed chain (1.5–1.9×) because per-op overhead is lower than numpy's ufunc dispatch, even though numpy fuses a whole expression into fewer passes.
+- The contiguous elementwise fast paths beat numpy on a 1e6-element mixed chain (1.6–1.9×) because per-op overhead is lower than numpy's ufunc dispatch, even though numpy fuses a whole expression into fewer passes.
 - The transcendental chain wins by 9× because `erf`/`gelu`/`tanh` go through scalar `libm` calls while numpy composes them from several ufuncs.
-- `dot` at 256² runs the `matrixmultiply` BLAS-3 kernel at ~58 GFLOP/s single-threaded (2·256³ FLOP in 0.575 ms) and still loses 5× to numpy's threaded OpenBLAS (~300 GFLOP/s at 0.109 ms) on a matrix this small, because the engine's scoped threading only engages above its work thresholds.
-- numpy still wins where it has SIMD kernels safe Rust cannot express (`sort`/`argsort` use AVX2/AVX-512 sorting networks while the engine's odd-even networks are scalar, 0.39× on 4096×64) and on threaded BLAS.
-- native wins where per-op dispatch dominates (`chain_2000` at ~0.06 µs/op, 11.4×), on transcendental compositions (9×) and on mid-size 3-D elementwise+reduction chains (5.1×).
-- Compiled plans are reusable across runs (`Arc<Plan>`), so a caller that keeps the plan pays only `run`; a full `native_compile` of a 2000-op graph is 6.281 ms, of which 5.421 ms is envelope decode + FFI crossings (the engine's plan compile is 0.860 ms, target ≤ 2 ms).
+- `dot` at 256² runs the `matrixmultiply` BLAS-3 kernel at ~58 GFLOP/s single-threaded but loses to numpy's threaded OpenBLAS on a matrix this small, because the engine's scoped threading only engages above its work thresholds.
+- numpy still wins where it has SIMD kernels safe Rust cannot express (`sort`/`argsort`, `astype`, `expf`) and on threaded BLAS; native wins where per-op dispatch dominates (`chain_2000` at ~0.06 µs/op), on transcendental compositions, and on every real many-small-op graph whose op mix includes control flow.
+- Compiled plans are reusable across runs (`Arc<Plan>`), so a caller that keeps the plan pays only `run`.
 
-### Real-workload profile: many-small-op graphs LOSE to numpy (TensorNEAT `Pipeline.step`)
+### Real downstream workload: TensorNEAT 0.2.0 `Pipeline.step`
 
-On the downstream TensorNEAT 0.2.0 generation graph (one `evoxc.build` + one warm `evoxc.run` per generation) the engine is slower than the numpy interpreter, so the synthetic-bench wins above do not generalize: `xor_p500` (2245 static / 7920 executed ops, 500 genomes) 188 ms/run native vs 45–54 ms numpy, `cartpole_p100` (2238 static / 20.6 k executed ops) 74 ms vs 48 ms at generation 1 — and both legs grow as the evolved trees deepen.
+The authoritative workload is the external TensorNEAT 0.2.0 harness: one `evoxc.build` + one warm `evoxc.run` per generation over a 500-genome population.
 Reproduce with `PYTHONPATH=<tensorneat>/src .venv/bin/python <tensorneat>/benchmarks/run_benchmark.py --impl new --backend numpy,native --cases xor_p500,cartpole_p100 --generations 8 --warmup 2 --repeats 1`.
-Per-op self time (temporary `Instant` brackets in the `exec.rs` step loop, ~0.2 % overhead, scratch build loaded through `EVOXC_NATIVE_LIB`) attributes the xor gap of ≈ +141 ms to `slice` +86.4 (61 %), `gather` +16.5 (12 %), `scatter` +11.2 (8 %), `random_uniform` +10.6 (7.5 %), `add` +8.7 (6 %), `broadcast` +3.7, `reshape` +3.4, `random_normal` +3.3, `select` +2.9 and ≈ +1 each for `cast`/`equal`/`constant`/`logical_and`/`pad`, partly offset (−13 ms) by ops where native wins (`argsort`, `reduce_sum`, `reduce_max`, `argmax`, `while`, `subtract`).
-`slice` dominated because the graph is built from 4-wide last-axis slices `(500,50,4) → (500,50,1)`: NO trailing axis is selected whole, so `slice_row_blocks` ran with `inner = 1` and paid a `for_each_index` odometer plus `i128` offset arithmetic per output element (~5 ns/elem, 25 k elements ≈ 125 µs), while numpy returns a strided VIEW in ~1 µs and charges the strided read to the consumer (~0.3 ns/elem) — 693 calls/run over 9.1 M elements.
-That odometer is gone: every non-negative-step slice/stride view now takes the [`stride_copy`](src/kernels/indexing/stride_copy.rs) `CopyPlan`, whose innermost run is one pooled `copy_from_slice` (a whole-array slice/reshape/transpose is ONE bulk memcpy) and whose interleaved family is a lane-grouped strided run at ~0.2–0.3 ns per output element (25 000 elements out of a stride-4 window in 6.4–6.9 µs of kernel, against a 6.2 µs bare 400 KB memcpy).
-Same-shape in-graph per-call measurements (marginal method: 11 fan-out copies + add chain, native vs numpy) put the losses on the same per-element paths: `slice i32 (500,100,2)→(500,100,1)` 200 vs 26 µs, `gather i32 (500,100,2)+scalar axis 2` 156 vs 83 µs, `broadcast i32 (500,1,50)→(500,4,50)` 175 vs 41 µs, `add i32 (500,100)+(500,1)` 106 vs 23 µs, `scatter f32 (50500,)` 274 vs 129 µs, `random_uniform f32 (500,50,1)` 587 vs 92 µs, `random_normal` 1052 vs 210 µs — against `add f32 (500,50,1)` flat 5.7 vs 10.6 µs (native 1.85× faster) and `argsort i8 (500,150)` 101 vs 294 µs (2.9× faster).
-So every native loss sits in the per-element `for_each_index`/broadcast `walk` paths and in `random_*` (which materializes a whole `Vec<f64>`/`Vec<ScalarValue>` chain per call — word stream, uniforms, broadcast gather, `broadcast_to` of the bounds, output vector — at ~25–40 ns/element).
-Interpreter overhead is not the problem: a marginal per-op cost of ~2.3 µs (numpy ~7.2 µs), 17× cheaper `while` region machinery (0.54 vs 9.3 ms per xor run) and a Python run wrapper worth ≲1 ms/run (raw `NativeProgram.run` and `exe.backend_executable.run` agree within noise) are all wins.
-The generic per-call path also shows on symbolic-dim graphs: `reshape` (a pure storage relabel) measures 2.6 µs/call and `constant` 1.4 µs/call in xor versus 0.3 µs on small concrete shapes (~4.6 ms of the 141 ms).
+
+| case | numpy ms/gen | native now ms/gen | native before this round | now |
+|---|---|---|---|---|
+| `xor_p500` (2249 static ops, ~7900 executed) | 48.9–49.5 | **41.5–42.8** | 80.8 | native 1.15–1.18× faster |
+| `cartpole_p100` (2238 static ops, ~31.6 k executed) | 68.7–69.4 | **24.1–24.2** | 44.6 | native 2.9× faster |
+
+Per-op attribution at the end state (nested-aware `Instant` brackets around the `exec.rs` step-kernel call in a scratch build loaded through `EVOXC_NATIVE_LIB`, ~0.2 % overhead, median of 3 runs; the numpy leg is the numpy interpreter's own kernels wrapped the same way), kernel totals: `xor_p500` native **42.65** vs numpy **50.54 ms/run**, `cartpole_p100` native **32.80** vs numpy **82.86 ms/run**.
+The xor split is **+15.04 ms over the 146 ops where native loses** and **−22.90 ms over the 411 ops where native wins** (net −7.86); the largest single win is the many-small-op tail — 505 ops at ~2.3 µs/call against numpy's ~7 µs — i.e. interpreter and plan overhead, which is what the block-plan work targets.
+
+| xor op | calls/run | native ms | numpy ms | delta |
+|---|---:|---:|---:|---:|
+| `gather f32 (500,100,2)` | 40 | 3.748 | 1.206 | +2.542 |
+| `slice f32 (500,50,1)` | 364 | 2.471 | 0.394 | +2.077 |
+| `while` (5 region ops) | 5 | 2.435 | 5.869 | −3.434 |
+| `gather f32 (500,50,5)` | 40 | 1.891 | 1.664 | +0.227 |
+| `cast int32 (500,100)` | 86 | 1.650 | 0.923 | +0.727 |
+| `slice f32 (500,50,4)` | 40 | 1.532 | 0.047 | +1.485 |
+| `scatter f32 (50500)` | 40 | 1.488 | 2.968 | −1.480 |
+| `multiply f32 (2000,50,4)` (broadcast) | 4.2 | 0.927 | 0.491 | +0.436 |
+| `slice f32 (500,100,1)` | 80 | 0.848 | 0.095 | +0.753 |
+| `random_normal f32 (500,100,1)` | 1 | 0.725 | 0.390 | +0.335 |
+| `exp f32 (2000,50)` | 4.2 | 0.687 | 0.245 | +0.442 |
+| `argsort int64 (500,200)` | 1 | 0.660 | 1.260 | −0.600 |
+| `reshape f32 (500,100)` | 82 | 0.386 | 0.060 | +0.326 |
+| `select f32 (500,50,4)` | 10 | 0.348 | 1.123 | −0.775 |
+| `not_equal bool (500,50,1)` | 80 | 0.254 | 1.192 | −0.938 |
+| 505 smaller ops (< 0.05 ms each) | | 4.386 | 9.999 | −5.613 |
+
+`cartpole_p100` splits **+3.00 ms over 51 losing ops** and **−52.82 ms over 463 winning ops**; its single largest loss is `exp f32 (100,50)` (+2.05 ms, 68 % of all its losses) and its largest wins are the `while` regions (−19.2 ms), `select` (−6.8 ms), the elementwise family (−12.6 ms) and the small-op tail (−6.1 ms).
+
+The residual, with its reason — these are floors, not tuning gaps:
+- **Views vs copies: `slice` +4.83 ms and `reshape`/identity-`transpose`/`concatenate`/`broadcast` ≈ +1.3 ms on xor.** `Storage` owns plain `Vec`s, so the engine cannot return a strided view the way numpy does (`np.take`'s consumer pays ~0.3 ns/element for a strided read; the engine pays a copy at ~0.2–0.38 ns/element). Every strided slice is already at strided-run speed (`CopyPlan` + `fill_strided`), so only a view/Tensor-owning-a-layout refactor could move it.
+- **numpy SIMD: `cast` +1.06 ms, `exp` +0.44 ms, `sort`/`argsort` +0.29/−0.65 ms.** `astype` runs at 0.21 ns/element against the engine's scalar `convert_generic` 0.38, numpy's AVX-512 `expf` is 0.58 ns/element against libm's 1.0, and the sorting networks are vectorized where safe Rust cannot reach.
+- **`gather` +2.54 ms on the interleaved `(500,100,2)` family:** both sides copy (no view exists), the engine already resolves the index operand once per call and copies innermost runs, but numpy's C `take` loop is 0.30 ns/element against the engine's 0.94.
+- **Broadcast elementwise +0.44 ms:** the `buffer/stride` run driver keeps a broadcast `multiply (2000,50,4)` at 0.55 ns/element against numpy's 0.29.
+- **`random_normal` +0.64 ms/run across its three call shapes:** the Box–Muller tail still materializes the salted word stream, the broadcast parameter chain and a `Vec<ScalarValue>` pass per call (~14.5 ns/element against numpy's 7.8); `random_uniform`/`random_randint` take the typed contiguous path and are already 2–3× faster than numpy.
 
 ## Optimizations
 
@@ -125,6 +155,15 @@ The generic per-call path also shows on symbolic-dim graphs: `reshape` (a pure s
 - No SIMD intrinsics are used (they would need `unsafe`, which this crate forbids outside the two `matrixmultiply` call sites), so elementwise throughput rests on LLVM auto-vectorizing safe slice loops.
 - **Per-run setup is small and allocation-bounded:** a run never recompiles or re-decodes the plan (`run_program` takes `&Arc<Plan>`), and only allocates one flat `store: vec![None; plan.max_value]`, one `Bindings` map and one reusable `operands` scratch `Vec` (`exec.rs` `RunCtx::new`); `RunCtx::run` additionally clones the entry `FunctionPlan` (name + type vectors) per call for its input/output validation, and the `call` kernel resolves a callee by linear name search per call op (`kernels/control.rs` `call_kernel`).
 
+- **Typed index resolution, once per call (`kernels/indexing/{gather,scatter,mod}.rs`):** `gather`/`scatter` resolve their index operand into a typed `Vec<usize>` in ONE pass (`resolve_index_fast`) instead of widening every element to `i128` per use, and `scatter_selection` chooses between the single-block and the per-index path from the resolved indices, so the copy runs are slices of a pre-offset destination.
+- **The broadcast run driver (`buffer/stride/`):** a run-oriented walk — the innermost axis is a contiguous run, outer axes carry strides — used by the `Layout::Broadcast` arms of `binary`, `compare` and `select`, so a bias `(n,)` against `(pop,m,n)`, a `(pop,1)` per-row scalar and a broadcast `select` predicate no longer fall to the rank-deep `for_each_index` odometer; `broadcast_to` materializes through `fill_broadcast` (one copy per contiguous run) instead of a per-element gather.
+- **Pooled comparison/logical results and pooled casts:** the comparison family builds its bool result through `bool_results` (a pooled vector; `BOOL_RESULT_THREAD_MIN = 1 << 19` above which the result is built per scoped chunk) and `cast` converts whole storages through a pooled `convert_generic`, so neither pays a zero fill.
+- **`reshape`/identity-`transpose`/`pad` take a pooled destination and copy it with `copy_from_slice`** (`kernels/indexing/reshape.rs`, `kernels/structure/pad.rs`), so the shape-only ops are one bulk memcpy with no per-element work; `constant` still clones its plan payload per use (see Known Issues).
+- **`random_uniform`/`random_normal`/`random_randint` typed contiguous path (`kernels/random/sampled.rs`):** a contiguous same-shape draw runs a word visitor straight into the destination storage per dtype — no `Vec<ScalarValue>` chain, no `broadcast_to` of the bounds, no per-element `%`/`/` axis arithmetic — and stays bit-exact with the numpy backend for all three algorithms (the multi-pass reference path remains for broadcast draw shapes).
+- **`dot` casts only a differing operand:** `dot_impl` compares each operand's dtype with the compute dtype before calling `Buffer::cast` (`kernels/linalg/matmul.rs`), so the common same-dtype matmul no longer memcpys both inputs (the older unguarded pattern remains in `conv.rs`/`solve.rs`).
+- **Plan entries are reference counted, not cloned:** `Plan.blocks` holds `Arc<BlockPlan>` and `RunCtx::run` borrows the entry `FunctionPlan` signature, so a region execution and a run no longer deep-copy `BlockPlan`/`Step` (the per-region-iteration clone the `while` kernel used to pay). `Plan` must stay `Send + Sync` (the PyO3 handle holds `Arc<Plan>`), which is why `Step.constant` remains an owned `Buffer` and not a shared `Rc<Buffer>`.
+- **`exp` on f32 uses libm, with no polynomial arm:** glibc's vectorized `expf` is 1.0 ns/element against the hand-rolled precheck + Taylor arm's 1.64 at every size (100 k elements +15 %, 1 M +49 %) and is the more accurate of the two, so `exp` runs the ordinary `Num::exp` path for every dtype.
+
 ## Constraints
 
 - Depends on `evoxc-core` only — never `evoxc-compiler`, `evoxc-runtime`, `evoxc-python` or PyO3. Third-party deps: `half` (f16), `num-complex` (complex), `libm` (`erf`, `ln_1p`), `nalgebra` (linalg), `serde_json` (`block_call.static_args`) and `matrixmultiply` — the ONE performance dependency, a pure-Rust BLAS-3 microkernel used only by `dot`'s f32/f64 fast path (its threading feature is off, so one call is single-threaded and any parallelism comes from the engine's own scoped split).
@@ -139,7 +178,7 @@ The generic per-call path also shows on symbolic-dim graphs: `reshape` (a pure s
 ## Test strategy
 
 - `nan_to_num` reads its three `any` replacements from the attrs: `posinf`/`neginf` default to JSON `null` (the dtype's max/min finite value — numpy's own default), `nan` is `0.0` when absent and keeps NaN when explicitly `null` (the IR op's "None keeps the value"; numpy itself raises for `nan=None`), and a `null` replacement is never a type error. Pinned end-to-end (envelope decode → compile → run) in `tests/nullable_attrs.rs`, which also covers `flip.axes`, `roll.axis`, `argmax.axis`, `transpose.permutation`, `slice.strides`, `matrix_rank.tol`, `conv.strides`/dilations and the collective `group_size`.
-- In-crate `#[cfg(test)]` per module: **297 lib tests (1 ignored)** plus 13 in the `tests/nullable_attrs.rs` integration target (nullable JSON-`null` attributes end-to-end) — kernel numerics (promotions, NaN/complex/rounding edge cases, error cases), symbolic-dim binding and the `DimExpr` failure modes, control flow (nested regions, multi-carry loops, recursion depth), the bit-exact random vectors for all three algorithms, collectives, plus the two registry-inventory tests that pin `unsupported_ops()` to empty.
+- In-crate `#[cfg(test)]` per module: **309 lib tests (1 ignored)** plus 13 in the `tests/nullable_attrs.rs` integration target (nullable JSON-`null` attributes end-to-end) — kernel numerics (promotions, NaN/complex/rounding edge cases, error cases), symbolic-dim binding and the `DimExpr` failure modes, control flow (nested regions, multi-carry loops, recursion depth), the bit-exact random vectors for all three algorithms, collectives, plus the two registry-inventory tests that pin `unsupported_ops()` to empty.
 The contiguous-copy paths pin their own behaviour: [`stride_copy`](src/kernels/indexing/stride_copy.rs)'s `lane_grouped_runs_match_the_elementwise_reference` (every stride/extent combination against a per-element reference, i32 and bool) and `a_pooled_strided_result_leaves_no_stale_element` (a parked garbage stock of the result's exact size is fully overwritten, for both a strided and a contiguous run), `slice`'s `the_last_axis_single_element_family_is_one_strided_run` (the `(500,50,4) → (500,50,1)` family is ONE axis of extent 25 000 stride 4) and `a_whole_array_slice_is_one_contiguous_run`, and `pad`'s `pad_copies_a_long_row_and_fills_only_the_pad_cells`, `pad_places_every_element_of_a_padded_result` (asymmetric pads on both axes, i32 and f32/NaN), `pad_rejects_a_result_shape_that_contradicts_the_padding`, `pad_rejects_a_mismatched_config_and_negative_padding`, `a_pooled_pad_result_leaves_no_stale_element` and `pad_handles_empty_extents`.
 - The performance paths have their own pins: the storage pool's retention and eviction policy (`stocks_are_retained_per_size_up_to_the_per_size_cap`, `a_full_size_class_keeps_its_newest_stocks`, `the_pool_evicts_the_least_recently_used_other_size_class`, `a_differently_sized_predecessor_does_not_starve_later_workloads`, `a_stock_larger_than_the_byte_cap_is_refused_and_evicts_nothing`, `a_recycled_result_is_fully_overwritten`, `stock_reuse_is_last_in_first_out`), the scoped split (`the_thread_split_hands_every_chunk_its_running_offset`, `threaded_chunks_read_their_operands_at_their_own_offset`, `the_thread_split_scales_with_the_work_per_thread`), in-place accumulation against the allocating path (`in_place_accumulation_matches_the_allocating_map`, `in_place_accumulation_is_bit_identical_to_the_allocating_path`, plus the plan's `a_dying_broadcast_free_operand_is_the_in_place_target` / `a_constant_payload_is_never_an_in_place_target`), the reduction lane and arg-scan paths (`long_integer_sums_are_bit_exact_under_the_lane_split`, `multi_accumulator_max_and_min_propagate_nan_in_a_long_run`, `the_two_arg_scans_agree_on_short_and_long_runs`) and the sorting networks against `sort_unstable` (`the_network_covers_only_the_extents_it_wins_at`, `matches_the_reference_across_the_network_extents`, `matches_the_reference_past_the_network_ceiling`).
 - The lib-level `#[ignore]`d test is `bench_thread_crossover`, a measurement aid that prints the per-element cost of a flat `add` at several sizes and thread counts (it is what `PARALLEL_MIN_ELEMS` is chosen from), run with `cargo test --release -p evoxc-cpu bench_thread_crossover -- --ignored --nocapture`.
@@ -156,7 +195,7 @@ The contiguous-copy paths pin their own behaviour: [`stride_copy`](src/kernels/i
 - **`sort`/`argsort` lose to numpy's AVX2/AVX-512 sorting networks:** the engine's Batcher odd-even networks are scalar, so a row-wise 4096×64 sort/argsort measures 0.39× numpy — safe Rust rules out explicit SIMD intrinsics (they would need `unsafe`).
 - **Elementwise throughput is per-op, not fused:** contiguous same-shape binary/unary ops and the comparison/cast/select family take dedicated slice fast paths and lead numpy on a 1e6-element chain (1.5–1.9×), but there is still no cross-op fusion, so an expression numpy can fuse into a single pass can win on very large single arrays; broadcasting and non-contiguous operands take the general strided driver.
 - **`dot` loses to numpy's threaded OpenBLAS on small matrices:** 0.19× at 256², because the engine's scoped threading only engages above `GEMM_PARALLEL_MIN_WORK` / `GEMM_PARALLEL_MIN_BLOCK_WORK` and each `matrixmultiply` call is single-thread-limited by design, while numpy's BLAS threads a matrix this small at ~300 GFLOP/s.
-- **`gp_gather_4096` is process-state-sensitive, not graph-limited:** alone in a fresh process it is 1.46–1.56× numpy (0.55–0.59 ms vs 0.86 ms), and inside the full seven-workload sequence the same code measures 0.80–1.5× because the per-op two-thread split pays thread-wake latency that varies with host load and core state.
+- **`gp_gather_4096` is process-state-sensitive, not graph-limited:** alone in a fresh process it is 1.46–1.56× numpy (0.55–0.59 ms vs 0.86 ms), and inside the full eight-workload sequence the same code measures 0.80–1.5× because the per-op two-thread split pays thread-wake latency that varies with host load and core state.
   The remedy would be a persistent worker pool; rayon's scope would make that safe Rust, but it is gated above 2^18 elements by design, so the medium-op splits stay scoped-thread based.
 - **`power` is specialised apart from the rest of the elementwise family:** `kernels/pow.rs` owns numpy's `npy_pow` arm table (`0`/`1`/`2`/`3`/`0.5`/`-1`/small-integer exponents, f32/f64 only, scalar exponent only) plus the negative-integer-exponent guard; `elementwise::binary` calls into it for the `power` kind and keeps the generic driver for everything else.
 - **Single-rank only:** the collectives are identity kernels guarded by `world_size == 1`; a rank/world-size context exists (`RunOptions`) but no multi-rank executor.
@@ -166,23 +205,21 @@ The contiguous-copy paths pin their own behaviour: [`stride_copy`](src/kernels/i
 - **`nalgebra` is declared but unused by the linalg kernels:** the factorizations are hand-written (`eigh` via cyclic Jacobi, `qr` via Householder, `svd` via one-sided Jacobi) so the numerics stay deterministic and dependency-light; remove the dependency rather than grow the surface.
 - **Shape-only ops COPY the whole array:** `reshape` and an identity `transpose` take a pooled destination and `copy_from_slice` the whole storage (`kernels/indexing/reshape.rs:65`, `:127` — one bulk memcpy, but still a copy), a same-shape `broadcast` returns `buffer.clone()` (`buffer/broadcast.rs:147`) and otherwise materializes through `broadcast_vec` (`:157-173`), and a `constant` step deep-clones its plan payload once per use (`exec.rs:245-247`); `Buffer`/`Storage` own plain `Vec`s (`buffer/storage.rs:14-30`), so each is a full array memcpy where the numpy backend returns a view (`np.reshape`/`np.broadcast_to`/`arr.transpose`).
 This is the floor for `reshape`/identity-`slice`/`transpose`: without views in `Storage` the engine cannot match numpy's ~1 µs view return, so those ops stay at memcpy speed (`reshape f32 (500,100)`, 200 KB, 3.14 µs of kernel against 6.20 µs for a 400 KB i32 memcpy baseline; the 800 KB identity `reshape` 19.8 µs) rather than view speed.
-- **`gather` widens the whole index operand per call:** `index_values` builds a `Vec<i128>` over every index element (`kernels/indexing/mod.rs:216-228`), the block fast path additionally builds a `Vec<usize>` of `outer × indices.len()` offsets before copying (`kernels/indexing/gather.rs:117-127`), and with `inner == 1` the block path copies one element at a time through `block_storage_from` (`kernels/indexing/mod.rs:139-160`), with the per-element `for_each_index` driver (`gather.rs:140-166`) as the fallback for shapes the block decomposition declines; all of it is single-threaded, unlike `np.take`.
-- **A flat map over ≥ 2^18 elements spawns scoped threads per op:** `PARALLEL_MIN_ELEMS = 1 << 18` (`buffer/parallel.rs:41`) with one thread per 2^17 elements capped at 4 (`:47-49`), and each split is one `std::thread::scope` with `scope.spawn` (`:70-98`) at a documented ~10 µs setup per extra thread (`:26-27`); the prose above the constant still says the threshold is 2^19 and that 2^18 tensors belong on one thread (`:30-39`), which contradicts the constant, the split test (`:121`) and this file's table note.
-- **Result allocation is per op and mostly unpooled:** every kernel returns a fresh `Vec<Value>` plus one `Rc` per result (`exec.rs:63-65`), pooled storage is taken only by `map1..3` (`buffer/zipmap.rs:132-192`), `block_storage_filled`/`repeat_storage` (`buffer/blocks.rs:69-120`) and constant-payload/new-buffer decode (`buffer/storage.rs:127-140`), while the general broadcast/strided paths zero-fill (`vec![T::zero(); n]`, e.g. `kernels/elementwise/compare.rs:265`) and `gather`/`concatenate`/`sort` allocate with `Vec::with_capacity`; a graph with many distinct result sizes (a `batch_functions` merged population) mostly misses the pool's per-size stocks (8 per class, 64 MiB / 64 entries total, `buffer/pool.rs:59-84`).
-
-- **The random-sampling kernels are multi-pass and unpooled:** `random_uniform`/`random_normal`/`random_randint` materialize the salted word stream into fresh `Vec<u64>`/`Vec<u32>` (2–7 full-size allocations in `kernels/random/bits.rs` `stream_words`/`normal_word_pairs`), copy each parameter operand through `broadcast_to` (a full clone when its shape already matches) + `Vec<ScalarValue>` (24 B/element) + `Vec<f64>` (`kernels/random/mod.rs:46-71`, `160-164`), compute `broadcast_offsets`/`gather` even when the draw shape equals the result shape (`kernels/random/sampling.rs:307-328`, per-element `%`/`/` per axis), and push every result through another `Vec<ScalarValue>` before the final cast (`kernels/random/mod.rs:125-157`); `random_normal`'s Box–Muller tail is a scalar `ln`/`sqrt`/`cos` loop with a per-element `match words` (`sampling.rs:203-225`, `235-260`), and the family has no contiguous-typed or pooled fast path, unlike `map1`/`map2`.
-- **Broadcast-shaped elementwise ops take a per-element odometer:** only a same-shape operand (`Layout::Flat`) or a rank-0 one (`Layout::Scalar`) reaches `map1`/`map2`/`map3` (`kernels/elementwise/binary.rs:366-417`), so a bias `(n,)` against `(pop,m,n)`, a `(pop,1)` per-row scalar or a broadcast `select` predicate falls to `apply2`/`apply3` → `walk`, a rank-deep index odometer plus a closure call per element over `Vec`-indexed offsets (`buffer/broadcast.rs:56-142`), and `broadcast_to` materializes instead of viewing (`:145-174`).
-- **`dot` copies both operands even with no cast:** `dot_impl` calls `a.cast(dtype)?`/`b.cast(dtype)?` (`kernels/linalg/matmul.rs:90-91`) and `Buffer::cast` returns a full `self.clone()` when the dtype already matches (`buffer/mod.rs:126-132`), so every dot memcpys both operands and then zero-allocates its output, where numpy's `dot` is one `np.matmul` with no copy; the same unguarded pattern is `conv.rs:290-291` and `solve.rs:140-141`.
+- **`gather` is still ~3× numpy's `take` loop on an interleaved last-axis family:** the index operand is resolved once per call (`resolve_index_fast`) and innermost runs are copied with `copy_from_slice`, but a `(500,100,2) → (500,100,1)`-style gather measures 0.94 ns/element against numpy's 0.30, and the path is single-threaded unlike `np.take`; it is the largest remaining per-op loss on `xor_p500` (+2.54 ms/run).
+- **A flat map over ≥ 2^18 elements spawns scoped threads per op:** `PARALLEL_MIN_ELEMS = 1 << 18` (`buffer/parallel.rs:41`) with one thread per 2^17 elements capped at 4 (`:47-49`), and each split is one `std::thread::scope` with `scope.spawn` (`:70-98`) at a documented ~10 µs setup per extra thread (`:26-27`).
+- **Result allocation is pooled on the hot kernels only:** `map1..3`, the stride copies (`block_storage_filled`/`fill_strided`), `reshape`/`transpose`/`pad`, the comparison/logical `bool_results` family and `cast`'s `convert_generic` take pooled storage, while the general broadcast/strided drivers still zero-fill (`vec![T::zero(); n]`) and `gather`/`concatenate`/`sort` allocate with `Vec::with_capacity`; every kernel also returns a fresh `Vec<Value>` plus one `Rc` per result (`exec.rs`).
+- **`random_normal` is the random family's slow path:** it still materializes the salted word stream, each parameter operand through `broadcast_to` + `Vec<ScalarValue>` and a final `Vec<ScalarValue>` cast, and its Box–Muller tail is a scalar `ln`/`sqrt`/`cos` loop (~14.5 ns/element against numpy's 7.8; +0.34/+0.30 ms per run on `xor_p500`'s two call shapes). `random_uniform` and `random_randint` take the typed contiguous path in `kernels/random/sampled.rs` and are 2–3× faster than numpy.
+- **Broadcast-shaped elementwise ops run the stride driver, not the flat maps:** a broadcast operand takes `buffer/stride`'s run walk (innermost contiguous run, outer axes strided) instead of `map2`/`map3`, which measures ~0.55 ns/element against numpy's 0.29 for a broadcast `multiply (2000,50,4)` (+0.44 ms/run on `xor_p500`) — the residual is per-element dispatch, not layout math.
+- **`dot` still copies an operand when the compute dtype differs:** `dot_impl` casts only a differing operand now (`kernels/linalg/matmul.rs`), so a same-dtype matmul is copy-free on the input side; `conv.rs` and `solve.rs` keep the older unguarded `cast` call and still memcpy both inputs.
 - **`sort`/`argsort` each compute their own permutation:** `sorted_positions` allocates a full-size `Vec<u32>` (`kernels/sorting/permutation.rs:45`), gathers every non-innermost segment through a per-segment scratch copy (`:78-97`), sorts long extents with scalar `sort_unstable` (only extents ≤ 16 use the Batcher network, `network.rs:56`) and resolves wide `f64`/`i64` keys through an index-comparator closure with two indirect loads per comparison (`permutation.rs:128-144`), so the frontend's `topk` = sort + argsort + gather composition pays the whole ordering twice per call.
-- **The engine's two slowest per-element paths are unbenchmarked:** `../tools/bench_cpu.py`'s workloads cover flat elementwise/transcendental chains, `dot_sum_256`, GP gather/sort and softmax, but no `random_*` kernel and no broadcast-dim elementwise op.
-
+- **Coverage of the slow paths:** `../tools/bench_cpu.py`'s eight workloads cover flat elementwise/transcendental chains, `dot_sum_256`, GP gather/sort, softmax and the `tn_step_pop500` real-workload approximation, which exercises `random_*` and broadcast-dim elementwise ops; what remains unbenched in isolation is `random_normal`'s word-stream tail and the stride driver's fully-general case.
 ## Routing Table
 
 | Path | Area |
 |---|---|
 | `./Cargo.toml` | Crate manifest: `evoxc-core` + `half` / `num-complex` / `libm` / `nalgebra` / `serde_json` / `matrixmultiply`. |
 | `./src/lib.rs` | Module wiring, `run_program` / `evaluate`, the callback-requirement pre-flight. |
-| `./src/plan.rs` | `compile(&Program) -> Plan`: `OpSpec`, `Step` (kernel, operand/result ids, liveness free list, per-result static-`(dtype, shape)` marker, plan-time decoded `constant` payload, in-place slot), `InPlace`, `BlockPlan`, `FunctionPlan`, `Plan::text()`, unsupported-op rejection. |
+| `./src/plan.rs` | `compile(&Program) -> Plan`: `OpSpec`, `Step` (kernel, operand/result ids, liveness free list, per-result static-`(dtype, shape)` marker, plan-time decoded `constant` payload, in-place slot), `InPlace`, `BlockPlan` (held as `Arc`), `FunctionPlan`, `Plan::text()`, unsupported-op rejection. |
 | `./src/exec.rs` | `RunCtx` (flat store, last-use release, region execution, dim binding, result validation, the `try_in_place` accumulate path), `Callbacks`, `RunOptions`, `Value`. |
 | `./src/buffer/` | The typed value representation, one submodule per mechanism: `mod.rs` (`Buffer` + impl, `shape_text`, the crate-internal re-exports), `storage.rs` (`Storage` over all 14 dtypes, little-endian decode, `cast_storage`/`convert_generic`), `broadcast.rs` (`broadcast_shape`/`broadcast_strides`/`walk`/`apply1..3`/`broadcast_to`), `zipmap.rs` (the flat `zip1..3`/`zip2_accumulate`/`map1..3` builders), `parallel.rs` (`PARALLEL_*`, `split_parallel`, `window`), `pool.rs` (`POOL_*` caps, `StoragePool`, `take_pooled_vec`, the `Drop` impls), `blocks.rs` (`copy_blocks`, `block_storage*`, `repeat_storage`), `test_support.rs` (the one shared `#[cfg(test)]` fixture). |
 | `./src/scalar.rs` | `Scalar` / `Num` / `ScalarValue` and the per-dtype numpy-semantics impls. |
@@ -205,6 +242,7 @@ Each `mod.rs` keeps `pub fn register` plus the re-exports the rest of the crate 
 - `buffer/parallel.rs` — `PARALLEL_*`, `parallel_threads`, `split_parallel`, `window`.
 - `buffer/pool.rs` — `POOL_*`, `StoragePool`, `take_pooled_vec`, `Drop for Storage`.
 - `buffer/blocks.rs` — `copy_blocks`, `block_storage`, `block_storage_filled`, `repeat_storage`.
+- `buffer/stride/` — the broadcast run driver (`stride/mod.rs`: the run walk and `fill_broadcast`) with its pins (`stride/tests.rs`).
 - `buffer/test_support.rs` — the shared `#[cfg(test)]` fixture.
 - `kernels/elementwise/mod.rs` — registry, the `stop_gradient`/`cast`/`broadcast` kernels, the `in_place_kernel` re-export.
 - `kernels/elementwise/binary.rs` — `BinKind`, the dense binary drivers (arithmetic/bitwise/shift), the in-place accumulate path.
@@ -215,8 +253,8 @@ Each `mod.rs` keeps `pub fn register` plus the re-exports the rest of the crate 
 - `kernels/indexing/reshape.rs` — `reshape`, `transpose`.
 - `kernels/indexing/slice.rs` — `slice` (bounds, strides, the row-block and `CopyPlan` selection).
 - `kernels/indexing/stride_copy.rs` — `CopyPlan`/`CopyAxis` (innermost-first collapsed axes), `block_offsets`, `fill_strided` (the lane-grouped strided run); shared with `gather`'s block path.
-- `kernels/indexing/gather.rs` — `gather`.
-- `kernels/indexing/scatter.rs` — `scatter`.
+- `kernels/indexing/gather.rs` — `gather` (typed index resolution, block and stride-copy paths).
+- `kernels/indexing/scatter.rs` — `scatter` (typed indices, `scatter_selection`).
 - `kernels/indexing/concatenate.rs` — `concatenate`.
 - `kernels/indexing/test_support.rs` — the shared `#[cfg(test)]` builders.
 - `kernels/structure/mod.rs` — registry, dispatch, `identity_shape`/`same_shape`, attribute helpers.
@@ -252,6 +290,7 @@ Each `mod.rs` keeps `pub fn register` plus the re-exports the rest of the crate 
 - `kernels/random/bits.rs` — the splitmix64/threefry2x32/philox4x32_10 word streams and their constants.
 - `kernels/random/key.rs` — `Algorithm`/`Key`/`Words`, key extraction and child derivation.
 - `kernels/random/sampling.rs` — `random_key_mix`, `random_uniform`, `random_normal`, `random_randint`.
+- `kernels/random/sampled.rs` — the typed contiguous fast path for `random_uniform`/`random_normal`/`random_randint` (bit-exact word visitors).
 - `kernels/random/permutation.rs` — `random_permutation`, `random_multinomial`.
 - `kernels/random/test_util.rs` — the shared `#[cfg(test)]` harness.
 - `kernels/{control,collective,util,pow}.rs` — single-file modules, unchanged by the split.
