@@ -7,9 +7,10 @@ It lives here rather than under `../../tests/` because that directory mirrors `e
 The suite pins the **external** contracts — config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, parity against an independent oracle — plus the **functional shape** of the API: `evoxc_hf.load` (checkpoint → config + params), `evoxc_hf.program` (memoised forward, specs, oracle), `evoxc_hf.pipeline` (build/run/predict/placement), joined only by ordinary values.
 Everything is offline and numpy-only by default (no torch, no compiler), so the contract verifies on a bare `uv run --with pytest` install; only the guarded checkpoint readers touch the network.
 
-## Counts (default env: torch/transformers and iree absent, checkpoint + golden caches present)
+## Counts (default env: torch/transformers, iree, tvm and any PJRT plugin absent, the golden-fixture directory absent, checkpoint downloads available)
 
-**727 collected in 15 modules — 694 passed, 33 skipped, 0 failed** in the default env (`PYTHONPATH=evoxc_hf/src uv run --with pytest python -m pytest evoxc_hf/tests`, or the bare command once the workspace member is installed with `uv sync --all-packages`); the `--extra iree` and `--extra iree` + `EVOXC_HF_BIG=1` legs run with strictly fewer skips (the iree / real-size / torch groups actually execute on this host).
+**728 collected in 15 modules — 695 passed, 33 skipped, 0 failed** in the default env (`PYTHONPATH=evoxc_hf/src uv run --with pytest python -m pytest evoxc_hf/tests`, or the bare command once the workspace member is installed with `uv sync --all-packages`); the `--extra iree` and `--extra iree` + `EVOXC_HF_BIG=1` legs run with strictly fewer skips (the iree and real-size groups actually execute); the torch/transformers oracle group needs the `hf` extra, which this host does not have.
+Recorded environment: Python 3.14.10, numpy 2.5.2, one built extension, no torch/transformers/iree/tvm/PJRT plugin on the host.
 Skip groups (default env): `iree` absent (22), torch/transformers absent (4), `EVOXC_HF_BIG` unset (4), torch goldens absent (3).
 
 | Module | Collected | Area |
@@ -28,7 +29,7 @@ Skip groups (default env): `iree` absent (22), torch/transformers absent (4), `E
 | `test_real_checkpoints.py` | 11 | real checkpoints end-to-end |
 | `test_reference.py` | 59 | the numpy oracle |
 | `test_torch_oracle.py` | 8 | optional torch oracle |
-| `test_weights.py` | 50 | checkpoint readers |
+| `test_weights.py` | 51 | checkpoint readers |
 
 ## What each module pins
 
@@ -53,7 +54,7 @@ Skip groups (default env): `iree` absent (22), torch/transformers absent (4), `E
 `pytest` is not in the base uv env: `PYTHONPATH=evoxc_hf/src uv run --with pytest python -m pytest evoxc_hf/tests -q` (drop the prefix after `uv sync --all-packages`; add `--extra iree` for the compiled path; `uv run --isolated --extra iree …` for GPU work — the base env has no iree, so `evoxc.devices()` shows only cpu).
 Take authoritative counts from `--junit-xml`: iree's nanobind teardown can abort at exit and swallow the `-q` summary; also export `PYTHONUNBUFFERED=1` on a GPU host so buffered diagnostics survive a redirect.
 Never assert timings (the GPU is shared): measured numbers live in module-level `MEASURED` dicts or assertion messages.
-Use `$TMPDIR` (never `/tmp`) for scratch files, and never write into `../../bench_logs/` or `../../evoxc/`.
+Use `$TMPDIR` (never `/tmp`) for scratch files, never write into `../../evoxc/` (read-only sibling), and treat the external golden-fixture directory as read-only when it happens to exist.
 
 ## Network and environment gates
 
@@ -61,16 +62,18 @@ Network access never fails a run: `hf_download.require_model` turns `DownloadUna
 Checkpoints cache under `$EVOXC_HF_MODELS_DIR` if set, else `$TMPDIR/evoxc_hf_models`; a cached file is trusted only when non-empty and, for `*.safetensors`, when its 8-byte header length parses and fits in the file.
 `EVOXC_HF_BIG=1` re-enables 8 real-size cases (`test_real_checkpoints.py` incl. the Qwen3-0.6B QK-Norm case, `test_torch_oracle.py`'s Qwen3 oracle case, `test_iree_rocm.py`, `test_pack.py`), each also guarding `/proc/meminfo` `MemAvailable` (the packed 124M path peaks near 1.7 GB RSS plus device buffers; the Qwen3 path needs ~6 GB for a 2.4 GB fp32 canonical tree).
 `@requires_iree` (module-level `find_spec` probe) gates the compiling tests; `test_iree_rocm.py` adds `@requires_rocm`, composing it with `evoxc.devices()` so a CPU host's skip reason separates "iree not installed" from "no rocm device".
-There is no `xla` test module: the compiled `xla` path is validated by the benchmark harness (`../../bench_logs/hf_bench.py` → `../../bench_logs/hf_bench_results.md`), which needs a user-provided PJRT plugin, not by this suite.
+There is no `xla` test module: the compiled `xla` path was measured by the HF-vs-PyTorch benchmark campaign archived in the separate `evoxc-bench` repository (outside this tree), which needs a user-provided PJRT plugin, not by this suite.
 No test requires torch: the compiled and conformance paths are numpy-only, and every optional dependency is imported lazily inside a function or probed in a subprocess.
 
 ## Golden fixtures
 
-`../../bench_logs/hf_goldens/` (resolved from the repo root, never the cwd) is the read-only contract with a separate torch-golden harness; it carries five fixtures (`tiny_random_llama`, `tiny_random_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`) and nothing here writes it.
+`test_torch_oracle.py` resolves golden fixtures at `<repo>/bench_logs/hf_goldens` (from the repo root, never the cwd): a read-only directory produced by the torch-golden harness of the separate `evoxc-bench` repository, which **does not exist in this tree** — so every golden test skips with a contract restatement (the 3-item golden skip group) and nothing here writes it.
+When that archived harness runs it drops five fixtures there (`tiny_random_llama`, `tiny_random_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2`); none of them is shipped with this repository.
 Per model: `<slug>.npz` with `input_ids` (int32, `(batch, seq_len)`) and `logits` (float32, `(batch, seq_len, vocab)` or `(batch*seq_len, vocab)`), plus `<slug>.meta.json` with an HF repo id under `model` or `model_id` (`model` wins) and informational `revision`/`dtype`.
 Reading uses `allow_pickle=False`; the meta repo id wins over the slug mapping, and the stored logits must be float32.
 An absent directory skips the parity test with a contract restatement; a malformed fixture fails `test_golden_fixture_format`, an unmappable one fails `test_golden_slugs_resolve`.
-Measured parity (numpy interpreter vs stored HF logits): `tiny_gpt2` bit-exact, `tiny_random_llama` 8.9e-8, `tiny_random_mistral` 1.2e-7, `distilgpt2` 1.07e-4, `gpt2` 1.53e-4 (1.1e-6 relative to absmax).
+Measured parity (numpy interpreter vs the stored HF logits of those archived fixtures): `tiny_gpt2` bit-exact, `tiny_random_llama` 8.9e-8, `tiny_random_mistral` 1.2e-7, `distilgpt2` 1.07e-4, `gpt2` 1.53e-4 (1.1e-6 relative to absmax).
+Checkpoint parity overall spans eight checkpoint slugs validated against real torch/transformers logits (the eight `hf_download.MODELS` keys) plus `qwen3_14b` validated only against the independent pure-numpy oracle; no checkpoint or golden data is stored in this tree.
 
 ## `hf_download.py` contract
 
@@ -83,7 +86,7 @@ CLI: `python evoxc_hf/tests/hf_download.py [--slugs a,b] [--root DIR] [--check]`
 ## Known Issues / quirks
 
 `sshleifer/tiny-gpt2` is an ordinary oracle case — its legacy `pytorch_model.bin` reads correctly (33 tensors matching `torch.load`, `max |logit| ≈ 0.1285`, 2.2e-8 vs HuggingFace); a shifted parse still yields well-shaped tensors that agree with evoxc_hf's own numpy reference, so only that external comparison (or `test_weights.py`'s exact-consumption check) catches it.
-The `~1e-44` "degenerate checkpoint" figure in `../../bench_logs/hf_feasibility_findings.md` describes such a shifted parse, not the checkpoint.
+The `~1e-44` "degenerate checkpoint" figure in the archived `evoxc-bench` feasibility findings describes such a shifted parse, not the checkpoint.
 ROCm: `Device("rocm", 0)` maps to HAL `device_id = 1` (1-based; `create_device(0)` raises); fp32 `dot` is true fp32 on iree/ROCm; the first `.to(cpu)` readback and first `place_params` leaf each pay a one-time driver init never to be charged to a per-call loop.
 `tiny-random-Mistral` uses exact `erf`-GELU, a StableHLO v1 deferral, so it is numpy-backend-only.
 `test_public_api.py` enumerates the whole surface, so it is the first file to update when the public API changes — it fails loudly on drift instead of tolerating stale names.
