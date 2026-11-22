@@ -133,8 +133,7 @@ No SIMD intrinsics are used (`std::arch` and `core::simd` appear nowhere).
 
 ### Measured FFI floor
 
-A round trip is one typed copy in — the only unavoidable one, because the engine must own its inputs — plus one zero-copy ownership move out: a measured 0.587 ms for an 8 MB payload in a release build (0.293 ms/direction).
-The earlier byte path measured ~0.20 ms for the same payload because it split both copies across up to four threads; the typed path trades that parallelism for no `unsafe`, no hand-rolled byte layout and a zero-copy output.
+A round trip is one typed copy in — the only unavoidable one, because the engine must own its inputs — plus one zero-copy ownership move out: a measured 0.592 ms for an 8 MB payload in a release build (0.296 ms/direction), and 0.43 ms end to end for a whole identity `evoxc.run` at that size.
 A small-graph `run` is therefore dominated by the kernels and the plan dispatch, not by the hand-off.
 `run`'s per-call cost is O(input bytes + output bytes) and INDEPENDENT of op count: every input array is copied into a fresh typed `Storage` once per call, outputs are handed to numpy once each (no copy), and no Python code runs during the planned loop (the GIL is released at `cpu.rs:195`), so a performance gap that scales with op count is inside `evoxc_cpu::run_program`, never in this seam.
 `stats()['compile_ms']` times ONLY `evoxc_cpu::plan::compile` — the timer starts after `json_from_py` and `envelope::decode` (`src/cpu.rs:110-118`) — so a `native_compile` wall time is decode + plan compile (at 2000 ops: 5.421 ms of envelope decode/FFI vs 0.860 ms of engine compile, `../CONTEXT.md` "Known gap (CPU FFI)").
