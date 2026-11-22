@@ -1,4 +1,8 @@
-//! Attribute, arity and index helpers shared by the linear-algebra families.
+//! Attribute, arity and result-shape helpers shared by the linear-algebra
+//! families.
+//!
+//! N-dimensional addressing belongs to `ndarray` (see `conv.rs`, `solve.rs` and
+//! `structural.rs`), so no index/stride walk lives here.
 //!
 //! Every helper is a defensive re-check of what the plan build already verified,
 //! so it can only fire on a hand-built `OpSpec` and never changes an op's
