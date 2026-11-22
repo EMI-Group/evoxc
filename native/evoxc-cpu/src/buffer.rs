@@ -1336,6 +1336,55 @@ mod tests {
     }
 
     #[test]
+    fn the_thread_split_hands_every_chunk_its_running_offset() {
+        // A count the split does not divide evenly makes the LAST chunk shorter,
+        // so a chunk's start is the running total of the chunks before it and not
+        // a multiple of the chunk length.  Deriving it from the chunk length made
+        // every operand window of the trailing chunk read shifted elements — a
+        // wrong result, not a slow one — which is why this is pinned: the chunks
+        // must partition `out` in order, and each element must be written exactly
+        // once by the chunk that owns it.
+        for &len in &[(1 << 19) + 5, (1 << 18) + 3, 4099, 1000, 7, 3] {
+            let mut out: Vec<u64> = vec![0; len];
+            let chunks = std::sync::Mutex::new(Vec::new());
+            split_parallel(&mut out, PARALLEL_MAX_THREADS, |offset, chunk| {
+                chunks.lock().expect("chunk list").push((offset, chunk.len()));
+                for (index, slot) in chunk.iter_mut().enumerate() {
+                    *slot = (offset + index) as u64 + 1;
+                }
+            });
+            let mut chunks = chunks.into_inner().expect("chunk list");
+            chunks.sort_unstable();
+            // The partition `chunks_mut` would walk: a full `chunk` per thread
+            // except for the short tail.
+            let chunk = if len >= PARALLEL_MAX_THREADS {
+                len.div_ceil(PARALLEL_MAX_THREADS)
+            } else {
+                len
+            };
+            let mut expected = Vec::new();
+            let mut start = 0;
+            while start < len {
+                let end = (start + chunk).min(len);
+                expected.push((start, end - start));
+                start = end;
+            }
+            assert_eq!(chunks, expected, "len {len}: the chunks partition `out` in order");
+            let want: Vec<u64> = (1..=len as u64).collect();
+            assert_eq!(out, want, "len {len}: every element exactly once, own offset");
+        }
+        // Four chunks with a short last one: the shape the old arithmetic broke
+        // (an offset derived from the chunk length lands 3 elements late).
+        let len: usize = (1 << 19) + 5;
+        let chunk = len.div_ceil(PARALLEL_MAX_THREADS);
+        assert_eq!(
+            len - (PARALLEL_MAX_THREADS - 1) * chunk,
+            chunk - 3,
+            "the last chunk is short, so the offsets are not multiples of `chunk`"
+        );
+    }
+
+    #[test]
     fn block_storage_filled_matches_the_zero_filled_helper() {
         let values: Vec<f32> = (0..12).map(|index| index as f32 * 0.5).collect();
         let offsets = [0usize, 4, 8, 1];
