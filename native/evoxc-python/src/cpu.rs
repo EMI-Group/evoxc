@@ -1,11 +1,11 @@
 //! The native CPU execution engine behind `native_compile` / `NativeProgram`.
 //!
 //! `native_compile(envelope) -> NativeProgram` decodes one `evoxc-native-ir`
-//! envelope with [`evoxc_core::envelope::decode`] and hands the program to
-//! [`evoxc_cpu::plan::compile`] (detached — the closure captures only `Send`
+//! envelope with [`evoxc::core::envelope::decode`] and hands the program to
+//! [`evoxc::cpu::plan::compile`] (detached — the closure captures only `Send`
 //! data).  The returned object is immutable: it owns the decoded `Program`,
 //! the `Arc<Plan>` and the measured compile time, and `run()` executes it on
-//! typed host buffers through [`evoxc_cpu::run_program`].
+//! typed host buffers through [`evoxc::cpu::run_program`].
 //!
 //! ## numpy interop (typed views in, typed ownership out)
 //!
@@ -13,7 +13,7 @@
 //! hand-rolled little-endian byte slices:
 //!
 //! * **in** — [`array_to_buffer`] downcasts to a `numpy::PyUntypedArray`, takes
-//!   the dtype name from `dtype.name` ([`evoxc_core::DType::parse`]), refuses a
+//!   the dtype name from `dtype.name` ([`evoxc::core::DType::parse`]), refuses a
 //!   swapped byte order (`dtype.is_native_byteorder() == Some(false)`) BEFORE
 //!   any typed view could misread it, copies `shape()`, and then reads the
 //!   payload through `PyReadonlyArrayDyn<T>`: a C-contiguous array is one
@@ -59,10 +59,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde_json::{Map, Value as Json};
 
-use evoxc_core::graph::Program;
-use evoxc_core::DType;
-use evoxc_cpu::plan::Plan;
-use evoxc_cpu::{Buffer, Callbacks, RunOptions, Storage, Value};
+use evoxc::core::graph::Program;
+use evoxc::core::DType;
+use evoxc::cpu::plan::Plan;
+use evoxc::cpu::{Buffer, Callbacks, RunOptions, Storage, Value};
 
 use crate::convert::{json_from_py, py_from_json};
 use crate::error;
@@ -87,8 +87,8 @@ fn numpy(py: Python<'_>) -> PyResult<&Bound<'_, pyo3::types::PyModule>> {
 // ---------------------------------------------------------------------------
 
 /// Decode one envelope into a `Program` (interpreter-free, unit-tested).
-fn program_from_json(envelope: &Json) -> evoxc_core::Result<Program> {
-    evoxc_core::envelope::decode(envelope).map_err(|err| err.context("envelope"))
+fn program_from_json(envelope: &Json) -> evoxc::core::Result<Program> {
+    evoxc::core::envelope::decode(envelope).map_err(|err| err.context("envelope"))
 }
 
 /// Compile an `evoxc-native-ir` envelope for native CPU execution.
@@ -111,7 +111,7 @@ pub fn native_compile(py: Python<'_>, envelope: &Bound<'_, PyAny>) -> PyResult<N
 
     let started = Instant::now();
     let plan = py
-        .detach(|| evoxc_cpu::plan::compile(&program))
+        .detach(|| evoxc::cpu::plan::compile(&program))
         .map_err(|err| error::from_core(py, err))?;
     let compile_ms = started.elapsed().as_secs_f64() * 1000.0;
 
@@ -140,7 +140,7 @@ impl NativeProgram {
         self.plan.entry_function().name.clone()
     }
 
-    /// The human-readable dispatch plan (`evoxc_cpu::Plan::text`).
+    /// The human-readable dispatch plan (`evoxc::cpu::Plan::text`).
     fn plan_text(&self) -> String {
         self.plan.text()
     }
@@ -156,7 +156,7 @@ impl NativeProgram {
     /// The entry function's output types as
     /// `{"dtype": name, "shape": [Dim...]}` dicts.
     fn output_types(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let json = evoxc_core::wire::value_types_to_json(&self.plan.entry_function().output_types);
+        let json = evoxc::core::wire::value_types_to_json(&self.plan.entry_function().output_types);
         Ok(py_from_json(py, &json)?.unbind())
     }
 
@@ -196,7 +196,7 @@ impl NativeProgram {
                 let callbacks = callbacks
                     .as_ref()
                     .map(|callbacks| callbacks as &dyn Callbacks);
-                evoxc_cpu::run_program(program, &plan, inputs, RunOptions::default(), callbacks)
+                evoxc::cpu::run_program(program, &plan, inputs, RunOptions::default(), callbacks)
             })
             .map_err(|err| error::from_core(py, err))?;
 
@@ -573,7 +573,7 @@ impl Callbacks for PyCallbacks {
         name: &str,
         args: &[Value],
         static_args: &Json,
-    ) -> evoxc_core::Result<Vec<Buffer>> {
+    ) -> evoxc::core::Result<Vec<Buffer>> {
         Python::attach(|py| {
             invoke(
                 py,
@@ -586,11 +586,11 @@ impl Callbacks for PyCallbacks {
         })
     }
 
-    fn call_external(&self, name: &str, args: &[Value]) -> evoxc_core::Result<Vec<Buffer>> {
+    fn call_external(&self, name: &str, args: &[Value]) -> evoxc::core::Result<Vec<Buffer>> {
         Python::attach(|py| invoke(py, &self.resolver, "call_external", name, args, None))
     }
 
-    fn call_runtime(&self, callback: &str, args: &[Value]) -> evoxc_core::Result<Vec<Buffer>> {
+    fn call_runtime(&self, callback: &str, args: &[Value]) -> evoxc::core::Result<Vec<Buffer>> {
         Python::attach(|py| invoke(py, &self.resolver, "call_runtime", callback, args, None))
     }
 }
@@ -604,7 +604,7 @@ fn invoke(
     name: &str,
     args: &[Value],
     static_args: Option<&Json>,
-) -> evoxc_core::Result<Vec<Buffer>> {
+) -> evoxc::core::Result<Vec<Buffer>> {
     let function = resolver
         .bind(py)
         .getattr(method)
@@ -644,8 +644,8 @@ fn invoke(
 
 /// A Python failure inside the bridge is a `BackendError` naming the method and
 /// the op, preserving the interpreter's message text.
-fn callback_error(py: Python<'_>, method: &str, name: &str, err: &PyErr) -> evoxc_core::Error {
-    evoxc_core::Error::backend(format!(
+fn callback_error(py: Python<'_>, method: &str, name: &str, err: &PyErr) -> evoxc::core::Error {
+    evoxc::core::Error::backend(format!(
         "resolver.{method}({name}) raised: {}",
         message(err.value(py))
     ))
@@ -681,11 +681,11 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evoxc_core::ErrorKind;
+    use evoxc::core::ErrorKind;
 
     #[test]
     fn dtype_names_round_trip() {
-        for dtype in evoxc_core::dtype::ALL {
+        for dtype in evoxc::core::dtype::ALL {
             assert_eq!(DType::parse(dtype.name()).unwrap(), dtype);
         }
         assert_eq!(
@@ -822,7 +822,7 @@ mod marshalling {
     #[test]
     fn every_dtype_round_trips_bit_identically() {
         Python::attach(|py| {
-            for dtype in evoxc_core::dtype::ALL {
+            for dtype in evoxc::core::dtype::ALL {
                 if dtype == DType::Bool {
                     continue; // non-canonical byte values normalize (see below)
                 }
@@ -1125,7 +1125,7 @@ mod marshalling {
             // buffer -> numpy array -> buffer again, twice through the bridge.
             // The comparison is over the numpy BYTES (not `Storage`, whose
             // float equality would trip on the NaNs the random payload carries).
-            for dtype in evoxc_core::dtype::ALL {
+            for dtype in evoxc::core::dtype::ALL {
                 let (array, _) = make_array(py, dtype, 64);
                 let first = ok(array_to_buffer(py, &array, "test"), dtype);
                 let out = ok(buffer_to_array(py, first), dtype);

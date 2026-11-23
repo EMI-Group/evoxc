@@ -20,9 +20,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use serde_json::{Map, Value as Json};
 
-use evoxc_compiler::batch_functions::batch_functions_with_env;
-use evoxc_compiler::{ExtensionRule, TransformEnv};
-use evoxc_core::graph::Program;
+use evoxc::compiler::batch_functions::batch_functions_with_env;
+use evoxc::compiler::{ExtensionRule, TransformEnv};
+use evoxc::core::graph::Program;
 
 use crate::convert::{json_from_py, py_from_json};
 use crate::error;
@@ -69,7 +69,7 @@ pub fn batch_functions(
     // The result nests the merged `evoxc-native-ir` envelope under `"module"`:
     // that is the shape `run_batch_parity.py` drives (`convert.from_native`
     // consumes `result["module"]`, the report is `result["batch_report"]`).
-    let envelope = evoxc_core::envelope::encode(&output.program);
+    let envelope = evoxc::core::envelope::encode(&output.program);
     let mut result = Map::new();
     result.insert("module".to_string(), envelope);
     result.insert("batch_report".to_string(), output.report.to_json());
@@ -102,7 +102,7 @@ fn decode_programs(py: Python<'_>, programs: &Bound<'_, PyAny>) -> PyResult<Vec<
         let path = format!("programs[{index}]");
         let json = json_from_py(envelope.as_any(), &path)
             .map_err(|err| error::object_error(py, err, &format!("batch_functions: {path}")))?;
-        let program = evoxc_core::envelope::decode(&json)
+        let program = evoxc::core::envelope::decode(&json)
             .map_err(|err| error::from_core(py, err.context(&path)))?;
         decoded.push(program);
     }
@@ -141,7 +141,7 @@ fn parse_batch_config(
     config: &Bound<'_, PyDict>,
     n_inputs: usize,
     n_outputs: usize,
-) -> PyResult<(evoxc_compiler::batch_functions::BatchFunctionsConfig, Option<PyExtensionRule>)> {
+) -> PyResult<(evoxc::compiler::batch_functions::BatchFunctionsConfig, Option<PyExtensionRule>)> {
     let mut json = Map::new();
     let mut extension: Option<PyExtensionRule> = None;
     for (key, value) in config.iter() {

@@ -19,12 +19,12 @@
 //!
 //! Every decode failure is a `TransformError` naming the offending config key
 //! (or response field) — a typo is never silently ignored.
-use evoxc_compiler::batch_functions::{
+use evoxc::compiler::batch_functions::{
     Alignment, Bands, BatchFunctionsConfig, MergeGroupSpec, SwitchOps,
 };
-use evoxc_compiler::{ExtensionRequest, ExtensionResponse, OutAxes, TransformConfig};
-use evoxc_core::error::{Error, Result};
-use evoxc_core::graph::ValueId;
+use evoxc::compiler::{ExtensionRequest, ExtensionResponse, OutAxes, TransformConfig};
+use evoxc::core::error::{Error, Result};
+use evoxc::core::graph::ValueId;
 use serde_json::{Map, Value as Json};
 
 /// The accepted keys of the Python-side transform config dict.
@@ -450,11 +450,11 @@ pub fn request_to_json(request: &ExtensionRequest) -> Json {
     map.insert("attributes".to_string(), Json::Object(request.attributes.clone()));
     map.insert(
         "operand_types".to_string(),
-        evoxc_core::wire::value_types_to_json(&request.operand_types),
+        evoxc::core::wire::value_types_to_json(&request.operand_types),
     );
     map.insert(
         "result_types".to_string(),
-        evoxc_core::wire::value_types_to_json(&request.result_types),
+        evoxc::core::wire::value_types_to_json(&request.result_types),
     );
     map.insert(
         "axes".to_string(),
@@ -478,7 +478,7 @@ pub fn request_to_json(request: &ExtensionRequest) -> Json {
     map.insert(
         "cotangent_type".to_string(),
         match &request.cotangent_type {
-            Some(ty) => evoxc_core::wire::value_type_to_json(ty),
+            Some(ty) => evoxc::core::wire::value_type_to_json(ty),
             None => Json::Null,
         },
     );
@@ -633,10 +633,10 @@ fn response_error(op_name: &str, field: &str, detail: impl std::fmt::Display) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evoxc_compiler::{Dual, ExtensionKind, ExtensionRequest};
-    use evoxc_core::attr::Attrs;
-    use evoxc_core::dtype::DType;
-    use evoxc_core::value_type::ValueType;
+    use evoxc::compiler::{Dual, ExtensionKind, ExtensionRequest};
+    use evoxc::core::attr::Attrs;
+    use evoxc::core::dtype::DType;
+    use evoxc::core::value_type::ValueType;
     use serde_json::json;
 
     fn f32_ty() -> ValueType {
@@ -731,11 +731,11 @@ mod tests {
     fn request_json_matches_the_documented_dict() {
         let mut request = ExtensionRequest::new(
             ExtensionKind::Batching,
-            &evoxc_compiler::RuleOp {
+            &evoxc::compiler::RuleOp {
                 name: "block_call".to_string(),
                 attributes: {
                     let mut attrs = Attrs::new();
-                    attrs.insert("block_name", evoxc_core::attr::AttrValue::Str("foo".to_string()));
+                    attrs.insert("block_name", evoxc::core::attr::AttrValue::Str("foo".to_string()));
                     attrs
                 },
                 original_operand_types: vec![f32_ty(), f32_ty()],
@@ -761,11 +761,11 @@ mod tests {
 
     #[test]
     fn request_json_carries_the_dual_values_of_its_kind_only() {
-        let rule_op = evoxc_compiler::RuleOp {
+        let rule_op = evoxc::compiler::RuleOp {
             name: "block_call".to_string(),
             attributes: {
                 let mut attrs = Attrs::new();
-                attrs.insert("block_name", evoxc_core::attr::AttrValue::Str("foo".to_string()));
+                attrs.insert("block_name", evoxc::core::attr::AttrValue::Str("foo".to_string()));
                 attrs
             },
             original_operand_types: vec![f32_ty(), f32_ty()],

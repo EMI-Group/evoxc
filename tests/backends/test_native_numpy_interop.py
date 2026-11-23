@@ -11,18 +11,15 @@ through the PUBLIC API only — ``evoxc.from_numpy`` → ``evoxc.build`` /
 
 1. Every dtype the backend declares (bool, int8/16/32/64, uint8/16/32/64,
    float16/32/64, complex64/complex128) round-trips with its dtype and shape
-   intact, and the result is a FRESH, writable, C-contiguous, owning array
+   intact, and the result is a FRESH, writable, C-contiguous, unaliased array
    that matches both an explicit ``np.*`` reference and the numpy interpreter.
 2. Memory LAYOUT is never silently misread: a Fortran-order array, a
    transposed view and a negatively-strided slice each give the same values as
    their ``np.ascontiguousarray`` copy, and ``run`` never mutates the caller's
    buffer (including the base of a view).
 3. Read-only inputs (``arr.setflags(write=False)``) work, and stay read-only.
-4. 0-d and zero-length arrays round-trip (shape, dtype and values); the
-   rank-2 zero-length case is a strict-xfail ``BUG(evoxc)`` pin — the native
-   marshalling cannot take a byte view of an empty higher-rank array (see
-   ``TestScalarAndEmpty::test_zero_length_matrix_round_trips`` and the
-   ``Known Issues`` entry in ``./CONTEXT.md``).
+4. 0-d and zero-length arrays round-trip (shape, dtype and values), including
+   a rank-2 zero-length matrix (``(0, 3)``).
 5. No aliasing: mutating an output array never reaches the input, and two
    consecutive runs produce identical results.
 6. A two-call chain — the output of one native ``run`` fed back in through
@@ -156,14 +153,23 @@ def _spec_for(array, *, name=None):
 
 
 def _assert_fresh_host_array(array, reference):
-    """A native output array is fresh, writable, C-contiguous and unaliased."""
+    """A native output array is fresh, writable, C-contiguous and unaliased.
+
+    ``array.flags.owndata`` is deliberately NOT required: the typed hand-off
+    MOVES the engine's Rust ``Vec`` into numpy, so numpy records the
+    transferred buffer as the array's base object and ``owndata`` is
+    legitimately ``False`` while the memory is still exclusively owned by this
+    array. 13 of the 14 dtypes take that zero-copy path; ``bool`` is copied
+    because a ``Vec<bool>`` is bit-packed. Non-aliasing is checked directly
+    instead.
+    """
     assert isinstance(array, np.ndarray), f"expected an ndarray, got {type(array)}"
     assert array.flags.c_contiguous, "a native output array must be C-contiguous"
     assert array.flags.writeable, "a native output array must be writable"
-    assert array.flags.owndata, "a native output array must own its bytes"
-    assert not np.shares_memory(array, reference), (
-        "a native output array must not alias the caller's input buffer"
-    )
+    if isinstance(reference, np.ndarray):
+        assert not np.shares_memory(array, reference), (
+            "a native output array must not alias the caller's input buffer"
+        )
 
 
 def _snapshot(array):
@@ -367,29 +373,6 @@ class TestScalarAndEmpty:
         assert array.flags.writeable
         nu.assert_parity(nu.evaluate_pair(_reshape_empty_1d, values), values)
 
-    # BUG(evoxc): the native engine's array marshalling takes the byte view with
-    # `memoryview.cast("B")`, which numpy refuses for ANY view whose SHAPE
-    # contains a zero — so a rank >= 2 zero-length array fails on BOTH the input
-    # path (`array_to_buffer`) and the output path (`buffer_to_array`), while the
-    # numpy interpreter runs the same graph. Rank-0 and rank-1 empty arrays work
-    # (pinned above). Minimal repro:
-    #   np.zeros((0, 3), np.float32).data.cast("B")
-    #     -> TypeError: memoryview: cannot cast view with zeros in shape or strides
-    #   evoxc.evaluate(_reshape_empty_2d, np.zeros((0, 3), np.float32),
-    #                  backend="native")
-    #     -> TypeError: flat_inputs[0]: cannot take a byte view (...)
-    #   (and a (0,) input reshaped to (0, 3) fails on the OUTPUT side:
-    #    "run: output 0: memoryview: cannot cast view with zeros in shape or strides")
-    # Delete this marker (and the matching Known Issues entry in
-    # ``tests/backends/CONTEXT.md``) once ``native/evoxc-python/src/cpu.rs``
-    # handles empty higher-rank views.
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG(evoxc): native marshalling cannot byte-view a rank >= 2 "
-            "zero-length array"
-        ),
-    )
     def test_zero_length_matrix_round_trips(self):
         values = np.zeros((0, 3), dtype=np.float64)
 

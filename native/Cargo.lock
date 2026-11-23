@@ -239,6 +239,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b14b339eb76d07f052cdbad76ca7c1310e56173a138095d3bf42a23c06ef5d8"
 
 [[package]]
+name = "evoxc"
+version = "0.1.0"
+dependencies = [
+ "evoxc-compiler",
+ "evoxc-core",
+ "evoxc-cpu",
+ "evoxc-runtime",
+]
+
+[[package]]
 name = "evoxc-compiler"
 version = "0.1.0"
 dependencies = [
@@ -272,10 +282,7 @@ dependencies = [
 name = "evoxc-python"
 version = "0.1.0"
 dependencies = [
- "evoxc-compiler",
- "evoxc-core",
- "evoxc-cpu",
- "evoxc-runtime",
+ "evoxc",
  "half",
  "ndarray",
  "num-complex",

@@ -7,7 +7,7 @@
 //! and no core type is kept alive across the GIL boundary by a Python
 //! reference.
 //!
-//! `transform` is the thin shell around `evoxc_compiler::transform`: the
+//! `transform` is the thin shell around `evoxc::compiler::transform`: the
 //! config dict is decoded by [`transform_config`] (interpreter-free), the
 //! `extension_rule` callable is kept as a [`PyExtensionRule`] handle, and the
 //! engine runs detached — the bridge re-attaches to the interpreter only when
@@ -17,8 +17,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyInt, PyString};
 use serde_json::{Map, Value as Json};
 
-use evoxc_compiler::{ExtensionRequest, ExtensionResponse, ExtensionRule, TransformKind};
-use evoxc_core::graph::ValueId;
+use evoxc::compiler::{ExtensionRequest, ExtensionResponse, ExtensionRule, TransformKind};
+use evoxc::core::graph::ValueId;
 
 use crate::convert::{json_from_py, py_from_json};
 use crate::error;
@@ -53,7 +53,7 @@ pub fn infer(
     // ---- GIL released: pure native inference ------------------------------
     let outputs = py
         .detach(|| {
-            evoxc_core::infer_op(
+            evoxc::core::infer_op(
                 op_name,
                 &operand_types,
                 &attrs,
@@ -64,7 +64,7 @@ pub fn infer(
         .map_err(|err| error::from_core(py, err))?;
 
     // ---- GIL held: native types -> envelope JSON -> Python ----------------
-    let json = evoxc_core::wire::value_types_to_json(&outputs);
+    let json = evoxc::core::wire::value_types_to_json(&outputs);
     Ok(py_from_json(py, &json)?.unbind())
 }
 
@@ -103,7 +103,7 @@ pub fn transform(
     // ---- GIL held: envelope JSON -> Program, Python config -> native config
     let envelope = json_from_py(module.as_any(), "module")
         .map_err(|err| error::object_error(py, err, "transform: module"))?;
-    let program = evoxc_core::envelope::decode(&envelope)
+    let program = evoxc::core::envelope::decode(&envelope)
         .map_err(|err| error::from_core(py, err.context("module")))?;
     let (config, extension) = parse_config(py, config)?;
 
@@ -114,12 +114,12 @@ pub fn transform(
             let bridge = extension
                 .as_ref()
                 .map(|rule| rule as &dyn ExtensionRule);
-            evoxc_compiler::transform(kind, &program, &config, bridge)
+            evoxc::compiler::transform(kind, &program, &config, bridge)
         })
         .map_err(|err| error::from_core(py, err))?;
 
     // ---- GIL held: native -> envelope JSON (plus the transform metadata) ---
-    let mut envelope = evoxc_core::envelope::encode(&output.program);
+    let mut envelope = evoxc::core::envelope::encode(&output.program);
     if let Json::Object(map) = &mut envelope {
         let mut meta = Map::new();
         meta.insert("kind".to_string(), Json::String(kind.as_str().to_string()));
@@ -152,7 +152,7 @@ pub(crate) struct PyExtensionRule {
 }
 
 impl ExtensionRule for PyExtensionRule {
-    fn call(&self, request: &ExtensionRequest) -> evoxc_core::Result<Option<ExtensionResponse>> {
+    fn call(&self, request: &ExtensionRequest) -> evoxc::core::Result<Option<ExtensionResponse>> {
         // The engine runs detached; the bridge is the only place that needs the
         // interpreter, so it re-attaches here and nowhere else.
         Python::attach(|py| call_python_rule(py, &self.callback, request))
@@ -164,7 +164,7 @@ fn call_python_rule(
     py: Python<'_>,
     callback: &Py<PyAny>,
     request: &ExtensionRequest,
-) -> evoxc_core::Result<Option<ExtensionResponse>> {
+) -> evoxc::core::Result<Option<ExtensionResponse>> {
     let request_json = transform_config::request_to_json(request);
     let request_py = py_from_json(py, &request_json)
         .map_err(|err| python_failure(py, &err, &request.op_name))?;
@@ -182,12 +182,12 @@ fn call_python_rule(
 
 /// A Python failure inside the bridge is a `TransformError` that preserves the
 /// interpreter's message text (and names the op being transformed).
-fn python_failure(py: Python<'_>, err: &PyErr, op_name: &str) -> evoxc_core::Error {
+fn python_failure(py: Python<'_>, err: &PyErr, op_name: &str) -> evoxc::core::Error {
     let text = match err.value(py).str() {
         Ok(text) => text.to_string_lossy().into_owned(),
         Err(_) => String::from("<unprintable Python error>"),
     };
-    evoxc_core::Error::transform(format!("extension rule for op '{op_name}': {text}"))
+    evoxc::core::Error::transform(format!("extension rule for op '{op_name}': {text}"))
 }
 
 /// Decode one `extension_rule` config value into the bridge handle.
@@ -221,8 +221,8 @@ pub(crate) fn extension_rule_from_value(
 fn parse_config(
     py: Python<'_>,
     config: &Bound<'_, PyDict>,
-) -> PyResult<(evoxc_compiler::TransformConfig, Option<PyExtensionRule>)> {
-    let mut out = evoxc_compiler::TransformConfig::default();
+) -> PyResult<(evoxc::compiler::TransformConfig, Option<PyExtensionRule>)> {
+    let mut out = evoxc::compiler::TransformConfig::default();
     let mut extension: Option<PyExtensionRule> = None;
     for (key, value) in config.iter() {
         let name = key.cast::<PyString>().map_err(|_| {
@@ -296,7 +296,7 @@ fn parse_config(
 fn apply_axes_from_py(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
-    config: &mut evoxc_compiler::TransformConfig,
+    config: &mut evoxc::compiler::TransformConfig,
 ) -> PyResult<()> {
     if let Ok(dict) = value.cast::<PyDict>() {
         let mut entries = Vec::with_capacity(dict.len());
@@ -371,10 +371,10 @@ fn decode_types(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     name: &str,
-) -> PyResult<Vec<evoxc_core::ValueType>> {
+) -> PyResult<Vec<evoxc::core::ValueType>> {
     let json = json_from_py(value, name)
         .map_err(|err| error::object_error(py, err, &format!("infer: {name}")))?;
-    evoxc_core::wire::value_types_from_json(&json)
+    evoxc::core::wire::value_types_from_json(&json)
         .map_err(|err| error::from_core(py, err.context(name)))
 }
 
@@ -382,8 +382,8 @@ fn decode_attrs(
     py: Python<'_>,
     op_name: &str,
     attributes: Option<&Bound<'_, PyAny>>,
-) -> PyResult<evoxc_core::Attrs> {
-    let schema = evoxc_core::schema::require(op_name).map_err(|err| error::from_core(py, err))?;
+) -> PyResult<evoxc::core::Attrs> {
+    let schema = evoxc::core::schema::require(op_name).map_err(|err| error::from_core(py, err))?;
     let json = match attributes.filter(|value| !value.is_none()) {
         Some(value) => json_from_py(value, "attributes")
             .map_err(|err| error::object_error(py, err, "infer: attributes"))?,
@@ -398,7 +398,7 @@ fn decode_attrs(
     // `attrs_from_json` is the envelope's tolerant decoder: an INTS attribute
     // whose declared default is `null` accepts JSON `null`, exactly as the
     // Python builder serializes it.
-    evoxc_core::envelope::attrs_from_json(map, schema)
+    evoxc::core::envelope::attrs_from_json(map, schema)
         .map_err(|err| error::from_core(py, err))
 }
 
@@ -443,7 +443,7 @@ mod py_tests {
                 vec![(ValueId(0), Some(0)), (ValueId(1), None)]
             );
             assert_eq!(parsed.batch_dim_name.as_deref(), Some("sample"));
-            assert_eq!(parsed.out_axes, Some(evoxc_compiler::OutAxes::All(Some(1))));
+            assert_eq!(parsed.out_axes, Some(evoxc::compiler::OutAxes::All(Some(1))));
             assert_eq!(parsed.argnums, Some(vec![0, 2]));
             assert_eq!(parsed.tangent_inputs, Some(vec![0]));
             assert_eq!(parsed.cotangent_inputs, Some(vec![0]));
@@ -501,23 +501,23 @@ mod py_tests {
     fn a_python_extension_rule_returns_none_or_a_response() {
         Python::attach(|py| {
             let mut request = ExtensionRequest::new(
-                evoxc_compiler::ExtensionKind::Batching,
-                &evoxc_compiler::RuleOp {
+                evoxc::compiler::ExtensionKind::Batching,
+                &evoxc::compiler::RuleOp {
                     name: "block_call".to_string(),
                     attributes: {
-                        let mut attrs = evoxc_core::Attrs::new();
-                        attrs.insert("block_name", evoxc_core::AttrValue::Str("foo".to_string()));
+                        let mut attrs = evoxc::core::Attrs::new();
+                        attrs.insert("block_name", evoxc::core::AttrValue::Str("foo".to_string()));
                         attrs
                     },
-                    original_operand_types: vec![evoxc_core::ValueType::scalar(
-                        evoxc_core::DType::Float32,
+                    original_operand_types: vec![evoxc::core::ValueType::scalar(
+                        evoxc::core::DType::Float32,
                     )],
-                    original_result_types: vec![evoxc_core::ValueType::scalar(
-                        evoxc_core::DType::Float32,
+                    original_result_types: vec![evoxc::core::ValueType::scalar(
+                        evoxc::core::DType::Float32,
                     )],
                     operands: Vec::new(),
-                    operand_types: vec![evoxc_core::ValueType::scalar(
-                        evoxc_core::DType::Float32,
+                    operand_types: vec![evoxc::core::ValueType::scalar(
+                        evoxc::core::DType::Float32,
                     )],
                     results: Vec::new(),
                     result_types: Vec::new(),

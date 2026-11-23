@@ -622,7 +622,7 @@ mod tests {
             let py_value = py_from_json(py, &payload).unwrap();
             let back = json_from_py(&py_value, "attributes.value").unwrap();
             assert_eq!(back, payload);
-            let array = evoxc_core::wire::array_from_json(&back).unwrap();
+            let array = evoxc::core::wire::array_from_json(&back).unwrap();
             assert_eq!(array.shape, vec![2]);
             assert_eq!(array.dtype.name(), "float32");
             let floats: Vec<f32> = array
