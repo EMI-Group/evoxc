@@ -221,7 +221,7 @@ Same adapter and machinery, driven by `get_driver("vulkan")`.
 
 ## Scale & module-shape facts (large graphs)
 - **No program-size limit exists anywhere in the adapter compile path** — no graph-size / op-count / MLIR-text-size / recursion-depth guard in `iree.py`/`xla.py`/`tvm.py` `compile()`. The only numeric caps are unrelated: staging/run caches (`_STAGED_INPUT_CACHE_MAX = 64`, `_ROCM_SOURCE_CACHE_MAX = 16`, `_EXECUTE_SCAFFOLDING_MAX = 64`), the `_STAGED_INPUT_MAX_BYTES = 16 MB` staging *fallback* (never a rejection), and the `inline_portables` 1000-expansion fixpoint cap (`../inline.py:321`).
-- **Function count:** tvm requires EXACTLY ONE `func.func` (`tvm_util.precheck_module`, `BackendError` naming the count) and rejects a multi-operand `func.return` (the vendored importer keeps only the first output). iree compiles whatever the module contains, but `IreeExecutable._entry_function` (`iree.py:2140`) resolves `"main"` first and otherwise requires exactly ONE recorded entry function. xla records `entry_functions` but never consults it.
+- **Function count:** tvm requires EXACTLY ONE `func.func` (`tvm_util.precheck_module`, `BackendError` naming the count) and rejects a multi-operand `func.return` (the vendored importer keeps only the first output). iree compiles whatever the module contains, but `IreeExecutable._entry_function` (`iree.py:2244`) resolves `"main"` first and otherwise requires exactly ONE recorded entry function. xla records `entry_functions` but never consults it.
 - **tvm's op whitelist lacks `stablehlo.iota`** (so iota-based compositions — `diag`/`eye`/`linspace`/count-sort/`eigh` — hit the compile gate), plus no `gather`/`scatter`/`if`/`while`/`remainder`/`conv`/`reduce_window`/`sort`: an embedding-gather transformer forward is rejected on tvm before translation.
 
 ## Native-host portability boundary
@@ -236,8 +236,8 @@ No adapter fetches anything at run time: there is no urllib/requests/curl/wget, 
 `_pjrt_c_api.HEADER_URL`/`HEADER_COMMIT`/`HEADER_SIZE_BYTES` are provenance METADATA only — never opened or fetched; the module is a hand-written ctypes translation, stdlib-only.
 xla needs ZERO pip dependencies: the PJRT C API is driven over pure-stdlib ctypes against a `GetPjRtApi`-exporting plugin `.so`, required at compile/load time, discovered as documented above and dlopen-ed never imported (no xla extra); provenance (header URL + commit) is recorded in `_pjrt_c_api.py` and the artifact `runtime_dependencies`.
 tvm needs `apache-tvm` + `jaxlib`, the latter ONLY for its bundled LLVM MLIR python bindings (not the jax API) behind the `_mlir_bindings` seam; `jax` is never imported anywhere in `evoxc/`, and `check_available()` probes `jaxlib.mlir` + `jaxlib.mlir.ir` with the `pip install evoxc[tvm]` hint.
-**Legitimately long files — do not split without a plan:** `iree.py` (3828 lines) holds the whole iree adapter surface (options/defaults, backend + executable + cached run plans, staging tiers, adapter readback, device acquisition, segments/external dispatch, `IreeDevicePayload`, `upload_tensor`, `register()`).
-`xla.py` (1447) and `xla_util.py` (1675) are the same split for xla (backend/executable surface incl. the static-shape gate, `_XlaRunPlan`, the device-complete-event lifecycle; PJRT C API driver).
+**Legitimately long files — do not split without a plan:** `iree.py` (3836 lines) holds the whole iree adapter surface (options/defaults, backend + executable + cached run plans, staging tiers, adapter readback, device acquisition, segments/external dispatch, `IreeDevicePayload`, `upload_tensor`, `register()`).
+`xla.py` (1479) and `xla_util.py` (1680) are the same split for xla (backend/executable surface incl. the static-shape gate, `_XlaRunPlan`, the device-complete-event lifecycle; PJRT C API driver).
 All three are cohesive and tightly coupled, so splitting would only spread one adapter across files.
 
 ## Routing table
