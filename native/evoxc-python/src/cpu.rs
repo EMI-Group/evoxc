@@ -7,30 +7,32 @@
 //! the `Arc<Plan>` and the measured compile time, and `run()` executes it on
 //! typed host buffers through [`evoxc_cpu::run_program`].
 //!
-//! ## numpy interop (borrow on the way in, one copy out)
+//! ## numpy interop (typed views in, typed ownership out)
 //!
-//! The newest `numpy` crate (0.28) requires pyo3 0.28 while this crate pins
-//! pyo3 0.30, so there is no `numpy` crate to use here and the binding crosses
-//! the boundary as raw little-endian bytes.  Both directions are ONE pass over
-//! the payload — a marshalling memcpy, not an element-at-a-time conversion
-//! through an intermediate `Vec<u8>`:
+//! Payloads cross through the `numpy` 0.30 crate as TYPED arrays — never as
+//! hand-rolled little-endian byte slices:
 //!
-//! * **in** — `arr.dtype.name` → [`evoxc_core::DType::parse`], `arr.shape` →
-//!   dims, `arr.flags.c_contiguous` decides whether `numpy.ascontiguousarray`
-//!   is applied first (a strided array is never silently misread, and the
-//!   caller's array is only borrowed).  The bytes are BORROWED from the array
-//!   through a `memoryview` cast to `B` ([`pyo3::buffer::PyBuffer<u8>`] +
-//!   `as_slice_ptr`) and decoded straight into the typed
-//!   [`evoxc_cpu::Storage`] (one pass, no intermediate byte vector); the
-//!   caller's array is never mutated.
-//! * **out** — the destination array is allocated ONCE with
-//!   `numpy.empty(shape, dtype)` (so it owns its bytes, is writable and
-//!   C-contiguous) and the storage's little-endian bytes are bulk-copied into
-//!   it with [`pyo3::buffer::PyBuffer::copy_from_slice`] (one `memcpy`).  On a
-//!   little-endian target the typed storage's own bytes ARE the numpy layout
-//!   for every dtype (f16 2 bytes, complex re/im contiguous, bool 1 byte), so
-//!   the copy reads them through a zero-copy `&[u8]` view; a big-endian host
-//!   keeps the per-element `to_le_bytes` flattening.
+//! * **in** — [`array_to_buffer`] downcasts to a `numpy::PyUntypedArray`, takes
+//!   the dtype name from `dtype.name` ([`evoxc_core::DType::parse`]), refuses a
+//!   swapped byte order (`dtype.is_native_byteorder() == Some(false)`) BEFORE
+//!   any typed view could misread it, copies `shape()`, and then reads the
+//!   payload through `PyReadonlyArrayDyn<T>`: a C-contiguous array is one
+//!   `memcpy` (`ArrayView::as_slice().to_vec()`), while a Fortran-ordered,
+//!   transposed or negative-stride view is walked in logical order by
+//!   `ndarray`'s iterator.  A strided array is therefore never misread, no
+//!   `numpy.ascontiguousarray` call happens anywhere, and the caller's array is
+//!   only borrowed (never mutated).  `bool` is the one special case: a numpy
+//!   bool array may hold any byte (only `!= 0` is meaningful) and reading byte
+//!   `2` as a Rust `bool` would be undefined behaviour, so it is read through a
+//!   zero-copy `uint8` view and normalized to `byte != 0`.
+//! * **out** — [`buffer_to_array`] CONSUMES the engine's `Buffer`: each
+//!   `Storage` variant hands its `Vec<T>` to numpy as the array's buffer
+//!   (`ndarray::ArrayD::from_shape_vec` + `IntoPyArray`), i.e. zero copy, and
+//!   the result is fresh, writable and C-contiguous.  `bool` cannot move (a
+//!   `Vec<bool>` is bit-packed, one BIT per element) and gets a zero-filled
+//!   numpy allocation filled elementwise.  Resolver arguments are borrowed
+//!   (`Rc<Buffer>`), so [`buffer_to_array_copy`] clones the typed payload once
+//!   and reuses the owned path.
 //!
 //! ## Host callbacks
 //!
@@ -47,11 +49,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use half::f16;
+use ndarray::{ArrayD, IxDyn};
 use num_complex::Complex;
-use pyo3::buffer::PyBuffer;
+use numpy::{
+    IntoPyArray, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn,
+    PyUntypedArray, PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
+use pyo3::types::{PyDict, PyList};
 use serde_json::{Map, Value as Json};
 
 use evoxc_core::graph::Program;
@@ -62,13 +67,16 @@ use evoxc_cpu::{Buffer, Callbacks, RunOptions, Storage, Value};
 use crate::convert::{json_from_py, py_from_json};
 use crate::error;
 
-/// The `numpy` module, imported once per process (lazily — `import evoxc`
-/// never needs it, only a `run`/`native_compile` conversion does).
-static NUMPY: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+/// The `numpy` module, imported once per process.  Only the tests need it (the
+/// conversion paths below use the typed `numpy` crate), and `import evoxc` never
+/// runs any of this.
+#[cfg(all(test, feature = "auto-init"))]
+static NUMPY: pyo3::sync::PyOnceLock<Py<pyo3::types::PyModule>> = pyo3::sync::PyOnceLock::new();
 
-fn numpy(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
+#[cfg(all(test, feature = "auto-init"))]
+fn numpy(py: Python<'_>) -> PyResult<&Bound<'_, pyo3::types::PyModule>> {
     NUMPY
-        .get_or_try_init(py, || -> PyResult<Py<PyModule>> {
+        .get_or_try_init(py, || -> PyResult<Py<pyo3::types::PyModule>> {
             Ok(py.import("numpy")?.unbind())
         })
         .map(|module| module.bind(py))
@@ -192,9 +200,9 @@ impl NativeProgram {
             })
             .map_err(|err| error::from_core(py, err))?;
 
-        // ---- GIL held: buffers -> fresh numpy arrays -----------------------
+        // ---- GIL held: buffers -> fresh numpy arrays (ownership moves) ------
         let list = PyList::empty(py);
-        for (index, buffer) in outputs.iter().enumerate() {
+        for (index, buffer) in outputs.into_iter().enumerate() {
             let array = buffer_to_array(py, buffer)
                 .map_err(|err| error::object_error(py, err, &format!("run: output {index}")))?;
             list.append(array)?;
@@ -283,6 +291,10 @@ fn decode_inputs(py: Python<'_>, flat_inputs: &Bound<'_, PyAny>) -> PyResult<Vec
 }
 
 /// numpy array → [`Buffer`], naming `path` (`flat_inputs[2]`) in a `TypeError`.
+///
+/// The array is only BORROWED: values are copied out of its view (one memcpy for
+/// a C-contiguous array, a logical-order walk for any other layout) into the
+/// engine's own typed storage, so the caller's array is never mutated.
 fn array_to_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResult<Buffer> {
     let not_array = || {
         error::type_error(format!(
@@ -290,19 +302,19 @@ fn array_to_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResu
             type_name(obj)
         ))
     };
-    let dtype_obj = obj.getattr("dtype").map_err(|_| not_array())?;
-    let dtype_name = dtype_obj
+    // `PyUntypedArray` accepts ndarray subclasses (`numpy.matrix`, masked-free
+    // subclasses) exactly like `PyArray_Check` does.
+    let array = obj.cast::<PyUntypedArray>().map_err(|_| not_array())?;
+    let descr = array.dtype();
+    let dtype_name = descr
         .getattr("name")
         .and_then(|name| name.extract::<String>())
         .map_err(|_| not_array())?;
-    let native_order = dtype_obj
-        .getattr("isnative")
-        .and_then(|value| value.extract::<bool>())
-        .map_err(|_| not_array())?;
     let dtype = DType::parse(&dtype_name).map_err(|err| error::from_core(py, err))?;
-    if !native_order {
-        // The bytes below are the array's raw bytes, so a swapped byte order
-        // would be silently misread; refuse it explicitly.
+    // The typed views below read native-endian values, so a swapped byte order
+    // would be silently misread; refuse it before any conversion.  A `|`/1-byte
+    // dtype reports `None`, which IS native.
+    if descr.is_native_byteorder() == Some(false) {
         return Err(error::raise(
             py,
             "BackendError",
@@ -311,399 +323,184 @@ fn array_to_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResu
             ),
         ));
     }
-    let shape = obj
-        .getattr("shape")
-        .and_then(|shape| shape.extract::<Vec<i64>>())
-        .map_err(|_| not_array())?;
-    let contiguous = obj
-        .getattr("flags")
-        .and_then(|flags| flags.getattr("c_contiguous"))
-        .and_then(|value| value.extract::<bool>())
-        .map_err(|_| not_array())?;
-
-    // A strided view is copied, never misread; the caller's array stays untouched.
-    let copied = if contiguous {
-        None
-    } else {
-        let ascontiguousarray = numpy(py)?.getattr("ascontiguousarray")?;
-        Some(ascontiguousarray.call1((obj,)).map_err(|err| {
-            error::object_error(py, err, &format!("{path}: numpy.ascontiguousarray"))
-        })?)
+    let dims: Vec<usize> = array.shape().to_vec();
+    let storage = match dtype {
+        DType::Bool => Storage::Bool(bool_values(py, obj, path)?),
+        DType::Int8 => Storage::I8(collect_values::<i8>(py, obj, path)?),
+        DType::Int16 => Storage::I16(collect_values::<i16>(py, obj, path)?),
+        DType::Int32 => Storage::I32(collect_values::<i32>(py, obj, path)?),
+        DType::Int64 => Storage::I64(collect_values::<i64>(py, obj, path)?),
+        DType::UInt8 => Storage::U8(collect_values::<u8>(py, obj, path)?),
+        DType::UInt16 => Storage::U16(collect_values::<u16>(py, obj, path)?),
+        DType::UInt32 => Storage::U32(collect_values::<u32>(py, obj, path)?),
+        DType::UInt64 => Storage::U64(collect_values::<u64>(py, obj, path)?),
+        DType::Float16 => Storage::F16(collect_values::<f16>(py, obj, path)?),
+        DType::Float32 => Storage::F32(collect_values::<f32>(py, obj, path)?),
+        DType::Float64 => Storage::F64(collect_values::<f64>(py, obj, path)?),
+        DType::Complex64 => Storage::C64(collect_values::<Complex<f32>>(py, obj, path)?),
+        DType::Complex128 => Storage::C128(collect_values::<Complex<f64>>(py, obj, path)?),
     };
-    let array = copied.as_ref().unwrap_or(obj);
-
-    // Borrow the array's bytes and decode them straight into the typed storage:
-    // one pass over the payload, no intermediate `Vec<u8>`.  `view` owns the
-    // borrow, so it must outlive `bytes` (and no Python code runs in between).
-    let view = byte_view(py, array, path)?;
-    let bytes = borrowed_bytes(py, &view, path)?;
-
-    let dims = shape
-        .iter()
-        .map(|dim| {
-            usize::try_from(*dim).map_err(|_| {
-                error::raise(
-                    py,
-                    "ShapeError",
-                    format!("{path}: negative dimension ({dim}) in the array shape"),
-                )
-            })
-        })
-        .collect::<PyResult<Vec<usize>>>()?;
-    let expected = dims.iter().product::<usize>() * dtype.itemsize();
-    if bytes.len() != expected {
-        return Err(error::raise(
-            py,
-            "VerificationError",
-            format!(
-                "{path}: the array's shape {dims:?} declares {expected} byte(s) but it carries {}",
-                bytes.len()
-            ),
-        ));
-    }
-    let storage = decode_bytes(dtype, bytes, split_threads(bytes.len()));
     Buffer::new(dtype, dims, storage).map_err(|err| error::from_core(py, err))
 }
 
-/// The `B`-cast memoryview of a numpy array, as a [`PyBuffer`] borrow.
-fn byte_view(py: Python<'_>, array: &Bound<'_, PyAny>, path: &str) -> PyResult<PyBuffer<u8>> {
-    let view = array.getattr("data").map_err(|err| {
-        error::type_error(format!(
-            "{path}: expected a numpy array ({})",
-            message(err.value(py))
-        ))
-    })?;
-    let cast = view.call_method1("cast", ("B",)).map_err(|err| {
-        error::type_error(format!(
-            "{path}: cannot take a byte view ({})",
-            message(err.value(py))
-        ))
-    })?;
-    PyBuffer::<u8>::get(&cast).map_err(|err| {
+/// Copy a typed numpy view into an owned `Vec<T>` in logical (C) order.
+///
+/// `ArrayView::as_slice` succeeds only for a standard-layout array — that arm is
+/// one `memcpy`; every other layout (Fortran order, a transpose, a
+/// negative-stride slice) falls back to `ndarray`'s logical-order iterator, which
+/// visits the same elements numpy's own `ascontiguousarray` would produce.
+fn collect_values<T: numpy::Element + Copy>(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    path: &str,
+) -> PyResult<Vec<T>> {
+    let view = obj
+        .extract::<PyReadonlyArrayDyn<'_, T>>()
+        .map_err(|err| borrow_error(py, path, &err))?;
+    let array = view.as_array();
+    // `ArrayView::as_slice` is `Some` only for a standard (C) layout; any
+    // other layout is walked in logical index order by `iter`.
+    Ok(match array.as_slice() {
+        Some(values) => values.to_vec(),
+        None => array.iter().copied().collect(),
+    })
+}
+
+/// A typed `bool` view would be unsound (numpy bool pixels may hold any byte),
+/// so read the array through a zero-copy `uint8` view and normalize.
+///
+/// `view('uint8')` keeps the itemsize at 1 byte, which numpy allows for ANY
+/// strides, and `byte != 0` is the same normalization the engine applies.
+fn bool_values(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResult<Vec<bool>> {
+    let bytes = obj.call_method1("view", ("uint8",)).map_err(|err| {
         error::raise(
             py,
             "BackendError",
             format!(
-                "{path}: numpy refused a contiguous byte buffer ({})",
+                "{path}: cannot view the bool array as uint8 ({})",
                 message(err.value(py))
             ),
         )
+    })?;
+    Ok(collect_values::<u8>(py, &bytes, path)?
+        .into_iter()
+        .map(|byte| byte != 0)
+        .collect())
+}
+
+/// Borrow a typed numpy view and turn a refusal into a `BackendError` naming
+/// `path` (the preflight downcast already proved the object is an ndarray, so
+/// this only reports a borrow-flag conflict or an equivalent FFI failure).
+fn borrow_error(py: Python<'_>, path: &str, err: &PyErr) -> PyErr {
+    error::raise(
+        py,
+        "BackendError",
+        format!("{path}: cannot read the array ({})", message(err.value(py))),
+    )
+}
+
+/// [`Buffer`] → a fresh numpy array, ZERO copy for every dtype but `bool`.
+///
+/// The `Buffer` is CONSUMED: its `Vec<T>` becomes numpy's own buffer
+/// (`ndarray::ArrayD::from_shape_vec` + `IntoPyArray`, which hands the
+/// allocation to a `PySliceContainer` base object), so no element is copied and
+/// the result is writable and C-contiguous.  Nothing is shared with the engine,
+/// so writing into it never reaches a caller's input array.
+fn buffer_to_array<'py>(py: Python<'py>, buffer: Buffer) -> PyResult<Bound<'py, PyAny>> {
+    let Buffer {
+        dtype,
+        shape,
+        mut storage,
+    } = buffer;
+    // `ArrayD::from_shape_vec` is the only fallible step (it checks that the
+    // element count matches the shape, which `Buffer::new` has already done) and
+    // it never reallocates, so the transfer stays zero copy.  The payload is
+    // TAKEN out of its `Storage` variant (`Storage` has a `Drop` impl for the
+    // engine's byte pool, so the variant itself cannot be moved out); the
+    // emptied storage then drops without touching the pool.
+    macro_rules! taken {
+        ($values:expr) => {{
+            let values = std::mem::take($values);
+            let array = ArrayD::from_shape_vec(IxDyn(&shape), values).map_err(|err| {
+                error::raise(
+                    py,
+                    "ShapeError",
+                    format!(
+                        "run: cannot build a numpy {} array of shape {shape:?}: {err}",
+                        dtype.name()
+                    ),
+                )
+            })?;
+            array.into_pyarray(py).into_any()
+        }};
+    }
+    Ok(match &mut storage {
+        Storage::Bool(values) => bool_array(py, &shape, values)?,
+        Storage::I8(values) => taken!(values),
+        Storage::I16(values) => taken!(values),
+        Storage::I32(values) => taken!(values),
+        Storage::I64(values) => taken!(values),
+        Storage::U8(values) => taken!(values),
+        Storage::U16(values) => taken!(values),
+        Storage::U32(values) => taken!(values),
+        Storage::U64(values) => taken!(values),
+        Storage::F16(values) => taken!(values),
+        Storage::F32(values) => taken!(values),
+        Storage::F64(values) => taken!(values),
+        Storage::C64(values) => taken!(values),
+        Storage::C128(values) => taken!(values),
     })
 }
 
-/// The borrowed bytes of a contiguous byte view.
+/// [`Buffer`] → a numpy array for a BORROWED buffer.
 ///
-/// The slice borrows the exporter's memory, so the caller must keep `view`
-/// alive for as long as it uses the slice and must not run Python code
-/// meanwhile (a Python call could resize the exporting array).
-fn borrowed_bytes<'a>(py: Python<'_>, view: &'a PyBuffer<u8>, path: &str) -> PyResult<&'a [u8]> {
-    match view.as_slice_ptr() {
-        // SAFETY: the pointer addresses the buffer's own `item_count()` bytes,
-        // which `view` keeps exported for `'a`; `u8` has no validity or
-        // alignment requirements, and nothing writes through this shared slice.
-        Some(ptr) => Ok(unsafe { &*ptr.as_ptr() }),
-        None => Err(error::raise(
-            py,
-            "BackendError",
-            format!("{path}: numpy refused a contiguous byte buffer (non-contiguous strides)"),
-        )),
-    }
+/// Resolver arguments arrive as `Rc<Buffer>` and cannot be moved out of the
+/// engine, so the typed payload is cloned once (a single typed memcpy) and the
+/// owned path does the rest.
+fn buffer_to_array_copy<'py>(py: Python<'py>, buffer: &Buffer) -> PyResult<Bound<'py, PyAny>> {
+    buffer_to_array(py, buffer.clone())
 }
 
-/// Decode raw little-endian bytes into the typed storage (bool as `!= 0`).
-///
-/// Byte-for-byte what [`evoxc_cpu::Buffer::from_payload`] decodes, just read
-/// from a borrowed slice instead of a copied `Vec<u8>`, and split across
-/// `threads` for a payload large enough to pay for them.
-fn decode_bytes(dtype: DType, bytes: &[u8], threads: usize) -> Storage {
-    let count = bytes.len() / dtype.itemsize();
-    match dtype {
-        DType::Bool => Storage::Bool(decode_words::<bool, 1>(bytes, count, threads, |word| {
-            word[0] != 0
-        })),
-        DType::Int8 => Storage::I8(decode_words::<i8, 1>(bytes, count, threads, |word| {
-            word[0] as i8
-        })),
-        DType::UInt8 => Storage::U8(decode_words::<u8, 1>(bytes, count, threads, |word| word[0])),
-        DType::Int16 => Storage::I16(decode_words(bytes, count, threads, i16::from_le_bytes)),
-        DType::UInt16 => Storage::U16(decode_words(bytes, count, threads, u16::from_le_bytes)),
-        DType::Float16 => Storage::F16(decode_words::<f16, 2>(bytes, count, threads, |word| {
-            f16::from_bits(u16::from_le_bytes(word))
-        })),
-        DType::Int32 => Storage::I32(decode_words(bytes, count, threads, i32::from_le_bytes)),
-        DType::UInt32 => Storage::U32(decode_words(bytes, count, threads, u32::from_le_bytes)),
-        DType::Float32 => Storage::F32(decode_words(bytes, count, threads, f32::from_le_bytes)),
-        DType::Int64 => Storage::I64(decode_words(bytes, count, threads, i64::from_le_bytes)),
-        DType::UInt64 => Storage::U64(decode_words(bytes, count, threads, u64::from_le_bytes)),
-        DType::Float64 => Storage::F64(decode_words(bytes, count, threads, f64::from_le_bytes)),
-        DType::Complex64 => Storage::C64(decode_words(bytes, count, threads, |word: [u8; 8]| {
-            Complex::new(
-                f32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-                f32::from_le_bytes([word[4], word[5], word[6], word[7]]),
+/// The `bool` output path: a `Vec<bool>` is bit-packed (one BIT per element), so
+/// its allocation can never become numpy's byte-per-element buffer — allocate the
+/// numpy array and write the values into it instead.
+fn bool_array<'py>(
+    py: Python<'py>,
+    shape: &[usize],
+    values: &[bool],
+) -> PyResult<Bound<'py, PyAny>> {
+    let array = PyArrayDyn::<bool>::zeros(py, IxDyn(shape), false);
+    {
+        let mut writable = array.try_readwrite().map_err(|err| {
+            error::raise(
+                py,
+                "BackendError",
+                format!("run: cannot write the bool output ({err})"),
             )
-        })),
-        DType::Complex128 => {
-            Storage::C128(decode_words(bytes, count, threads, |word: [u8; 16]| {
-                Complex::new(
-                    f64::from_le_bytes([
-                        word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
-                    ]),
-                    f64::from_le_bytes([
-                        word[8], word[9], word[10], word[11], word[12], word[13], word[14],
-                        word[15],
-                    ]),
-                )
-            }))
+        })?;
+        let slots = writable.as_slice_mut().map_err(|err| {
+            error::raise(
+                py,
+                "BackendError",
+                format!("run: the bool output is not contiguous ({err})"),
+            )
+        })?;
+        if slots.len() != values.len() {
+            return Err(error::raise(
+                py,
+                "ShapeError",
+                format!(
+                    "run: a bool buffer of shape {shape:?} needs {} element(s), got {}",
+                    slots.len(),
+                    values.len()
+                ),
+            ));
+        }
+        for (slot, value) in slots.iter_mut().zip(values.iter()) {
+            *slot = *value;
         }
     }
-}
-
-/// The output address shared with [`decode_words`]' helper threads.
-///
-/// The threads write disjoint index ranges through it, so sharing the raw
-/// address is sound (`*mut T` is neither `Send` nor `Sync` on its own).
-struct OutPtr<T>(*mut T);
-// SAFETY: `decode_words` hands out disjoint output ranges only.
-unsafe impl<T> Send for OutPtr<T> {}
-unsafe impl<T> Sync for OutPtr<T> {}
-
-impl<T> OutPtr<T> {
-    /// Write one element at `index` (each index is written exactly once).
-    ///
-    /// # Safety
-    /// `index` must be inside the allocation this pointer came from, and no
-    /// other thread may write the same index.
-    unsafe fn write(&self, index: usize, value: T) {
-        self.0.add(index).write(value);
-    }
-}
-
-/// Decode `count` little-endian words of `N` bytes each into a vector of `T`,
-/// splitting the work across `threads` when asked.
-///
-/// The values are written through raw pointers, one disjoint range per thread,
-/// so no reference to uninitialized memory is created and the trailing
-/// `set_len` is sound; `bytes` must hold at least `count * N` bytes.
-fn decode_words<T: Copy + Send, const N: usize>(
-    bytes: &[u8],
-    count: usize,
-    threads: usize,
-    decode: impl Fn([u8; N]) -> T + Sync,
-) -> Vec<T> {
-    let mut values: Vec<T> = Vec::with_capacity(count);
-    let chunk = count.div_ceil(threads.max(1));
-    // SAFETY: `values` has room for `count` elements and is empty, so its
-    // allocation is exclusively ours; every thread writes its own
-    // `[start, start + len)` range through the raw pointer (`ptr::write` into
-    // uninitialized memory is fine for a `Copy` type — no reference to it is
-    // ever formed), and `set_len(count)` only runs after the join, when every
-    // element is initialized.  `count * N` bytes are guaranteed by the caller.
-    unsafe {
-        let out = OutPtr(values.as_mut_ptr());
-        let body = |start: usize, len: usize| {
-            let mut offset = start * N;
-            for index in start..start + len {
-                let mut word = [0u8; N];
-                word.copy_from_slice(&bytes[offset..offset + N]);
-                out.write(index, decode(word));
-                offset += N;
-            }
-        };
-        if threads <= 1 || chunk == 0 || chunk >= count {
-            body(0, count);
-        } else {
-            std::thread::scope(|scope| {
-                let mut next = chunk;
-                while next < count {
-                    let len = chunk.min(count - next);
-                    let body = &body;
-                    scope.spawn(move || body(next, len));
-                    next += len;
-                }
-                // The calling thread takes the leading chunk instead of idling.
-                body(0, chunk);
-            });
-        }
-        values.set_len(count);
-    }
-    values
-}
-
-/// Copy `src` into `dst`, splitting the work across `threads` when asked.
-fn copy_bytes(dst: &mut [u8], src: &[u8], threads: usize) {
-    if threads <= 1 || dst.len() <= threads {
-        dst.copy_from_slice(src);
-        return;
-    }
-    let chunk = dst.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let mut chunks = dst.chunks_mut(chunk);
-        let mut offset = 0;
-        let first = chunks.next();
-        for chunk in chunks {
-            let start = offset + chunk.len();
-            let window = &src[start..start + chunk.len()];
-            scope.spawn(move || chunk.copy_from_slice(window));
-            offset = start;
-        }
-        // The calling thread takes the leading chunk instead of idling.
-        if let Some(chunk) = first {
-            chunk.copy_from_slice(&src[..chunk.len()]);
-        }
-    });
-}
-
-/// Element count a flat copy of `bytes` bytes should split across, mirroring
-/// the engine's own threshold: one thread below 1 MiB, then one more per
-/// further 512 KiB up to four (a scoped spawn costs ~12 µs here, so spawning
-/// for a smaller payload loses more than it gains).
-const SPLIT_MIN_BYTES: usize = 1 << 20;
-const SPLIT_PER_THREAD: usize = 1 << 19;
-const SPLIT_MAX_THREADS: usize = 4;
-
-fn split_threads(bytes: usize) -> usize {
-    if bytes < SPLIT_MIN_BYTES {
-        return 1;
-    }
-    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let cores = *CORES.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(1)
-            .clamp(1, SPLIT_MAX_THREADS)
-    });
-    cores.min((bytes / SPLIT_PER_THREAD).max(1))
-}
-
-/// [`Buffer`] → a fresh, writable, C-contiguous numpy array (owns its bytes).
-///
-/// One allocation (`numpy.empty`) and one bulk copy: nothing is shared with the
-/// engine, and the caller's inputs are untouched.
-fn buffer_to_array<'py>(py: Python<'py>, buffer: &Buffer) -> PyResult<Bound<'py, PyAny>> {
-    let shape = PyTuple::new(py, &buffer.shape)?;
-    let empty = numpy(py)?.getattr("empty")?;
-    let array = empty.call1((shape, buffer.dtype.name()))?;
-    let view = array.getattr("data")?.call_method1("cast", ("B",))?;
-    let dest = PyBuffer::<u8>::get(&view)?;
-
-    // On a little-endian target the typed storage's bytes already are the numpy
-    // layout for every dtype, so a borrowed view is enough (no flattening); a
-    // big-endian host keeps the per-element `to_le_bytes` path.
-    let threads = split_threads(buffer.storage.len() * buffer.dtype.itemsize());
-    if cfg!(target_endian = "little") {
-        fill_bytes(py, &dest, storage_bytes_le(&buffer.storage), threads)?;
-    } else {
-        let bytes = storage_to_bytes(&buffer.storage);
-        fill_bytes(py, &dest, &bytes, threads)?;
-    }
-    Ok(array)
-}
-
-/// Write `bytes` into a freshly allocated numpy array's memory.
-fn fill_bytes(py: Python<'_>, dest: &PyBuffer<u8>, bytes: &[u8], threads: usize) -> PyResult<()> {
-    if threads <= 1 {
-        return dest.copy_from_slice(py, bytes);
-    }
-    let Some(ptr) = dest.as_slice_ptr() else {
-        return Err(pyo3::exceptions::PyBufferError::new_err(
-            "the destination array is not C-contiguous",
-        ));
-    };
-    // SAFETY: `dest` is the `B`-cast view of an array this call just allocated
-    // with `numpy.empty` and has not returned or shared yet, so this exclusive
-    // borrow of its `bytes.len()` bytes cannot alias anything; no Python code
-    // runs while it lives, and `copy_bytes` splits it into disjoint chunks.
-    let dst: &mut [u8] = unsafe { &mut *ptr.as_ptr() };
-    if dst.len() != bytes.len() {
-        return Err(pyo3::exceptions::PyBufferError::new_err(format!(
-            "the destination array holds {} byte(s) but {} were produced",
-            dst.len(),
-            bytes.len()
-        )));
-    }
-    copy_bytes(dst, bytes, threads);
-    Ok(())
-}
-
-/// The little-endian bytes of a storage, borrowed without a copy.
-///
-/// Only valid on a little-endian target: there the in-memory bytes of every
-/// typed storage are the numpy layout (`f16` is its 2-byte bit pattern,
-/// `Complex` is `repr(C) {re, im}`, `bool` is one byte holding 0 or 1).
-fn storage_bytes_le(storage: &Storage) -> &[u8] {
-    /// A byte view of any typed slice: sound because `u8` has no validity or
-    /// alignment requirements and `size_of_val` is exactly the slice's byte
-    /// range (the classic `bytemuck::cast_slice`, made safe by the `u8` target).
-    fn view<T>(values: &[T]) -> &[u8] {
-        // SAFETY: see above — a shared, initialized `&[T]` reinterpreted as a
-        // `&[u8]` of exactly its bytes; nothing writes through it and the
-        // lifetime is the source's.
-        unsafe {
-            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-        }
-    }
-    match storage {
-        Storage::Bool(values) => view(values),
-        Storage::I8(values) => view(values),
-        Storage::I16(values) => view(values),
-        Storage::I32(values) => view(values),
-        Storage::I64(values) => view(values),
-        Storage::U8(values) => view(values),
-        Storage::U16(values) => view(values),
-        Storage::U32(values) => view(values),
-        Storage::U64(values) => view(values),
-        Storage::F16(values) => view(values),
-        Storage::F32(values) => view(values),
-        Storage::F64(values) => view(values),
-        Storage::C64(values) => view(values),
-        Storage::C128(values) => view(values),
-    }
-}
-
-/// Flatten storage to little-endian bytes (bool as `0x00`/`0x01`, f16 via its
-/// bit pattern, complex as interleaved real/imaginary).
-///
-/// This is the big-endian host fallback; on a little-endian target
-/// [`storage_bytes_le`] hands out the same bytes as a borrowed view.
-fn storage_to_bytes(storage: &Storage) -> Vec<u8> {
-    let itemsize = match storage {
-        Storage::Bool(_) | Storage::I8(_) | Storage::U8(_) => 1,
-        Storage::I16(_) | Storage::U16(_) | Storage::F16(_) => 2,
-        Storage::I32(_) | Storage::U32(_) | Storage::F32(_) | Storage::C64(_) => 4,
-        Storage::I64(_) | Storage::U64(_) | Storage::F64(_) | Storage::C128(_) => 8,
-    };
-    let mut bytes = Vec::with_capacity(storage.len() * itemsize);
-    match storage {
-        Storage::Bool(values) => bytes.extend(values.iter().map(|value| u8::from(*value))),
-        Storage::I8(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::I16(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::I32(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::I64(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::U8(values) => bytes.extend_from_slice(values),
-        Storage::U16(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::U32(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::U64(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::F16(values) => bytes.extend(
-            values
-                .iter()
-                .flat_map(|value| value.to_bits().to_le_bytes()),
-        ),
-        Storage::F32(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::F64(values) => bytes.extend(values.iter().flat_map(|value| value.to_le_bytes())),
-        Storage::C64(values) => {
-            for value in values {
-                bytes.extend_from_slice(&value.re.to_le_bytes());
-                bytes.extend_from_slice(&value.im.to_le_bytes());
-            }
-        }
-        Storage::C128(values) => {
-            for value in values {
-                bytes.extend_from_slice(&value.re.to_le_bytes());
-                bytes.extend_from_slice(&value.im.to_le_bytes());
-            }
-        }
-    }
-    bytes
+    Ok(array.into_any())
 }
 
 // ---------------------------------------------------------------------------
@@ -815,8 +612,8 @@ fn invoke(
 
     let list = PyList::empty(py);
     for value in args {
-        let array =
-            buffer_to_array(py, value).map_err(|err| callback_error(py, method, name, &err))?;
+        let array = buffer_to_array_copy(py, value)
+            .map_err(|err| callback_error(py, method, name, &err))?;
         list.append(array)
             .map_err(|err| callback_error(py, method, name, &err))?;
     }
@@ -898,48 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn integers_and_floats_flatten_little_endian() {
-        let storage = Storage::I32(vec![1, -2]);
-        assert_eq!(
-            storage_to_bytes(&storage),
-            vec![1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]
-        );
-        let storage = Storage::F32(vec![1.0, -1.0]);
-        assert_eq!(
-            storage_to_bytes(&storage),
-            1.0f32
-                .to_le_bytes()
-                .iter()
-                .copied()
-                .chain((-1.0f32).to_le_bytes())
-                .collect::<Vec<u8>>()
-        );
-    }
-
-    #[test]
-    fn bool_f16_and_complex_flatten_to_their_numpy_layouts() {
-        let storage = Storage::Bool(vec![true, false]);
-        assert_eq!(storage_to_bytes(&storage), vec![1, 0]);
-
-        let value = f16::from_f32(0.5);
-        let storage = Storage::F16(vec![value]);
-        assert_eq!(
-            storage_to_bytes(&storage),
-            value.to_bits().to_le_bytes().to_vec()
-        );
-
-        let storage = Storage::C64(vec![Complex::new(1.5f32, -2.5f32)]);
-        let mut expected = 1.5f32.to_le_bytes().to_vec();
-        expected.extend_from_slice(&(-2.5f32).to_le_bytes());
-        assert_eq!(storage_to_bytes(&storage), expected);
-
-        let storage = Storage::C128(vec![Complex::new(1.0f64, 2.0f64)]);
-        let mut expected = 1.0f64.to_le_bytes().to_vec();
-        expected.extend_from_slice(&2.0f64.to_le_bytes());
-        assert_eq!(storage_to_bytes(&storage), expected);
-    }
-
-    #[test]
     fn a_bad_discriminator_is_a_persistence_error() {
         let envelope = Json::Object(Map::from_iter([
             ("format".to_string(), Json::from("something-else")),
@@ -967,12 +722,15 @@ mod tests {
     }
 }
 
-/// The numpy marshalling surface, exercised through a real interpreter (run
-/// with `cargo test -p evoxc-python --no-default-features --features auto-init`).
+/// The numpy bridging surface, exercised through a real interpreter (run with
+/// `cargo test -p evoxc-python --no-default-features --features auto-init`).
+///
+/// The linked interpreter must be able to `import numpy` — the root project's
+/// `.venv` provides it — because every case here builds real numpy arrays.
 #[cfg(all(test, feature = "auto-init"))]
 mod marshalling {
     use super::*;
-    use pyo3::types::PyByteArray;
+    use pyo3::types::{PyByteArray, PyTuple};
 
     /// A deterministic byte pattern: every bit pattern is a valid value of
     /// every evoxc dtype (except `bool`, which is covered separately).
@@ -1014,6 +772,53 @@ mod marshalling {
             .unwrap()
     }
 
+    fn dtype_name(array: &Bound<'_, PyAny>) -> String {
+        array
+            .getattr("dtype")
+            .unwrap()
+            .getattr("name")
+            .unwrap()
+            .extract::<String>()
+            .unwrap()
+    }
+
+    fn shape_of(array: &Bound<'_, PyAny>) -> Vec<usize> {
+        array
+            .getattr("shape")
+            .unwrap()
+            .extract::<Vec<usize>>()
+            .unwrap()
+    }
+
+    fn flag(array: &Bound<'_, PyAny>, name: &str) -> bool {
+        array
+            .getattr("flags")
+            .unwrap()
+            .getattr(name)
+            .unwrap()
+            .extract::<bool>()
+            .unwrap()
+    }
+
+    /// numpy's own answer to "what does this view mean" — the C-order values of
+    /// an arbitrarily strided array — so a strided input can be compared exactly
+    /// without the binding's help.
+    fn contiguous_bytes(py: Python<'_>, array: &Bound<'_, PyAny>) -> Vec<u8> {
+        let copy = numpy(py)
+            .unwrap()
+            .getattr("ascontiguousarray")
+            .unwrap()
+            .call1((array,))
+            .unwrap();
+        bytes_of(&copy)
+    }
+
+    /// `Result::expect` with the dtype in the panic message (clippy's
+    /// `expect_fun_call` rejects `expect(dtype.name())` outright).
+    fn ok<T, E: std::fmt::Display>(result: Result<T, E>, dtype: DType) -> T {
+        result.unwrap_or_else(|err| panic!("{}: {err}", dtype.name()))
+    }
+
     #[test]
     fn every_dtype_round_trips_bit_identically() {
         Python::attach(|py| {
@@ -1022,11 +827,57 @@ mod marshalling {
                     continue; // non-canonical byte values normalize (see below)
                 }
                 let (array, bytes) = make_array(py, dtype, 1024);
-                let buffer = array_to_buffer(py, &array, "test").expect(dtype.name());
+                let buffer = ok(array_to_buffer(py, &array, "test"), dtype);
                 assert_eq!(buffer.dtype, dtype);
                 assert_eq!(buffer.shape, vec![1024]);
-                let out = buffer_to_array(py, &buffer).expect(dtype.name());
+                let out = ok(buffer_to_array(py, buffer), dtype);
+                assert_eq!(dtype_name(&out), dtype.name());
+                assert_eq!(shape_of(&out), vec![1024]);
                 assert_eq!(bytes_of(&out), bytes, "{} round trip", dtype.name());
+            }
+        });
+    }
+
+    /// The typed outbound path per dtype: a `Buffer`'s payload becomes a numpy
+    /// array of the matching dtype and shape, and survives the trip back.
+    #[test]
+    fn typed_buffers_become_numpy_arrays_of_their_dtype() {
+        Python::attach(|py| {
+            let cases: Vec<(DType, Vec<usize>, Storage)> = vec![
+                (DType::Int32, vec![2], Storage::I32(vec![1, -2])),
+                (DType::Float32, vec![2], Storage::F32(vec![1.0, -1.0])),
+                (DType::Float64, vec![2, 2], Storage::F64(vec![0.5, 1.5, -2.5, 3.0])),
+                (DType::Int8, vec![3], Storage::I8(vec![-1, 0, 127])),
+                (DType::Bool, vec![2], Storage::Bool(vec![true, false])),
+                (
+                    DType::Float16,
+                    vec![1],
+                    Storage::F16(vec![f16::from_f32(0.5)]),
+                ),
+                (
+                    DType::Complex64,
+                    vec![1],
+                    Storage::C64(vec![Complex::new(1.5f32, -2.5f32)]),
+                ),
+                (
+                    DType::Complex128,
+                    vec![1],
+                    Storage::C128(vec![Complex::new(1.0f64, 2.0f64)]),
+                ),
+            ];
+            for (dtype, shape, storage) in cases {
+                let expected = storage.clone();
+                let buffer = ok(Buffer::new(dtype, shape.clone(), storage), dtype);
+                let array = ok(buffer_to_array(py, buffer), dtype);
+                assert_eq!(dtype_name(&array), dtype.name());
+                assert_eq!(shape_of(&array), shape);
+                assert!(flag(&array, "c_contiguous"));
+
+                // ...and back into the engine: identical dtype, shape and values.
+                let back = ok(array_to_buffer(py, &array, "test"), dtype);
+                assert_eq!(back.dtype, dtype);
+                assert_eq!(back.shape, shape);
+                assert_eq!(back.storage, expected, "{} values", dtype.name());
             }
         });
     }
@@ -1041,91 +892,84 @@ mod marshalling {
                 .unwrap()
                 .call1((owner, "bool"))
                 .unwrap();
-            // The previous path (`Buffer::from_payload`) also decoded any
-            // non-zero byte as `true` and re-encoded it as 1.
+            // A numpy bool array may hold any byte (`only != 0` is meaningful),
+            // so the uint8 view normalizes exactly like `Buffer::from_payload`.
             let buffer = array_to_buffer(py, &array, "test").unwrap();
             assert_eq!(buffer.storage, Storage::Bool(vec![false, true, true, true]));
-            let out = buffer_to_array(py, &buffer).unwrap();
+            let out = buffer_to_array(py, buffer).unwrap();
             assert_eq!(bytes_of(&out), vec![0u8, 1, 1, 1]);
         });
     }
 
     #[test]
-    fn large_payloads_take_the_threaded_path_bit_identically() {
-        Python::attach(|py| {
-            // Above the 1 MiB split threshold, so the decode and the copy are
-            // both chunked across threads.
-            for (dtype, count) in [
-                (DType::Float32, 1 << 20),
-                (DType::Int64, 1 << 19),
-                (DType::Complex128, 1 << 18),
-                (DType::Float16, 1 << 21),
-                (DType::UInt8, 1 << 21),
-                (DType::Int8, 1 << 21),
-                (DType::Bool, 1 << 21),
-            ] {
-                assert!(count * dtype.itemsize() > SPLIT_MIN_BYTES);
-                let (array, bytes) = make_array(py, dtype, count);
-                let buffer = array_to_buffer(py, &array, "test").expect(dtype.name());
-                assert_eq!(buffer.storage.len(), count);
-                let out = buffer_to_array(py, &buffer).expect(dtype.name());
-                let expected = if dtype == DType::Bool {
-                    bytes.iter().map(|byte| u8::from(*byte != 0)).collect()
-                } else {
-                    bytes
-                };
-                assert_eq!(bytes_of(&out), expected, "{} round trip", dtype.name());
-            }
-        });
-    }
-
-    #[test]
-    fn the_returned_array_is_fresh_writable_and_does_not_alias_the_input() {
-        Python::attach(|py| {
-            let (array, bytes) = make_array(py, DType::Float32, 4096);
-            let buffer = array_to_buffer(py, &array, "test").unwrap();
-            let out = buffer_to_array(py, &buffer).unwrap();
-            let flags = out.getattr("flags").unwrap();
-            for flag in ["owndata", "c_contiguous", "writeable"] {
-                assert!(
-                    flags.getattr(flag).unwrap().extract::<bool>().unwrap(),
-                    "the result must be {flag}"
-                );
-            }
-            // Writing the result must not reach the caller's array.
-            out.call_method1("fill", (7.0,)).unwrap();
-            assert_eq!(bytes_of(&array), bytes);
-            assert!(bytes_of(&out)
-                .chunks_exact(4)
-                .all(|word| word == 7.0f32.to_le_bytes()));
-        });
-    }
-
-    #[test]
-    fn a_strided_input_is_copied_contiguous_not_misread() {
+    fn a_fortran_ordered_input_reads_in_logical_order() {
         Python::attach(|py| {
             let (source, _) = make_array(py, DType::Float32, 24);
-            let matrix = source.call_method1("reshape", ((4, 6),)).unwrap();
-            let transposed = matrix.call_method0("transpose").unwrap();
-            assert!(!transposed
-                .getattr("flags")
+            let c_order = source.call_method1("reshape", ((4, 6),)).unwrap();
+            let fortran = numpy(py)
                 .unwrap()
-                .getattr("c_contiguous")
+                .getattr("asfortranarray")
                 .unwrap()
-                .extract::<bool>()
-                .unwrap());
-            let buffer = array_to_buffer(py, &transposed, "test").unwrap();
-            assert_eq!(buffer.shape, vec![6, 4]);
-            let contiguous = numpy(py)
-                .unwrap()
-                .getattr("ascontiguousarray")
-                .unwrap()
-                .call1((&transposed,))
+                .call1((&c_order,))
                 .unwrap();
-            assert_eq!(
-                storage_bytes_le(&buffer.storage),
-                bytes_of(&contiguous).as_slice()
-            );
+            assert!(flag(&fortran, "f_contiguous"));
+            assert!(!flag(&fortran, "c_contiguous"));
+
+            let buffer = array_to_buffer(py, &fortran, "test").unwrap();
+            assert_eq!(buffer.shape, vec![4, 6]);
+            let reference = array_to_buffer(py, &c_order, "test").unwrap();
+            assert_eq!(buffer.storage, reference.storage);
+            // ...and the same values numpy itself reads out of the view.
+            let out = buffer_to_array(py, buffer).unwrap();
+            assert!(flag(&out, "c_contiguous"));
+            assert_eq!(bytes_of(&out), contiguous_bytes(py, &fortran));
+        });
+    }
+
+    #[test]
+    fn negative_stride_views_read_their_logical_values() {
+        Python::attach(|py| {
+            let (source, _) = make_array(py, DType::Int32, 12);
+            let matrix = source.call_method1("reshape", ((3, 4),)).unwrap();
+
+            // A reversed vector (`arr[::-1]`) and a flipped transpose: both are
+            // negative-stride views, which `ndarray` offsets and inverts.
+            for view in [
+                numpy(py)
+                    .unwrap()
+                    .getattr("flip")
+                    .unwrap()
+                    .call1((&source,))
+                    .unwrap(),
+                numpy(py)
+                    .unwrap()
+                    .getattr("flip")
+                    .unwrap()
+                    .call1((matrix.getattr("T").unwrap(),))
+                    .unwrap(),
+            ] {
+                let strides: Vec<isize> = view.getattr("strides").unwrap().extract().unwrap();
+                assert!(strides.iter().any(|stride| *stride < 0), "{strides:?}");
+                assert!(!flag(&view, "c_contiguous"));
+
+                let buffer = array_to_buffer(py, &view, "test").unwrap();
+                assert_eq!(buffer.shape, shape_of(&view));
+                let out = buffer_to_array(py, buffer).unwrap();
+                assert_eq!(bytes_of(&out), contiguous_bytes(py, &view));
+            }
+        });
+    }
+
+    #[test]
+    fn a_read_only_input_is_accepted() {
+        Python::attach(|py| {
+            let (array, bytes) = make_array(py, DType::Float64, 8);
+            array.call_method1("setflags", (false,)).unwrap();
+            assert!(!flag(&array, "writeable"));
+            let buffer = array_to_buffer(py, &array, "test").unwrap();
+            let out = buffer_to_array(py, buffer).unwrap();
+            assert_eq!(bytes_of(&out), bytes);
+            assert!(flag(&out, "writeable"));
         });
     }
 
@@ -1138,7 +982,7 @@ mod marshalling {
             let buffer = array_to_buffer(py, &scalar, "test").unwrap();
             assert!(buffer.shape.is_empty());
             assert!(buffer.storage.len() == 1);
-            let out = buffer_to_array(py, &buffer).unwrap();
+            let out = buffer_to_array(py, buffer).unwrap();
             assert_eq!(out.getattr("shape").unwrap().len().unwrap(), 0);
             assert_eq!(bytes_of(&out), bytes);
 
@@ -1152,8 +996,109 @@ mod marshalling {
             let buffer = array_to_buffer(py, &empty, "test").unwrap();
             assert_eq!(buffer.shape, vec![0]);
             assert!(buffer.storage.is_empty());
-            let out = buffer_to_array(py, &buffer).unwrap();
+            let out = buffer_to_array(py, buffer).unwrap();
+            assert_eq!(shape_of(&out), vec![0]);
+            assert_eq!(dtype_name(&out), "float64");
             assert_eq!(bytes_of(&out), Vec::<u8>::new());
+        });
+    }
+
+    #[test]
+    fn a_non_native_byte_order_is_refused_with_the_pinned_message() {
+        Python::attach(|py| {
+            for (dtype, swapped) in [(DType::Float32, ">f4"), (DType::Complex128, ">c16")] {
+                let (array, _) = make_array(py, dtype, 4);
+                let big_endian = array.call_method1("astype", (swapped,)).unwrap();
+                assert!(!big_endian
+                    .getattr("dtype")
+                    .unwrap()
+                    .getattr("isnative")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap());
+                let err = array_to_buffer(py, &big_endian, "flat_inputs[0]").unwrap_err();
+                let value = err.value(py);
+                assert_eq!(
+                    value.getattr("kind").unwrap().extract::<String>().unwrap(),
+                    "BackendError"
+                );
+                // numpy reports the canonical name, so the pinned text names the
+                // dtype rather than the `>f4` spelling.
+                assert_eq!(
+                    value.str().unwrap().to_string_lossy(),
+                    format!(
+                        "flat_inputs[0]: non-native byte order {} is not supported — convert the array with `.astype(...)` first",
+                        dtype.name()
+                    )
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn the_returned_array_is_fresh_writable_and_does_not_alias_the_input() {
+        Python::attach(|py| {
+            let (array, bytes) = make_array(py, DType::Float32, 4096);
+            let buffer = array_to_buffer(py, &array, "test").unwrap();
+            let out = buffer_to_array(py, buffer).unwrap();
+            for name in ["c_contiguous", "writeable"] {
+                assert!(flag(&out, name), "the result must be {name}");
+            }
+            // `IntoPyArray` moves the Rust allocation into a `PySliceContainer`
+            // BASE object, and numpy never reports `owndata` for an array with a
+            // base — the memory is still exclusively this array's (that base IS
+            // the engine's `Vec<T>`), and it is writable and C-contiguous.
+            assert!(!flag(&out, "owndata"));
+            let base = out.getattr("base").unwrap();
+            assert!(!base.is_none());
+            assert_eq!(
+                base.get_type().name().unwrap().to_string_lossy(),
+                "PySliceContainer"
+            );
+            // Writing the result must not reach the caller's array.
+            out.call_method1("fill", (7.0,)).unwrap();
+            assert_eq!(bytes_of(&array), bytes);
+            assert!(bytes_of(&out)
+                .chunks_exact(4)
+                .all(|word| word == 7.0f32.to_le_bytes()));
+        });
+    }
+
+    #[test]
+    fn a_transposed_input_is_read_in_logical_order() {
+        Python::attach(|py| {
+            let (source, _) = make_array(py, DType::Float32, 24);
+            let matrix = source.call_method1("reshape", ((4, 6),)).unwrap();
+            let transposed = matrix.call_method0("transpose").unwrap();
+            assert!(!flag(&transposed, "c_contiguous"));
+            let buffer = array_to_buffer(py, &transposed, "test").unwrap();
+            assert_eq!(buffer.shape, vec![6, 4]);
+            let out = buffer_to_array(py, buffer).unwrap();
+            assert_eq!(bytes_of(&out), contiguous_bytes(py, &transposed));
+        });
+    }
+
+    #[test]
+    fn an_ndarray_subclass_is_accepted() {
+        Python::attach(|py| {
+            // `numpy.matrix` is an `ndarray` subclass; the downcast uses
+            // `PyArray_Check`, so it is accepted like a plain array.
+            let (source, _) = make_array(py, DType::Float64, 6);
+            let matrix = numpy(py)
+                .unwrap()
+                .getattr("matrix")
+                .unwrap()
+                .call1((source.call_method1("reshape", ((2, 3),)).unwrap(),))
+                .unwrap();
+            let buffer = array_to_buffer(py, &matrix, "test").unwrap();
+            assert_eq!(buffer.shape, vec![2, 3]);
+            let reference = array_to_buffer(
+                py,
+                &source.call_method1("reshape", ((2, 3),)).unwrap(),
+                "test",
+            )
+            .unwrap();
+            assert_eq!(buffer.storage, reference.storage);
         });
     }
 
@@ -1166,16 +1111,60 @@ mod marshalling {
                 16
             );
             let err = array_to_buffer(py, &py.None().into_bound(py), "flat_inputs[0]").unwrap_err();
-            assert!(err.to_string().contains("expected a numpy array"), "{err}");
+            assert!(
+                err.to_string()
+                    .contains("flat_inputs[0]: expected a numpy array, got NoneType"),
+                "{err}"
+            );
         });
     }
 
     #[test]
-    fn split_threads_only_splits_large_payloads() {
-        assert_eq!(split_threads(0), 1);
-        assert_eq!(split_threads(SPLIT_MIN_BYTES - 1), 1);
-        assert!(split_threads(SPLIT_MIN_BYTES) >= 1);
-        assert_eq!(split_threads(64 << 20), split_threads(1 << 22).max(1));
-        assert!(split_threads(64 << 20) <= SPLIT_MAX_THREADS);
+    fn a_buffer_numpy_buffer_chain_round_trips_bit_identically() {
+        Python::attach(|py| {
+            // buffer -> numpy array -> buffer again, twice through the bridge.
+            // The comparison is over the numpy BYTES (not `Storage`, whose
+            // float equality would trip on the NaNs the random payload carries).
+            for dtype in evoxc_core::dtype::ALL {
+                let (array, _) = make_array(py, dtype, 64);
+                let first = ok(array_to_buffer(py, &array, "test"), dtype);
+                let out = ok(buffer_to_array(py, first), dtype);
+                let bytes = bytes_of(&out);
+                let second = ok(array_to_buffer(py, &out, "test"), dtype);
+                assert_eq!(second.dtype, dtype);
+                assert_eq!(second.shape, vec![64]);
+                let out_again = ok(buffer_to_array(py, second), dtype);
+                assert_eq!(dtype_name(&out_again), dtype.name());
+                assert_eq!(bytes_of(&out_again), bytes, "{} chain", dtype.name());
+            }
+        });
+    }
+
+    /// The committed FFI floor: 8 MB in + 8 MB out through the typed bridge.
+    #[test]
+    #[ignore = "timing probe: `--ignored --nocapture` refreshes the 8 MB round-trip number"]
+    fn an_eight_megabyte_round_trip_is_measured() {
+        Python::attach(|py| {
+            const COUNT: usize = 2 << 20; // 2M float32 = 8 MB
+            let (array, bytes) = make_array(py, DType::Float32, COUNT);
+            // One untimed warm-up (numpy's C-API init, the allocator).
+            let warm = array_to_buffer(py, &array, "test").unwrap();
+            let warm = buffer_to_array(py, warm).unwrap();
+            assert_eq!(bytes_of(&warm), bytes);
+
+            const REPS: u32 = 20;
+            let started = Instant::now();
+            for _ in 0..REPS {
+                let buffer = array_to_buffer(py, &array, "test").unwrap();
+                let out = buffer_to_array(py, buffer).unwrap();
+                std::hint::black_box(&out);
+            }
+            let per_round_trip = started.elapsed().as_secs_f64() / f64::from(REPS);
+            println!(
+                "8 MB round trip (2M f32 in + 2M f32 out): {:.3} ms/round trip, {:.3} ms/direction",
+                per_round_trip * 1000.0,
+                per_round_trip * 500.0
+            );
+        });
     }
 }
