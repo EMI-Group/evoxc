@@ -84,6 +84,7 @@ No `Bound<PyAny>` crosses into native code and no native type is captured from a
 `stats()` has exactly `ops`, `dispatched_ops` (equal to `ops` — this engine dispatches every planned op), `blocks` (`plan.block_count`), `plan_entries` (`plan.op_count`, the planned step count), `compile_ms`, `unsupported` (`plan.unsupported`, the dense ops the engine does not implement), `required_blocks`, `required_external` and `required_runtime`; `required_ops()` has `blocks`, `external` and `runtime_calls`.
 `run(flat_inputs, resolver=None)` converts the flat numpy inputs while holding the GIL, preflights the resolver, runs `evoxc::cpu::run_program(program, &plan, inputs, RunOptions::default(), callbacks)` detached, then builds fresh numpy arrays with the GIL re-acquired.
 Input arity/dtype/shape are validated by the engine at the run boundary (`BackendError`/`DTypeError`/`ShapeError`); an op without a native kernel is the plan's own `BackendError` at compile time.
+That rejection is `evoxc::cpu::plan::compile`'s per-step `kernels::lookup(&op.name)` miss, which returns `BackendError("no native CPU kernel for op '<name>'")` (plus ` [at <location>]` when the op has a known location), so a graph can only name a dense kernel or one of the three host-callback ops `block_call`/`external_call`/`runtime_call` — those compile to a kernel of their own and are recorded in `plan.required_blocks`/`required_external`/`required_runtime` by their `block_name`/`name`/`callback` attribute.
 
 ### numpy interop
 
@@ -98,6 +99,7 @@ Preflight (GIL held, before the detach) requires `resolver` whenever `plan.requi
 Call shape is `call_block(name, args)` plus — when the engine's `static_args` is non-null and non-empty — the static args payload as a third positional argument (converted with `crate::convert::py_from_json`); `call_external(name, args)` and `call_runtime(name, args)` always take exactly two arguments.
 `args` is a Python list of numpy arrays and the answer must be a list/tuple of numpy arrays (converted back through the same array→`Buffer` path).
 A resolver exception, an un-iterable answer or an unconvertible array becomes `BackendError("resolver.<method>(<name>) raised: <interpreter text>")`; nothing panics and nothing is silently skipped.
+Nothing in this crate loads native code — no `libloading`/`dlopen`/`dlsym`, no `extern "C"` function pointer built from user input, no Triton, no `PyCapsule`/`PyDLL`/`ctypes`, and no `unsafe` of its own — so the Python resolver object is the ONLY route by which non-builtin work reaches Rust: the engine never dispatches to a foreign `.so`, it calls the `Py<PyAny>` callables (`evoxc/backends/native/resolver.py`'s `NativeCallbackResolver` on the frontend side, whose `call_external` reads the `evoxc.external` registry of Python callables and rejects a `device_resident=True` slot).
 
 ## Buffer hand-off (native CPU engine)
 
