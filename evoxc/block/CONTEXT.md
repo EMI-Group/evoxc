@@ -145,8 +145,25 @@ Per backend capabilities, in order — first available wins, none → explicit
 2. **Registered backend impl** — `impl(backend_name)` entry (v1: `"numpy"`;
    the registry is backend-neutral so future names register identically).
 3. **Portable decomposition** — trace the registered `evoxc.defn` and inline
-   the resulting ordinary-op graph; works on every backend.
-4. (Future documented tiers: vendor-library dispatch, custom-call registration.)
+   the resulting ordinary-op graph (numpy inlines it only when the block has
+   no `"numpy"` impl; the native backend requires a registered `"native"`
+   impl and never inlines at load).
+4. (Future documented tiers: vendor-library dispatch, custom-call registration
+   — no `stablehlo.custom_call` emission exists anywhere in `../backends/`.)
+
+**Shipped-engine reality (binding):** all three compiler adapters declare
+`capabilities.custom_blocks = False`, and `CompilerBackend.lower` rejects a
+surviving `block_call` BEFORE portable inlining with
+`BackendError("capability drift: the <backend> backend cannot execute custom
+block ops (block_call)")` — so tier 3 does NOT make a block run on
+iree/xla/tvm today, even with a registered portable; `README.md` says the
+same ("Compiler adapters declare `custom_blocks=False` in v1 and reject a
+block graph with an explicit `BackendError`"). The `inline.py` message
+"compiler backends require BlockOp.portable(...)" is reachable only by a
+hypothetical `custom_blocks=True` compiler backend (the stub in
+`tests/backends/test_compiler_framework.py`). A kernel that must run on a
+compiler backend goes through `evoxc.external_call` (iree host/device
+dispatch), not a block.
 
 Derivatives (grad/jvp/vjp): explicit rule → use it; else portable
 decomposition (inline → differentiate) → else TransformError ("not
@@ -165,6 +182,11 @@ v1 numpy impls are callables the numpy interpreter backend invokes when it
 meets the block_call: `impl(*numpy_arrays, **static_args)` returning one
 ndarray or a tuple of them, with the JSON-able `static_args` attribute as
 kwargs (see `../backends/numpy/CONTEXT.md`).
+Kwarg VALUES are the encoded `{"kind": ..., "value": ...}` payload dicts, not
+decoded Python values (`tests/block/test_impl.py` pins
+`{"scale": {"kind": "float", "value": 2.5}}`), so an impl reads
+`kwargs["scale"]["value"]`; the native backend calls its `"native"` impl the
+same way and never falls back to a numpy impl.
 
 ## Rule bridge to transforms
 
