@@ -17,7 +17,7 @@ use crate::with_type;
 
 use super::{
     index_as_i128, operand, pooled_total, reconcile, render_ints, require_integer_indices,
-    resolve_index_fast,
+    resolve_index_fast, strided_copy,
 };
 
 pub(super) fn gather_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
@@ -54,7 +54,7 @@ fn gather_axis(spec: &OpSpec, rank: usize) -> Result<usize> {
     Ok(normalized[0])
 }
 
-fn gather(
+pub(super) fn gather(
     source: &Buffer,
     indices: &Buffer,
     axis: usize,
@@ -95,12 +95,19 @@ fn resolve_indices(indices: &Buffer, extent: usize, axis: usize) -> Result<Vec<u
 ///
 /// Only the gathered axis selects anything, so the index tensor's own shape is
 /// spliced into that position as ONE axis holding every resolved index (the
-/// element sequence is the same C order), each resolved offset takes one slice
-/// out of the source view through `index_axis`, and that slice is `assign`ed
-/// into the matching slice of the destination view. `assign` copies contiguous
-/// runs where the two views line up and falls back to its stride-aware walk
-/// otherwise, so there is no per-element odometer and no hand-built offset
-/// table on the path.
+/// element sequence is the same C order) and each resolved offset copies one
+/// axis slice out of the source into the matching slice of the destination.
+///
+/// The copy itself is [`super::strided_copy`]'s two-sided run plan: it is built
+/// ONCE for the whole gather (the axis slice has the same shape and strides at
+/// every index; only its base moves) and each selected index replays it. A
+/// C-contiguous slice copy — the leading/whole-axis families, the rank-1
+/// gather that takes one element per index — is one `copy_from_slice`, and an
+/// interleaved axis-last slice (a non-contiguous source into a contiguous
+/// destination, or a non-contiguous destination for a middle axis) is the
+/// lane-grouped run copy. Every layout the plan declines (a negative stride, a
+/// shape or offset it cannot prove) receives ndarray's `assign`, so the
+/// specialization can only change speed, never a value.
 fn gather_typed<T: Scalar + NdScalar>(
     values: &[T],
     dtype: DType,
@@ -115,7 +122,19 @@ fn gather_typed<T: Scalar + NdScalar>(
     flat.extend_from_slice(&source_shape[axis + 1..]);
     let total = util::numel(&shape);
     let mut out = pooled_total::<T>(total);
-    {
+    let plan = strided_copy::plan_axis_copy(values, &source, axis, &out, &flat, axis);
+    let mut copied = plan.is_some();
+    if let Some(plan) = &plan {
+        for (position, &selected) in resolved.iter().enumerate() {
+            if !plan.copy(values, selected, &mut out, position) {
+                copied = false;
+                break;
+            }
+        }
+    }
+    if !copied {
+        // The reference path: ndarray's own strided walk. It rewrites every
+        // axis slice, so a partly-written `out` is still fully overwritten.
         let mut dest = array_view_mut(&mut out, &flat)?;
         for (position, &selected) in resolved.iter().enumerate() {
             dest.index_axis_mut(ndarray::Axis(axis), position)
@@ -340,6 +359,158 @@ mod tests {
         assert!(
             !result.contains(&sentinel),
             "a recycled result vector leaked a stale element"
+        );
+    }
+
+    /// The per-index `ndarray` `assign` as an INDEPENDENT reference: it is the
+    /// path the run-copy plan replaced, so agreeing with it pins the plan
+    /// against ndarray's own strided element walk.
+    fn assign_reference<T: Scalar + NdScalar>(
+        values: &[T],
+        source_shape: &[usize],
+        axis: usize,
+        resolved: &[usize],
+        flat: &[usize],
+    ) -> Vec<T> {
+        let source = crate::buffer::array_view(values, source_shape).expect("a source view");
+        let mut reference: Vec<T> = T::zeros(crate::kernels::util::numel(flat));
+        {
+            let mut dest = crate::buffer::array_view_mut(&mut reference, flat)
+                .expect("a destination view");
+            for (position, &selected) in resolved.iter().enumerate() {
+                dest.index_axis_mut(ndarray::Axis(axis), position)
+                    .assign(&source.index_axis(ndarray::Axis(axis), selected));
+            }
+        }
+        reference
+    }
+
+    /// The regression family: an interleaved LAST-axis gather of a
+    /// `(500, 100, 2)` operand — every selected axis slice is non-contiguous —
+    /// must equal ndarray's `assign` for both result positions.
+    #[test]
+    fn gather_matches_the_ndarray_reference_on_the_interleaved_last_axis() {
+        let shape = [500usize, 100, 2];
+        let values: Vec<f32> = (0..100_000).map(|value| value as f32 * 0.5).collect();
+        let x = f32_buffer(&shape, &values);
+        let flat = [500usize, 100, 2];
+        let out = gather(&x, &i64_buffer(&[2], &[1, 0]), 2, &declared(&flat)).unwrap();
+        let Storage::F32(actual) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert_eq!(*actual, assign_reference::<f32>(&values, &shape, 2, &[1, 0], &flat));
+
+        // The same operand gathered along its MIDDLE axis, where the
+        // destination slice is non-contiguous too.
+        let flat = [500usize, 2, 2];
+        let out = gather(&x, &i64_buffer(&[2], &[1, 0]), 1, &declared(&flat)).unwrap();
+        let Storage::F32(actual) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert_eq!(*actual, assign_reference::<f32>(&values, &shape, 1, &[1, 0], &flat));
+    }
+
+    /// The two other shapes the instrumented workload spends its time in: a
+    /// wide `i8` operand gathered along axis 0 (one contiguous run per index)
+    /// and a flat `bool` mask (one element per index).
+    #[test]
+    fn gather_matches_the_ndarray_reference_for_i8_rows_and_a_flat_bool_mask() {
+        use crate::kernels::indexing::test_support::buffer;
+        let shape = [500usize, 200];
+        let values: Vec<i8> = (0..100_000).map(|value| (value % 251) as i8).collect();
+        let x = buffer(DType::Int8, &shape, Storage::I8(values.clone()));
+        let indices: Vec<i64> = (0..500).map(|value| (value * 7919) % 500).collect();
+        let resolved: Vec<usize> = indices.iter().map(|&index| index as usize).collect();
+        let flat = [500usize, 200];
+        let out = gather(&x, &i64_buffer(&[500], &indices), 0, &declared(&flat)).unwrap();
+        let Storage::I8(actual) = &out.storage else {
+            panic!("the fixture is i8");
+        };
+        assert_eq!(*actual, assign_reference::<i8>(&values, &shape, 0, &resolved, &flat));
+
+        let mask: Vec<bool> = (0..50_000).map(|value| value % 3 == 0).collect();
+        let x = buffer(DType::Bool, &[50_000], Storage::Bool(mask.clone()));
+        let indices: Vec<i64> = (0..50_000).map(|value| (value * 40009) % 50_000).collect();
+        let resolved: Vec<usize> = indices.iter().map(|&index| index as usize).collect();
+        let out = gather(&x, &i64_buffer(&[50_000], &indices), 0, &declared(&[50_000])).unwrap();
+        let Storage::Bool(actual) = &out.storage else {
+            panic!("the fixture is bool");
+        };
+        assert_eq!(*actual, assign_reference::<bool>(&mask, &[50_000], 0, &resolved, &[50_000]));
+    }
+
+    /// A rank-4 operand: the interleaved stride-4 family with a trailing unit
+    /// axis, the same axis gathered repeatedly, and the trailing axis itself.
+    #[test]
+    fn gather_matches_the_ndarray_reference_on_a_rank_four_operand() {
+        let shape = [500usize, 50, 4, 1];
+        let values: Vec<f32> = (0..100_000).map(|value| value as f32 * 1.25).collect();
+        let x = f32_buffer(&shape, &values);
+        let flat = [500usize, 50, 4, 1];
+        let out = gather(&x, &i64_buffer(&[4], &[3, 1, 3, 0]), 2, &declared(&flat)).unwrap();
+        let Storage::F32(actual) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert_eq!(
+            *actual,
+            assign_reference::<f32>(&values, &shape, 2, &[3, 1, 3, 0], &flat)
+        );
+
+        // The trailing unit axis: a contiguous run (of one element) per index.
+        let flat = [500usize, 50, 4, 1];
+        let out = gather(&x, &i64_buffer(&[1], &[0]), 3, &declared(&flat)).unwrap();
+        let Storage::F32(actual) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert_eq!(*actual, assign_reference::<f32>(&values, &shape, 3, &[0], &flat));
+    }
+
+    /// NaN payloads, `-0.0` and infinities travel BIT-EXACTLY: the copy moves
+    /// elements, it never computes — so the strided runs cannot normalize a
+    /// value even where every element of a run is copied twice.
+    #[test]
+    fn gather_copies_float_bits_unchanged() {
+        let values = [
+            f32::NAN,
+            -0.0,
+            f32::INFINITY,
+            3.5,
+            -0.0,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            2.0,
+        ];
+        let shape = [2usize, 4];
+        let x = f32_buffer(&shape, &values);
+        let out = gather(&x, &i64_buffer(&[3], &[3, 1, 3]), 1, &declared(&[2, 3])).unwrap();
+        let Storage::F32(actual) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        let expected = assign_reference::<f32>(&values, &shape, 1, &[3, 1, 3], &[2, 3]);
+        assert_eq!(
+            actual.iter().map(|value| value.to_bits()).collect::<Vec<u32>>(),
+            expected.iter().map(|value| value.to_bits()).collect::<Vec<u32>>(),
+        );
+    }
+
+    /// The strided run copy must write EVERY element of a pooled destination:
+    /// park a sentinel stock of the exact result size and run the interleaved
+    /// last-axis family through it.
+    #[test]
+    fn gather_fully_overwrites_a_recycled_result_on_the_interleaved_family() {
+        let shape = [500usize, 100, 2];
+        let total = 500 * 100 * 2; // 400 KiB f32 — above the pool's minimum size
+        let sentinel = 7.5e30f32;
+        drop(Storage::F32(vec![sentinel; total]));
+        let values: Vec<f32> = (0..total).map(|value| value as f32).collect();
+        let x = f32_buffer(&shape, &values);
+        let out = gather(&x, &i64_buffer(&[2], &[1, 0]), 2, &declared(&shape)).unwrap();
+        let Storage::F32(result) = &out.storage else {
+            panic!("the fixture is f32");
+        };
+        assert!(
+            !result.contains(&sentinel),
+            "a recycled strided result leaked a stale element"
         );
     }
 }

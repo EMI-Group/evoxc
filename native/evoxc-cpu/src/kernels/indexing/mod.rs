@@ -50,6 +50,8 @@ mod strided_copy;
 #[cfg(test)]
 mod bench_concatenate;
 #[cfg(test)]
+mod bench_gather;
+#[cfg(test)]
 mod test_support;
 
 use concatenate::concatenate_kernel;

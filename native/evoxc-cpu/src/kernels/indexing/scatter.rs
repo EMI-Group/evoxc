@@ -96,7 +96,7 @@ fn selection_shape(source: &Buffer, index_shape: &[usize], axis: usize) -> Resul
     Ok(selection)
 }
 
-fn scatter(
+pub(super) fn scatter(
     source: &Buffer,
     indices: &Buffer,
     index_shape: &[usize],
@@ -138,9 +138,8 @@ fn scatter(
     ))
 }
 
-/// The no-broadcast `scatter` fast path: a full-rank index tensor whose
-/// non-axis extents equal the data's, with `updates` exactly the
-/// advanced-indexing selection.
+/// The no-broadcast `scatter` fast path: `updates` is exactly the
+/// advanced-indexing selection of the data under the index tensor.
 ///
 /// The index tensor need NOT have full-rank-equal-to-data shape: it may select
 /// an arbitrary number of runs along `axis` (the `scatter(vec[50500],
@@ -153,8 +152,9 @@ fn scatter(
 /// (numpy's negative-index and bounds rules, unchanged error wording) and the
 /// walk is one flat loop in the result's C order — which is what keeps numpy's
 /// duplicate-index rule (the LAST write in C order wins).  `Ok(None)` when this
-/// decomposition does not apply (a padded or broadcast index/update shape, an
-/// empty operand) — the general driver owns those.
+/// decomposition does not apply (a selection that stretches the data on a
+/// non-axis axis, a mismatched update shape, an empty operand) — the general
+/// driver owns those.
 fn scatter_selection(
     source: &Buffer,
     indices: &Buffer,
@@ -162,21 +162,26 @@ fn scatter_selection(
     updates: &Buffer,
     axis: usize,
 ) -> Result<Option<Storage>> {
-    if index_shape.len() != source.rank() || updates.shape.as_slice() != index_shape {
+    if index_shape.len() != source.rank() {
         return Ok(None);
     }
-    // No broadcast anywhere but the gathered axis: an index extent of 1 against
-    // a longer data extent (or the reverse) writes whole runs from one element
-    // and keeps the general driver.
-    for (position, (data, index)) in source.shape.iter().zip(index_shape).enumerate() {
-        if position != axis && data != index {
+    // numpy's put_along_axis selection: the data's shape with the axis extent
+    // taken from the index tensor, and `updates` is that whole selection.
+    let selection = selection_shape(source, index_shape, axis)?;
+    if updates.shape.as_slice() != selection.as_slice() {
+        return Ok(None);
+    }
+    // A selection that stretches the data on a NON-axis axis has no per-run
+    // decomposition here: the general driver owns it.
+    for (position, (want, data)) in selection.iter().zip(&source.shape).enumerate() {
+        if position != axis && want != data {
             return Ok(None);
         }
     }
     let Some(&extent) = source.shape.get(axis) else {
         return Ok(None);
     };
-    let Some(&selected) = index_shape.get(axis) else {
+    let Some(&selected) = selection.get(axis) else {
         return Ok(None);
     };
     let inner: usize = source.shape[axis + 1..].iter().product();
@@ -194,13 +199,29 @@ fn scatter_selection(
     else {
         return Ok(None);
     };
-    if count != indices.numel() || count != updates.numel() {
+    if count != updates.numel() {
+        return Ok(None);
+    }
+    // Two index regimes, both at one `copy_from_slice` (or one scalar write) per
+    // selected axis position rather than one per element:
+    //  * PER ELEMENT — a full-rank index tensor whose non-axis extents equal the
+    //    data's, so every element carries its own index (`indices == count`);
+    //  * PER RUN — a padded/broadcast index tensor, where one run of `inner`
+    //    contiguous updates shares one index — the downstream
+    //    `scatter(dst[n], idx[m], values[m])` shape (`indices == outer ×
+    //    selected`).
+    let per_element = indices.numel() == count;
+    if !per_element && indices.numel() != outer * selected {
         return Ok(None);
     }
     let built: Result<Storage> = with_type!(indices, |raw| {
-        with_same_type!(source, updates, |data, values| scatter_into(
-            data, values, raw, outer, extent, selected, inner, band, axis
-        ))
+        with_same_type!(source, updates, |data, values| {
+            if per_element {
+                scatter_into(data, values, raw, outer, extent, selected, inner, band, axis)
+            } else {
+                scatter_runs(data, values, raw, outer, extent, selected, inner, band, axis)
+            }
+        })
     });
     built.map(Some)
 }
@@ -275,6 +296,51 @@ fn scatter_into<I: Scalar, T: Scalar>(
     Ok(T::into_storage(out))
 }
 
+/// Apply the run regime: ONE index per run of `inner` contiguous updates.
+///
+/// `resolved[block × selected + axis_position]` is the selected axis coordinate
+/// of that run, so the whole run is one `copy_from_slice` into the destination
+/// (`inner == 1` degenerates to a single scalar write) — no per-element bounds
+/// check, no per-element odometer. C order is preserved, so numpy's
+/// duplicate-index rule (the LAST write wins) holds exactly as in
+/// [`scatter_into`].
+#[allow(clippy::too_many_arguments)]
+fn scatter_runs<I: Scalar, T: Scalar>(
+    data: &[T],
+    values: &[T],
+    indices: &[I],
+    outer: usize,
+    extent: usize,
+    selected: usize,
+    inner: usize,
+    band: usize,
+    axis: usize,
+) -> Result<Storage> {
+    let total = data.len();
+    let mut out = take_pooled_vec::<T>(total)
+        .filter(|out| out.len() == total)
+        .unwrap_or_else(|| T::zeros(total));
+    out.copy_from_slice(data);
+    let mut resolved = Vec::with_capacity(indices.len());
+    for raw in indices {
+        resolved.push(resolve_index_fast(index_as_i128(*raw), extent, axis, "scatter")?);
+    }
+    for block in 0..outer {
+        let destination = block * band;
+        let read = block * selected * inner;
+        let first = block * selected;
+        for axis_position in 0..selected {
+            let at = destination + resolved[first + axis_position] * inner;
+            let run = read + axis_position * inner;
+            match (out.get_mut(at..at + inner), values.get(run..run + inner)) {
+                (Some(slots), Some(from)) => slots.copy_from_slice(from),
+                _ => return Err(offset_error(at, total, "scatter")),
+            }
+        }
+    }
+    Ok(T::into_storage(out))
+}
+
 /// The general (broadcast-capable) scatter, driven by ndarray views.
 ///
 /// A pooled copy of the data is written in place; the destination strides come
@@ -285,7 +351,7 @@ fn scatter_into<I: Scalar, T: Scalar>(
 /// selection in ndarray's own C order keeps numpy's duplicate-index rule (the
 /// LAST write wins) and the first-out-of-range-index diagnostic order.
 #[allow(clippy::too_many_arguments)]
-fn scatter_typed<T: Scalar + NdScalar>(
+pub(super) fn scatter_typed<T: Scalar + NdScalar>(
     source: &[T],
     updates: &[T],
     dtype: DType,
@@ -593,6 +659,85 @@ mod tests {
             );
             assert_eq!(x.storage, Storage::F32(values), "the input must not be mutated");
         }
+    }
+
+    #[test]
+    fn scatter_one_index_per_run_agrees_with_the_general_path() {
+        // The downstream `scatter(dst[n, a], idx[m], values[m, a])` shape: a
+        // rank-1 (or padded) index tensor whose non-axis extents are 1, so every
+        // selected axis position writes a whole RUN of `inner` updates from one
+        // index.  The fast path must take the run regime and agree with the
+        // general rank-deep driver, for `inner == 1`, `inner == 2` and a rank-3
+        // operand with `inner == 6`, including duplicate indices.
+        type RunCase = (Vec<usize>, usize, u64, usize); // data shape, selected, step, extent
+        let cases: [RunCase; 3] = [
+            (vec![41], 17, 7919, 41),
+            (vec![9, 2], 5, 3, 9),
+            (vec![4, 3, 2], 4, 5, 4),
+        ];
+        for (data_shape, selected, step, extent) in cases {
+            let inner: usize = data_shape[1..].iter().product();
+            let data_len: usize = data_shape.iter().product();
+            let shape = data_shape.clone();
+            let declared_dims = declared(&shape);
+            // A pattern with guaranteed duplicates along the scattered axis.
+            let narrowed: Vec<i64> = (0..selected)
+                .map(|position| ((position as u64 * step + 1) % extent as u64) as i64)
+                .collect();
+            let indices = i64_buffer(&[selected], &narrowed);
+            // `updates` is exactly the selection: one run of the data's trailing
+            // (non-axis) extents per selected axis position.
+            let mut update_shape = vec![selected];
+            update_shape.extend_from_slice(&data_shape[1..]);
+            let update_values: Vec<f32> = (0..selected * inner).map(|value| value as f32).collect();
+            let updates = f32_buffer(&update_shape, &update_values);
+            let values: Vec<f32> = (0..data_len).map(|value| value as f32).collect();
+            let x = f32_buffer(&data_shape, &values);
+
+            let fast = scatter(&x, &indices, &[selected], &updates, 0, &declared_dims)
+                .expect("the run fast path succeeds");
+            // The padded index shape the general driver needs for the same call.
+            let mut padded = vec![1usize; data_shape.len()];
+            padded[0] = selected;
+            let general =
+                general_scatter_shaped(&x, &updates, 0, &padded, &update_shape, &indices)
+                    .expect("the general path succeeds");
+            assert_eq!(fast, general, "data {data_shape:?}");
+            assert_eq!(x.storage, Storage::F32(values), "the input must not be mutated");
+
+            // Duplicate indices: the LAST write in C order wins.
+            let duplicate = (0..extent).find(|&slot| {
+                narrowed.iter().filter(|&&raw| raw as usize == slot).count() > 1
+            });
+            let Some(slot) = duplicate else {
+                continue;
+            };
+            let last = narrowed
+                .iter()
+                .rposition(|&raw| raw as usize == slot)
+                .expect("at least one occurrence");
+            for offset in 0..inner {
+                assert_eq!(
+                    f32_slot(&fast.storage, slot * inner + offset),
+                    update_values[last * inner + offset],
+                    "data {data_shape:?}: the last write must win at index {slot}, element {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_run_regime_rejects_an_out_of_range_index_with_the_pinned_message() {
+        let x = f32_buffer(&[4, 2], &[0.; 8]);
+        let updates = f32_buffer(&[2, 2], &[1., 2., 3., 4.]);
+        let indices = i64_buffer(&[2], &[1, 9]);
+        let err = scatter(&x, &indices, &[2], &updates, 0, &declared(&[4, 2])).unwrap_err();
+        assert!(
+            err.message
+                .contains("scatter: index 9 is out of bounds for axis 0 with size 4"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

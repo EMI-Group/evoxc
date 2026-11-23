@@ -14,15 +14,25 @@
 //! non-identity `transpose`, an interleaved last-axis `gather`).
 //!
 //! This module therefore keeps ONE specialization, and it derives everything
-//! from an [`ArrayViewD`]: its shape, its element strides and its base offset
-//! inside the owning slice (through `as_ptr`, so no layout fact is re-derived by
-//! hand). Those are collapsed innermost-first into "outer axis list, innermost
-//! contiguous run", and each run is emitted [`LANES`] elements per iteration out
-//! of one `stride * LANES`-element source window. Anything the plan cannot
-//! describe — a negative stride (a backwards `slice`), a shape/offset it cannot
-//! prove — returns `false` with the destination untouched, and the caller uses
-//! ndarray's `assign` instead. So the specialization can only ever change speed,
-//! never a value; the kernel tests pin it against `assign` itself.
+//! from [`ArrayViewD`]s: each side's shape, its element strides and its base
+//! offset inside the owning slice (through `as_ptr`, so no layout fact is
+//! re-derived by hand). Those are collapsed innermost-first into "outer axis
+//! list, innermost contiguous run", and each run is emitted [`LANES`] elements
+//! per iteration out of one `stride * LANES`-element source window. Anything the
+//! plan cannot describe — a negative stride (a backwards `slice`), a shape or an
+//! offset it cannot prove — returns `false` with the destination untouched, and
+//! the caller uses ndarray's `assign` instead. So the specialization can only
+//! ever change speed, never a value; the kernel tests pin it against `assign`
+//! itself.
+//!
+//! The plan is TWO-SIDED, which is what lets `gather` use it: a range copy names
+//! the strides of the source range AND of the destination range, so a
+//! destination that is not contiguous (a gathered axis slice of a middle axis)
+//! copies just as cheaply as a C-contiguous destination. [`copy_view`] is the
+//! one-sided front door (`slice`, `transpose`: a strided source into a
+//! C-contiguous destination) and [`AxisCopy`] the `gather` one — one plan whose
+//! two bases advance by a fixed step per selected index / result position, so a
+//! whole multi-index gather re-uses a single plan.
 use ndarray::ArrayViewD;
 
 use crate::scalar::Scalar;
@@ -31,8 +41,125 @@ use crate::scalar::Scalar;
 /// of `LANES * stride` elements).
 const LANES: usize = 4;
 
-/// One axis of the copy plan, innermost first: `extent` elements `stride` apart.
-type Axis = (usize, usize);
+/// One axis of a two-sided copy plan, innermost first: `extent` elements whose
+/// source stride is `src` and destination stride is `dst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Step {
+    extent: usize,
+    src: usize,
+    dst: usize,
+}
+
+/// A copy plan between two STRIDED ranges of two owning slices.
+///
+/// Built once from the two [`ArrayViewD`]s describing the ranges and then
+/// replayed per (source base, destination base) pair; it holds no borrows, so a
+/// caller can build it while reading the destination and then write to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CopyPlan {
+    steps: Vec<Step>,
+    src_base: usize,
+    dst_base: usize,
+}
+
+impl CopyPlan {
+    /// The plan copying `view` (borrowing `source`) into `dest`, whose layout is
+    /// `dest_view`'s (the two views must have the same shape).
+    ///
+    /// `None` when a layout fact cannot be proven: mismatched shapes or lengths,
+    /// a zero extent, or a negative/oversized stride.
+    fn build<T: Scalar>(
+        source: &[T],
+        view: &ArrayViewD<'_, T>,
+        dest: &[T],
+        dest_view: &ArrayViewD<'_, T>,
+    ) -> Option<CopyPlan> {
+        if view.shape() != dest_view.shape() || view.len() != dest.len() {
+            return None;
+        }
+        Some(CopyPlan {
+            steps: plan_steps(view, dest_view)?,
+            src_base: base_offset(view, source)?,
+            dst_base: base_offset(dest_view, dest)?,
+        })
+    }
+
+    /// Copy the whole planned range. Returns `true` when `dest` was fully
+    /// written, `false` when the plan did not hold (nothing to do then).
+    pub(super) fn copy<T: Scalar>(&self, source: &[T], dest: &mut [T]) -> bool {
+        copy_at(&self.steps, source, self.src_base, dest, self.dst_base)
+    }
+}
+
+/// A copy plan for a gather-style axis slice.
+///
+/// The gathered axis slice has the same shape and strides at every axis
+/// position; only its BASE moves — by `src_step` in the source slice per
+/// selected index, and by `dst_step` in the destination slice per result
+/// position. One plan therefore serves every index of a multi-index gather.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AxisCopy {
+    steps: Vec<Step>,
+    src_base: usize,
+    dst_base: usize,
+    src_step: usize,
+    dst_step: usize,
+}
+
+impl AxisCopy {
+    /// Copy the axis slice at `selected` into the axis slice at `position`.
+    ///
+    /// Returns `true` when that destination range was fully written.
+    pub(super) fn copy<T: Scalar>(
+        &self,
+        source: &[T],
+        selected: usize,
+        dest: &mut [T],
+        position: usize,
+    ) -> bool {
+        copy_at(
+            &self.steps,
+            source,
+            self.src_base + selected * self.src_step,
+            dest,
+            self.dst_base + position * self.dst_step,
+        )
+    }
+}
+
+/// Build the [`AxisCopy`] plan for `gather`'s per-index slice copy.
+///
+/// `source_view` views all of `source` as `source_shape`; `dest_shape` is the
+/// shape whose every `dest_axis` slice receives one selected source axis slice.
+/// Both layouts are read out of ndarray views of the two owning slices, so this
+/// module re-derives no stride by hand.
+pub(super) fn plan_axis_copy<T: Scalar>(
+    source: &[T],
+    source_view: &ArrayViewD<'_, T>,
+    source_axis: usize,
+    dest: &[T],
+    dest_shape: &[usize],
+    dest_axis: usize,
+) -> Option<AxisCopy> {
+    // A zero-extent axis has no slice to take (and `index_axis` would panic).
+    if *source_view.shape().get(source_axis)? == 0 || *dest_shape.get(dest_axis)? == 0 {
+        return None;
+    }
+    let src_slice = source_view.index_axis(ndarray::Axis(source_axis), 0);
+    let dst_view = ArrayViewD::<T>::from_shape(ndarray::IxDyn(dest_shape), dest).ok()?;
+    let dst_slice = dst_view.index_axis(ndarray::Axis(dest_axis), 0);
+    if src_slice.shape() != dst_slice.shape() {
+        return None;
+    }
+    Some(AxisCopy {
+        steps: plan_steps(&src_slice, &dst_slice)?,
+        src_base: base_offset(&src_slice, source)?,
+        dst_base: base_offset(&dst_slice, dest)?,
+        // The step from one axis slice's base to the next.
+        src_step: usize::try_from(source_view.stride_of(ndarray::Axis(source_axis))).ok()?,
+        dst_step: usize::try_from(dst_view.stride_of(ndarray::Axis(dest_axis))).ok()?,
+    })
+}
 
 /// Copy `view` into `dest`, which must be exactly `view.len()` elements long.
 ///
@@ -47,34 +174,17 @@ pub(super) fn copy_view<T: Scalar>(source: &[T], view: &ArrayViewD<'_, T>, dest:
     if dest.is_empty() {
         return true;
     }
-    let Some(base) = base_offset(view, source) else {
-        return false;
-    };
-    let Some(axes) = plan_axes(view) else {
-        return false;
-    };
-    if axes.is_empty() {
-        // Every extent was 1: the view is a single element.
-        return match source.get(base) {
-            Some(value) if dest.len() == 1 => {
-                dest[0] = *value;
-                true
-            }
-            _ => false,
+    // The destination of a `slice`/`transpose` is C-contiguous in `view`'s
+    // shape: the layout comes from a view of it, exactly like the source's.
+    let plan = {
+        let Ok(dest_view) = ArrayViewD::<T>::from_shape(ndarray::IxDyn(view.shape()), &*dest) else {
+            return false;
         };
-    }
-    match axes.as_slice() {
-        // A wholly contiguous view: one bulk memcpy.
-        [(extent, 1)] if *extent == dest.len() => {
-            match source.get(base..base + dest.len()) {
-                Some(run) => {
-                    dest.copy_from_slice(run);
-                    true
-                }
-                None => false,
-            }
-        }
-        _ => fill_runs(source, base, dest, &axes),
+        CopyPlan::build(source, view, &*dest, &dest_view)
+    };
+    match plan {
+        Some(plan) => plan.copy(source, dest),
+        None => false,
     }
 }
 
@@ -100,67 +210,111 @@ fn base_offset<T>(view: &ArrayViewD<'_, T>, source: &[T]) -> Option<usize> {
     Some(base)
 }
 
-/// Collapse the view's axes innermost-first, dropping extent-1 axes and folding
-/// every axis whose stride continues the inner one (`stride_outer ==
-/// stride_inner * extent_inner`).
+/// Collapse the two equally shaped views' axes innermost-first, dropping
+/// extent-1 axes and folding every axis whose stride continues the inner one on
+/// BOTH sides (`stride_outer == stride_inner * extent_inner`).
 ///
-/// `None` for a negative stride — the collapsed plan only describes a forward
-/// walk, and a backwards `slice` keeps ndarray's `assign`.
-fn plan_axes<T>(view: &ArrayViewD<'_, T>) -> Option<Vec<Axis>> {
-    let mut axes: Vec<Axis> = Vec::with_capacity(view.ndim());
+/// `None` for a zero extent or a negative stride — the collapsed plan only
+/// describes a forward walk, and a backwards `slice` keeps ndarray's `assign`.
+fn plan_steps<T: Scalar>(
+    view: &ArrayViewD<'_, T>,
+    dest_view: &ArrayViewD<'_, T>,
+) -> Option<Vec<Step>> {
+    let mut steps: Vec<Step> = Vec::with_capacity(view.ndim().min(dest_view.ndim()));
     for index in (0..view.ndim()).rev() {
         let extent = view.shape()[index];
-        let stride = view.strides()[index];
         if extent == 0 {
             return None;
         }
         if extent == 1 {
             continue;
         }
-        let stride = usize::try_from(stride).ok()?;
-        match axes.last_mut() {
-            Some(inner) if inner.1 * inner.0 == stride => {
-                inner.0 = inner.0.checked_mul(extent)?;
+        let src = usize::try_from(view.strides()[index]).ok()?;
+        let dst = usize::try_from(dest_view.strides()[index]).ok()?;
+        match steps.last_mut() {
+            Some(inner)
+                if inner.src.checked_mul(inner.extent) == Some(src)
+                    && inner.dst.checked_mul(inner.extent) == Some(dst) =>
+            {
+                inner.extent = inner.extent.checked_mul(extent)?;
             }
-            _ => axes.push((extent, stride)),
+            _ => steps.push(Step { extent, src, dst }),
         }
     }
-    Some(axes)
+    Some(steps)
 }
 
-/// Walk the outer axes with one running offset and fill the innermost run of
-/// `outer.0` elements `outer.1` apart per iteration.
-fn fill_runs<T: Scalar>(source: &[T], base: usize, dest: &mut [T], axes: &[Axis]) -> bool {
-    let (run_extent, run_stride) = axes[0];
-    let mut out = 0usize;
-    let mut offset = base;
-    // The outer axes: a plain odometer over `axes[1..]`, outermost last.
-    let mut odometer = vec![0usize; axes.len() - 1];
-    loop {
-        let Some(chunk) = dest.get_mut(out..out + run_extent) else {
-            return false;
+/// Replay a plan's runs from `src_base` in `source` to `dst_base` in `dest`.
+///
+/// Both running offsets are the START of the current run, so a run does not
+/// advance them — the odometer below displaces them by each outer axis's own
+/// step (the innermost OUTER axis varies fastest, so a carry walks outward one
+/// axis at a time).
+fn copy_at<T: Scalar>(
+    steps: &[Step],
+    source: &[T],
+    src_base: usize,
+    dest: &mut [T],
+    dst_base: usize,
+) -> bool {
+    let Some(run) = steps.first() else {
+        // Every extent was 1: the plan is a single element.
+        return match (source.get(src_base), dest.get_mut(dst_base)) {
+            (Some(value), Some(slot)) => {
+                *slot = *value;
+                true
+            }
+            _ => false,
         };
-        if !fill_strided(source, offset, chunk, run_stride) {
+    };
+    let mut odometer = vec![0usize; steps.len() - 1];
+    let mut src = src_base;
+    let mut dst = dst_base;
+    loop {
+        let written = if run.dst == 1 {
+            match dest.get_mut(dst..dst + run.extent) {
+                Some(chunk) => fill_run(source, src, chunk, run.src),
+                None => false,
+            }
+        } else {
+            copy_elements(source, src, dest, dst, run.extent, run.src, run.dst)
+        };
+        if !written {
             return false;
         }
-        out += run_extent;
-        // Advance the odometer: the innermost OUTER axis varies fastest, so a
-        // carry walks outward one axis at a time.
         let mut axis = 0usize;
         loop {
             if axis == odometer.len() {
-                return out == dest.len();
+                return true;
             }
+            let outer = steps[axis + 1];
             odometer[axis] += 1;
-            offset += axes[axis + 1].1;
-            if odometer[axis] < axes[axis + 1].0 {
+            src += outer.src;
+            dst += outer.dst;
+            if odometer[axis] < outer.extent {
                 break;
             }
-            offset -= axes[axis + 1].1 * axes[axis + 1].0;
+            src -= outer.src * outer.extent;
+            dst -= outer.dst * outer.extent;
             odometer[axis] = 0;
             axis += 1;
         }
     }
+}
+
+/// Fill one C-contiguous destination run from `source[offset..]`, taking every
+/// `stride`-th element (a contiguous source is one memcpy).
+fn fill_run<T: Scalar>(source: &[T], offset: usize, dest: &mut [T], stride: usize) -> bool {
+    if stride == 1 {
+        return match source.get(offset..offset + dest.len()) {
+            Some(run) => {
+                dest.copy_from_slice(run);
+                true
+            }
+            None => false,
+        };
+    }
+    fill_strided(source, offset, dest, stride)
 }
 
 /// Fill one contiguous destination run from `source[offset..]` taking every
@@ -188,6 +342,30 @@ fn fill_strided<T: Scalar>(source: &[T], offset: usize, dest: &mut [T], stride: 
             }
             None => return false,
         }
+    }
+    true
+}
+
+/// Copy a run element by element when the DESTINATION is strided too (neither
+/// side is a contiguous block, so there is no bulk copy to make).
+fn copy_elements<T: Scalar>(
+    source: &[T],
+    src_base: usize,
+    dest: &mut [T],
+    dst_base: usize,
+    extent: usize,
+    src_stride: usize,
+    dst_stride: usize,
+) -> bool {
+    let mut src = src_base;
+    let mut dst = dst_base;
+    for _ in 0..extent {
+        match (source.get(src), dest.get_mut(dst)) {
+            (Some(value), Some(slot)) => *slot = *value,
+            _ => return false,
+        }
+        src += src_stride;
+        dst += dst_stride;
     }
     true
 }
@@ -252,7 +430,11 @@ mod tests {
         let mut view = base.view();
         view.slice_axis_inplace(ndarray::Axis(2), Slice::new(0, Some(1), 1));
         assert_eq!(view.shape(), &[500, 50, 1]);
-        assert_eq!(plan_axes(&view), Some(vec![(25_000, 4)]));
+        let dest_view = Array::<f32, _>::zeros(IxDyn(&[500, 50, 1]));
+        assert_eq!(
+            plan_steps(&view, &dest_view.view()),
+            Some(vec![Step { extent: 25_000, src: 4, dst: 1 }])
+        );
         let mut dest = vec![0f32; view.len()];
         assert!(copy_view(storage, &view, &mut dest));
         for (position, value) in dest.iter().enumerate() {
@@ -272,5 +454,77 @@ mod tests {
         let mut dest = vec![-1.0f32; view.len()];
         assert!(copy_view(storage, &view, &mut dest));
         assert!(!dest.contains(&-1.0), "a stale element survived the copy");
+    }
+
+    /// The `gather` front door on the family that regressed: an interleaved
+    /// LAST-axis gather of a `(500, 100, 2)` operand into a `(500, 100)` result
+    /// is ONE strided run of 50 000 elements, and it must equal ndarray's
+    /// `assign` reference element for element.
+    #[test]
+    fn axis_copy_covers_an_interleaved_last_axis() {
+        let source: Vec<f32> = (0..100_000).map(|value| value as f32).collect();
+        let flat = Array::from_shape_vec(IxDyn(&[500, 100, 2]), source.clone()).unwrap();
+        let storage = flat.as_slice().unwrap();
+        let shape = [500usize, 100, 2];
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let mut out = vec![0f32; 50_000];
+        let plan = plan_axis_copy(storage, &view, 2, &out, &[500, 100, 1], 2).expect("a plan");
+        assert!(plan.copy(storage, 1, &mut out, 0));
+        let mut reference = Array::<f32, _>::zeros(IxDyn(&[500, 100]));
+        reference.assign(&view.index_axis(ndarray::Axis(2), 1));
+        assert_eq!(out, reference.as_slice().unwrap());
+    }
+
+    /// A strided DESTINATION — an interleaved last axis of a multi-index gather,
+    /// where every result position's slice takes every `count`-th element —
+    /// copies element by element and still matches ndarray's `assign`.
+    #[test]
+    fn axis_copy_covers_an_interleaved_destination() {
+        let source: Vec<f32> = (0..100_000).map(|value| value as f32).collect();
+        let flat = Array::from_shape_vec(IxDyn(&[500, 100, 2]), source.clone()).unwrap();
+        let storage = flat.as_slice().unwrap();
+        let shape = [500usize, 100, 2];
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let mut out = vec![0f32; 100_000];
+        let plan = plan_axis_copy(storage, &view, 2, &out, &[500, 100, 2], 2).expect("a plan");
+        let mut reference = Array::<f32, _>::zeros(IxDyn(&[500, 100, 2]));
+        for (position, selected) in [1usize, 0].into_iter().enumerate() {
+            reference
+                .index_axis_mut(ndarray::Axis(2), position)
+                .assign(&view.index_axis(ndarray::Axis(2), selected));
+            assert!(plan.copy(storage, selected, &mut out, position), "position {position}");
+            assert_eq!(out, reference.as_slice().unwrap(), "position {position}");
+        }
+    }
+
+    /// A strided DESTINATION (a gathered MIDDLE axis of a C-contiguous result)
+    /// copies run by run and still matches ndarray's `assign`.
+    #[test]
+    fn axis_copy_covers_a_non_contiguous_destination() {
+        let source: Vec<i32> = (0..12i32).collect();
+        let shape = [2usize, 3, 2];
+        let flat = Array::from_shape_vec(IxDyn(&shape), source.clone()).unwrap();
+        let storage = flat.as_slice().unwrap();
+        let view = ArrayViewD::<i32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let mut out = vec![0i32; 2 * 2 * 2];
+        let plan = plan_axis_copy(storage, &view, 1, &out, &[2, 2, 2], 1).expect("a plan");
+        let mut reference = Array::<i32, _>::zeros(IxDyn(&[2, 2, 2]));
+        for (position, selected) in [2usize, 0].into_iter().enumerate() {
+            reference
+                .index_axis_mut(ndarray::Axis(1), position)
+                .assign(&view.index_axis(ndarray::Axis(1), selected));
+            assert!(plan.copy(storage, selected, &mut out, position), "position {position}");
+            assert_eq!(out, reference.as_slice().unwrap(), "position {position}");
+        }
+    }
+
+    /// A zero-extent gathered axis has no slice to take: the plan declines so
+    /// the caller takes ndarray's `assign` (which is a no-op there).
+    #[test]
+    fn axis_copy_declines_a_zero_extent_axis() {
+        let storage: Vec<f32> = Vec::new();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&[0usize, 3]), storage.as_slice()).unwrap();
+        let out: Vec<f32> = vec![0.0; 3];
+        assert!(plan_axis_copy(&storage, &view, 0, &out, &[1, 3], 0).is_none());
     }
 }
