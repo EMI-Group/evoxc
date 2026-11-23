@@ -31,6 +31,14 @@ read with `tomllib`, the checkout is walked, installed metadata is inspected via
 `uv`, a Rust toolchain and a C compiler for the extension). Every
 environment-dependent step SKIPS with a clear reason; only a genuine contract
 violation fails.
+
+That build is self-contained and time-bounded: it runs in `os.environ` plus the
+fast-but-still-release Cargo profile knobs (`_FAST_CARGO_PROFILE`, applied only
+when the caller has not set them), under a `_build_timeout()` cap that defaults
+to 1800 s and is overridable with `EVOXC_TEST_BUILD_TIMEOUT`. The knobs change
+only how long the compile takes — the artifacts stay release, abi3, stripped
+wheels carrying the compiled extension, which the assertions below verify.
+Expiring the cap FAILS the run (never skips) with the knob named in the message.
 """
 
 from __future__ import annotations
@@ -566,6 +574,46 @@ _NO_BUILD_TOOLCHAIN = (
     "extension also needs a Rust toolchain and a C compiler)"
 )
 
+# The checkout's `[profile.release]` is opt-level 3 + thin LTO + ONE codegen unit,
+# which is right for shipped wheels and ~17-20 min from a COLD target dir (the
+# throwaway copy always is). These two knobs are still a release build — the
+# artifacts keep the compiled, abi3, stripped extension — but compile far faster,
+# so a real assertion cannot decay into a timeout. Applied only when unset: a
+# caller's own profile always wins.
+_FAST_CARGO_PROFILE = {
+    "CARGO_PROFILE_RELEASE_LTO": "false",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+}
+
+# The `uv build` cap: generous enough for a cold extension build on a slow host.
+_BUILD_TIMEOUT_ENV = "EVOXC_TEST_BUILD_TIMEOUT"
+_DEFAULT_BUILD_TIMEOUT = 1800.0
+
+
+def _build_env() -> dict[str, str]:
+    """`os.environ` plus the fast release profile knobs the caller left unset."""
+    env = dict(os.environ)
+    for name, value in _FAST_CARGO_PROFILE.items():
+        env.setdefault(name, value)
+    return env
+
+
+def _build_timeout() -> float:
+    """The per-command build cap in seconds: 1800 by default, `EVOXC_TEST_BUILD_TIMEOUT` overrides."""
+    raw = os.environ.get(_BUILD_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_BUILD_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = -1.0
+    if timeout <= 0:
+        pytest.fail(
+            f"{_BUILD_TIMEOUT_ENV}={raw!r} must be a positive number of seconds",
+            pytrace=False,
+        )
+    return timeout
+
 
 def _sanitize_source_tree(src: Path) -> list[str]:
     """Delete stale build artifacts from a copied tree (`rm -rf evoxc.egg-info build`)."""
@@ -589,13 +637,34 @@ def _copy_checkout(dest: Path) -> Path:
 
 
 def _run_build(src: Path, out_dir: Path, project: str | None = None) -> tuple[list[Path], str]:
-    """Build the workspace (or one `--package`) from `src`; `(artifacts, skip-reason)`."""
+    """Build the workspace (or one `--package`) from `src`; `(artifacts, skip-reason)`.
+
+    SHARED by the one session-wide workspace build and the standalone planted
+    stale-`egg-info` build, so both get the same self-contained env and cap. A
+    missing toolchain SKIPS (the caller turns the reason into `pytest.skip`); a
+    build that starts and fails, or that outlives the cap, FAILS.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     plan = _build_plan(src, out_dir, project)
     if plan is None:
         return [], _NO_BUILD_TOOLCHAIN
+    env = _build_env()
+    timeout = _build_timeout()
     for cwd, argv in plan:
-        proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, timeout=900)
+        try:
+            proc = subprocess.run(
+                argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, env=env
+            )
+        except subprocess.TimeoutExpired as expired:
+            partial = expired.stderr or expired.output or ""
+            if isinstance(partial, bytes):  # defensive: capture_output=True keeps text here
+                partial = partial.decode(errors="replace")
+            pytest.fail(
+                f"`{' '.join(argv[1:])}` did not finish within {timeout:g} s — a cold extension "
+                f"build on a slow host needs a larger cap: set "
+                f"{_BUILD_TIMEOUT_ENV}=<seconds> (last output: {partial[-500:].strip()!r})",
+                pytrace=False,
+            )
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "no output")[-500:]
             return [], f"build unavailable (`{' '.join(argv[1:])}`): {detail}"
