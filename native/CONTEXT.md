@@ -10,7 +10,7 @@ The implemented Python packages stay authoritative for behavior **until** a code
 
 ## Crate layout, ownership and dependency rules
 
-Cargo workspace at `./Cargo.toml`; crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-cpu`, `evoxc-python`.
+Cargo workspace at `./Cargo.toml`; crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-cpu`, the published facade `evoxc`, and the unpublished PyO3 binding `evoxc-python`.
 
 ```
 evoxc-core      dtypes, dims, ValueType, attrs, op schemas, graph IR, envelope codec, inference
@@ -19,8 +19,12 @@ evoxc-compiler   evoxc-runtime      evoxc-cpu
  builder,        sessions, buffers, the immutable plan + typed host
  vectorize, AD,  submissions,       buffers + every dense kernel
  batch_functions executables        (the native CPU execution engine)
-   ↑             ↑                  ↑
-   └─────────────┴──── evoxc-python (PyO3) ────┘
+   └─────────────┴──────────────────┘
+                 ↑
+        evoxc (public Rust facade: re-exports core/compiler,
+               optional cpu (default) and runtime)
+                 ↑
+        evoxc-python (PyO3, publish = false)
 ```
 
 Dependency rules (binding):
