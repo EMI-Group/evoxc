@@ -232,6 +232,8 @@ TVM compilation needs Python Relax translation/build plus a monkey-patched `Stab
 
 ## Dependency surface
 
+No adapter fetches anything at run time: there is no urllib/requests/curl/wget, no `XDG_CACHE_HOME`/`HOME` cache directory, and no software download anywhere in this node (the only `subprocess` call is `iree.py::_detect_rocm_target`'s local `amdgpu-arch`/`rocm_agent_enumerator` probe; the only filesystem writes are `tvm_util`'s temp `.so` for `export_library`/`load_module`).
+`_pjrt_c_api.HEADER_URL`/`HEADER_COMMIT`/`HEADER_SIZE_BYTES` are provenance METADATA only — never opened or fetched; the module is a hand-written ctypes translation, stdlib-only.
 xla needs ZERO pip dependencies: the PJRT C API is driven over pure-stdlib ctypes against a `GetPjRtApi`-exporting plugin `.so`, required at compile/load time, discovered as documented above and dlopen-ed never imported (no xla extra); provenance (header URL + commit) is recorded in `_pjrt_c_api.py` and the artifact `runtime_dependencies`.
 tvm needs `apache-tvm` + `jaxlib`, the latter ONLY for its bundled LLVM MLIR python bindings (not the jax API) behind the `_mlir_bindings` seam; `jax` is never imported anywhere in `evoxc/`, and `check_available()` probes `jaxlib.mlir` + `jaxlib.mlir.ir` with the `pip install evoxc[tvm]` hint.
 **Legitimately long files — do not split without a plan:** `iree.py` (3828 lines) holds the whole iree adapter surface (options/defaults, backend + executable + cached run plans, staging tiers, adapter readback, device acquisition, segments/external dispatch, `IreeDevicePayload`, `upload_tensor`, `register()`).
