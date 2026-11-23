@@ -21,7 +21,7 @@ create_exception!(
 );
 /// Every public error family, spelled as the Python class name (minus `EVOXCError`).
 ///
-/// This is the closed set `.kind` may hold; `evoxc_core::ErrorKind::as_str` is
+/// This is the closed set `.kind` may hold; `evoxc::core::ErrorKind::as_str` is
 /// the authority and [`from_core`] copies it verbatim.
 pub const KINDS: [&str; 9] = [
     "TraceError",
@@ -58,11 +58,11 @@ pub fn raise(py: Python<'_>, kind: &str, message: impl Into<String>) -> PyErr {
     }
     PyErr::from_value(instance)
 }
-/// Map a native [`evoxc_core::Error`] to the public Python family it names.
+/// Map a native [`evoxc::core::Error`] to the public Python family it names.
 ///
 /// `ErrorKind::as_str()` is the Python class name, so the family survives the
 /// FFI boundary unchanged; only the message text travels with it.
-pub fn from_core(py: Python<'_>, err: evoxc_core::Error) -> PyErr {
+pub fn from_core(py: Python<'_>, err: evoxc::core::Error) -> PyErr {
     raise(py, err.kind_str(), err.message)
 }
 /// A `TypeError` for a Python object the envelope format cannot carry.
@@ -91,7 +91,7 @@ pub fn object_error(py: Python<'_>, err: PyErr, context: &str) -> PyErr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evoxc_core::ErrorKind;
+    use evoxc::core::ErrorKind;
     /// Every native error family maps to a name the Python side knows.
     #[test]
     fn kinds_cover_every_core_family() {
@@ -137,7 +137,7 @@ mod py_tests {
     #[test]
     fn core_errors_keep_their_family_and_text() {
         Python::attach(|py| {
-            let err = from_core(py, evoxc_core::Error::shape("broadcast 2 vs 3"));
+            let err = from_core(py, evoxc::core::Error::shape("broadcast 2 vs 3"));
             let value = err.value(py);
             assert_eq!(
                 value.getattr("kind").unwrap().extract::<String>().unwrap(),
@@ -151,7 +151,7 @@ mod py_tests {
                     .unwrap(),
                 "broadcast 2 vs 3"
             );
-            let err = from_core(py, evoxc_core::Error::verification("unknown op"));
+            let err = from_core(py, evoxc::core::Error::verification("unknown op"));
             assert_eq!(
                 err.value(py)
                     .getattr("kind")

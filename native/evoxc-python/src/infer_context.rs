@@ -10,11 +10,11 @@
 //!
 //! Argument-shape problems are plain `TypeError`s (never a silent fallback to
 //! "no module" — `native/CONTEXT.md`), while a malformed *type* keeps the type
-//! decoder's own `evoxc_core::Error` family tagged with its path.
+//! decoder's own `evoxc::core::Error` family tagged with its path.
 use pyo3::prelude::*;
 use serde_json::{Map, Value as Json};
 
-use evoxc_core::graph::{Function, Program};
+use evoxc::core::graph::{Function, Program};
 
 use crate::convert::json_from_py;
 use crate::error;
@@ -25,7 +25,7 @@ use crate::error;
 /// for `call`-callee resolution (`module.function(callee)?.output_types`):
 ///
 /// * a full `evoxc-native-ir` envelope — recognised by its `"format"` tag and
-///   decoded by [`evoxc_core::envelope::decode`], exactly as before;
+///   decoded by [`evoxc::core::envelope::decode`], exactly as before;
 /// * a signature-only context — a dict carrying `"functions"`, a list of
 ///   `[name, [output types]]`, `[name, [input types], [output types]]` or
 ///   `{"name": …, "input_types": …, "output_types": …}` entries.  A `Program`
@@ -33,7 +33,7 @@ use crate::error;
 ///   downstream changes.
 ///
 /// Types use the same `{"dtype": str, "shape": [dim, …]}` dicts as
-/// `operand_types` (`decode_types`' decoder, [`evoxc_core::wire`]).  A
+/// `operand_types` (`decode_types`' decoder, [`evoxc::core::wire`]).  A
 /// non-dict module, a missing `"functions"` list, a malformed entry or an
 /// unknown dict key is a `TypeError` (argument shape, like every other
 /// decoder); a malformed type is the type decoder's own `VerificationError`
@@ -60,7 +60,7 @@ fn decode_module_json(json: &Json) -> std::result::Result<Program, ContextError>
         ))
     })?;
     if map.contains_key("format") {
-        return evoxc_core::envelope::decode(json)
+        return evoxc::core::envelope::decode(json)
             .map_err(|err| ContextError::Core(err.context("module")));
     }
     let functions = map.get("functions").ok_or_else(|| {
@@ -75,11 +75,11 @@ fn decode_module_json(json: &Json) -> std::result::Result<Program, ContextError>
 
 /// Why a signature-only module context was rejected: an argument-shape problem
 /// (a `TypeError`, like every other decoder) or a native judgment (a
-/// `NativeError` from `evoxc_core`).
+/// `NativeError` from `evoxc::core`).
 #[derive(Debug)]
 enum ContextError {
     Shape(String),
-    Core(evoxc_core::Error),
+    Core(evoxc::core::Error),
 }
 
 /// Synthesize a `Program` holding one signature-only `Function` per entry.
@@ -106,7 +106,7 @@ fn signature_program(functions: &Json) -> std::result::Result<Program, ContextEr
 }
 
 /// One decoded signature entry: `(name, input types, output types)`.
-type Signature = (String, Vec<evoxc_core::ValueType>, Vec<evoxc_core::ValueType>);
+type Signature = (String, Vec<evoxc::core::ValueType>, Vec<evoxc::core::ValueType>);
 
 /// Decode one `module.functions[i]` signature entry.
 fn signature_entry(entry: &Json, at: &str) -> std::result::Result<Signature, ContextError> {
@@ -185,8 +185,8 @@ fn signature_name(value: &Json, at: &str) -> std::result::Result<String, Context
 fn signature_types(
     value: &Json,
     at: &str,
-) -> std::result::Result<Vec<evoxc_core::ValueType>, ContextError> {
-    evoxc_core::wire::value_types_from_json(value)
+) -> std::result::Result<Vec<evoxc::core::ValueType>, ContextError> {
+    evoxc::core::wire::value_types_from_json(value)
         .map_err(|err| ContextError::Core(err.context(format!("{at} types"))))
 }
 
@@ -219,7 +219,7 @@ fn json_keys(map: &Map<String, Json>) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use evoxc_core::{Dim, Shape};
+    use evoxc::core::{Dim, Shape};
     use serde_json::json;
 
     /// A static shape, spelled the way `Dim` wants it.
@@ -239,8 +239,8 @@ pub(crate) mod test_support {
     /// its argument.
     pub(crate) fn envelope() -> Json {
         json!({
-            "format": evoxc_core::envelope::FORMAT,
-            "version": evoxc_core::envelope::VERSION,
+            "format": evoxc::core::envelope::FORMAT,
+            "version": evoxc::core::envelope::VERSION,
             "module": {"name": "m"},
             "functions": [{
                 "name": "callee",
@@ -271,7 +271,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{envelope, shape, ty};
     use super::*;
-    use evoxc_core::{AttrValue, Attrs, DType, ValueType};
+    use evoxc::core::{AttrValue, Attrs, DType, ValueType};
     use serde_json::json;
 
     // --- the `infer` module argument ---------------------------------------
@@ -281,8 +281,8 @@ mod tests {
     }
 
     /// `infer_op("call", ..)` against a decoded module, as `infer` runs it.
-    fn call_outputs(module: &Program) -> evoxc_core::Result<Vec<ValueType>> {
-        evoxc_core::infer_op(
+    fn call_outputs(module: &Program) -> evoxc::core::Result<Vec<ValueType>> {
+        evoxc::core::infer_op(
             "call",
             &[ValueType::new(DType::Float32, shape(&[2]))],
             &call_attrs("callee"),
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn an_unknown_callee_stays_a_verification_error_naming_it() {
         let program = decode_module_json(&json!({"functions": [["callee", []]]})).unwrap();
-        let err = evoxc_core::infer_op(
+        let err = evoxc::core::infer_op(
             "call",
             &[],
             &call_attrs("nope"),
