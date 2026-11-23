@@ -4,7 +4,8 @@ Public surface (full contract in this directory's CONTEXT.md and ../CONTEXT.md):
 
 - ``Capabilities``, ``Backend``, ``Executable`` (protocol)      — backend.py
 - ``Signature``, ``LoweredProgram``, ``CompiledArtifact``       — program.py (owned HERE, not by pipeline)
-- ``register``, ``get`` (auto-activates optional adapters)      — registry.py
+- ``register``/``unregister``, ``get`` (auto-activates optional adapters
+  and the ``evoxc.backends`` entry-point group)                 — registry.py
 - ``CompilerBackend``, ``CompilerExecutable``                   — compiler.py (shared pluggable-compiler framework)
 - ``numpy_backend`` (default), ``NumpyBackend``, ``NumpyExecutable`` — numpy/
 - ``stablehlo`` submodule (``stablehlo.export``; export utility, NOT a backend) — stablehlo/
@@ -25,7 +26,7 @@ from evoxc.core import DeviceError, register_device_transfer_provider
 from .backend import Backend, Capabilities, Executable
 from .compiler import CompilerBackend, CompilerExecutable
 from .program import CompiledArtifact, LoweredProgram, Signature
-from .registry import get, register
+from .registry import get, register, unregister
 from . import numpy, stablehlo
 from .numpy import NumpyBackend, NumpyExecutable, numpy_backend
 
@@ -40,6 +41,7 @@ __all__ = [
     "CompiledArtifact",
     # registry
     "register",
+    "unregister",
     "get",
     # shared pluggable-compiler framework (adapters/ subpackage)
     "CompilerBackend",
