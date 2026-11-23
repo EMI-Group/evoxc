@@ -72,7 +72,7 @@ This section is the authority for counts; other CONTEXT files' test-count senten
 
 
 Recorded 2026-11-22 on host `billmini` (Intel Core Ultra 7 356H, 16 cpus, loadavg ~1.0) with the uvenv from `source scripts/dev-env.sh && uv sync --locked --all-packages --extra dev --extra iree` (the extension is built into the source tree by that sync).
-`.venv/bin/python -m pytest tests -o addopts='' -q -p no:cacheprovider --junit-xml=…` → **7818 passed, 88 skipped, 4 xfailed, 0 failed in 930 s** (junit `tests=7910 errors=0 failures=0 skipped=92`; the 92 = 88 skips + 4 xfails).
+`.venv/bin/python -m pytest tests -o addopts='' -q -p no:cacheprovider --junit-xml=…` → **7859 passed, 88 skipped, 4 xfailed, 0 failed in 1077 s** (junit `tests=7951 errors=0 failures=0 skipped=92`; the 92 = 88 skips + 4 xfails).
 `--collect-only -q -o addopts=` → **7907 collected**, plus the 3 module-level collection skips (`test_adapter_tvm.py`, `test_adapter_xla.py`, `test_external_portable_fallback.py`) = 7910 reported items.
 
 Environment: Python 3.14.10, numpy 2.5.2, pytest 9.1.1, `iree-base-compiler`/`iree-base-runtime` 3.13.0, `uv`/`gcc`/`cargo` present (so all 42 `test_packaging.py` items RUN), the native extension BUILT at `evoxc/_evoxc_native.abi3.so` (so all 442 native items RUN), one enumerated Vulkan device (so the device-guarded Vulkan suite RUNS 6/6), no NVIDIA GPU, no usable ROCm/HIP device, and `torch`/`transformers`/`tvm`/`jaxlib`/`jax`/any PJRT plugin ABSENT.

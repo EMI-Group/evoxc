@@ -9,7 +9,7 @@
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
   <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20native%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, native, IREE, XLA, TVM"></a>
-  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7818%20passing-4c9a72?style=flat-square" alt="tests: 7818 passing"></a>
+  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-7859%20passing-4c9a72?style=flat-square" alt="tests: 7859 passing"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
@@ -56,7 +56,7 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 | load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called | move your data onto the device, or recompile for another target |
 | run | `evoxc.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in | copy results to the host, cast, reshard, or insert communication |
 
-**Three execution paths below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The optional **`native`** backend runs the same EvoXIR on the in-process Rust CPU engine (immutable plans over typed host buffers; bit-identical to the interpreter, faster on real workloads). The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
+**Three execution paths below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The optional **`native`** backend runs the same EvoXIR on the in-process Rust CPU engine (immutable plans over typed host buffers; matching the interpreter's values (bool/integer and one-rounding float ops exactly, f32 transcendentals within a couple of ulp, f32 `dot` within ~1e-6) and faster on real workloads). The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a plugin `.so` it discovers, no `jax`/`jaxlib`) and **TVM** (StableHLO frontend + Relax VM).
 
 **Layer discipline** — a strict one-way import DAG, so every problem has one owner:
 
@@ -392,7 +392,7 @@ The in-tree [`evoxc/bench/`](evoxc/bench) is the committed evidence cited above:
 | backend | how to enable | what it owns | validated on |
 |---|---|---|---|
 | **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
-| **`native`** | `backend="native"` — optional, shipped in the wheel | the in-process Rust CPU engine: immutable plans over typed host buffers, numpy-mirroring staging | CPU (this host; `native/tools/parity_cpu.py` 71/71 bit-identical to numpy) |
+| **`native`** | `backend="native"` — optional, shipped in the wheel | the in-process Rust CPU engine: immutable plans over typed host buffers, numpy-mirroring staging | CPU (this host; `native/tools/parity_cpu.py` 73/73 at parity with numpy (exact bool/int, measured float tolerances)) |
 | **StableHLO export** | nothing — `evoxc.backends.stablehlo.export(graph)` | MLIR text emission; also the lowering input for every compiler | n/a (text) |
 | **IREE** | `pip install evoxc[iree]`, `lower(..., backend="iree")` | IREE compile + HAL runtime, external-kernel host dispatch, device-resident payloads | llvm-cpu, CUDA, ROCm, Vulkan-SPIRV |
 | **XLA** | `backend="xla"` — no path plumbing: it discovers an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`), else `EVOXC_PJRT_PLUGIN` / `plugin_path` | PJRT C API via ctypes over an auto-discovered plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
@@ -535,7 +535,7 @@ Docs map: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchma
 
 Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops, `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the optional `native` Rust CPU-engine backend, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the committed bench evidence under [`evoxc/bench/`](evoxc/bench).
 
-Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **7818 passed, 88 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, plus **695 passed, 33 skipped** in the colocated `./evoxc_hf/tests/` suite. Every skip is a host or dependency guard (no NVIDIA CUDA or AMD ROCm device on the recorded host, `tvm`/`torch`/`transformers`/`jaxlib`/PJRT plugin absent from the recorded venv, the io pristine-process guard), so a host carrying those extras turns them into passes.
+Test suite (`./tests/`, with its recorded baseline and per-file inventories in [`./tests/CONTEXT.md`](tests/CONTEXT.md)): **7859 passed, 88 skipped, 4 xfailed, 0 failed** with the IREE adapters installed, plus **706 passed, 22 skipped** in the colocated `./evoxc_hf/tests/` suite. Every skip is a host or dependency guard (no NVIDIA CUDA or AMD ROCm device on the recorded host, `tvm`/`torch`/`transformers`/`jaxlib`/PJRT plugin absent from the recorded venv, the io pristine-process guard), so a host carrying those extras turns them into passes.
 
 <details>
 <summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
