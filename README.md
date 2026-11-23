@@ -422,9 +422,11 @@ Placement is physical and explicit: `Tensor.to(device)` is the only transfer pri
 
 The numerical authority is the reusable Rust workspace in [`native/`](native/CONTEXT.md): op schemas and inference, the graph IR, the `vectorize`/`vmap` and AD (`jvp`/`vjp`/`grad`) engines, the `batch_functions` merge, and the CPU execution engine behind the `native` backend.
 
-The reusable crate is **`evoxc`**, with features `cpu` (the CPU execution engine), `runtime` (the runtime session layer) and `full`; with `default-features = false` it is the graph/transform core on its own, without the CPU engine.
+The CPU engine builds on mature crates rather than hand-rolled N-dimensional machinery: [`ndarray`](https://crates.io/crates/ndarray) for typed N-d views, broadcasting and iteration, and [`faer`](https://crates.io/crates/faer) for BLAS-3 `dot`. The few kernels that remain hand-written (the deterministic factorizations and the sorting segment walk) are documented with the measurement that rules out the library path.
 
-The Python package `evoxc` binds that crate through PyO3 as the extension module `evoxc._evoxc_native`, which `pip install evoxc` loads; Python keeps the frontend duties (executing `defn` bodies, specs/pytree adaptation, the extension-rule bridge) and never a second transform implementation.
+The reusable crate is **`evoxc`**, with features `cpu` (the CPU execution engine), `runtime` (the runtime session layer) and `full`; with `default-features = false` it is the graph/transform core on its own, without the CPU engine. The Rust crates publish separately on crates.io in dependency order (`evoxc-core` → `evoxc-compiler` → `evoxc-runtime` → `evoxc-cpu` → `evoxc`), so another language frontend can depend on the same numerical authority.
+
+The Python package `evoxc` binds that crate through PyO3 as the extension module `evoxc._evoxc_native`, which `pip install evoxc` loads; Python keeps the frontend duties (executing `defn` bodies, specs/pytree adaptation, the extension-rule bridge) and never a second transform implementation. Tensors cross that boundary as typed numpy views in and zero-copy numpy arrays out: an input is copied once into the engine's owned buffers, and a returned array is a fresh, C-contiguous, writeable array that shares no memory with any input.
 
 The published wheel is prebuilt abi3 (`cp311-abi3-*`, one wheel per platform serving every supported CPython, 3.11+): Linux x86_64 and aarch64 (manylinux and musllinux), macOS x86_64 and arm64, Windows x86_64 — plus one sdist that carries the whole Rust workspace, so a source install compiles the same crate with maturin.
 
