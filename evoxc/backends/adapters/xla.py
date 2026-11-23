@@ -265,6 +265,12 @@ class XlaBackend(CompilerBackend):
         # (shared lower() rejects collective graphs explicitly).
         runtime_calls=False,
         custom_blocks=False,
+        # custom_ops: ``custom_call`` / ``inline_stablehlo`` ops are
+        # forwarded VERBATIM into the emitted StableHLO text; whether the
+        # target exists and the MLIR is valid is the external XLA
+        # compiler's verdict, surfaced as-is (evoxc adds no target
+        # registry and no pre-validation).
+        custom_ops=True,
         async_collectives=False,
         # frozenset() — empty by design. XLA ships RngBitGenerator with
         # THREE_FRY/PHILOX, but real-plugin validation (jax_cuda12_pjrt

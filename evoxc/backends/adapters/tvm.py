@@ -166,6 +166,12 @@ class TvmBackend(CompilerBackend):
         collectives=False,
         runtime_calls=False,
         custom_blocks=False,
+        # custom_ops: ``custom_call`` / ``inline_stablehlo`` ops are
+        # forwarded VERBATIM into the emitted StableHLO text; whether the
+        # target exists and the MLIR is valid is the TVM StableHLO
+        # frontend/compiler's verdict, surfaced as-is (evoxc adds no target
+        # registry and no pre-validation).
+        custom_ops=True,
         async_collectives=False,
         # frozenset(): the TVM StableHLO frontend has no rng_bit_generator
         # support — the exporter's bit-exact inline expansions are used
