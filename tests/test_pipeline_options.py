@@ -14,6 +14,11 @@ Pinned here:
   test drives them with ``monkeypatch`` after ``import evoxc``).
 * stage-scoped application: ``EVOXC_IREE_COMPILE_ARGS`` applies at the compile
   stage only, ``EVOXC_IREE_RUNTIME_ARGS`` at the load stage only.
+* the iree custom-build seam: ``EVOXC_IREE_COMPILER_MODULE`` ->
+  ``iree_compiler_module`` at the compile stage and
+  ``EVOXC_IREE_RUNTIME_MODULE`` -> ``iree_runtime_module`` at the load stage —
+  dotted module paths, whitespace-stripped only (the adapter resolves and
+  validates them; a module OBJECT is explicit-kwarg only).
 * explicit-wins-per-key; empty/whitespace env = unset; the caller's dict is
   never mutated.
 * ``EVOXC_TVM_TARGET`` / ``EVOXC_TVM_PASS_CONFIGS`` (JSON object) /
@@ -170,9 +175,10 @@ def test_env_option_table_entries():
 def test_env_option_table_keys_and_parsers():
     """The documented env var -> option key mapping (parsers are functions)."""
     iree_compile = ENV_OPTION_TABLE[("iree", "compile")]
-    assert len(iree_compile) == 4
+    assert len(iree_compile) == 5
     assert {entry[1] for entry in iree_compile} == {
         "iree_compile_args",
+        "iree_compiler_module",
         "opt_level",
         "vulkan_target",
         "dispatch_formation",
@@ -182,6 +188,19 @@ def test_env_option_table_keys_and_parsers():
     )
     assert args_entry[:2] == ("EVOXC_IREE_COMPILE_ARGS", "iree_compile_args")
     assert callable(args_entry[2])
+    compiler_module_entry = next(
+        entry for entry in iree_compile if entry[1] == "iree_compiler_module"
+    )
+    assert compiler_module_entry[:2] == (
+        "EVOXC_IREE_COMPILER_MODULE",
+        "iree_compiler_module",
+    )
+    assert callable(compiler_module_entry[2])
+    # The parser only strips whitespace — the adapter resolves/validates the
+    # dotted module path (an unimportable path is a loud BackendError).
+    assert compiler_module_entry[2](
+        "EVOXC_IREE_COMPILER_MODULE", "  my_iree.compiler  "
+    ) == "my_iree.compiler"
     vulkan_entry = next(
         entry for entry in iree_compile if entry[1] == "vulkan_target"
     )
@@ -205,10 +224,29 @@ def test_env_option_table_keys_and_parsers():
     )
 
     iree_load = ENV_OPTION_TABLE[("iree", "load")]
-    assert len(iree_load) == 1
-    var, key, parser = iree_load[0]
+    assert len(iree_load) == 2
+    assert {entry[1] for entry in iree_load} == {
+        "iree_runtime_args",
+        "iree_runtime_module",
+    }
+    var, key, parser = next(
+        entry for entry in iree_load if entry[1] == "iree_runtime_args"
+    )
     assert (var, key) == ("EVOXC_IREE_RUNTIME_ARGS", "iree_runtime_args")
     assert callable(parser)
+    runtime_module_entry = next(
+        entry for entry in iree_load if entry[1] == "iree_runtime_module"
+    )
+    assert runtime_module_entry[:2] == (
+        "EVOXC_IREE_RUNTIME_MODULE",
+        "iree_runtime_module",
+    )
+    assert callable(runtime_module_entry[2])
+    # Same whitespace-only parse as the compile-stage half: a dotted module
+    # path the adapter resolves (an unimportable path -> BackendError).
+    assert runtime_module_entry[2](
+        "EVOXC_IREE_RUNTIME_MODULE", "  my_iree.runtime  "
+    ) == "my_iree.runtime"
 
     compile_entries = ENV_OPTION_TABLE[("tvm", "compile")]
     assert {entry[1] for entry in compile_entries} == {
