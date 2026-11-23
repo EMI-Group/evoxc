@@ -171,7 +171,7 @@ Top-level imports: `evoxc.core`, `evoxc.ir`, this backend's siblings (`..backend
 - One executable is not required to be thread-safe for concurrent `run` calls; the resolver is stateless, but the engine's internal buffers are its own contract.
 - The engine program is compiled at `lower()` (capability gate) and again at `load()` only when the in-process program attachment is absent (a reloaded artifact) — report `stats()["compile_ms"]` when measuring staging cost, and `staging_stats()` for the decode/encode/compile tallies.
 - The `run` hot path caches two pure derivations per executable — the resolved extension module and the flattened spec layout (rebuilt when `signature` is REPLACED) — so a `NativeExecutable` resolves `engine.engine_module()` once, not per call. Validation and every error message are unchanged.
-- A `random_key_mix` graph fails at `lower()` on the Rust envelope decoder (`VerificationError: attribute "salt": expected an int, got 11400714819323198485` — a u64 value above `i64::MAX`). That is an engine-side int-attribute limit (outside this node; there is no narrowing workaround here — nothing in this package touches attribute encoding), reproducible at the same boundary in every staging chain, in-process or from disk.
+- Integer attributes cross the envelope unchanged: the Rust decoder takes a Python int as `i64` first and `u64` second, so `random_key_mix`'s `0x9E3779B97F4A7C15` salt (above `i64::MAX`) stages on this backend bit-exactly; only an int fitting neither width is rejected (owned by `../../../native/CONTEXT.md`).
 - `Graph` mutation warning: like numpy/compiler `lower()`, portable inlining mutates the caller's module, so a `lower()` that fails at the engine gate (step 6) leaves blocks already inlined.
 
 ## Test strategy
