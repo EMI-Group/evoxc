@@ -32,6 +32,8 @@ The shared mechanism — per-stage `KNOWN_OPTIONS`, union-of-stages key validati
 | iree | compile | `opt_level` (str\|int) | `EVOXC_OPT_LEVEL` | `"O0"`..`"O3"` (case-insensitive) or 0..3 → the DERIVED flag `--iree-opt-level=O{N}` (the O-form is REQUIRED — 3.11 and 3.13 both reject numeric levels). A user `--iree-opt-level=…` wins and the derived flag is dropped; not in the DENY list; unset → no flag, byte-identical |
 | iree | compile | `vulkan_target` (str) | `EVOXC_IREE_VULKAN_TARGET` | the `--iree-vulkan-target=<profile>` sugar for `vulkan-spirv` (IREE has no Vulkan target auto-detection). A NON-EMPTY `str`, else a loud `core.BackendError`; joins the defaults with a same-NAME user flag winning; UNSET → NO flag (the compiler default `vp_android_baseline_2022` applies, args byte-identical); set while `target_backends` lacks `vulkan-spirv` → loud `core.BackendError` |
 | iree | compile | `dispatch_formation` (str) | `EVOXC_DISPATCH_FORMATION` | `"default"` (or unset) = NO derived flag, byte-identical compile args; `"aggressive"` = `--iree-dispatch-creation-enable-aggressive-fusion`. Case-insensitive, whitespace-stripped; any other value → loud `core.BackendError`. Joins the defaults (a same-NAME user flag wins), NOT in the DENY list, OPT-IN; on 3.13 the flag's own default became opt-level-dependent (O0 → false, O2+ → true), so at O2/O3 it yields a BYTE-IDENTICAL vmfb |
+| iree | compile | `iree_compiler_module` (module object or dotted module-path string) | `EVOXC_IREE_COMPILER_MODULE` | the module the COMPILER half is imported from: `None` (default) = the published `iree.compiler`, else a `types.ModuleType` or a non-empty dotted string resolved with `importlib.import_module`; every internal compiler use routes through the resolver and `CompilerToolError` comes from the SAME module as `compile_str`; a supplied module replaces the default `check_available()` probe with its own validation (`compile_str` + `CompilerToolError`); a non-module/non-str value, an empty string or an unimportable path → loud `core.BackendError` naming the option, the value and the accepted forms |
+| iree | load | `iree_runtime_module` (module object or dotted module-path string) | `EVOXC_IREE_RUNTIME_MODULE` | the module the RUNTIME half is imported from: `None` (default) = the published `iree.runtime`, else a module object or dotted string as above, validated on its own attributes (`get_driver`, `DeviceArray`, `load_vm_module`); device acquisition, staging, readback, DLPack and module loading all route through it and the resolved module is carried on the payloads/executables it creates, while the option-less sites (`upload_tensor`, the `evoxc.io` worker bootstrap) resolve the ENV VAR only — a module OBJECT must therefore also be exported as the env var to reach placement |
 | iree | load | `iree_runtime_args` (list of flags) | `EVOXC_IREE_RUNTIME_ARGS` | loader/HAL flags via `rt.flags.parse_flags` (loud errors). evoxc sets NO process-global runtime flag — iree's own `--cuda_async_allocations=true` (stream-ordered) default stands (forcing `false` measured ~2–3× slower per DE/PSO step); override per load here or via `IREE_PY_RUNTIME_FLAGS` |
 | xla | compile AND load | `plugin_path` (str) | `EVOXC_PJRT_PLUGIN` | plugin discovery — the FIRST of four steps (then the env var, the fixed well-known paths, then the installed `jax_plugins/*/*.so` scan, which takes no option); honored at load too, so a persisted artifact loads without re-passing it |
 | xla | compile | `xla_compile_options` (bytes) | `EVOXC_XLA_COMPILE_OPTIONS` (base64) | raw serialized `xla.CompileOptionsProto` into `PJRT_Client_Compile_Args.compile_options` (evoxc does not parse it). Unset → `bytes.fromhex("1a0420012801")` (num_replicas=1/num_partitions=1 — a NULL one CHECK-crashes real plugins). Non-bytes → `core.BackendError` |
@@ -132,8 +134,12 @@ Same adapter and machinery, driven by `get_driver("vulkan")`.
 | `runtime_calls` | `False` | `False` | `False` |
 | `external_calls` | `True` (the ONLY adapter with host/device dispatch) | `False` (portable inlined at `lower()`, else `BackendError`) | `False` (same) |
 | `custom_blocks` | `False` | `False` | `False` |
+| `custom_ops` | `True` | `True` | `True` |
 | `async_collectives` | `False` | `False` | `False` |
 | `rng_bit_generator` | `{"threefry2x32"}` (native THREE_FRY is bit-exact vs numpy on llvm-cpu/cuda/rocm and the default path for threefry; PHILOX fails legalization → inline expansion) | `frozenset()` (native path unusable for evoxc's algorithms — Known Issue 3) | `frozenset()` (no such op in the TVM StableHLO frontend) |
+
+`custom_ops=True` on all three adapters means evoxc forwards `stablehlo.custom_call` / `inline_stablehlo` ops VERBATIM into the emitted StableHLO text: evoxc keeps no target registry and pre-validates nothing, so the external compiler's diagnostic is the verdict (an unknown target parses and fails legalization — Known Issue 22).
+The `numpy` interpreter and the `native` engine leave `custom_ops` at its `False` default (neither has a kernel for either op).
 
 ## Constraints (binding)
 
@@ -150,6 +156,28 @@ Same adapter and machinery, driven by `get_driver("vulkan")`.
 - **Flag:** `"aggressive"` derives `--iree-dispatch-creation-enable-aggressive-fusion`; `"default"`/unset derives NO flag (byte-identical compile args), an unknown value a loud `BackendError`.
 - **Verdict: OPT-IN, enabled for rocm merged plans.** On iree 3.11 it takes 596 → 548 dispatches on the reference merged graph (2191 → 2021 ops), i.e. −5 % compile at pop 4000 and −7…−9 % WARM on rocm, while llvm-cpu is flat-to-worse.
 - **Enable rule (rocm merged plans): keep the band cap at 15 recommended — a ONE-binding margin under the 16-binding wall** (Known Issue 19) — so fusion cannot push a dispatch past the limit; 16 binds exactly at the wall.
+
+## Custom IREE builds (`iree_compiler_module` / `iree_runtime_module`)
+
+A custom-built IREE whose Python packages are not named `iree.compiler` / `iree.runtime` is plugged in with the two module options (table above: values, defaults, env spellings; precedence unchanged — explicit kwarg > env var > default).
+The published packages are used when the options are unset, so nothing changes for a normal install.
+Recipe:
+```python
+import evoxc
+from evoxc.backends.adapters.iree import iree_backend  # import only; no heavy import
+
+evoxc.backends.register(iree_backend, replace=True)
+exe = evoxc.build(
+    fn, spec, backend="iree",
+    iree_compiler_module="my_iree.compiler",  # or a module object
+    iree_runtime_module="my_iree.runtime",    # or a module object, or EVOXC_IREE_*
+)
+```
+`import evoxc.backends.adapters.iree` is safe: the heavy-import rule keeps `iree.compiler`/`iree.runtime` out of module import.
+`evoxc.backends.register(..., replace=True)` does NOT probe the default packages, so the custom build works on a host with no default `iree` install; `registry.get("iree")` (and the adapter's module-level `register()`) still probe the DEFAULT packages and fail loudly with the `pip install evoxc[iree]` hint, by design.
+`build`/`evaluate`/`build_cached` forward one options dict to `lower`, `compile` AND `load`, so both keys can be passed together.
+The compiler option is compile-stage and the runtime option load-stage; a `compile()` that is handed a custom compiler module validates it instead of the default probe, and a `load()` likewise for the runtime module.
+Every internal run-path cache is module-aware: the DEFAULT module keeps the historical `(kind, index, runtime_args)`-shaped keys, while a custom module's entries are prefixed with the module object so two builds can never share a HAL device, staging buffer or dtype memo.
 
 ## Known Issues
 
@@ -217,6 +245,12 @@ Same adapter and machinery, driven by `get_driver("vulkan")`.
 21. **The device→host readback is ADAPTER-OWNED — iree 3.13.0's `DeviceArray.to_host()` fast path is unusable on the Vulkan HAL.** Every host materialization of an iree buffer (hence `.numpy()` on a cpu-kind output, `t.to(cpu)`, `evoxc.io.sink`, host-mode external-kernel boundaries) goes through `iree.py::_readback_device_array`: a **zero-copy mapping** for host-mappable llvm-cpu/`local-task` allocations, else an explicit **staging `queue_copy`** with the shared query-first semaphore, `map()` + copy out.
    Cause: `_copy_to_host` prefers `allocator.import_host_allocation` whenever `query_buffer_compatibility` reports `IMPORTABLE`, and the Vulkan allocator then rejects the very buffer it advertised (`allocator.c:1985`, `minImportedHostPointerAlignment 4096`) — so the adapter never uses that primitive, has no version branch or `try: to_host() except:` fallback, and leaves host-memory IMPORT unused even where it works so ONE implementation serves every kind. Re-tested bit-exact on vulkan (lavapipe), rocm and llvm-cpu. Cost table → notes (`## Known Issue 21`).
 
+22. **An unknown `stablehlo.custom_call` target PARSES but fails IREE legalization — IREE only legalizes its own known target set.** `custom_ops=True` means evoxc forwards the op verbatim; validation is the compiler's, and `_compile_mlir` surfaces its diagnostic as-is inside the `core.BackendError` ("iree-compile failed to compile the StableHLO program for the iree backend (targets: …)"). Measured on iree-base 3.13.0 / llvm-cpu with a hand-written module `%r = stablehlo.custom_call @my_target(%arg0) {api_version = 1 : i32, backend_config = "{}"} : (tensor<4xf32>) -> tensor<4xf32>`, `iree.compiler.compile_str` raises `CompilerToolError` with, verbatim:
+   ```
+   <stdin>:3:10: error: failed to legalize operation 'stablehlo.custom_call' that was explicitly marked illegal: %0 = "stablehlo.custom_call"(%arg0) <{api_version = 1 : i32, backend_config = "{}", call_target_name = "my_target"}> : (tensor<4xf32>) -> tensor<4xf32> loc("<stdin>":3:10)
+   ```
+   The op survives parsing (IREE reads it, including the `call_target_name` attribute) and dies in legalization, so this is a target-set verdict, not a syntax error.
+   Two supported workarounds — do NOT try to make IREE accept arbitrary targets: (a) `evoxc.inline_stablehlo` (IR op `inline_stablehlo`) — emit the raw StableHLO/MLIR snippet yourself; IREE parses and legalizes it as ordinary code; (b) `evoxc.external_call` — the adapter's segment split plus host/device kernel dispatch for Python/Triton kernels (see "External kernels on compiler backends" in `../CONTEXT.md`).
 - **ROCm `while_loop`/`scan` unreliability (same upstream family as 8f):** shapes build and compile, but at run the HIP HAL aborts with a RAW `RuntimeError: … hip/event_semaphore.c:786: ABORTED … hal.fence.await` (from `entry(*buffers)`, unwrapped) and the process often hangs at teardown; deterministic per shape and the same graphs are llvm-cpu-clean. Failing shapes: a loop carry initialized from a graph CONSTANT (`enp.zeros` — also why `evoxc.scan` fails) and a multi-carry loop whose condition reads the float carry; working bit-exact: an i64 counter condition with input-derived carries. **3.13.0 status:** all three formerly-failing shapes ran 6/6 bit-exact vs numpy on this host (gfx942, ROCm 7.1) and `non_dominate_rank` compiled 10/10 per target — no longer reproducible, reported rather than assumed fixed; 3.13 still rejects only the fully input-independent counted loop, as a compile error.
 
 ## Scale & module-shape facts (large graphs)
@@ -236,7 +270,7 @@ No adapter fetches anything at run time: there is no urllib/requests/curl/wget, 
 `_pjrt_c_api.HEADER_URL`/`HEADER_COMMIT`/`HEADER_SIZE_BYTES` are provenance METADATA only — never opened or fetched; the module is a hand-written ctypes translation, stdlib-only.
 xla needs ZERO pip dependencies: the PJRT C API is driven over pure-stdlib ctypes against a `GetPjRtApi`-exporting plugin `.so`, required at compile/load time, discovered as documented above and dlopen-ed never imported (no xla extra); provenance (header URL + commit) is recorded in `_pjrt_c_api.py` and the artifact `runtime_dependencies`.
 tvm needs `apache-tvm` + `jaxlib`, the latter ONLY for its bundled LLVM MLIR python bindings (not the jax API) behind the `_mlir_bindings` seam; `jax` is never imported anywhere in `evoxc/`, and `check_available()` probes `jaxlib.mlir` + `jaxlib.mlir.ir` with the `pip install evoxc[tvm]` hint.
-**Legitimately long files — do not split without a plan:** `iree.py` (3836 lines) holds the whole iree adapter surface (options/defaults, backend + executable + cached run plans, staging tiers, adapter readback, device acquisition, segments/external dispatch, `IreeDevicePayload`, `upload_tensor`, `register()`).
+**Legitimately long files — do not split without a plan:** `iree.py` (4355 lines) holds the whole iree adapter surface (custom-module resolvers, options/defaults, backend + executable + cached run plans, staging tiers, adapter readback, device acquisition, segments/external dispatch, `IreeDevicePayload`, `upload_tensor`, `register()`).
 `xla.py` (1479) and `xla_util.py` (1680) are the same split for xla (backend/executable surface incl. the static-shape gate, `_XlaRunPlan`, the device-complete-event lifecycle; PJRT C API driver).
 All three are cohesive and tightly coupled, so splitting would only spread one adapter across files.
 
@@ -245,7 +279,7 @@ All three are cohesive and tightly coupled, so splitting would only spread one a
 |---|---|
 | `./PER-ADAPTER-NOTES.md` | Companion reference: measured numbers, staging-tier byte-level machinery, XLA hot-path design + A/B medians, env recipes, the IREE while-loop version matrix, and the Known-Issue narratives 3/9/10/11/13/14/15/16/17/18/19/20/21 |
 | `./__init__.py` | package marker + adapter-module contract (documentation only) |
-| `./iree.py` | `IreeBackend`/`IreeExecutable` (run + no-op `synchronize()`), `iree_backend`, `register()` (+ the FLAT device-transfer slot for `vulkan`), `upload_tensor`, the `*_device` helpers, public `IreeDevicePayload`, the adapter-owned readback (Known Issue 21), segment/external-call machinery, `_load_vm_module` + `_raise_if_dispatch_binding_limit` (Known Issue 19) |
+| `./iree.py` | `IreeBackend`/`IreeExecutable` (run + no-op `synchronize()`), `iree_backend`, `register()` (+ the FLAT device-transfer slot for `vulkan`), the custom-module resolvers (`_compiler_module`/`_runtime_module`/`_module_cache_prefix`, option `iree_compiler_module`/`iree_runtime_module`, `custom_ops=True`), `upload_tensor`, the `*_device` helpers, public `IreeDevicePayload`, the adapter-owned readback (Known Issue 21), segment/external-call machinery, `_load_vm_module` + `_raise_if_dispatch_binding_limit` (Known Issue 19) |
 | `./xla.py` | `XlaBackend`, `XlaExecutable` (static-shape gate, `_XlaRunPlan`, `_XlaDeviceRunGroup`, `synchronize()`/`_pending_events`, `close`), `xla_backend`, `register()`, `XlaDevicePayload`, `upload_tensor`, `_NON_CPU_KINDS`/`_PLATFORM_KINDS`/`_check_kind_served` |
 | `./xla_util.py` | PJRT C API driver: plugin discovery/loading (4-step order, opt-out), version gate, client/compile/execute/buffer/serialize plumbing (device-complete-event slot, `events=` sink, `_Buffer` metadata + `_verify_metadata`, `release_payloads`, `await_event`/`destroy_event`, the shared-client cache — Known Issue 20), dtype map, `_resolve_static_shape`, `set_opt_level` |
 | `./_pjrt_c_api.py` | vendored ctypes translation of the PJRT C API header (Apache-2.0; URL + commit recorded; offsets verified against a real-header-compiled plugin) |
@@ -260,6 +294,9 @@ Committed adapter tests live in the SIBLING `tests/backends/` (read-only here; w
 `test_xla_device_resident.py` (9, fake plugin) pins device-resident staging (zero-staging same-device loop, run-boundary host-input `DeviceError`, load-device validation, payload/client lifecycle) plus the rank-0 staging guard; `test_pjrt_ctypes_plugin.py` (10) pins the ABI checks + shared-client refcount; `test_adapter_xla.py`/`test_adapter_iree.py`/`test_adapter_tvm.py` hold the per-adapter end-to-end numerics.
 iree E2E suites: `test_iree_emitters_parity.py`, `test_iree_random_algorithms_parity.py`, `test_iree_eigh_diag_parity.py`, `test_iree_device_resident.py`, `test_iree_same_device_loop.py`, `test_iree_hotpath_validation.py`, `test_iree_llvm_cpu_host_inputs.py`, `test_iree_rocm_device_resident.py` (rocm-guarded via `_rocm_guard.py`), `test_external_call_iree.py` (39), `test_external_batched_iree.py` (6), `test_build_cache_iree.py`, `test_nsga2_xla_route.py`;
 **Coverage gaps:** the per-call hot-path machinery has no direct assertion (every device-resident run exercises it; the SEMANTICS are pinned).
+The two custom-module options and the three adapters' `custom_ops=True` have no committed test yet (the behaviors are exercised only by throwaway probes: default/string/module-object/env forms, bad values, and an end-to-end llvm-cpu run).
+`test_options_override.py` still pins the pre-`iree_compiler_module`/`iree_runtime_module` `KNOWN_OPTIONS` dict and message listing, so its `test_adapter_known_options_declarations` and `test_validate_options_unknown_key_lists_known_options_per_stage` need the two added keys; `test_compiler_framework.py::test_capability_pre_check_rejects_naming_feature[block]` predates this node's work (the portable-`block_call` gate in `../compiler.py` vs a test that still expects rejection).
+The vulkan/rocm HAL-device, readback-staging and dtype-memo caches keep the historical key shape for the DEFAULT runtime module and prefix a CUSTOM module's entries with the module object, so their pinned key tuples still hold.
 Known Issue 20's committed pin belongs in the sibling `test_xla_device_resident.py` §5 and must force GC inside the critical section (a stub plugin running `gc.collect()` with a PENDING finalizer, in a subprocess so a regression fails on a timeout, asserting the state lock is NOT held and the create lock IS).
 The `synchronize()`/event lifecycle has NO committed test (only throwaway stubs and the fake C plugin); a real `PJRT_Event*` needs a GPU run.
 ROCM gaps: rocm × `external_call`/segment staging, thread-locality of the staging caches, and a real-rocm `upload_tensor` on the `evoxc.io` worker thread (`prefetch`).

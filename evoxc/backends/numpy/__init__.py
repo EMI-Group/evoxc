@@ -10,7 +10,13 @@ and the interpreter execution model defined in the parent contract
   there is no machine code). ``block_call`` portable decompositions are
   inlined as graph->graph expansion at LOWER time (``inline.py``); a block
   with neither a portable decomposition nor a registered numpy impl =>
-  ``core.BackendError`` naming the block.
+  ``core.BackendError`` naming the block. The compiler escape hatches
+  (``custom_call`` / ``inline_stablehlo``, IR category ``"custom"``) are
+  REJECTED at ``lower()`` — a local CPU interpreter cannot execute a
+  compiler custom call or a raw StableHLO snippet — with an actionable
+  ``core.BackendError`` pointing at ``evoxc.external_call`` /
+  ``evoxc.ops.runtime_call`` / ``evoxc.block`` or a compiler backend;
+  never a silent pass-through.
 - ``NumpyExecutable``: the backend executable (satisfies the ``Executable``
   protocol), wrapping an ``Interpreter`` (``interpreter.py``).
 - Execution model: execution order = block op order (the effect ordering);
@@ -187,7 +193,10 @@ class NumpyBackend(Backend):
         2. ``kernels.register_all()`` (idempotent), then a capability
            pre-check on the CURRENT module state (live walk — the module is
            mutated by inlining in step 3): capability FLAGS are checked here
-           (runtime_call/block_call/collective effects vs ``Capabilities``);
+           (runtime_call/block_call/collective effects vs ``Capabilities``),
+           and the compiler-escape-hatch ops (``custom_call`` /
+           ``inline_stablehlo``) are rejected here AND in the post-inline
+           walk — a local interpreter cannot execute them;
            kernel-table membership is re-checked AFTER inlining (the full
            drift net — portables replace ``block_call``s first).
         3. Inline ``block_call`` portable decompositions as a graph->graph
@@ -435,6 +444,11 @@ class NumpyBackend(Backend):
         - every non-terminator op must have a kernel when ``check_kernels``
           (the full net runs AFTER portable inlining — the executed module
           state);
+        - the compiler-escape-hatch ops ``custom_call`` / ``inline_stablehlo``
+          (IR category ``"custom"``) are REJECTED in BOTH walks — a local CPU
+          interpreter cannot execute a compiler custom call or raw MLIR, so
+          they fail with a specific, actionable message BEFORE the generic
+          kernel-table net could fire;
         - ``runtime_call``/``block_call``/``collective``-effect ops require
           the matching ``Capabilities`` flag (all True for numpy v1 — the
           flags make future capability changes fail explicitly).
@@ -451,6 +465,26 @@ class NumpyBackend(Backend):
         for op in iter_ops(module):
             if op.is_terminator:
                 continue  # 'return' is special-cased in the interpreter loop
+            # Compiler escape hatches (IR category "custom" — deliberately
+            # distinct from the "sparse" capability gate the compiler adapters
+            # enforce): the compiler adapters forward these ops to their
+            # compiler, but a local CPU interpreter has nothing to run, so it
+            # must reject them in BOTH walks (the pre-inline flags walk as well
+            # as the post-inline kernel net) rather than fall through to the
+            # generic "no numpy kernel" drift message. Never a silent
+            # pass-through.
+            if op.name in ("custom_call", "inline_stablehlo"):
+                raise core.BackendError(
+                    f"capability drift: the numpy backend cannot execute "
+                    f"'{op.name}' — a local CPU interpreter cannot run a "
+                    "compiler custom call / raw StableHLO snippet. Options: "
+                    "(1) use a Python kernel instead — "
+                    "evoxc.external_call(...) for a named kernel, "
+                    "evoxc.ops.runtime_call(...) for an inline callback, or "
+                    "evoxc.block(...) for a reusable custom op; (2) run the "
+                    "graph on a compiler backend that forwards custom calls: "
+                    'backend="iree" (also xla/tvm)'
+                )
             if check_kernels and op.name not in kernels.KERNEL_TABLE:
                 raise core.BackendError(
                     f"capability drift: no numpy kernel for op '{op.name}' "

@@ -66,7 +66,7 @@ The user-facing `Executable.summary()` inspection API lives in `evoxc/pipeline.p
 
 1. `options.validate_options(options, KNOWN_OPTIONS, "native", "lower")`.
 2. `graph.verify()` (`core.VerificationError` surfaces as-is).
-3. Capability pre-check over the live module: `runtime_call` / `block_call` / collective effects vs `Capabilities`; `sparse_*` ops (category `"sparse"`); every op result and function-signature dtype against `Capabilities.dtypes`.
+3. Capability pre-check over the live module: `runtime_call` / `block_call` / collective effects vs `Capabilities`; the `custom_call` / `inline_stablehlo` compiler escape hatches (category `"custom"`); `sparse_*` ops (category `"sparse"`); every op result and function-signature dtype against `Capabilities.dtypes`.
 4. `inline_portables(graph.module, keep_backend_impls="native")` — the SHARED `../inline.py` fixpoint: blocks with a registered `native` impl stay, blocks with only a portable decomposition are spliced in, a block with neither is an explicit `BackendError` naming it (never a cross-backend impl fallback). External-kernel portables are NOT inlined (`external_calls=True` — the engine calls back through `call_external`).
 5. Only when step 4 spliced something: `graph.verify()` + repeat step 3 (the module changed).
 6. **Engine capability gate**: `native_compile` the module and read `stats()`; every op the engine reports as unsupported becomes one `core.BackendError` naming the ops and pointing at `backend="numpy"`. This is the authoritative gate — the Rust engine, not this package, knows what it implements.
@@ -142,6 +142,8 @@ Measured on this host (numpy 2.5, glibc) by running one graph on both backends w
 ## Explicit deferrals (always an explicit error, never a silent fallback)
 
 - **Sparse ops** — `Capabilities.sparse_ops=False`; the pre-check names the op and suggests `backend="numpy"` (sparse is numpy-backend-only by contract).
+- **Compiler escape hatches (`custom_call` / `inline_stablehlo`)** — `Capabilities.custom_ops` stays `False`, and the Python capability pre-check (step 3) rejects them by name BEFORE the engine gate, because an in-process CPU engine cannot execute a compiler custom call or raw MLIR.
+  The message points at a Python kernel instead (`evoxc.external_call(...)` — host-mode kernels dispatch through the native callback resolver — `evoxc.ops.runtime_call(...)` or `evoxc.block(...)`) or at a compiler backend that forwards custom calls (`backend="iree"`, also xla/tvm), so the actionable message never comes from the Rust engine's own plan-compile rejection — never a silent pass-through.
 - **Non-CPU devices** — `load()` rejects a non-CPU `Device`; `run()` rejects a non-CPU input tensor with `DeviceError` + the explicit `.to(Device("cpu", 0))` remedy (the pipeline already enforces this at the run boundary — defence in depth, no implicit transfer).
 - **Any op the Rust engine does not implement** — reported by the engine at `lower()` as a `BackendError` listing the ops.
 - **`device_resident=True` external-kernel slots** — the resolver rejects them explicitly (host arrays cannot honor device-resident semantics).

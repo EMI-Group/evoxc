@@ -67,6 +67,14 @@ class Capabilities:
             frontend has no rng_bit_generator support), numpy ``frozenset()``
             (no StableHLO emission). The per-call ``rng_bit_generator`` lower
             option overrides this set for one ``lower()``/``build()`` call.
+        custom_ops: the backend can compile ``custom_call`` / ``inline_stablehlo``
+            ops by handing them to its external compiler. Both ops are opaque
+            escape hatches emitted verbatim into the program (a StableHLO
+            custom-call target, or a raw StableHLO/MLIR snippet), so the flag
+            only claims the ops are FORWARDED; whether the target exists and
+            the MLIR is valid is the external compiler's decision, and its
+            error is surfaced as-is. A local interpreter (numpy, native) sets
+            ``False`` — it cannot execute a compiler custom call or raw MLIR.
     """
 
     dynamic_shapes: bool = False
@@ -78,6 +86,7 @@ class Capabilities:
     async_collectives: bool = False
     sparse_ops: bool = False
     rng_bit_generator: frozenset = field(default_factory=frozenset)
+    custom_ops: bool = False
 
     def supports_dtype(self, dtype: Any) -> bool:
         """True iff ``dtype`` is among ``self.dtypes`` (numpy dtype equality)."""

@@ -7,6 +7,16 @@ and it never lowers, compiles, or runs anything. The compiler adapters that
 CONSUME this export (`"iree"`, `"xla"`, `"tvm"`) are implemented in
 `../adapters/`.
 
+Two compiler escape hatches are forwarded verbatim: `custom_call` emits one
+`stablehlo.custom_call` line (target symbol, optional `backend_config`, an
+always-present `api_version`, an opt-in `has_side_effect`) and
+`inline_stablehlo` emits its raw `body` snippet with the `%in<i>`/`%out<i>`
+tokens substituted for the op's real SSA names (the exporter validates that
+token contract). Both are effect-`callback` and are therefore emitted as one
+atomic, never-hoisted unit. `export` emits them UNCONDITIONALLY — which
+backend may forward them is the ADAPTER capability gate
+(`Capabilities.custom_ops`, checked in `../compiler.py`).
+
 See `../../CONTEXT.md` (backends contract; "StableHLO exporter — v1 scope"
 is binding) and `../../../CONTEXT.md` (root design principles).
 """

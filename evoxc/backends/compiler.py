@@ -50,6 +50,25 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 
 __all__ = ["CompilerBackend", "CompilerExecutable"]
 
+#: The compiler-escape-hatch ops (see ``evoxc/ir/op_defs/custom.py``): they
+#: are emitted verbatim and gated on ``Capabilities.custom_ops``. Their IR
+#: category is ``"custom"`` — deliberately NOT ``"sparse"``, so the sparse
+#: gate below never matches them.
+_CUSTOM_OPS: frozenset[str] = frozenset({"custom_call", "inline_stablehlo"})
+
+
+def _block_has_portable(block_name: Any) -> bool:
+    """True iff ``block_name`` has a registered portable decomposition.
+
+    Uses the SAME lazy accessor as ``inline.py`` (``evoxc.block.registry`` —
+    ``evoxc.block`` may not be imported at module import time). An unknown
+    block resolves to ``False`` here; ``inline_portables`` then raises its
+    own explicit "unknown block" ``BackendError``.
+    """
+    from evoxc.block import registry as block_registry
+
+    return block_registry.get_portable(block_name) is not None
+
 
 class CompilerBackend(Backend):
     """Shared base for compiler backends that consume StableHLO MLIR.
@@ -81,24 +100,34 @@ class CompilerBackend(Backend):
       every rejection naming the missing feature:
       ``runtime_call`` requires ``capabilities.runtime_calls``;
       ``collective``-effect ops require ``capabilities.collectives``;
-      ``block_call`` requires ``capabilities.custom_blocks``; ops in the
+      ``block_call`` requires ``capabilities.custom_blocks`` OR a
+      registered portable decomposition (``evoxc.block.registry.get_portable``
+      — such blocks are skipped here and spliced by the portable-inline
+      step below, exactly like a portable ``external_call``); ops in the
       ``"sparse"`` category require ``capabilities.sparse_ops``;
       ``external_call`` requires ``capabilities.external_calls`` OR a
       registered portable decomposition (``evoxc.external.get_portable`` —
       such ops are skipped here and inlined by the portable-inline step
-      below with a warning); every value dtype must be declared in
+      below with a warning); ``custom_call`` / ``inline_stablehlo``
+      require ``capabilities.custom_ops`` (they are forwarded verbatim to
+      the external compiler — the compiler decides whether the target
+      exists and the MLIR is valid); every value dtype must be declared in
       ``capabilities.dtypes``; when ``capabilities.dynamic_shapes`` is
       False, symbolic / runtime-dynamic (``None``) dimensions are
       rejected — all raise ``core.BackendError`` naming the feature.
-    - Portable inlining: with ``custom_blocks=True`` every remaining
-      ``block_call`` is inlined by ``inline_portables(module,
-      keep_backend_impls=None)`` (a compiler adapter has no per-backend
-      block impls) — a block without a portable decomposition raises
-      ``core.BackendError`` naming it. With
+    - Portable inlining: every remaining ``block_call`` is inlined by
+      ``inline_portables(module, keep_backend_impls=None)`` (a compiler
+      adapter has no per-backend block impls) — a block without a portable
+      decomposition raises ``core.BackendError`` naming it. With
       ``inline_external_portables=not capabilities.external_calls``,
       ``external_call`` ops with a registered portable decomposition are
       inlined through the same splicing machinery (``UserWarning`` per
       kernel name); ops without one were already rejected at the pre-check.
+    - ``custom_call`` / ``inline_stablehlo`` are passed through UNTOUCHED
+      (they are emitted as ``stablehlo.custom_call`` / verbatim MLIR text;
+      see ``stablehlo/``). Their capability flag only says the adapter
+      FORWARDS them — validity is the external compiler's verdict, and its
+      diagnostic is surfaced as-is.
     - The StableHLO export is the capability gate for ops: deferred ops
       raise ``core.BackendError`` naming them (see ``stablehlo/`` v1 scope).
     - The ``Signature`` is recorded from the Graph's LIVE attributes
@@ -242,10 +271,15 @@ class CompilerBackend(Backend):
            ``inline.iter_ops`` — the module is mutated by inlining in
            step 3): ``runtime_call`` / ``collective``-effect ops /
            ``block_call`` / sparse ops (category "sparse" vs
-           ``capabilities.sparse_ops``) / ``external_call`` / dtypes /
+           ``capabilities.sparse_ops``) / ``external_call`` /
+           ``custom_call`` / ``inline_stablehlo`` / dtypes /
            dynamic shapes are checked against ``Capabilities`` here
            (mirrors the numpy backend's flag pattern). Every rejection
-           names the missing feature. ``external_call`` ops with a
+           names the missing feature. ``block_call`` ops whose block has a
+           registered portable decomposition (``evoxc.block.registry``) are
+           SKIPPED here — the portable-inline step splices them; a block
+           without one raises ``BackendError`` naming the block and the
+           ``BlockOp.portable(...)`` remedy. ``external_call`` ops with a
            registered portable decomposition
            (``evoxc.external.get_portable``) are SKIPPED here — the
            portable-inline fallback (step 3) handles them with a warning;
@@ -340,9 +374,26 @@ class CompilerBackend(Backend):
                     f"execute collective op '{op.name}'"
                 )
             if op.name == "block_call" and not capabilities.custom_blocks:
+                block_name = op.attributes.get("block_name")
+                if _block_has_portable(block_name):
+                    # The portable-inline step below splices this block's
+                    # decomposition (a compiler adapter has no per-backend
+                    # block impls) — skip it here, exactly like a portable
+                    # ``external_call`` above.
+                    continue
                 raise core.BackendError(
                     f"capability drift: the {self.name} backend cannot "
-                    "execute custom block ops (block_call)"
+                    f"execute custom block op {block_name!r} (block_call) — "
+                    "compiler backends require a portable decomposition: "
+                    f"register one via BlockOp.portable(...) on block "
+                    f"{block_name!r}"
+                )
+            if op.name in _CUSTOM_OPS and not capabilities.custom_ops:
+                raise core.BackendError(
+                    f"capability drift: the {self.name} backend cannot "
+                    f"execute '{op.name}' — this adapter does not forward "
+                    "compiler custom calls / raw StableHLO snippets to its "
+                    "external compiler (Capabilities.custom_ops is False)"
                 )
             if op.opdef.category == "sparse" and not capabilities.sparse_ops:
                 raise core.BackendError(
