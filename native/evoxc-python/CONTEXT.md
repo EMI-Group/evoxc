@@ -11,7 +11,7 @@ The built cdylib is `libevoxc_python.so`, installed by `scripts/build-native.sh`
 
 | Name | Signature | Behavior |
 |---|---|---|
-| `version()` | `-> str` | `evoxc_core::VERSION` (`"0.1.0"`). |
+| `version()` | `-> str` | `evoxc::core::VERSION` (`"0.1.0"`). |
 | `__version__` | `str` | Same string; also appears in the generated `__all__`. |
 | `infer(...)` | `(op_name: str, operand_types, attributes, result_types=None, module=None) -> list[dict]` | Native shape inference for one op; returns `[{"dtype": str, "shape": [dim, ...]}, ...]`. `module` accepts a full envelope **or** a signature-only callee context ("The `infer` module argument" below). |
 | `transform(...)` | `(kind: str, module: dict, config: dict) -> dict` | Runs `evoxc_compiler::transform` (all five kinds); returns the transformed `evoxc-native-ir` envelope plus `"transform": {"kind", "output_ids", "input_ids", "batch_dim"}`. Config keys and accepted shapes: `native/CONTEXT.md` "Transform configs" + "Config decoding" below. |
@@ -27,15 +27,15 @@ The built cdylib is `libevoxc_python.so`, installed by `scripts/build-native.sh`
 
 ## The `infer` module argument
 
-`infer`'s `module` supplies the callee signatures `call` resolves against (`evoxc_core::infer_op` reads `module.function(callee)?.output_types`), and it is decoded by `infer_context::decode_module` into a `Program`. Two shapes are accepted:
+`infer`'s `module` supplies the callee signatures `call` resolves against (`evoxc::core::infer_op` reads `module.function(callee)?.output_types`), and it is decoded by `infer_context::decode_module` into a `Program`. Two shapes are accepted:
 
-* **A full `evoxc-native-ir` envelope** — recognized by its `"format"` key and decoded by `evoxc_core::envelope::decode`, unchanged (`PersistenceError`/`VerificationError` diagnostics keep their `module:` context).
+* **A full `evoxc-native-ir` envelope** — recognized by its `"format"` key and decoded by `evoxc::core::envelope::decode`, unchanged (`PersistenceError`/`VerificationError` diagnostics keep their `module:` context).
 * **A signature-only context** — a dict whose `"functions"` is a list of function signatures; one body-less `Function` per entry is synthesized into a `Program` named `"signature-context"`, so every downstream `call` path is untouched:
   * `[name, [output types]]` (2-element: no input types are claimed),
   * `[name, [input types], [output types]]` (3-element),
   * `{"name": ..., "input_types": optional, "output_types": ...}` (an unknown dict key is a `TypeError`).
 
-Types are the same `{"dtype": str, "shape": [dim, ...]}` dicts as `operand_types` (both go through `evoxc_core::wire`), so symbolic `Dim`s, `DimExpr`s and `None` dims work identically. An empty `"functions"` list is a valid callee-less module (a later `call` then fails naming its callee).
+Types are the same `{"dtype": str, "shape": [dim, ...]}` dicts as `operand_types` (both go through `evoxc::core::wire`), so symbolic `Dim`s, `DimExpr`s and `None` dims work identically. An empty `"functions"` list is a valid callee-less module (a later `call` then fails naming its callee).
 
 An unknown callee stays an explicit `VerificationError` (`no function named 'x' in module 'signature-context'`); a malformed type is the type decoder's own family (`DTypeError`/`VerificationError`) tagged with its path (`module.functions[0] types: ...`).
 Argument-shape problems are plain `TypeError`s (never a silent fallback to "no module"): a non-dict module, a dict with neither `"format"` nor `"functions"`, a `"functions"` value that is not a list, an entry that is neither list nor dict, a wrong element count (not 2/3), a non-string or empty name, a dict entry missing `"name"`/`"output_types"`, or an unknown dict key.
@@ -50,7 +50,7 @@ The JSON walk (`decode_module_json`/`signature_program`/`signature_entry`) is in
 - `dict` keys must be `str`; a non-string key is a `TypeError` naming the path.
 - JSON → Python rebuilds `dict`/`list`/`str`/`bool`/`int`/`float`/`None` only (never a wrapper object), and an `i64`/`u64` JSON number becomes a Python `int`.
 - One conversion per call: a per-node Python callback is explicitly rejected by the contract (it would cross the GIL once per op and tie the native dispatch loop to Python object lifetimes).
-- Conversion failures are `TypeError`s; envelope/schema/inference failures are `NativeError`s from `evoxc_core::Error`.
+- Conversion failures are `TypeError`s; envelope/schema/inference failures are `NativeError`s from `evoxc::core::Error`.
 
 ### Outbound object sharing (what the returned envelope aliases)
 
@@ -78,8 +78,8 @@ No `Bound<PyAny>` crosses into native code and no native type is captured from a
 
 ## The native CPU engine (`native_compile` / `NativeProgram`, `src/cpu.rs`)
 
-`native_compile(envelope)` decodes with `evoxc_core::envelope::decode` (GIL held), times and runs `evoxc_cpu::plan::compile(&program)` detached, and returns an immutable `NativeProgram` owning the `Program`, the `Arc<Plan>` and the measured `compile_ms: f64`.
-`entry()` is the plan's entry function name and `plan_text()` is `Plan::text()`; `output_types()` is `evoxc_core::wire::value_types_to_json(plan.entry_function().output_types)` through `py_from_json`; `stats()` and `required_ops()` build one `serde_json` object each and return it through `py_from_json`.
+`native_compile(envelope)` decodes with `evoxc::core::envelope::decode` (GIL held), times and runs `evoxc_cpu::plan::compile(&program)` detached, and returns an immutable `NativeProgram` owning the `Program`, the `Arc<Plan>` and the measured `compile_ms: f64`.
+`entry()` is the plan's entry function name and `plan_text()` is `Plan::text()`; `output_types()` is `evoxc::core::wire::value_types_to_json(plan.entry_function().output_types)` through `py_from_json`; `stats()` and `required_ops()` build one `serde_json` object each and return it through `py_from_json`.
 `stats()` has exactly `ops`, `dispatched_ops` (equal to `ops` — this engine dispatches every planned op), `blocks` (`plan.block_count`), `plan_entries` (`plan.op_count`, the planned step count), `compile_ms`, `unsupported` (`plan.unsupported`, the dense ops the engine does not implement), `required_blocks`, `required_external` and `required_runtime`; `required_ops()` has `blocks`, `external` and `runtime_calls`.
 `run(flat_inputs, resolver=None)` converts the flat numpy inputs while holding the GIL, preflights the resolver, runs `evoxc_cpu::run_program(program, &plan, inputs, RunOptions::default(), callbacks)` detached, then builds fresh numpy arrays with the GIL re-acquired.
 Input arity/dtype/shape are validated by the engine at the run boundary (`BackendError`/`DTypeError`/`ShapeError`); an op without a native kernel is the plan's own `BackendError` at compile time.
@@ -149,7 +149,7 @@ Negative values keep their sign (the `i64` arm), and `number_to_py` on the way b
 
 | Native `ErrorKind` | `NativeError.kind` | Origin |
 |---|---|---|
-| `Trace` | `TraceError` | `evoxc_core::Error::trace` |
+| `Trace` | `TraceError` | `evoxc::core::Error::trace` |
 | `Shape` | `ShapeError` | inference shape/axis conflicts |
 | `Transform` | `TransformError` | unknown transform kind, transform-engine diagnostics, malformed config/extension response |
 | `Backend` | `BackendError` | `evoxc-cpu` compile/run diagnostics, the resolver preflight and the host-callback bridge |
@@ -164,8 +164,8 @@ Negative values keep their sign (the `i64` arm), and `number_to_py` on the way b
 
 ## `transform` is wired to `evoxc-compiler`
 
-`module_ops::transform` validates `kind` with `TransformKind::parse` (unknown → `TransformError` naming the kind and the accepted set), requires `module`/`config` to be dicts (`TypeError`), decodes `module` with `evoxc_core::envelope::decode`, decodes the config with `parse_config`, and runs `evoxc_compiler::transform(kind, &program, &config, extension)` inside `Python::detach`.
-The transformed `Program` is encoded with `evoxc_core::envelope::encode` and the envelope gains one top-level `"transform"` object: `kind`, `output_ids` (the transformed return operands), `input_ids` (the transformed block arguments) and `batch_dim` (the fresh batch `Dim` name, `null` for the AD transforms).
+`module_ops::transform` validates `kind` with `TransformKind::parse` (unknown → `TransformError` naming the kind and the accepted set), requires `module`/`config` to be dicts (`TypeError`), decodes `module` with `evoxc::core::envelope::decode`, decodes the config with `parse_config`, and runs `evoxc_compiler::transform(kind, &program, &config, extension)` inside `Python::detach`.
+The transformed `Program` is encoded with `evoxc::core::envelope::encode` and the envelope gains one top-level `"transform"` object: `kind`, `output_ids` (the transformed return operands), `input_ids` (the transformed block arguments) and `batch_dim` (the fresh batch `Dim` name, `null` for the AD transforms).
 Engine `Error` kinds map to `NativeError.kind` verbatim, so e.g. `grad`'s non-scalar-output diagnostic stays `ShapeError` and every transform-engine diagnostic stays `TransformError`.
 
 ## Config decoding
@@ -180,7 +180,7 @@ All JSON-shaped decoding lives in `src/transform_config.rs` and is unit-tested w
 
 ## `batch_functions` is wired to `evoxc-compiler`
 
-`batch_ops::batch_functions` is the population-merge sibling of `transform`: `programs` is a list/tuple of `evoxc-native-ir` envelopes (one per function, decoded by `evoxc_core::envelope::decode` with a `programs[i]` context), the config dict is decoded with `transform_config::parse_batch_config`, and `evoxc_compiler::batch_functions::batch_functions_with_env` runs inside `Python::detach` with the SAME extension-rule bridge `transform` builds (`extension_rule_from_value` + `PyExtensionRule`), so `sparse_*` / `block:*` / `external:*` rules participate exactly as in a transform.
+`batch_ops::batch_functions` is the population-merge sibling of `transform`: `programs` is a list/tuple of `evoxc-native-ir` envelopes (one per function, decoded by `evoxc::core::envelope::decode` with a `programs[i]` context), the config dict is decoded with `transform_config::parse_batch_config`, and `evoxc_compiler::batch_functions::batch_functions_with_env` runs inside `Python::detach` with the SAME extension-rule bridge `transform` builds (`extension_rule_from_value` + `PyExtensionRule`), so `sparse_*` / `block:*` / `external:*` rules participate exactly as in a transform.
 The result is `{"module": <merged evoxc-native-ir envelope>, "batch_report": <BatchReport::to_json()>}` — the shape `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` drives (`convert.from_native(result["module"])`, `_normalize_report(result["batch_report"])`).
 The `BatchReport` object has exactly the 12 documented keys: `n_functions`, `value_classes`, `shared_classes`, `switched` (group/variants/rows_per_variant), `stacked_constants`, `output_muxes`, `emitted_ops`, `bands`, `band_sizes`, `band_strategy`, `cost_estimate`, `flat_cost_estimate`.
 
