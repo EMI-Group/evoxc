@@ -40,6 +40,10 @@ Dependency rules (binding):
 - No `unsafe` outside FFI glue; user errors are `Result` values, never panics (no `unwrap`/`expect` on user input).
   No crate contains `unsafe` logic: `evoxc-cpu` uses `ndarray` for all N-dimensional layout work and `faer` for `dot`'s f32/f64 gemm, so it needs neither SIMD intrinsics nor a raw BLAS microkernel.
   `faer` (feature `rayon`) is the ONE place a third-party thread pool is permitted, and only inside a single `dot` call above its work thresholds; every other thread in the workspace is a scoped thread owned by the call that spawned it.
+- There is NO foreign/user-kernel hook and no native-code loading anywhere in the workspace: no `libloading`/`dlopen`/`dlsym`, no `extern "C"` fn pointer (the `extern` keyword appears in zero `.rs` files), no runtime kernel registration, and no Triton/custom-call op (the 119-op table has `call`/`block_call`/`external_call`/`runtime_call` only).
+  The only two host seams are per-call `&dyn` trait objects and neither is a plugin registry: `evoxc_cpu::Callbacks` (`evoxc-cpu/src/exec.rs:30-39`, consulted only by the `block_call`/`external_call`/`runtime_call` kernels) and `evoxc_compiler::ExtensionRule` (`evoxc-compiler/src/lib.rs:284-286`, a transform-time graph-rewrite callback).
+  Kernel dispatch itself is a closed compile-time `fn`-pointer table (`evoxc-cpu/src/kernels/mod.rs::build_table` behind a `OnceLock`), and an op with no kernel is a `BackendError` at plan-compile time.
+  `evoxc-runtime` declares zero traits and no driver, so no plugin surface exists there either.
 
 ## Publishing (crates.io)
 
