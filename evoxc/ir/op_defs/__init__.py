@@ -170,6 +170,7 @@ def all_opdefs() -> tuple[OpDef, ...]:
 from . import (  # noqa: E402,F401
     collective,
     control,
+    custom,
     elementwise,
     linalg,
     random,

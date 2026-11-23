@@ -57,7 +57,8 @@ Encoding notes (binding):
 - Tuples are wrapped as ``{"__evoxc_tuple__": [...]}`` so the tuple/list
   distinction survives the JSON round-trip (``json`` itself flattens tuples
   to arrays); attribute sequence tags decode back to the original shape.
-- ``runtime_call``/``block_call`` ``result_specs``: encoded as a list of type
+- ``runtime_call``/``block_call``/``external_call``/``custom_call``/
+  ``inline_stablehlo`` ``result_specs``: encoded as a list of type
   dicts ``{"dtype": str, "shape": [dim, ...]}`` (one per declared result);
   on decode every entry is NORMALIZED back to a ``ValueType`` instance (the
   in-memory form the Builder produces), so ``verify``'s in-memory comparison
@@ -434,7 +435,8 @@ def _decode_generic(value, constants: dict):
 
 
 # ---------------------------------------------------------------------------
-# result_specs (runtime_call / block_call)
+# result_specs (runtime_call / block_call / external_call / custom_call /
+# inline_stablehlo)
 # ---------------------------------------------------------------------------
 
 

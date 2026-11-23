@@ -16,7 +16,8 @@ still ``verify``'s job):
 * op/value ids are assigned from the owning module's counters;
 * result types resolve in order: explicit ``result_types`` → the ``OpDef``'s
   ``shape_fn`` → op-specific resolution (``constant``/``call``/``if``/
-  ``runtime_call``/``block_call`` — see ``inference.py``), else
+  ``runtime_call``/``block_call``/``external_call``/``custom_call``/
+  ``inline_stablehlo`` — see ``inference.py``), else
   ``VerificationError`` demanding explicit types;
 * a ``ShapeError`` raised by a ``shape_fn`` propagates with the op's source
   location appended to its message (when a real location is known) — it is a
@@ -35,7 +36,8 @@ Attribute-validation details (binding for ``verify``'s agreement checks):
   (``INTS``/``FLOATS``/``STRS``/``NESTED_INTS``/``SHAPE``) accept tuples or
   lists and are normalized to tuples; ``ATTR_SHAPE`` entries must be
   ``int | Dim | DimExpr | None``.
-* ``result_specs`` (``runtime_call``/``block_call``/``external_call``) is a
+* ``result_specs`` (``runtime_call``/``block_call``/``external_call``/
+  ``custom_call``/``inline_stablehlo``) is a
   sequence of ``ValueType`` | ``TensorSpec`` | ``{"dtype": ..., "shape": ...}``
   entries, converted to ``ValueType``s.
 """
@@ -497,7 +499,13 @@ class Builder:
             return self._call_result_types(attrs)
         if op_name == "if":
             return self._if_result_types(regions)
-        if op_name in ("runtime_call", "block_call", "external_call"):
+        if op_name in (
+            "runtime_call",
+            "block_call",
+            "external_call",
+            "custom_call",
+            "inline_stablehlo",
+        ):
             return self._specs_result_types(op_name, attrs["result_specs"])
         raise VerificationError(
             f"op '{op_name}': no shape_fn and no op-specific result-type rule; "
