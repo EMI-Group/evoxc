@@ -4,6 +4,21 @@
 //! scalar type produces the axis-local position vector, and
 //! [`permuted_storage`] / [`index_storage`] turn it into the `sort` /
 //! `argsort` result storage.
+//!
+//! # Why the segment walk is hand-written, not ndarray lanes
+//!
+//! The axis layout is a fixed C-contiguous stride walk, and the per-segment
+//! core (a 2–16-key Batcher network) is only a handful of nanoseconds.  An
+//! ndarray `ArrayViewD`/`lanes(Axis(axis))` expression of this loop was
+//! measured and REJECTED: constructing a dynamic-rank 1-D view per lane plus a
+//! per-lane `assign` costs ~37 ns/segment against a ~7 ns core, so `sort` of
+//! `(262144, 2)` regressed 7.1 → 44.8 ns/segment (6.3x), `(131072, 8)` 22.3 →
+//! 59.7 (2.7x) and a strided `(131072, 4, 2)` 17.2 → 65.4 (3.8x) in release
+//! (`bench_segment_walk`, this host).  ndarray is the layout engine for the
+//! broadcast/reduction paths, whose per-call work dwarfs the seam; here the
+//! seam would dominate, so [`sorted_positions`] keeps the flat base/stride
+//! arithmetic and the contiguous `inner == 1` case stays one
+//! `copy_from_slice`/extend per segment.
 
 use evoxc_core::{DType, Error, Result};
 use half::f16;

@@ -18,10 +18,14 @@
 //! * `cumsum`/`cumprod` preserve the operand dtype and honor `reverse`
 //!   (accumulate from the end toward the start).
 //!
-//! Performance shape: a reduction whose reduced axes are CONTIGUOUS runs the
-//! flat multi-accumulator [`Block`] path (no per-element offset table, no
-//! per-output odometer); every other axis pattern keeps the general [`Layout`]
-//! path.  The two agree bit-for-bit for integer, bool, float16 and complex
+//! Performance shape: a contiguous reduced block — the `outer x red x inner`
+//! layout of every real reduce, including `inner == 1` — is folded flat by
+//! [`fold_block`] ([`flat`]), one pass over the slice with no per-lane view
+//! construction.  Every other layout (a gapped reduced axis pair, or nothing
+//! reduced at all) takes the ndarray lane walk (kept axes permuted first, reduced
+//! axes last, `axis_iter` recursion), folding each output lane through the
+//! multi-accumulator fold; that walk is the reference the flat fold is pinned
+//! against.  The two agree bit-for-bit for integer, bool, float16 and complex
 //! folds — reassociation is exact for wrapping integers and those dtypes stay on
 //! one sequential lane — and only float32/float64 sums move inside the parity
 //! tolerance's documented window.
@@ -34,22 +38,24 @@
 
 mod argmax;
 mod cumulative;
+mod flat;
 mod layout;
 
 use evoxc_core::{DType, Error, Result};
 use num_complex::Complex;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
 use crate::plan::OpSpec;
-use crate::scalar::{Num, ScalarValue};
+use crate::scalar::{Num, Scalar, ScalarValue};
 use crate::with_type;
 
 use argmax::arg_kernel;
 use cumulative::cumulative_kernel;
-use layout::{expect_rank, fold_all, fold_first, fold_groups, reduce_mask, Block, FoldSelect, Layout};
+use flat::fold_block;
+use layout::{expect_rank, fold_all, fold_first, reduce_mask, Block, FoldSelect};
 
 pub fn register(map: &mut KernelMap) {
     for name in [
@@ -185,48 +191,49 @@ fn reduce(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<Valu
     single(computed)
 }
 
-fn compute_reduce<T: Num + FoldSelect>(
+fn compute_reduce<T: Num + FoldSelect + NdScalar>(
     request: &Request<'_>,
     values: &[T],
     in_shape: &[usize],
 ) -> Result<Buffer> {
-    let folded = match Block::new(in_shape, request.reduced) {
-        // The contiguous fast path (see [`Block`]); `red == 0` (an empty reduced
-        // axis) falls through to the general path, which owns the identity /
-        // zero-size rules.
-        Some(block) if block.red > 0 => match request.kind {
-            Kind::Sum => fold_groups(values, &block, Some(T::zero()), |a, b| a.add(b)),
-            Kind::Prod => fold_groups(values, &block, Some(T::one()), |a, b| a.mul(b)),
-            Kind::Max => fold_groups(values, &block, None, |a, b| a.select_max(b)),
-            Kind::Min => fold_groups(values, &block, None, |a, b| a.select_min(b)),
-            Kind::Mean => divide_by(
-                request.acc_dtype,
-                fold_groups(values, &block, Some(T::zero()), |a, b| a.add(b)),
-                request.count,
-            ),
+    // The flat block fold owns every contiguous reduced block (any `inner`,
+    // including the trailing-axis `inner == 1` rows); every other axis pattern —
+    // including a `red == 0` empty reduced axis, which the general path's
+    // identity / zero-size rules handle — takes the ndarray lane walk.
+    let block = Block::new(in_shape, request.reduced).filter(|block| block.inner > 0 && block.red > 0);
+    let folded = match request.kind {
+        Kind::Sum => match &block {
+            Some(block) => fold_block(values, block, Some(T::zero()), |a, b| a.add(b))?,
+            None => fold_all(values, in_shape, request.reduced, T::zero(), |a, b| a.add(b))?,
         },
-        _ => {
-            let layout = Layout::new(in_shape, request.reduced);
-            match request.kind {
-                Kind::Sum => fold_all(&layout, values, T::zero(), |a, b| a.add(b)),
-                Kind::Prod => fold_all(&layout, values, T::one(), |a, b| a.mul(b)),
-                Kind::Max => {
-                    fold_first(request.name, "maximum", &layout, values, |a, b| a.select_max(b))?
-                }
-                Kind::Min => {
-                    fold_first(request.name, "minimum", &layout, values, |a, b| a.select_min(b))?
-                }
-                Kind::Mean => {
-                    let sums = fold_all(&layout, values, T::zero(), |a, b| a.add(b));
-                    divide_by(request.acc_dtype, sums, request.count)
-                }
-            }
+        Kind::Prod => match &block {
+            Some(block) => fold_block(values, block, Some(T::one()), |a, b| a.mul(b))?,
+            None => fold_all(values, in_shape, request.reduced, T::one(), |a, b| a.mul(b))?,
+        },
+        Kind::Max => match &block {
+            Some(block) => fold_block(values, block, None, |a, b| a.select_max(b))?,
+            None => fold_first(request.name, "maximum", values, in_shape, request.reduced, |a, b| {
+                a.select_max(b)
+            })?,
+        },
+        Kind::Min => match &block {
+            Some(block) => fold_block(values, block, None, |a, b| a.select_min(b))?,
+            None => fold_first(request.name, "minimum", values, in_shape, request.reduced, |a, b| {
+                a.select_min(b)
+            })?,
+        },
+        Kind::Mean => {
+            let sums = match &block {
+                Some(block) => fold_block(values, block, Some(T::zero()), |a, b| a.add(b))?,
+                None => fold_all(values, in_shape, request.reduced, T::zero(), |a, b| a.add(b))?,
+            };
+            divide_by(request.acc_dtype, sums, request.count)
         }
     };
     let computed = Buffer::new(
         request.acc_dtype,
         request.out_shape.to_vec(),
-        T::into_storage(folded),
+        <T as Scalar>::into_storage(folded),
     )?;
     if request.acc_dtype == request.out_dtype {
         Ok(computed)

@@ -1,12 +1,19 @@
-//! `cumsum` / `cumprod`: one strided lane walk along the given axis in the
-//! declared result dtype, forward or reverse.
+//! `cumsum` / `cumprod`: one lane walk along the given axis in the declared
+//! result dtype, forward or reverse.
+//!
+//! The walk itself is `ndarray`'s: [`ndarray::ArrayBase::lanes`] enumerates the
+//! rank-1 lanes along the axis in C order of the other axes, and
+//! [`ndarray::ArrayBase::lanes_mut`] yields the matching destination lanes in
+//! the SAME order, so the two iterators zip lane-for-lane and no `outer`/
+//! `inner` stride arithmetic is needed here.
 use evoxc_core::{DType, Error, Result};
+use ndarray::Axis;
 
-use crate::buffer::{shape_text, Buffer};
+use crate::buffer::{array_view, array_view_mut, shape_text, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
-use crate::scalar::Num;
+use crate::scalar::{Num, Scalar};
 use crate::with_type;
 
 // ---------------------------------------------------------------------------
@@ -66,7 +73,7 @@ pub(super) fn cumulative(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn typed_cumulative<T: Num>(
+fn typed_cumulative<T: Num + NdScalar>(
     values: &[T],
     shape: &[usize],
     axis: usize,
@@ -75,32 +82,37 @@ fn typed_cumulative<T: Num>(
     out_dtype: DType,
     out_shape: &[usize],
 ) -> Result<Vec<Value>> {
-    let extent = shape[axis];
-    // `inner` is the axis stride, so one lane is a strided walk along `axis` at
-    // a fixed (outer, inner) position.
-    let inner: usize = shape[axis + 1..].iter().product();
-    let outer: usize = shape[..axis].iter().product();
+    // The result starts as a copy of the operand (an empty axis therefore yields
+    // a correctly shaped, element-free result) and every lane is then fully
+    // overwritten in place, so no zero fill is needed.
+    let view = array_view(values, shape)?;
     let mut out = values.to_vec();
-    if extent > 0 {
-        for block in 0..outer {
-            for lane in 0..inner {
-                let start = block * extent * inner + lane;
-                if reverse {
-                    let mut acc = values[start + (extent - 1) * inner];
-                    out[start + (extent - 1) * inner] = acc;
-                    for step in (0..extent - 1).rev() {
-                        let position = start + step * inner;
-                        acc = step_value(multiply, acc, values[position]);
-                        out[position] = acc;
-                    }
-                } else {
-                    let mut acc = values[start];
-                    out[start] = acc;
-                    for step in 1..extent {
-                        let position = start + step * inner;
-                        acc = step_value(multiply, acc, values[position]);
-                        out[position] = acc;
-                    }
+    {
+        let mut out_view = array_view_mut(&mut out, shape)?;
+        for (source, mut destination) in view
+            .lanes(Axis(axis))
+            .into_iter()
+            .zip(out_view.lanes_mut(Axis(axis)))
+        {
+            // One lane: a contiguous run along `axis`.  A zero-length lane (an
+            // empty axis elsewhere in the shape) writes nothing.
+            let len = source.len();
+            if len == 0 {
+                continue;
+            }
+            if reverse {
+                let mut acc = source[len - 1];
+                destination[len - 1] = acc;
+                for index in (0..len - 1).rev() {
+                    acc = step_value(multiply, acc, source[index]);
+                    destination[index] = acc;
+                }
+            } else {
+                let mut acc = source[0];
+                destination[0] = acc;
+                for index in 1..len {
+                    acc = step_value(multiply, acc, source[index]);
+                    destination[index] = acc;
                 }
             }
         }
@@ -108,7 +120,7 @@ fn typed_cumulative<T: Num>(
     single(Buffer::new(
         out_dtype,
         out_shape.to_vec(),
-        T::into_storage(out),
+        <T as Scalar>::into_storage(out),
     )?)
 }
 
@@ -138,6 +150,30 @@ mod tests {
         // reverse cumprod over axis 0: accumulate from the last row up.
         let op = cum_op("cumprod", 0, true, DType::Int64, &[2, 3]);
         assert_eq!(cumulative(&op, &input, &[2, 3]).unwrap()[0].storage, Storage::I64(vec![4, 10, 18, 4, 5, 6]));
+    }
+
+    /// A rank-3 shape whose inner extent is 2 — so the replaced `outer`/`inner`
+    /// stride arithmetic was non-trivial — walked along a NON-last axis, in both
+    /// directions.  This pins the lane order of the ndarray walk: the lanes along
+    /// axis 1 are enumerated in C order of the other axes (here (i, k) pairs),
+    /// and each lane is the axis-1 column at that (i, k).
+    #[test]
+    fn cumulative_walks_a_non_last_axis_of_a_rank_three_operand() {
+        // 0..12 in C order: element (i, j, k) is `i * 6 + j * 2 + k`.
+        let input = buffer(DType::Int64, &[2, 3, 2], Storage::I64((0..12).collect()));
+        // Forward cumsum over axis 0 adds row 0 into row 1, lane by lane.
+        let op = cum_op("cumsum", 0, false, DType::Int64, &[2, 3, 2]);
+        assert_eq!(
+            cumulative(&op, &input, &[2, 3, 2]).unwrap()[0].storage,
+            Storage::I64(vec![0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16])
+        );
+        // Reverse cumsum over axis 1 accumulates each (i, k) column from j = 2
+        // back to j = 0.
+        let op = cum_op("cumsum", 1, true, DType::Int64, &[2, 3, 2]);
+        assert_eq!(
+            cumulative(&op, &input, &[2, 3, 2]).unwrap()[0].storage,
+            Storage::I64(vec![6, 9, 6, 8, 4, 5, 24, 27, 18, 20, 10, 11])
+        );
     }
 
     #[test]

@@ -1,18 +1,27 @@
 //! Structure kernels: `tile`, `flip`, `roll`, `pad` and `diag`.
 //!
-//! `tile`, `flip`, `roll` and `diag` are pure relabellings of the operand's
-//! elements (a rank-1 `diag` adds zeros), so one shape-driven index map plus
-//! one typed copy serves them all:
+//! Every one of them is an `ndarray` expression over a view of the operand —
+//! there is no hand-written N-dimensional offset walk (and no per-element index
+//! map) in this module, with ONE measured exception: `pad`'s row copy (see the
+//! `pad` bullet), which beats the equivalent view assignment and is pinned
+//! against it in `pad`'s tests.
 //!
-//! * the map is built from the DECLARED result shape ([`util::result_shape`]),
-//!   never re-derived, and holds exactly one entry per result element;
-//! * `Some(offset)` copies the operand element at C-order `offset`, `None`
-//!   leaves the destination's zero.
+//! * `tile` — the promoted operand is viewed with a size-1 axis interleaved
+//!   before every axis and broadcast to `[rep, extent, rep, extent, ...]`; that
+//!   broadcast's C order *is* `np.tile`'s `index % extent` mapping, so one
+//!   assignment into a pooled destination produces the tiling ([`tile`]).
+//! * `flip` — `slice_each_axis` with a `-1` step on every requested axis.
+//! * `roll` — the two wrapped halves of a `concatenate` per axis (or of the
+//!   flattened operand for a null `axis`).
+//! * `diag` — the `diag`/`diag_mut` views of a rank-2 array (the rank-1 case
+//!   fills zeros and then assigns the vector onto the main diagonal).
+//! * `pad` — one innermost-axis row at a time: a row is either pad-only (one
+//!   `fill`) or `before` pad cells, one `copy_from_slice` of its interior run
+//!   out of the contiguous operand and `after` pad cells ([`pad`]).  An
+//!   all-zero config is one bulk copy and a rank-0 operand one element.
 //!
-//! `pad` is the exception: constant padding is a row-wise copy (fill the pad
-//! cells, then one `copy_from_slice` per operand row — see [`pad`]), because a
-//! per-element index map costs a full odometer per pad cell and a second pass
-//! over the whole result.
+//! The results live in C-contiguous [`Storage`] vectors (the engine has no
+//! views), so each op materializes into a pooled destination.
 //!
 //! numpy semantics reproduced exactly (the reference is
 //! `evoxc/backends/numpy/kernels/structural.py` + `_pad` in `indexing.py`):
@@ -47,12 +56,12 @@
 use evoxc_core::{AttrValue, Error, Result};
 use serde_json::Value as Json;
 
-use crate::buffer::{Buffer, Storage};
+use crate::buffer::{take_pooled_vec, Buffer, NdScalar, Storage};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::kernels::KernelMap;
 use crate::plan::OpSpec;
-use crate::scalar::{Scalar, ScalarValue};
+use crate::scalar::Scalar;
 use crate::with_type;
 
 mod diag;
@@ -63,10 +72,10 @@ mod tile;
 #[cfg(test)]
 mod test_support;
 
-use diag::diag_map;
-use flip_roll::{flip_axes, flip_map, roll_map};
+use diag::diag_storage;
+use flip_roll::{flip_axes, flip_storage, roll_storage};
 use pad::{pad_result, pad_value, padding};
-use tile::{reps, tile_blocks, tile_map, tile_whole_repeat};
+use tile::{reps, tile_storage, tile_whole_repeat};
 
 pub fn register(map: &mut KernelMap) {
     for name in ["tile", "flip", "roll", "pad", "diag"] {
@@ -75,7 +84,7 @@ pub fn register(map: &mut KernelMap) {
 }
 
 /// The shared kernel entry point: resolve the declared result shape, then run
-/// the `spec.name`-selected mapping.
+/// the `spec.name`-selected ndarray materialization.
 fn structure_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
     let Some(input) = operands.first() else {
         return Err(Error::verification(format!(
@@ -87,118 +96,85 @@ fn structure_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> 
     structural(spec, input, &out_shape)
 }
 
-/// Build the index map for `spec.name` and materialize the result.
+/// Materialize `spec.name`'s result from `input` into a fresh buffer of
+/// `out_shape`.
 fn structural(spec: &OpSpec, input: &Buffer, out_shape: &[usize]) -> Result<Vec<Value>> {
     let name = spec.name.as_str();
-    let (map, fill) = match name {
+    let storage = match name {
         "tile" => {
             let reps = reps(spec)?;
             // Whole-source repeats first: `reps` repeats only the leading axis,
             // so every output element is `source[i % source.len()]` and the
-            // result is the operand copied whole, `reps[0]` times.
-            if let Some(storage) = tile_whole_repeat(name, input, out_shape, &reps)? {
-                return single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?);
+            // result is the operand copied whole, `reps[0]` times — one
+            // `repeat_storage` instead of a broadcast pass.
+            match tile_whole_repeat(name, input, out_shape, &reps)? {
+                Some(storage) => storage,
+                None => with_type!(input, |values| tile_storage(
+                    values,
+                    &input.shape,
+                    out_shape,
+                    &reps,
+                    name
+                ))?,
             }
-            // Contiguous operands: whole-run copies, no per-element index map.
-            if let Some(storage) = tile_blocks(name, input, out_shape, &reps)? {
-                return single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?);
-            }
-            (tile_map(name, &input.shape, out_shape, &reps)?, None)
         }
-        "flip" => (
-            flip_map(name, &input.shape, out_shape, &flip_axes(spec, input.rank())?)?,
-            None,
-        ),
-        "roll" => (roll_map(name, &input.shape, out_shape, spec)?, None),
-        // Constant padding is a row-wise memcpy, not an index map: it fills the
-        // pad cells and copies each operand row whole.
-        "pad" => {
-            return pad_result(name, input, out_shape, &padding(spec)?, pad_value(spec)?)
-        }
-        "diag" => (diag_map(name, &input.shape, out_shape)?, None),
+        "flip" => with_type!(input, |values| flip_storage(
+            values,
+            &input.shape,
+            out_shape,
+            &flip_axes(spec, input.rank())?,
+            name
+        ))?,
+        "roll" => with_type!(input, |values| roll_storage(
+            values,
+            &input.shape,
+            out_shape,
+            spec,
+            name
+        ))?,
+        "pad" => pad_result(name, input, out_shape, &padding(spec)?, pad_value(spec)?)?,
+        "diag" => with_type!(input, |values| diag_storage(
+            values,
+            &input.shape,
+            out_shape,
+            name
+        ))?,
         other => {
             return Err(Error::verification(format!(
                 "unexpected structure op '{other}'"
             )))
         }
     };
-    copy_mapped(spec, input, out_shape, &map, fill)
+    single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?)
 }
 
 // ---------------------------------------------------------------------------
-// Materializing one index map
+// ndarray materialization helpers
 // ---------------------------------------------------------------------------
 
-/// Copy `input`'s elements through `map` into a fresh buffer of `out_shape`.
-fn copy_mapped(
-    spec: &OpSpec,
-    input: &Buffer,
-    out_shape: &[usize],
-    map: &[Option<usize>],
-    fill: Option<f64>,
-) -> Result<Vec<Value>> {
-    let total = util::numel(out_shape);
-    if map.len() != total {
-        return Err(Error::verification(format!(
-            "op '{}': the index map covers {} element(s) but the result has {total}",
-            spec.name,
-            map.len()
-        )));
-    }
-    with_type!(input, |values| {
-        let storage = gather(values.as_slice(), total, map, fill)?;
-        single(Buffer::new(input.dtype, out_shape.to_vec(), storage)?)
-    })
+/// A pooled result vector of exactly `total` elements (a recycled stock is only
+/// reused when the caller overwrites every element of it).
+pub(super) fn pooled<T: Scalar + NdScalar>(total: usize) -> Vec<T> {
+    take_pooled_vec::<T>(total).unwrap_or_else(|| vec![T::zero(); total])
 }
 
-/// The dtype-generic copy: pre-fill `total` elements, then overwrite the mapped
-/// ones.  `None` in the map keeps the fill value.
-fn gather<T: Scalar>(
-    source: &[T],
-    total: usize,
-    map: &[Option<usize>],
-    fill: Option<f64>,
-) -> Result<Storage> {
-    let mut out = match fill {
-        // numpy casts `constant_values` to the operand dtype: `as` truncates
-        // toward zero for integers and `truthy` is bool's conversion.
-        Some(value) => vec![T::from_scalar(ScalarValue::F(value)); total],
-        None => vec![T::zero(); total],
+/// Take a finished standard-layout (C-order) array's own allocation as this
+/// dtype's [`Storage`] — a move, never a copy.
+pub(super) fn storage_of<T: NdScalar>(array: ndarray::ArrayD<T>) -> Storage {
+    // A `Storage` is always C-contiguous, and ndarray producers do not all
+    // return a standard layout (`concatenate` of a dynamic-rank array returns a
+    // non-standard one), so a non-C-order result is standardized — one copy.
+    let array = if array.is_standard_layout() {
+        array
+    } else {
+        array.as_standard_layout().into_owned()
     };
-    for (slot, entry) in out.iter_mut().zip(map) {
-        if let Some(offset) = *entry {
-            match source.get(offset) {
-                Some(value) => *slot = *value,
-                None => {
-                    return Err(Error::verification(format!(
-                        "structural index map reads element {offset} of a {} element(s) operand (internal engine error)",
-                        source.len()
-                    )))
-                }
-            }
-        }
-    }
-    Ok(T::into_storage(out))
-}
-
-/// Iterate every C-order multi-index of `shape` (rank 0 yields one empty index;
-/// an empty shape yields none).
-fn each_index(shape: &[usize], mut body: impl FnMut(&[usize])) {
-    let total = util::numel(shape);
-    if total == 0 {
-        return;
-    }
-    let mut index = vec![0usize; shape.len()];
-    for _ in 0..total {
-        body(&index);
-        for axis in (0..shape.len()).rev() {
-            index[axis] += 1;
-            if index[axis] < shape[axis] {
-                break;
-            }
-            index[axis] = 0;
-        }
-    }
+    let (values, offset) = array.into_raw_vec_and_offset();
+    debug_assert!(
+        offset.unwrap_or(0) == 0,
+        "a materialized result starts at its allocation"
+    );
+    <T as NdScalar>::into_storage(values)
 }
 
 /// Reject a declared result shape that is not the operand's own shape (the

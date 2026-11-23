@@ -195,10 +195,13 @@ macro_rules! dense_compare_drivers {
             }
         }
 
-        /// The broadcast-operand comparison: the general run decomposition of
-        /// `buffer::stride` (`map2_runs`) with the kind dispatched once per arm,
-        /// exactly as the broadcast-free drivers above — no per-element odometer
-        /// and no zero-filled result.
+        /// The broadcast-operand comparison: `buffer::zipmap`'s pooled broadcast
+        /// builder `map2_runs` — one [`crate::buffer::broadcast`] `apply2` (an
+        /// ndarray `Zip` pass over the operands' broadcast views), a result taken
+        /// from the storage pool, and `buffer::rowsplit` cutting a wide result
+        /// along its outermost axis — with the kind dispatched once per arm,
+        /// exactly as the broadcast-free drivers above, so there is no per-element
+        /// offset table and no zero-filled result.
         fn broadcast_compare<T: Orderable + Copy>(
             kind: BinKind,
             out_shape: &[usize],
@@ -310,10 +313,12 @@ where
         // Broadcast-free: one flat three-way map into a freshly built result.
         return map3(dtype, out_shape, pred, a, b, |p, x, y| if p { x } else { y });
     }
-    // A broadcast predicate and/or branch: the run decomposition of
-    // `buffer::stride` (`map3_runs`), which allocates no zero-filled result and
-    // runs one contiguous pass per outer step, with the branch selection (a
-    // constant, not a per-element `match`) dispatched once per pass.
+    // A broadcast predicate and/or branch: `buffer::zipmap`'s pooled broadcast
+    // builder `map3_runs` — one `buffer::broadcast` `apply3` (an ndarray `Zip`
+    // pass over the three broadcast views), a pooled result and the same
+    // outermost-axis row split — which allocates no zero-filled result, with the
+    // branch selection (a constant, not a per-element `match`) dispatched once
+    // per pass.
     map3_runs(
         dtype,
         out_shape,
@@ -332,7 +337,9 @@ mod tests {
     use super::*;
     use evoxc_core::{Dim, ValueType};
 
-    use crate::kernels::elementwise::test_support::{binary, buffer, spec};
+    use crate::kernels::elementwise::test_support::{
+        binary, buffer, spec, zip2_reference, zip3_reference,
+    };
 
     #[test]
     fn comparisons_produce_bool() {
@@ -343,8 +350,9 @@ mod tests {
         assert_eq!(out[0].storage, Storage::Bool(vec![true, false, false]));
     }
 
-    /// The broadcast contract: the run driver and the general `walk` driver
-    /// place the same bools.
+    /// The broadcast contract: the broadcast builder (`map2_runs`) places the
+    /// same bools as an INDEPENDENT ndarray `Zip` expression written out here —
+    /// not a second call into a `buffer` driver, which is the code under test.
     fn assert_broadcast_compare_agrees(
         kind_name: &str,
         kind: BinKind,
@@ -359,16 +367,9 @@ mod tests {
         let dims: Vec<Dim> = out_shape.iter().map(|dim| Dim::int(*dim as i64)).collect();
         let op = spec(kind_name, ValueType::of(DType::Bool, dims));
         let got = binary(&op, &a, &b).unwrap();
-        let mut expected = vec![false; out_shape.iter().product()];
-        crate::buffer::apply2(
-            &mut expected,
-            out_shape,
-            left,
-            left_shape,
-            right,
-            right_shape,
-            |p, q| compare_op(kind, p, q),
-        );
+        let expected = zip2_reference(left, left_shape, right, right_shape, out_shape, |p, q| {
+            compare_op(kind, p, q)
+        });
         assert_eq!(
             got[0].storage,
             Storage::Bool(expected),
@@ -508,4 +509,205 @@ mod tests {
             assert_eq!(out.storage, Storage::Bool(expected), "{size}");
         }
     }
+
+    /// The flat comparison arm pinned against the INDEPENDENT ndarray reference
+    /// ([`zip2_reference`]): `reference` is the comparison written out by the
+    /// test, so the oracle is not another `buffer` driver.
+    fn assert_flat_compare_matches_reference<T, F>(
+        kind: BinKind,
+        shape: &[usize],
+        left: &[T],
+        right: &[T],
+        reference: F,
+    ) where
+        T: Orderable + Copy + crate::buffer::NdScalar,
+        F: Fn(T, T) -> bool,
+    {
+        let got = dense_compare::<T>(kind, shape, left, right)
+            .unwrap_or_else(|err| panic!("flat comparison: {}", err.message));
+        assert_eq!(got.dtype, DType::Bool);
+        assert_eq!(got.shape, shape);
+        assert_eq!(
+            got.storage,
+            Storage::Bool(zip2_reference(left, shape, right, shape, shape, reference)),
+            "{kind:?} {shape:?}"
+        );
+    }
+
+    #[test]
+    fn the_flat_comparison_path_matches_an_ndarray_zip_expression() {
+        // Every kind over values that include NaN (false against everything for
+        // an ordering kind and for `equal`, true for `not_equal`), a signed zero
+        // and an infinity — compared element for element with a plain `Zip`.
+        let left = [f32::NAN, -0.0, 1.0, 0.0, f32::INFINITY, -1.0];
+        let right = [1.0f32, 0.0, 1.0, 1.0, f32::INFINITY, f32::NAN];
+        for kind in [
+            BinKind::Eq,
+            BinKind::Ne,
+            BinKind::Lt,
+            BinKind::Le,
+            BinKind::Gt,
+            BinKind::Ge,
+        ] {
+            let reference: fn(f32, f32) -> bool = match kind {
+                BinKind::Eq => |a, b| a == b,
+                BinKind::Ne => |a, b| a != b,
+                BinKind::Lt => |a, b| a < b,
+                BinKind::Le => |a, b| a <= b,
+                BinKind::Gt => |a, b| a > b,
+                _ => |a, b| a >= b,
+            };
+            for shape in [vec![6], vec![2, 3], vec![1, 2, 3]] {
+                assert_flat_compare_matches_reference(kind, &shape, &left, &right, reference);
+            }
+        }
+        // f64, i32 and a rank-0 pair (a `while_loop` condition's shape).
+        let doubles_left = [1.0f64, f64::NAN, -2.5];
+        let doubles_right = [1.0f64, 1.0, 0.0];
+        assert_flat_compare_matches_reference(
+            BinKind::Lt,
+            &[3, 1],
+            &doubles_left,
+            &doubles_right,
+            |a: f64, b: f64| a < b,
+        );
+        let ints_left = [3i32, -1, 7, 7];
+        let ints_right = [3i32, 0, -8, 6];
+        assert_flat_compare_matches_reference(
+            BinKind::Le,
+            &[2, 2],
+            &ints_left,
+            &ints_right,
+            |a: i32, b: i32| a <= b,
+        );
+        assert_flat_compare_matches_reference(
+            BinKind::Ge,
+            &[],
+            &[2i32],
+            &[2i32],
+            |a: i32, b: i32| a >= b,
+        );
+    }
+
+    #[test]
+    fn select_matches_an_ndarray_zip_expression() {
+        // The broadcast-free `select` (one flat three-way map) and the non-flat
+        // one (`map3_runs`, with a (2, 1) predicate and a (3,) branch), each
+        // against a plain three-view `Zip` expression.
+        let shape = [2usize, 3];
+        let pred = [true, false, true, false, true, false];
+        let on_true = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let on_false = [-1.0f32, -2.0, -3.0, -4.0, -5.0, -6.0];
+        let select = |p: bool, x: f32, y: f32| if p { x } else { y };
+
+        let predicate = buffer(DType::Bool, &shape, Storage::Bool(pred.to_vec()));
+        let a = buffer(DType::Float32, &shape, Storage::F32(on_true.to_vec()));
+        let b = buffer(DType::Float32, &shape, Storage::F32(on_false.to_vec()));
+        let got = select_apply(
+            DType::Float32,
+            &pred,
+            &predicate,
+            &on_true,
+            &a,
+            &on_false,
+            &b,
+            &shape,
+        )
+        .unwrap();
+        assert_eq!(
+            got.storage,
+            Storage::F32(zip3_reference(
+                &pred,
+                &shape,
+                &on_true,
+                &shape,
+                &on_false,
+                &shape,
+                &shape,
+                select
+            ))
+        );
+
+        let column = [true, false];
+        let row = [-1.0f32, -2.0, -3.0];
+        let predicate = buffer(DType::Bool, &[2, 1], Storage::Bool(column.to_vec()));
+        let b = buffer(DType::Float32, &[3], Storage::F32(row.to_vec()));
+        let got = select_apply(
+            DType::Float32,
+            &column,
+            &predicate,
+            &on_true,
+            &a,
+            &row,
+            &b,
+            &shape,
+        )
+        .unwrap();
+        assert_eq!(
+            got.storage,
+            Storage::F32(zip3_reference(
+                &column,
+                &[2, 1],
+                &on_true,
+                &shape,
+                &row,
+                &[3],
+                &shape,
+                select
+            ))
+        );
+
+        // Integer branches go through `select_numeric`'s per-dtype dispatch.
+        let ints_true = [10i32, 20, 30, 40, 50, 60];
+        let ints_false = [-10i32, -20, -30, -40, -50, -60];
+        let predicate = buffer(DType::Bool, &shape, Storage::Bool(pred.to_vec()));
+        let a = buffer(DType::Int32, &shape, Storage::I32(ints_true.to_vec()));
+        let b = buffer(DType::Int32, &shape, Storage::I32(ints_false.to_vec()));
+        let got = select_numeric(DType::Int32, &predicate, &a, &b, &shape).unwrap();
+        assert_eq!(
+            got.storage,
+            Storage::I32(zip3_reference(
+                &pred,
+                &shape,
+                &ints_true,
+                &shape,
+                &ints_false,
+                &shape,
+                &shape,
+                |p: bool, x: i32, y: i32| if p { x } else { y }
+            ))
+        );
+
+        // Bool branches take the one-byte arm of `select_apply` (the `bool`
+        // storage dispatch in `select_kernel`).
+        let bool_true = [true, true, false, false, true, true];
+        let bool_false = [false, true, true, false, false, true];
+        let a = buffer(DType::Bool, &shape, Storage::Bool(bool_true.to_vec()));
+        let b = buffer(DType::Bool, &shape, Storage::Bool(bool_false.to_vec()));
+        let got = select_apply(
+            DType::Bool,
+            &pred,
+            &predicate,
+            &bool_true,
+            &a,
+            &bool_false,
+            &b,
+            &shape,
+        )
+        .unwrap();
+        assert_eq!(
+            got.storage,
+            Storage::Bool(zip3_reference(
+                &pred,
+                &shape,
+                &bool_true,
+                &shape,
+                &bool_false,
+                &shape,
+                &shape,
+                |p: bool, x: bool, y: bool| if p { x } else { y }
+            ))
+        );
+    }
 }
+

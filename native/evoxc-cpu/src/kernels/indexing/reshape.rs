@@ -6,14 +6,15 @@
 //! declared-shape and error-wording rules.
 use evoxc_core::{DType, Error, Result};
 
-use crate::buffer::{block_storage_filled, walk, Buffer};
+use crate::buffer::{array_view, array_view_mut, block_storage_filled, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
 use crate::scalar::Scalar;
 use crate::with_type;
 
-use super::{operand, reconcile, render_ints, render_shape};
+use super::strided_copy;
+use super::{operand, pooled_total, reconcile, render_ints, render_shape};
 
 // ---------------------------------------------------------------------------
 // reshape
@@ -129,29 +130,40 @@ fn transpose(source: &Buffer, permutation: &[usize], declared: &[Option<usize>])
         ))?;
         return Buffer::new(source.dtype, shape, storage);
     }
-    let source_strides = util::c_strides(&source.shape);
-    let strides: Vec<usize> = permutation
-        .iter()
-        .map(|axis| source_strides[*axis])
-        .collect();
     with_type!(source, |values| transpose_typed(
         values,
         source.dtype,
-        shape,
-        strides
+        &source.shape,
+        permutation,
+        shape
     ))
 }
 
-fn transpose_typed<T: Scalar>(
+/// Materialize the transposed view through ndarray.
+///
+/// `permuted_axes` expresses the axis order and yields a (usually strided) view;
+/// the fresh C-contiguous destination then receives it through
+/// [`super::strided_copy`]'s lane-grouped run copy (ndarray's `assign` for any
+/// layout it declines), so no hand-written permutation walk steps an offset
+/// odometer per element. A permutation that happens to leave the view
+/// C-contiguous (a size-1 axis, say) copies with a single `copy_from_slice`.
+fn transpose_typed<T: Scalar + NdScalar>(
     values: &[T],
     dtype: DType,
+    source_shape: &[usize],
+    permutation: &[usize],
     shape: Vec<usize>,
-    strides: Vec<usize>,
 ) -> Result<Buffer> {
-    let rank = shape.len();
-    let mut out = Vec::with_capacity(values.len());
-    walk(rank, &shape, &[strides], |offsets| out.push(values[offsets[0]]));
-    Buffer::new(dtype, shape, T::into_storage(out))
+    let view = array_view(values, source_shape)?.permuted_axes(ndarray::IxDyn(permutation));
+    let total = util::numel(&shape);
+    let mut out = pooled_total::<T>(total);
+    if let Some(source) = view.as_slice() {
+        out.copy_from_slice(source);
+    } else if !strided_copy::copy_view(values, &view, &mut out) {
+        let mut dest = array_view_mut(&mut out, &shape)?;
+        dest.assign(&view);
+    }
+    Buffer::new(dtype, shape, <T as NdScalar>::into_storage(out))
 }
 
 #[cfg(test)]

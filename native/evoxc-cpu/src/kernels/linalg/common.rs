@@ -1,4 +1,8 @@
-//! Attribute, arity and index helpers shared by the linear-algebra families.
+//! Attribute, arity and result-shape helpers shared by the linear-algebra
+//! families.
+//!
+//! N-dimensional addressing belongs to `ndarray` (see `conv.rs`, `solve.rs` and
+//! `structural.rs`), so no index/stride walk lives here.
 //!
 //! Every helper is a defensive re-check of what the plan build already verified,
 //! so it can only fire on a hand-built `OpSpec` and never changes an op's
@@ -9,7 +13,6 @@ use serde_json::Value as Json;
 
 use crate::buffer::shape_text;
 use crate::exec::Value;
-use crate::kernels::util;
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -23,27 +26,6 @@ pub(super) fn expect_arity(name: &str, operands: &[Value], expected: usize) -> R
             "op '{name}': expected {expected} operand(s), got {}",
             operands.len()
         )));
-    }
-    Ok(())
-}
-
-/// Visit every C-order multi-index of `shape` (one visit for the empty shape,
-/// none for a shape with a zero extent).
-pub(super) fn each_index(shape: &[usize], mut body: impl FnMut(&[usize]) -> Result<()>) -> Result<()> {
-    let total = util::numel(shape);
-    if total == 0 {
-        return Ok(());
-    }
-    let mut index = vec![0usize; shape.len()];
-    for _ in 0..total {
-        body(&index)?;
-        for axis in (0..shape.len()).rev() {
-            index[axis] += 1;
-            if index[axis] < shape[axis] {
-                break;
-            }
-            index[axis] = 0;
-        }
     }
     Ok(())
 }

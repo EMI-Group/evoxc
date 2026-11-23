@@ -9,9 +9,9 @@
 //! body stay generic (`T: Num`) while the storage enum is matched once per
 //! call site, so a new op costs a generic function, not 14 copies.
 //!
-//! The pieces live in submodules (`storage`, `broadcast`, `pool`, `parallel`,
-//! `zipmap`, `blocks`) and are re-exported here, so every item keeps its
-//! `crate::buffer::…` path.
+//! The pieces live in submodules (`storage`, `broadcast`, `ndarray_views`,
+//! `pool`, `parallel`, `zipmap`, `blocks`) and are re-exported here, so every
+//! item keeps its `crate::buffer::…` path.
 
 use evoxc_core::{ArrayPayload, DType, Error, Result};
 use half::f16;
@@ -19,20 +19,24 @@ use num_complex::Complex;
 
 mod blocks;
 mod broadcast;
+#[cfg(test)]
+mod bench_broadcast;
+mod ndarray_views;
 mod parallel;
 mod pool;
+mod rowsplit;
 mod storage;
-mod stride;
 #[cfg(test)]
 mod test_support;
 mod zipmap;
 
 pub use blocks::{block_storage, block_storage_filled, copy_blocks, repeat_storage};
 pub use broadcast::{
-    apply1, apply2, apply3, broadcast_shape, broadcast_strides, broadcast_to, walk,
+    apply1, apply2, apply3, broadcast_shape, broadcast_strides, broadcast_to, fill_broadcast, walk,
 };
+pub use broadcast::{apply2 as apply2_runs, apply3 as apply3_runs};
+pub use ndarray_views::{array_view, array_view_mut, NdScalar};
 pub use storage::Storage;
-pub use stride::{fill_broadcast, apply2 as apply2_runs, apply3 as apply3_runs};
 pub use zipmap::{map1, map2, map2_runs, map3, map3_runs, zip1, zip2, zip2_accumulate, zip3};
 #[allow(unused_imports)] // kernels adopt it per hot path (see `take_pooled_vec`)
 pub(crate) use pool::take_pooled_vec;
