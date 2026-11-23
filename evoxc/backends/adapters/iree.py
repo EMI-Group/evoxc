@@ -325,6 +325,40 @@ def _runtime_module(options: dict | None = None) -> Any:
     )
 
 
+def _default_runtime_module() -> Any:
+    """The module the DEFAULT runtime path resolves: ``iree.runtime``.
+
+    A plain ``sys.modules`` lookup through ``importlib.import_module`` — never a
+    memoized handle, because a reload (or a test double re-binding
+    ``sys.modules["iree.runtime"]``) must be visible to the identity test in
+    ``_module_cache_prefix``. Returns ``None`` when the default module is not
+    importable at all: a CUSTOM ``iree_runtime_module`` may be in play on a host
+    where ``iree.runtime`` is absent, and ``None`` is never a module, so the
+    prefix rule below still distinguishes the two exactly.
+    """
+    try:
+        return importlib.import_module(_DEFAULT_RUNTIME_MODULE)
+    except Exception:
+        return None
+
+
+def _module_cache_prefix(rt: Any) -> tuple:
+    """Leading component of a run-path cache key for the RESOLVED runtime ``rt``.
+
+    ``()`` for the DEFAULT module (``_default_runtime_module()``) — the default
+    path's key shape is a pinned EXTERNAL contract (the acquisition pins read
+    ``_HAL_DEVICE_CACHE.devices[("vulkan", 0, ())]`` directly), so no historical
+    key may gain a component — and ``(rt,)`` for a CUSTOM module (an explicit
+    ``iree_runtime_module`` option or ``EVOXC_IREE_RUNTIME_MODULE``).
+
+    A custom module must never share a cached entry with the default module:
+    two IREE builds have SEPARATE handle/allocator spaces, so a HAL device (or
+    staging buffer, or element-type mapping) cached from one is meaningless in
+    the other; distinct custom modules are separated by their own identity.
+    """
+    return () if rt is _default_runtime_module() else (rt,)
+
+
 def _validate_compiler_module(module: Any) -> None:
     """Validate a SUPPLIED compiler module's adapter-facing surface.
 
@@ -940,8 +974,11 @@ def _acquire_vulkan_device(
     does NOT exist here: the HAL device is created from the enumerated info
     dict of ``Device("vulkan", index)``.
 
-    The device is CACHED per ``(module, index, runtime args)`` on the calling
-    thread via ``_cached_hal_device`` — the same thread-local cache the rocm
+    The device is CACHED per ``(index, runtime args)`` on the calling thread
+    via ``_cached_hal_device`` — prefixed with the resolved module only for a
+    CUSTOM runtime module, so the default module keeps the historical key shape
+    while a custom module never reuses a default-module HAL device (see
+    ``_module_cache_prefix``) — the same thread-local cache the rocm
     placement path uses, and for the same reason (HAL devices are
     thread-affine and repeated ``create_device`` calls are costly). Because
     the cache lookup lives HERE, ``load()`` and the ``upload_tensor``
@@ -1012,7 +1049,8 @@ def _acquire_vulkan_device(
             ) from exc
 
     return _cached_hal_device(
-        (rt, "vulkan", index, tuple(runtime_args or ())), _create
+        _module_cache_prefix(rt) + ("vulkan", index, tuple(runtime_args or ())),
+        _create,
     )
 
 
@@ -1025,9 +1063,10 @@ def _acquire_cached_rocm_device(
     (IREE 3.11.0 / MI300X) and does NOT warm up, so a fresh device per
     ``upload_tensor`` made every rocm placement pay ~34-40 ms of pure setup
     on top of the copy. This cache reuses the device across uploads on the
-    SAME THREAD, keyed by ``(module, normalized kind, device index, runtime
-    args)`` (the resolved module is part of the key, so a custom module never
-    reuses a default-module HAL device and vice versa).
+    SAME THREAD, keyed by ``(normalized kind, device index, runtime args)``
+    (``_module_cache_prefix`` prepends the resolved module for a CUSTOM one, so
+    a custom module never reuses a default-module HAL device and vice versa,
+    while the default module keeps the historical key shape).
 
     THREAD-LOCAL IS REQUIRED (not an optimization choice): CUDA/ROCm HAL
     devices are THREAD-AFFINE — the ``evoxc.io`` worker thread separately calls
@@ -1050,7 +1089,7 @@ def _acquire_cached_rocm_device(
     if rt is None:
         rt = _runtime_module(None)
     return _cached_hal_device(
-        (rt, "rocm", device.index, tuple(runtime_args)),
+        _module_cache_prefix(rt) + ("rocm", device.index, tuple(runtime_args)),
         lambda: _acquire_runtime_device("rocm", device, runtime_args, rt),
     )
 
@@ -2718,8 +2757,9 @@ def _readback_staging_buffer(
     never reuses across them. Bounded at ``_READBACK_STAGING_MAX`` distinct
     sizes; clearing the cache is performance-only, never a correctness
     change. ``rt`` is the RESOLVED IREE runtime module (defaults to the
-    default/env-resolved module); it is part of the cache key, so a custom
-    module never reuses a default-module staging buffer and vice versa.
+    default/env-resolved module); ``_module_cache_prefix`` prepends it to the
+    ``(nbytes,)`` key only for a CUSTOM module, so a custom module never reuses
+    a default-module staging buffer and vice versa.
     """
     if rt is None:
         rt = _runtime_module(None)
@@ -2728,7 +2768,7 @@ def _readback_staging_buffer(
     if cache is None:
         cache = {}
         _READBACK_STAGING.buffers = cache
-    key = (rt, nbytes)
+    key = _module_cache_prefix(rt) + (nbytes,)
     entry = cache.get(key)
     if entry is not None and entry[0] is hal_device:
         return entry[1]
@@ -3029,8 +3069,9 @@ def _rocm_source_buffer(
     Bounded at ``_ROCM_SOURCE_CACHE_MAX`` entries (a bounded cache; clearing
     it is performance-neutral, never a correctness change). ``rt`` is the
     RESOLVED IREE runtime module (defaults to the default/env-resolved
-    module), and it is part of the cache key so a custom module never reuses a
-    default-module source buffer and vice versa.
+    module); ``_module_cache_prefix`` prepends it to the ``(shape, dtype)`` key
+    only for a CUSTOM module, so a custom module never reuses a default-module
+    source buffer and vice versa.
     """
     if rt is None:
         rt = _runtime_module(None)
@@ -3039,7 +3080,7 @@ def _rocm_source_buffer(
     if cache is None:
         cache = {}
         _ROCM_SOURCE.buffers = cache
-    key = (rt, shape, dtype)
+    key = _module_cache_prefix(rt) + (shape, dtype)
     entry = cache.get(key)
     if entry is not None and entry[0] is runtime_device:
         return entry[1], entry[2]
@@ -3679,8 +3720,10 @@ def _runtime_modules(rt: Any = None) -> tuple[Any, Any]:
 
 # HAL element-type int -> numpy dtype, resolved lazily through iree's own
 # mapping helper and memoized per element type (a STATIC mapping: an element
-# type's numpy dtype never changes).
-_HAL_ELEMENT_DTYPES: dict[int, Any] = {}
+# type's numpy dtype never changes). The key is ``(element_type,)`` for the
+# default runtime module, ``(module, element_type)`` for a custom one — see
+# ``_module_cache_prefix``.
+_HAL_ELEMENT_DTYPES: dict[tuple, Any] = {}
 
 
 #: DLPack device-type codes (dlpack.h) for the device kinds a payload can
@@ -3781,13 +3824,14 @@ def _hal_element_dtype(element_type: int, rt: Any = None) -> Any:
     ``rt`` is the RESOLVED IREE runtime module (defaults to the
     default/env-resolved module); ``HalElementType`` is resolved from that
     module's own ``array_interop`` submodule (attribute first, then import),
-    and the memo is keyed on ``(module, element type)`` so a custom module's
-    mapping never shadows the default module's.
+    and the memo is keyed on ``(element type)`` — ``_module_cache_prefix``
+    prepends the module for a CUSTOM one — so a custom module's mapping never
+    shadows the default module's and vice versa.
     """
     if rt is None:
         rt = _runtime_module(None)
 
-    key = (rt, element_type)
+    key = _module_cache_prefix(rt) + (element_type,)
     dtype = _HAL_ELEMENT_DTYPES.get(key)
     if dtype is None:
         array_interop = _runtime_submodule(rt, "array_interop")
