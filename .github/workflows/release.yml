@@ -1,19 +1,28 @@
-# Release — build ONE distribution from the tagged tree, verify it against its
+# Release — route the tag to its distribution, build it, verify it against its
 # own pyproject.toml, publish it to PyPI, then attach the artifacts.
 #
 # This repository is a uv workspace that ships TWO PyPI distributions from ONE
 # `uv.lock`, so a release carries TWO tag schemes and the tag decides which
-# distribution is built (routed once, in `build`, into the `package` /
-# `pyproject` / `prefix` step outputs):
+# distribution is built (routed once, in `route`, into the `package` /
+# `pyproject` / `prefix` job outputs):
 #   tag `v<version>`          → distribution `evoxc`    — the workspace ROOT
 #                               project (`./pyproject.toml`, tag prefix `v`)
 #   tag `evoxc-hf-v<version>` → distribution `evoxc-hf` — the workspace MEMBER
 #                               (`./evoxc_hf/pyproject.toml`, import name
 #                               `evoxc_hf`, tag prefix `evoxc-hf-v`)
-# Any other tag fails loudly in `build`: nothing is built and nothing is
+# Any other tag fails loudly in `route`: nothing is built and nothing is
 # published. There is NO version bump and NO version derivation anywhere in this
 # workflow — each project's pyproject.toml is the single source of truth for its
-# OWN version, and `build` FAILS if `<prefix><version>` does not equal the tag.
+# OWN version, and `route` FAILS if `<prefix><version>` does not equal the tag.
+#
+# WHAT A `v<version>` RELEASE BUILDS: the multi-platform wheel matrix lives in
+# `.github/workflows/wheels.yml` (the same workflow the `pull_request` /
+# `workflow_dispatch` build-only runs exercise). `wheels` calls it, so a release
+# ships SEVEN `cp311-abi3-<platform>` wheels — Linux x86_64/aarch64 ×
+# manylinux/musllinux, macOS x86_64/arm64, Windows x86_64 — plus ONE sdist, all
+# collected by that workflow's `collect` job into a single `dist` artifact.
+# A `evoxc-hf-v<version>` release stays a pure-Python `uv build --package
+# evoxc-hf` (no Rust, no platform matrix).
 #
 # Publishing uses PyPI trusted publishing (OIDC) — no API token / password is
 # stored in this repository or in any secret. The PyPI side must have TWO
@@ -23,7 +32,7 @@
 #   project: evoxc-hf | owner: EMI-Group | repository: evoxc
 #   workflow: release.yml | environment: pypi
 # and the GitHub repository must have an environment named `pypi`.
-# Human procedure: RELEASING.md.
+# Human procedure (including the Rust crates.io order): RELEASING.md.
 #
 # ORDERING: publish an `evoxc` release BEFORE an `evoxc-hf` release whenever the
 # `evoxc-hf` minimum `evoxc` version is new (`dependencies = ["evoxc>=X", ...]`
@@ -31,13 +40,14 @@
 # requires an `evoxc` version PyPI does not have yet, and `pip install evoxc-hf`
 # fails for everyone until the second release lands.
 #
-# Job chain: build → (publish-evoxc | publish-evoxc-hf) → attach. Exactly ONE
-# publish job runs, selected by the routed package; they are two jobs instead of
-# one because each carries its own `environment.url` (and each PyPI pending
-# trusted publisher is bound to its own project). `attach` needs ALL THREE with
-# an `if:` that tolerates the always-skipped sibling, so the artifacts are still
-# attached to the GitHub Release, while a failed build or a failed publish keeps
-# them off the Release — nothing is left half-published.
+# Job chain: route → (wheels | build-evoxc-hf) → (publish-evoxc |
+# publish-evoxc-hf) → attach. Exactly ONE build route and ONE publish job run,
+# selected by the routed package; the two publish jobs are separate because each
+# carries its own `environment.url` (and each PyPI pending trusted publisher is
+# bound to its own project). `attach` needs ALL of them with an `if:` that
+# tolerates the always-skipped siblings, so the artifacts are still attached to
+# the GitHub Release, while a failed build or a failed publish keeps them off the
+# Release — nothing is left half-published.
 #
 # OPTIONAL, NOT ENABLED — TestPyPI dry run:
 # To rehearse a release without touching the real index, add a manual trigger to
@@ -50,8 +60,8 @@
 # the same way — by the routed package — so also gate them on
 # `github.event_name == 'workflow_dispatch'`):
 #   testpypi-evoxc:
-#     needs: build
-#     if: github.event_name == 'workflow_dispatch' && needs.build.outputs.package == 'evoxc'
+#     needs: [route, wheels]
+#     if: github.event_name == 'workflow_dispatch' && needs.route.outputs.package == 'evoxc'
 #     runs-on: ubuntu-latest
 #     environment: testpypi
 #     permissions: { id-token: write }
@@ -62,7 +72,7 @@
 #         with:
 #           repository-url: https://test.pypi.org/legacy/
 #           # no `password`: trusted publishing, environment `testpypi`
-#   testpypi-evoxc-hf:  # identical, but needs.build.outputs.package == 'evoxc-hf'
+#   testpypi-evoxc-hf:  # identical, but needs.route.outputs.package == 'evoxc-hf'
 # TestPyPI needs its OWN pending trusted publisher for EACH project (two of them
 # — see RELEASING.md). Order matters on the dry run too: rehearse `evoxc` before
 # `evoxc-hf`, because resolving the member's `evoxc>=X` requirement needs that
@@ -84,12 +94,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: build + verify (${{ github.event.release.tag_name }})
+  route:
+    name: route + verify (${{ github.event.release.tag_name }})
     runs-on: ubuntu-latest
     outputs:
-      # Consumed by the two publish jobs' `if:`. (The version guard and the
-      # build step read the same routing through `steps.route.outputs.*`.)
+      # Consumed by the build routes and the two publish jobs' `if:`.
       package: ${{ steps.route.outputs.package }}
       pyproject: ${{ steps.route.outputs.pyproject }}
       prefix: ${{ steps.route.outputs.prefix }}
@@ -104,20 +113,9 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      # The root `evoxc` distribution is a mixed maturin project (a Rust/PyO3
-      # abi3 extension from `./native/`), so building its wheel needs a Rust
-      # toolchain. `evoxc-hf` builds without one.
-      - name: Set up Rust (maturin builds evoxc._evoxc_native)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build products
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native -> target
-
       # ONE routing decision for the whole run: the tag names the distribution.
-      # Everything downstream reads these outputs (job outputs are set above),
-      # so the accepted tag schemes live in exactly one place.
+      # Everything downstream reads these outputs, so the accepted tag schemes
+      # live in exactly one place.
       - name: Route the release tag to a distribution
         id: route
         env:
@@ -151,12 +149,6 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
           echo "tag '${tag}' -> distribution '${package}' (version source: ${pyproject}, tag prefix: ${prefix})"
 
-      # `--package` names the workspace project, so the root project is not
-      # built for an `evoxc-hf` release (and vice versa). Artifact names are
-      # normalized: `evoxc-hf` → `evoxc_hf-<version>-py3-none-any.whl`.
-      - name: Build sdist + wheel from the tagged tree
-        run: uv build --package ${{ steps.route.outputs.package }} --out-dir dist
-
       - name: Fail if the release tag does not match the routed [project].version
         env:
           TAG: ${{ github.event.release.tag_name }}
@@ -174,6 +166,51 @@ jobs:
             exit 1
           fi
 
+  # The `evoxc` route: the multi-platform abi3 wheel matrix + the sdist, defined
+  # ONCE in `wheels.yml` (also run build-only on pull_request/workflow_dispatch)
+  # and collected there into a single `dist` artifact. A Rust toolchain is not
+  # needed here — the called workflow installs what its own runners need.
+  wheels:
+    name: evoxc wheels (multi-platform)
+    needs: route
+    if: needs.route.outputs.package == 'evoxc'
+    uses: ./.github/workflows/wheels.yml
+
+  # The `evoxc-hf` route: unchanged pure-Python build (no Rust, no matrix).
+  build-evoxc-hf:
+    name: build + verify evoxc-hf (${{ github.event.release.tag_name }})
+    needs: route
+    if: needs.route.outputs.package == 'evoxc-hf'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set up uv (Python 3.12)
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # `--package` names the workspace project, so the root project is not
+      # built for an `evoxc-hf` release (and vice versa). Artifact names are
+      # normalized: `evoxc-hf` → `evoxc_hf-<version>-py3-none-any.whl`.
+      - name: Build sdist + wheel from the tagged tree
+        run: uv build --package evoxc-hf --out-dir dist
+
+      - name: Assert the two pure-Python artifacts exist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/evoxc_hf-*-py3-none-any.whl)
+          sdists=(dist/evoxc_hf-*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one evoxc_hf-*-py3-none-any.whl and one evoxc_hf-*.tar.gz, found ${wheels[*]:-none} / ${sdists[*]:-none}"
+            exit 1
+          fi
+          ls -la dist
+
       - name: Check distribution metadata
         run: uvx twine check dist/*
 
@@ -187,13 +224,15 @@ jobs:
 
   # Exactly one of the next two jobs runs — the tag routed to its project. Two
   # jobs (not one) so each can declare its own `environment.url`, which PyPI
-  # shows as the deployment target. A plain `if:` still requires `build` to have
-  # succeeded (GitHub applies an implicit success() status check), so a failed
-  # build publishes nothing.
+  # shows as the deployment target. A plain `if:` still requires the needed
+  # build jobs to have succeeded (GitHub applies an implicit success() status
+  # check), so a failed build publishes nothing. A skipped build route for the
+  # sibling distribution is not a failure — it is why each publish job depends
+  # only on its own route's build and is selected by the routed package.
   publish-evoxc:
     name: publish evoxc to PyPI
-    needs: build
-    if: needs.build.outputs.package == 'evoxc'
+    needs: [route, wheels]
+    if: needs.route.outputs.package == 'evoxc'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -213,8 +252,8 @@ jobs:
 
   publish-evoxc-hf:
     name: publish evoxc-hf to PyPI
-    needs: build
-    if: needs.build.outputs.package == 'evoxc-hf'
+    needs: [route, build-evoxc-hf]
+    if: needs.route.outputs.package == 'evoxc-hf'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -234,22 +273,24 @@ jobs:
 
   attach:
     name: attach artifacts to the GitHub Release
-    needs: [build, publish-evoxc, publish-evoxc-hf]
-    # One of the two publish jobs is ALWAYS skipped (a release carries a single
-    # distribution), and GitHub propagates `skipped` through `needs` — without a
-    # status-check function this job would be skipped too and the artifacts
-    # would never be attached. `!failure()` lets it run when nothing failed (a
-    # skipped sibling is not a failure), and the explicit `build` result check
-    # guarantees there are artifacts to attach.
-    if: ${{ !failure() && needs.build.result == 'success' }}
+    needs: [route, wheels, build-evoxc-hf, publish-evoxc, publish-evoxc-hf]
+    # Every release runs ONE build route and ONE publish job; GitHub propagates
+    # `skipped` through `needs` — without a status-check function this job would
+    # be skipped too and the artifacts would never be attached. `!failure()`
+    # lets it run when nothing failed (a skipped sibling is not a failure), and
+    # the explicit `route` result check guarantees the run was a real release.
+    if: ${{ !failure() && needs.route.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      # Both routes name their collected artifact `dist` (the `evoxc` one comes
+      # from `wheels.yml`'s `collect` job, the `evoxc-hf` one from
+      # `build-evoxc-hf`), and only one route runs per release.
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist
 
-      - name: Attach sdist + wheel to the release
+      - name: Attach sdist + wheels to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}

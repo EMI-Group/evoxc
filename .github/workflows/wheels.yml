@@ -1,0 +1,322 @@
+# Wheels — prebuilt abi3 wheels for the `evoxc` distribution, on every platform
+# the README's "Rust core" and Install sections promise.
+#
+# WHY A SEPARATE WORKFLOW: `release.yml` is `release: published` only, but the
+# wheel matrix must also be exercised on pull requests and by hand. This file is
+# the ONE definition of that matrix; `release.yml` invokes it with
+# `uses: ./.github/workflows/wheels.yml` for a `v<version>` release, so the
+# release path and the pre-merge check build exactly the same artifacts.
+#
+# WHAT IS BUILT (all from `native/evoxc-python/Cargo.toml`, the crate
+# `scripts/build-native.sh` builds — default `extension-module` feature, whose
+# `abi3-py311` pyo3 feature makes ONE `cp311-abi3-<platform>` wheel serve every
+# supported CPython):
+#   linux   x86_64  manylinux   (maturin-action container, `manylinux: auto`)
+#   linux   x86_64  musllinux   (`manylinux: musllinux_1_2`)
+#   linux   aarch64 manylinux   (native arm64 runner `ubuntu-24.04-arm`)
+#   linux   aarch64 musllinux   (native arm64 runner, musllinux_1_2)
+#   macos   x86_64  (`macos-13`, x86_64-apple-darwin)
+#   macos   arm64   (`macos-14`, aarch64-apple-darwin)
+#   windows x86_64  (`windows-latest`, x86_64-pc-windows-msvc)
+# plus ONE sdist (the complete source tree: the Python package + the whole Rust
+# workspace, so `pip install evoxc` from the sdist can compile the extension).
+#
+# `collect` merges them into ONE `dist` artifact and is the gate: seven
+# `cp311-abi3` platform wheels (one per matrix row, covering all seven platform
+# tags), one `evoxc-<version>.tar.gz`, `twine check` on the metadata, and a
+# content check — each wheel ships `evoxc/` + `evoxc/_evoxc_native.(abi3.)(so|
+# pyd|dylib)` and NOTHING of the separate `evoxc_hf` distribution; the sdist
+# ships the Rust workspace (including the reusable `native/evoxc/` crate) and
+# no built artifact. `release.yml` publishes that `dist` artifact through PyPI
+# trusted publishing and attaches it to the GitHub Release.
+#
+# Triggers:
+#   pull_request     build-only — the matrix is exercised before a release
+#   workflow_dispatch build-only
+#   workflow_call    `release.yml` (publishes the collected `dist` artifact)
+# Nothing here publishes; the only publish path is `release.yml`'s OIDC jobs.
+name: Wheels
+
+on:
+  pull_request:
+    # Only a change that can alter the wheel affects it; docs-only PRs skip.
+    paths:
+      - "pyproject.toml"
+      - "native/**"
+      - "scripts/**"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Standalone runs cancel their own superseded builds; a release run (repository
+# dispatch through `release.yml`) never cancels — a tagged release is not
+# re-cut by a newer commit.
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: wheel (linux-${{ matrix.arch }}-${{ matrix.libc }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            libc: manylinux
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+          - os: ubuntu-latest
+            arch: x86_64
+            libc: musllinux
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            libc: manylinux
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            libc: musllinux
+            target: aarch64-unknown-linux-musl
+            manylinux: musllinux_1_2
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux builds run INSIDE the manylinux/musllinux container that
+      # maturin-action selects, where Rust is preinstalled.
+      - name: Build manylinux/musllinux wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          # Same build as `scripts/build-native.sh --release`: default features
+          # (`extension-module`), release profile from the workspace.
+          args: --release --out dist
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  native:
+    name: wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            name: macos-x86_64
+            target: x86_64-apple-darwin
+          - os: macos-14
+            name: macos-arm64
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            name: windows-x86_64
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      # Host runners build natively, so the target triple matches the runner.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The sdist carries the whole cargo workspace, so `cargo metadata` (and
+      # therefore a Rust toolchain) is needed even though nothing is compiled.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload the sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  collect:
+    name: collect + verify
+    needs: [linux, native, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "wheel-*"
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      # The release gate: exactly the promised artifacts, each with the promised
+      # contents. Mirrors the packaging job in `ci.yml`, which only sees the ONE
+      # Linux wheel `uv build` produces.
+      - name: Verify the wheel matrix and the distribution boundary
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import os
+          import re
+          import sys
+          import tarfile
+          import zipfile
+
+          DIST = "dist"
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+          wheels = sorted(glob.glob(os.path.join(DIST, "*.whl")))
+          sdists = sorted(glob.glob(os.path.join(DIST, "*.tar.gz")))
+          if len(wheels) != 7:
+              fail(f"expected 7 platform wheels (linux/macos/windows x86_64 + arm64 rows), found {len(wheels)}: {[os.path.basename(w) for w in wheels]}")
+          if len(sdists) != 1:
+              fail(f"expected exactly one sdist, found {[os.path.basename(s) for s in sdists]}")
+
+          version = None
+          platforms = []
+          for wheel in wheels:
+              name = os.path.basename(wheel)
+              match = re.fullmatch(r"evoxc-([^-]+)-cp(\d+)-abi3-(.+)\.whl", name)
+              if not match:
+                  fail(f"{name} is not an `evoxc-<version>-cp<X>-abi3-<platform>.whl` wheel")
+              this_version, cpython, platform = match.groups()
+              if version is None:
+                  version = this_version
+              elif version != this_version:
+                  fail(f"{name}: mixed versions {version!r} and {this_version!r}")
+              if cpython != "311":
+                  fail(f"{name}: expected the abi3-py311 tag `cp311-abi3` (one wheel serves CPython 3.11+), got cp{cpython}")
+              if "py3-none-any" in name:
+                  fail(f"{name}: the root project embeds a compiled extension, so its wheel must be platform-specific")
+              platforms.append(platform)
+
+              with zipfile.ZipFile(wheel) as zf:
+                  entries = zf.namelist()
+                  sizes = {info.filename: info.file_size for info in zf.infolist()}
+              tops = {entry.split("/", 1)[0] for entry in entries}
+              expected = {"evoxc", f"evoxc-{version}.dist-info"}
+              if tops != expected:
+                  fail(f"{name}: top-level entries must be exactly {sorted(expected)}, got {sorted(tops)}")
+              if any(entry == "evoxc_hf" or entry.startswith("evoxc_hf/") for entry in entries):
+                  fail(f"{name}: ships `evoxc_hf` — that is the SEPARATE distribution `evoxc-hf` and must never be inside the `evoxc` wheel")
+              extensions = [entry for entry in entries if re.fullmatch(r"evoxc/_evoxc_native\.(abi3\.)?(so|pyd|dylib)", entry)]
+              if not extensions:
+                  fail(f"{name}: ships no evoxc/_evoxc_native.(abi3.)(so|pyd|dylib) — maturin must compile the extension from ./native/")
+              if sizes[extensions[0]] == 0:
+                  fail(f"{name}: {extensions[0]} is empty")
+
+          def coverage(fragment_a, fragment_b):
+              return any(fragment_a in p and fragment_b in p for p in platforms)
+
+          required = {
+              "linux x86_64 manylinux": ("manylinux", "x86_64"),
+              "linux x86_64 musllinux": ("musllinux", "x86_64"),
+              "linux aarch64 manylinux": ("manylinux", "aarch64"),
+              "linux aarch64 musllinux": ("musllinux", "aarch64"),
+              "macos x86_64": ("macosx", "x86_64"),
+              "macos arm64": ("macosx", "arm64"),
+              "windows x86_64": ("win_amd64", ""),
+          }
+          missing = [label for label, fragments in required.items() if not coverage(*fragments)]
+          if missing:
+              fail(f"no wheel covers {missing}; platform tags built: {platforms}")
+
+          sdist = sdists[0]
+          if os.path.basename(sdist) != f"evoxc-{version}.tar.gz":
+              fail(f"{os.path.basename(sdist)} does not match the wheel version {version}")
+          with tarfile.open(sdist) as tf:
+              names = tf.getnames()
+          root = f"evoxc-{version}"
+          roots = {name.split("/", 1)[0] for name in names}
+          if roots != {root}:
+              fail(f"the sdist must have the single root {root!r}, got {sorted(roots)}")
+          relative = {name[len(root) + 1:] for name in names if name.startswith(root + "/")}
+          for required_entry in (
+              "pyproject.toml",
+              "README.md",
+              "LICENSE",
+              "native/Cargo.toml",
+              "native/Cargo.lock",
+              "native/evoxc-python/Cargo.toml",
+              "native/evoxc/Cargo.toml",
+          ):
+              if required_entry not in relative:
+                  fail(f"the sdist ships no {required_entry} — a source install could not build the extension / the reusable crate")
+          if not any(entry.startswith("evoxc/") for entry in relative):
+              fail("the sdist ships no evoxc/ package")
+          if not any(entry.startswith("tests/") for entry in relative):
+              fail("the sdist ships no tests/ (the sdist-only include set)")
+          if any("evoxc_hf" in entry for entry in relative):
+              fail("the sdist ships an evoxc_hf path — the workspace member is a separate distribution")
+          if any(entry.endswith((".so", ".pyd", ".dylib")) for entry in relative):
+              fail("the sdist ships a compiled artifact — the extension is built from source by maturin")
+
+          print(f"ok: {len(wheels)} cp311-abi3 wheels ({', '.join(sorted(platforms))}) + evoxc-{version}.tar.gz")
+          PY
+
+      # The single artifact `release.yml` publishes / attaches.
+      - name: Upload the collected distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7

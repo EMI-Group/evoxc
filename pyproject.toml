@@ -164,6 +164,12 @@ manifest-path = "native/evoxc-python/Cargo.toml"
 python-source = "."
 module-name = "evoxc._evoxc_native"
 bindings = "pyo3"
+# Release wheels drop the Rust symbol table (a few hundred KiB per platform):
+# the extension is a self-contained abi3 cdylib, nothing links against its
+# exports. Complements the workspace's `[profile.release]` (opt-level 3,
+# thin LTO, codegen-units 1) — the CI `wheels` matrix builds with
+# `--release`, so this applies to every platform wheel.
+strip = true
 # The ONLY shipped Python module of THIS distribution: maturin packages the
 # `evoxc` package next to the extension, so the wheel carries `evoxc/` and
 # nothing else. The sibling `evoxc-hf` distribution is built from its OWN
@@ -177,6 +183,12 @@ bindings = "pyo3"
 #   assets/**     — README-only SVG diagrams referenced by the packaged README
 #   conftest.py   — the root pytest configuration that makes `tests/` importable
 #   CHANGELOG.md  — read by the packaged suite's release-hygiene leg
+# The whole Rust workspace — `native/Cargo.toml`, `native/Cargo.lock` and every
+# crate under `native/` (including the reusable `evoxc` facade crate) — is part
+# of the cargo build graph, so maturin carries it in the sdist automatically;
+# a source install rebuilds `evoxc/_evoxc_native.abi3.so` from it (the
+# `test_evoxc_sdist_is_a_complete_buildable_source_tree` packaging test pins
+# that the manifest, the lock and the PyO3 crate are all present).
 # Deliberately NOT shipped: the workspace member `evoxc_hf/` (a SEPARATE
 # distribution built from its own project) and the dev-built extension (a
 # gitignored build product that maturin compiles itself).

@@ -418,6 +418,16 @@ See the [Intel findings](evoxc/bench/intel_vulkan_findings.md) and [ICD/loader r
 
 Placement is physical and explicit: `Tensor.to(device)` is the only transfer primitive, `run` outputs stay on the device they ran on, host inputs to a non-cpu executable are a `DeviceError` at the run boundary, and `.numpy()` on a non-cpu tensor raises `DeviceError` (`.to(cpu)` first). No API moves your data behind your back.
 
+## Rust core
+
+The numerical authority is the reusable Rust workspace in [`native/`](native/CONTEXT.md): op schemas and inference, the graph IR, the `vectorize`/`vmap` and AD (`jvp`/`vjp`/`grad`) engines, the `batch_functions` merge, and the CPU execution engine behind the `native` backend.
+
+The reusable crate is **`evoxc`**, with features `cpu` (the CPU execution engine), `runtime` (the runtime session layer) and `full`; with `default-features = false` it is the graph/transform core on its own, without the CPU engine.
+
+The Python package `evoxc` binds that crate through PyO3 as the extension module `evoxc._evoxc_native`, which `pip install evoxc` loads; Python keeps the frontend duties (executing `defn` bodies, specs/pytree adaptation, the extension-rule bridge) and never a second transform implementation.
+
+The published wheel is prebuilt abi3 (`cp311-abi3-*`, one wheel per platform serving every supported CPython, 3.11+): Linux x86_64 and aarch64 (manylinux and musllinux), macOS x86_64 and arm64, Windows x86_64 — plus one sdist that carries the whole Rust workspace, so a source install compiles the same crate with maturin.
+
 ## Built on evoxc: `evoxc_hf`
 
 [`evoxc_hf`](evoxc_hf/CONTEXT.md) — the **`evoxc-hf` distribution** (`pip install evoxc-hf`) — loads a real HuggingFace checkpoint and runs the **whole model forward as ONE evoxc graph** — a 124M-parameter GPT-2, or a 14B-parameter Qwen3, goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a **separate distribution published independently from this same repository** (a `uv` workspace member with its own version, release tag and PyPI release), built only on evoxc's public API: the import name stays `evoxc_hf`, no `evoxc` wheel or sdist contains it, and `import evoxc` never imports it, `torch` or `transformers`.
