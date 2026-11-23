@@ -33,6 +33,7 @@
 //! C-contiguous destination) and [`AxisCopy`] the `gather` one — one plan whose
 //! two bases advance by a fixed step per selected index / result position, so a
 //! whole multi-index gather re-uses a single plan.
+use evoxc_core::{Error, Result};
 use ndarray::ArrayViewD;
 
 use crate::scalar::Scalar;
@@ -40,6 +41,11 @@ use crate::scalar::Scalar;
 /// Elements written per iteration by the strided run filler (one source window
 /// of `LANES * stride` elements).
 const LANES: usize = 4;
+
+/// Runs at least this long are one `copy_from_slice`; shorter ones are an
+/// element loop. A `gather`'s collapsed run is typically 1–8 elements, where the
+/// memcpy dispatch costs more than the 4–32 bytes it moves.
+const RUN_MEMCPY_MIN: usize = 32;
 
 /// One axis of a two-sided copy plan, innermost first: `extent` elements whose
 /// source stride is `src` and destination stride is `dst`.
@@ -161,6 +167,189 @@ pub(super) fn plan_axis_copy<T: Scalar>(
     })
 }
 
+/// A gather's per-index copy COLLAPSED to one run: `run` elements read from
+/// `source` at `src_base + selected * src_step` (stride `src_stride` between
+/// them), written at `position * dst_step` in a C-contiguous destination.
+///
+/// This is the shape family the downstream workloads spend their time in — a
+/// flat table gathered with a whole block of indices, which is one contiguous
+/// run per index (`src_stride == 1`, the axis-0 and rank-1 families) or one
+/// strided run (`src_stride > 1`, an axis-last gather). It is a plain value the
+/// CALLER's loop drives, which is the point: resolving an index and copying its
+/// run stay in one inlined loop instead of a per-index
+/// `copy` → `copy_at` → `write_run` chain, and no per-index plan is replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RunCopy {
+    run: usize,
+    src_base: usize,
+    src_stride: usize,
+    src_step: usize,
+    dst_stride: usize,
+    dst_step: usize,
+}
+
+impl RunCopy {
+    /// True when consecutive result positions continue the destination in
+    /// order, so the whole destination can be APPENDED run by run — which is
+    /// what lets a destination be built with no zero fill at all.
+    ///
+    /// True exactly when the gathered axis is the outermost one: every position
+    /// then takes the next `run` contiguous elements.
+    pub(super) fn appends(&self) -> bool {
+        self.dst_stride == 1 && self.dst_step == self.run
+    }
+
+    /// Copy every selected run, APPENDING into `dest` in destination order:
+    /// `dest` starts empty and receives exactly `count * run` elements, so a
+    /// caller may hand it a destination that was never zero-filled.
+    pub(super) fn append_runs<T: Scalar, I>(
+        &self,
+        source: &[T],
+        selected: I,
+        dest: &mut Vec<T>,
+    ) -> Result<()>
+    where
+        I: Iterator<Item = Result<usize>>,
+    {
+        for index in selected {
+            let start = self.src_base + index? * self.src_step;
+            if self.run == 1 {
+                // One element per index — the flat-table family: a single push
+                // and no run slice at all.
+                match source.get(start) {
+                    Some(value) => dest.push(*value),
+                    None => return Err(run_out_of_bounds(start, 1, source.len())),
+                }
+                continue;
+            }
+            let Some(run) = source.get(start..start + self.run) else {
+                return Err(run_out_of_bounds(start, self.run, source.len()));
+            };
+            match self.src_stride {
+                1 if self.run >= RUN_MEMCPY_MIN => dest.extend_from_slice(run),
+                // A short contiguous run is a handful of loads and stores; the
+                // elementwise extend beats a memcpy call at these lengths.
+                1 => dest.extend(run.iter().copied()),
+                // A stride-0 read repeats one source value (never produced by a
+                // C-contiguous operand, kept sound for a future caller).
+                0 => {
+                    if let Some(value) = run.first() {
+                        dest.extend(std::iter::repeat_n(*value, self.run));
+                    }
+                }
+                stride => {
+                    let mut cursor = start;
+                    for _ in 0..self.run {
+                        let Some(value) = source.get(cursor) else {
+                            return Err(run_out_of_bounds(cursor, 1, source.len()));
+                        };
+                        dest.push(*value);
+                        cursor += stride;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy every selected run into a pre-sized destination, each run starting
+    /// at `position * dst_step` (the interleaved families: a gathered innermost
+    /// axis, where consecutive result positions interleave element by element).
+    pub(super) fn place_runs<T: Scalar, I>(
+        &self,
+        source: &[T],
+        selected: I,
+        dest: &mut [T],
+    ) -> Result<()>
+    where
+        I: Iterator<Item = Result<usize>>,
+    {
+        for (position, index) in selected.enumerate() {
+            let start = self.src_base + index? * self.src_step;
+            let at = position * self.dst_step;
+            if self.dst_stride == 1 {
+                let Some(slot) = dest.get_mut(at..at + self.run) else {
+                    return Err(run_out_of_bounds(at, self.run, dest.len()));
+                };
+                if !fill_run(source, start, slot, self.src_stride) {
+                    return Err(run_out_of_bounds(start, self.run, source.len()));
+                }
+                continue;
+            }
+            // Both sides strided: the destination run takes every `dst_stride`-th
+            // element too, so the run is an element walk (still one inlined loop
+            // with no odometer and no per-index plan).
+            let mut cursor = start;
+            let mut slot = at;
+            for _ in 0..self.run {
+                match (source.get(cursor), dest.get_mut(slot)) {
+                    (Some(value), Some(target)) => *target = *value,
+                    (Some(_), None) => return Err(run_out_of_bounds(slot, self.run, dest.len())),
+                    (None, _) => return Err(run_out_of_bounds(cursor, self.run, source.len())),
+                }
+                cursor += self.src_stride;
+                slot += self.dst_stride;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Classify a gather's per-index axis-slice copy as ONE run (see [`RunCopy`]).
+///
+/// `source_view` views all of `source` as `source_shape`; `dest_shape` is the
+/// shape whose every `dest_axis` slice receives one selected source axis slice
+/// and is C-contiguous, like every [`Buffer`](crate::buffer::Buffer) storage, so
+/// its strides are the C strides of `dest_shape` with that axis removed.
+///
+/// `None` when the range is not one run: gathering a MIDDLE axis splits the
+/// range at that axis (the leading part's destination stride is scaled by the
+/// index count), so those keep the general multi-run replay.
+pub(super) fn plan_axis_runs<T: Scalar>(
+    source: &[T],
+    source_view: &ArrayViewD<'_, T>,
+    source_axis: usize,
+    dest_shape: &[usize],
+    dest_axis: usize,
+) -> Option<RunCopy> {
+    if *source_view.shape().get(source_axis)? == 0 || *dest_shape.get(dest_axis)? == 0 {
+        return None;
+    }
+    let src_slice = source_view.index_axis(ndarray::Axis(source_axis), 0);
+    let range = src_slice.shape();
+    // The destination slice's strides: a C-contiguous `dest_shape` with the
+    // gathered axis removed, where every axis BEFORE the gathered one also spans
+    // the `count` index positions it sits outside of.
+    let count = *dest_shape.get(dest_axis)?;
+    let mut dst_strides: Vec<isize> = crate::kernels::util::c_strides(range)
+        .into_iter()
+        .map(|stride| stride as isize)
+        .collect();
+    for stride in dst_strides.iter_mut().take(dest_axis.min(range.len())) {
+        *stride *= count as isize;
+    }
+    let steps = collapse_steps(range, src_slice.strides(), &dst_strides)?;
+    // ONE run per index, for the whole range. An EMPTY collapse is a rank-0 (or
+    // all-extent-1) range — one element per index, the flat-table family every
+    // attribute/window lookup takes.
+    let (extent, src_stride, dst_stride) = match steps.split_first() {
+        Some((step, [])) => (step.extent, step.src, step.dst),
+        Some(_) => return None,
+        None => (1, 1, 1),
+    };
+    Some(RunCopy {
+        run: extent,
+        src_base: base_offset(&src_slice, source)?,
+        src_stride,
+        src_step: usize::try_from(source_view.stride_of(ndarray::Axis(source_axis))).ok()?,
+        dst_stride,
+        // The destination slice at position 0 starts at element 0 of a
+        // C-contiguous destination, and every position advances by the gathered
+        // axis' own C stride.
+        dst_step: dest_shape[dest_axis + 1..].iter().product(),
+    })
+}
+
 /// Copy `view` into `dest`, which must be exactly `view.len()` elements long.
 ///
 /// Returns `true` when the whole destination was written from `source` (the
@@ -210,6 +399,18 @@ fn base_offset<T>(view: &ArrayViewD<'_, T>, source: &[T]) -> Option<usize> {
     Some(base)
 }
 
+/// An out-of-range run diagnostic: the run arms WRITE as they go (no fallback
+/// pass rewrites the destination afterwards), so a run the layout cannot
+/// accommodate is an explicit error rather than a silently short copy. A
+/// C-contiguous operand whose shape produced the plan never triggers it.
+#[cold]
+#[inline(never)]
+fn run_out_of_bounds(offset: usize, extent: usize, len: usize) -> Error {
+    Error::backend(format!(
+        "indexing copy: a {extent}-element run at offset {offset} is outside a {len}-element buffer — the declared result shape does not match the operands"
+    ))
+}
+
 /// Collapse the two equally shaped views' axes innermost-first, dropping
 /// extent-1 axes and folding every axis whose stride continues the inner one on
 /// BOTH sides (`stride_outer == stride_inner * extent_inner`).
@@ -220,17 +421,24 @@ fn plan_steps<T: Scalar>(
     view: &ArrayViewD<'_, T>,
     dest_view: &ArrayViewD<'_, T>,
 ) -> Option<Vec<Step>> {
-    let mut steps: Vec<Step> = Vec::with_capacity(view.ndim().min(dest_view.ndim()));
-    for index in (0..view.ndim()).rev() {
-        let extent = view.shape()[index];
+    collapse_steps(view.shape(), view.strides(), dest_view.strides())
+}
+
+/// [`plan_steps`] over explicit shapes/strides, so a caller that knows its
+/// destination's layout without materializing a view of it (a C-contiguous
+/// result buffer) shares the same collapsing rule.
+fn collapse_steps(shape: &[usize], src_strides: &[isize], dst_strides: &[isize]) -> Option<Vec<Step>> {
+    let mut steps: Vec<Step> = Vec::with_capacity(shape.len());
+    for index in (0..shape.len()).rev() {
+        let extent = *shape.get(index)?;
         if extent == 0 {
             return None;
         }
         if extent == 1 {
             continue;
         }
-        let src = usize::try_from(view.strides()[index]).ok()?;
-        let dst = usize::try_from(dest_view.strides()[index]).ok()?;
+        let src = usize::try_from(*src_strides.get(index)?).ok()?;
+        let dst = usize::try_from(*dst_strides.get(index)?).ok()?;
         match steps.last_mut() {
             Some(inner)
                 if inner.src.checked_mul(inner.extent) == Some(src)
@@ -316,6 +524,7 @@ fn copy_at<T: Scalar>(
 
 /// Emit one planned run: a contiguous destination run takes one `copy_from_slice`
 /// (or a [`LANES`]-grouped strided fill), a strided destination an element walk.
+#[inline]
 fn write_run<T: Scalar>(
     run: Step,
     source: &[T],
@@ -334,12 +543,31 @@ fn write_run<T: Scalar>(
 }
 
 /// Fill one C-contiguous destination run from `source[offset..]`, taking every
-/// `stride`-th element (a contiguous source is one memcpy).
+/// `stride`-th element (a contiguous source is one memcpy when the run is long
+/// enough to amortize it, an element loop when it is not).
+#[inline]
 fn fill_run<T: Scalar>(source: &[T], offset: usize, dest: &mut [T], stride: usize) -> bool {
     if stride == 1 {
-        return match source.get(offset..offset + dest.len()) {
-            Some(run) => {
-                dest.copy_from_slice(run);
+        let Some(run) = source.get(offset..offset + dest.len()) else {
+            return false;
+        };
+        if run.len() >= RUN_MEMCPY_MIN {
+            dest.copy_from_slice(run);
+        } else {
+            // The short-run arm every collapsed gather/slice family lands on: a
+            // handful of loads and stores, with no memcpy dispatch between them.
+            for (slot, value) in dest.iter_mut().zip(run) {
+                *slot = *value;
+            }
+        }
+        return true;
+    }
+    if stride == 0 {
+        // A stride-0 read repeats one source value; a C-contiguous operand never
+        // produces one, but the run filler stays sound if it ever does.
+        return match source.get(offset) {
+            Some(value) => {
+                dest.fill(*value);
                 true
             }
             None => false,
@@ -557,5 +785,178 @@ mod tests {
         let view = ArrayViewD::<f32>::from_shape(IxDyn(&[0usize, 3]), storage.as_slice()).unwrap();
         let out: Vec<f32> = vec![0.0; 3];
         assert!(plan_axis_copy(&storage, &view, 0, &out, &[1, 3], 0).is_none());
+    }
+
+    /// Append `selected`'s runs into a fresh destination, the way `gather`'s
+    /// non-zero-fill arm does, and compare with ndarray's `assign` reference for
+    /// the same selection.
+    fn appended<T: Scalar + Copy>(
+        storage: &[T],
+        view: &ArrayViewD<'_, T>,
+        axis: usize,
+        dest_shape: &[usize],
+        selected: &[usize],
+    ) -> (RunCopy, Vec<T>) {
+        let runs = plan_axis_runs(storage, view, axis, dest_shape, axis).expect("one run per index");
+        let mut out: Vec<T> = Vec::new();
+        runs.append_runs(storage, selected.iter().map(|&index| Ok(index)), &mut out)
+            .expect("the runs copy");
+        (runs, out)
+    }
+
+    /// The flat-table family (the downstream workloads' own shape) — a rank-1
+    /// operand (one element per index) and a trailing run of 2 — collapses to
+    /// ONE run per index with an APPENDABLE destination, and the append is
+    /// bit-identical to ndarray's `assign`.
+    #[test]
+    fn append_runs_covers_the_flat_table_family() {
+        let shape = [50_000usize, 2];
+        let values: Vec<f32> = (0..100_000).map(|value| value as f32 * 1.5).collect();
+        let base = Array::from_shape_vec(IxDyn(&shape), values.clone()).unwrap();
+        let storage = base.as_slice().unwrap();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let selected: Vec<usize> = (0..5_000).map(|position| (position * 7919 + 3) % 50_000).collect();
+
+        let (runs, out) = appended(storage, &view, 0, &[5_000, 2], &selected);
+        assert_eq!(
+            (runs.run, runs.src_stride, runs.src_step, runs.dst_stride, runs.dst_step),
+            (2, 1, 2, 1, 2)
+        );
+        assert!(runs.appends(), "a leading gathered axis appends");
+        let mut reference = Array::<f32, _>::zeros(IxDyn(&[5_000, 2]));
+        for (position, &index) in selected.iter().enumerate() {
+            reference
+                .index_axis_mut(ndarray::Axis(0), position)
+                .assign(&view.index_axis(ndarray::Axis(0), index));
+        }
+        assert_eq!(out, reference.into_raw_vec_and_offset().0);
+
+        // The rank-1 flat table: a rank-0 axis slice, i.e. ONE element per index.
+        let shape = [50_000usize];
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let selected: Vec<usize> = (0..20_000).map(|position| (position * 7919 + 3) % 50_000).collect();
+        let (runs, out) = appended(storage, &view, 0, &[20_000], &selected);
+        assert_eq!((runs.run, runs.src_stride, runs.dst_step), (1, 1, 1));
+        assert!(runs.appends());
+        let expected: Vec<f32> = selected.iter().map(|&index| values[index]).collect();
+        assert_eq!(out, expected);
+    }
+
+    /// The axis-LAST family collapses to one STRIDED run per index whose
+    /// destination interleaves; it is not appendable, so it goes through
+    /// [`RunCopy::place_runs`] — still bit-identical to ndarray's `assign`.
+    #[test]
+    fn place_runs_covers_an_axis_last_gather() {
+        let shape = [500usize, 50, 5];
+        let values: Vec<f32> = (0..125_000).map(|value| value as f32).collect();
+        let base = Array::from_shape_vec(IxDyn(&shape), values.clone()).unwrap();
+        let storage = base.as_slice().unwrap();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let dest_shape = [500usize, 50, 4];
+        let selected = [3usize, 0, 4, 1];
+
+        let runs = plan_axis_runs(storage, &view, 2, &dest_shape, 2).expect("one run per index");
+        assert_eq!(
+            (runs.run, runs.src_stride, runs.src_step, runs.dst_stride, runs.dst_step),
+            (25_000, 5, 1, 4, 1)
+        );
+        assert!(!runs.appends(), "the destination positions interleave");
+        let mut out = vec![f32::NAN; 500 * 50 * 4];
+        runs.place_runs(storage, selected.iter().map(|&index| Ok(index)), &mut out)
+            .expect("the runs copy");
+        let mut reference = Array::<f32, _>::zeros(IxDyn(&dest_shape));
+        for (position, &index) in selected.iter().enumerate() {
+            reference
+                .index_axis_mut(ndarray::Axis(2), position)
+                .assign(&view.index_axis(ndarray::Axis(2), index));
+        }
+        assert_eq!(out, reference.into_raw_vec_and_offset().0);
+    }
+
+    /// A gathered MIDDLE axis splits the range at that axis (the leading part's
+    /// destination stride spans the index count), so the classifier declines and
+    /// the caller keeps the general plan.
+    #[test]
+    fn plan_axis_runs_declines_a_middle_axis() {
+        let shape = [500usize, 100, 2];
+        let values: Vec<f32> = (0..100_000).map(|value| value as f32).collect();
+        let base = Array::from_shape_vec(IxDyn(&shape), values).unwrap();
+        let storage = base.as_slice().unwrap();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        assert!(plan_axis_runs(storage, &view, 1, &[500, 4, 2], 1).is_none());
+
+        // A zero-extent gathered axis has no run to copy at all.
+        let empty: Vec<f32> = Vec::new();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&[0usize, 3]), empty.as_slice()).unwrap();
+        assert!(plan_axis_runs(&empty, &view, 0, &[1, 3], 0).is_none());
+    }
+
+    /// Every arm moves BITS: NaN payloads, `-0.0` and infinities survive both
+    /// the append and the place path unchanged.
+    #[test]
+    fn the_run_arms_copy_float_bits_unchanged() {
+        let values = [
+            f32::NAN,
+            -0.0,
+            f32::INFINITY,
+            3.5,
+            -0.0,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            2.0,
+        ];
+        // Append arm: a rank-1 table, one element per index.
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&[8]), &values[..]).unwrap();
+        let (_, out) = appended(&values, &view, 0, &[4], &[6, 1, 6, 2]);
+        let expected: Vec<u32> = [6usize, 1, 6, 2]
+            .iter()
+            .map(|&index| values[index].to_bits())
+            .collect();
+        assert_eq!(out.iter().map(|value| value.to_bits()).collect::<Vec<u32>>(), expected);
+
+        // Place arm: an axis-last gather of the same operand.
+        let shape = [2usize, 4];
+        let base = Array::from_shape_vec(IxDyn(&shape), values.to_vec()).unwrap();
+        let storage = base.as_slice().unwrap();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&shape), storage).unwrap();
+        let runs = plan_axis_runs(storage, &view, 1, &[2, 3], 1).expect("one run per index");
+        assert!(!runs.appends());
+        let mut out = vec![0f32; 6];
+        runs.place_runs(storage, [3usize, 1, 3].iter().map(|&index| Ok(index)), &mut out)
+            .expect("the runs copy");
+        let mut reference = Array::<f32, _>::zeros(IxDyn(&[2, 3]));
+        for (position, &index) in [3usize, 1, 3].iter().enumerate() {
+            reference
+                .index_axis_mut(ndarray::Axis(1), position)
+                .assign(&view.index_axis(ndarray::Axis(1), index));
+        }
+        let expected = reference.into_raw_vec_and_offset().0;
+        assert_eq!(
+            out.iter().map(|value| value.to_bits()).collect::<Vec<u32>>(),
+            expected.iter().map(|value| value.to_bits()).collect::<Vec<u32>>(),
+        );
+    }
+
+    /// An index the caller's resolver rejects stops the copy through the same
+    /// error the resolving walk reports (the arms resolve inline, so the first
+    /// bad index is the one that surfaces).
+    #[test]
+    fn the_run_arms_propagate_an_index_error() {
+        let values: Vec<f32> = (0..8).map(|value| value as f32).collect();
+        let view = ArrayViewD::<f32>::from_shape(IxDyn(&[8]), &values[..]).unwrap();
+        let runs = plan_axis_runs(&values, &view, 0, &[3], 0).expect("one run per index");
+        let mut out: Vec<f32> = Vec::new();
+        let err = runs
+            .append_runs(
+                &values,
+                [0usize, 99, 2].iter().map(|&index| match index {
+                    0..=7 => Ok(index),
+                    _ => Err(Error::shape(format!("gather: index {index} is out of bounds"))),
+                }),
+                &mut out,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("index 99 is out of bounds"), "{}", err.message);
+        assert_eq!(out, vec![0.0], "the run before the bad index was appended");
     }
 }

@@ -52,6 +52,8 @@ mod bench_concatenate;
 #[cfg(test)]
 mod bench_gather;
 #[cfg(test)]
+mod bench_slice;
+#[cfg(test)]
 mod test_support;
 
 use concatenate::concatenate_kernel;
@@ -133,6 +135,25 @@ fn pooled_total<T: Scalar>(total: usize) -> Vec<T> {
         .unwrap_or_else(|| T::zeros(total))
 }
 
+/// The APPEND-ONLY counterpart of [`pooled_total`]: a destination the caller
+/// grows by writing every element in order, never reading one back first.
+///
+/// A recycled stock of exactly `total` elements keeps its ALLOCATION but has its
+/// length reset, so its stale values are dropped as zero-length data and are
+/// never read; a pool miss allocates capacity for `total` with **no zero fill at
+/// all** (which is the whole difference from [`pooled_total`], whose miss pays a
+/// `memset`). The capacity is already `total` on both paths, so appending never
+/// reallocates.
+fn pooled_append<T: Scalar>(total: usize) -> Vec<T> {
+    match take_pooled_vec::<T>(total).filter(|values| values.len() == total) {
+        Some(mut values) => {
+            values.clear();
+            values
+        }
+        None => Vec::with_capacity(total),
+    }
+}
+
 /// A tuple rendering for diagnostics (numpy's `(0, 1)` spelling).
 fn render_ints(values: &[i64]) -> String {
     let parts: Vec<String> = values.iter().map(|value| value.to_string()).collect();
@@ -208,6 +229,7 @@ fn out_of_bounds(raw: i128, extent: usize, axis: usize, op: &str) -> Error {
 mod tests {
     use super::*;
     use crate::kernels::indexing::test_support::{declared, f32_buffer, i64_buffer};
+    use crate::Storage;
 
     #[test]
     fn reconcile_rejects_a_wrong_static_dim() {
@@ -230,5 +252,38 @@ mod tests {
             err.message
         );
         assert!(require_integer_indices("gather", &i64_buffer(&[1], &[0])).is_ok());
+    }
+
+    /// The append-only destination reuses a recycled stock's ALLOCATION but
+    /// never hands back a stale element: the stock's length is reset, and after
+    /// the caller appends `total` values nothing of the parked sentinel is left.
+    #[test]
+    fn pooled_append_drops_a_recycled_stock_and_leaves_no_stale_element() {
+        let total = 20_000usize; // 80 KiB f32 — above the pool's minimum size
+        let sentinel = 7.5e30f32;
+        // Park a sentinel stock in this thread's pool, then let the builder
+        // recycle it: its allocation comes back, its stale values do not.
+        drop(Storage::F32(vec![sentinel; total]));
+        let mut out = pooled_append::<f32>(total);
+        assert!(out.is_empty(), "the recycled stock's length is reset");
+        assert!(out.capacity() >= total, "its allocation is reused");
+        for position in 0..total {
+            out.push(position as f32);
+        }
+        assert_eq!(out.len(), total);
+        assert!(!out.contains(&sentinel), "a stale element reached the destination");
+        assert_eq!(out[total - 1], (total - 1) as f32);
+    }
+
+    /// A destination that is never zero-filled must still be the exact length
+    /// asked for: a pool miss reserves capacity without writing anything.
+    #[test]
+    fn pooled_append_reserves_without_writing_on_a_pool_miss() {
+        let total = 3usize;
+        let mut out = pooled_append::<i32>(total);
+        assert!(out.capacity() >= total);
+        assert!(out.is_empty());
+        out.extend([7, 8, 9]);
+        assert_eq!(out, vec![7, 8, 9]);
     }
 }

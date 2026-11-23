@@ -16,8 +16,8 @@ use crate::scalar::Scalar;
 use crate::with_type;
 
 use super::{
-    index_as_i128, operand, pooled_total, reconcile, render_ints, require_integer_indices,
-    resolve_index_fast, strided_copy,
+    index_as_i128, operand, pooled_append, pooled_total, reconcile, render_ints,
+    require_integer_indices, resolve_index_fast, strided_copy,
 };
 
 pub(super) fn gather_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
@@ -66,6 +66,21 @@ pub(super) fn gather(
     derived.extend_from_slice(&source.shape[axis + 1..]);
     let shape = reconcile("gather", declared, derived)?;
     let extent = source.shape[axis];
+    // The fused arm first: one run per index with the index resolved inside the
+    // copy loop. `None` means the axis slice is not a single run (a gathered
+    // middle axis), which keeps the general per-index plan below.
+    let fused = with_type!(source, |values| gather_runs(
+        values,
+        source.dtype,
+        &source.shape,
+        axis,
+        indices,
+        extent,
+        &shape
+    ))?;
+    if let Some(result) = fused {
+        return Ok(result);
+    }
     let resolved = resolve_indices(indices, extent, axis)?;
     with_type!(source, |values| gather_typed(
         values,
@@ -75,6 +90,58 @@ pub(super) fn gather(
         &resolved,
         shape
     ))
+}
+
+/// The fused fast arm: the gathered axis slice collapses to ONE run per index,
+/// so the index is resolved INSIDE the copy loop — no intermediate `Vec<usize>`
+/// and no per-index plan replay.
+///
+/// `Ok(None)` when the collapse does not hold; the caller then resolves the
+/// indices once and takes [`gather_typed`].
+fn gather_runs<T: Scalar + NdScalar>(
+    values: &[T],
+    dtype: DType,
+    source_shape: &[usize],
+    axis: usize,
+    indices: &Buffer,
+    extent: usize,
+    shape: &[usize],
+) -> Result<Option<Buffer>> {
+    let source = array_view(values, source_shape)?;
+    let mut flat: Vec<usize> = source_shape[..axis].to_vec();
+    flat.push(indices.numel());
+    flat.extend_from_slice(&source_shape[axis + 1..]);
+    let Some(runs) = strided_copy::plan_axis_runs(values, &source, axis, &flat, axis) else {
+        return Ok(None);
+    };
+    let total = util::numel(shape);
+    let out = if runs.appends() {
+        // Consecutive positions continue the destination in order, so it is
+        // built by appending: a recycled stock with its length reset (no zero
+        // fill) or a fresh reservation, both fully written.
+        let mut out = pooled_append::<T>(total);
+        with_type!(indices, |raw| runs.append_runs(
+            values,
+            raw.iter()
+                .map(|raw| resolve_index_fast(index_as_i128(*raw), extent, axis, "gather")),
+            &mut out
+        ))?;
+        out
+    } else {
+        let mut out = pooled_total::<T>(total);
+        with_type!(indices, |raw| runs.place_runs(
+            values,
+            raw.iter()
+                .map(|raw| resolve_index_fast(index_as_i128(*raw), extent, axis, "gather")),
+            &mut out
+        ))?;
+        out
+    };
+    Ok(Some(Buffer::new(
+        dtype,
+        shape.to_vec(),
+        <T as NdScalar>::into_storage(out),
+    )?))
 }
 
 /// Resolve every index of the gathered axis once, in the index tensor's own C

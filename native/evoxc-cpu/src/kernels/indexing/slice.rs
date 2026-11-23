@@ -18,7 +18,7 @@ use super::{operand, pooled_total, reconcile};
 
 /// One operand axis mapped onto a Python `slice(start, stop, step)`.
 #[derive(Debug, Clone, Copy)]
-struct DimSlice {
+pub(super) struct DimSlice {
     start: i64,
     /// The normalized, clamped Python STOP bound (exclusive): the low bound of a
     /// negative step, the high bound of a positive one.
@@ -33,7 +33,7 @@ impl DimSlice {
     /// The bounds are already Python-normalized and clamped, so they are
     /// non-negative here except for a negative step's exclusive low bound; that
     /// one is shifted to the inclusive `stop + 1` ndarray reverses from.
-    fn to_ndarray(self) -> ndarray::Slice {
+    pub(super) fn to_ndarray(self) -> ndarray::Slice {
         if self.extent == 0 {
             // An empty axis selects nothing regardless of the bounds.
             return ndarray::Slice::new(0, Some(0), 1);
@@ -62,7 +62,7 @@ pub(super) fn slice_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Valu
 /// Resolve the op's `start_indices` / `limit_indices` / `strides` attributes —
 /// a missing list means numpy's defaults for EVERY axis — and reject a list
 /// whose length is not the operand rank.
-fn slice_ranges(spec: &OpSpec, shape: &[usize]) -> Result<Vec<DimSlice>> {
+pub(super) fn slice_ranges(spec: &OpSpec, shape: &[usize]) -> Result<Vec<DimSlice>> {
     let rank = shape.len();
     let starts = spec.attrs.opt_ints("start_indices")?;
     let limits = spec.attrs.opt_ints("limit_indices")?;
@@ -148,7 +148,7 @@ fn plan_slice_dim(
     Ok(DimSlice { start, stop, step, extent })
 }
 
-fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Result<Buffer> {
+pub(super) fn slice(source: &Buffer, ranges: &[DimSlice], declared: &[Option<usize>]) -> Result<Buffer> {
     let derived: Vec<usize> = ranges.iter().map(|range| range.extent).collect();
     let shape = reconcile("slice", declared, derived)?;
     with_type!(source, |values| slice_typed(

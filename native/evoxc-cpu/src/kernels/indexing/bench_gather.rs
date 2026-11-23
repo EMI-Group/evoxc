@@ -56,7 +56,7 @@ struct Case {
 /// index — and the last three are the run-per-index relatives (an interleaved
 /// last axis, a rank-4 operand with a trailing unit axis, and a middle axis
 /// whose destination slice is strided).
-const CASES: [Case; 10] = [
+const CASES: [Case; 12] = [
     Case {
         label: "f32 (500,100) — flat table, one element per index",
         dtype: DType::Float32,
@@ -126,6 +126,20 @@ const CASES: [Case; 10] = [
         shape: &[500, 100, 2],
         axis: 1,
         index_shape: &[4],
+    },
+    Case {
+        label: "i8 (500,50) — one element per index (the i8 family, half the indices)",
+        dtype: DType::Int8,
+        shape: &[50_000],
+        axis: 0,
+        index_shape: &[500, 50],
+    },
+    Case {
+        label: "bool (500,200) — one element per index (the bool family, twice the indices)",
+        dtype: DType::Bool,
+        shape: &[100_000],
+        axis: 0,
+        index_shape: &[500, 200],
     },
 ];
 
