@@ -564,6 +564,19 @@ mod tests {
         }
 
         fn push(&mut self, name: &str, operands: &[usize], ty: ValueType, attrs: Attrs) -> usize {
+            self.push_at(name, operands, ty, attrs, None)
+        }
+
+        /// `push` with an explicit source location (the callback-op rejection
+        /// tests need one to pin the `[at file:line:col]` suffix).
+        fn push_at(
+            &mut self,
+            name: &str,
+            operands: &[usize],
+            ty: ValueType,
+            attrs: Attrs,
+            location: Option<Location>,
+        ) -> usize {
             let op_id = self.program.new_op_id();
             let value_id = self.program.new_value_id();
             self.program
@@ -573,6 +586,7 @@ mod tests {
             op.operands = operands.iter().map(|index| self.nodes[*index]).collect();
             op.results = vec![value_id];
             op.attributes = attrs;
+            op.location = location;
             self.program.add_op(op).expect("fixture op");
             self.block.ops.push(op_id);
             self.nodes.push(value_id);
@@ -733,5 +747,93 @@ mod tests {
         let powered = fixture.op("power", &[first, 1], &[2]);
         let program = fixture.finish(&[powered]);
         assert!(markers(&program)[1].is_none(), "power is not whitelisted");
+    }
+
+    /// The wire-shaped `result_specs` a variadic callback op carries: a JSON list
+    /// of `{"dtype", "shape"}` type dicts, one per declared result.
+    fn result_specs_json() -> serde_json::Value {
+        serde_json::json!([{ "dtype": "float32", "shape": [{ "int": 2 }] }])
+    }
+
+    fn custom_call_attrs() -> Attrs {
+        Attrs::from_pairs([
+            ("call_target_name", AttrValue::Str("my_custom_call".to_string())),
+            ("result_specs", AttrValue::Any(result_specs_json())),
+        ])
+    }
+
+    fn inline_stablehlo_attrs() -> Attrs {
+        Attrs::from_pairs([
+            ("body", AttrValue::Str("stablehlo.negate %0 : tensor<2xf32>".to_string())),
+            ("result_specs", AttrValue::Any(result_specs_json())),
+        ])
+    }
+
+    /// `main(x): r = <callback op>(x); return r` — a schema-valid program the
+    /// engine deliberately has no kernel for.
+    fn callback_program(name: &str, attrs: Attrs, location: Option<Location>) -> Program {
+        let mut fixture = Fixture::new(&[&[2]]);
+        let result = fixture.push_at(name, &[0], f32_ty(&[2]), attrs, location);
+        fixture.finish(&[result])
+    }
+
+    /// The two `custom`-category callback ops run opaque payloads, so the engine
+    /// rejects them at plan compile with the SAME named `BackendError` an
+    /// out-of-scope `sparse_*` op produces — never a panic and never a silent
+    /// execution path.
+    #[test]
+    fn a_custom_callback_op_is_rejected_with_a_named_backend_error() {
+        for (name, attrs) in [
+            ("custom_call", custom_call_attrs()),
+            ("inline_stablehlo", inline_stablehlo_attrs()),
+        ] {
+            let program = callback_program(name, attrs, None);
+            let error = compile(&program)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must be rejected at plan compile"));
+            assert_eq!(error.kind_str(), "BackendError", "{name}: {error}");
+            assert!(
+                error.message.contains(name),
+                "{name}: the message must name the op: {error}"
+            );
+            assert!(
+                error.message.contains("no native CPU kernel"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_callback_rejection_carries_a_known_source_location() {
+        let program = callback_program(
+            "custom_call",
+            custom_call_attrs(),
+            Some(Location::new("model.py", 83, 5, None)),
+        );
+        let error = compile(&program)
+            .err()
+            .expect("custom_call has no native kernel");
+        assert_eq!(error.kind_str(), "BackendError");
+        assert!(
+            error.message.contains("[at model.py:83:5]"),
+            "the error must carry the source location: {error}"
+        );
+    }
+
+    /// Regression guard for the Python capability gate: a graph without a
+    /// callback op compiles and reports an EMPTY plan-level inventory (the native
+    /// backend raises for every graph whenever `stats()["unsupported"]` is
+    /// non-empty).
+    #[test]
+    fn an_ordinary_graph_still_compiles_with_an_empty_unsupported_inventory() {
+        let mut fixture = Fixture::new(&[&[2], &[2]]);
+        let sum = fixture.op("add", &[0, 1], &[2]);
+        let program = fixture.finish(&[sum]);
+        let plan = compile(&program).expect("an ordinary graph compiles");
+        assert!(
+            plan.unsupported.is_empty(),
+            "the Python capability gate reads this: {:?}",
+            plan.unsupported
+        );
     }
 }

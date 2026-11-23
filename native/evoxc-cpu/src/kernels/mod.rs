@@ -44,8 +44,18 @@ pub type KernelFn = fn(&mut RunCtx<'_>, &OpSpec, &[Value]) -> Result<Vec<Value>>
 /// The registration table each category module fills.
 pub type KernelMap = HashMap<&'static str, KernelFn>;
 
-/// Every dense (non-sparse, non-terminator) IR op.  `sparse_*` ops are out of
-/// scope for the dense CPU engine and are rejected explicitly.
+/// Every dense (non-sparse, non-terminator) IR op this engine inventories.
+///
+/// The `sparse_*` ops and the `return` terminator are out of scope for the dense
+/// CPU engine, and so is the `custom`-category callback pair (`custom_call`,
+/// `inline_stablehlo`): those execute opaque payloads the engine cannot run, so
+/// they are deliberately absent from this list and have no kernel (not even one
+/// that errors).  [`lookup`] therefore misses them and `plan::compile` rejects
+/// any graph that uses one with the named `BackendError` — exactly like the
+/// out-of-scope `sparse_*` family.  Keeping them out of `DENSE_OPS` also keeps
+/// [`unsupported_ops`] empty: such a graph never reaches a compiled plan, so the
+/// plan-level inventory the Python capability gate reads must not report them as
+/// a global gap.
 pub const DENSE_OPS: &[&str] = &[
     // control
     "block_call",
@@ -227,5 +237,28 @@ mod tests {
                 "'{name}' is registered but missing from DENSE_OPS"
             );
         }
+    }
+
+    /// The `custom`-category callback ops execute opaque payloads, so the dense
+    /// engine deliberately has no kernel for them: they stay out of `DENSE_OPS`,
+    /// `lookup` misses them, and `plan::compile` rejects a graph that uses one by
+    /// name (see `plan.rs`'s callback-rejection tests).  Pinned here so the
+    /// inventory and the kernel table can never drift apart silently, and so the
+    /// plan-level `unsupported` gate stays empty for ordinary graphs.
+    #[test]
+    fn the_custom_callback_ops_have_no_kernel() {
+        for name in ["custom_call", "inline_stablehlo"] {
+            assert!(lookup(name).is_none(), "'{name}' must have no native kernel");
+            assert!(!is_supported(name), "'{name}' must not be reported as supported");
+            assert!(
+                !DENSE_OPS.contains(&name),
+                "'{name}' must stay out of the dense inventory (it never reaches a plan)"
+            );
+        }
+        assert!(
+            unsupported_ops().is_empty(),
+            "the plan-level inventory must stay empty: {:?}",
+            unsupported_ops()
+        );
     }
 }
