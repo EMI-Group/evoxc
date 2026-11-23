@@ -147,6 +147,9 @@ Native run vs numpy on synthetic graphs (`native/tools/bench_cpu.py`, release, l
 Still slower than numpy: unblocked `dot` (0.38× in the eight-row sequence — numpy uses threaded OpenBLAS, while `faer`'s parallel path is 4.8× faster when measured in isolation), `sort`/`argsort` (0.58× vs AVX2), `random_normal` (correctly-rounded libm floor).
 **Real-workload check (tensorneat 0.2.0 `Pipeline.step`, one build + one run per generation):** native is FASTER than numpy — `xor_p500` 40.4–41.0 vs 49.0–49.6 ms/gen, `cartpole_p100` 24.1 vs 68.5–69.6 ms/gen, A/B-interleaved against the pre-`ndarray` engine on the same host (`cartpole_p100` 23.9 → 24.1, `xor_p500` 40.9–41.4 → 40.4–41.0, i.e. within noise; the numpy legs are identical across builds, which is the control that the harness did not move).
 
+**Cross-backend numerics (binding, measured; full table in `./evoxc/backends/native/CONTEXT.md`):** bool/integer paths and every float op built from one-rounding primitives — including `power`, which reproduces numpy's 0/1/2/3/0.5/−1 special table and calls one libm `powf`/`pow` for every other exponent — are bit-identical between numpy and native.
+f32 transcendentals follow the platform libm while numpy uses its own CPU-dispatched SIMD kernels (≤2 ulp), and f32 `dot` reassociates differently through `faer` than through OpenBLAS `sgemm` (≤1e-6 relative near cancellation, `atol 1e-5` in the parity harness); a graph that branches on float comparisons can amplify those windows, so a numpy-vs-native trajectory difference is diagnosed op by op, never assumed to be a staging bug.
+Measured end to end, evox's NSGA2 quickstart (f64 DTLZ2, 50 generations) is output-identical on both backends (`339` Pareto points, `max |f|` deviation `0.005165`).
 **Compile/staging performance (evidence `./evoxc/bench/compile_perf_findings.md` + probe + JSON, `--seed 0 --reps 7`, numpy backend):** in-process staging decodes the serialized module at most once (`LoweredProgram` → `CompiledArtifact` → `load`), so `compile`/`load` cost ~5 µs/20 µs instead of re-decoding: 200-op graph staging total 6.29 → 1.99 ms (3.16×), `build` 8.65 → 3.68 ms (2.35×); 1700-op graph staging 52.0 → 16.7 ms (3.11×), `build` 66.2 → 30.8 ms (2.15×); 5000-op trace 65.6 → 36.4 ms (1.8×). `build_cached` hits stay ~0.04 ms. The native backend stages through the same single-decode pattern (100-op graph 3.46 → 1.51 ms).
 
 ### Backends and adapters
@@ -168,7 +171,7 @@ Every stage is inspectable without side effects: `Graph.summary()`/`digest()` (a
 
 ### Test suite
 
-`./tests/` at this tree: **7818 passed, 88 skipped, 4 xfailed, 0 failed** (7910 reported items; Python 3.14.10, numpy 2.5.2, `iree-base` 3.13.0, the Intel Panther Lake Vulkan device present, one built extension; no CUDA/usable ROCm/tvm/torch/PJRT). `./evoxc_hf/tests/`: **695 passed, 33 skipped**. Every skip in either suite is a host/dependency guard. `./tests/CONTEXT.md` owns the per-area inventories and the exact environment.
+`./tests/` at this tree: **7859 passed, 88 skipped, 4 xfailed, 0 failed** (7951 reported items in 1077 s; Python 3.14.10, numpy 2.5.2, `iree-base` 3.13.0, the Intel Panther Lake Vulkan device present, one built extension; no CUDA/usable ROCm/tvm/torch/PJRT). `./evoxc_hf/tests/`: **706 passed, 22 skipped**. Every skip in either suite is a host/dependency guard. `./tests/CONTEXT.md` owns the per-area inventories and the exact environment.
 
 ### Downstream validation (2026-11-22, this host)
 
