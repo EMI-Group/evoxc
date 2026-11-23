@@ -115,7 +115,22 @@ fn gather_runs<T: Scalar + NdScalar>(
         return Ok(None);
     };
     let total = util::numel(shape);
-    let out = if runs.appends() {
+    let count = indices.numel();
+    let out = if runs.run() == 1 && runs.appends() && total == count {
+        // ONE element per index — the flat-table family (a rank-1 source
+        // gathered along axis 0, and every attribute / window lookup that
+        // reads a table). The destination is pre-sized, so each index is one
+        // direct store: no per-element capacity check, no length bookkeeping,
+        // and no zero fill beyond the first pool miss.
+        let mut out = pooled_total::<T>(total);
+        with_type!(indices, |raw| runs.store_singles(
+            values,
+            raw.iter()
+                .map(|raw| resolve_index_fast(index_as_i128(*raw), extent, axis, "gather")),
+            &mut out
+        ))?;
+        out
+    } else if runs.appends() {
         // Consecutive positions continue the destination in order, so it is
         // built by appending: a recycled stock with its length reset (no zero
         // fill) or a fresh reservation, both fully written.
@@ -380,6 +395,38 @@ mod tests {
         assert!(err.message.contains("multi-axis gather is not supported"), "{}", err.message);
     }
 
+    #[test]
+    fn gather_one_element_per_index_fills_every_slot_in_c_order() {
+        // The flat-table family: a rank-1 source gathered along axis 0 takes the
+        // pre-sized direct-store arm (one element per index). Duplicated,
+        // negative and out-of-order indices must all land positionally.
+        let values: Vec<f32> = (0..64).map(|value| value as f32).collect();
+        let x = f32_buffer(&[64], &values);
+        let indices: Vec<i64> = (0..30).map(|index| (index * 7 % 64) - 40).collect();
+        let out = gather(&x, &i64_buffer(&[3, 10], &indices), 0, &declared(&[3, 10])).unwrap();
+        let expected: Vec<f32> = indices
+            .iter()
+            .map(|index| values[index.rem_euclid(64) as usize])
+            .collect();
+        assert_eq!(out.shape, vec![3, 10]);
+        assert_eq!(out.storage, Storage::F32(expected));
+    }
+    #[test]
+    fn gather_one_element_per_index_reports_the_first_bad_index_in_order() {
+        // The direct-store arm resolves indices in the same C order as the
+        // resolved-index path, so the reported offender does not depend on which
+        // arm ran.
+        let x = f32_buffer(&[8], &[0., 1., 2., 3., 4., 5., 6., 7.]);
+        let err = gather(&x, &i64_buffer(&[4], &[0, 8, 1, 2]), 0, &declared(&[4])).unwrap_err();
+        assert!(
+            err.message.contains("index 8 is out of bounds for axis 0 with size 8"),
+            "{}",
+            err.message
+        );
+        let wide = i64_buffer(&[2, 3], &[1, 2, 3, 4, -9, 5]);
+        let err = gather(&x, &wide, 0, &declared(&[2, 3])).unwrap_err();
+        assert!(err.message.contains("index -9 is out of bounds"), "{}", err.message);
+    }
     #[test]
     fn gather_out_of_bounds_index_is_an_error() {
         let x = f32_buffer(&[3], &[1., 2., 3.]);

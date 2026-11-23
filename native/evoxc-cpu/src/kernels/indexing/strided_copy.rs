@@ -198,6 +198,39 @@ impl RunCopy {
     pub(super) fn appends(&self) -> bool {
         self.dst_stride == 1 && self.dst_step == self.run
     }
+    /// Elements one selected index copies (1 for the flat-table family).
+    pub(super) fn run(&self) -> usize {
+        self.run
+    }
+    /// Store ONE element per selected index into a PRE-SIZED destination, in
+    /// destination order — the `run == 1` counterpart of [`Self::append_runs`]
+    /// for a caller that already holds a `count`-element destination.
+    ///
+    /// This is the flat-table family every attribute / window / table lookup
+    /// takes: a rank-1 source gathered along axis 0 moves a single element per
+    /// index, and the destination positions are contiguous (`appends()`), so a
+    /// direct `*slot = …` store runs without the per-element capacity check and
+    /// length bookkeeping an appending `Vec` pays. `dest` must be exactly the
+    /// number of indices long; that is checked up front by the caller, so the
+    /// zip below always covers it.
+    pub(super) fn store_singles<T: Scalar, I>(
+        &self,
+        source: &[T],
+        selected: I,
+        dest: &mut [T],
+    ) -> Result<()>
+    where
+        I: Iterator<Item = Result<usize>>,
+    {
+        for (slot, index) in dest.iter_mut().zip(selected) {
+            let start = self.src_base + index? * self.src_step;
+            match source.get(start) {
+                Some(value) => *slot = *value,
+                None => return Err(run_out_of_bounds(start, 1, source.len())),
+            }
+        }
+        Ok(())
+    }
 
     /// Copy every selected run, APPENDING into `dest` in destination order:
     /// `dest` starts empty and receives exactly `count * run` elements, so a
