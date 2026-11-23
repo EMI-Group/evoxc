@@ -84,6 +84,7 @@ No `Bound<PyAny>` crosses into native code and no native type is captured from a
 `stats()` has exactly `ops`, `dispatched_ops` (equal to `ops` — this engine dispatches every planned op), `blocks` (`plan.block_count`), `plan_entries` (`plan.op_count`, the planned step count), `compile_ms`, `unsupported` (`plan.unsupported`, the dense ops the engine does not implement), `required_blocks`, `required_external` and `required_runtime`; `required_ops()` has `blocks`, `external` and `runtime_calls`.
 `run(flat_inputs, resolver=None)` converts the flat numpy inputs while holding the GIL, preflights the resolver, runs `evoxc::cpu::run_program(program, &plan, inputs, RunOptions::default(), callbacks)` detached, then builds fresh numpy arrays with the GIL re-acquired.
 Input arity/dtype/shape are validated by the engine at the run boundary (`BackendError`/`DTypeError`/`ShapeError`); an op without a native kernel is the plan's own `BackendError` at compile time.
+That rejection is `evoxc::cpu::plan::compile`'s per-step `kernels::lookup(&op.name)` miss, which returns `BackendError("no native CPU kernel for op '<name>'")` (plus ` [at <location>]` when the op has a known location), so a graph can only name a dense kernel or one of the three host-callback ops `block_call`/`external_call`/`runtime_call` — those compile to a kernel of their own and are recorded in `plan.required_blocks`/`required_external`/`required_runtime` by their `block_name`/`name`/`callback` attribute.
 
 ### numpy interop
 
