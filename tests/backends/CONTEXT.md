@@ -162,7 +162,7 @@ This file owns the test-side contracts, the skip/host-guard policy and the recor
 
 ## Recorded counts
 Measured at this HEAD with `iree-base` 3.13.0 installed, the native extension BUILT, no NVIDIA GPU, no usable ROCm/HIP device, no PJRT plugin, no tvm and no torch, and one enumerated Vulkan device (so the device-guarded Vulkan suite RUNS).
-`pytest tests/backends -o addopts='' -q` → **2003 passed, 73 skipped, 3 xfailed, 0 failed**; `--collect-only -q` → 2076 collected plus the 3 module-level collection skips (`test_adapter_tvm.py` 13, `test_adapter_xla.py` 10, `test_external_portable_fallback.py` 9 items when their dependencies are present) = 2079 reported items.
+`pytest tests/backends -o addopts='' -q` → **2057 passed, 73 skipped, 3 xfailed, 0 failed**; `--collect-only -q` → 2130 collected plus the 3 module-level collection skips (`test_adapter_tvm.py` 13, `test_adapter_xla.py` 10, `test_external_portable_fallback.py` 9 items when their dependencies are present) = 2133 reported items.
 The 73 skips are host/dependency guards only: 22 CUDA (`nvidia-smi` absent, incl. the `Device("cuda", 5)` smokes), 22 ROCm (the `hip` HAL driver reports no devices), 12 tvm-absent, 8 PJRT-plugin-absent xla items, 5 tvm-adapter-unavailable, 1 ROCm-runtime probe and the 3 module-level collection skips.
 The 3 xfails are the exporter-only split-reduction sub-option plumbing pins.
 Item counts per file are in the routing table; the three dependency-gated modules report 1 item each in this environment.
