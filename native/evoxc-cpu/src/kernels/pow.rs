@@ -5,9 +5,14 @@
 //! for `2 ** x`).  Here the exponent of a size-one operand is fixed for the
 //! whole call, so the dispatch happens ONCE, outside the loop, and each arm is
 //! its own monomorphized map -- a `match` inside the element loop would stop the
-//! vectorizer.  Everything the table does not name falls through to the same
-//! `powf` the general driver uses, so NaN propagation and the
-//! negative-base-fractional NaN are unchanged.
+//! vectorizer.  The table is reproduced EXACTLY -- `0`, `1`, `2`, `3`, `0.5` and
+//! `-1` -- and every other exponent, integer or not, is ONE libm `powf`/`pow`
+//! call, exactly as `npy_pow` computes outside its table.  That is what makes
+//! this backend bit-identical to numpy's `npy_pow` on f32 and f64: a
+//! repeated-squaring arm for small integers would round differently from `powf`
+//! (measured on f32: exponent 21 up to 13 ulp, exponent 64 up to 40 ulp), so no
+//! such arm exists and `powi` has no reason to exist either.  NaN propagation and
+//! the negative-base-fractional NaN are therefore also `npy_pow`'s.
 //!
 //! `elementwise::binary` reaches this module through [`scalar_power`] (the fast
 //! path) and [`reject_negative_exponent`] (the integer guard); `util` keeps only
@@ -25,9 +30,6 @@ use crate::scalar::Num;
 trait PowBase: Num {
     /// The nearest constant of this dtype (an `f64` literal folds to a literal).
     fn from_f64(value: f64) -> Self;
-    /// The exponent as a `u32` when it is an exact non-negative integer small
-    /// enough that repeated squaring beats one `powf`.
-    fn small_exponent(self) -> Option<u32>;
 }
 
 macro_rules! impl_pow_base {
@@ -36,36 +38,11 @@ macro_rules! impl_pow_base {
             fn from_f64(value: f64) -> Self {
                 value as $ty
             }
-            fn small_exponent(self) -> Option<u32> {
-                if (0.0..=64.0).contains(&self) && self.fract() == 0.0 {
-                    Some(self as u32)
-                } else {
-                    None
-                }
-            }
         }
     )*};
 }
 
 impl_pow_base!(f32, f64);
-
-/// `base ** exponent` for a non-negative integer exponent by repeated squaring
-/// (`base ** 0 == 1`, NaN included, matching `powf`).
-fn powi<T: PowBase>(base: T, exponent: u32) -> T {
-    let mut result = T::one();
-    let mut square = base;
-    let mut remaining = exponent;
-    while remaining > 0 {
-        if remaining & 1 == 1 {
-            result = result.mul(square);
-        }
-        remaining >>= 1;
-        if remaining > 0 {
-            square = square.mul(square);
-        }
-    }
-    result
-}
 
 /// A `power` result the scalar-exponent fast path produced.
 enum PowScalar {
@@ -139,10 +116,9 @@ fn pow_scalar_typed<T: PowBase>(
     if exponent == T::from_f64(-1.0) {
         return map1(dtype, out_shape, base, |value| T::one().div(value)).map(PowScalar::Built);
     }
-    if let Some(exponent) = exponent.small_exponent() {
-        return map1(dtype, out_shape, base, move |value| powi(value, exponent))
-            .map(PowScalar::Built);
-    }
+    // Every exponent outside numpy's table is ONE libm `powf`/`pow` call, which
+    // is what `npy_pow` does outside its own table (and why the two agree bit
+    // for bit -- no repeated squaring, no `powi`).
     map1(dtype, out_shape, base, move |value| value.pow(exponent)).map(PowScalar::Built)
 }
 
@@ -280,13 +256,6 @@ mod tests {
         // numpy's `sqrt` keeps the sign of -0.0 and `1 / -0.0` is `-inf`.
         assert_eq!(pow_arm_f32(&[-0.0], 0.5)[0].to_bits(), (-0.0f32).to_bits());
         assert_eq!(pow_arm_f32(&[-0.0], -1.0), vec![f32::NEG_INFINITY]);
-        // Exponent 5 is repeated squaring (`x^4 * x`), not five multiplies.
-        let x = [1.0000001f32, -2.0, 3.0, 0.0];
-        assert_bits_f32(
-            &pow_arm_f32(&x, 5.0),
-            &x.map(|v| (v * v) * (v * v) * v),
-            "x ** 5",
-        );
         // The identity arm hands the base back instead of copying it, unless the
         // base reached the kernel through a cast (`base_is_original == false`).
         let shape = [2usize];
@@ -294,8 +263,9 @@ mod tests {
         let one = Buffer::new(DType::Float32, vec![], Storage::F32(vec![1.0])).unwrap();
         assert!(matches!(pow_scalar(&shape, &base, &one, true).unwrap(), Some(PowScalar::Reuse)));
         assert!(matches!(pow_scalar(&shape, &base, &one, false).unwrap(), Some(PowScalar::Built(_))));
-        // An exponent the table does not name still takes this path (`powi`
-        // declines it, so it is one `powf` per element)...
+        // An exponent the table does not name still takes this path, as one
+        // `powf` per element (the separate `power_off_table_exponents_are_one_powf`
+        // test pins that against libm)...
         assert_bits_f32(&pow_arm_f32(&[2.0, 3.0], 2.5), &[2.0f32.powf(2.5), 3.0f32.powf(2.5)], "x ** 2.5");
         // ...but a broadcast (non-size-one) exponent is declined outright.
         let exponent = Buffer::new(DType::Float32, vec![2, 2], Storage::F32(vec![2.0; 4])).unwrap();
@@ -316,20 +286,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn powi_is_repeated_squaring() {
-        assert_eq!(powi(3.0f32, 0), 1.0);
-        assert_eq!(powi(3.0f32, 1), 3.0);
-        assert_eq!(powi(3.0f32, 5), 243.0);
-        assert_eq!(powi(-2.0f64, 3), -8.0);
-        assert_eq!(powi(f64::NAN, 0), 1.0);
-        assert!((powi(1.5f32, 7) - 1.5f32.powi(7)).abs() < 1e-5);
-        assert_eq!(3.0f32.small_exponent(), Some(3));
-        assert_eq!((-1.0f32).small_exponent(), None);
-        assert_eq!(0.5f32.small_exponent(), None);
-        assert_eq!(65.0f32.small_exponent(), None);
-    }
-
     // -- `power` through the elementwise kernel ----------------------------
 
     fn pow_spec(dtype: DType, shape: &[usize]) -> OpSpec {
@@ -348,34 +304,94 @@ mod tests {
     }
 
 
+    /// The off-table sample.  Half of it is chosen so a repeated-squaring arm
+    /// would FAIL this test: `powi` and `powf` disagree in the last bits on
+    /// these bases at every exponent below (measured), so the array is pinned by
+    /// `from_bits` and nothing floats.  The rest are the edge values every arm
+    /// must keep: `1.0`, both signed zeros, a tiny and a huge magnitude, both
+    /// infinities and a NaN; the negative base makes the sign rules depend on
+    /// the exponent's parity.
+    const OFF_TABLE_F32_BITS: [u32; 16] = [
+        0x4066_5835, // 3.5991337  -- differs from repeated squaring at 4, 21, 64
+        0x4048_02DB, // 3.1251743  -- differs at 4, 21, 64
+        0x3F7A_7265, // 0.9783080  -- differs at every exponent here
+        0x4027_7959, // 2.6167815  -- differs at 4, 21, 64
+        0x406C_95C5, // 3.6966412  -- differs at 5, 64
+        0x3F83_E6A6, // 1.0304763  -- differs at 5, 64
+        0xBFAF_DDA2, // -1.3739512 -- the negative-base sign rules
+        0x3F80_0001, // 1.0000001
+        0x0DA2_4260, // 1.0e-30
+        0x7149_F2CA, // 3.0e30
+        0x0000_0000, // 0.0
+        0x8000_0000, // -0.0
+        0x3F80_0000, // 1.0
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x7FC0_0000, // NaN
+    ];
+
+    const OFF_TABLE_F64_BITS: [u64; 15] = [
+        0x4003_9116_7254_024F, // 2.4430...  -- differs from repeated squaring at 4, 5, 21, 64
+        0x3FE5_A942_C9BF_CA71, // 0.6773...  -- differs at every exponent here
+        0x4004_33E8_9C21_C23A, // 2.5256...  -- differs at every exponent here
+        0x3FD7_FA1B_1628_B818, // 0.3749...  -- differs at 5, 64
+        0xC003_9116_7254_024F, // -2.4430... -- the negative-base sign rules
+        0xBFE5_A942_C9BF_CA71, // -0.6773...
+        0x3FF0_0000_0000_0001, // 1.0000000000000002
+        0x01A5_6E1F_C2F8_F359, // 1.0e-300
+        0x7E51_EB2D_6600_5835, // 3.0e300
+        0x0000_0000_0000_0000, // 0.0
+        0x8000_0000_0000_0000, // -0.0
+        0x3FF0_0000_0000_0000, // 1.0
+        0x7FF0_0000_0000_0000, // +inf
+        0xFFF0_0000_0000_0000, // -inf
+        0x7FF8_0000_0000_0000, // NaN
+    ];
+
+    /// **The binding equivalence**: every exponent outside numpy's special table
+    /// -- integer ones (4, 5, 21, 64) included -- is ONE libm `powf`/`pow` call, so
+    /// the kernel's result is bit-for-bit `x.powf(e)` on f32 and f64.
     #[test]
-    fn power_integer_exponents_use_repeated_squaring() {
+    fn power_off_table_exponents_are_one_powf() {
+        let bases32 = OFF_TABLE_F32_BITS.map(f32::from_bits);
+        for exponent in [4.0f32, 5.0, 21.0, 64.0] {
+            let got = pow_arm_f32(&bases32, exponent);
+            let want = bases32.map(|value| value.powf(exponent));
+            assert_bits_f32(&got, &want, &format!("f32 x ** {exponent}"));
+        }
+        let bases64 = OFF_TABLE_F64_BITS.map(f64::from_bits);
+        for exponent in [4.0f64, 5.0, 21.0, 64.0] {
+            let got = pow_arm_f64(&bases64, exponent);
+            let want = bases64.map(|value| value.powf(exponent));
+            for (index, (have, expected)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    expected.to_bits(),
+                    have.to_bits(),
+                    "f64 x ** {exponent}: index {index}"
+                );
+            }
+        }
+        // An even exponent keeps the sign of the zero, an odd one keeps `-0.0`.
+        assert_eq!(pow_arm_f32(&[-0.0], 4.0)[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(pow_arm_f32(&[-0.0], 5.0)[0].to_bits(), (-0.0f32).to_bits());
+
         // An INTEGER exponent is cast to the float compute dtype first, so it
-        // reaches the same fast path: 0 -> ones, 1 -> the base itself (reused,
-        // not copied), 5 -> `x * x^2 * x^2` by repeated squaring.
-        let x = [1.0000001f32, -2.0, 3.0, 0.0];
+        // reaches the very same arm: `x ** 21` through an int32 exponent buffer is
+        // bit-identical to `powf(21.0)` (and NOT to a repeated-squaring product).
+        let x = [1.0000001f32, -2.0, 3.5991337, 0.0];
         let base = buffer(DType::Float32, &[x.len()], Storage::F32(x.to_vec()));
         let op = pow_spec(DType::Float32, &[x.len()]);
-        let integer = |value: i32| buffer(DType::Int32, &[], Storage::I32(vec![value]));
-        let f32_values = |out: Vec<Value>| match &out[0].storage {
-            Storage::F32(values) => values.clone(),
-            other => panic!("unexpected storage {other:?}"),
-        };
-        assert_eq!(f32_values(binary(&op, &base, &integer(0)).unwrap()), vec![1.0; x.len()]);
-        let shared = std::rc::Rc::new(base.clone());
-        let out = elementwise::binary(&op, &shared, &std::rc::Rc::new(integer(1))).unwrap();
-        assert!(std::rc::Rc::ptr_eq(&out[0], &shared));
-        assert_eq!(f32_values(out), x.to_vec());
-        let five = f32_values(binary(&op, &base, &integer(5)).unwrap());
-        for (index, value) in x.iter().enumerate() {
-            let exact = (value * value) * (value * value) * value;
-            assert_eq!(exact.to_bits(), five[index].to_bits(), "x ** 5: index {index}");
-            let reference = value.powf(5.0);
-            assert!(
-                (reference - five[index]).abs() <= reference.abs() * 2e-7,
-                "x ** 5 at index {index}: {reference} vs {}",
-                five[index]
-            );
+        for exponent in [4i32, 5, 21, 64] {
+            let integer = buffer(DType::Int32, &[], Storage::I32(vec![exponent]));
+            let out = binary(&op, &base, &integer).unwrap();
+            match &out[0].storage {
+                Storage::F32(values) => assert_bits_f32(
+                    values,
+                    &x.map(|value| value.powf(exponent as f32)),
+                    &format!("f32 x ** {exponent} (int32 exponent)"),
+                ),
+                other => panic!("unexpected storage {other:?}"),
+            }
         }
     }
 

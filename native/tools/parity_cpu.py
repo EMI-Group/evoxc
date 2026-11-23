@@ -14,21 +14,36 @@ Run it (needs the built extension — ``scripts/build-native.sh``)::
 
 Comparison contract
 -------------------
+What is ACTUALLY asserted, leaf by leaf:
 * Output-leaf count, order (the entry function's return operands), dtype and
   shape must match EXACTLY.
 * bool / integer leaves: ``np.array_equal`` (exact).  NaN positions must match
   exactly wherever NaN is produced.
 * float / complex leaves: ``np.allclose`` with ``rtol=1e-5, atol=1e-6`` for
-  f16/f32/c64 and ``rtol=1e-12, atol=1e-13`` for f64/c128, INF/NAN-infinity
-  agreement, plus an exact NaN-position match.  The table always reports the
-  max absolute and max relative error (``-`` = an exact-comparison case).
-  f16 is held to the f32 tolerance: its own epsilon (~1e-3) would otherwise
-  fail on rounding alone.
-* Cases flagged ``exact`` compare floats bit-exactly — the key-based RNG
-  sampling cases (``np.array_equal``; the algorithm is documented
-  bit-identical against numpy).  ``rng_normal`` relaxes ONLY the f32 ``normal``
-  leaf to the tolerance path (the engine documents a 1-ulp f32 window) and
-  marks the row ``PASS~`` so the flag is visible.
+  f16/f32/c64 and ``rtol=1e-12, atol=1e-13`` for f64/c128, plus an exact
+  NaN-position match and INF agreement (same positions, same sign).  The table
+  always reports the max absolute and max relative error (``-`` = an
+  exact-comparison case).  f16 is held to the f32 tolerance: its own epsilon
+  (~1e-3) would otherwise fail on rounding alone.
+* FLOAT BIT-IDENTITY IS NOT ASSERTED HERE (and cannot be for every leaf).  It is
+  asserted ONLY for the cases that flag it explicitly: the ``exact`` key-based
+  RNG cases compare floats bit-for-bit with ``np.array_equal`` (the algorithm is
+  documented bit-identical against numpy).  Two families legitimately differ in
+  their last bits and would fail a bit-exact contract: an f32 ``dot`` (faer's
+  gemm reassociates the K-sum differently from numpy's threaded OpenBLAS
+  ``sgemm`` — ~5e-5 relative where cancellation leaves a near-zero result) and
+  any transcendental elementwise op (``sin``/``cos``/``tan``/``tanh``/``exp``/
+  ``log``/``log1p``/``erf``/``gelu`` call the platform libm, while numpy uses
+  its own SIMD kernels — 1-2 ulp windows).
+* ``known_roundoff: (rtol, atol)`` on a case REPLACES the default float
+  tolerance for that case's tolerance-mode (float/complex) leaves and marks the
+  row ``PASS~``, the same visible flag style as ``rng_normal`` below.  It exists
+  for a measured, understood round-off gap rather than a defect:
+  ``dot_f32_large`` uses ``(1e-4, 1e-5)`` (measured: 580/3072 elements differ,
+  max abs 9.5e-6), while ``transcendental_f32`` runs on the DEFAULT tolerance
+  (measured: ≤1-2 ulp).
+* ``rng_normal`` relaxes ONLY the f32 ``normal`` leaf to the tolerance path
+  (the engine documents a 1-ulp f32 window) and marks the row ``PASS~``.
 * A case whose NUMPY side raises passes when the native side raises too
   (error parity; both families are printed) and fails when it does not.  A
   case may declare ``native_error=(kind, ...)``: "native must raise this kind
@@ -91,6 +106,10 @@ class Case:
     #: ``normal`` window (tolerance pass, flagged ``PASS~``). Never both on one
     #: leaf: ``rng_normal`` relaxes only the f32 leaves.
     flags: frozenset = frozenset()
+    #: ``(rtol, atol)`` REPLACING the default float tolerance for this case's
+    #: tolerance-mode leaves, for a measured round-off gap (see the module
+    #: docstring); the row prints ``PASS~``. Ignored by bit-exact leaves.
+    known_roundoff: Optional[tuple] = None
     #: Error kinds the NATIVE side must raise while the numpy side succeeds.
     native_error: tuple = ()
     #: Optional resolver passed to ``NativeProgram.run``.
@@ -197,8 +216,18 @@ def run_native(program, case: Case) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _compare_float(native: np.ndarray, ref: np.ndarray, dtype: np.dtype) -> tuple:
-    rtol, atol = TOL_F64 if dtype.itemsize >= 8 else TOL_F32
+def _compare_float(
+    native: np.ndarray,
+    ref: np.ndarray,
+    dtype: np.dtype,
+    override: Optional[tuple] = None,
+) -> tuple:
+    # A per-case override replaces the dtype-family default (the measured
+    # round-off gaps in the module docstring); nothing else changes.
+    if override is not None:
+        rtol, atol = override
+    else:
+        rtol, atol = TOL_F64 if dtype.itemsize >= 8 else TOL_F32
     nan_mismatch = int(np.count_nonzero(np.isnan(native) ^ np.isnan(ref)))
     inf_mismatch = int(
         np.count_nonzero(np.isinf(native) ^ np.isinf(ref))
@@ -249,7 +278,7 @@ def _compare_leaf(native: np.ndarray, ref: np.ndarray, case: Case) -> tuple:
     if _leaf_mode(case, native.dtype) == "exact":
         ok = bool(np.array_equal(native, ref, equal_nan=True))
         return ok, (0.0 if ok else None), (0.0 if ok else None), "" if ok else "values differ (bit-exact)"
-    return _compare_float(native, ref, native.dtype)
+    return _compare_float(native, ref, native.dtype, case.known_roundoff)
 
 
 def _describe_outputs(outputs: Sequence[np.ndarray]) -> str:
@@ -269,7 +298,8 @@ def compare(case: Case, native: list, ref: list) -> Outcome:
         max_rel = None if rel_err is None or max_rel is None else max(max_rel, rel_err)
         if not ok:
             problems.append(f"output[{index}]: {detail}")
-    status = "FAIL" if problems else ("PASS~" if "rng_normal" in case.flags else "PASS")
+    roundoff_flagged = case.known_roundoff is not None or "rng_normal" in case.flags
+    status = "FAIL" if problems else ("PASS~" if roundoff_flagged else "PASS")
     return Outcome(case, status, "; ".join(problems), _describe_outputs(native), max_abs, max_rel)
 
 
@@ -449,6 +479,9 @@ idx_tile = evoxc.defn(lambda x: evoxc.tile(x, (2, 3)))
 idx_flip = evoxc.defn(lambda x: (evoxc.flip(x, (0,)), evoxc.flip(x, (0, 1))))
 # Nullable-attribute graphs: every `None` parameter below is serialized as an
 # explicit JSON `null` on the op (the registry's documented `default=None`).
+ew_transcendental = evoxc.defn(
+    lambda x: (evoxc.sin(x), evoxc.cos(x), evoxc.tanh(x), evoxc.exp(x))
+)
 ew_nan_to_num = evoxc.defn(lambda x: evoxc.nan_to_num(x))
 ew_nan_to_num_explicit = evoxc.defn(lambda x: evoxc.nan_to_num(x, nan=7, posinf=1.0, neginf=-1.0))
 idx_flip_all_axes = evoxc.defn(lambda x: evoxc.flip(x, None))
@@ -611,6 +644,9 @@ def build_cases() -> list:
     ``graph``, ``flags``, ``native_error``, ``resolver`` and ``note``.
     """
     rng = np.random.default_rng(20260101)
+    # A SEPARATE seed for the round-off cases added below, so their (large)
+    # draws cannot shift the shared `rng` sequence every other case derives from.
+    rng_roundoff = np.random.default_rng(20260202)
     f32, f64, c64 = evoxc.float32, evoxc.float64, evoxc.complex64
     i32, i64 = evoxc.int32, evoxc.int64
     S = _spec  # S((3, 4)) / S((5,), i64)
@@ -650,6 +686,10 @@ def build_cases() -> list:
         ("err_int_power_negative", "elementwise", ew_int_power_negative, (S((2,), i64), S((2,), i64)), {
             "inputs": (np.array([2, 3], np.int64), np.array([-1, -2], np.int64)),
             "note": "integer power with a negative exponent: both sides raise"}),
+        ("transcendental_f32", "elementwise", ew_transcendental, (S((4000,)),), {
+            "inputs": (np.linspace(-0.9, 0.9, 4000, dtype=np.float32),),
+            "note": "sin/cos/tanh/exp over 4000 samples: DEFAULT tolerance (measured ≤1-2 ulp, "
+                    "platform libm vs numpy's SIMD kernels — bit-identity is not asserted)"}),
     ]
 
     # ---- 2. reductions ----------------------------------------------------
@@ -719,6 +759,12 @@ def build_cases() -> list:
         ("lin_argsort_no_ties", "linalg", lin_argsort_no_ties, (S((4, 5)),),
          {"inputs": (rng.permutation(20).reshape(4, 5).astype(np.float32),),
           "note": "stable=False over distinct values"}),
+        ("dot_f32_large", "linalg", lin_dot, (S((64, 96)), S((96, 48))), {
+            "inputs": (rng_roundoff.standard_normal((64, 96)).astype(np.float32),
+                       rng_roundoff.standard_normal((96, 48)).astype(np.float32)),
+            "known_roundoff": (1e-4, 1e-5),
+            "note": "faer gemm vs OpenBLAS sgemm reassociate the K-sum: measured 580/3072 "
+                    "elements differ, max abs 9.5e-6"}),
     ]
 
     # ---- 5. control flow --------------------------------------------------
