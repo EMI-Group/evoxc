@@ -195,17 +195,15 @@ fn source_buffer(case: &Case) -> Buffer {
 }
 
 /// The production path: the two-sided run-copy plan.
-fn production(case: &Case) -> Buffer {
+fn production(case: &Case, x: &Buffer, indices: &Buffer) -> Buffer {
     let declared: Vec<Option<usize>> = flat_shape(case).into_iter().map(Some).collect();
-    gather(&source_buffer(case), &index_buffer(case), case.axis, &declared)
-        .expect("gather succeeds")
+    gather(x, indices, case.axis, &declared).expect("gather succeeds")
 }
 
-/// The pre-fix path: one ndarray `assign` per selected index.
-fn assign_arm<T: Scalar + NdScalar>(case: &Case) -> Buffer {
-    let x = source::<T>(case);
+/// The pre-fix path: one ndarray `assign` per selected index. The operand is
+/// passed in (borrowed), so the timed window holds only the copy.
+fn assign_arm<T: Scalar + NdScalar>(case: &Case, values: &[T]) -> Buffer {
     let flat = collapsed_shape(case);
-    let values = T::slice_of(&x.storage).expect("the case dtype");
     let source_view = array_view(values, case.shape).expect("a source view");
     let mut out: Vec<T> = T::zeros(numel(&flat));
     {
@@ -255,13 +253,17 @@ fn median<F: FnMut() -> T, T>(mut call: F) -> f64 {
 
 fn report(case: &Case) {
     let elements = numel(&flat_shape(case));
+    // The fixtures are built ONCE and borrowed: the timed window must hold the
+    // kernel, never the operand construction.
+    let x = source_buffer(case);
+    let indices = index_buffer(case);
 
     // Correctness first: a timing of the wrong elements would be worthless.
-    let produced = production(case);
+    let produced = production(case, &x, &indices);
     let expected = match case.dtype {
-        DType::Float32 => assign_arm::<f32>(case),
-        DType::Int8 => assign_arm::<i8>(case),
-        DType::Bool => assign_arm::<bool>(case),
+        DType::Float32 => assign_arm::<f32>(case, f32::slice_of(&x.storage).unwrap()),
+        DType::Int8 => assign_arm::<i8>(case, i8::slice_of(&x.storage).unwrap()),
+        DType::Bool => assign_arm::<bool>(case, bool::slice_of(&x.storage).unwrap()),
         other => panic!("bench case dtype {other:?} has no arm"),
     };
     match case.dtype {
@@ -273,11 +275,11 @@ fn report(case: &Case) {
     drop(produced);
     drop(expected);
 
-    let fast = median(|| production(case));
+    let fast = median(|| production(case, &x, &indices));
     let assign = match case.dtype {
-        DType::Float32 => median(|| assign_arm::<f32>(case)),
-        DType::Int8 => median(|| assign_arm::<i8>(case)),
-        DType::Bool => median(|| assign_arm::<bool>(case)),
+        DType::Float32 => median(|| assign_arm::<f32>(case, f32::slice_of(&x.storage).unwrap())),
+        DType::Int8 => median(|| assign_arm::<i8>(case, i8::slice_of(&x.storage).unwrap())),
+        DType::Bool => median(|| assign_arm::<bool>(case, bool::slice_of(&x.storage).unwrap())),
         other => panic!("bench case dtype {other:?} has no arm"),
     };
     let per_element = |seconds: f64| seconds * 1e9 / elements as f64;
@@ -377,16 +379,14 @@ fn scatter_declared(case: &ScatterCase) -> Vec<Option<usize>> {
 }
 
 /// The production path: the one-run-per-index copy.
-fn scatter_production(case: &ScatterCase) -> Buffer {
-    let (data, indices, updates) = scatter_buffers(case);
-    scatter_kernel(&data, &indices, &scatter_index_shape(case), &updates, 0, &scatter_declared(case))
+fn scatter_production(case: &ScatterCase, x: &Buffer, indices: &Buffer, updates: &Buffer) -> Buffer {
+    scatter_kernel(x, indices, &scatter_index_shape(case), updates, 0, &scatter_declared(case))
         .expect("scatter succeeds")
 }
 
 /// The path the run regime replaced: the general rank-deep driver, whose
 /// per-element walk pays a bounds-checked read and write per element.
-fn scatter_general(case: &ScatterCase) -> Buffer {
-    let (data, indices, updates) = scatter_buffers(case);
+fn scatter_general(case: &ScatterCase, data: &Buffer, indices: &Buffer, updates: &Buffer) -> Buffer {
     let update_shape = scatter_update_shape(case);
     let mut padded = vec![1usize; case.shape.len()];
     padded[0] = case.selected;
@@ -398,7 +398,7 @@ fn scatter_general(case: &ScatterCase) -> Buffer {
         DType::Float32,
         case.shape,
         0,
-        &indices,
+        indices,
         &padded,
         &update_shape,
         &update_shape,
@@ -409,15 +409,16 @@ fn scatter_general(case: &ScatterCase) -> Buffer {
 
 fn scatter_report(case: &ScatterCase) {
     let writes = case.selected * numel(&case.shape[1..]);
+    let (data, indices, updates) = scatter_buffers(case);
 
-    let produced = scatter_production(case);
-    let expected = scatter_general(case);
+    let produced = scatter_production(case, &data, &indices, &updates);
+    let expected = scatter_general(case, &data, &indices, &updates);
     same::<f32>(&produced, &expected, case.label);
     drop(produced);
     drop(expected);
 
-    let fast = median(|| scatter_production(case));
-    let general = median(|| scatter_general(case));
+    let fast = median(|| scatter_production(case, &data, &indices, &updates));
+    let general = median(|| scatter_general(case, &data, &indices, &updates));
     let per_write = |seconds: f64| seconds * 1e9 / writes as f64;
     println!("  {}  ({} written elements)", case.label, writes);
     for (name, seconds) in [("production (run regime)", fast), ("general driver", general)] {

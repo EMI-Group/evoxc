@@ -244,6 +244,12 @@ fn plan_steps<T: Scalar>(
     Some(steps)
 }
 
+/// How many outer axes the replay odometer keeps on the stack, so a per-index
+/// [`AxisCopy::copy`] allocation-free for every rank the engine sees. A deeper
+/// operand falls back to a heap odometer (a rank above 9 is exotic, and the
+/// fallback is still one allocation per CALL, not per element).
+const MAX_STACK_AXES: usize = 8;
+
 /// Replay a plan's runs from `src_base` in `source` to `dst_base` in `dest`.
 ///
 /// Both running offsets are the START of the current run, so a run does not
@@ -257,7 +263,7 @@ fn copy_at<T: Scalar>(
     dest: &mut [T],
     dst_base: usize,
 ) -> bool {
-    let Some(run) = steps.first() else {
+    let Some((run, outer)) = steps.split_first() else {
         // Every extent was 1: the plan is a single element.
         return match (source.get(src_base), dest.get_mut(dst_base)) {
             (Some(value), Some(slot)) => {
@@ -267,19 +273,25 @@ fn copy_at<T: Scalar>(
             _ => false,
         };
     };
-    let mut odometer = vec![0usize; steps.len() - 1];
+    let run = *run;
+    if outer.is_empty() {
+        // ONE run and no outer axis — the whole plan is a single run copy
+        // (every flat-table and interleaved gather collapse to this), so there
+        // is no odometer and no allocation at all.
+        return write_run(run, source, src_base, dest, dst_base);
+    }
+    let mut stack = [0usize; MAX_STACK_AXES];
+    let mut heap;
+    let odometer: &mut [usize] = if outer.len() <= MAX_STACK_AXES {
+        &mut stack[..outer.len()]
+    } else {
+        heap = vec![0usize; outer.len()];
+        heap.as_mut_slice()
+    };
     let mut src = src_base;
     let mut dst = dst_base;
     loop {
-        let written = if run.dst == 1 {
-            match dest.get_mut(dst..dst + run.extent) {
-                Some(chunk) => fill_run(source, src, chunk, run.src),
-                None => false,
-            }
-        } else {
-            copy_elements(source, src, dest, dst, run.extent, run.src, run.dst)
-        };
-        if !written {
+        if !write_run(run, source, src, dest, dst) {
             return false;
         }
         let mut axis = 0usize;
@@ -287,7 +299,7 @@ fn copy_at<T: Scalar>(
             if axis == odometer.len() {
                 return true;
             }
-            let outer = steps[axis + 1];
+            let outer = outer[axis];
             odometer[axis] += 1;
             src += outer.src;
             dst += outer.dst;
@@ -299,6 +311,25 @@ fn copy_at<T: Scalar>(
             odometer[axis] = 0;
             axis += 1;
         }
+    }
+}
+
+/// Emit one planned run: a contiguous destination run takes one `copy_from_slice`
+/// (or a [`LANES`]-grouped strided fill), a strided destination an element walk.
+fn write_run<T: Scalar>(
+    run: Step,
+    source: &[T],
+    src: usize,
+    dest: &mut [T],
+    dst: usize,
+) -> bool {
+    if run.dst == 1 {
+        match dest.get_mut(dst..dst + run.extent) {
+            Some(chunk) => fill_run(source, src, chunk, run.src),
+            None => false,
+        }
+    } else {
+        copy_elements(source, src, dest, dst, run.extent, run.src, run.dst)
     }
 }
 
