@@ -1,7 +1,7 @@
 """evoxc.ops — frontend tensor operations.
 
 Every numerical op that can appear in an EvoXIR graph. This module defines
-the full public op surface (99 functions), the unified operand/construction/
+the full public op surface (104 functions), the unified operand/construction/
 inference semantics (see this directory's ``CONTEXT.md`` — binding), and the
 ``SymbolicTensor`` operator handlers registered into ``evoxc.core`` at import
 time.
@@ -81,6 +81,7 @@ from .stats import median, nansum, std, var  # noqa: F401
 
 # Constants / escape hatches.
 from .constant import constant, runtime_call, stop_gradient  # noqa: F401
+from .custom import custom_call, inline_stablehlo  # noqa: F401
 from .external import external_call  # noqa: F401
 
 # Import-time side effect: wire SymbolicTensor operator handlers into core.
@@ -115,4 +116,5 @@ __all__ = [
     "var", "std", "median", "nansum",
     # constants / escape hatches
     "constant", "runtime_call", "stop_gradient", "external_call",
+    "custom_call", "inline_stablehlo",
 ]
