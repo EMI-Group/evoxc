@@ -82,8 +82,8 @@ from evoxc.trace import Graph
 from evoxc.trace._tree import _static_equal
 from evoxc.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
-__all__ = ["Executable", "BoundExecutable", "lower", "compile", "load", "run",
-           "bind", "build", "evaluate"]
+__all__ = ["Executable", "BoundExecutable", "lower", "compile", "compile_text",
+           "load", "run", "bind", "build", "evaluate"]
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +678,8 @@ def load(artifact, backend=None, device=None, **options):
 
     ``backend`` may be omitted (taken from the artifact) but must match if
     given (``core.PersistenceError`` naming both otherwise — never a silent
-    recompile). ``device`` normalizes: None -> ``core.Device("cpu", 0)`` (the
+    recompile); a passed ``Backend`` instance is the one used for the load
+    hop (after that name check), never re-resolved by name. ``device`` normalizes: None -> ``core.Device("cpu", 0)`` (the
     v1 default), str -> ``core.Device(name)``, ``core.Device`` -> as-is,
     anything else -> ``core.DeviceError``. Returns the user-facing wrapper
     carrying the structured signature (the artifact's live decoded
@@ -697,8 +698,12 @@ def load(artifact, backend=None, device=None, **options):
             f"load expects an evoxc.backends.CompiledArtifact (from "
             f"evoxc.compile), got {type(artifact).__name__}"
         )
+    resolved = None
     if backend is not None:
         if isinstance(backend, backends.Backend):
+            # A passed Backend INSTANCE is the one used for loading (after the
+            # name-match check) — never re-resolved by name.
+            resolved = backend
             given_name = backend.name
         elif isinstance(backend, str):
             given_name = backend
@@ -713,14 +718,143 @@ def load(artifact, backend=None, device=None, **options):
                 f"cannot load it with backend {given_name!r} — never "
                 f"silently recompile"
             )
-    resolved = backends.get(artifact.backend)
+    if resolved is None:
+        resolved = backends.get(artifact.backend)
     device = _normalize_device(device)
-    options = apply_env_options(artifact.backend, options, "load")
+    options = apply_env_options(resolved.name, options, "load")
     if options:
         backend_executable = resolved.load(artifact, device, options)
     else:
         backend_executable = resolved.load(artifact, device)
     return Executable(backend_executable, artifact.signature)
+
+
+def _text_spec_sequence(argname, value):
+    """Validate a ``compile_text`` spec sequence and return it as a tuple.
+
+    Accepts any non-string sequence of ``core.TensorSpec`` (an empty
+    ``input_specs`` is allowed); anything else raises ``TypeError`` naming
+    the argument and the offending value.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(
+        value, collections.abc.Sequence
+    ):
+        raise TypeError(
+            f"compile_text: {argname} must be a sequence of core.TensorSpec, "
+            f"got {type(value).__name__}"
+        )
+    specs = tuple(value)
+    for index, spec in enumerate(specs):
+        if not isinstance(spec, core.TensorSpec):
+            raise TypeError(
+                f"compile_text: {argname}[{index}] must be a core.TensorSpec, "
+                f"got {type(spec).__name__}"
+            )
+    return specs
+
+
+def compile_text(mlir_text, input_specs, output_specs, *, backend=None,
+                 device=None, entry_functions=("main",), **options):
+    """``compile_text(mlir_text, input_specs, output_specs) -> Executable``.
+
+    The explicit-staging escape hatch for hand-authored or hand-EDITED
+    StableHLO text (for example, the output of ``Executable.source_text()``
+    after manual surgery — or a fully hand-written StableHLO module)::
+
+        lowered = LoweredProgram(
+            backend=backend.name,
+            signature=Signature(
+                input_tree=core.flatten(tuple(input_specs))[1],
+                output_tree=core.flatten(tuple(output_specs))[1],
+                input_specs=..., output_specs=...,
+                static_values=(), output_static_values=(),
+            ),
+            payload={"format": "stablehlo", "format_version": 1,
+                     "mlir_text": mlir_text,
+                     "entry_functions": list(entry_functions)},
+        )
+        artifact = compile(lowered, backend=backend, **options)
+        return load(artifact, backend=backend, device=device, **options)
+
+    There is NO tracing and NO ``Graph`` here: the text IS the program, and
+    the compiler validates it end to end (a malformed module or a missing
+    entry function fails in the compiler with its own diagnostic). Both
+    spec lists describe the OUTER tuple of arguments/results: the signature
+    trees are ``core.flatten(tuple(input_specs))`` /
+    ``core.flatten(tuple(output_specs))``, so ``evoxc.run(exe, a, b)``
+    matches the flat tuple of inputs and the outputs come back as a tuple of
+    tensors. ``input_specs`` may be empty; ``output_specs`` must contain at
+    least one ``core.TensorSpec``.
+
+    ``backend`` must be a compiler backend that consumes StableHLO text
+    (``evoxc.backends.CompilerBackend`` — e.g. ``"iree"``); the numpy
+    interpreter and the native CPU engine reject the call with a
+    ``core.BackendError`` naming the backend. ``device``/``**options`` are
+    forwarded unchanged to the normal ``compile`` and ``load`` stages (same
+    env-option precedence: explicit kwarg > env var > evoxc default), which
+    keep all their validation — no stage is bypassed and nothing is
+    re-lowered.
+    """
+    if not isinstance(mlir_text, str):
+        raise TypeError(
+            f"compile_text: mlir_text must be a non-empty StableHLO/MLIR "
+            f"string, got {type(mlir_text).__name__}"
+        )
+    if not mlir_text.strip():
+        raise TypeError(
+            "compile_text: mlir_text must be a non-empty StableHLO/MLIR "
+            "string, got an empty/whitespace-only string"
+        )
+    input_specs = _text_spec_sequence("input_specs", input_specs)
+    output_specs = _text_spec_sequence("output_specs", output_specs)
+    if not output_specs:
+        raise TypeError(
+            "compile_text: output_specs must contain at least one "
+            "core.TensorSpec"
+        )
+    if not isinstance(entry_functions, (tuple, list)) or not entry_functions:
+        raise TypeError(
+            f"compile_text: entry_functions must be a non-empty tuple/list of "
+            f"strings, got {type(entry_functions).__name__}"
+        )
+    entry_functions = tuple(entry_functions)
+    for index, name in enumerate(entry_functions):
+        if not isinstance(name, str) or not name:
+            raise TypeError(
+                f"compile_text: entry_functions[{index}] must be a non-empty "
+                f"string, got {type(name).__name__}"
+            )
+
+    resolved = _resolve_backend(backend)
+    if not isinstance(resolved, backends.CompilerBackend):
+        raise core.BackendError(
+            f"compile_text requires a compiler backend that consumes "
+            f"StableHLO text, got backend {resolved.name!r} — pass a compiler "
+            f"backend such as backend='iree'"
+        )
+
+    input_leaves, input_tree = core.flatten(input_specs)
+    output_leaves, output_tree = core.flatten(output_specs)
+    signature = backends.Signature(
+        input_tree=input_tree,
+        output_tree=output_tree,
+        input_specs=tuple(input_leaves),
+        output_specs=tuple(output_leaves),
+        static_values=(),
+        output_static_values=(),
+    )
+    lowered = LoweredProgram(
+        backend=resolved.name,
+        signature=signature,
+        payload={
+            "format": "stablehlo",
+            "format_version": 1,
+            "mlir_text": mlir_text,
+            "entry_functions": list(entry_functions),
+        },
+    )
+    artifact = compile(lowered, backend=resolved, **options)
+    return load(artifact, backend=resolved, device=device, **options)
 
 
 # ---------------------------------------------------------------------------
@@ -1717,13 +1851,19 @@ def build(fn, *specs, backend=None, device=None, **options):
     """``build(f, *specs) -> Executable``.
 
     Documented shorthand for ``load(compile(lower(trace(fn, *specs),
-    backend), **options), backend, device, **options)`` — no other behavior
+    backend=backend, **options), backend=backend, **options),
+    backend=backend, device=device, **options)`` — no other behavior
     (docstring must stay in sync with the expansion)::
 
         graph = evoxc.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
-        artifact = compile(lowered, **options)
+        artifact = compile(lowered, backend=backend, **options)
         return load(artifact, backend=backend, device=device, **options)
+
+    ``backend`` is resolved ONCE (``_resolve_backend_device``) and the
+    resolved ``Backend`` instance is the one used by the ``lower``,
+    ``compile`` AND ``load`` hops — an explicitly passed ``Backend``
+    instance is therefore never dropped or re-resolved by name.
 
     ``options`` are forwarded to ``lower``, ``compile`` AND ``load``
     (stage-appropriate: each stage uses the keys it understands, validates
@@ -1762,7 +1902,7 @@ def build(fn, *specs, backend=None, device=None, **options):
         )
     graph = trace_fn(fn, *specs)
     lowered = lower(graph, backend=backend, **options)
-    artifact = compile(lowered, **options)
+    artifact = compile(lowered, backend=backend, **options)
     return load(artifact, backend=backend, device=device, **options)
 
 
