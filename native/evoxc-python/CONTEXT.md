@@ -2,7 +2,8 @@
 
 ## Intent
 
-The only crate that knows about Python: it exposes `evoxc._evoxc_native` as a thin adapter over `evoxc-core` (schemas, envelope codec, inference, error families), `evoxc-compiler` (the five transforms and the `batch_functions` merge) and `evoxc-cpu` (the native CPU plan + interpreter).
+The only crate that knows about Python: it exposes `evoxc._evoxc_native` as a thin adapter over the `evoxc` facade — `evoxc::core` (schemas, envelope codec, inference, error families), `evoxc::compiler` (the five transforms and the `batch_functions` merge) and `evoxc::cpu` (the native CPU plan + interpreter).
+`evoxc = { workspace = true, features = ["full"] }` is its only workspace dependency, and `publish = false` keeps the cdylib off crates.io (it ships inside the `evoxc` Python wheel only).
 It holds **no** numerical semantics of its own — one envelope dict crosses the FFI per call, and every judgment (schemas, inference, error families) comes from the native authority.
 `native/CONTEXT.md` is the binding contract; this file refines crate internals and never changes the wire format or the FFI names.
 The built cdylib is `libevoxc_python.so`, installed by `scripts/build-native.sh` as `evoxc/_evoxc_native.abi3.so` for `evoxc/_native.py` to load — a build product, gitignored.
