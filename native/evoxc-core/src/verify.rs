@@ -721,7 +721,7 @@ fn verify_op_specific_results(program: &Program, op: &Op, loc: Option<&Location>
             }
             Ok(())
         }
-        "runtime_call" | "block_call" | "external_call" => {
+        "runtime_call" | "block_call" | "external_call" | "custom_call" | "inline_stablehlo" => {
             let specs_value = op
                 .attributes
                 .get("result_specs")
@@ -1358,5 +1358,193 @@ mod tests {
             .push(crate::graph::Use { op: grad_id, operand_index: 3 });
         let error = error_of(&program);
         assert!(error.message.contains("does not refer to this value"), "{}", error.message);
+    }
+
+    // --- `custom`-category callback ops (`custom_call`, `inline_stablehlo`) --
+
+    /// `{"id": 1..n, "type": ...}` op-result entries from a list of wire types
+    /// (value id 0 is the block argument).
+    fn op_results(types: &Json) -> Json {
+        Json::Array(
+            types
+                .as_array()
+                .expect("a list of wire types")
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| serde_json::json!({"id": index + 1, "type": ty}))
+                .collect(),
+        )
+    }
+
+    /// An `evoxc-native-ir` v1 envelope TEXT: one `f32[2,3]` block argument, the
+    /// callback op under test and a `return` of every op result.
+    ///
+    /// `attributes` carries the op's attributes (including its `result_specs`);
+    /// `recorded` is the list of result types recorded on the op.
+    fn callback_envelope(op_name: &str, attributes: &Json, recorded: &Json) -> String {
+        let results = op_results(recorded);
+        let return_operands: Vec<usize> = (1..=recorded.as_array().expect("a list of wire types").len())
+            .collect();
+        serde_json::json!({
+            "format": "evoxc-native-ir",
+            "version": 1,
+            "module": {"name": "callback_ops"},
+            "functions": [{
+                "name": "main",
+                "input_types": [{"dtype": "float32", "shape": [{"int": 2}, {"int": 3}]}],
+                "output_types": recorded,
+                "block": {
+                    "arguments": [{
+                        "id": 0,
+                        "type": {"dtype": "float32", "shape": [{"int": 2}, {"int": 3}]},
+                    }],
+                    "ops": [{"id": 0, "ref": "0"}, {"id": 1, "ref": "1"}],
+                },
+            }],
+            "ops": [
+                {"id": 0, "name": op_name, "operands": [0], "results": results, "attributes": attributes},
+                {"id": 1, "name": "return", "operands": return_operands, "results": []},
+            ],
+        })
+        .to_string()
+    }
+
+    /// Decode the envelope TEXT produced by [`callback_envelope`] (as a string,
+    /// through a JSON round trip).
+    fn decode_callback(op_name: &str, attributes: &Json, recorded: &Json) -> Program {
+        let text = callback_envelope(op_name, attributes, recorded);
+        let json: Json = serde_json::from_str(&text).expect("the envelope text is JSON");
+        crate::envelope::decode(&json)
+            .unwrap_or_else(|error| panic!("{op_name} decode: {}", error.message))
+    }
+
+    #[test]
+    fn custom_category_callback_ops_decode_infer_and_verify() {
+        let specs = serde_json::json!([
+            {"dtype": "float32", "shape": [{"int": 4}]},
+            {"dtype": "int32", "shape": []},
+        ]);
+        let expected = vec![
+            ValueType::of(DType::Float32, [Dim::int(4)]),
+            ValueType::scalar(DType::Int32),
+        ];
+        let cases = [
+            (
+                "custom_call",
+                true,
+                serde_json::json!({
+                    "call_target_name": "tgt",
+                    "result_specs": specs,
+                    "has_side_effect": true,
+                    "api_version": 2,
+                }),
+            ),
+            (
+                "inline_stablehlo",
+                false,
+                serde_json::json!({
+                    "body": "module {}",
+                    "result_specs": specs,
+                    "has_side_effect": false,
+                }),
+            ),
+        ];
+        for (op_name, side_effect, attrs) in &cases {
+            let program = decode_callback(op_name, attrs, &specs);
+            let op_id = op_named(&program, op_name);
+            let op = program.op(op_id).unwrap();
+            // The `any` result_specs list and the scalar tags decode generically.
+            match op.attributes.get("result_specs") {
+                Some(AttrValue::Any(Json::Array(items))) => assert_eq!(items.len(), 2, "op {op_name}"),
+                other => panic!("op {op_name}: result_specs decoded as {other:?}"),
+            }
+            assert_eq!(
+                op.attributes.get("has_side_effect"),
+                Some(&AttrValue::Bool(*side_effect)),
+                "op {op_name}"
+            );
+            if *op_name == "custom_call" {
+                assert_eq!(op.attributes.get("api_version"), Some(&AttrValue::Int(2)));
+                assert_eq!(
+                    op.attributes.get("call_target_name"),
+                    Some(&AttrValue::Str("tgt".to_string()))
+                );
+            } else {
+                assert_eq!(
+                    op.attributes.get("body"),
+                    Some(&AttrValue::Str("module {}".to_string()))
+                );
+            }
+
+            // Inference: explicit result types are the only answer, and they come
+            // back unchanged (`result_specs` is never used to derive them).
+            let operand_types = vec![matrix()];
+            let error =
+                infer::infer_op(op_name, &operand_types, &op.attributes, None, None).unwrap_err();
+            assert_eq!(error.kind_str(), "VerificationError", "op {op_name}");
+            assert!(error.message.contains(&format!("op '{op_name}'")), "{}", error.message);
+            assert!(
+                error.message.contains("result types must be supplied explicitly"),
+                "{}",
+                error.message
+            );
+            assert_eq!(
+                infer::infer_op(op_name, &operand_types, &op.attributes, Some(&expected), None).unwrap(),
+                expected,
+                "op {op_name}"
+            );
+
+            // Verification reads the declared `result_specs`.
+            verify(&program).unwrap_or_else(|error| panic!("{op_name} verify: {}", error.message));
+        }
+    }
+
+    #[test]
+    fn custom_category_callback_ops_reject_mismatched_result_specs() {
+        let specs = serde_json::json!([
+            {"dtype": "float32", "shape": [{"int": 4}]},
+            {"dtype": "int32", "shape": []},
+        ]);
+        let cases = [
+            (
+                "custom_call",
+                serde_json::json!({
+                    "call_target_name": "tgt",
+                    "result_specs": specs,
+                }),
+            ),
+            (
+                "inline_stablehlo",
+                serde_json::json!({
+                    "body": "module {}",
+                    "result_specs": specs,
+                }),
+            ),
+        ];
+        // A recorded result type that disagrees with the declared spec.
+        let recorded = serde_json::json!([
+            {"dtype": "float64", "shape": [{"int": 4}]},
+            {"dtype": "int32", "shape": []},
+        ]);
+        for (op_name, attrs) in &cases {
+            let program = decode_callback(op_name, attrs, &recorded);
+            let error = error_of(&program);
+            assert_eq!(error.kind_str(), "VerificationError", "op {op_name}");
+            assert!(error.message.contains(&format!("op '{op_name}'")), "{}", error.message);
+            assert!(error.message.contains("declared result_specs"), "{}", error.message);
+
+            // A non-sequence `result_specs` is the same family, naming the op.
+            let mut broken = attrs.clone();
+            broken["result_specs"] = serde_json::json!("not-a-type-list");
+            let program = decode_callback(op_name, &broken, &specs);
+            let error = error_of(&program);
+            assert_eq!(error.kind_str(), "VerificationError", "op {op_name}");
+            assert!(error.message.contains(&format!("op '{op_name}'")), "{}", error.message);
+            assert!(
+                error.message.contains("must be a sequence of ValueTypes"),
+                "{}",
+                error.message
+            );
+        }
     }
 }

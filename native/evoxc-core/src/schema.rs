@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn registry_covers_the_python_op_set() {
-        assert_eq!(count(), 119);
+        assert_eq!(count(), 121);
         assert_eq!(all().len(), count());
         for op in all() {
             assert!(!op.name.is_empty());
@@ -157,6 +157,13 @@ mod tests {
         let sorted = names.clone();
         names.sort_unstable();
         assert_eq!(names, sorted);
+        // The generated index agrees with OPS position by position.
+        let index = crate::schema_table::OP_INDEX;
+        assert_eq!(index.len(), count());
+        for (position, (name, slot)) in index.iter().enumerate() {
+            assert_eq!(all()[*slot as usize].name, *name);
+            assert_eq!(*slot as usize, position);
+        }
     }
 
     #[test]
@@ -201,6 +208,50 @@ mod tests {
         assert!(specific.contains(&"runtime_call"));
         assert!(specific.contains(&"block_call"));
         assert!(specific.contains(&"external_call"));
+        assert!(specific.contains(&"custom_call"));
+        assert!(specific.contains(&"inline_stablehlo"));
+        for name in ["custom_call", "inline_stablehlo"] {
+            let op = require(name).unwrap();
+            assert_eq!(op.category, "custom");
+            assert_eq!(op.effect, effect::CALLBACK);
+            assert!(!op.has_shape_fn);
+            assert_eq!(op.arity_min, 0);
+            assert_eq!(op.arity_max, None);
+            assert!(!op.result_count_known);
+            assert_eq!(op.regions, 0);
+        }
+        let custom = require("custom_call").unwrap();
+        let has_side_effect = custom.attr("has_side_effect").expect("custom_call.has_side_effect");
+        assert!(!has_side_effect.required);
+        assert_eq!(has_side_effect.ty, attr_type::BOOL);
+        assert_eq!(has_side_effect.default_json, Some("false"));
+        let api_version = custom.attr("api_version").expect("custom_call.api_version");
+        assert!(!api_version.required);
+        assert_eq!(api_version.ty, attr_type::INT);
+        assert_eq!(api_version.default_json, Some("1"));
+        let backend_config = custom.attr("backend_config").expect("custom_call.backend_config");
+        assert!(!backend_config.required);
+        assert_eq!(backend_config.ty, attr_type::STR);
+        assert_eq!(backend_config.default_json, Some("\"\""));
+        for name in ["call_target_name", "result_specs"] {
+            let attr = custom.attr(name).unwrap_or_else(|| panic!("custom_call.{name}"));
+            assert!(attr.required);
+            assert_eq!(attr.default_json, None);
+        }
+        assert_eq!(custom.attr("call_target_name").unwrap().ty, attr_type::STR);
+        assert_eq!(custom.attr("result_specs").unwrap().ty, attr_type::ANY);
+        let inline = require("inline_stablehlo").unwrap();
+        for name in ["body", "result_specs"] {
+            let attr = inline.attr(name).unwrap_or_else(|| panic!("inline_stablehlo.{name}"));
+            assert!(attr.required);
+            assert_eq!(attr.default_json, None);
+        }
+        assert_eq!(inline.attr("body").unwrap().ty, attr_type::STR);
+        assert_eq!(inline.attr("result_specs").unwrap().ty, attr_type::ANY);
+        let inline_side_effect = inline.attr("has_side_effect").expect("inline_stablehlo.has_side_effect");
+        assert!(!inline_side_effect.required);
+        assert_eq!(inline_side_effect.ty, attr_type::BOOL);
+        assert_eq!(inline_side_effect.default_json, Some("false"));
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! `infer(...)` FFI calls (contract: `native/CONTEXT.md`).  It validates the
 //! op against the generated schema table, validates and default-fills the
 //! attributes, resolves the op-specific result rules (`constant`, `call`,
-//! `if`, `runtime_call`, `block_call`, `external_call`) and the trivial
+//! `if`, `runtime_call`, `block_call`, `external_call`, `custom_call`,
+//! `inline_stablehlo`) and the trivial
 //! controls (`return`, `stop_gradient`, `while`), then chains the seven
 //! category dispatchers:
 //!
@@ -153,7 +154,8 @@ pub(crate) fn handled_lists() -> [(&'static str, &'static [&'static str]); 8] {
 ///   default-filled here, so a bare [`Attrs`] is self-sufficient.
 /// * `result_types`: the caller's explicit result types — the op-specific
 ///   answer for `constant`/`call` and the only answer for `if` /
-///   `runtime_call` / `block_call` / `external_call`.
+///   `runtime_call` / `block_call` / `external_call` / `custom_call` /
+///   `inline_stablehlo`.
 /// * `module`: the enclosing module (resolves `call`'s callee signature).
 ///
 /// Errors: `VerificationError` for an unknown op, a wrong arity, a bad
@@ -217,8 +219,9 @@ pub fn infer_op(
 ///
 /// Port of the `shape_fn=None` contract in `evoxc/ir/inference.py`:
 /// `constant` derives its type from the payload, `call` from the callee
-/// signature, and `if` / `runtime_call` / `block_call` / `external_call`
-/// require explicit `result_types`.
+/// signature, and `if` / `runtime_call` / `block_call` / `external_call` /
+/// `custom_call` / `inline_stablehlo` require explicit `result_types` (their
+/// `result_specs` attribute is NOT used to derive them).
 fn op_specific_result_types(
     op_name: &str,
     attrs: &Attrs,
@@ -245,7 +248,8 @@ fn op_specific_result_types(
             let callee = attrs.str("callee")?;
             Ok(module.function(callee)?.output_types.clone())
         }
-        "if" | "runtime_call" | "block_call" | "external_call" => result_types
+        "if" | "runtime_call" | "block_call" | "external_call" | "custom_call"
+        | "inline_stablehlo" => result_types
             .map(<[ValueType]>::to_vec)
             .ok_or_else(|| {
                 Error::verification(format!(
@@ -408,7 +412,7 @@ mod tests {
     #[test]
     fn explicit_result_types_are_required_for_region_and_callback_ops() {
         // Each op still needs its required attributes to reach the result rule.
-        let cases: [(&str, Attrs); 4] = [
+        let cases: [(&str, Attrs); 6] = [
             ("if", Attrs::new()),
             (
                 "runtime_call",
@@ -428,6 +432,20 @@ mod tests {
                 "external_call",
                 Attrs::from_pairs([
                     ("name", AttrValue::Str("kernel".to_string())),
+                    ("result_specs", AttrValue::Any(json!([]))),
+                ]),
+            ),
+            (
+                "custom_call",
+                Attrs::from_pairs([
+                    ("call_target_name", AttrValue::Str("tgt".to_string())),
+                    ("result_specs", AttrValue::Any(json!([]))),
+                ]),
+            ),
+            (
+                "inline_stablehlo",
+                Attrs::from_pairs([
+                    ("body", AttrValue::Str("module {}".to_string())),
                     ("result_specs", AttrValue::Any(json!([]))),
                 ]),
             ),
@@ -583,6 +601,14 @@ mod tests {
                     .unwrap_or_else(|| panic!("{category} list names unknown op {name:?}"));
                 assert!(op.has_shape_fn, "{category} list names {name:?} without a shape fn");
             }
+        }
+        // The `custom`-category callback ops resolve their result types
+        // op-specifically, so no coverage list may claim them.
+        for name in ["custom_call", "inline_stablehlo"] {
+            assert!(
+                !handled_lists().iter().any(|(_, names)| names.contains(&name)),
+                "{name:?} must not appear in a category coverage list"
+            );
         }
     }
 
