@@ -247,6 +247,82 @@ def _is_hoistable_unit(unit: str) -> bool:
     return bool(match) and match.group(1) in _HOISTABLE_MNEMONICS
 
 
+#: The compiler escape-hatch ops (`custom_call` / `inline_stablehlo`, IR
+#: category "custom", effect "callback" — see `../../ir/op_defs/custom.py`).
+#: Their emitted text is kept as ONE atomic unit (`Writer._block_units`) so
+#: the region-invariant hoist can never lift it out of a region, and a
+#: while-bearing `cond` refuses to inline a branch containing one
+#: (`Writer._emit_if_select`) — a callback-effect op must never be moved or
+#: predicated away.
+_OPAQUE_CALLBACK_OPS = frozenset({"custom_call", "inline_stablehlo"})
+
+#: Marker comment lines prefixed to both escape-hatch emissions. They keep
+#: the emitted unit MULTI-LINE (hence never hoistable) and identify which op
+#: produced the text in an exported program.
+_CUSTOM_CALL_MARKER = "// evoxc:custom_call"
+_INLINE_STABLEHLO_MARKER = "// evoxc:inline_stablehlo"
+
+#: Conservative MLIR bare-identifier form: a `custom_call` target matching it
+#: is emitted as `@name`, anything else as a quoted symbol `@"..."`.
+_BARE_SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$.]*")
+
+#: SSA tokens of an `inline_stablehlo` body: operand *i* is `%in<i>`, result
+#: *i* must be defined as `%out<i>` (`Writer._emit_inline_stablehlo`).
+_IN_REF_RE = re.compile(r"%in([0-9]+)(?![0-9])")
+_OUT_REF_RE = re.compile(r"%out([0-9]+)(?![0-9])")
+#: LHS of an `%out<i>` definition line, incl. the multi-result list form
+#: (`%out0, %out1 = ...`).
+_OUT_DEF_RE = re.compile(r"^\s*((?:%out[0-9]+\s*,\s*)*%out[0-9]+)\s*=")
+_OUT_NAME_RE = re.compile(r"%out([0-9]+)(?![0-9])")
+
+
+def _mlir_string(text: str) -> str:
+    """Render ``text`` as an MLIR string literal (double-quoted).
+
+    Escapes ``\\``/``"`` and every control character (``\\n``/``\\t``/``\\r``
+    mnemonics, other controls as ``\\XX`` hex), so ANY user string — a
+    multi-line JSON ``backend_config``, a quoted symbol name — yields one
+    legal single-line MLIR token."""
+    out = ['"']
+    for char in text:
+        if char == "\\":
+            out.append("\\\\")
+        elif char == '"':
+            out.append('\\"')
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\t":
+            out.append("\\t")
+        elif char == "\r":
+            out.append("\\r")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"\\{ord(char):02x}")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
+
+
+def _mlir_symbol(name: str) -> str:
+    """Render a symbol reference: bare ``@name`` for a conservative bare
+    identifier, else a quoted ``@"..."`` symbol."""
+    if _BARE_SYMBOL_RE.fullmatch(name):
+        return f"@{name}"
+    return "@" + _mlir_string(name)
+
+
+def _region_contains_opaque_callback(region) -> bool:
+    """True when a region's body contains a `custom_call`/`inline_stablehlo`
+    op, directly or in a nested region (see `Writer._emit_if_select`)."""
+    for block in region.blocks:
+        for op in block.ops:
+            if op.name in _OPAQUE_CALLBACK_OPS:
+                return True
+            if any(_region_contains_opaque_callback(inner) for inner in op.regions):
+                return True
+    return False
+
+
 #: IR op names whose EMITTED text contains a ``stablehlo.while``: the
 #: ``while`` op itself and ``eigh``, whose cyclic-Jacobi compositions are
 #: emitted as one (``_emit_eigh`` / ``./eigh_batched.py``). These are the
@@ -328,6 +404,8 @@ _SPECIAL_EMITTER_METHODS = {
     "eigh": "_emit_eigh",
     "diag": "_emit_diag",
     "random": "_emit_random",
+    "custom_call": "_emit_custom_call",
+    "inline_stablehlo": "_emit_inline_stablehlo",
 }
 
 #: Op name -> the UNBOUND Writer emitter function for it (``fn(writer, op)``),
@@ -4271,13 +4349,22 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         each result i becomes ``select(broadcast(pred), true_i, false_i)``:
         no ``if`` region, and both ``while`` ops sit at function (or
         enclosing-block) level, where iree executes them correctly — the
-        same shape a bare ``eigh`` emits. Every op reaching the exporter is
-        pure (effectful ops — collectives, `runtime_call`/`external_call` —
-        defer with ``BackendError``), so running both branches is
-        semantics-preserving: only the selected value reaches the
-        consumers. The cost is that the UNSELECTED branch is computed too —
-        its ``while`` runs its full iteration count — so a while-bearing
-        `cond` costs the sum of both branches rather than one of them.
+        same shape a bare ``eigh`` emits. Every op reaching this fallback is
+        pure (the collectives defer, and a callback-effect
+        ``custom_call``/``inline_stablehlo`` in a branch is REJECTED — see
+        below), so running both branches is semantics-preserving: only the
+        selected value reaches the consumers. The cost is that the
+        UNSELECTED branch is computed too — its ``while`` runs its full
+        iteration count — so a while-bearing `cond` costs the sum of both
+        branches rather than one of them.
+
+        A branch holding a ``custom_call``/``inline_stablehlo`` op (effect
+        ``callback``) raises ``core.BackendError``: the fallback executes BOTH
+        branches unconditionally, which would run a callback-effect op the
+        program may have predicated away — the IR's callback contract
+        forbids reordering/duplicating an opaque call, so the graph must be
+        re-expressed (move the custom op out of the `cond` branches) rather
+        than silently mis-executed.
 
         Reason: iree 3.11's ``local-task`` driver mis-executes a
         ``stablehlo.if`` whose regions contain a ``stablehlo.while`` — the
@@ -4290,6 +4377,17 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         and reduce-only branches keep the ``stablehlo.if`` emission, byte
         for byte.
         """
+        for region in op.regions:
+            if _region_contains_opaque_callback(region):
+                raise BackendError(
+                    f"stablehlo export: op 'if'{self._loc(op)}: a branch "
+                    "contains a 'custom_call'/'inline_stablehlo' op AND a "
+                    "'while'-emitting op — the select fallback required for "
+                    "the while (iree mis-executes a while inside an if) "
+                    "would execute the callback-effect custom op "
+                    "unconditionally in both branches; move the custom op "
+                    "out of the cond branches (or use the xla adapter)"
+                )
         pred = op.operands[0]
         result_names = self._bind_results(op)
         lines, branches = [], []
@@ -4602,6 +4700,170 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
             out.extend("    " + line for line in lines)
         return prelude, "\n".join(out)
 
+    # --- Compiler escape hatches (custom_call / inline_stablehlo) ---
+
+    def _emit_custom_call(self, op: Op) -> str:
+        """``custom_call`` -> one ``stablehlo.custom_call`` line (the compiler
+        escape hatch; ``../../ir/op_defs/custom.py`` owns the attributes).
+
+        Emitted form (MLIR custom assembly)::
+
+            %r = stablehlo.custom_call @target(%a, %b) {backend_config =
+                  "...", api_version = 1 : i32, has_side_effect = true}
+                  : (t0, t1) -> t0
+
+        - The target prints as a bare ``@name`` when it matches the
+          conservative bare-identifier form (``_BARE_SYMBOL_RE``,
+          ``[A-Za-z_][A-Za-z0-9_$.]*``), else as a quoted symbol ``@"..."``
+          with ``\\``/``"``/control characters escaped — so ANY user string
+          yields legal MLIR.
+        - Attribute order is ``backend_config``, ``api_version``,
+          ``has_side_effect`` (the order they read naturally). ``api_version``
+          is ALWAYS emitted (typed ``: i32``); ``backend_config`` only when
+          non-empty; ``has_side_effect = true`` only when true (the default
+          False emits nothing — the StableHLO default).
+        - Results: one result prints ``-> t0``, several ``-> (t0, t1)``, a
+          result-less call ``-> ()``.
+        - The ``// evoxc:custom_call`` marker line keeps the emission
+          MULTI-LINE, so the region-invariant hoist can never lift it (a
+          callback-effect op must never be reordered); ``_block_units``
+          additionally keeps the whole emission as ONE atomic unit.
+        - Opaque by contract: whether the target exists and what
+          ``backend_config`` means is the external compiler's verdict. The
+          attributes are re-validated here only so a directly constructed op
+          fails with a naming ``BackendError`` instead of malformed MLIR.
+        """
+        attrs = op.attributes
+        target = attrs.get("call_target_name")
+        if not isinstance(target, str) or not target:
+            raise BackendError(
+                f"stablehlo export: op 'custom_call'{self._loc(op)}: "
+                f"attribute 'call_target_name' must be a non-empty str, got "
+                f"{target!r}"
+            )
+        api_version = attrs.get("api_version", 1)
+        if (
+            not isinstance(api_version, int)
+            or isinstance(api_version, bool)
+            or api_version < 1
+        ):
+            raise BackendError(
+                f"stablehlo export: op 'custom_call'{self._loc(op)}: "
+                f"attribute 'api_version' must be an int >= 1, got "
+                f"{api_version!r}"
+            )
+        backend_config = attrs.get("backend_config", "")
+        if backend_config is None:
+            backend_config = ""
+        if not isinstance(backend_config, str):
+            raise BackendError(
+                f"stablehlo export: op 'custom_call'{self._loc(op)}: "
+                f"attribute 'backend_config' must be a str, got "
+                f"{backend_config!r}"
+            )
+        has_side_effect = attrs.get("has_side_effect", False)
+        if not isinstance(has_side_effect, bool):
+            raise BackendError(
+                f"stablehlo export: op 'custom_call'{self._loc(op)}: "
+                f"attribute 'has_side_effect' must be a bool, got "
+                f"{has_side_effect!r}"
+            )
+        fields = []
+        if backend_config:
+            fields.append(f"backend_config = {_mlir_string(backend_config)}")
+        fields.append(f"api_version = {api_version} : i32")
+        if has_side_effect:
+            fields.append("has_side_effect = true")
+        operands = ", ".join(self._name(v) for v in op.operands)
+        operand_types = ", ".join(self._vt_value(v) for v in op.operands)
+        result_names = self._bind_results(op)
+        lhs = f"{', '.join(result_names)} = " if result_names else ""
+        result_types = self._result_types_str(op.results) if result_names else "()"
+        line = (
+            f"{lhs}stablehlo.custom_call {_mlir_symbol(target)}({operands}) "
+            f"{{{', '.join(fields)}}} : ({operand_types}) -> {result_types}"
+        )
+        return f"{_CUSTOM_CALL_MARKER}\n{line}"
+
+    def _emit_inline_stablehlo(self, op: Op) -> str:
+        """``inline_stablehlo`` -> its ``body`` snippet emitted VERBATIM as the
+        op's lowering (the raw-MLIR compiler escape hatch).
+
+        SSA contract (binding, validated HERE — the exporter never trusts the
+        frontend):
+
+        - operand *i* is referred to in the body as ``%in<i>``;
+        - result *i* MUST be defined exactly once as an assignment
+          left-hand side, ``%out<i> = ...`` (a multi-result op may define
+          several in one list: ``%out0, %out1 = ...``);
+        - no ``%in<i>`` may name an operand beyond the op's operand count and
+          no ``%out<i>`` may name a result beyond the op's result count.
+
+        A violation raises ``core.BackendError`` naming the op and the
+        offending token BEFORE any text is emitted. Validated tokens are then
+        substituted TEXTUALLY with the op's real SSA names
+        (``self._name`` / ``self._bind_results``), so the snippet joins the
+        surrounding program's SSA namespace; substitution is purely textual,
+        so ``%in<i>``/``%out<i>`` are reserved tokens everywhere in the body,
+        including inside string literals.
+
+        Emission: a ``// evoxc:inline_stablehlo`` marker line, then the
+        snippet's lines exactly as written — blank lines, inner indentation
+        and any nested region (a ``stablehlo.while`` with its ``^bb0`` blocks
+        and ``({ ... })`` region) are preserved; the enclosing block's
+        indentation is applied by the block emitter. The marker makes the
+        whole emission one MULTI-LINE atomic unit (``_block_units``), so the
+        region-invariant hoist can never lift part of a callback-effect
+        snippet out of a region.
+        """
+        body = op.attributes.get("body")
+        if not isinstance(body, str) or not body.strip():
+            raise BackendError(
+                f"stablehlo export: op 'inline_stablehlo'{self._loc(op)}: "
+                f"attribute 'body' must be a non-empty str, got {body!r}"
+            )
+        operand_names = [self._name(v) for v in op.operands]
+        result_names = self._bind_results(op)
+        text = body.rstrip("\n")
+        for match in _IN_REF_RE.finditer(text):
+            index = int(match.group(1))
+            if index >= len(operand_names):
+                valid = (
+                    f"%in0..%in{len(operand_names) - 1}"
+                    if operand_names
+                    else "none"
+                )
+                raise BackendError(
+                    f"stablehlo export: op 'inline_stablehlo'{self._loc(op)}: "
+                    f"body references {match.group(0)} but the op has "
+                    f"{len(operand_names)} operand(s) (valid: {valid})"
+                )
+        for match in _OUT_REF_RE.finditer(text):
+            index = int(match.group(1))
+            if index >= len(result_names):
+                raise BackendError(
+                    f"stablehlo export: op 'inline_stablehlo'{self._loc(op)}: "
+                    f"body references {match.group(0)} but the op has "
+                    f"{len(result_names)} result(s)"
+                )
+        definitions: dict = {}
+        for line in text.split("\n"):
+            declared = _OUT_DEF_RE.match(line)
+            if declared:
+                for index in _OUT_NAME_RE.findall(declared.group(1)):
+                    definitions[int(index)] = definitions.get(int(index), 0) + 1
+        for index in range(len(result_names)):
+            count = definitions.get(index, 0)
+            if count != 1:
+                raise BackendError(
+                    f"stablehlo export: op 'inline_stablehlo'{self._loc(op)}: "
+                    f"body must define %out{index} exactly once as an "
+                    f"assignment left-hand side (found {count})"
+                )
+        text = _IN_REF_RE.sub(lambda m: operand_names[int(m.group(1))], text)
+        text = _OUT_REF_RE.sub(lambda m: result_names[int(m.group(1))], text)
+        return f"{_INLINE_STABLEHLO_MARKER}\n{text}"
+
     # --- Collectives ---
 
     def _emit_collective(self, op: Op) -> str:
@@ -4913,10 +5175,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 break
             text = self._emit_op(op)
             if text:
+                if op.name in _OPAQUE_CALLBACK_OPS:
+                    # A callback-effect escape hatch emits as ONE atomic unit:
+                    # `_split_atomic_units` would peel its marker comment (and,
+                    # for a single-line `inline_stablehlo` body, each snippet
+                    # line) into separate units, and a pure-LOOKING snippet line
+                    # could then be lifted out of the enclosing region — moving
+                    # a callback op across a region boundary.
+                    units.append(text)
                 # Fast path for the overwhelmingly common single-line unit
                 # (`_split_atomic_units` would return `[text]` unchanged);
                 # a region-bearing group still goes through the splitter.
-                if "\n" in text:
+                elif "\n" in text:
                     units.extend(_split_atomic_units(text))
                 else:
                     units.append(text)

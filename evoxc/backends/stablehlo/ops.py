@@ -55,6 +55,19 @@ stablehlo/dialect/StablehloOps.td):
   - ``diag`` → rank-2: flatten + constant-index gather (the main
     diagonal); rank-1: iota-EQ mask + select (the diagonal matrix). No
     StableHLO diag op exists.
+  - ``custom_call`` → ``stablehlo.custom_call @<target>(...)`` — the
+    compiler escape hatch, emitted as one line with the target symbol,
+    an optional ``backend_config`` string, the mandatory
+    ``api_version`` and an opt-in ``has_side_effect`` flag (the attribute
+    order the writer emits).
+  - ``inline_stablehlo`` → its ``body`` snippet emitted VERBATIM as the
+    lowering, with ``%in<i>``/``%out<i>`` tokens substituted for the op's
+    operand/result SSA names (the writer validates the token contract
+    before emitting).
+    Both are effect-``callback`` opaque ops: the writer keeps their
+    emission as one atomic unit so the region-invariant hoist can never
+    move them. ``external_call`` stays deferred here (the iree adapter
+    SPLITS those graphs before export instead).
 * NOT in StableHLO (moved to DEFERRED_OPS here):
   - ``erf`` — only ``chlo.erf`` exists (CHLO: "an intermediate value in
     decompositions, never constructed directly"), and there is no trivial
@@ -147,6 +160,14 @@ SPECIAL_EMITTERS: dict[str, str] = {
     "random_permutation": "random",
     # random_multinomial stays deferred (cumulative-search decomposition is
     # not wired in v1; not needed by the benchmark suite).
+    # Compiler escape hatches (`evoxc/ir/op_defs/custom.py`, IR category
+    # "custom", effect "callback"): forwarded VERBATIM to the external
+    # compiler as `stablehlo.custom_call` / raw MLIR text. Whether the target
+    # exists and the MLIR is valid is the compiler's verdict — the exporter
+    # only guarantees well-formed syntax around the opaque payload. Adapters
+    # gate them on ``Capabilities.custom_ops`` (see `../compiler.py`).
+    "custom_call": "custom_call",
+    "inline_stablehlo": "inline_stablehlo",
 }
 
 # Ops emitted by expansion into other ops rather than a direct mnemonic.
