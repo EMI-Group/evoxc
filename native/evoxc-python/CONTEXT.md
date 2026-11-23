@@ -14,9 +14,9 @@ The built cdylib is `libevoxc_python.so`, installed by `scripts/build-native.sh`
 | `version()` | `-> str` | `evoxc::core::VERSION` (`"0.1.0"`). |
 | `__version__` | `str` | Same string; also appears in the generated `__all__`. |
 | `infer(...)` | `(op_name: str, operand_types, attributes, result_types=None, module=None) -> list[dict]` | Native shape inference for one op; returns `[{"dtype": str, "shape": [dim, ...]}, ...]`. `module` accepts a full envelope **or** a signature-only callee context ("The `infer` module argument" below). |
-| `transform(...)` | `(kind: str, module: dict, config: dict) -> dict` | Runs `evoxc_compiler::transform` (all five kinds); returns the transformed `evoxc-native-ir` envelope plus `"transform": {"kind", "output_ids", "input_ids", "batch_dim"}`. Config keys and accepted shapes: `native/CONTEXT.md` "Transform configs" + "Config decoding" below. |
-| `batch_functions(...)` | `(programs: list[dict], config: dict) -> dict` | Runs `evoxc_compiler::batch_functions::batch_functions_with_env`; returns `{"module": <merged evoxc-native-ir envelope>, "batch_report": <12-key report>}`. Config keys (`axes`/`out_axes`/`switch_ops`/`bands`/`alignment`/`extension_rule`) and shapes: "`batch_functions`" below. |
-| `batching_rule_keys()` | `-> list[str]` | Read-only introspection: `evoxc_compiler::builtin_rule_keys()` — the sorted rule keys of the compiled-in builtin batching registry (the ops the native engines can map); never `block:*`/`external:*`/`sparse_*`, which come from the host bridge. |
+| `transform(...)` | `(kind: str, module: dict, config: dict) -> dict` | Runs `evoxc::compiler::transform` (all five kinds); returns the transformed `evoxc-native-ir` envelope plus `"transform": {"kind", "output_ids", "input_ids", "batch_dim"}`. Config keys and accepted shapes: `native/CONTEXT.md` "Transform configs" + "Config decoding" below. |
+| `batch_functions(...)` | `(programs: list[dict], config: dict) -> dict` | Runs `evoxc::compiler::batch_functions::batch_functions_with_env`; returns `{"module": <merged evoxc-native-ir envelope>, "batch_report": <12-key report>}`. Config keys (`axes`/`out_axes`/`switch_ops`/`bands`/`alignment`/`extension_rule`) and shapes: "`batch_functions`" below. |
+| `batching_rule_keys()` | `-> list[str]` | Read-only introspection: `evoxc::compiler::builtin_rule_keys()` — the sorted rule keys of the compiled-in builtin batching registry (the ops the native engines can map); never `block:*`/`external:*`/`sparse_*`, which come from the host bridge. |
 | `native_compile(envelope: dict)` | `-> NativeProgram` | Decodes an `evoxc-native-ir` envelope and compiles it with `evoxc_cpu::plan::compile`; a non-dict is a `TypeError`, envelope violations keep their native family, an op without a native kernel is `BackendError` at compile time. |
 | `NativeProgram` | class | Immutable compiled native CPU program: `entry()`, `plan_text()`, `stats()`, `output_types()`, `required_ops()`, `run(flat_inputs, resolver=None)`, plus a `__repr__`. |
 | `NativeError` | exception class (`__module__` = `"evoxc._evoxc_native"`) | Every native failure; `.kind` names the public family, `.message` equals `str(exc)`. |
@@ -164,7 +164,7 @@ Negative values keep their sign (the `i64` arm), and `number_to_py` on the way b
 
 ## `transform` is wired to `evoxc-compiler`
 
-`module_ops::transform` validates `kind` with `TransformKind::parse` (unknown → `TransformError` naming the kind and the accepted set), requires `module`/`config` to be dicts (`TypeError`), decodes `module` with `evoxc::core::envelope::decode`, decodes the config with `parse_config`, and runs `evoxc_compiler::transform(kind, &program, &config, extension)` inside `Python::detach`.
+`module_ops::transform` validates `kind` with `TransformKind::parse` (unknown → `TransformError` naming the kind and the accepted set), requires `module`/`config` to be dicts (`TypeError`), decodes `module` with `evoxc::core::envelope::decode`, decodes the config with `parse_config`, and runs `evoxc::compiler::transform(kind, &program, &config, extension)` inside `Python::detach`.
 The transformed `Program` is encoded with `evoxc::core::envelope::encode` and the envelope gains one top-level `"transform"` object: `kind`, `output_ids` (the transformed return operands), `input_ids` (the transformed block arguments) and `batch_dim` (the fresh batch `Dim` name, `null` for the AD transforms).
 Engine `Error` kinds map to `NativeError.kind` verbatim, so e.g. `grad`'s non-scalar-output diagnostic stays `ShapeError` and every transform-engine diagnostic stays `TransformError`.
 
@@ -180,7 +180,7 @@ All JSON-shaped decoding lives in `src/transform_config.rs` and is unit-tested w
 
 ## `batch_functions` is wired to `evoxc-compiler`
 
-`batch_ops::batch_functions` is the population-merge sibling of `transform`: `programs` is a list/tuple of `evoxc-native-ir` envelopes (one per function, decoded by `evoxc::core::envelope::decode` with a `programs[i]` context), the config dict is decoded with `transform_config::parse_batch_config`, and `evoxc_compiler::batch_functions::batch_functions_with_env` runs inside `Python::detach` with the SAME extension-rule bridge `transform` builds (`extension_rule_from_value` + `PyExtensionRule`), so `sparse_*` / `block:*` / `external:*` rules participate exactly as in a transform.
+`batch_ops::batch_functions` is the population-merge sibling of `transform`: `programs` is a list/tuple of `evoxc-native-ir` envelopes (one per function, decoded by `evoxc::core::envelope::decode` with a `programs[i]` context), the config dict is decoded with `transform_config::parse_batch_config`, and `evoxc::compiler::batch_functions::batch_functions_with_env` runs inside `Python::detach` with the SAME extension-rule bridge `transform` builds (`extension_rule_from_value` + `PyExtensionRule`), so `sparse_*` / `block:*` / `external:*` rules participate exactly as in a transform.
 The result is `{"module": <merged evoxc-native-ir envelope>, "batch_report": <BatchReport::to_json()>}` — the shape `native/evoxc-compiler/tests/parity_transform/run_batch_parity.py` drives (`convert.from_native(result["module"])`, `_normalize_report(result["batch_report"])`).
 The `BatchReport` object has exactly the 12 documented keys: `n_functions`, `value_classes`, `shared_classes`, `switched` (group/variants/rows_per_variant), `stacked_constants`, `output_muxes`, `emitted_ops`, `bands`, `band_sizes`, `band_strategy`, `cost_estimate`, `flat_cost_estimate`.
 
@@ -195,7 +195,7 @@ The five data keys are decoded interpreter-free by `transform_config::{batch_axe
 
 ## Extension-rule bridge
 
-`PyExtensionRule` implements `evoxc_compiler::ExtensionRule` over the `Py<PyAny>` callable.
+`PyExtensionRule` implements `evoxc::compiler::ExtensionRule` over the `Py<PyAny>` callable.
 The engine runs detached, so `call` re-attaches with `Python::attach` for the duration of one rule call only.
 The request is encoded as the neutral dict of `native/CONTEXT.md` (`kind`, `op_name`, `rule_key`, `attributes`, `operand_types`, `result_types`, `axes`, `tangents`, `cotangent_type`) via `py_from_json`.
 The callback's answer is read back with `json_from_py`: Python `None` → `Ok(None)` (the engine then raises its ordinary `TransformError` naming the op), a dict → `ExtensionResponse` with `module`/`entry`/`output_ids`/`output_axes` decoded by `transform_config::response_from_json`.
