@@ -110,6 +110,23 @@ A same-order-of-magnitude cost remains for the same reason at 100 ops (0.18 veri
 Warm `run` overhead (`evoxc.run`, best-of-300, host tensors, loadavg ≈4): 1-op graph native 7.5 µs vs numpy 6.1 µs (backend executable 5.04 vs 3.63 µs — the raw Rust `NativeProgram.run` alone is ≈3.55 µs, i.e. the engine call is already numpy's whole backend run, and the residual seam is `_validated_inputs` 0.30 + output wrapping + a 0.2 µs `core.Tensor` construction); 100-op graph native 32.0 µs vs numpy 88.2 µs.
 Caching the resolved extension module on the executable (`engine.program_run(..., native=...)`, 0.34 µs/call saved) and the identity-keyed input/output spec layout (0.3–0.4 µs/call) took the 1-op pipeline call from 8.05 → 7.5 µs with every validation and error message unchanged.
 
+## Numerical equivalence with the numpy backend (binding)
+
+The two CPU backends are not a bit-exact pair: the contract is exact for some values and a measured tolerance elsewhere.
+Measured on this host (numpy 2.5, glibc) by running one graph on both backends with the same inputs:
+- **Exact**: every bool/integer path; every float op built from one-rounding IEEE-754 primitives (`add`/`subtract`/`multiply`/`divide`/`sqrt`/`minimum`/`maximum`/`select`/`cast`, reductions of them in the same order, and `power` for the scalar exponents 0/1/2/3/0.5/−1); `random_*` sampling except the documented f32 `normal` 1-ulp window.
+- **Last-bit tolerance — transcendental elementwise ops**: `sin`/`cos`/`tan`/`tanh`/`exp`/`log`/`log1p`/`erf`/`gelu` call the PLATFORM libm in f32 and their results equal glibc `sinf`/`cosf`/`expf`/`tanhf` bit-for-bit (verified through ctypes), while numpy uses its own SIMD kernels whose output depends on the CPU dispatch; a cross-backend bit-identity contract cannot exist for them.
+  Measured f32 windows over 4000 samples in [−0.9, 0.9]: `sin` 219 differ (≤1 ulp), `cos` 250 (≤1 ulp), `tanh` 1210 (≤1 ulp), `exp` 1558 (≤2 ulp, max abs 2.4e-7).
+- **Relative tolerance — f32 `dot`**: `faer` blocks and threads the gemm differently from numpy's OpenBLAS `sgemm`, so every output element reassociates its K-sum.
+  Measured 64×96 @ 96×48 with N(0,1) operands: 580/3072 elements differ, max abs 9.5e-6, up to ~5e-5 relative where cancellation leaves a near-zero result; both sides are equally far (9.5e-6) from the f64 reference.
+  The parity harness's default f32 tolerance (rtol 1e-5/atol 1e-6) does NOT cover a realistic f32 `dot`; atol 1e-5 does.
+- **`power` with an integer exponent 4..=64 (known deviation)**: the engine routes those exponents through a repeated-squaring arm (`native/evoxc-cpu/src/kernels/pow.rs`) while numpy's `npy_pow` calls `powf` for everything outside its 0/1/2/3/0.5/−1 table.
+  Measured f32: exponent 21 → 3588/4000 samples differ, up to 13 ulp (1.8e-7 abs); exponent 64 → 3066/4000, up to 40 ulp (5.6e-8 abs, 2.4e-6 relative); exponents 4/5 up to 2 ulp.
+  Dropping that arm makes those exponents one `powf` per element and restores bit-identity with numpy.
+- **Consequence for callers — trajectory, not per-op correctness**: any algorithm that branches on float comparisons amplifies a last-bit difference.
+  An evolutionary selection operator reads `<=`/`==` on fitness values, so a 1-ulp `fit` change flips domination relations, ranks and crowding orders, and the generation trajectory diverges while every op stays inside the windows above.
+  Do not read a numpy-vs-native trajectory difference as a staging or version bug without an op-level bisect.
+
 ## Capability matrix (v1)
 
 | Capability | Value | Notes |
