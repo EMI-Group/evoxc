@@ -14,6 +14,7 @@ Staging (mirrors ``numpy/`` step for step):
 
 - ``lower(graph, options)``: ``graph.verify()`` → capability pre-check (the
   live module walk: ``runtime_call`` / collective effects / ``block_call`` /
+  the compiler-escape-hatch ops ``custom_call`` / ``inline_stablehlo`` /
   sparse ops / dtypes) → ``inline_portables(..., keep_backend_impls="native")``
   through the SHARED ``../inline.py`` machinery (a block with neither a
   portable decomposition nor a registered ``native`` impl is an explicit
@@ -66,6 +67,11 @@ Deliberate v1 deferrals (every one an explicit error, never silent):
 - sparse ops — ``Capabilities.sparse_ops=False``; the pre-check rejects the 16
   ``sparse_*`` ops naming the op and suggesting ``backend="numpy"`` (sparse is
   numpy-backend-only by contract);
+- the compiler-escape-hatch ops ``custom_call`` / ``inline_stablehlo`` —
+  ``Capabilities.custom_ops=False``; the pre-check rejects them before the
+  Rust engine gate, naming the op and pointing at the Python-kernel
+  alternatives (``external_call`` / ``runtime_call`` / ``block``) and at
+  ``backend="iree"`` (a compiler backend that forwards custom calls);
 - non-CPU devices — ``load`` raises ``core.BackendError`` naming the kind;
 - any op the Rust engine does not implement — reported by the engine at
   ``lower()`` as a ``BackendError`` naming the ops (``backend="numpy"`` is the
@@ -481,8 +487,11 @@ class NativeBackend(Backend):
         """Capability drift net over the module's current (live) op set.
 
         Mirrors the numpy/compiler pre-checks: effect flags from
-        ``Capabilities``, sparse ops (numpy-backend-only in v1), and the
-        declared dtype set. The engine's own op support is gated separately
+        ``Capabilities``, the ``custom_call`` / ``inline_stablehlo``
+        compiler-escape-hatch ops (``Capabilities.custom_ops=False`` — an
+        in-process CPU engine cannot execute a compiler custom call or raw
+        MLIR), sparse ops (numpy-backend-only in v1), and the declared dtype
+        set. The engine's own op support is gated separately
         (``_probe_engine``) — that is the Rust side's authority.
         """
         capabilities = self.capabilities
@@ -506,6 +515,22 @@ class NativeBackend(Backend):
                 raise core.BackendError(
                     f"capability drift: the native backend cannot execute "
                     f"collective op '{op.name}'"
+                )
+            # Compiler escape hatches ('custom' category — distinct from the
+            # 'sparse' gate below): the compiler adapters FORWARD these ops to
+            # their compiler/HAL, but an in-process CPU engine has nothing to
+            # forward them to. Reject here so the actionable message comes from
+            # this Python gate, never from the Rust engine's own op gate.
+            if op.name in ("custom_call", "inline_stablehlo"):
+                raise core.BackendError(
+                    "capability drift: the native backend cannot execute "
+                    f"'{op.name}' — "
+                    "the in-process Rust CPU engine cannot run a compiler custom call / "
+                    "raw StableHLO snippet. Options: (1) use a Python kernel instead — "
+                    "evoxc.external_call(...) (host-mode kernels dispatch through the "
+                    "native callback resolver), evoxc.ops.runtime_call(...), or "
+                    "evoxc.block(...); (2) run the graph on a compiler backend that "
+                    "forwards custom calls: backend=\"iree\" (also xla/tvm)"
                 )
             if op.opdef.category == "sparse" and not capabilities.sparse_ops:
                 raise core.BackendError(
