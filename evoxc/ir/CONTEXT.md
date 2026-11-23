@@ -7,7 +7,7 @@ EvoXIR is evoxc's compiler-neutral, region-based SSA intermediate representation
 `Function`s of `Block`s of `Op`s over typed `Value`s. EvoXIR is *the* frontend
 IR — StableHLO is an important export target, never the definition. This
 directory owns the IR data model, the op-definition registry (full canonical
-v1 op set, 119 ops), the `Builder` (op-construction API), `verify`
+v1 op set, 121 ops), the `Builder` (op-construction API), `verify`
 (structural/type/attribute validation), serialization (the self-describing IR
 payload — core of the `.evoxcgraph` format; the outer container lives in
 `../persist`), the trusted fast decode of an in-process `evoxc-native-ir`
@@ -115,7 +115,7 @@ Module's counters (stable ids for serialization). Parent pointers
 `verify` checks consistency. `Value.uses` is maintained by the Builder and by
 `Value.replace_all_uses_with`.
 
-## Op registry (canonical v1 set — 119 ops, all declared in `op_defs/`)
+## Op registry (canonical v1 set — 121 ops, all declared in `op_defs/`)
 
 | File | Category | Ops | Effect |
 |---|---|---|---|
@@ -131,6 +131,34 @@ Module's counters (stable ids for serialization). Parent pointers
 | collective.py | collective | rank world_size (scalar int64) | read |
 | sparse.py | sparse | sparse_from_dense sparse_to_dense sparse_coo_to_csr sparse_csr_to_coo sparse_coo_to_csc sparse_csc_to_coo sparse_negate sparse_add sparse_multiply sparse_multiply_dense sparse_reduce_sum sparse_transpose sparse_reshape sparse_concatenate sparse_dot_dense dense_dot_sparse | pure |
 | random.py | random | random_key_mix random_uniform random_normal random_randint random_permutation random_multinomial | pure |
+| custom.py | custom | custom_call inline_stablehlo | callback |
+
+**Opaque custom ops (`op_defs/custom.py`, category `custom` — binding):**
+`custom_call` and `inline_stablehlo` mirror `external_call`: both are
+`arity=(0, None)`, `result_count=None`, `effect=EFFECT_CALLBACK`, zero
+regions, `shape_fn=None`, and their result types resolve from the required
+`result_specs` attribute (or explicit `result_types`), with `verify` checking
+the two agree.
+`custom_call.call_target_name` is a REQUIRED `ATTR_STR` naming the StableHLO
+custom-call target symbol (non-empty; `verify` rejects an empty string).
+`custom_call.result_specs` is a REQUIRED `ATTR_ANY` sequence of `ValueType`s
+exactly equal to the op's result types (same rule as `external_call`).
+`custom_call.backend_config` is an `ATTR_STR` defaulting to `""` (opaque
+backend-specific configuration passed through with the call).
+`custom_call.api_version` is an `ATTR_INT` defaulting to `1` (`verify`
+rejects a non-int, a bool, or a value < 1).
+`custom_call.has_side_effect` is an `ATTR_BOOL` defaulting to `False`.
+`inline_stablehlo.body` is a REQUIRED `ATTR_STR` holding a raw
+StableHLO/MLIR snippet (non-empty; `verify` rejects an empty string).
+`inline_stablehlo.result_specs` is a REQUIRED `ATTR_ANY` sequence of
+`ValueType`s exactly equal to the op's result types.
+`inline_stablehlo.has_side_effect` is an `ATTR_BOOL` defaulting to `False`.
+Both ops' attribute VALUES are checked by `verify._verify_op_specific_attrs`
+(guarded by the `_OP_SPECIFIC_ATTR_OPS` set, so other ops pay nothing beyond
+their tag checks); serialization needs no special case because the
+`result_specs` encoding is keyed by ATTRIBUTE NAME.
+Neither op has a frontend builder, exporter entry, transform rule or backend
+implementation yet — declaring them does not make any backend accept them.
 
 **Multi-algorithm random framework (binding):** `op_defs/random.py` is the
 SINGLE source of truth for the canonical algorithm names — `ALGORITHMS =
@@ -397,7 +425,7 @@ extension-gated native transform/`batch_functions` legs, and
 `EVOXC_NATIVE_DECODE_CHECK=1` turns on its `ir.verify` audit.
 
 ## Known Issues
-- **Count of record is 119 ops; `__init__.py`'s module docstring still says "97 ops"** (stale). Verified split: elementwise 38 + comparison 6, structure 13, reduction 9, sorting 2, linalg 12, control 8 + terminator 1, collective 8, sparse 16, random 6 — 11 categories, `{o.category for o in ir.all_opdefs()}`. Use `ir.op_names()`/`ir.all_opdefs()` rather than the docstring.
+- **Count of record is 121 ops** (`__init__.py`'s module docstring is in sync). Verified split: elementwise 38 + comparison 6, structure 13, reduction 9, sorting 2, linalg 12, control 8 + terminator 1, collective 8, sparse 16, random 6, custom 2 — 12 categories, `{o.category for o in ir.all_opdefs()}`. Use `ir.op_names()`/`ir.all_opdefs()` rather than prose.
 
 - **Generic inference + ops-side compensation (sanctioned division of
   labor):** the registry keeps generic hooks — `divide` →
@@ -423,7 +451,7 @@ extension-gated native transform/`batch_functions` legs, and
 
 ## Status
 
-Phase 2 complete for this directory: SSA data model, op registry (119 ops),
+Phase 2 complete for this directory: SSA data model, op registry (121 ops),
 shape-inference hooks (`inference.py`, 56 hooks), `pretty_print`, `verify`
 (the full invariant set — module/function/region/op/value levels, SSA
 dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
