@@ -41,6 +41,16 @@ Dependency rules (binding):
   No crate contains `unsafe` logic: `evoxc-cpu` uses `ndarray` for all N-dimensional layout work and `faer` for `dot`'s f32/f64 gemm, so it needs neither SIMD intrinsics nor a raw BLAS microkernel.
   `faer` (feature `rayon`) is the ONE place a third-party thread pool is permitted, and only inside a single `dot` call above its work thresholds; every other thread in the workspace is a scoped thread owned by the call that spawned it.
 
+## Publishing (crates.io)
+
+The Rust core is published as five crates in dependency order: `evoxc-core` → `evoxc-compiler` → `evoxc-runtime` → `evoxc-cpu` → `evoxc`.
+Every internal dependency in `[workspace.dependencies]` carries one version (`0.1.0`) beside its path, so a published manifest resolves from crates.io; the workspace has exactly one version, bumped for all crates together.
+Publishable crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-cpu` and `evoxc`; each inherits `license = "Apache-2.0"`, `authors`, `repository`, `homepage`, `keywords` and `categories` from `[workspace.package]`, and the facade additionally inherits `documentation` and ships its own `./evoxc/README.md` (the repository README sits outside every crate directory, so `readme` is never inherited).
+The single license is Apache-2.0 everywhere — `[workspace.package]`, `../LICENSE` and the Python distribution's metadata agree.
+`evoxc-python` is `publish = false`: a cdylib extension module, not a library crate, reaching users only inside the `evoxc` Python wheel.
+`cargo package --list -p <crate>` inspects a package without touching the network; `cargo package [-p <crate>]` (with or without `--no-verify`) for `evoxc-compiler` and everything above it fails until their siblings exist on crates.io (`no matching package named 'evoxc-core' found`), which is why the publish order above is mandatory rather than convenient.
+`[package.metadata.docs.rs] all-features = true` on the facade is what makes docs.rs render the `cpu` and `runtime` modules.
+
 ## Generated files are authoritative
 
 Two generated tables are committed and are the authority; the generators are dev aids re-run only when the Python registry changes:
