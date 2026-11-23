@@ -173,7 +173,7 @@ Every stage is inspectable without side effects: `Graph.summary()`/`digest()` (a
 
 ### Test suite
 
-`./tests/` at this tree: **7859 passed, 88 skipped, 4 xfailed, 0 failed** (7951 reported items in 1077 s; Python 3.14.10, numpy 2.5.2, `iree-base` 3.13.0, the Intel Panther Lake Vulkan device present, one built extension; no CUDA/usable ROCm/tvm/torch/PJRT). `./evoxc_hf/tests/`: **706 passed, 22 skipped**. Every skip in either suite is a host/dependency guard. `./tests/CONTEXT.md` owns the per-area inventories and the exact environment.
+`./tests/` at this tree: **8015 passed, 88 skipped, 4 xfailed, 0 failed** (8107 reported items in 1134 s; Python 3.14.10, numpy 2.5.2, `iree-base` 3.13.0, the Intel Panther Lake Vulkan device present, one built extension; no CUDA/usable ROCm/tvm/torch/PJRT). `./evoxc_hf/tests/`: **706 passed, 22 skipped**. Every skip in either suite is a host/dependency guard. `./tests/CONTEXT.md` owns the per-area inventories and the exact environment.
 
 ### Downstream validation (2026-11-23, this host)
 The evoxc-based consumers were exercised against this tree's wheel (a throwaway venv per repo; the read-only checkouts were copied out of their source trees and never modified):
