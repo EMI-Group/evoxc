@@ -397,6 +397,7 @@ pub(crate) fn attrs_json(attributes: &Attrs) -> Map<String, Json> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::Builder;
+    use evoxc_core::attr::{AttrValue, Attrs};
     use evoxc_core::dim::Dim;
     use evoxc_core::dtype::DType;
     use evoxc_core::graph::Program;
@@ -419,6 +420,41 @@ pub(crate) mod test_support {
         let args = builder.block_arguments().unwrap();
         let out = builder.binary("add", args[0], args[1]).unwrap();
         builder.set_terminator(&[out], None).unwrap();
+        builder.finish()
+    }
+
+    /// The attribute payload of one `custom`-category callback op
+    /// (`custom_call` / `inline_stablehlo`), its `result_specs` describing the
+    /// op's single `result` type.
+    ///
+    /// These ops have no builtin batching or derivative rule, so every
+    /// transform must reject them with an explicit `TransformError`.
+    pub fn callback_attrs(op: &str, result: &ValueType) -> Attrs {
+        let specs =
+            AttrValue::Any(evoxc_core::wire::value_types_to_json(std::slice::from_ref(result)));
+        match op {
+            "custom_call" => Attrs::from_pairs([
+                ("call_target_name", AttrValue::Str("evoxc_probe".to_string())),
+                ("result_specs", specs),
+            ]),
+            "inline_stablehlo" => Attrs::from_pairs([
+                ("body", AttrValue::Str("module {}".to_string())),
+                ("result_specs", specs),
+            ]),
+            other => panic!("test_support::callback_attrs: unknown callback op '{other}'"),
+        }
+    }
+
+    /// `x: f32[2, 3] -> callback_op(x)` with an explicit `f32[2, 3]` result.
+    pub fn callback_program(op: &str) -> Program {
+        let result = f32_ty(&[2, 3]);
+        let mut builder = Builder::new("main");
+        builder.open_function("main", std::slice::from_ref(&result)).unwrap();
+        let args = builder.block_arguments().unwrap();
+        let results = builder
+            .emit(op, &args, &callback_attrs(op, &result), Some(&[result]), None)
+            .unwrap();
+        builder.set_terminator(&results, None).unwrap();
         builder.finish()
     }
 }

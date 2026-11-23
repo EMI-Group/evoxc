@@ -526,6 +526,63 @@ mod tests {
     }
 
     #[test]
+    fn callback_ops_without_a_derivative_rule_are_rejected() {
+        use crate::test_support::callback_attrs;
+
+        // `x: f32[2, 3] -> y = reduce_sum(callback_op(x), axes=[0, 1])`: a rank-0
+        // f32 output, so `grad` reaches the callback op before any other check.
+        let scalar_callback_graph = |op: &str| {
+            let mut builder = Builder::new("main");
+            builder.open_function("main", &[f32_matrix()]).unwrap();
+            let args = builder.block_arguments().unwrap();
+            let produced = builder
+                .emit(
+                    op,
+                    &args,
+                    &callback_attrs(op, &f32_matrix()),
+                    Some(&[f32_matrix()]),
+                    None,
+                )
+                .unwrap()[0];
+            let total = {
+                let mut ctx = RuleCtx::new(&mut builder);
+                ctx.reduce_sum(produced, &[0, 1], false).unwrap()
+            };
+            builder.set_terminator(&[total], None).unwrap();
+            builder.finish()
+        };
+
+        let registry = Registry::default();
+        let env = TransformEnv::with_registry(&registry);
+        for op in ["custom_call", "inline_stablehlo"] {
+            let program = scalar_callback_graph(op);
+            let err = grad_graph(&program, &TransformConfig::default(), &env).unwrap_err();
+            assert_eq!(err.kind_str(), "TransformError");
+            assert!(
+                err.message
+                    .contains(&format!("grad/vjp: no VJP rule for op '{op}'")),
+                "{}",
+                err.message
+            );
+            let err = forward_sweep(&program, &[0], &env).unwrap_err();
+            assert_eq!(err.kind_str(), "TransformError");
+            assert!(
+                err.message.contains(&format!("jvp: no JVP rule for op '{op}'")),
+                "{}",
+                err.message
+            );
+            let err = reverse_sweep(&program, &[0], &env).unwrap_err();
+            assert_eq!(err.kind_str(), "TransformError");
+            assert!(
+                err.message
+                    .contains(&format!("grad/vjp: no VJP rule for op '{op}'")),
+                "{}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
     fn vjp_rejects_a_non_scalar_unseeded_output() {
         let mut builder = Builder::new("main");
         builder.open_function("main", &[f32_matrix()]).unwrap();

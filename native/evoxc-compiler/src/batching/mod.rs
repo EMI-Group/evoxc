@@ -605,6 +605,28 @@ mod tests {
         assert!(err.message.contains("no batching rule for op 'external_call'"));
     }
     #[test]
+    fn callback_ops_without_a_batching_rule_are_rejected() {
+        use crate::test_support::callback_program;
+        use crate::TransformConfig;
+
+        let config = TransformConfig {
+            input_axes: vec![Some(0)],
+            ..TransformConfig::default()
+        };
+        for op in ["custom_call", "inline_stablehlo"] {
+            let program = callback_program(op);
+            let expected = format!("no batching rule for op '{op}'");
+            let err = crate::vectorize::vectorize_graph(&program, &config, &TransformEnv::builtin())
+                .unwrap_err();
+            assert_eq!(err.kind_str(), "TransformError");
+            assert!(err.message.contains(&expected), "{}", err.message);
+            let err = crate::vmap::vmap_graph(&program, &config, &TransformEnv::builtin())
+                .unwrap_err();
+            assert_eq!(err.kind_str(), "TransformError");
+            assert!(err.message.contains(&expected), "{}", err.message);
+        }
+    }
+    #[test]
     fn builtin_rule_keys_are_sorted_and_cover_the_builtins() {
         let keys = builtin_rule_keys();
         assert!(!keys.is_empty());
@@ -628,7 +650,8 @@ mod tests {
     #[test]
     fn builtin_rule_keys_exclude_unruled_ops_and_host_namespaces() {
         let keys = builtin_rule_keys();
-        // The 15-op batch gap + random ops + the runtime call op have no rule.
+        // The 15-op batch gap + random ops + the runtime call op + the custom
+        // callback ops have no rule.
         for name in [
             "sort",
             "argsort",
@@ -640,6 +663,8 @@ mod tests {
             "nan_to_num",
             "random_uniform",
             "runtime_call",
+            "custom_call",
+            "inline_stablehlo",
         ] {
             assert!(
                 !keys.iter().any(|key| key == name),

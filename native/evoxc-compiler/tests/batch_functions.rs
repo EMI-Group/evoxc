@@ -5,7 +5,7 @@ use evoxc_compiler::batch_functions::{
     SwitchOps,
 };
 use evoxc_compiler::Builder;
-use evoxc_core::attr::ArrayPayload;
+use evoxc_core::attr::{ArrayPayload, Attrs};
 use evoxc_core::dim::Dim;
 use evoxc_core::dtype::DType;
 use evoxc_core::error::{Error, Result};
@@ -95,6 +95,35 @@ fn sort_program() -> Program {
     build(DType::parse("float32").expect("float32"), &[3], |builder, args| {
         let attrs = evoxc_core::attr::Attrs::new();
         builder.emit_typed_one("sort", &[args[0]], &attrs)
+    })
+}
+
+/// The attribute payload of one `custom`-category callback op, its
+/// `result_specs` describing the single `f32[3]` result.
+fn callback_attrs(op: &str) -> Attrs {
+    use evoxc_core::attr::AttrValue;
+    let result = f32_ty(&[3]);
+    let specs = AttrValue::Any(evoxc_core::wire::value_types_to_json(std::slice::from_ref(&result)));
+    match op {
+        "custom_call" => Attrs::from_pairs([
+            ("call_target_name", AttrValue::Str("evoxc_probe".to_string())),
+            ("result_specs", specs),
+        ]),
+        "inline_stablehlo" => Attrs::from_pairs([
+            ("body", AttrValue::Str("module {}".to_string())),
+            ("result_specs", specs),
+        ]),
+        other => panic!("unknown callback op '{other}'"),
+    }
+}
+
+/// A program whose only non-terminator op is a callback op with no batching
+/// rule (`custom_call` / `inline_stablehlo`).
+fn callback_program(op: &'static str) -> Program {
+    build(DType::parse("float32").expect("float32"), &[3], move |builder, args| {
+        let result = f32_ty(&[3]);
+        let results = builder.emit(op, &[args[0]], &callback_attrs(op), Some(&[result]), None)?;
+        Ok(results[0])
     })
 }
 
@@ -492,6 +521,19 @@ fn ops_without_a_batching_rule_are_rejected() {
     assert_transform_error(&error, "no batching rule registered for key 'sort'");
     assert!(error.to_string().contains("v1 deferral of batch_functions"), "{error}");
     assert!(error.to_string().contains("from function 0"), "{error}");
+}
+#[test]
+fn callback_ops_without_a_batching_rule_are_rejected() {
+    for op in ["custom_call", "inline_stablehlo"] {
+        let error = merge_error(&[callback_program(op), callback_program(op)], &config());
+        assert_transform_error(&error, &format!("cannot batch op '{op}' from function 0"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("no batching rule registered for key '{op}'")),
+            "{error}"
+        );
+    }
 }
 
 #[test]
