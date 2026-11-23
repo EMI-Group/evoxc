@@ -150,6 +150,15 @@ Measured on this host (numpy 2.5, glibc) by running one graph on both backends w
 - **Blocks whose impl exists only for another backend** — `inline_portables(..., keep_backend_impls="native")` requires a `native` impl or a portable, and `load()` re-checks it.
 - **Pipeline options** — none in v1 (`KNOWN_OPTIONS` all-empty): a compiler option passed here fails loudly rather than being ignored.
 
+## Known issues
+
+- **evox NSGA2 on DTLZ2 diverges in trajectory (expected, measured; not a staging bug).**
+  Against one wheel built from this tree, evox's quickstart (`examples/quickstart.py`, a separate repo) over seed 42 gives identical single-objective PSO output on both backends but a different multi-objective NSGA2 result: numpy `339` Pareto points with `max |f|` deviation `0.005165`, native `348` with `0.004541` (objective ranges identical at [0, 1] both).
+  Attribution chain: generation 1 (`init_step` = evaluation + environmental selection, no `power`/sort/dot in the graph) already differs in `fit` — 7/80 f32 elements, max abs 1.19e-7 — which is `DTLZ2`'s `sin`/`cos` alone; `pop`/`rank`/`dis` are still exact there, and `pop` first differs at generation 3.
+  From the SAME gen-1 state the next step gives: tournament `pool` exact, `parents` exact, crossover `crossed` exact, mutated `offspring` 1/200 different (5.96e-8, the `power(x, 21)` arm), `fit_new` 7/80 (1.19e-7), `rank` 1 element, `crowd` 2/80, selection `order` 13/40.
+  Sort/gather/scatter/topk/randint/uniform are bit-identical on those inputs; the divergence starts in the float evaluation and is amplified by non-dominated sorting's comparison branches.
+- **`power` integer-exponent arm deviates from numpy** — see the equivalence bullet above (≤40 ulp on f32, inside the float tolerance contract but outside numpy's answers); the arm lives in `native/evoxc-cpu/src/kernels/pow.rs`, outside this node.
+
 ## Import acyclicity
 
 Top-level imports: `evoxc.core`, `evoxc.ir`, this backend's siblings (`..backend`, `..program`, `..registry`, `..options`, `..inline`, `..external_validate`), numpy.
