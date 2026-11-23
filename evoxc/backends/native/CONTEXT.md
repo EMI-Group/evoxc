@@ -114,15 +114,12 @@ Caching the resolved extension module on the executable (`engine.program_run(...
 
 The two CPU backends are not a bit-exact pair: the contract is exact for some values and a measured tolerance elsewhere.
 Measured on this host (numpy 2.5, glibc) by running one graph on both backends with the same inputs:
-- **Exact**: every bool/integer path; every float op built from one-rounding IEEE-754 primitives (`add`/`subtract`/`multiply`/`divide`/`sqrt`/`minimum`/`maximum`/`select`/`cast`, reductions of them in the same order, and `power` for the scalar exponents 0/1/2/3/0.5/−1); `random_*` sampling except the documented f32 `normal` 1-ulp window.
+- **Exact**: every bool/integer path; every float op built from one-rounding IEEE-754 primitives (`add`/`subtract`/`multiply`/`divide`/`sqrt`/`minimum`/`maximum`/`select`/`cast`, reductions of them in the same order, and `power` for every exponent — numpy's 0/1/2/3/0.5/−1 special table is reproduced and every other exponent is one libm `powf`/`pow` call, the same function numpy calls); `random_*` sampling except the documented f32 `normal` 1-ulp window.
 - **Last-bit tolerance — transcendental elementwise ops**: `sin`/`cos`/`tan`/`tanh`/`exp`/`log`/`log1p`/`erf`/`gelu` call the PLATFORM libm in f32 and their results equal glibc `sinf`/`cosf`/`expf`/`tanhf` bit-for-bit (verified through ctypes), while numpy uses its own SIMD kernels whose output depends on the CPU dispatch; a cross-backend bit-identity contract cannot exist for them.
   Measured f32 windows over 4000 samples in [−0.9, 0.9]: `sin` 219 differ (≤1 ulp), `cos` 250 (≤1 ulp), `tanh` 1210 (≤1 ulp), `exp` 1558 (≤2 ulp, max abs 2.4e-7).
 - **Relative tolerance — f32 `dot`**: `faer` blocks and threads the gemm differently from numpy's OpenBLAS `sgemm`, so every output element reassociates its K-sum.
   Measured 64×96 @ 96×48 with N(0,1) operands: 580/3072 elements differ, max abs 9.5e-6, up to ~5e-5 relative where cancellation leaves a near-zero result; both sides are equally far (9.5e-6) from the f64 reference.
   The parity harness's default f32 tolerance (rtol 1e-5/atol 1e-6) does NOT cover a realistic f32 `dot`; atol 1e-5 does.
-- **`power` with an integer exponent 4..=64 (known deviation)**: the engine routes those exponents through a repeated-squaring arm (`native/evoxc-cpu/src/kernels/pow.rs`) while numpy's `npy_pow` calls `powf` for everything outside its 0/1/2/3/0.5/−1 table.
-  Measured f32: exponent 21 → 3588/4000 samples differ, up to 13 ulp (1.8e-7 abs); exponent 64 → 3066/4000, up to 40 ulp (5.6e-8 abs, 2.4e-6 relative); exponents 4/5 up to 2 ulp.
-  Dropping that arm makes those exponents one `powf` per element and restores bit-identity with numpy.
 - **Consequence for callers — trajectory, not per-op correctness**: any algorithm that branches on float comparisons amplifies a last-bit difference.
   An evolutionary selection operator reads `<=`/`==` on fitness values, so a 1-ulp `fit` change flips domination relations, ranks and crowding orders, and the generation trajectory diverges while every op stays inside the windows above.
   Do not read a numpy-vs-native trajectory difference as a staging or version bug without an op-level bisect.
@@ -152,12 +149,9 @@ Measured on this host (numpy 2.5, glibc) by running one graph on both backends w
 
 ## Known issues
 
-- **evox NSGA2 on DTLZ2 diverges in trajectory (expected, measured; not a staging bug).**
-  Against one wheel built from this tree, evox's quickstart (`examples/quickstart.py`, a separate repo) over seed 42 gives identical single-objective PSO output on both backends but a different multi-objective NSGA2 result: numpy `339` Pareto points with `max |f|` deviation `0.005165`, native `348` with `0.004541` (objective ranges identical at [0, 1] both).
-  Attribution chain: generation 1 (`init_step` = evaluation + environmental selection, no `power`/sort/dot in the graph) already differs in `fit` — 7/80 f32 elements, max abs 1.19e-7 — which is `DTLZ2`'s `sin`/`cos` alone; `pop`/`rank`/`dis` are still exact there, and `pop` first differs at generation 3.
-  From the SAME gen-1 state the next step gives: tournament `pool` exact, `parents` exact, crossover `crossed` exact, mutated `offspring` 1/200 different (5.96e-8, the `power(x, 21)` arm), `fit_new` 7/80 (1.19e-7), `rank` 1 element, `crowd` 2/80, selection `order` 13/40.
-  Sort/gather/scatter/topk/randint/uniform are bit-identical on those inputs; the divergence starts in the float evaluation and is amplified by non-dominated sorting's comparison branches.
-- **`power` integer-exponent arm deviates from numpy** — see the equivalence bullet above (≤40 ulp on f32, inside the float tolerance contract but outside numpy's answers); the arm lives in `native/evoxc-cpu/src/kernels/pow.rs`, outside this node.
+- **Cross-backend trajectories are exact where the ops are exact; only the documented float windows can move them.**
+  Measured end to end: evox's quickstart (`examples/quickstart.py`, a separate repo) over seed 42 produces identical output on both backends — single-objective PSO identical, NSGA2 `339` Pareto points with `max |f|` deviation `0.005165`.
+  The remaining sources of cross-backend difference are the f32 transcendental window and f32 `dot` above; an algorithm that branches on float comparisons can amplify them, so a trajectory difference is diagnosed with an op-level bisect (one-op graphs over the real intermediate arrays), never assumed to be a staging or version bug.
 
 ## Import acyclicity
 
