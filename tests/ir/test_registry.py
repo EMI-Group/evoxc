@@ -3,7 +3,7 @@
 The registry (``evoxc.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
-set (119 ops) so any accidental addition/removal/rename/effect change in the
+set (121 ops) so any accidental addition/removal/rename/effect change in the
 ``evoxc`` package is caught here.
 """
 
@@ -150,6 +150,11 @@ _SORTING = (
     "argsort",
 )
 
+_CUSTOM = (
+    "custom_call",
+    "inline_stablehlo",
+)
+
 CANONICAL_NAMES = (
     _ELEMENTWISE_BINARY
     + ("cast",)
@@ -164,6 +169,7 @@ CANONICAL_NAMES = (
     + _SPARSE
     + _RANDOM
     + _SORTING
+    + _CUSTOM
 )
 
 _CATEGORY_EXPECTED = {
@@ -180,12 +186,15 @@ _CATEGORY_EXPECTED = {
     **{name: "sparse" for name in _SPARSE},
     **{name: "random" for name in _RANDOM},
     **{name: "sorting" for name in _SORTING},
+    **{name: "custom" for name in _CUSTOM},
 }
 
 _EFFECT_EXPECTED = {name: "pure" for name in CANONICAL_NAMES}
 _EFFECT_EXPECTED["runtime_call"] = "callback"
 _EFFECT_EXPECTED["external_call"] = "callback"
 _EFFECT_EXPECTED["block_call"] = "read"
+_EFFECT_EXPECTED["custom_call"] = "callback"
+_EFFECT_EXPECTED["inline_stablehlo"] = "callback"
 _EFFECT_EXPECTED["rank"] = "read"
 _EFFECT_EXPECTED["world_size"] = "read"
 _EFFECT_EXPECTED.update(
@@ -333,7 +342,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 119
+    assert len(names) == 121
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -349,7 +358,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 119) --------------------------------------
+# --- 3. per-op effect mapping (all 121) --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -426,7 +435,16 @@ _SHAPE_FN_OPS = (
     + _SORTING
 )
 
-_NO_SHAPE_FN_OPS = ("constant", "call", "if", "runtime_call", "external_call", "block_call")
+_NO_SHAPE_FN_OPS = (
+    "constant",
+    "call",
+    "if",
+    "runtime_call",
+    "external_call",
+    "block_call",
+    "custom_call",
+    "inline_stablehlo",
+)
 
 
 @pytest.mark.parametrize("name", _SHAPE_FN_OPS)
@@ -504,7 +522,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 119
+    assert len(opdefs) == 121
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )

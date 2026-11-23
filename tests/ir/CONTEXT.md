@@ -4,17 +4,18 @@
 
 pytest suite validating the `evoxc.ir` package (sibling — the contract lives in
 `../../evoxc/ir/CONTEXT.md`, read it before touching these tests). These tests are
-the executable spec of the IR layer: the op registry (canonical 119-op v1 set)
+the executable spec of the IR layer: the op registry (canonical 121-op v1 set)
 and its lookup contract, `verify()` invariants, serialization
 round-trips/integrity, `pretty_print` golden output, the `Builder`,
 shape-inference hooks, and the SSA data model.
-862 tests, all fast (whole file set runs <2s).
+894 tests, all fast (whole file set runs <2s).
 
 ## Test files
 
 | File | Covers |
 |---|---|
-| `test_registry.py` | 119-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
+| `test_registry.py` | 121-op canonical set (incl. `return` terminator, `broadcast_collective` distinct from shape-op `broadcast`, and the `custom` pair `custom_call`/`inline_stablehlo`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
+| `test_custom_ops.py` | 26 tests — the two opaque custom ops (`custom_call`/`inline_stablehlo`): `OpDef` contract (category `custom`, effect `callback`, arity `(0, None)`, `result_count is None`, no shape function, exact attr schemas + defaults), `Builder.create` result-type resolution from `result_specs` (single/multiple, symbolic `Dim` and runtime-dynamic `None` dims, empty sequence), `verify` success plus each failure (empty target/body, bad `api_version`, non-bool `has_side_effect`, `result_specs` mismatch / not a ValueType sequence), byte-identical serialize→deserialize→serialize with quotes/backslashes/newlines in the body, and `pretty_print` rendering |
 | `test_opdef_lookup.py` | 12 tests — the op-def lookup contract and the cached-lookup-callable speed hook: unregistered name → `KeyError` with `has_opdef` False and no registry mutation, `register_opdef` returns its argument / rejects duplicates with `ValueError` (first registration wins) / is reversible, repeated `opdef` calls return the identical `OpDef`, `Op.opdef` is `ir.opdef(op.name)` for every op of a traced graph, `op._OPDEF_LOOKUP` caches only the registry callable (never a name→`OpDef` mapping), NO negative memo (an `Op` built and looked up before registration raises then resolves after it, and raises again once removed), and an extra registered `OpDef` disturbs neither tracing nor `verify()` |
 | `test_verify.py` | valid modules + one test per violation class from `verify()`'s docstring: module/function/region/op/SSA/use-bookkeeping/shape_fn-agreement/attr-schema violations, location-annotated messages, TypeError on non-Module |
 | `test_serialize.py` | payload schema, multi-feature round-trips (symbolic dims, constants as base64 npy, all effect kinds, if/while regions, multi-function + `call`), original id preservation, fast-forwarded counters, tamper detection (sha256), version/format rejection (PersistenceError) |
