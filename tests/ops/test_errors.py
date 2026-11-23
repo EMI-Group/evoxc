@@ -1,6 +1,6 @@
 """Error semantics of the full public op surface (contract: ``evoxc/ops/CONTEXT.md``).
 
-Every public op in ``evoxc.ops.__all__`` (102 names) is exercised in three
+Every public op in ``evoxc.ops.__all__`` (104 names) is exercised in three
 parametrized error categories:
 
 (a) called OUTSIDE a trace -> ``TraceError`` with the directing message
@@ -29,7 +29,7 @@ import evoxc
 from tests.ops.conftest import ops_of
 
 # ---------------------------------------------------------------------------
-# Per-op table of MINIMAL VALID call arguments (all 101 public ops).
+# Per-op table of MINIMAL VALID call arguments (all 104 public ops).
 # Each entry: op name -> (args_builder, kwargs). ``args_builder`` receives the
 # dict ``t`` of symbolic tensors below and returns the positional args of a
 # valid call; ``kwargs`` are constant per op.
@@ -176,6 +176,14 @@ OP_CALLS = {
         lambda t: ("external_k", t["x"], t["x"]),
         {"result": _RUNTIME_RESULT},
     ),
+    "custom_call": (
+        lambda t: ("custom_target", t["x"]),
+        {"result": _RUNTIME_RESULT},
+    ),
+    "inline_stablehlo": (
+        lambda t: ("%out0 = stablehlo.add %in0, %in0 : tensor<4xf32>", t["x"]),
+        {"result": _RUNTIME_RESULT},
+    ),
     "stop_gradient": (lambda t: (t["x"],), {}),
 }
 
@@ -227,8 +235,14 @@ def _tensor_variant(op_name, args_builder):
             args[0] = [t["x"], tensor]  # Tensor inside the container
         elif op_name == "runtime_call":
             args[1] = tensor  # args[0] is the callback, args[1] the 1st operand
-        elif op_name == "external_call":
-            args[1] = tensor  # args[0] is the kernel name, args[1] the 1st operand
+        elif op_name in (
+            "external_call",
+            "custom_call",
+            "inline_stablehlo",
+        ):
+            # args[0] is the kernel name / target name / snippet string,
+            # args[1] the first operand.
+            args[1] = tensor
         else:
             args[0] = tensor
         return tuple(args)
@@ -252,9 +266,9 @@ def _op_ref(op_name):
 # ---------------------------------------------------------------------------
 
 def test_op_table_covers_all_public_ops():
-    """The table must exercise exactly the 102 public op names."""
+    """The table must exercise exactly the 104 public op names."""
     assert set(OP_CALLS) == set(evoxc.ops.__all__)
-    assert len(evoxc.ops.__all__) == 102
+    assert len(evoxc.ops.__all__) == 104
 
 
 # ---------------------------------------------------------------------------
