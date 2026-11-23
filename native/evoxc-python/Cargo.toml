@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "PyO3 extension module evoxc._evoxc_native: the inference/transform/CPU-engine bridge over the evoxc facade."
 [lib]
