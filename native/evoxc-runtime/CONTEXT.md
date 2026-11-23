@@ -54,6 +54,7 @@ Consequences, each pinned by a test:
 ## Known gaps (intentional)
 
 - **No drivers, allocators, queues or kernels.** Device buffers are either host `Vec<u8>` or an opaque `DeviceHandle` (a `placeholder()` handle with no resource id for unallocated outputs); nothing dereferences a handle.
+- **No extension surface.** The crate declares no traits at all (no `Driver`/`Backend`/`Session`/`Executable` trait), no `dyn` trait objects, no `extern`/fn-pointer slots and no `libloading`/`dlopen` dependency (`Cargo.toml` dependencies are `evoxc-core` only), so a foreign kernel or device plugin has no seam here — adding one means introducing a new trait, not filling a placeholder; the only "driver hook" is the inherent settlement pair `Submission::complete_success`/`complete_failure` (mirrored on `Completion`) plus `Buffer::mark_ready`, called by whichever side created the submission.
 - **No execution.** A submission is settled by the side that created it (`complete_success`/`complete_failure`, reachable from the returned `Completion`); `wait`/`synchronize` on still-pending work is an explicit `BackendError`, never a hang or a fake success.
 - **Static shapes only for storage.** Buffers and output types must be statically sized, so a symbolic *output* type is rejected at `Executable::load` (symbolic *inputs* are accepted: only dims already known are checked).
 - **No `MappedView` / `ForeignExport` / DLPack surface.** Proposal §12/§15 objects that require a real payload are not modelled yet.
