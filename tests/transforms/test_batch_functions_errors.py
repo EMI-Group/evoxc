@@ -510,8 +510,9 @@ def test_sparse_output_reaches_the_registered_node_guard():
 # ---------------------------------------------------------------------------
 
 _SWITCH_CATEGORIES = (
-    "['collective', 'comparison', 'control', 'elementwise', 'linalg', "
-    "'random', 'reduction', 'sorting', 'sparse', 'structure', 'terminator']"
+    "['collective', 'comparison', 'control', 'custom', 'elementwise', "
+    "'linalg', 'random', 'reduction', 'sorting', 'sparse', 'structure', "
+    "'terminator']"
 )
 
 
