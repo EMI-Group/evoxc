@@ -4,7 +4,7 @@
 
 `native/` is the Rust core of evoxc and the **single numerical authority** for builtin op schemas, dtype promotion, shape inference, graph transforms (`vectorize`, `vmap`, `jvp`, `vjp`, `grad`), the runtime session/buffer model and native CPU execution (`evoxc-cpu`: compile to a plan, run on typed host buffers).
 Python remains the frontend: it executes `defn` bodies and adapts Python objects, but it must never hold a second implementation of builtin inference or of a builtin transform rule.
-Language bindings (PyO3 now, others later) are not a second implementation of evoxc.
+Language bindings (PyO3 now, others later) are not a second implementation of evoxc, and they consume the published `evoxc` facade crate rather than the individual crates.
 The design rationale and the proposed end state are `../NATIVE_ARCHITECTURE_PROPOSAL.md`; this file is the binding contract for what exists here.
 The implemented Python packages stay authoritative for behavior **until** a code path delegates natively: the port must match `evoxc/ir/inference.py`, `evoxc/transforms/rules.py`, `evoxc/transforms/batching.py` and `evoxc/transforms/autodiff.py` exactly.
 
