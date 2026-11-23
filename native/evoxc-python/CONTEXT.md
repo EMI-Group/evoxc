@@ -99,6 +99,7 @@ Preflight (GIL held, before the detach) requires `resolver` whenever `plan.requi
 Call shape is `call_block(name, args)` plus — when the engine's `static_args` is non-null and non-empty — the static args payload as a third positional argument (converted with `crate::convert::py_from_json`); `call_external(name, args)` and `call_runtime(name, args)` always take exactly two arguments.
 `args` is a Python list of numpy arrays and the answer must be a list/tuple of numpy arrays (converted back through the same array→`Buffer` path).
 A resolver exception, an un-iterable answer or an unconvertible array becomes `BackendError("resolver.<method>(<name>) raised: <interpreter text>")`; nothing panics and nothing is silently skipped.
+Nothing in this crate loads native code — no `libloading`/`dlopen`/`dlsym`, no `extern "C"` function pointer built from user input, no Triton, no `PyCapsule`/`PyDLL`/`ctypes`, and no `unsafe` of its own — so the Python resolver object is the ONLY route by which non-builtin work reaches Rust: the engine never dispatches to a foreign `.so`, it calls the `Py<PyAny>` callables (`evoxc/backends/native/resolver.py`'s `NativeCallbackResolver` on the frontend side, whose `call_external` reads the `evoxc.external` registry of Python callables and rejects a `device_resident=True` slot).
 
 ## Buffer hand-off (native CPU engine)
 
