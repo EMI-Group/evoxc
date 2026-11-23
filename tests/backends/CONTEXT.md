@@ -84,6 +84,7 @@ This file owns the test-side contracts, the skip/host-guard policy and the recor
 | `test_collectives.py` | single- and multi-rank collectives, `rank`/`world_size`, executor hook and rank-context save/restore | 22 |
 | `test_stablehlo.py` | the general exporter goldens, dynamic-dim rejections, batch-rank dots, RNG set form, `eigh` compositions, fast-path byte identity, verify-once | 163 |
 | `test_stablehlo_remainder.py` | the `remainder` floormod text golden, the unsigned shortcut and the bool/complex deferrals | 9 |
+| `test_stablehlo_custom_ops.py` | the `custom_call` / `inline_stablehlo` exporter goldens: result arities, target quoting/escaping, `backend_config`/`api_version`/`has_side_effect`, `%in`/`%out` substitution, multi-line/nested-body preservation, writer token validation, program order, `status()` v1 vs deferred | 19 |
 | `test_split_reduction.py` | the two-stage split-reduction emission goldens (exactness classes, gates, geometry, `split_reduction=False` byte identity) | 67 |
 | `test_iree_eigh_diag_parity.py` | llvm-cpu `eigh`/`diag` parity on scale-normalized invariants, plus `eigh` inside `cond`/`while` regions | 24 |
 | `test_mixed_dtype.py` | mixed-dtype compile+run parity on every available adapter via `_xla_plugin_probe`/`importorskip` gates | 18 |
@@ -124,6 +125,11 @@ This file owns the test-side contracts, the skip/host-guard policy and the recor
 | `test_external_portable_fallback.py` | portable-decomposition inlining with one warning per kernel, and the no-portable deferral (tvm-gated) | 9 |
 | `test_iree_host_io_parity.py` | `evoxc.io` prefetch/sink parity, verbatim schedule errors and runtime failures surfacing at wait/result | 11 |
 | `test_build_cache_iree.py` | `build_cached`/`CompileCache` keys and is-identity hits on real iree compiles | 4 |
+| `test_custom_ops_iree.py` | `inline_stablehlo` compiles/runs on iree with numpy parity (host-resident); `custom_call` reaches IREE and fails the legalization diagnostic (naming the op/target, never a parse error) | 3 |
+| `test_custom_ops_backend_rejection.py` | numpy + native `lower()` reject `custom_call` / `inline_stablehlo` with a naming `BackendError` (native leg engine-guarded) | 6 |
+| `test_block_portable_compiler.py` | portable block inlining on a compiler backend (numpy, a `CompilerBackend` stub, iree) and the explicit rejection of a backend-only block | 7 |
+| `test_registry_extensibility.py` | `register(replace=True)`, `unregister`, and entry-point discovery (module/`register()`, callable, `Backend` instance), single-scan-per-process, failing entry point → `BackendError` with `__cause__` | 11 |
+| `test_iree_module_option.py` | `iree_compiler_module` / `iree_runtime_module`: option-surface validation, a delegating fake routing the compile/load hop, bogus dotted path → `BackendError` naming option+value | 7 |
 | `test_native_backend.py` | native staging/errors/diagnostics/persistence, `summary()`/`plan_text()`/`stats()` keys | 32 |
 | `test_native_backend_missing_engine.py` | the missing-extension contract in both configurations | 10 |
 | `test_native_backend_parity_core.py` | native-vs-numpy parity for elementwise/comparison/reduction ops across every dtype | 155 |

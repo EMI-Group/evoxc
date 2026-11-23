@@ -168,10 +168,11 @@ def test_validate_options_unknown_key_lists_known_options_per_stage():
         "sort_emission, split_reduction, while_init_rewrite" in message
     )
     assert (
-        "compile: dispatch_formation, iree_compile_args, opt_level, "
-        "target_backends" in message
+        "compile: dispatch_formation, iree_compile_args, "
+        "iree_compiler_module, opt_level, target_backends, vulkan_target"
+        in message
     )
-    assert "load: iree_runtime_args" in message
+    assert "load: iree_runtime_args, iree_runtime_module" in message
     assert "run: (none)" in message
 
 
@@ -209,12 +210,13 @@ def test_adapter_known_options_declarations():
             {
                 "target_backends",
                 "iree_compile_args",
+                "iree_compiler_module",
                 "opt_level",
                 "vulkan_target",
                 "dispatch_formation",
             }
         ),
-        "load": frozenset({"iree_runtime_args"}),
+        "load": frozenset({"iree_runtime_args", "iree_runtime_module"}),
         "run": frozenset(),
     }
     assert xla_adapt.XlaBackend.KNOWN_OPTIONS == {
