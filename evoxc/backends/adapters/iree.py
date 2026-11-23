@@ -168,6 +168,7 @@ import base64
 import importlib
 import os
 import re
+import sys
 import threading
 import types
 import warnings
@@ -255,7 +256,12 @@ def _resolve_module_option(
             f"got {value!r} of type {type(value).__name__}"
         )
     cached = cache.get(module_name)
-    if cached is not None:
+    # The cache is keyed by the module NAME, so the entry is validated against
+    # the module CURRENTLY registered under that name: a process that re-binds
+    # ``sys.modules[module_name]`` (a swapped/reloaded module, or a fake
+    # installed by a test) is never served a stale handle. In the steady state
+    # both objects are identical, so this costs one dict lookup.
+    if cached is not None and sys.modules.get(module_name) is cached:
         return cached
     try:
         module = importlib.import_module(module_name)
@@ -874,7 +880,7 @@ def _acquire_runtime_device(
         rt = _runtime_module(None)
 
     if device_kind == "vulkan":
-        return _acquire_vulkan_device(device, runtime_args)
+        return _acquire_vulkan_device(device, runtime_args, rt)
     if device_kind in _GPU_DEVICE_KINDS:
         if device_kind == "cuda":
             _configure_cuda_runtime_flags()
@@ -3288,7 +3294,7 @@ class _IreeSegmentExecutable:
                 # cuda-only classic-allocator pool anchor (see the staging
                 # notes at the top of this module) — the rocm and vulkan
                 # paths need no anchor.
-                import iree.runtime as rt
+                rt = self._runtime_module
 
                 try:
                     self._pool_anchor = runtime_device.allocator.allocate_buffer(
@@ -3337,6 +3343,7 @@ class _IreeSegmentExecutable:
             self.core_device,
             self._staged_inputs,
             device_kind=self.device_kind,
+            rt=self._runtime_module,
         )
         results = self._entry_function()(*buffers)
         if results is None:
@@ -3344,7 +3351,11 @@ class _IreeSegmentExecutable:
         elif not isinstance(results, tuple):
             results = (results,)
         return [
-            core.Tensor(IreeDevicePayload(result, self.core_device))
+            core.Tensor(
+                IreeDevicePayload(
+                    result, self.core_device, runtime_module=self._runtime_module
+                )
+            )
             for result in results
         ]
 
@@ -3606,11 +3617,17 @@ class IreeExternalExecutable(CompilerExecutable):
         returning a buffer still pending on another runtime's stream
         requires that stream to be synchronized by the kernel (the adapter
         adds no fence; see ``evoxc.external``).
+
+        Every helper and payload here uses the executable's RESOLVED runtime
+        module (``self._runtime_module``), so a custom
+        ``iree_runtime_module`` is honored on the whole device-result path.
         """
-        import iree.runtime as rt
+        rt = self._runtime_module
 
         if isinstance(entry, rt.DeviceArray):
-            return core.Tensor(IreeDevicePayload(entry, self._core_device))
+            return core.Tensor(
+                IreeDevicePayload(entry, self._core_device, runtime_module=rt)
+            )
         if isinstance(entry, IreeDevicePayload):
             # Already a device payload (the duck-payload contract): wrap it
             # directly, unchanged — never re-imported through DLPack.
@@ -3619,9 +3636,11 @@ class IreeExternalExecutable(CompilerExecutable):
             getattr(entry, "__dlpack_device__", None)
         ):
             array = _device_array_from_dlpack(
-                entry, self.runtime_device, self._core_device
+                entry, self.runtime_device, self._core_device, rt
             )
-            return core.Tensor(IreeDevicePayload(array, self._core_device))
+            return core.Tensor(
+                IreeDevicePayload(array, self._core_device, runtime_module=rt)
+            )
         return core.Tensor(entry)
 
 
@@ -3632,22 +3651,30 @@ class IreeExternalExecutable(CompilerExecutable):
 # metadata (plans, dtype mappings) or module handles, re-checked against the
 # ACTUAL run arguments on every call.
 #
-# ``numpy`` / ``iree.runtime`` memoized once for the run path: the heavy-import
-# rule keeps them out of module top level, but a per-call ``import`` statement
-# still pays a ``sys.modules`` lookup on every run.
-_RUNTIME_MODULES: list = []
+# ``numpy`` / the RESOLVED ``iree.runtime`` module memoized for the run path:
+# the heavy-import rule keeps them out of module top level, but a per-call
+# ``import`` statement still pays a ``sys.modules`` lookup on every run.
+_RUNTIME_MODULES: dict[Any, tuple[Any, Any]] = {}
 
 
-def _runtime_modules() -> tuple[Any, Any]:
-    """Return the memoized ``(numpy, iree.runtime)`` module pair."""
-    mods = _RUNTIME_MODULES
-    if not mods:
+def _runtime_modules(rt: Any = None) -> tuple[Any, Any]:
+    """Return the memoized ``(numpy, resolved iree.runtime)`` module pair.
+
+    The memo is keyed by the RESOLVED runtime module OBJECT (modules are
+    hashable), so a custom ``iree_runtime_module`` and the default module
+    never share an entry. ``rt`` defaults to the default/env-resolved module
+    (``_runtime_module(None)``), so an executable carrying a custom module
+    passes ``self._runtime_module`` and gets numpy plus THAT module back.
+    """
+    if rt is None:
+        rt = _runtime_module(None)
+    pair = _RUNTIME_MODULES.get(rt)
+    if pair is None:
         import numpy as np
 
-        import iree.runtime as rt
-
-        mods += (np, rt)
-    return mods[0], mods[1]
+        pair = (np, rt)
+        _RUNTIME_MODULES[rt] = pair
+    return pair
 
 
 # HAL element-type int -> numpy dtype, resolved lazily through iree's own
@@ -3688,7 +3715,9 @@ def _dlpack_device_id(device: Device) -> tuple[int, int]:
     return (code, device.index)
 
 
-def _device_array_from_dlpack(entry: Any, runtime_device: Any, core_device: Device) -> Any:
+def _device_array_from_dlpack(
+    entry: Any, runtime_device: Any, core_device: Device, rt: Any = None
+) -> Any:
     """Import a DLPack-capable object as an iree ``DeviceArray`` (zero-copy).
 
     The ``device_resident=True`` external-kernel result path for a producer
@@ -3703,9 +3732,12 @@ def _device_array_from_dlpack(entry: Any, runtime_device: Any, core_device: Devi
     raises ``core.BackendError`` instead. ``stream=None`` is passed to the
     producer (no synchronization request: iree's HAL uses its own HIP queue,
     so the KERNEL must have completed its writes before returning; see
-    ``evoxc.external``).
+    ``evoxc.external``). ``rt`` is the RESOLVED IREE runtime module
+    (defaults to the default/env-resolved module) — the imported
+    ``DeviceArray`` is built with THAT module's class.
     """
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     expected = _dlpack_device_id(core_device)
     try:
@@ -3850,11 +3882,18 @@ class IreeDevicePayload:
     cuda/rocm/vulkan it is an explicit staging-buffer ``queue_copy`` — a
     fresh D2H copy per call, the explicit ``t.to(Device("cpu", 0))`` download
     path with no per-kind code.
+
+    The ``runtime_module`` the buffer belongs to is carried on the payload (a
+    private slot; ``None`` = the default/env-resolved ``iree.runtime``), so
+    the adapter-owned readback and the DLPack export use the SAME module
+    instance every other stage of that pipeline resolves.
     """
 
-    __slots__ = ("_array", "_shape", "_dtype", "device")
+    __slots__ = ("_array", "_shape", "_dtype", "_runtime", "device")
 
-    def __init__(self, array: Any, device: Device) -> None:
+    def __init__(
+        self, array: Any, device: Device, runtime_module: Any = None
+    ) -> None:
         # Metadata cached at construction: an iree runtime ``DeviceArray`` is
         # immutable in shape/dtype for its lifetime (run outputs, staged
         # inputs, and external-kernel results are all created once with fixed
@@ -3871,7 +3910,16 @@ class IreeDevicePayload:
         # output wrapping at 12 outputs). The buffer view is the same source
         # those accessors read: the shape is a tuple of ints and the dtype is
         # the element-type int resolved through the module-level memo.
+        #
+        # ``runtime_module`` is the RESOLVED IREE runtime module this payload's
+        # buffer belongs to (``None`` = the default/env-resolved module). The
+        # two-positional-argument form stays valid; the module is carried so
+        # the readback and the DLPack export use the SAME runtime the payload
+        # was produced with.
         self._array = array
+        self._runtime = (
+            runtime_module if runtime_module is not None else _runtime_module(None)
+        )
         try:
             view = array._buffer_view
             # ``DeviceArray``'s explicit dtype override WINS whenever set,
@@ -3879,7 +3927,7 @@ class IreeDevicePayload:
             # dtypes the HAL element type cannot express).
             dtype = array._override_dtype
             if dtype is None:
-                dtype = _hal_element_dtype(view.element_type)
+                dtype = _hal_element_dtype(view.element_type, self._runtime)
             shape = tuple(view.shape)
         except (AttributeError, ValueError):
             # Defensive: a runtime without the private buffer-view protocol —
@@ -3936,7 +3984,7 @@ class IreeDevicePayload:
         returned array is always a fresh host array for those kinds; it never
         aliases the device buffer.
         """
-        return _readback_device_array(self._array)
+        return _readback_device_array(self._array, rt=self._runtime)
 
     def __dlpack_device__(self) -> tuple[int, int]:
         """Report the DLPack ``(device_type, device_id)`` of this buffer.
@@ -4015,7 +4063,7 @@ class IreeDevicePayload:
                 "t.to(core.Device('cpu', 0)) instead."
             )
         try:
-            raw_dtype = _hal_element_dtype(view.element_type)
+            raw_dtype = _hal_element_dtype(view.element_type, self._runtime)
         except (AttributeError, ValueError) as exc:
             raise core.DeviceError(
                 f"Tensor.__dlpack__: the HAL element type of this payload "
@@ -4048,7 +4096,7 @@ class IreeDevicePayload:
         mappable llvm-cpu buffer stays zero-copy and device memory pays one
         explicit D2H copy per call.
         """
-        return _readback_device_array(self._array, dtype=dtype)
+        return _readback_device_array(self._array, dtype=dtype, rt=self._runtime)
 
 
 # Backward-compat alias: the payload was private (``_IreeDevicePayload``)
@@ -4116,6 +4164,16 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
        the plain ``rt.asdevicearray`` copy.
     5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
 
+    The IREE RUNTIME MODULE resolves option-less here (the provider protocol
+    has no options dict): ``EVOXC_IREE_RUNTIME_MODULE`` -> ``iree.runtime``
+    (``_runtime_module(None)``), and that SAME module is passed into every
+    helper this provider calls and into the returned payload (so the
+    readback/DLPack export use it too). A module OBJECT cannot reach placement
+    through the option — to place data with a custom runtime module, also
+    expose it via ``EVOXC_IREE_RUNTIME_MODULE`` (a dotted importable path);
+    the other direction needs nothing, because payloads and executables carry
+    their resolved module.
+
     The DOWNLOAD direction needs no kind-specific code here: ``t.to(cpu)`` on
     a vulkan-resident tensor goes through the payload's host copy
     (``IreeDevicePayload.to_host()`` -> the adapter's own
@@ -4128,7 +4186,11 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     actionable message — never a raw iree exception.
     """
     import numpy as np
-    import iree.runtime as rt
+
+    # The placement-provider protocol has no options channel, so the runtime
+    # module resolves option -> env (EVOXC_IREE_RUNTIME_MODULE) -> default —
+    # the same resolution `load` performs for an unset `iree_runtime_module`.
+    rt = _runtime_module(None)
 
     if not isinstance(tensor, core.Tensor):
         raise core.DeviceError(
@@ -4161,13 +4223,13 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     # fresh-per-call path, rocm reuses one THREAD-LOCAL device
     # (create_device measured ~46 ms per call on the hip driver).
     runtime_args = _runtime_args_from_env()
-    _apply_iree_runtime_args(runtime_args)
+    _apply_iree_runtime_args(runtime_args, rt)
     try:
         if device_kind == "rocm":
-            runtime_device = _acquire_cached_rocm_device(device, runtime_args)
+            runtime_device = _acquire_cached_rocm_device(device, runtime_args, rt)
         else:
             runtime_device = _acquire_runtime_device(
-                device_kind, device, runtime_args
+                device_kind, device, runtime_args, rt
             )
     except core.EVOXCError:
         raise
@@ -4185,7 +4247,7 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     # returns None here and takes the plain asdevicearray copy below, as do
     # oversized/unmappable inputs or any failure on a fast path.
     try:
-        staged = _staged_input({}, runtime_device, 0, tensor, device_kind)
+        staged = _staged_input({}, runtime_device, 0, tensor, device_kind, rt)
         if staged is None:
             staged = rt.asdevicearray(runtime_device, tensor.numpy())
     except core.EVOXCError:
@@ -4195,7 +4257,7 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
             f"Tensor.to could not upload the host tensor to {device!r} via "
             f"the {IreeBackend.name} backend: {exc}"
         ) from exc
-    return core.Tensor(IreeDevicePayload(staged, device))
+    return core.Tensor(IreeDevicePayload(staged, device, runtime_module=rt))
 
 
 # ---------------------------------------------------------------------------
