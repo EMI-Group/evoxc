@@ -16,11 +16,15 @@ move tags. Configuring publishing and running a rehearsal do not publish anythin
    release maintainers and prevent updates and deletions. The workflow uses
    per-tag concurrency and rechecks the live tag before remote release operations;
    those checks are not a substitute for tag protection.
-2. In GitHub **Settings → Environments**, create `pypi` and limit its deployment
-   refs to the `v*` and `evoxc-hf-v*` tags, not branches. Configure required
-   reviewers and prevent self-review where available. Approve only the intended
-   release tag and run after checking the gates and the artifact link in the run
-   summary. Review the verified GitHub draft for `evoxc` before approving.
+2. In GitHub **Settings → Environments**, create `pypi`. Its deployment refs
+   must be limited to the `v*` and `evoxc-hf-v*` tags, not branches. Configuring
+   required reviewers is optional but recommended for the first native `evoxc`
+   release. Without required reviewers, a valid `evoxc` tag push proceeds to
+   publishing after the release gates pass, without manual approval.
+   If you configure required reviewers, prevent self-review where available.
+   Approve only the intended release tag and run after checking the gates and
+   the artifact link in the run summary. For `evoxc`, review the verified GitHub
+   draft before approving.
 3. Configure a separate [PyPI trusted publisher](https://pypi.org/manage/account/publishing/)
    for each project. Use a pending publisher if the project does not exist yet;
    otherwise configure it on the existing project.
@@ -98,10 +102,10 @@ These commands require a Rust toolchain and a C compiler on `PATH` to build
 3. Watch **Release** in Actions. After `verify → ci → wheels`, `prepare` stages a
    GitHub draft with the tested archives and checks their SHA-256 digests. A
    matching draft from an earlier attempt can be resumed; a conflicting one is
-   rejected. `publish-evoxc` waits for any `pypi` approval, then rechecks the live
-   tag, the draft, its assets and PyPI before uploading. `finalize` confirms PyPI
-   has the exact tested files and that the same draft and assets still match
-   before making it public.
+   rejected. If `pypi` has required reviewers, `publish-evoxc` waits for their
+   approval. Before uploading, it rechecks the live tag, the draft, its assets
+   and PyPI. `finalize` confirms PyPI has the exact tested files and that the
+   same draft and assets still match before making it public.
 4. Check the version-specific [PyPI files](https://pypi.org/project/evoxc/#files)
    and the public GitHub Release for the seven wheels and one sdist below. After
    publication, try `python -m pip install evoxc==0.2.0` in a fresh environment
