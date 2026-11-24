@@ -68,7 +68,7 @@ pub(super) const PARALLEL_LARGE_ELEMS: usize = 1 << 22;
 pub(super) const PARALLEL_MAX_THREADS_LARGE: usize = 8;
 
 /// How many threads a flat map over `count` elements should split across.
-pub(super) fn parallel_threads(count: usize) -> usize {
+pub(crate) fn parallel_threads(count: usize) -> usize {
     if count < PARALLEL_MIN_ELEMS {
         return 1;
     }
@@ -91,7 +91,7 @@ pub(super) fn parallel_threads(count: usize) -> usize {
 /// scoped threads.  Every chunk is visited exactly once, so a body that writes
 /// all of its chunk writes all of `out`; `offset` is the chunk's start index,
 /// which is how a caller slices its operands to match.
-pub(super) fn split_parallel<R: Copy + Send, F: Fn(usize, &mut [R]) + Sync>(
+pub(crate) fn split_parallel<R: Copy + Send, F: Fn(usize, &mut [R]) + Sync>(
     out: &mut [R],
     threads: usize,
     body: F,

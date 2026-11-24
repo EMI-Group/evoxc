@@ -39,6 +39,7 @@ pub use ndarray_views::{array_view, array_view_mut, NdScalar};
 pub use storage::Storage;
 pub use zipmap::{map1, map2, map2_runs, map3, map3_runs, zip1, zip2, zip2_accumulate, zip3};
 #[allow(unused_imports)] // kernels adopt it per hot path (see `take_pooled_vec`)
+pub(crate) use parallel::{parallel_threads, split_parallel};
 pub(crate) use pool::take_pooled_vec;
 
 use self::storage::{cast_storage, decode_storage};
