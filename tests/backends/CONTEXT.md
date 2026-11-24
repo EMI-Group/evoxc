@@ -158,11 +158,11 @@ This file owns the test-side contracts, the skip/host-guard policy and the recor
 - Stage asymmetry to keep in mind in the explicit pipeline: `target_backends` is a COMPILE-stage option (accepted and ignored at lower/load), so a ROCm build spells `lower(..., target_backends=["rocm"])` → `compile(..., target_backends=["rocm"])` → `load(..., device=rocm)`.
 - `BUG(evoxc)` policy: a test that exposes a real evoxc bug keeps its assertions intact and is reported upward with a minimal repro; never fix evoxc and never weaken the test.
 - The green sibling suites get `@pytest.mark.xfail(strict=True, reason="BUG(evoxc): …")` with a `# BUG(evoxc):` comment, so the pin XPASSes — failing loudly — the day evoxc is fixed.
-- Current pins in this node: the 3 `test_options_override.py` exporter-only-sub-option cases (see Known Issues).
+- Current pins in this node: none.
 
 ## Recorded counts
 Measured at this HEAD with `iree-base` 3.13.0 installed, the native extension BUILT, no NVIDIA GPU, no usable ROCm/HIP device, no PJRT plugin, no tvm and no torch, and one enumerated Vulkan device (so the device-guarded Vulkan suite RUNS).
-`pytest tests/backends -o addopts='' -q` → **2057 passed, 73 skipped, 3 xfailed, 0 failed**; `--collect-only -q` → 2130 collected plus the 3 module-level collection skips (`test_adapter_tvm.py` 13, `test_adapter_xla.py` 10, `test_external_portable_fallback.py` 9 items when their dependencies are present) = 2133 reported items.
+`pytest tests/backends -o addopts='' -q` → **2060 passed, 73 skipped, 0 xfailed, 0 failed**; `--collect-only -q` → 2130 collected plus the 3 module-level collection skips (`test_adapter_tvm.py` 13, `test_adapter_xla.py` 10, `test_external_portable_fallback.py` 9 items when their dependencies are present) = 2133 reported items.
 The 73 skips are host/dependency guards only: 22 CUDA (`nvidia-smi` absent, incl. the `Device("cuda", 5)` smokes), 22 ROCm (the `hip` HAL driver reports no devices), 12 tvm-absent, 8 PJRT-plugin-absent xla items, 5 tvm-adapter-unavailable, 1 ROCm-runtime probe and the 3 module-level collection skips.
 The 3 xfails are the exporter-only split-reduction sub-option plumbing pins.
 Item counts per file are in the routing table; the three dependency-gated modules report 1 item each in this environment.
