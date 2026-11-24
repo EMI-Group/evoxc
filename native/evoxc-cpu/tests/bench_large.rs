@@ -29,13 +29,15 @@ fn ty(dtype: &str, shape: &[i64]) -> Json {
 struct Graph {
     inputs: Vec<Json>,
     ops: Vec<Json>,
+    block: Vec<Json>,
     next_value: u32,
     next_op: u32,
 }
 
 impl Graph {
     fn new(inputs: &[(&str, &[i64])]) -> Graph {
-        let mut graph = Graph { inputs: Vec::new(), ops: Vec::new(), next_value: 0, next_op: 0 };
+        let mut graph =
+            Graph { inputs: Vec::new(), ops: Vec::new(), block: Vec::new(), next_value: 0, next_op: 0 };
         for (dtype, shape) in inputs {
             graph.inputs.push(ty(dtype, shape));
             graph.next_value += 1;
@@ -48,6 +50,7 @@ impl Graph {
         self.next_value += 1;
         let op_id = self.next_op;
         self.next_op += 1;
+        self.block.push(json!({"id": op_id, "ref": op_id.to_string()}));
         self.ops.push(json!({
             "id": op_id,
             "name": name,
@@ -62,6 +65,7 @@ impl Graph {
 
     fn finish(mut self, output: u32, output_type: Json) -> Json {
         let op_id = self.next_op;
+        self.block.push(json!({"id": op_id, "ref": op_id.to_string()}));
         self.ops.push(json!({
             "id": op_id,
             "name": "return",
@@ -86,7 +90,7 @@ impl Graph {
                 "input_types": self.inputs,
                 "output_types": [output_type],
                 "metadata": {},
-                "block": {"arguments": arguments, "ops": self.ops},
+                "block": {"arguments": arguments, "ops": self.block},
             }],
             "ops": self.ops,
         })
@@ -177,7 +181,6 @@ fn bench_large_elementwise() {
 #[test]
 #[ignore = "measurement aid: prints large-graph timings"]
 fn bench_large_reductions() {
-    let row = ty("float32", &[4096, 4096]);
     let inputs = vec![f32_buffer(&[4096, 4096])];
 
     // A full reduction of 16M elements to rank 0.
@@ -186,7 +189,7 @@ fn bench_large_reductions() {
         "reduce_sum",
         &[0],
         ty("float32", &[]),
-        json!({"axes": Json::Null, "keepdims": false, "reduce_op": "sum"}),
+        json!({"axes": [], "keepdims": false, "reduce_op": "sum"}),
     );
     let module = graph.finish(out, ty("float32", &[]));
     measure("reduce_sum full (16M f32)", &module, &[f32_buffer(&[BIG])], BIG);
@@ -211,22 +214,17 @@ fn bench_large_reductions() {
     );
     let module = graph.finish(out, ty("float32", &[4096]));
     measure("reduce_sum axis=0 (4096x4096)", &module, &inputs, BIG);
-    let _ = row;
 }
 
 #[test]
 #[ignore = "measurement aid: prints large-graph timings"]
 fn bench_large_dot() {
     for (m, k, n) in [(1024usize, 1024, 1024), (2048, 2048, 2048), (4096, 1024, 4096)] {
-        let left = ty("float32", &[m as i64, k as i64]);
-        let right = ty("float32", &[k as i64, n as i64]);
         let out = ty("float32", &[m as i64, n as i64]);
         let mut graph = Graph::new(&[("float32", &[m as i64, k as i64]), ("float32", &[k as i64, n as i64])]);
         let result = graph.op("dot", &[0, 1], out.clone(), json!({}));
         let module = graph.finish(result, out);
         let inputs = vec![f32_buffer(&[m, k]), f32_buffer(&[k, n])];
-        let work = m.max(k).max(n);
         measure(&format!("dot {m}x{k} @ {k}x{n} f32"), &module, &inputs, m * k + k * n + m * n);
-        let _ = work;
     }
 }

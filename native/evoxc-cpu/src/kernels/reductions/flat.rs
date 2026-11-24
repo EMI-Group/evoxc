@@ -318,12 +318,11 @@ mod tests {
                 reference.push(started.elapsed().as_secs_f64() * 1e3);
             }
             let elements = values.len();
+            let (flat_us, reference_us) = (median(fold8), median(reference));
             println!(
-                "{label:34} fold_block {:7.3} ms ({:5.2} ns/el)  unrolled {:7.3} ms ({:5.2} ns/el)",
-                median(fold8),
-                median(fold8) * 1e6 / elements as f64,
-                median(reference),
-                median(reference) * 1e6 / elements as f64
+                "{label:34} fold_block {flat_us:7.3} ms ({:5.2} ns/el)  unrolled {reference_us:7.3} ms ({:5.2} ns/el)",
+                flat_us * 1e6 / elements as f64,
+                reference_us * 1e6 / elements as f64
             );
         }
 
@@ -340,10 +339,10 @@ mod tests {
                 std::hint::black_box(fold_run(&values, 0.0f32, |a, b| a + b, lanes));
                 samples.push(started.elapsed().as_secs_f64() * 1e3);
             }
+            let us = median(samples);
             println!(
-                "full sum 16M, fold_run lanes={lanes:<2}       {:7.3} ms ({:5.2} ns/el)",
-                median(samples),
-                median(samples) * 1e6 / big as f64
+                "full sum 16M, fold_run lanes={lanes:<2}       {us:7.3} ms ({:5.2} ns/el)",
+                us * 1e6 / big as f64
             );
         }
 
@@ -360,10 +359,10 @@ mod tests {
             std::hint::black_box(fold_block(&values, &block, Some(0.0f32), |a, b| a + b).unwrap());
             samples.push(start.elapsed().as_secs_f64() * 1e3);
         }
+        let us = median(samples);
         println!(
-            "sum cols (4096x4096) axis=0        fold_block {:7.3} ms ({:5.2} ns/el)",
-            median(samples),
-            median(samples) * 1e6 / (side * side) as f64
+            "sum cols (4096x4096) axis=0        fold_block {us:7.3} ms ({:5.2} ns/el)",
+            us * 1e6 / (side * side) as f64
         );
     }
 
