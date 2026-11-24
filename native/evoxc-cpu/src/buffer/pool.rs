@@ -263,7 +263,7 @@ pub(crate) fn take_pooled_vec<R: Scalar>(count: usize) -> Option<Vec<R>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{map1, Storage};
+    use crate::buffer::{map1, map2, Storage};
     use evoxc_core::DType;
 
     /// Empty this thread's pool so a policy test starts from a known state
@@ -420,6 +420,46 @@ mod tests {
         });
         let taken = take_pooled_vec::<f32>(count).expect("a stock of this size is pooled");
         assert_eq!(taken[0], 2.0, "the most recently freed stock is handed back first");
+        reset_pool();
+    }
+
+    /// Measurement aid: one flat `a * b` over 16M f32 (64 MiB per tensor) with
+    /// the pool warm versus emptied before every call, interleaved, medians of 9
+    /// passes.  This is what decides the retention caps for large size classes:
+    /// the difference is the per-call first-touch (mmap + kernel zeroing + page
+    /// faults) that a 64 MiB result pays when the pool cannot serve it.
+    #[test]
+    #[ignore = "measurement aid: prints timings"]
+    fn bench_pool_large() {
+        use std::time::Instant;
+        let count = 16usize << 20;
+        let left = vec![1.5f32; count];
+        let right = vec![2.5f32; count];
+        let mut warm = Vec::new();
+        let mut cold = Vec::new();
+        for pass in 0..13 {
+            if pass >= 2 {
+                let started = Instant::now();
+                let out = map2(DType::Float32, &[count], &left, &right, |a, b| a * b).unwrap();
+                warm.push(started.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&out);
+                drop(out);
+            }
+            // The emptied pool forces the allocating path (and its first touch).
+            reset_pool();
+            let started = Instant::now();
+            let out = map2(DType::Float32, &[count], &left, &right, |a, b| a * b).unwrap();
+            cold.push(started.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(&out);
+            drop(out);
+        }
+        warm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        cold.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "map2 f32 16M: warm-pool median {:7.3} ms, pool-emptied median {:7.3} ms",
+            warm[warm.len() / 2],
+            cold[cold.len() / 2]
+        );
         reset_pool();
     }
 

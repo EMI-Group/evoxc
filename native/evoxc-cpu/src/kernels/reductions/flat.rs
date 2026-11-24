@@ -266,6 +266,107 @@ mod tests {
         }
     }
 
+    /// Measurement aid: LARGE contiguous folds (a full 16M-element sum, and both
+    /// axes of a (4096, 4096) matrix) against (a) the sequential one-lane fold and
+    /// (b) a hand-written 8-accumulator `chunks_exact(32)` sum, which is the
+    /// memory-bound floor the lane fold is supposed to reach.  Medians of 9
+    /// passes after 3 warmups; this host is shared, so compare within a run only.
+    #[test]
+    #[ignore = "measurement aid: prints large-reduce timings"]
+    fn bench_reduce_large() {
+        use std::time::Instant;
+        const WARMUPS: usize = 3;
+        const REPS: usize = 9;
+
+        /// The unrolled reference: 8 accumulators, four 8-lane chunks per pass.
+        fn unrolled_sum(values: &[f32]) -> f32 {
+            let mut acc = [0.0f32; 8];
+            let mut chunks = values.chunks_exact(32);
+            for chunk in &mut chunks {
+                for (lane, slot) in acc.iter_mut().enumerate() {
+                    *slot += chunk[lane]
+                        + chunk[lane + 8]
+                        + chunk[lane + 16]
+                        + chunk[lane + 24];
+                }
+            }
+            let mut total: f32 = acc.iter().sum();
+            for value in chunks.remainder() {
+                total += *value;
+            }
+            total
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        }
+
+        fn bench(label: &str, values: &[f32], block: &Block) {
+            let mut fold8 = Vec::new();
+            let mut reference = Vec::new();
+            for _ in 0..WARMUPS {
+                std::hint::black_box(fold_block(values, block, Some(0.0f32), |a, b| a + b).unwrap());
+                std::hint::black_box(unrolled_sum(values));
+            }
+            for _ in 0..REPS {
+                let started = Instant::now();
+                std::hint::black_box(fold_block(values, block, Some(0.0f32), |a, b| a + b).unwrap());
+                fold8.push(started.elapsed().as_secs_f64() * 1e3);
+                let started = Instant::now();
+                std::hint::black_box(unrolled_sum(values));
+                reference.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            let elements = values.len();
+            println!(
+                "{label:34} fold_block {:7.3} ms ({:5.2} ns/el)  unrolled {:7.3} ms ({:5.2} ns/el)",
+                median(fold8),
+                median(fold8) * 1e6 / elements as f64,
+                median(reference),
+                median(reference) * 1e6 / elements as f64
+            );
+        }
+
+        let big = 16usize << 20;
+        let values: Vec<f32> = (0..big).map(|index| (index % 1000) as f32 * 0.001).collect();
+        let block = Block::new(&[big], &[true]).expect("contiguous block");
+        bench("full sum 16M", &values, &block);
+        // The lane count the fold is supposed to reach, and the one-lane fold,
+        // both over the whole slice, so the difference is the accumulator split.
+        for lanes in [1usize, LANE_COUNT] {
+            let mut samples = Vec::new();
+            for _ in 0..REPS {
+                let started = Instant::now();
+                std::hint::black_box(fold_run(&values, 0.0f32, |a, b| a + b, lanes));
+                samples.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "full sum 16M, fold_run lanes={lanes:<2}       {:7.3} ms ({:5.2} ns/el)",
+                median(samples),
+                median(samples) * 1e6 / big as f64
+            );
+        }
+
+        let side = 4096usize;
+        let values: Vec<f32> = (0..side * side).map(|index| (index % 1000) as f32 * 0.001).collect();
+        let block = Block::new(&[side, side], &[false, true]).expect("contiguous block");
+        bench("sum rows (4096x4096) axis=1", &values, &block);
+        let block = Block::new(&[side, side], &[true, false]).expect("contiguous block");
+        // The `inner > 1` arm is not a `fold_run`; it is timed through
+        // `fold_block` alone, so the reference column is not comparable.
+        let mut samples = Vec::new();
+        for _ in 0..REPS {
+            let start = Instant::now();
+            std::hint::black_box(fold_block(&values, &block, Some(0.0f32), |a, b| a + b).unwrap());
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        println!(
+            "sum cols (4096x4096) axis=0        fold_block {:7.3} ms ({:5.2} ns/el)",
+            median(samples),
+            median(samples) * 1e6 / (side * side) as f64
+        );
+    }
+
     fn time_us<F: FnMut() -> Vec<f32>>(iterations: usize, mut run: F) -> f64 {
         for _ in 0..10 {
             std::hint::black_box(run());

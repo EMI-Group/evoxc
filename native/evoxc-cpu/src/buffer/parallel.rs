@@ -175,6 +175,106 @@ mod tests {
     }
 
     /// Measurement aid, not a correctness test: `cargo test --release -p
+    /// evoxc-cpu bench_flat_map_large -- --ignored --nocapture` measures a flat
+    /// `add` over LARGE (DRAM-resident) results at 1/2/4/8/16 threads and the
+    /// bare spawn+join cost of a `split_parallel` call, which is what the
+    /// large-map thread policy is chosen from.  Thread counts are interleaved
+    /// inside one rep loop (this host is shared), and every cell reports the
+    /// MEDIAN of [`BENCH_REPS`] timed passes after [`BENCH_WARMUPS`] warmups.
+    #[test]
+    #[ignore = "measurement aid: prints timings"]
+    fn bench_flat_map_large() {
+        use std::time::Instant;
+        const BENCH_WARMUPS: usize = 3;
+        const BENCH_REPS: usize = 9;
+        let thread_counts = [1usize, 2, 3, 4, 6, 8, 12, 16];
+        println!("cpus {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+        for count in [1usize << 18, 1 << 20, 1 << 22, 4 << 20, 16 << 20] {
+            let left: Vec<f32> = vec![1.5; count];
+            let right: Vec<f32> = vec![2.5; count];
+            let mut out = vec![0.0f32; count];
+            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); thread_counts.len()];
+            let mut spawns: Vec<Vec<f64>> = vec![Vec::new(); thread_counts.len()];
+            for _ in 0..BENCH_WARMUPS {
+                for threads in thread_counts {
+                    split_parallel(&mut out, threads, |offset, chunk| {
+                        let len = chunk.len();
+                        for ((slot, x), y) in chunk
+                            .iter_mut()
+                            .zip(window(&left, offset, len))
+                            .zip(window(&right, offset, len))
+                        {
+                            *slot = *x + *y;
+                        }
+                    });
+                }
+            }
+            for _ in 0..BENCH_REPS {
+                for (index, threads) in thread_counts.iter().copied().enumerate() {
+                    let started = Instant::now();
+                    split_parallel(&mut out, threads, |offset, chunk| {
+                        let len = chunk.len();
+                        for ((slot, x), y) in chunk
+                            .iter_mut()
+                            .zip(window(&left, offset, len))
+                            .zip(window(&right, offset, len))
+                        {
+                            *slot = *x + *y;
+                        }
+                    });
+                    samples[index].push(started.elapsed().as_secs_f64() * 1e3);
+                    let started = Instant::now();
+                    split_parallel(&mut out, threads, |_offset, _chunk| {});
+                    spawns[index].push(started.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            let mut line = format!("count {count:>9} ({:>3} MiB):", count * 4 >> 20);
+            for (index, threads) in thread_counts.iter().enumerate() {
+                samples[index].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                spawns[index].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = samples[index][samples[index].len() / 2];
+                let spawn = spawns[index][spawns[index].len() / 2];
+                line.push_str(&format!(
+                    "  {threads:2}t {med:7.3} ms (+{spawn:5.3} spawn)"
+                ));
+            }
+            println!("{line}");
+        }
+    }
+
+    /// Measurement aid: the cost of one flat `add` **including a fresh 64 MiB
+    /// result allocation**, i.e. what a map that the storage pool cannot serve
+    /// pays on top of the copy (`vec![0.0; n]` first touch = mmap + kernel
+    /// zeroing + every page faulted in on the write).
+    #[test]
+    #[ignore = "measurement aid: prints timings"]
+    fn bench_allocation_first_touch() {
+        use std::time::Instant;
+        let count = 16usize << 20;
+        for label in ["vec![0.0; 16M]", "with_capacity + fill 16M"] {
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let started = Instant::now();
+                let mut values: Vec<f32> = match label {
+                    "vec![0.0; 16M]" => vec![0.0; count],
+                    _ => {
+                        let mut values = Vec::with_capacity(count);
+                        values.resize(count, 0.0);
+                        values
+                    }
+                };
+                for (index, slot) in values.iter_mut().enumerate() {
+                    *slot = index as f32;
+                }
+                std::hint::black_box(&values);
+                samples.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("{label:28} median {:7.3} ms", samples[samples.len() / 2]);
+        }
+    }
+
+    /// Measurement aid, not a correctness test: `cargo test --release -p
     /// evoxc-cpu bench_thread_crossover -- --ignored --nocapture` prints the
     /// per-element cost of one flat `add` at several sizes and thread counts,
     /// which is what the `PARALLEL_MIN_ELEMS` threshold is chosen from.
