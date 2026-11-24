@@ -188,15 +188,21 @@ def test_slice_add_uniform_run_under_generous_ceiling():
 # ---------------------------------------------------------------------------
 # the bench harness the recorded table comes from still exists
 # ---------------------------------------------------------------------------
-def test_bench_harness_carries_the_eight_workloads():
-    """``native/tools/bench_cpu.py`` still defines the authoritative workloads."""
+def test_bench_harness_carries_the_expected_workloads():
+    """``native/tools/bench_cpu.py`` still defines the authoritative workloads.
+
+    The registry has grown past the eight rows of the CONTEXT table (the
+    large-tensor rows came later), so the pin is: every original name is still
+    there AND the closed registry still carries at least 17 ``Workload(...)``
+    entries.
+    """
     text = (REPO_ROOT / "native" / "tools" / "bench_cpu.py").read_text(encoding="utf-8")
 
     assert "def tn_step_pop500(" in text, (
         "native/tools/bench_cpu.py no longer defines the tn_step_pop500 workload "
         "that native/evoxc-cpu/CONTEXT.md's authoritative table is measured on"
     )
-    # Every workload name the table registers (the eight rows of the CONTEXT table).
+    # Every original workload name the table registers (the eight base rows).
     for name in (
         "ew_chain_1e6",
         "ew_transcendental_1e6",
@@ -211,3 +217,11 @@ def test_bench_harness_carries_the_eight_workloads():
     # The registry itself, not just the defns.
     assert "def build_workloads()" in text
     assert "Workload(" in text
+    # The closed registry is the ``Workload(...)`` list ``build_workloads()``
+    # returns (there is no module-level ``WORKLOADS`` table to read); all of
+    # them live inside that function, so counting there is exact.
+    registry = text.split("def build_workloads()", 1)[1]
+    assert registry.count("Workload(") >= 17, (
+        "native/tools/bench_cpu.py's build_workloads() registry shrank below the "
+        "17 workloads its docstring advertises"
+    )
