@@ -115,7 +115,7 @@ fn measure(label: &str, module: &Json, inputs: &[Buffer], elements: usize) {
         let out = run_program(
             &program,
             &compiled,
-            inputs.iter().map(|input| input.clone()).collect(),
+            inputs.to_vec(),
             RunOptions::default(),
             None,
         )
@@ -128,7 +128,7 @@ fn measure(label: &str, module: &Json, inputs: &[Buffer], elements: usize) {
         let out = run_program(
             &program,
             &compiled,
-            inputs.iter().map(|input| input.clone()).collect(),
+            inputs.to_vec(),
             RunOptions::default(),
             None,
         )

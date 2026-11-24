@@ -71,6 +71,60 @@ impl Storage {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Copy a typed host slice into RECYCLED storage when a stock of exactly
+    /// that size is pooled, else into fresh storage.
+    ///
+    /// A caller that only holds host data (a binding marshalling an input array,
+    /// a `constant` payload) otherwise pays the first touch of a new allocation:
+    /// measured on this host, 26.0 ms for a 64 MiB buffer (0.4 ms per MiB, see
+    /// the pool note).  The copy itself is a memcpy either way; only the
+    /// page faults disappear.  Pooled vectors are fully overwritten by
+    /// `copy_from_slice`, so no stale value can survive.
+    pub fn from_slice_pooled<T: Scalar>(values: &[T]) -> Storage {
+        match take_pooled_vec::<T>(values.len()) {
+            Some(mut pooled) => {
+                pooled.copy_from_slice(values);
+                T::into_storage(pooled)
+            }
+            None => T::into_storage(values.to_vec()),
+        }
+    }
+
+    /// Deep copy into recycled storage — what [`super::Buffer`]'s `Clone`
+    /// uses, so cloning a multi-megabyte value (a plan-time `constant` per use,
+    /// a caller's input) reuses its own size class instead of re-faulting a
+    /// fresh allocation.  Same values as the derived `Vec` clone, arm for arm.
+    pub(super) fn clone_pooled(&self) -> Storage {
+        macro_rules! arms {
+            ($($variant:ident => $ty:ty),* $(,)?) => {
+                match self {
+                    $(
+                        Storage::$variant(values) => {
+                            Storage::from_slice_pooled::<$ty>(values)
+                        }
+                    )*
+                }
+            };
+        }
+        arms!(
+            Bool => bool,
+            I8 => i8,
+            I16 => i16,
+            I32 => i32,
+            I64 => i64,
+            U8 => u8,
+            U16 => u16,
+            U32 => u32,
+            U64 => u64,
+            F16 => f16,
+            F32 => f32,
+            F64 => f64,
+            C64 => Complex<f32>,
+            C128 => Complex<f64>,
+        )
+    }
+
     /// Bytes of element storage this value holds (not its capacity).
     pub(super) fn bytes(&self) -> usize {
         fn size<T>(values: &[T]) -> usize {
