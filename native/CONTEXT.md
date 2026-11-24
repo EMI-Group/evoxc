@@ -50,7 +50,7 @@ Dependency rules (binding):
 
 The Rust core is published as five crates in dependency order: `evoxc-core` → `evoxc-compiler` → `evoxc-runtime` → `evoxc-cpu` → `evoxc`.
 Every internal dependency in `[workspace.dependencies]` carries one version (`0.1.0`) beside its path, so a published manifest resolves from crates.io; the workspace has exactly one version, bumped for all crates together.
-Publishable crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-cpu` and `evoxc`; each inherits `license = "Apache-2.0"`, `authors`, `repository`, `homepage`, `keywords` and `categories` from `[workspace.package]`, and the facade additionally inherits `documentation` and ships its own `./evoxc/README.md` (the repository README sits outside every crate directory, so `readme` is never inherited).
+Publishable crates are `evoxc-core`, `evoxc-compiler`, `evoxc-runtime`, `evoxc-cpu` and `evoxc`; each inherits `license = "Apache-2.0"`, `authors`, `repository`, `keywords` and `categories` from `[workspace.package]`, and the facade additionally inherits `documentation` and ships its own `./evoxc/README.md` (the repository README sits outside every crate directory, so `readme` is never inherited).
 The single license is Apache-2.0 everywhere — `[workspace.package]`, `../LICENSE` and the Python distribution's metadata agree.
 `evoxc-python` is `publish = false`: a cdylib extension module, not a library crate, reaching users only inside the `evoxc` Python wheel.
 `cargo package --list -p <crate>` inspects a package without touching the network; `cargo package [-p <crate>]` (with or without `--no-verify`) for `evoxc-compiler` and everything above it fails until their siblings exist on crates.io (`no matching package named 'evoxc-core' found`), which is why the publish order above is mandatory rather than convenient.
@@ -313,6 +313,8 @@ Batching rules cover elementwise, reductions, structural, dot, linalg aux and co
 - `evoxc-compiler/src/batch_functions/` is deliberately Python-free: it takes `Program`s and typed config enums and returns a `Program` + `BatchReport`; pytrees, static values, device placement, source locations and the registered-static-output-node check stay in the FFI/frontend layer. The FFI must pass the extension bridge (the engine only merges `block:*`/`external:*`/`sparse_*` populations with one) — see `./evoxc-python/CONTEXT.md`.
 - Out of this node: `evoxc.ir`/`evoxc.transforms` delegate their graph rewrite to this extension; changes to those Python modules are a separate workstream that must not edit `../evoxc/`, `../tests/` or `../scripts/` from here.
 - Known gap: the Python bridge (`evoxc/transforms/_native_rules.py::_derivative_response`) still materializes zero duals with `autodiff._materialize` and sends real ids; the nullable `output_ids` contract above is a capability this engine exposes for the Python side to adopt (send `None`, return only the non-zero contributions).
+- CI's Clippy is newer than the pinned local toolchain, so lints such as the `clippy::needless_bool` shape and cargo's unused-workspace-dependency and redundant-`homepage` manifest warnings can surface in CI before they reproduce locally.
+- The CI gate is `cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings` run from `native/`, so a `[workspace.dependencies]`/`[workspace.package]`/member-manifest edit must land with a regenerated `./Cargo.lock` (`cargo metadata --offline` suffices).
 
 ## Routing Table
 

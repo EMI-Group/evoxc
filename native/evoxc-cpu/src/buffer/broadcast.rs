@@ -219,10 +219,10 @@ pub(crate) static RUNS_DISABLED: std::sync::atomic::AtomicBool =
 #[inline]
 fn runs_enabled() -> bool {
     #[cfg(test)]
-    if RUNS_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
-    true
+    let disabled = RUNS_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let disabled = false;
+    !disabled
 }
 
 /// One operand's REPEATING-RUN view: element `i` of the broadcast result reads

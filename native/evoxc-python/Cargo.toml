@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 publish = false
 description = "PyO3 extension module evoxc._evoxc_native: the inference/transform/CPU-engine bridge over the evoxc facade."
 [lib]
@@ -26,12 +25,13 @@ num-complex = "0.4"
 # adds the `f16` element type), and `ndarray` 0.17 is the array type it exposes.
 numpy = { version = "0.30", features = ["half"] }
 ndarray = "0.17"
-# Deliberately not `pyo3.workspace = true`: the workspace entry hard-enables
-# `extension-module`, and an extension-module build does not link libpython, so
-# a `cargo test` binary that touches the Python API cannot link.  The
-# `extension-module` feature below is on by DEFAULT (the cdylib build path used
-# by `scripts/build-native.sh`); `auto-init` is the test-only alternative that
-# links libpython and initializes an interpreter for the conversion/error tests.
+# `pyo3` is declared here rather than in `[workspace.dependencies]`: a workspace
+# entry fixes one feature set for every member, and `extension-module` does not
+# link libpython, so a `cargo test` binary that touches the Python API could not
+# link.  The `extension-module` feature below is on by DEFAULT (the cdylib build
+# path used by `scripts/build-native.sh`); `auto-init` is the test-only
+# alternative that links libpython and initializes an interpreter for the
+# conversion/error tests.
 pyo3 = { version = "0.30", features = ["macros", "abi3-py311"], default-features = false }
 [features]
 default = ["extension-module"]

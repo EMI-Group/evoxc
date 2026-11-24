@@ -5,7 +5,7 @@
 `evoxc-core` is the Rust half of EvoX Compiler's numerical authority: dtypes and `np.result_type` promotion, symbolic `Dim`/`DimExpr`, `ValueType`, typed attributes with raw-byte tensor payloads, the generated op schema registry, the region-based SSA graph IR, the `evoxc-native-ir` envelope codec, native shape inference and the IR verifier.
 It has no Python dependency and no knowledge of storage, devices, backends or compilation: those live in `evoxc-compiler`, `evoxc-runtime` and the PyO3 crate.
 The Python packages stay authoritative for behavior: `src/infer/` must match `evoxc/ir/inference.py` exactly and `src/verify.rs` must match `evoxc/ir/verify.py`, pinned by the committed differential fixture.
-Allowed third-party dependencies are `serde`, `serde_json` and `base64` only (`../../native/CONTEXT.md` is the binding FFI/wire contract; this file refines crate internals and never changes the wire format or FFI names).
+Allowed third-party dependencies are `serde_json` and `base64` only (`serde` is reached transitively through `serde_json` and is not a direct dependency; `../../native/CONTEXT.md` is the binding FFI/wire contract while this file refines crate internals and never changes the wire format or FFI names).
 
 ## Module map
 
