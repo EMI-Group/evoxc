@@ -428,11 +428,10 @@ fn dot_gemm(
 }
 
 /// Multiply-adds (`m * k * n * output blocks`) from which the plain matmul is
-/// worth splitting across threads.  Measured on a 16-cpu hybrid host (6
-/// performance + 8 efficiency + 2 low-power cores) with a row split of the
-/// output: a 256^3 matmul (2^24) is a wash at the median and a 512^3 (2^27) is
-/// 1.1-1.9x faster threaded, so this floor sits above the 256^3 shape: below it
-/// the spawn is not repaid.
+/// worth splitting across threads.  Measured on a 16-cpu host with a row split
+/// of the output: a 256^3 matmul (2^24) is a wash at the median and a 512^3
+/// (2^27) is 1.1-1.9x faster threaded, so this floor sits above the 256^3 shape:
+/// below it the spawn is not repaid.
 const GEMM_PARALLEL_MIN_WORK: usize = 1 << 25;
 /// Multiply-adds one batch element must reach before the batch is worth
 /// splitting.  A batch of many small matmuls (measured: eight 128^3 blocks,
@@ -442,13 +441,45 @@ const GEMM_PARALLEL_MIN_WORK: usize = 1 << 25;
 const GEMM_PARALLEL_MIN_BLOCK_WORK: usize = 1 << 23;
 /// Multiply-adds one thread should own before another thread is worth spawning.
 const GEMM_PARALLEL_WORK_PER_THREAD: usize = 1 << 23;
-/// Thread cap below [`GEMM_WIDE_WORK`].  Measured on the same hybrid host: a
-/// 512^3 matmul is fastest at 8 threads and loses at 16, because the extra
-/// strips land on efficiency cores and every thread re-packs the whole B panel.
+/// Thread cap below [`GEMM_WIDE_WORK`]: the measured optimum for a matmul that
+/// is threaded but not wide (a 512^3 is fastest at 8 threads on the recorded
+/// host), and the count `gemm_threads` returns for every shape below the wide
+/// crossover.  The sweep recorded under [`GEMM_WIDE_WORK`] does not exercise it
+/// (all three of its shapes are wide).
+///
+/// This is a degree HINT, never a hard partition, and it cannot be raised past
+/// the machine: faer's `Par::rayon(n)` hands `n` to `spindle`, which clamps its
+/// worker count to `rayon::current_num_threads()` — the process-global rayon
+/// pool, sized `available_parallelism()` — and no crate here installs a rayon
+/// pool of its own, so a hint BELOW the pool is honoured while a hint above it
+/// only queues work the pool cannot run in parallel.
 const GEMM_PARALLEL_MAX_THREADS: usize = 8;
-/// Work from which every available cpu may be used: a 1024^3 matmul (this many
-/// multiply-adds) is where 16 threads first beat 8, because the per-thread
-/// packing and spawn costs are amortized by then.
+/// Work from which every available cpu may be requested: a 1024^3 matmul (this
+/// many multiply-adds).
+///
+/// What threading actually costs in faer 0.24: the OUTPUT is split across
+/// threads (microtiles of `m x n`; never the contraction), so every output
+/// element keeps its single accumulation order over K and a threaded result is
+/// bit-identical to the one-thread result (pinned by
+/// `dot_parallel_matches_the_single_threaded_path_bit_for_bit`).  Each LHS/RHS
+/// panel is packed lazily exactly ONCE per gemm call, guarded by pack jobs — no
+/// thread re-packs another thread's operand — so the only per-thread costs are
+/// the pack jobs and the split itself.
+///
+/// MEASURED (2026-11-24, this host: 16 cpus, AVX2+FMA, shared; f32,
+/// `bench_dot_gemm`'s pooled leg, medians of 9 interleaved passes after 3
+/// warmups, the spread over four runs):
+///
+/// | shape | 1 thread | 4 | 8 | 16 (= `parallel_cpus()`) |
+/// |---|---|---|---|---|
+/// | 1024^3 | 17.9-23.1 ms | 6.6-7.7 ms | 3.7-4.5 ms | 3.0-3.9 ms |
+/// | 2048^3 | 142.7-143.2 ms | 41.3-42.2 ms | 23.9-26.2 ms | **15.2-17.2 ms** |
+/// | 4096x1024 . 1024x4096 | 284.0-284.5 ms | 76.1-77.3 ms | 48.1-49.5 ms | **30.7-31.9 ms** |
+///
+/// So a 1024^3 matmul is at worst a wash between the 8-thread cap and every cpu
+/// (16 never lost it), 2048^3 and the 4096x1024 . 1024x4096 pair want every
+/// cpu (1.6-1.7x over 8 threads), and the crossover therefore sits at 1024^3 —
+/// which is where it already was, so no threshold changed on this evidence.
 const GEMM_WIDE_WORK: usize = 1 << 30;
 
 /// The host's usable parallelism, probed once.
@@ -496,10 +527,11 @@ fn gemm_par(threads: usize) -> faer::Par {
     }
 }
 
-/// One BLAS-3 call per batch element, writing straight into a freshly allocated
-/// result (every block is contiguous, so the kernel's out pointer is the block's
-/// own start).  Above [`GEMM_PARALLEL_MIN_WORK`] the output is split across
-/// threads (see [`gemm_threads`]).
+/// One BLAS-3 call per batch element, writing straight into the result (every
+/// block is contiguous, so the kernel's out pointer is the block's own start).
+/// The destination comes from the thread-local pool (see
+/// [`pooled_destination`]) and the output is split across threads above
+/// [`GEMM_PARALLEL_MIN_WORK`] (see [`gemm_threads`]).
 fn gemm_run<T: FaerGemm>(
     a: Operand<'_, T>,
     b: Operand<'_, T>,
@@ -521,6 +553,39 @@ fn gemm_run_threads<T: FaerGemm>(
     out_shape: &[usize],
     threads: usize,
 ) -> Result<Option<Buffer>> {
+    gemm_run_with(a, b, g, dtype, out_shape, threads, |count| pooled_destination(count))
+}
+
+/// The shipping destination allocator: a recycled stock of exactly the result's
+/// size class when the thread-local pool has one, a fresh allocation otherwise.
+///
+/// Bit-safe because the gemm REPLACES the destination: `Accum::Replace` with
+/// `alpha = 1` means faer "does not read the preexisting values in `acc`" (its
+/// own documented contract) and writes every element of every `m x n` block, so
+/// a recycled stock's old bytes can never reach the result — pinned by
+/// `dot_reuses_a_pooled_destination_without_leaking_its_bytes`.
+///
+/// Measuring why this matters on a host where a fresh multi-megabyte allocation
+/// costs page faults, not copy: a 4096x4096 f32 result is 64 MiB, and the
+/// pre-pool `vec![T::zero(); n]` spent 32-45 ms per call of the `bench_dot_gemm`
+/// 64 MiB row faulting pages the kernel zeroes, only for faer to overwrite every
+/// byte.  The pool hands back an already-faulted stock (its `Drop` retains it,
+/// `take_pooled_vec` serves it), so that cost collapses to the gemm itself.
+fn pooled_destination<T: Scalar>(count: usize) -> Vec<T> {
+    crate::buffer::take_pooled_vec::<T>(count).unwrap_or_else(|| T::zeros(count))
+}
+
+/// [`gemm_run_threads`] with an explicit destination allocator (the bench keeps
+/// the pre-pool `vec![T::zero(); n]` as its "before" leg).
+fn gemm_run_with<T: FaerGemm>(
+    a: Operand<'_, T>,
+    b: Operand<'_, T>,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+    threads: usize,
+    destination: impl FnOnce(usize) -> Vec<T>,
+) -> Result<Option<Buffer>> {
     let (m, k, n) = (g.m, g.k, g.n);
     let block = m * n;
     let a_view = operand_view(a)?;
@@ -528,7 +593,7 @@ fn gemm_run_threads<T: FaerGemm>(
     let a_blocks = broadcast_blocks(&a_view, &g.batch, m, k)?;
     let b_blocks = broadcast_blocks(&b_view, &g.batch, k, n)?;
     let par = gemm_par(threads);
-    let mut out = vec![T::zero(); block * util::numel(&g.batch)];
+    let mut out = destination(block * util::numel(&g.batch));
     let mut owned = (None, None);
     // `chunks_exact_mut` and `ndarray::indices` are both C order, so each pair
     // is one batch position and the contiguous output block it owns.
@@ -1036,9 +1101,10 @@ mod tests {
         assert!(threads <= parallel_cpus(), "never more threads than cpus");
         assert!(threads <= 512, "never more threads than output rows");
         if parallel_cpus() >= GEMM_PARALLEL_MAX_THREADS {
-            // Below a 1024^3 matmul the measured optimum is the 8-thread cap.
+            // Below the wide crossover the measured optimum is the 8-thread cap.
             assert_eq!(threads, GEMM_PARALLEL_MAX_THREADS, "512^3 sits at the cap");
-            // ... while a 1024^3 matmul may use the whole machine.
+            // ... from a 1024^3 matmul on the whole machine is at least as fast
+            // (measured: a wash at 1024^3, 1.6-1.7x over 8 threads at 2048^3).
             assert_eq!(
                 gemm_threads(1024 * 1024 * 1024, 1, 1024),
                 parallel_cpus(),
@@ -1206,6 +1272,92 @@ mod tests {
         );
     }
 
+    // --- dot: the pooled gemm destination -----------------------------------
+
+    /// The gemm destination comes from the thread-local pool, and that is
+    /// BIT-SAFE: `Accum::Replace` + `alpha = 1` never reads the prior contents and
+    /// writes every element, so a recycled garbage-filled stock can only change
+    /// the destination's address, never a value.
+    #[test]
+    fn dot_reuses_a_pooled_destination_without_leaking_its_bytes() {
+        // 96^3 f32 -> one 96x96 block (36 KiB, above the pool's 4 KiB retention
+        // floor) and a single-threaded gemm, so the run is fully deterministic.
+        let (m, k, n) = (96usize, 96, 96);
+        let count = m * n;
+        let (a, b, g, out_shape) = gemm_pair(m, k, n, &[], DType::Float32);
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+
+        // A stock of exactly the destination's size class, filled with garbage
+        // that no product can contain (`ramp_f32` output is finite).  Dropping it
+        // hands it to the pool the test thread owns (a fresh thread starts with
+        // an empty pool), and `take` is LIFO, so the next take of this exact
+        // (dtype, count) is precisely these bytes.
+        drop(Storage::F32(vec![f32::NAN; count]));
+        let stock = crate::buffer::take_pooled_vec::<f32>(count)
+            .expect("the garbage stock was retained by the pool");
+        assert!(stock.iter().all(|value| value.is_nan()), "the pool served the garbage stock");
+        // Hand it straight back so the gemm's destination is the garbage stock.
+        drop(Storage::F32(stock));
+
+        let pooled =
+            gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        let pooled_values = f32s(&pooled);
+        assert!(
+            pooled_values.iter().all(|value| value.is_finite()),
+            "a pooled destination leaked a garbage value into the result"
+        );
+        assert_relative(
+            &pooled_values,
+            &f32s(&general_dot(&a, &b, DType::Float32, out_shape.clone())),
+            1e-5,
+            "pooled destination vs the triple loop",
+        );
+
+        // A second call recycles the first result's stock instead (the pool now
+        // holds correct values of the same class): still bit-identical, because
+        // the destination's CONTENTS are irrelevant to the gemm.
+        let again =
+            gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        assert_bit_identical(&f32s(&again), &pooled_values, "pooled destination reuse");
+
+        // The full `dot_impl` entry point takes the same path (the destination is
+        // chosen inside the kernel, not by the caller).
+        let op = spec("dot", DType::Float32, &[m, n], Attrs::new());
+        drop(Storage::F32(vec![f32::NAN; count]));
+        let through_dot = dot_impl(&[a.clone(), b.clone()], &op, vec![m, n]).unwrap();
+        assert!(
+            f32_slice(&through_dot[0]).iter().all(|value| value.is_finite()),
+            "dot_impl leaked a garbage destination value"
+        );
+        assert_bit_identical(
+            &f32s(&through_dot[0]),
+            &pooled_values,
+            "dot_impl through a pooled destination",
+        );
+
+        // The f64 twin, so the recycled-bytes proof is not a one-dtype accident.
+        let (a, b, g, out_shape) = gemm_pair(m, k, n, &[], DType::Float64);
+        let av = operand(&a, f64_slice(&a));
+        let bv = operand(&b, f64_slice(&b));
+        drop(Storage::F64(vec![f64::NAN; count]));
+        let served = crate::buffer::take_pooled_vec::<f64>(count)
+            .expect("the f64 garbage stock was retained by the pool");
+        assert!(served.iter().all(|value| value.is_nan()));
+        drop(Storage::F64(served));
+        let pooled =
+            gemm_run_threads(av, bv, &g, DType::Float64, &out_shape, 1).unwrap().unwrap();
+        let pooled_values = floats(&pooled);
+        assert!(
+            pooled_values.iter().all(|value| value.is_finite()),
+            "an f64 pooled destination leaked a garbage value into the result"
+        );
+        let general = floats(&general_dot(&a, &b, DType::Float64, out_shape));
+        for (got, want) in pooled_values.iter().zip(general.iter()) {
+            assert!((got - want).abs() <= 1e-12 * want.abs().max(1.0), "{got} vs {want}");
+        }
+    }
+
     #[test]
     fn blocks_contiguous_classifies_the_batch_layouts() {
         // Natural C-order block-unit strides for a (2, 3) matrix batch.
@@ -1257,10 +1409,43 @@ mod tests {
     }
 
     /// The gemm A/B: the faer gemm block (the shipping path, threaded by
-    /// `gemm_threads`) against the general triple loop, on the four shapes that
-    /// bracket the fast path.  Prints ms and GFLOP/s; asserts nothing (evidence,
+    /// `gemm_threads`) against the general triple loop, on the four small shapes
+    /// that bracket the fast path, and the three wide shapes the thread policy
+    /// has to decide, each swept over explicit thread counts 1/4/8/16.
+    ///
+    /// The wide rows also print the PRE-FIX destination leg (`zero-fill`: a fresh
+    /// `vec![T::zero(); n]` per call, which is what the shipping path did before
+    /// the destination came from the pool) so the two are measured in one
+    /// process, interleaved.  Prints ms and GFLOP/s; asserts nothing (evidence,
     /// run with `cargo test --release -p evoxc-cpu --lib bench_dot_gemm --
     /// --ignored --nocapture`).
+    ///
+    /// MEASURED (2026-11-24, Intel Core Ultra 7 356H, 16 cpus, AVX2+FMA only,
+    /// shared host, f32, medians of 9 interleaved passes after 3 warmups, the
+    /// spread over four runs of this instrument; `*` marks the count
+    /// `gemm_threads` ships):
+    ///
+    /// | shape | threads | pooled (shipping) | zero-fill (pre-fix) |
+    /// |---|---|---|---|
+    /// | 1024x1024 . 1024x1024 | 1 | 17.9-23.1 ms (93-120 GFLOP/s) | 17.7-18.3 ms |
+    /// | | 4 | 6.6-7.7 ms (279-327) | 6.9-8.0 ms |
+    /// | | 8 | 3.7-4.5 ms (478-587) | 4.4 ms |
+    /// | | 16* | 3.0-3.9 ms (546-712) | 4.5-6.8 ms |
+    /// | 2048x2048 . 2048x2048 | 1 | 142.7-143.2 ms (120) | 142.8-143.0 ms |
+    /// | | 4 | 41.3-42.2 ms (407-416) | 41.7-47.0 ms |
+    /// | | 8 | 23.9-26.2 ms (657-718) | 24.8-25.8 ms |
+    /// | | 16* | 15.2-17.2 ms (1000-1129) | 16.0-20.1 ms |
+    /// | 4096x1024 . 1024x4096 | 1 | 284.0-284.5 ms (121) | 302.2-303.1 ms |
+    /// | | 4 | 76.1-77.3 ms (445-451) | 88.5-91.5 ms |
+    /// | | 8 | 48.1-49.5 ms (694-714) | 60.3 ms |
+    /// | | 16* | 30.7-31.9 ms (1079-1122) | 63.7-76.1 ms |
+    ///
+    /// The pooled destination is the whole story on the 64 MiB result: 2.0-2.5x
+    /// faster end to end at the shipping count, and the saving scales with the
+    /// result size (nothing at 4 MiB, ~1 ms at 16 MiB, ~32-45 ms at 64 MiB).
+    /// The thread policy is unchanged: the 8-thread cap and every-cpu crossover
+    /// at 1024^3 are both what the sweep measures as best (see the constants
+    /// above `gemm_threads`).
     #[test]
     #[ignore = "measurement instrument (release only)"]
     fn bench_dot_gemm() {
@@ -1301,6 +1486,71 @@ mod tests {
                 flops / loop_ms / 1e6,
                 loop_ms / gemm_ms,
             );
+        }
+
+        // The wide shapes, where the thread policy actually chooses: one shared
+        // interleaved rep loop, so every count sees the same host state.
+        let wide: [(&str, usize, usize, usize); 3] = [
+            ("1024x1024 . 1024x1024", 1024, 1024, 1024),
+            ("2048x2048 . 2048x2048", 2048, 2048, 2048),
+            ("4096x1024 . 1024x4096", 4096, 1024, 4096),
+        ];
+        const COUNTS: [usize; 4] = [1, 4, 8, 16];
+        const PASSES: usize = 9;
+        const WARMUPS: usize = 3;
+        for (name, m, k, n) in wide {
+            let (a, b, g, out_shape) = gemm_pair(m, k, n, &[], DType::Float32);
+            let av = operand(&a, f32_slice(&a));
+            let bv = operand(&b, f32_slice(&b));
+            let flops = 2.0 * (m * k * n) as f64;
+            let shipping = gemm_threads(m * k * n, 1, m);
+            for _ in 0..WARMUPS {
+                for count in COUNTS {
+                    let out =
+                        gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, count).unwrap();
+                    std::hint::black_box(out);
+                    let out = gemm_run_with(av, bv, &g, DType::Float32, &out_shape, count, |len| {
+                        vec![0.0f32; len]
+                    })
+                    .unwrap();
+                    std::hint::black_box(out);
+                }
+            }
+            let mut pooled: [Vec<f64>; COUNTS.len()] = Default::default();
+            let mut zeroed: [Vec<f64>; COUNTS.len()] = Default::default();
+            for _ in 0..PASSES {
+                for (index, count) in COUNTS.iter().copied().enumerate() {
+                    let start = std::time::Instant::now();
+                    let out =
+                        gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, count).unwrap();
+                    std::hint::black_box(out);
+                    pooled[index].push(start.elapsed().as_secs_f64() * 1e3);
+                    let start = std::time::Instant::now();
+                    let out = gemm_run_with(av, bv, &g, DType::Float32, &out_shape, count, |len| {
+                        vec![0.0f32; len]
+                    })
+                    .unwrap();
+                    std::hint::black_box(out);
+                    zeroed[index].push(start.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            for (index, count) in COUNTS.iter().copied().enumerate() {
+                let median = |samples: &mut Vec<f64>| {
+                    samples.sort_by(f64::total_cmp);
+                    samples[samples.len() / 2]
+                };
+                let pooled_ms = median(&mut pooled[index]);
+                let zeroed_ms = median(&mut zeroed[index]);
+                println!(
+                    "{name:<24} threads {count:>2}{} pooled {:>9.3} ms ({:>7.1} GFLOP/s)   \
+                     zero-fill {:>9.3} ms ({:>7.1} GFLOP/s)",
+                    if count == shipping { "*" } else { " " },
+                    pooled_ms,
+                    flops / pooled_ms / 1e6,
+                    zeroed_ms,
+                    flops / zeroed_ms / 1e6,
+                );
+            }
         }
     }
 

@@ -11,7 +11,7 @@ use super::parallel::{parallel_threads, split_parallel};
 use super::pool::take_pooled_vec;
 
 /// One typed, C-contiguous value buffer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Storage {
     Bool(Vec<bool>),
     I8(Vec<i8>),
@@ -71,6 +71,25 @@ impl Storage {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Copy a typed host slice into storage, writing into a RECYCLED
+    /// allocation when this thread's pool holds a stock of exactly this dtype
+    /// and element count and into fresh storage otherwise.
+    ///
+    /// That is the same per-size-class pool results, results' clones, reduction
+    /// results and `dot` destinations draw from (see `pool.rs`), so a
+    /// multi-megabyte host array handed to the engine is not re-faulted on every
+    /// call; this constructor is the hand-off the PyO3 binding uses for a `run`'s
+    /// inputs.
+    ///
+    /// The copy is one `copy_from_slice` over the whole storage (split across
+    /// scoped threads above the flat map's crossover, exactly like
+    /// [`Storage::clone`]), so a pooled destination is FULLY overwritten — the
+    /// pool's contract — and the result never shares memory with `values`.
+    pub fn from_slice_pooled<T: Scalar>(values: &[T]) -> Storage {
+        T::into_storage(copy_slice_pooled(values))
+    }
+
     /// Bytes of element storage this value holds (not its capacity).
     pub(super) fn bytes(&self) -> usize {
         fn size<T>(values: &[T]) -> usize {
@@ -91,6 +110,68 @@ impl Storage {
             Storage::F64(v) => size(v),
             Storage::C64(v) => size(v),
             Storage::C128(v) => size(v),
+        }
+    }
+}
+
+/// Copy `source` into a pooled stock of exactly that size, falling back to an
+/// ordinary `Vec` copy when the pool has no stock (a small value, or a cold
+/// thread).  The shared body of [`Storage::from_slice_pooled`] and
+/// [`Storage::clone`]: one `copy_from_slice` (threaded above the flat map's
+/// crossover), so every element of the destination is written.
+pub(crate) fn copy_slice_pooled<T: Scalar>(source: &[T]) -> Vec<T> {
+    let Some(mut stock) = take_pooled_vec::<T>(source.len()) else {
+        return source.to_vec();
+    };
+    let threads = parallel_threads(source.len());
+    if threads > 1 {
+        split_parallel(&mut stock, threads, |offset, chunk| {
+            let len = chunk.len();
+            chunk.copy_from_slice(&source[offset..offset + len]);
+        });
+    } else {
+        stock.copy_from_slice(source);
+    }
+    stock
+}
+
+/// Cloning a value is the same allocation problem as producing one: a
+/// `Storage`'s clone is a full-size `Vec` plus a memcpy, and for anything past
+/// the allocator's mmap threshold the destination is a FRESH mapping whose pages
+/// the copy then faults in.  Measured on this host (medians of 11 runs after 3
+/// warmups), `Buffer::clone` of a 64 MiB f32 value costs **26.5 ms** that way,
+/// against **~7 ms** when the destination comes from the pool and its pages stay
+/// mapped — the same argument the pool exists for on result and constant paths
+/// (see `pool.rs`), now applied where a caller re-hands a host input to
+/// `run_program` (which takes owned buffers) or a kernel clones a value.
+///
+/// The copy is split across `parallel_threads` scoped threads above the flat
+/// map's own crossover, exactly like [`decode_le`], so a clone keeps that floor
+/// without changing a single value: every byte is copied exactly once.
+impl Clone for Storage {
+    fn clone(&self) -> Storage {
+        macro_rules! clone_arms {
+            ($($variant:ident($ty:ty) => $values:ident),* $(,)?) => {
+                match self {
+                    $(Storage::$variant($values) => Storage::$variant(copy_slice_pooled::<$ty>($values)),)*
+                }
+            };
+        }
+        clone_arms! {
+            Bool(bool) => values,
+            I8(i8) => values,
+            I16(i16) => values,
+            I32(i32) => values,
+            I64(i64) => values,
+            U8(u8) => values,
+            U16(u16) => values,
+            U32(u32) => values,
+            U64(u64) => values,
+            F16(f16) => values,
+            F32(f32) => values,
+            F64(f64) => values,
+            C64(Complex<f32>) => values,
+            C128(Complex<f64>) => values,
         }
     }
 }
@@ -292,6 +373,43 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|value| value.to_le_bytes()).collect();
         let storage = decode_storage(DType::Float32, &bytes).unwrap();
         assert_eq!(storage, Storage::F32(words));
+    }
+
+    #[test]
+    fn a_pooled_host_slice_copy_is_fully_overwritten() {
+        // `from_slice_pooled` is the binding's input hand-off, so the stock it
+        // takes from the pool must be overwritten end to end: a garbage stock of
+        // exactly this size class proves no stale element survives.
+        let count = POOL_MIN_BYTES / std::mem::size_of::<f32>() + 8;
+        garbage_f32(count);
+        let source: Vec<f32> = (0..count).map(|index| index as f32 * 0.25).collect();
+        let original = source.clone();
+        let storage = Storage::from_slice_pooled(&source);
+        assert_eq!(
+            storage,
+            Storage::F32(original.clone()),
+            "a pooled destination must carry the whole source"
+        );
+        // The copied storage owns its allocation: writing the source afterwards
+        // leaves the result untouched.
+        let mut source = source;
+        source[0] = -1.0;
+        assert_eq!(storage, Storage::F32(original));
+    }
+
+    #[test]
+    fn a_small_host_slice_copy_falls_back_to_fresh_storage() {
+        // Below `POOL_MIN_BYTES` the pool never retains anything, so this takes
+        // the fresh arm and must still copy every element (and every dtype).
+        let values: Vec<i32> = vec![-3, 0, 7, i32::MAX];
+        assert_eq!(Storage::from_slice_pooled(&values), Storage::I32(values));
+        let empty: Vec<f64> = Vec::new();
+        assert_eq!(Storage::from_slice_pooled(&empty), Storage::F64(Vec::new()));
+        let complex: Vec<Complex<f32>> = vec![Complex::new(1.0, -2.0)];
+        assert_eq!(
+            Storage::from_slice_pooled(&complex),
+            Storage::C64(complex.clone())
+        );
     }
 
     #[test]

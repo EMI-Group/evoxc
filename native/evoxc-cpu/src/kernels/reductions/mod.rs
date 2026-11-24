@@ -30,6 +30,16 @@
 //! one sequential lane — and only float32/float64 sums move inside the parity
 //! tolerance's documented window.
 //!
+//! A block fold is memory bound: 16M f32 (64 MiB) folds in ~2.5 ms on ONE
+//! thread (0.15 ns/element), so a reduction's own arithmetic is at the
+//! bandwidth floor and the only levers left are the ones around it — the result
+//! allocation (pooled, see [`flat::fold_block_with`]) and, where the block has
+//! several independent OUTPUTS, a scoped-thread split over them, which is
+//! bit-identical because each output element is still produced by one thread
+//! (`(4096, 4096)` reduced on one axis: 2.5 ms on one thread, 0.9 ms on the
+//! policy's eight).  A full reduction to rank 0 has a single output and can
+//! never split.
+//!
 //! Every result shape is the DECLARED result shape evaluated by the runtime
 //! ([`util::result_shape`]); a kernel never re-derives one.  Combinations the
 //! numerical vocabulary cannot express faithfully (complex ordering for
@@ -37,6 +47,8 @@
 //! `evoxc_core::Error`s naming the op — never a wrong value.
 
 mod argmax;
+#[cfg(test)]
+mod bench_reduce_large;
 mod cumulative;
 mod flat;
 mod layout;

@@ -17,14 +17,17 @@
 //!   swapped byte order (`dtype.is_native_byteorder() == Some(false)`) BEFORE
 //!   any typed view could misread it, copies `shape()`, and then reads the
 //!   payload through `PyReadonlyArrayDyn<T>`: a C-contiguous array is one
-//!   `memcpy` (`ArrayView::as_slice().to_vec()`), while a Fortran-ordered,
-//!   transposed or negative-stride view is walked in logical order by
-//!   `ndarray`'s iterator.  A strided array is therefore never misread, no
-//!   `numpy.ascontiguousarray` call happens anywhere, and the caller's array is
-//!   only borrowed (never mutated).  `bool` is the one special case: a numpy
-//!   bool array may hold any byte (only `!= 0` is meaningful) and reading byte
-//!   `2` as a Rust `bool` would be undefined behaviour, so it is read through a
-//!   zero-copy `uint8` view and normalized to `byte != 0`.
+//!   `memcpy` into `Storage::from_slice_pooled` (a recycled stock of exactly
+//!   that dtype and element count when the engine's thread-local pool holds
+//!   one, so a multi-megabyte input is not re-faulted on every run), while a
+//!   Fortran-ordered, transposed or negative-stride view is walked in logical
+//!   order by `ndarray`'s iterator into a fresh allocation.  A strided array is
+//!   therefore never misread, no `numpy.ascontiguousarray` call happens
+//!   anywhere, and the caller's array is only borrowed (never mutated).  `bool`
+//!   is the one special case: a numpy bool array may hold any byte (only
+//!   `!= 0` is meaningful) and reading byte `2` as a Rust `bool` would be
+//!   undefined behaviour, so it is read through a zero-copy `uint8` view and
+//!   normalized to `byte != 0`.
 //! * **out** — [`buffer_to_array`] CONSUMES the engine's `Buffer`: each
 //!   `Storage` variant hands its `Vec<T>` to numpy as the array's buffer
 //!   (`ndarray::ArrayD::from_shape_vec` + `IntoPyArray`), i.e. zero copy, and
@@ -62,7 +65,7 @@ use serde_json::{Map, Value as Json};
 use evoxc::core::graph::Program;
 use evoxc::core::DType;
 use evoxc::cpu::plan::Plan;
-use evoxc::cpu::{Buffer, Callbacks, RunOptions, Storage, Value};
+use evoxc::cpu::{Buffer, Callbacks, RunOptions, Scalar, Storage, Value};
 
 use crate::convert::{json_from_py, py_from_json};
 use crate::error;
@@ -293,8 +296,9 @@ fn decode_inputs(py: Python<'_>, flat_inputs: &Bound<'_, PyAny>) -> PyResult<Vec
 /// numpy array → [`Buffer`], naming `path` (`flat_inputs[2]`) in a `TypeError`.
 ///
 /// The array is only BORROWED: values are copied out of its view (one memcpy for
-/// a C-contiguous array, a logical-order walk for any other layout) into the
-/// engine's own typed storage, so the caller's array is never mutated.
+/// a C-contiguous array into a pooled or fresh engine allocation, a
+/// logical-order walk for any other layout) into the engine's own typed storage,
+/// so the caller's array is never mutated.
 fn array_to_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResult<Buffer> {
     let not_array = || {
         error::type_error(format!(
@@ -326,34 +330,39 @@ fn array_to_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResu
     let dims: Vec<usize> = array.shape().to_vec();
     let storage = match dtype {
         DType::Bool => Storage::Bool(bool_values(py, obj, path)?),
-        DType::Int8 => Storage::I8(collect_values::<i8>(py, obj, path)?),
-        DType::Int16 => Storage::I16(collect_values::<i16>(py, obj, path)?),
-        DType::Int32 => Storage::I32(collect_values::<i32>(py, obj, path)?),
-        DType::Int64 => Storage::I64(collect_values::<i64>(py, obj, path)?),
-        DType::UInt8 => Storage::U8(collect_values::<u8>(py, obj, path)?),
-        DType::UInt16 => Storage::U16(collect_values::<u16>(py, obj, path)?),
-        DType::UInt32 => Storage::U32(collect_values::<u32>(py, obj, path)?),
-        DType::UInt64 => Storage::U64(collect_values::<u64>(py, obj, path)?),
-        DType::Float16 => Storage::F16(collect_values::<f16>(py, obj, path)?),
-        DType::Float32 => Storage::F32(collect_values::<f32>(py, obj, path)?),
-        DType::Float64 => Storage::F64(collect_values::<f64>(py, obj, path)?),
-        DType::Complex64 => Storage::C64(collect_values::<Complex<f32>>(py, obj, path)?),
-        DType::Complex128 => Storage::C128(collect_values::<Complex<f64>>(py, obj, path)?),
+        DType::Int8 => collect_values::<i8>(py, obj, path)?,
+        DType::Int16 => collect_values::<i16>(py, obj, path)?,
+        DType::Int32 => collect_values::<i32>(py, obj, path)?,
+        DType::Int64 => collect_values::<i64>(py, obj, path)?,
+        DType::UInt8 => collect_values::<u8>(py, obj, path)?,
+        DType::UInt16 => collect_values::<u16>(py, obj, path)?,
+        DType::UInt32 => collect_values::<u32>(py, obj, path)?,
+        DType::UInt64 => collect_values::<u64>(py, obj, path)?,
+        DType::Float16 => collect_values::<f16>(py, obj, path)?,
+        DType::Float32 => collect_values::<f32>(py, obj, path)?,
+        DType::Float64 => collect_values::<f64>(py, obj, path)?,
+        DType::Complex64 => collect_values::<Complex<f32>>(py, obj, path)?,
+        DType::Complex128 => collect_values::<Complex<f64>>(py, obj, path)?,
     };
     Buffer::new(dtype, dims, storage).map_err(|err| error::from_core(py, err))
 }
 
-/// Copy a typed numpy view into an owned `Vec<T>` in logical (C) order.
+/// Copy a typed numpy view into the engine's own typed storage, in logical (C)
+/// order.
 ///
 /// `ArrayView::as_slice` succeeds only for a standard-layout array — that arm is
-/// one `memcpy`; every other layout (Fortran order, a transpose, a
+/// one memcpy into [`Storage::from_slice_pooled`], so the destination is a
+/// recycled stock of exactly this dtype and element count when this thread's
+/// engine pool holds one (and a fresh allocation otherwise) and is fully
+/// overwritten either way; every other layout (Fortran order, a transpose, a
 /// negative-stride slice) falls back to `ndarray`'s logical-order iterator, which
-/// visits the same elements numpy's own `ascontiguousarray` would produce.
-fn collect_values<T: numpy::Element + Copy>(
+/// visits the same elements numpy's own `ascontiguousarray` would produce.  One
+/// copy per input, never more.
+fn collect_values<T: numpy::Element + Scalar>(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
     path: &str,
-) -> PyResult<Vec<T>> {
+) -> PyResult<Storage> {
     let view = obj
         .extract::<PyReadonlyArrayDyn<'_, T>>()
         .map_err(|err| borrow_error(py, path, &err))?;
@@ -361,8 +370,8 @@ fn collect_values<T: numpy::Element + Copy>(
     // `ArrayView::as_slice` is `Some` only for a standard (C) layout; any
     // other layout is walked in logical index order by `iter`.
     Ok(match array.as_slice() {
-        Some(values) => values.to_vec(),
-        None => array.iter().copied().collect(),
+        Some(values) => Storage::from_slice_pooled(values),
+        None => T::into_storage(array.iter().copied().collect()),
     })
 }
 
@@ -370,7 +379,10 @@ fn collect_values<T: numpy::Element + Copy>(
 /// so read the array through a zero-copy `uint8` view and normalize.
 ///
 /// `view('uint8')` keeps the itemsize at 1 byte, which numpy allows for ANY
-/// strides, and `byte != 0` is the same normalization the engine applies.
+/// strides, and `byte != 0` is the same normalization the engine applies.  The
+/// normalization has no host slice to hand to [`Storage::from_slice_pooled`], so
+/// this is the one input path that builds its `Vec<bool>` element by element
+/// (one allocation, one logical-order pass, no intermediate byte vector).
 fn bool_values(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResult<Vec<bool>> {
     let bytes = obj.call_method1("view", ("uint8",)).map_err(|err| {
         error::raise(
@@ -382,10 +394,10 @@ fn bool_values(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str) -> PyResult<V
             ),
         )
     })?;
-    Ok(collect_values::<u8>(py, &bytes, path)?
-        .into_iter()
-        .map(|byte| byte != 0)
-        .collect())
+    let view = bytes
+        .extract::<PyReadonlyArrayDyn<'_, u8>>()
+        .map_err(|err| borrow_error(py, path, &err))?;
+    Ok(view.as_array().iter().map(|byte| *byte != 0).collect())
 }
 
 /// Borrow a typed numpy view and turn a refusal into a `BackendError` naming

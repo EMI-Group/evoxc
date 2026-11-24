@@ -9,7 +9,7 @@
 use evoxc_core::{DType, Error, Result};
 use ndarray::Axis;
 
-use crate::buffer::{array_view, array_view_mut, shape_text, Buffer, NdScalar};
+use crate::buffer::{array_view, array_view_mut, copy_slice_pooled, shape_text, Buffer, NdScalar};
 use crate::exec::{single, RunCtx, Value};
 use crate::kernels::util;
 use crate::plan::OpSpec;
@@ -84,9 +84,11 @@ fn typed_cumulative<T: Num + NdScalar>(
 ) -> Result<Vec<Value>> {
     // The result starts as a copy of the operand (an empty axis therefore yields
     // a correctly shaped, element-free result) and every lane is then fully
-    // overwritten in place, so no zero fill is needed.
+    // overwritten in place, so no zero fill is needed — and the copy itself
+    // lands in a recycled allocation when the pool has one (see
+    // `Storage::from_slice_pooled`'s shared body).
     let view = array_view(values, shape)?;
-    let mut out = values.to_vec();
+    let mut out = copy_slice_pooled(values);
     {
         let mut out_view = array_view_mut(&mut out, shape)?;
         for (source, mut destination) in view

@@ -12,6 +12,23 @@
 //! `inner > 1` keeps one accumulator per output lane of a group and folds it row
 //! by row.
 //!
+//! Two properties are orthogonal to that layout work and are what a LARGE block
+//! turns on (measured on this host through the whole graph — see the
+//! `bench_reduce_large` note below):
+//!
+//! * **The result comes from the pool.**  Every slot of the output is written
+//!   exactly once, so a pooled stock of that exact size is already the right
+//!   length and a fresh one is zero-filled — the same page-touch the fold pays
+//!   anyway.  A `vec![T::zero(); out_len]` for a wide output (one lane per
+//!   element of a 16M-element operand) used to add a whole zero-fill pass.
+//! * **Independent outputs are folded on scoped threads.**  A block fold's
+//!   output elements are independent — each is one `fold_run` (or one lane
+//!   window) over its own operand positions — so splitting a block over output
+//!   elements is bit-identical at any thread count, which is why it is allowed
+//!   here where splitting a single reduced run is not (that would reassociate
+//!   the sum).  [`fold_threads`] therefore caps the split at the output count: a
+//!   full `16M -> rank 0` sum has ONE output and stays on the calling thread.
+//!
 //! Both spellings implement the SAME semantics and stay bit-for-bit equivalent
 //! for integer, bool, float16 and complex folds (wrapping integer arithmetic is
 //! associative, and those dtypes keep the single sequential lane); only
@@ -19,10 +36,9 @@
 //! inside the documented parity tolerance.  The ndarray lane walk stays the
 //! reference for every non-block layout (a gapped reduced axis pair, or nothing
 //! reduced at all).
-use evoxc_core::Result;
-
+use crate::buffer::{parallel_threads, split_parallel, take_pooled_vec};
 use crate::scalar::{Num, Scalar};
-
+use evoxc_core::{Error, Result};
 use super::layout::{fold_lanes, fold_run, Block};
 
 /// Fold every output of a contiguous [`Block`], in C output order.
@@ -38,53 +54,156 @@ pub(super) fn fold_block<T, F>(
 ) -> Result<Vec<T>>
 where
     T: Num,
-    F: Fn(T, T) -> T + Copy,
+    F: Fn(T, T) -> T + Copy + Sync,
 {
-    let lanes = fold_lanes(<T as Scalar>::DTYPE);
-    let mut out = Vec::with_capacity(block.out_len());
+    let threads = fold_threads(block, values.len());
+    fold_block_with(values, block, identity, op, threads)
+}
+
+/// Elements ONE thread must own before a block fold splits at all.
+///
+/// The flat maps split from `parallel_threads`' own crossover (2^18) because
+/// their per-element work is a couple of loads; a reduce's per-thread work at
+/// that size is a single ~15 µs pass, which a ~10 µs scoped-thread spawn does
+/// not repay — measured on the engine's own shapes, `(4096, 64)` reduced on its
+/// trailing axis folds in 16.9 µs on ONE thread against 28.6 µs on the two the
+/// flat-map policy would pick, and `(64, 4096)` on its leading axis 21.4 against
+/// 29.2 µs.  Requiring 2^19 elements per thread (2 MiB of f32, a ~60 µs pass)
+/// keeps every small and medium reduce single-threaded, while a 16M-element
+/// one-axis reduce still takes the full eight threads (2.7 -> 0.9 ms on
+/// `(4096, 4096)`).
+pub(super) const REDUCE_MIN_PER_THREAD: usize = 1 << 19;
+
+/// The thread count a block fold may use.
+///
+/// One thread per output element is exactly as many as the split allows, so the
+/// count is the flat map's own [`parallel_threads`] crossover capped by
+/// `block.out_len()` and by [`REDUCE_MIN_PER_THREAD`]: a full reduction
+/// (`out_len == 1`) never splits, a small block never splits, and a large
+/// one-axis reduction splits only as far as it has independent outputs.
+pub(super) fn fold_threads(block: &Block, elements: usize) -> usize {
+    let per_thread = (elements / REDUCE_MIN_PER_THREAD).max(1);
+    parallel_threads(elements)
+        .min(block.out_len())
+        .min(per_thread)
+}
+
+/// Fold every output of a contiguous [`Block`], in C output order, with an
+/// explicit thread count.
+///
+/// `threads` is only ever a performance knob: outputs `[first, first + len)` of
+/// each disjoint chunk are folded by exactly one thread each, so every thread
+/// count produces the same values bit for bit.  `pub(super)` so the measurement
+/// aid can sweep the counts without changing the policy.
+pub(super) fn fold_block_with<T, F>(
+    values: &[T],
+    block: &Block,
+    identity: Option<T>,
+    op: F,
+    threads: usize,
+) -> Result<Vec<T>>
+where
+    T: Num,
+    F: Fn(T, T) -> T + Copy + Sync,
+{
+    let out_len = block.out_len();
     if block.red == 0 || block.inner == 0 {
         // Nothing is folded: an identity reduction yields its identity in every
         // slot, and an empty max/min reduction is rejected before it reaches a
         // block fold (so `identity` is always `Some` here).
+        let mut out = Vec::with_capacity(out_len);
         if let Some(init) = identity {
-            out.resize(block.out_len(), init);
+            out.resize(out_len, init);
         }
         return Ok(out);
     }
+    let expected = block.outer * block.red * block.inner;
+    if values.len() != expected {
+        return Err(Error::shape(format!(
+            "a ({}, {}, {}) contiguous reduction block needs {expected} element(s), got {}",
+            block.outer,
+            block.red,
+            block.inner,
+            values.len()
+        )));
+    }
+    // Written exactly once per slot (below), so pooled storage needs no zero
+    // fill; a pool miss zero-fills, which the fold's first touch would pay
+    // anyway.
+    let mut out = take_pooled_vec::<T>(out_len).unwrap_or_else(|| T::zeros(out_len));
+    let threads = threads.clamp(1, out_len.max(1));
+    if threads == 1 {
+        fold_outputs(values, block, identity, &op, 0, &mut out);
+    } else {
+        split_parallel(&mut out, threads, |offset, chunk| {
+            fold_outputs(values, block, identity, &op, offset, chunk);
+        });
+    }
+    Ok(out)
+}
+
+/// Fold the outputs `[first, first + chunk.len())` of `block` into `chunk`, in
+/// ascending (C) output order.
+///
+/// Every output folds exactly the positions the single-threaded arm folds, in
+/// the same order, so which chunk an output lands in can never move a bit.
+fn fold_outputs<T, F>(
+    values: &[T],
+    block: &Block,
+    identity: Option<T>,
+    op: &F,
+    first: usize,
+    chunk: &mut [T],
+) where
+    T: Num,
+    F: Fn(T, T) -> T + Copy + Sync,
+{
+    let lanes = fold_lanes(<T as Scalar>::DTYPE);
     let group_len = block.red * block.inner;
     if block.inner == 1 {
         // A trailing-axis (or full) reduction: every output is one contiguous
-        // run, folded in place with no view construction at all.
-        for group in values.chunks_exact(group_len) {
+        // run of `red` elements, folded with no view construction at all.
+        for (offset, slot) in chunk.iter_mut().enumerate() {
+            let start = (first + offset) * group_len;
+            let group = &values[start..start + group_len];
             let init = identity.unwrap_or(group[0]);
-            out.push(fold_run(group, init, op, lanes));
+            *slot = fold_run(group, init, *op, lanes);
         }
-        return Ok(out);
+        return;
     }
-    // One accumulator per output lane of a group: the identity when the
-    // reduction has one, otherwise the group's first row (max/min have no
-    // identity).  The accumulator is reused across groups, so a column sum pays
-    // no allocation per group.
-    let mut acc = vec![T::zero(); block.inner];
-    for group in values.chunks_exact(group_len) {
+    // One accumulator per output lane, accumulated row by row inside the
+    // chunk's own lane window: the identity when the reduction has one,
+    // otherwise the group's first row (max/min have no identity).  A chunk that
+    // spans a group boundary walks each group's lane window separately, so the
+    // shared operands are read once per chunk and never re-associated.
+    let inner = block.inner;
+    let mut output = first;
+    let mut filled = 0;
+    while filled < chunk.len() {
+        let group = output / inner;
+        let lane = output % inner;
+        let take = (inner - lane).min(chunk.len() - filled);
+        let base = group * group_len + lane;
+        let window = &mut chunk[filled..filled + take];
         let rows = match identity {
             Some(init) => {
-                acc.fill(init);
+                window.fill(init);
                 0
             }
             None => {
-                acc.copy_from_slice(&group[..block.inner]);
+                window.copy_from_slice(&values[base..base + take]);
                 1
             }
         };
-        for row in group.chunks_exact(block.inner).skip(rows) {
-            for (slot, value) in acc.iter_mut().zip(row) {
+        for row in rows..block.red {
+            let row_values = &values[base + row * inner..base + row * inner + take];
+            for (slot, value) in window.iter_mut().zip(row_values) {
                 *slot = op(*slot, *value);
             }
         }
-        out.extend_from_slice(&acc);
+        output += take;
+        filled += take;
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -264,6 +383,110 @@ mod tests {
                 lane_us / flat_us
             );
         }
+    }
+
+    /// Measurement aid: LARGE contiguous folds (a full 16M-element sum, and both
+    /// axes of a (4096, 4096) matrix) against (a) the sequential one-lane fold and
+    /// (b) a hand-written 8-accumulator `chunks_exact(32)` sum, which is the
+    /// memory-bound floor the lane fold is supposed to reach.  Medians of 9
+    /// passes after 3 warmups; this host is shared, so compare within a run only.
+    ///
+    /// This is the FOLD-level instrument; `bench_reduce_large` in
+    /// `reductions::bench_reduce_large` decomposes the same cases through the
+    /// whole graph (input clone, result allocation, kernel entry, threading).
+    #[test]
+    #[ignore = "measurement aid: prints large-fold timings"]
+    fn bench_reduce_large_fold() {
+        use std::time::Instant;
+        const WARMUPS: usize = 3;
+        const REPS: usize = 9;
+
+        /// The unrolled reference: 8 accumulators, four 8-lane chunks per pass.
+        fn unrolled_sum(values: &[f32]) -> f32 {
+            let mut acc = [0.0f32; 8];
+            let mut chunks = values.chunks_exact(32);
+            for chunk in &mut chunks {
+                for (lane, slot) in acc.iter_mut().enumerate() {
+                    *slot += chunk[lane]
+                        + chunk[lane + 8]
+                        + chunk[lane + 16]
+                        + chunk[lane + 24];
+                }
+            }
+            let mut total: f32 = acc.iter().sum();
+            for value in chunks.remainder() {
+                total += *value;
+            }
+            total
+        }
+
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        }
+
+        fn bench(label: &str, values: &[f32], block: &Block) {
+            let mut fold8 = Vec::new();
+            let mut reference = Vec::new();
+            for _ in 0..WARMUPS {
+                std::hint::black_box(fold_block(values, block, Some(0.0f32), |a, b| a + b).unwrap());
+                std::hint::black_box(unrolled_sum(values));
+            }
+            for _ in 0..REPS {
+                let started = Instant::now();
+                std::hint::black_box(fold_block(values, block, Some(0.0f32), |a, b| a + b).unwrap());
+                fold8.push(started.elapsed().as_secs_f64() * 1e3);
+                let started = Instant::now();
+                std::hint::black_box(unrolled_sum(values));
+                reference.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            let elements = values.len();
+            let (flat_us, reference_us) = (median(fold8), median(reference));
+            println!(
+                "{label:34} fold_block {flat_us:7.3} ms ({:5.2} ns/el)  unrolled {reference_us:7.3} ms ({:5.2} ns/el)",
+                flat_us * 1e6 / elements as f64,
+                reference_us * 1e6 / elements as f64
+            );
+        }
+
+        let big = 16usize << 20;
+        let values: Vec<f32> = (0..big).map(|index| (index % 1000) as f32 * 0.001).collect();
+        let block = Block::new(&[big], &[true]).expect("contiguous block");
+        bench("full sum 16M", &values, &block);
+        // The lane count the fold is supposed to reach, and the one-lane fold,
+        // both over the whole slice, so the difference is the accumulator split.
+        for lanes in [1usize, LANE_COUNT] {
+            let mut samples = Vec::new();
+            for _ in 0..REPS {
+                let started = Instant::now();
+                std::hint::black_box(fold_run(&values, 0.0f32, |a, b| a + b, lanes));
+                samples.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            let us = median(samples);
+            println!(
+                "full sum 16M, fold_run lanes={lanes:<2}       {us:7.3} ms ({:5.2} ns/el)",
+                us * 1e6 / big as f64
+            );
+        }
+
+        let side = 4096usize;
+        let values: Vec<f32> = (0..side * side).map(|index| (index % 1000) as f32 * 0.001).collect();
+        let block = Block::new(&[side, side], &[false, true]).expect("contiguous block");
+        bench("sum rows (4096x4096) axis=1", &values, &block);
+        let block = Block::new(&[side, side], &[true, false]).expect("contiguous block");
+        // The `inner > 1` arm is not a `fold_run`; it is timed through
+        // `fold_block` alone, so the reference column is not comparable.
+        let mut samples = Vec::new();
+        for _ in 0..REPS {
+            let start = Instant::now();
+            std::hint::black_box(fold_block(&values, &block, Some(0.0f32), |a, b| a + b).unwrap());
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        let us = median(samples);
+        println!(
+            "sum cols (4096x4096) axis=0        fold_block {us:7.3} ms ({:5.2} ns/el)",
+            us * 1e6 / (side * side) as f64
+        );
     }
 
     fn time_us<F: FnMut() -> Vec<f32>>(iterations: usize, mut run: F) -> f64 {
