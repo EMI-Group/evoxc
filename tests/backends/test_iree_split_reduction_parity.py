@@ -198,14 +198,14 @@ def _build(fn, spec, *, split=None, exporter_options=None):
 
 
 def _compile_with_exporter_options(fn, spec, exporter_options):
-    """Compile ``fn`` with EXPORTER-ONLY options forced.
+    """Compile ``fn`` with specific StableHLO exporter options forced.
 
-    ``split_reduction_non_exact`` and ``split_reduction_threshold`` are
-    exporter-only keys today: ``CompilerBackend._exporter_options`` forwards
-    only ``split_reduction`` (and the adapters' ``KNOWN_OPTIONS["lower"]``
-    lists only that one), so ``evoxc.build(..., split_reduction_non_exact=True)``
-    raises the adapter's unrecognized-lower-option ``BackendError``. This
-    helper produces the exact MLIR the option emits and swaps it into the
+    ``split_reduction_non_exact`` and ``split_reduction_threshold`` are also
+    accepted as LOWER options today (each adapter declares them in
+    ``KNOWN_OPTIONS["lower"]`` and ``CompilerBackend._exporter_options``
+    forwards them to the Writer), so this helper is used only for DIRECT
+    export comparisons: it produces the exact MLIR
+    ``stablehlo.export(graph, options=...)`` emits and swaps it into the
     lowered payload (the compile/load/run stages stay the product's).
     """
     graph = evoxc.trace(fn, spec)

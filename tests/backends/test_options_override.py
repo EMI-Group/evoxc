@@ -165,7 +165,8 @@ def test_validate_options_unknown_key_lists_known_options_per_stage():
     assert "the iree backend does not recognize the compile option 'bogus'" in message
     assert (
         "lower: dot_precision, eigh_algorithm, rng_bit_generator, "
-        "sort_emission, split_reduction, while_init_rewrite" in message
+        "sort_emission, split_reduction, split_reduction_non_exact, "
+        "split_reduction_threshold, while_init_rewrite" in message
     )
     assert (
         "compile: dispatch_formation, iree_compile_args, "
@@ -203,6 +204,8 @@ def test_adapter_known_options_declarations():
                 "rng_bit_generator",
                 "sort_emission",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
                 "while_init_rewrite",
             }
         ),
@@ -226,6 +229,8 @@ def test_adapter_known_options_declarations():
                 "dot_precision",
                 "eigh_algorithm",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
             }
         ),
         "compile": frozenset(
@@ -241,6 +246,8 @@ def test_adapter_known_options_declarations():
                 "dot_precision",
                 "eigh_algorithm",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
             }
         ),
         "compile": frozenset(
@@ -491,23 +498,6 @@ _SUM_10001_SPEC = evoxc.TensorSpec((10001,), evoxc.float32)
 #: threshold, so the default splits and a threshold past the extent does not.
 _MIN_10001_SPEC = evoxc.TensorSpec((10001,), evoxc.int32)
 
-# BUG(evoxc): `split_reduction_threshold` / `split_reduction_non_exact` are
-# exporter-only — the StableHLO Writer accepts them
-# (`evoxc/backends/stablehlo/split_reduce.py::normalize_split_reduction_threshold`
-# / `normalize_split_reduction_non_exact`) but NO adapter declares them in
-# `KNOWN_OPTIONS["lower"]` and `CompilerBackend._exporter_options` does not
-# forward them, so they are unreachable through the pipeline. Repro:
-#   evoxc.lower(evoxc.trace(lambda x: evoxc.min(x), evoxc.TensorSpec((10001,), np.float32)),
-#             backend="iree", split_reduction_threshold=2048)
-#   -> BackendError: the iree backend does not recognize the lower option
-#      'split_reduction_threshold' ...
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG(evoxc): split_reduction_threshold / split_reduction_non_exact are "
-    "exporter-only — not declared in KNOWN_OPTIONS['lower'] nor forwarded by "
-    "CompilerBackend._exporter_options, so they are unreachable through the "
-    "pipeline",
-)
 @pytest.mark.parametrize(("name", "backend_cls"), _ADAPTERS, ids=_ADAPTER_IDS)
 def test_split_reduction_sub_options_forwarded_through_lower(name, backend_cls):
     """The DESIRED contract for the two reduction-shape sub-options of the
