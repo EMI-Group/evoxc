@@ -525,9 +525,46 @@ _ROCM_SOURCE_CACHE_MAX = 16
 # cache would hand the ``evoxc.io`` worker thread a device created on another
 # thread and break it.
 _HAL_DEVICE_CACHE = threading.local()
-# THREAD-LOCAL reusable host-source buffers for the rocm staging path,
-# keyed by (shape, dtype) with the owning runtime device checked by identity.
+# THREAD-LOCAL reusable host-source buffers for the rocm/vulkan copy-tier
+# staging paths, keyed by (shape, dtype) with the owning runtime device checked
+# by identity.
 _ROCM_SOURCE = threading.local()
+# ---------------------------------------------------------------------------
+# Vulkan host<->device transfer configuration (see ``_vulkan_staged_input``)
+# ---------------------------------------------------------------------------
+# MEASURED on this host: Intel Graphics (PTL) iGPU 8086:b0a0 through Mesa
+# 26.3.0 ANV on iree-base-runtime 3.13.0, f32, medians of interleaved A/B
+# rounds (>= 7 reps each after warmup; the host is SHARED with other workloads,
+# so absolute numbers drift 2-3x between windows — the RATIOS are stable).
+# Incoming direction, 64 MB, before -> after:
+#   rt.asdevicearray            16.4 ms  (4.1 GB/s)
+#   host source + queue_copy     6.0 ms  (11.1 GB/s)
+#   mapped DEVICE_LOCAL write    3.1 ms  (21.8 GB/s)
+# so the vulkan upload takes the same two tiers as cuda, dispatched
+# explicitly by kind: a mapped host-write tier (persistent per (index, shape,
+# dtype) buffer for the segment executables, FRESH buffer for the one-shot
+# ``upload_tensor`` placement path) and a host-source + ``queue_copy`` tier.
+# The mapped tier is used up to ``_VULKAN_PINNED_MAX_BYTES``; above it the
+# copy tier carries the upload (still 2.9-3.3x faster than asdevicearray at
+# 64-128 MB). Unlike the cuda pinned tier the mapped write is CORRECT on the
+# vulkan HAL by memory coherence (the allocator hands back a HOST_COHERENT
+# host-visible allocation and a coherent host write is visible to the next
+# queue submission), not by a driver serialization guarantee — see
+# ``_vulkan_pinned_buffer`` for the coherence gate.
+# MEASURED crossover for the ONE-SHOT (fresh destination) form — mapped write
+# vs host source + queue_copy, same run: 16 MB 1.38 vs 3.09 ms (mapped wins),
+# 32 MB 5.02 vs 4.40 (copy wins), 64 MB 9.11 vs 7.05, 128 MB 25.6 vs 18.7:
+# a fresh 16 MB host-visible allocation still first-touches cheaply, a fresh
+# 32 MB one does not. The single ``_VULKAN_PINNED_MAX_BYTES`` cutoff below
+# (16 MB) therefore sits on the measured crossover, and the CACHED mapped
+# tier — which pays no first-touch after the first call — stays faster at
+# every size measured (64 MB 11.6 vs 14.7, 128 MB 29.0 vs 40.5); the cutoff is
+# kept at 16 MB anyway so the staging footprint matches the cuda/rocm cap.
+_VULKAN_PINNED_MAX_BYTES = 16 * 1024 * 1024
+# Alignment a host allocation must satisfy to be imported into the vulkan HAL
+# (``minImportedHostPointerAlignment``); the readback below over-allocates and
+# offsets to reach it.
+_HOST_IMPORT_ALIGNMENT = 4096
 
 # ---------------------------------------------------------------------------
 # Compile-flag policy (the options-override contract — see ../options.py)
@@ -2700,6 +2737,34 @@ def _wait_copy_semaphore(sem: Any, rt: Any = None) -> None:
     rt.HalFence.create_at(sem, 1).wait()
 
 
+#: HAL device ids whose memory IS host memory, so a mapped view is the data
+#: itself rather than a view of device memory (the id is iree's printable
+#: ``repr(hal_device)``: ``"local-task"`` on the CPU HAL, ``"vulkan"`` /
+#: ``"cuda:0"`` / ``"hip:0"`` on the GPU HALs — measured on iree-base 3.13.0).
+_HOST_MEMORY_HAL_IDS = frozenset({"local-task", "local-sync", "local", "cpu"})
+
+
+def _hal_is_host_memory(hal_device: Any) -> bool:
+    """True when a HAL device's buffers live in host memory.
+
+    ``local-task`` (llvm-cpu) allocations ARE host memory, so mapping them is
+    the data itself — the long-standing zero-copy readback. A GPU HAL
+    (``vulkan``/``cuda``/``hip``) can advertise a HOST_VISIBLE device buffer
+    too — measured on this host: a 1 MB vulkan run output is
+    ``memory_type = 62`` (DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT |
+    HOST_CACHED) with ``MAPPING_SCOPED`` allowed — so ``_buffer_is_host_mappable``
+    alone is NOT sufficient for a ``.to(cpu)``: mapping it would hand out a
+    ``Device("cpu", 0)`` tensor whose bytes still live in device memory.
+    Unknown/unprintable devices are treated as device memory (the safe side:
+    an explicit ``queue_copy``), never as host memory.
+    """
+    try:
+        device_id = repr(hal_device)
+    except Exception:  # pragma: no cover - a repr that raises is not a HAL id
+        return False
+    return device_id.split(":", 1)[0].strip().lower() in _HOST_MEMORY_HAL_IDS
+
+
 def _buffer_is_host_mappable(buffer: Any, rt: Any = None) -> bool:
     """True when ``buffer``'s memory can be read back by mapping it directly.
 
@@ -2707,12 +2772,15 @@ def _buffer_is_host_mappable(buffer: Any, rt: Any = None) -> bool:
     memory must be ``HOST_VISIBLE`` AND the buffer must have been allocated
     with ``BufferUsage.MAPPING_SCOPED`` in its allowed usage. The
     ``local-task`` (llvm-cpu) allocator satisfies both, so an llvm-cpu
-    readback stays a zero-copy mapping. A GPU allocation does not: a
-    cuda/rocm ``DEVICE_LOCAL`` buffer is not host-visible, and the vulkan
-    HAL's buffers are host-visible but carry no ``MAPPING_SCOPED`` usage —
-    both take the explicit ``queue_copy`` staging path in
-    ``_readback_device_array``. ``rt`` is the RESOLVED IREE runtime module
-    (defaults to the default/env-resolved module).
+    readback stays a zero-copy mapping. A cuda/rocm ``DEVICE_LOCAL`` buffer is
+    not host-visible, so it takes the explicit ``queue_copy`` path in
+    ``_readback_device_array``. A vulkan buffer is USUALLY not mappable
+    either (measured: a 64 MB output is ``memory_type = 54``,
+    ``allowed_usage = 3075`` — TRANSFER | DISPATCH_STORAGE), but a SMALL one
+    (≤ 16 MB here) comes back host-visible and MAPPING_SCOPED, which is why
+    ``_readback_device_array`` ALSO gates on ``_hal_is_host_memory`` before
+    it maps. ``rt`` is the RESOLVED IREE runtime module (defaults to the
+    default/env-resolved module).
     """
     if rt is None:
         rt = _runtime_module(None)
@@ -2727,7 +2795,9 @@ def _buffer_is_host_mappable(buffer: Any, rt: Any = None) -> bool:
 
 
 #: Reusable D2H staging buffers, held PER THREAD (see
-#: ``_readback_staging_buffer``): ``nbytes -> (HAL device, buffer)``.
+#: ``_readback_staging_buffer``): ``nbytes -> (HAL device, buffer, view)``,
+#: where ``view`` is the buffer's persistent coherent mapping (``None`` when
+#: the allocation is not ``HOST_COHERENT``).
 _READBACK_STAGING = threading.local()
 
 #: Bound on the per-thread staging cache (distinct byte lengths).
@@ -2736,8 +2806,8 @@ _READBACK_STAGING_MAX = 4
 
 def _readback_staging_buffer(
     hal_device: Any, nbytes: int, rt: Any = None
-) -> Any:
-    """Return a reusable ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer.
+) -> tuple[Any, Any]:
+    """Return a reusable ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer + view.
 
     ``_readback_device_array`` copies a device buffer into host staging
     memory and maps it. Allocating that staging buffer per call is CORRECT
@@ -2746,9 +2816,20 @@ def _readback_staging_buffer(
     the allocation, not the transfer, would dominate every large rocm
     readback (measured on IREE 3.13.0 / MI300X).
 
-    The buffer is safe to reuse: a readback is fully synchronous (the copy's
-    completion semaphore is awaited and the scoped mapping is released before
-    this helper returns), and every use overwrites the whole range.
+    Returns ``(buffer, view)``. Reuse is safe: a readback is fully
+    synchronous (the copy's completion semaphore is awaited), every use
+    overwrites the whole range, and the caller always COPIES OUT, so no
+    returned array ever aliases the staging memory. ``view`` is the buffer's
+    mapped flat array
+    when the allocation is ``HOST_COHERENT`` — the mapping is created ONCE
+    and HELD for the cache entry's lifetime, because MEASURED on the vulkan
+    HAL a per-call scoped map costs ~60 us/MB (4.3 ms for 64 MB — more than
+    the device->host copy it precedes), while a coherent mapping needs no
+    re-map: a coherent host read after the awaited copy sees the device
+    writes. A NON-coherent allocation would need an explicit range
+    invalidate, which the python HAL does not expose at all, so it keeps
+    ``view = None`` and the caller maps per call (the previous behaviour —
+    correct on every HAL, and never slower than before).
 
     THREAD-LOCAL because a HAL buffer and the device that owns it are both
     thread-affine (the ``evoxc.io`` worker reads back separately) — the same
@@ -2761,6 +2842,8 @@ def _readback_staging_buffer(
     ``(nbytes,)`` key only for a CUSTOM module, so a custom module never reuses
     a default-module staging buffer and vice versa.
     """
+    import numpy as np
+
     if rt is None:
         rt = _runtime_module(None)
 
@@ -2771,20 +2854,129 @@ def _readback_staging_buffer(
     key = _module_cache_prefix(rt) + (nbytes,)
     entry = cache.get(key)
     if entry is not None and entry[0] is hal_device:
-        return entry[1]
+        return entry[1], entry[2]
     buffer = hal_device.allocator.allocate_buffer(
         int(rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE),
         int(rt.BufferUsage.TRANSFER_TARGET | rt.BufferUsage.MAPPING_SCOPED),
         nbytes,
     )
+    view = None
+    coherent = getattr(rt.MemoryType, "HOST_COHERENT", None)
+    if coherent is not None and (int(buffer.memory_type()) & int(coherent)) == int(
+        coherent
+    ):
+        view = buffer.map().asarray((nbytes,), np.dtype(np.uint8))
     if len(cache) >= _READBACK_STAGING_MAX:
         cache.clear()
-    cache[key] = (hal_device, buffer)
-    return buffer
+    cache[key] = (hal_device, buffer, view)
+    return buffer, view
+
+
+def _readback_into_fresh_host_array(
+    source: Any,
+    hal_device: Any,
+    nbytes: int,
+    shape: tuple,
+    raw_dtype: Any,
+    rt: Any = None,
+) -> Any:
+    """Copy a device buffer straight into a fresh host array (zero copy-out).
+
+    The fastest device->host path found on the vulkan HAL: instead of
+    ``queue_copy`` into a staging buffer plus a SECOND host copy out of it,
+    an ALIGNED host array is imported into the HAL as a buffer
+    (``allocator.import_host_allocation``) and the single ``queue_copy``
+    writes the device data into it — so the array handed back IS the
+    transfer destination. MEASURED (Intel PTL iGPU / Mesa ANV,
+    iree-base-runtime 3.13.0, f32, interleaved rounds, 64/128 MB): 1.3-1.4x
+    faster than the held-mapping staging path and 1.7-2.3x faster than the
+    per-call-map path; at 1 MB the fixed costs dominate and the path is
+    cost-neutral, so the gate below is a plain capability check, not a size
+    threshold.
+
+    ``iree``'s own ``DeviceArray.to_host()`` fast path uses the same
+    primitive and fails on vulkan only because it passes an arbitrary
+    pointer (``minImportedHostPointerAlignment 4096``); this helper
+    over-allocates by ``_HOST_IMPORT_ALIGNMENT`` and offsets into it, and
+    gates the whole path on the allocator's own
+    ``query_buffer_compatibility`` report, so a HAL that cannot import host
+    memory (or a custom runtime module without the enums) keeps the staging
+    path. The returned array is a FRESH allocation owned by the caller —
+    never a view of reused staging memory, never an alias of the device
+    buffer, and never aliasing the user's data — and the imported buffer
+    does not own the memory (it is only registered for the duration of the
+    copy), so it is dropped on return.
+
+    Returns ``None`` when the import is unavailable or fails; the caller
+    then takes the staging path (identical bytes, identical semantics).
+    """
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
+
+    dtype = np.dtype(raw_dtype)
+    itemsize = dtype.itemsize
+    if itemsize <= 0 or nbytes % itemsize:
+        return None
+    align = _HOST_IMPORT_ALIGNMENT
+    memory_type = getattr(rt, "MemoryType", None)
+    usage = getattr(rt, "BufferUsage", None)
+    compat = getattr(rt, "BufferCompatibility", None)
+    if memory_type is None or usage is None or compat is None:
+        return None
+    importable = getattr(compat, "IMPORTABLE", None)
+    if importable is None:
+        return None
+    requested_type = (
+        int(memory_type.HOST_LOCAL)
+        | int(memory_type.DEVICE_VISIBLE)
+        | int(memory_type.HOST_COHERENT)
+    )
+    requested_usage = (
+        int(usage.TRANSFER_TARGET) | int(usage.MAPPING_SCOPED) | int(usage.MAPPING)
+    )
+    try:
+        allocator = hal_device.allocator
+        report = int(
+            allocator.query_buffer_compatibility(
+                requested_type,
+                requested_usage,
+                int(usage.TRANSFER),
+                nbytes,
+            )
+        )
+        if not report & int(importable):
+            return None
+        storage = np.empty(nbytes + align, dtype=np.uint8)
+        offset = int(-storage.ctypes.data % align)
+        if offset % itemsize:
+            return None
+        flat = storage[offset : offset + nbytes].view(dtype)
+        imported = allocator.import_host_allocation(
+            flat, requested_type, requested_usage
+        )
+        sem = hal_device.create_semaphore(0)
+        hal_device.queue_copy(
+            source,
+            imported,
+            wait_semaphores=rt.HalFence.create_at(sem, 0),
+            signal_semaphores=rt.HalFence.create_at(sem, 1),
+        )
+        _wait_copy_semaphore(sem, rt)
+    except core.EVOXCError:
+        raise
+    except Exception:
+        return None
+    return flat.reshape(shape)
 
 
 def _readback_device_array(
-    array: Any, dtype: Any = None, rt: Any = None
+    array: Any,
+    dtype: Any = None,
+    rt: Any = None,
+    *,
+    host_memory: bool | None = None,
 ) -> np.ndarray:
     """Materialize a host ``np.ndarray`` from an iree runtime buffer (explicit D2H).
 
@@ -2800,21 +2992,38 @@ def _readback_device_array(
     this module needs no fallback and no version branch — it performs the
     transfer with HAL primitives that are version-independent.
 
-    Two paths, chosen by ``_buffer_is_host_mappable``:
+    Two paths, chosen by ``_hal_is_host_memory`` + ``_buffer_is_host_mappable``:
+
+    * HOST MEMORY + MAPPABLE (llvm-cpu / ``local-task`` allocations): the
+      buffer view is mapped and returned as a ZERO-COPY numpy array -- no
+      allocation, no ``queue_copy``, no copy, exactly the cost the
+      runtime's own mapped path had. The mapping stays alive through the
+      returned array's base chain (numpy keeps the exporter of the
+      mapping's buffer alive). DELIBERATELY limited to a host-memory HAL:
+      a vulkan run output can be host-visible + MAPPING_SCOPED too
+      (measured: a 1 MB output is ``memory_type = 62``), and mapping it
+      would hand out live device memory as a ``Device('cpu', 0)`` array --
+      a placement lie and an alias of the device buffer. GPU kinds always
+      copy.
 
     * MAPPABLE (llvm-cpu / host-local allocations): the buffer view is
       mapped and returned as a ZERO-COPY numpy array — no allocation, no
       ``queue_copy``, no copy, exactly the cost the runtime's own mapped
       path had. The mapping stays alive through the returned array's base
       chain (numpy keeps the exporter of the mapping's buffer alive).
-    * NOT MAPPABLE (cuda/rocm/vulkan device memory): a
-      ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer of the buffer's byte
-      length (reused per thread, see ``_readback_staging_buffer``) receives
-      the device buffer through ``queue_copy``, the copy's completion
-      semaphore is awaited via the shared query-first
-      ``_wait_copy_semaphore``, the staging buffer is mapped and copied out,
-      and the scoped mapping is released. No host-memory IMPORT is attempted
-      (that is the primitive that fails on vulkan).
+    * NOT MAPPABLE (cuda/rocm/vulkan device memory): TWO paths, measured on
+      the vulkan HAL (Intel PTL, iree-base-runtime 3.13.0): (a) an ALIGNED
+      host array is IMPORTED into the HAL (``import_host_allocation``) and
+      ONE ``queue_copy`` writes the device data into it — no copy-out, the
+      fastest path, and the one taken whenever the allocator reports host
+      import as compatible (see ``_readback_into_fresh_host_array``); (b)
+      otherwise the per-thread ``HOST_LOCAL | DEVICE_VISIBLE`` staging
+      buffer receives the device buffer through ``queue_copy``, the copy's
+      completion semaphore is awaited via the shared query-first
+      ``_wait_copy_semaphore``, and the result is copied out of the buffer's
+      persistent coherent mapping (or a per-call mapping on a non-coherent
+      allocation). Both paths return a FRESH array that never aliases the
+      staging memory or the device buffer.
 
     ``dtype`` is the caller's requested output dtype (``None`` keeps the
     buffer's own dtype); a payload whose dtype is an OVERRIDE of the buffer's
@@ -2823,6 +3032,10 @@ def _readback_device_array(
     ``rt`` is the RESOLVED IREE runtime module (defaults to the
     default/env-resolved module) — the same module the payload was built with,
     so a custom ``iree_runtime_module`` is honored on the readback path.
+    ``host_memory`` says whether the SENDING device's memory IS host
+    memory (``IreeDevicePayload`` passes ``device.kind == "cpu"``); ``None``
+    falls back to ``_hal_is_host_memory``'s HAL-id test, so a direct call is
+    never more permissive than the payload path.
     """
     import numpy as np
 
@@ -2842,24 +3055,38 @@ def _readback_device_array(
     raw_dtype = _hal_element_dtype(view.element_type, rt=rt)
     shape = tuple(view.shape)
     nbytes = int(source.byte_length())
-    if _buffer_is_host_mappable(source, rt):
+    if host_memory is None:
+        host_memory = _hal_is_host_memory(hal_device)
+    if host_memory and _buffer_is_host_mappable(source, rt):
         result = view.map().asarray(shape, raw_dtype)
     elif nbytes == 0:
         result = np.empty(shape, raw_dtype)
     else:
-        staging = _readback_staging_buffer(hal_device, nbytes, rt)
-        sem = hal_device.create_semaphore(0)
-        hal_device.queue_copy(
-            source,
-            staging,
-            wait_semaphores=rt.HalFence.create_at(sem, 0),
-            signal_semaphores=rt.HalFence.create_at(sem, 1),
+        # Fastest path first: import an ALIGNED host array into the HAL and let
+        # ONE queue_copy write the device data into it (no copy-out). Falls
+        # back to the staging buffer when the allocator cannot import host
+        # memory — identical bytes either way.
+        result = _readback_into_fresh_host_array(
+            source, hal_device, nbytes, shape, raw_dtype, rt
         )
-        _wait_copy_semaphore(sem, rt)
-        # Copy OUT of the mapped staging buffer: the mapping must not outlive
-        # this call (the buffer is reused, and a scoped mapping is released
-        # with it) — so the result is a real copy, never an alias.
-        result = np.array(staging.map().asarray(shape, raw_dtype), copy=True)
+        if result is None:
+            staging, held_view = _readback_staging_buffer(hal_device, nbytes, rt)
+            sem = hal_device.create_semaphore(0)
+            hal_device.queue_copy(
+                source,
+                staging,
+                wait_semaphores=rt.HalFence.create_at(sem, 0),
+                signal_semaphores=rt.HalFence.create_at(sem, 1),
+            )
+            _wait_copy_semaphore(sem, rt)
+            # Copy OUT of the staging buffer: the buffer is reused across
+            # calls, so the result is a real copy, never an alias. ``held_view``
+            # is the buffer's persistent coherent mapping (None on a
+            # non-coherent allocation, which is re-mapped per call).
+            if held_view is not None:
+                result = np.array(held_view.view(raw_dtype).reshape(shape), copy=True)
+            else:
+                result = np.array(staging.map().asarray(shape, raw_dtype), copy=True)
     override = getattr(array, "_override_dtype", None)
     if override is not None and np.dtype(override) != np.dtype(raw_dtype):
         result = result.astype(override)
@@ -2875,26 +3102,28 @@ def _staged_input(
     tensor: core.Tensor,
     device_kind: str = "cuda",
     rt: Any = None,
+    *,
+    one_shot: bool = False,
 ) -> Any | None:
     """Upload a host tensor through staging buffers (segment boundaries + placement).
 
     R6.2+ consumers (binding — plain ``IreeExecutable`` runs NEVER stage):
     this helper now serves (a) the split external-call SEGMENT executables
     (``_IreeSegmentExecutable``) — host-mode external kernels legitimately
-    stage host tensors at kernel boundaries, and (b) the ``upload_tensor``
-    placement provider, which passes a FRESH per-call staging dict so every
-    upload uses fresh buffers (one-shot, no cache).
+    stage host tensors at kernel boundaries — and (b) the ``upload_tensor``
+    placement provider, which passes a FRESH per-call staging dict and
+    ``one_shot=True`` so every upload gets fresh DESTINATION buffers (the
+    returned tensor owns its buffer, no cache).
 
     The staging fast path is chosen EXPLICITLY by the NORMALIZED device kind
     (``device_kind``): ``"cuda"`` takes the two-tier pinned/DMA path below,
     ``"rocm"`` takes ``_rocm_staged_input`` (host-local source + queue_copy,
-    the same shapes, wired for the hip HAL driver). Both are fully
-    synchronous. ANY OTHER KIND — notably ``"vulkan"`` — takes NO staging
-    tier and returns ``None`` immediately (before any buffer work), so the
-    caller uses the plain ``rt.asdevicearray`` path: the CUDA tiers'
-    correctness rests on a CUDA-driver host-write-vs-dispatch ordering
-    guarantee (see the fresh-semaphore note below) that is NOT verified on
-    IREE's vulkan HAL driver, so the plain path is the v1 choice for it.
+    the same shapes, wired for the hip HAL driver), and ``"vulkan"`` takes
+    ``_vulkan_staged_input`` (a mapped host-write tier made correct by memory
+    COHERENCE, plus the same host-source + queue_copy tier — see its
+    docstring for the measurements). All three are fully synchronous. ANY
+    OTHER KIND takes NO staging tier and returns ``None`` immediately (before
+    any buffer work), so the caller uses the plain ``rt.asdevicearray`` path.
     Anything the selected path cannot handle — oversized inputs, unmappable
     dtypes, or ANY failure on the fast path — returns ``None`` as well
     (semantics identical either way).
@@ -2939,17 +3168,17 @@ def _staged_input(
 
     Falls back to ``None`` (caller uses ``asdevicearray``) for
     non-cuda executables (``staged_inputs is None``), device kinds with no
-    staging tier (anything but ``"cuda"``/``"rocm"``), oversized inputs,
-    unmappable dtypes, and a full cache — semantics identical either way.
+    staging tier (anything but ``"cuda"``/``"rocm"``/``"vulkan"``), oversized
+    inputs, unmappable dtypes, and a full cache — semantics identical either
+    way.
     """
     if staged_inputs is None:
         return None
-    if device_kind not in ("cuda", "rocm"):
+    if device_kind not in ("cuda", "rocm", "vulkan"):
         # Explicit kind dispatch (never a "defaults to cuda" fallthrough):
-        # only the cuda and rocm kinds have a staging tier. ``"vulkan"``
-        # uploads therefore go through the plain ``rt.asdevicearray`` path
-        # (the CUDA tiers' ordering guarantee is unverified on the vulkan
-        # HAL driver). Returns BEFORE any buffer work.
+        # only these three kinds have a staging tier (see each helper's
+        # docstring for why its tier is correct on its HAL). Returns BEFORE
+        # any buffer work.
         return None
     import numpy as np
     if rt is None:
@@ -2961,10 +3190,28 @@ def _staged_input(
     dtype = tensor.dtype
     shape = tuple(tensor.shape)
     nbytes = int(np.prod(shape)) * dtype.itemsize
-    if nbytes > _STAGED_INPUT_MAX_BYTES:
-        return None
     element_type = map_dtype_to_element_type(dtype)
     if element_type is None:
+        return None
+    if device_kind == "vulkan":
+        # Its own ceiling and tier selection (``_vulkan_staged_input``: the
+        # mapped tier up to ``_VULKAN_PINNED_MAX_BYTES``, the host-source +
+        # queue_copy tier above it) — the cuda/rocm ``_STAGED_INPUT_MAX_BYTES``
+        # ceiling does not apply, because the vulkan copy tier is worth taking
+        # well past it (2.9x faster than asdevicearray at 128 MB, measured).
+        return _vulkan_staged_input(
+            staged_inputs,
+            runtime_device,
+            index,
+            tensor,
+            shape,
+            dtype,
+            element_type,
+            nbytes,
+            rt,
+            one_shot=one_shot,
+        )
+    if nbytes > _STAGED_INPUT_MAX_BYTES:
         return None
     if device_kind == "rocm":
         return _rocm_staged_input(
@@ -3048,19 +3295,24 @@ def _staged_input(
     return staging_da
 
 
-def _rocm_source_buffer(
+def _host_source_buffer(
     runtime_device: Any, shape: tuple, dtype: Any, nbytes: int, rt: Any = None
 ) -> tuple[Any, Any]:
-    """Return a reusable THREAD-LOCAL host source buffer for the rocm path.
+    """Return a reusable THREAD-LOCAL host SOURCE buffer for the copy tier.
 
-    ``_rocm_staged_input`` memcpy's current host values into the mapped view
-    of a ``HOST_LOCAL | DEVICE_VISIBLE`` (``TRANSFER_SOURCE | MAPPING``)
-    buffer and then ``queue_copy``s it to the device. The SOURCE buffer is
-    safe to reuse across calls (runs are synchronous), and reusing it avoids
-    a per-call mapped-buffer allocation — the same idea as the cuda DMA
-    tier's persistent ``hl_buf``/``hl_view``, but shared across rocm
+    The rocm path (``_rocm_staged_input``) and the vulkan copy tier
+    (``_vulkan_staged_input``) both memcpy the current host values into the
+    mapped view of a ``HOST_LOCAL | DEVICE_VISIBLE`` (``TRANSFER_SOURCE |
+    MAPPING``) buffer and then ``queue_copy`` it to the device. The SOURCE
+    buffer is safe to reuse across calls (every staging path is synchronous:
+    the copy's completion semaphore is awaited before the helper returns), and
+    reusing it avoids a per-call mapped-buffer allocation — the same idea as
+    the cuda DMA tier's persistent ``hl_buf``/``hl_view``, but shared across
     uploads on the thread instead of per executable (the one-shot placement
-    path has no per-executable cache to hang it off).
+    path has no per-executable cache to hang it off). MEASURED (vulkan
+    iGPU, 64 MB f32): a cached source keeps the upload at 11.1 GB/s where a
+    fresh source allocation drops it to 4.2 GB/s — i.e. to the
+    ``asdevicearray`` baseline.
 
     THREAD-LOCAL because the mapped buffer and the HAL device that owns it
     are both thread-affine (``evoxc.io``'s worker thread uploads separately);
@@ -3087,8 +3339,8 @@ def _rocm_source_buffer(
     import numpy as np
 
     buf = runtime_device.allocator.allocate_buffer(
-        rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
-        rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
+        int(rt.MemoryType.HOST_LOCAL) | int(rt.MemoryType.DEVICE_VISIBLE),
+        int(rt.BufferUsage.TRANSFER_SOURCE) | int(rt.BufferUsage.MAPPING),
         nbytes,
     )
     view = buf.map().asarray(shape, np.dtype(dtype))
@@ -3096,6 +3348,19 @@ def _rocm_source_buffer(
         cache.clear()
     cache[key] = (runtime_device, buf, view)
     return buf, view
+
+
+def _rocm_source_buffer(
+    runtime_device: Any, shape: tuple, dtype: Any, nbytes: int, rt: Any = None
+) -> tuple[Any, Any]:
+    """The rocm path's host SOURCE buffer (``_host_source_buffer``).
+
+    Kept as the rocm entry point (the rocm staging path, the adapter docs and
+    the vulkan "no cuda/rocm tier is entered" pin all name it); the vulkan
+    copy tier calls the shared ``_host_source_buffer`` directly so the two
+    kinds share ONE thread-local source cache.
+    """
+    return _host_source_buffer(runtime_device, shape, dtype, nbytes, rt)
 
 
 def _rocm_staged_input(
@@ -3180,6 +3445,203 @@ def _rocm_staged_input(
     except Exception:
         # Fall back to rt.asdevicearray — same bytes, same semantics.
         return None
+
+
+def _vulkan_pinned_buffer(
+    runtime_device: Any,
+    shape: tuple,
+    dtype: Any,
+    element_type: Any,
+    nbytes: int,
+    rt: Any = None,
+) -> tuple[Any, Any] | None:
+    """Allocate + map one host-writable ``DEVICE_LOCAL`` buffer (vulkan tier 1).
+
+    The vulkan counterpart of the cuda pinned tier: a ``DEVICE_LOCAL |
+    HOST_VISIBLE`` allocation, mapped ONCE, whose mapped view the caller
+    memcpy's the host values into; the dispatches then read the buffer
+    DIRECTLY (no ``queue_copy``, no semaphore, no wait). MEASURED on the
+    Intel PTL iGPU / Mesa ANV: 21.8 GB/s at 64 MB f32 against 11.1 GB/s for
+    the copy tier and 4.1 GB/s for ``rt.asdevicearray``.
+
+    CORRECTNESS — the ONE difference from the cuda tier, and the reason this
+    helper is gated rather than copied: cuda's direct write rests on a CUDA
+    driver guarantee that a host write into host-mapped DEVICE memory is
+    serialized against outstanding device reads of that memory. That
+    guarantee is not established on IREE's vulkan HAL, so the write is made
+    correct by MEMORY COHERENCE instead: the allocation must come back
+    ``HOST_COHERENT`` (a coherent host write is visible to the next queue
+    submission, needing no flush — and the python HAL exposes no
+    flush/invalidate primitive at all), and when the allocator cannot offer a
+    coherent host-visible allocation this returns ``None`` and the caller
+    takes the copy tier. Validated by a 1200-iteration alternating-value
+    stress through the public ``run`` path (see ``_vulkan_staged_input``).
+
+    Returns ``(device_array, mapped_view)``; the caller owns both (a
+    persistent staging entry for the segment executables, or the buffer handed
+    out by ``upload_tensor``'s one-shot placement).
+    """
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
+
+    coherent = getattr(rt.MemoryType, "HOST_COHERENT", None)
+    if coherent is None:
+        return None
+    buf = runtime_device.allocator.allocate_buffer(
+        int(rt.MemoryType.DEVICE_LOCAL) | int(rt.MemoryType.HOST_VISIBLE),
+        int(rt.BufferUsage.DEFAULT) | int(rt.BufferUsage.MAPPING),
+        nbytes,
+    )
+    # Coherence gate (see the docstring): without it a mapped host write is
+    # only visible to the device after a flush this HAL does not expose.
+    if (int(buf.memory_type()) & int(coherent)) != int(coherent):
+        return None
+    view = buf.map().asarray(shape, np.dtype(dtype))
+    device_array = rt.DeviceArray(
+        runtime_device,
+        rt.HalBufferView(buf, shape, element_type),
+        implicit_host_transfer=False,
+        override_dtype=dtype,
+    )
+    return device_array, view
+
+
+def _vulkan_staged_input(
+    staged_inputs: dict,
+    runtime_device: Any,
+    index: int,
+    tensor: core.Tensor,
+    shape: tuple,
+    dtype: Any,
+    element_type: Any,
+    nbytes: int,
+    rt: Any = None,
+    *,
+    one_shot: bool = False,
+) -> Any | None:
+    """Vulkan staging fast path replacing ``rt.asdevicearray``.
+
+    Two tiers, dispatched on size and ownership (measured on the Intel PTL
+    iGPU through Mesa ANV, iree-base-runtime 3.13.0; the host is shared, so
+    the numbers below are medians of interleaved A/B rounds):
+
+    * MAPPED tier (``nbytes <= _VULKAN_PINNED_MAX_BYTES``): the host values
+      are memcpy'd (``np.copyto``) straight into the mapped view of a
+      ``DEVICE_LOCAL | HOST_VISIBLE`` buffer the dispatches read directly —
+      no copy, no semaphore, no wait (``_vulkan_pinned_buffer``, which also
+      carries the coherence gate that makes the direct write correct).
+    * COPY tier (larger inputs, or a mapped allocation the HAL cannot make
+      coherent): the same shape as the rocm path — memcpy into a reusable
+      THREAD-LOCAL host source buffer (``_host_source_buffer``), then a
+      per-call ``queue_copy`` into a ``DEVICE_LOCAL`` destination, waiting on
+      a FRESH semaphore via the shared query-first ``_wait_copy_semaphore``.
+      The fresh semaphore and the wait are LOAD-BEARING exactly as on
+      cuda/rocm (reusing a waited event-semaphore aborts the HAL; the copy is
+      not ordered ahead of the invoke's dispatches without the wait).
+
+    OWNERSHIP — ``one_shot`` is ``upload_tensor``'s placement call: every
+    destination is FRESH (the returned tensor owns it, and it must never alias
+    the caller's host memory or a later upload), so the destination is never
+    read from / written to ``staged_inputs``. Both destinations are fresh
+    buffers, so the returned array can never alias the user's host memory (the
+    reusable state is only the copy tier's host SOURCE, which is never handed
+    out). Without ``one_shot`` (the segment executables) both destinations are
+    cached per ``(index, shape, dtype)`` in ``staged_inputs`` — the entries
+    are ``("pin", (da, view))`` or ``("copy", da)``, and every call re-copies
+    the current host values in (runs are synchronous, so reuse cannot race).
+
+    Returns ``None`` (caller falls back to ``rt.asdevicearray``; semantics
+    identical) on ANY failure of the fast paths — a HAL lacking one of the
+    primitives, an unmappable buffer, a full cache, or a host-materialization
+    error other than an explicit ``core.EVOXCError`` (which always propagates:
+    it is the documented no-implicit-transfer error and the fallback would
+    re-raise it anyway).
+    """
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
+
+    try:
+        key = (index, shape, dtype)
+        cached = None if one_shot else staged_inputs.get(key)
+        if cached is not None:
+            kind, payload = cached
+            if kind == "pin":
+                da, view = payload
+                np.copyto(view, tensor.numpy())
+                return da
+            source_buf, source_view = _host_source_buffer(
+                runtime_device, shape, dtype, nbytes, rt
+            )
+            np.copyto(source_view, tensor.numpy())
+            _queue_copy_into(runtime_device, source_buf, payload, rt)
+            return payload
+        host = tensor.numpy()
+        if nbytes <= _VULKAN_PINNED_MAX_BYTES:
+            pinned = _vulkan_pinned_buffer(
+                runtime_device, shape, dtype, element_type, nbytes, rt
+            )
+            if pinned is not None:
+                da, view = pinned
+                np.copyto(view, host)
+                if not one_shot:
+                    _remember_staged_input(staged_inputs, key, ("pin", (da, view)))
+                return da
+        source_buf, source_view = _host_source_buffer(
+            runtime_device, shape, dtype, nbytes, rt
+        )
+        np.copyto(source_view, host)
+        dest_buf = runtime_device.allocator.allocate_buffer(
+            rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+        )
+        dest = rt.DeviceArray(
+            runtime_device,
+            rt.HalBufferView(dest_buf, shape, element_type),
+            implicit_host_transfer=False,
+            override_dtype=dtype,
+        )
+        _queue_copy_into(runtime_device, source_buf, dest, rt)
+        if not one_shot:
+            _remember_staged_input(staged_inputs, key, ("copy", dest))
+        return dest
+    except core.EVOXCError:
+        raise
+    except Exception:
+        # Fall back to rt.asdevicearray — same bytes, same semantics.
+        return None
+
+
+def _remember_staged_input(staged_inputs: dict, key: tuple, entry: Any) -> None:
+    """Store one staged-input cache entry, honouring ``_STAGED_INPUT_CACHE_MAX``.
+
+    A bounded cache: clearing it is performance-neutral, never a correctness
+    change (the next call simply stages into fresh buffers).
+    """
+    if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+        staged_inputs.clear()
+    staged_inputs[key] = entry
+
+
+def _queue_copy_into(
+    runtime_device: Any, source_buf: Any, destination: Any, rt: Any = None
+) -> None:
+    """``queue_copy`` a host source into a ``DeviceArray`` and wait for it.
+
+    Shared by the vulkan copy tier's cached and fresh forms: a FRESH
+    completion semaphore per call, awaited through the query-first
+    ``_wait_copy_semaphore`` (both load-bearing — see the tier docs).
+    """
+    sem = runtime_device.create_semaphore(0)
+    runtime_device.queue_copy(
+        source_buf,
+        destination._buffer_view.get_buffer(),
+        rt.HalFence.create_at(sem, 0),
+        rt.HalFence.create_at(sem, 1),
+    )
+    _wait_copy_semaphore(sem, rt)
 
 
 def _build_buffers(
@@ -4028,7 +4490,11 @@ class IreeDevicePayload:
         returned array is always a fresh host array for those kinds; it never
         aliases the device buffer.
         """
-        return _readback_device_array(self._array, rt=self._runtime)
+        return _readback_device_array(
+            self._array,
+            rt=self._runtime,
+            host_memory=self.device.kind == "cpu",
+        )
 
     def __dlpack_device__(self) -> tuple[int, int]:
         """Report the DLPack ``(device_type, device_id)`` of this buffer.
@@ -4140,7 +4606,12 @@ class IreeDevicePayload:
         mappable llvm-cpu buffer stays zero-copy and device memory pays one
         explicit D2H copy per call.
         """
-        return _readback_device_array(self._array, dtype=dtype, rt=self._runtime)
+        return _readback_device_array(
+            self._array,
+            dtype=dtype,
+            rt=self._runtime,
+            host_memory=self.device.kind == "cpu",
+        )
 
 
 # Backward-compat alias: the payload was private (``_IreeDevicePayload``)
@@ -4287,11 +4758,17 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     # buffer is fresh every time (the returned tensor owns it) while the
     # reusable SOURCE machinery is the kind's fast path (pinned/DMA on cuda
     # with the load-bearing fresh-semaphore wait; host-local source +
-    # queue_copy on rocm). A kind with NO staging tier -- vulkan -- always
-    # returns None here and takes the plain asdevicearray copy below, as do
-    # oversized/unmappable inputs or any failure on a fast path.
+    # queue_copy on rocm; on vulkan the mapped host-write tier or the same
+    # host-local source + queue_copy tier — see ``_vulkan_staged_input``).
+    # ``one_shot=True`` is what keeps the vulkan destination out of the
+    # staging cache, so the returned tensor never aliases a later upload. A
+    # kind with NO staging tier always returns None here and takes the plain
+    # asdevicearray copy below, as do oversized/unmappable inputs or any
+    # failure on a fast path.
     try:
-        staged = _staged_input({}, runtime_device, 0, tensor, device_kind, rt)
+        staged = _staged_input(
+            {}, runtime_device, 0, tensor, device_kind, rt, one_shot=True
+        )
         if staged is None:
             staged = rt.asdevicearray(runtime_device, tensor.numpy())
     except core.EVOXCError:
