@@ -24,7 +24,8 @@
 #                wheel/sdist must ship `evoxc` (plus the compiled
 #                `evoxc/_evoxc_native.abi3.so`) only, and the `evoxc_hf`
 #                wheel/sdist must ship `evoxc_hf` only — neither distribution
-#                may ever contain the other.
+#                may ever contain the other. Also runs the release-helper
+#                regression suite once on Python 3.12.
 #
 # The root `evoxc` project is a MIXED maturin project: its wheel embeds a
 # Rust/PyO3 abi3 extension compiled from `./native/`. Every job that installs
@@ -176,6 +177,9 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+
+      - name: Run release helper unit tests
+        run: uv run --no-project --python 3.12 python -m unittest discover -s .github/workflows -p 'test_release_checks.py'
 
       - name: Set up Rust (maturin builds evoxc._evoxc_native)
         uses: dtolnay/rust-toolchain@stable
