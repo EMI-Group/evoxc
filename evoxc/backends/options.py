@@ -47,7 +47,8 @@ options — it coerces real bools, 0/1 ints and the usual true/false strings
 to a real ``bool`` so a string value can never fall into the
 ``bool("0") is True`` trap. It is used by the bool exporter options the
 compiler framework forwards (``CompilerBackend._exporter_options``:
-``split_reduction``, ``while_init_rewrite``) and is the reuse point for
+``split_reduction``, ``split_reduction_non_exact``,
+``while_init_rewrite``) and is the reuse point for
 bool ``EVOXC_*`` env-var parsing. It is a TYPE COERCION for options whose
 type is bool — not a per-backend semantic mapping — so the statement above
 stays accurate: ``opt_level`` remains the one evoxc-DEFINED/translated
@@ -159,7 +160,8 @@ def normalize_bool_option(option: str, value) -> bool:
 
     A shared TYPE COERCION for options whose declared type is bool (the
     compiler framework's bool exporter options — ``split_reduction``,
-    ``while_init_rewrite`` — and the reuse point for bool ``EVOXC_*`` env-var
+    ``split_reduction_non_exact``, ``while_init_rewrite`` — and the reuse
+    point for bool ``EVOXC_*`` env-var
     parsing), so an env-style string value like ``"0"``/``"false"`` can
     never fall into the ``bool("0") is True`` trap. Accepted forms:
 

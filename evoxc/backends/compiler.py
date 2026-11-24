@@ -500,6 +500,18 @@ class CompilerBackend(Backend):
         — as is ``while_init_rewrite`` — so an env-style string value like
         ``"0"`` cannot fall into the ``bool("0") is True`` trap inside the
         Writer.
+        ``split_reduction_non_exact`` (bool, default ``False``) is the OPT-IN
+        companion that ALSO splits float ``sum``/``prod`` (and therefore
+        ``reduce_mean``/``var``): splitting reassociates the floating-point
+        accumulation, so those classes are not bit-exact versus the
+        single-stage text — that is why they are not split by default. Like
+        ``split_reduction`` it is coerced by ``options.normalize_bool_option``.
+        ``split_reduction_threshold`` (int >= 2, default 1024) sets the
+        minimum ``total_reduced`` extent for which a reduce is split; its
+        value is passed through UNVALIDATED — same framework split as
+        ``eigh_algorithm``, the Writer validates VALUES (raising
+        ``core.BackendError`` naming the valid forms) while this framework
+        validates unknown KEYS.
         """
         from .options import normalize_bool_option
 
@@ -523,6 +535,13 @@ class CompilerBackend(Backend):
                 (options or {}).get(
                     "split_reduction", self.default_split_reduction
                 ),
+            ),
+            "split_reduction_non_exact": normalize_bool_option(
+                "split_reduction_non_exact",
+                (options or {}).get("split_reduction_non_exact", False),
+            ),
+            "split_reduction_threshold": (options or {}).get(
+                "split_reduction_threshold", 1024
             ),
         }
 

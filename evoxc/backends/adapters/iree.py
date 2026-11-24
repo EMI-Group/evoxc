@@ -1520,6 +1520,16 @@ class IreeBackend(CompilerBackend):
     #: emits the two-stage split reductions for rank-0-result reductions
     #: (7.1-8.1x on those ops, 2.7-3.5x end-to-end on population-scale SO
     #: steps); ``False`` emits the byte-identical single-stage text.
+    #: ``split_reduction_non_exact`` (bool, default ``False``) is the OPT-IN
+    #: companion that also splits float ``sum``/``prod`` (and therefore
+    #: ``reduce_mean``/``var``), reassociating the accumulation — the documented
+    #: workaround for the rank-0 float-reduction cliff on iree/vulkan, where a
+    #: full ``sum`` of 16M f32 lowers to ONE workgroup of ONE thread (measured
+    #: on this Intel iGPU, iree-base 3.13.0, 4096x4096 f32, 3 warm in-process
+    #: runs, medians: default profile 648.5 ms -> 10.9 ms split, ~59x).
+    #: ``split_reduction_threshold``
+    #: (int >= 2, default 1024, Writer-validated) sets the minimum reduced extent
+    #: that is split.
     #:
     #: CUSTOM IREE BUILDS — two module-valued options let a user plug in an
     #: IREE whose Python packages are not named ``iree.compiler`` /
@@ -1557,6 +1567,8 @@ class IreeBackend(CompilerBackend):
                 "dot_precision",
                 "eigh_algorithm",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
             }
         ),
         "compile": frozenset(
