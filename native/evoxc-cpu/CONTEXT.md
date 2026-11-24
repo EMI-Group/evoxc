@@ -104,6 +104,28 @@ Reading of the numbers, which is load- and shape-dependent:
 - numpy still wins where it has SIMD kernels safe Rust cannot express (`sort`/`argsort`, `astype`, `expf`) and on threaded BLAS; native wins where per-op dispatch dominates (`chain_2000` at ~0.06 µs/op), on transcendental compositions, and on every real many-small-op graph whose op mix includes control flow.
 - Compiled plans are reusable across runs (`Arc<Plan>`), so a caller that keeps the plan pays only `run`.
 
+### Large single-op / multi-op graphs (16M-element f32 tensors)
+
+`tests/bench_large.rs` drives whole graphs over 64 MiB f32 tensors through `envelope::decode` -> `plan::compile` -> `run_program` with `--test-threads=1`, medians of 11 timed runs after 3 warmups.
+A row includes handing the engine a fresh copy of every input, which is what a caller that re-runs a graph pays, and what the Python binding's own input copy costs in kind.
+Baseline is this crate at the commit before the large-workload pass (2026-11-24, loadavg 1.9–4.3); the after column is the same host at loadavg 3.2 (build: release, `lto = off`, `codegen-units = 16` to fit the shared host's wall clock — the kernels here are memory-bound, and the reduction rows agree within 1 % with the real-profile medians below).
+
+| workload | before (ms) | after (ms) | numpy interpreter (ms) |
+|---|---|---|---|
+| `mul_add` 2 ops (`a*b + a`) | 56.213 | **13.492** | 19.0 |
+| `tanh(a)*b + a` | 71.356 | **21.393** | 43.7 |
+| 4-op elementwise chain | 62.843 | **20.076** | 79.7 |
+| `reduce_sum` full 16M -> rank-0 | 27.464 | **6.257** | 5.0 |
+| `reduce_sum` axis=1 of 4096² | 24.803 | **3.743** | 5.0 |
+| `reduce_sum` axis=0 of 4096² | 25.086 | **4.417** | 5.0 |
+| `dot` 1024² | 7.713 | 8.232 (min 4.062) | 3.64 |
+| `dot` 2048² | 28.975 | **17.759** | 19.2 |
+| `dot` 4096×1024 @ 1024×4096 | 72.048 | **33.687** | 42.9 |
+
+Root causes, all measured (the stage decomposition is in "Large reductions" below and `bench_pool_large`/`bench_allocation_first_touch`/`bench_flat_map_large` in `buffer/pool.rs` and `buffer/parallel.rs`): a fresh 64 MiB allocation costs **~26 ms** (0.4 ms/MiB of mmap page faults, 1.8 ns/element) against **0.15 ns/element** for a pooled one, and the old pool could retain exactly one 64 MiB stock, so it degenerated for these shapes; the engine's per-op threads capped at 4 below a 2^22-element DRAM stream that keeps scaling to 8.
+The fixes are the two-tier pool (large class above 8 MiB, 256 MiB / 4 stocks per size), the pooled `Storage::clone` (26.5 -> 2.78 ms per 64 MiB) and reduction result, the pooled `dot` destination, the 8-thread large-map cap, and the reduction fold's output-parallel split.
+What remains on `dot` 1024² and a 16M full sum (one output, so single-threaded by contract) is the numpy BLAS/SIMD floor described under "The honest losses".
+
 ### Real downstream workload: TensorNEAT 0.2.0 `Pipeline.step`
 
 The authoritative workload is the external TensorNEAT 0.2.0 harness: one `evoxc.build` + one warm `evoxc.run` per generation over a 500-genome population.
