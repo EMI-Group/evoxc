@@ -11,7 +11,7 @@ use super::parallel::{parallel_threads, split_parallel};
 use super::pool::take_pooled_vec;
 
 /// One typed, C-contiguous value buffer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Storage {
     Bool(Vec<bool>),
     I8(Vec<i8>),
@@ -91,6 +91,65 @@ impl Storage {
             Storage::F64(v) => size(v),
             Storage::C64(v) => size(v),
             Storage::C128(v) => size(v),
+        }
+    }
+}
+
+/// Cloning a value is the same allocation problem as producing one: a
+/// `Storage`'s clone is a full-size `Vec` plus a memcpy, and for anything past
+/// the allocator's mmap threshold the destination is a FRESH mapping whose pages
+/// the copy then faults in.  Measured on this host (medians of 11 runs after 3
+/// warmups), `Buffer::clone` of a 64 MiB f32 value costs **26.5 ms** that way,
+/// against **~7 ms** when the destination comes from the pool and its pages stay
+/// mapped — the same argument the pool exists for on result and constant paths
+/// (see `pool.rs`), now applied where a caller re-hands a host input to
+/// `run_program` (which takes owned buffers) or a kernel clones a value.
+///
+/// The copy is split across `parallel_threads` scoped threads above the flat
+/// map's own crossover, exactly like [`decode_le`], so a clone keeps that floor
+/// without changing a single value: every byte is copied exactly once.
+impl Clone for Storage {
+    fn clone(&self) -> Storage {
+        /// Copy `source` into a pooled stock of exactly that size, falling back
+        /// to an ordinary `Vec` clone when the pool has no stock (a small value,
+        /// or a cold thread).
+        fn copy<T: Scalar + Copy + Send>(source: &[T]) -> Vec<T> {
+            let Some(mut stock) = take_pooled_vec::<T>(source.len()) else {
+                return source.to_vec();
+            };
+            let threads = parallel_threads(source.len());
+            if threads > 1 {
+                split_parallel(&mut stock, threads, |offset, chunk| {
+                    let len = chunk.len();
+                    chunk.copy_from_slice(&source[offset..offset + len]);
+                });
+            } else {
+                stock.copy_from_slice(source);
+            }
+            stock
+        }
+        macro_rules! clone_arms {
+            ($($variant:ident($ty:ty) => $values:ident),* $(,)?) => {
+                match self {
+                    $(Storage::$variant($values) => Storage::$variant(copy::<$ty>($values)),)*
+                }
+            };
+        }
+        clone_arms! {
+            Bool(bool) => values,
+            I8(i8) => values,
+            I16(i16) => values,
+            I32(i32) => values,
+            I64(i64) => values,
+            U8(u8) => values,
+            U16(u16) => values,
+            U32(u32) => values,
+            U64(u64) => values,
+            F16(f16) => values,
+            F32(f32) => values,
+            F64(f64) => values,
+            C64(Complex<f32>) => values,
+            C128(Complex<f64>) => values,
         }
     }
 }

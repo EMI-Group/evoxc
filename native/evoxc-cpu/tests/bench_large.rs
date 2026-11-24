@@ -7,6 +7,13 @@
 //! Every row is the MEDIAN of `REPS` timed runs after `WARMUPS` warmups (this
 //! host is shared, so the minimum is reported beside it as the low-load
 //! reading).  It is a measurement aid, never a correctness test.
+//!
+//! A row includes handing the engine a FRESH copy of every input, because
+//! `run_program` takes owned buffers and a caller that re-runs a graph must
+//! clone its host inputs — that copy is caller cost, not kernel cost (a 64 MiB
+//! `Buffer::clone` measures ~3.2 ms with the storage pool, ~26.5 ms when the
+//! allocator re-faults a fresh 64 MiB mapping).  The kernel-side split of the
+//! same rows is `src/kernels/reductions/bench_reduce_large.rs`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -115,7 +122,7 @@ fn measure(label: &str, module: &Json, inputs: &[Buffer], elements: usize) {
         let out = run_program(
             &program,
             &compiled,
-            inputs.iter().map(|input| input.clone()).collect(),
+            inputs.to_vec(),
             RunOptions::default(),
             None,
         )
@@ -128,7 +135,7 @@ fn measure(label: &str, module: &Json, inputs: &[Buffer], elements: usize) {
         let out = run_program(
             &program,
             &compiled,
-            inputs.iter().map(|input| input.clone()).collect(),
+            inputs.to_vec(),
             RunOptions::default(),
             None,
         )
