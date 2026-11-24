@@ -1,297 +1,246 @@
-# Release — route the tag to its distribution, build it, verify it against its
-# own pyproject.toml, publish it to PyPI, then attach the artifacts.
-#
-# This repository is a uv workspace that ships TWO PyPI distributions from ONE
-# `uv.lock`, so a release carries TWO tag schemes and the tag decides which
-# distribution is built (routed once, in `route`, into the `package` /
-# `pyproject` / `prefix` job outputs):
-#   tag `v<version>`          → distribution `evoxc`    — the workspace ROOT
-#                               project (`./pyproject.toml`, tag prefix `v`)
-#   tag `evoxc-hf-v<version>` → distribution `evoxc-hf` — the workspace MEMBER
-#                               (`./evoxc_hf/pyproject.toml`, import name
-#                               `evoxc_hf`, tag prefix `evoxc-hf-v`)
-# Any other tag fails loudly in `route`: nothing is built and nothing is
-# published. There is NO version bump and NO version derivation anywhere in this
-# workflow — each project's pyproject.toml is the single source of truth for its
-# OWN version, and `route` FAILS if `<prefix><version>` does not equal the tag.
-#
-# WHAT A `v<version>` RELEASE BUILDS: the multi-platform wheel matrix lives in
-# `.github/workflows/wheels.yml` (the same workflow the `pull_request` /
-# `workflow_dispatch` build-only runs exercise). `wheels` calls it, so a release
-# ships SEVEN `cp311-abi3-<platform>` wheels — Linux x86_64/aarch64 ×
-# manylinux/musllinux, macOS x86_64/arm64, Windows x86_64 — plus ONE sdist, all
-# collected by that workflow's `collect` job into a single `dist` artifact.
-# A `evoxc-hf-v<version>` release stays a pure-Python `uv build --package
-# evoxc-hf` (no Rust, no platform matrix).
-#
-# Publishing uses PyPI trusted publishing (OIDC) — no API token / password is
-# stored in this repository or in any secret. The PyPI side must have TWO
-# pending trusted publishers, both pointing at THIS workflow and the `pypi`
-# environment:
-#   project: evoxc    | owner: EMI-Group | repository: evoxc
-#   project: evoxc-hf | owner: EMI-Group | repository: evoxc
-#   workflow: release.yml | environment: pypi
-# and the GitHub repository must have an environment named `pypi`.
-# Human procedure (including the Rust crates.io order): RELEASING.md.
-#
-# ORDERING: publish an `evoxc` release BEFORE an `evoxc-hf` release whenever the
-# `evoxc-hf` minimum `evoxc` version is new (`dependencies = ["evoxc>=X", ...]`
-# in evoxc_hf/pyproject.toml). Otherwise the freshly published `evoxc-hf` wheel
-# requires an `evoxc` version PyPI does not have yet, and `pip install evoxc-hf`
-# fails for everyone until the second release lands.
-#
-# Job chain: route → (wheels | build-evoxc-hf) → (publish-evoxc |
-# publish-evoxc-hf) → attach. Exactly ONE build route and ONE publish job run,
-# selected by the routed package; the two publish jobs are separate because each
-# carries its own `environment.url` (and each PyPI pending trusted publisher is
-# bound to its own project). `attach` needs ALL of them with an `if:` that
-# tolerates the always-skipped siblings, so the artifacts are still attached to
-# the GitHub Release, while a failed build or a failed publish keeps them off the
-# Release — nothing is left half-published.
-#
-# OPTIONAL, NOT ENABLED — TestPyPI dry run:
-# To rehearse a release without touching the real index, add a manual trigger to
-# this workflow:
-#   on:
-#     release: { types: [published] }
-#     workflow_dispatch:
-#     # and give the route step something to read, e.g. an `inputs.tag` string
-# and TWO dry-run jobs that mirror the publish jobs one-for-one (both selected
-# the same way — by the routed package — so also gate them on
-# `github.event_name == 'workflow_dispatch'`):
-#   testpypi-evoxc:
-#     needs: [route, wheels]
-#     if: github.event_name == 'workflow_dispatch' && needs.route.outputs.package == 'evoxc'
-#     runs-on: ubuntu-latest
-#     environment: testpypi
-#     permissions: { id-token: write }
-#     steps:
-#       - uses: actions/download-artifact@v4
-#         with: { name: dist, path: dist }
-#       - uses: pypa/gh-action-pypi-publish@release/v1
-#         with:
-#           repository-url: https://test.pypi.org/legacy/
-#           # no `password`: trusted publishing, environment `testpypi`
-#   testpypi-evoxc-hf:  # identical, but needs.route.outputs.package == 'evoxc-hf'
-# TestPyPI needs its OWN pending trusted publisher for EACH project (two of them
-# — see RELEASING.md). Order matters on the dry run too: rehearse `evoxc` before
-# `evoxc-hf`, because resolving the member's `evoxc>=X` requirement needs that
-# version to be installable from somewhere. Keep the dry run out of the default
-# path — a draft/pre-release GitHub Release already gives you a build-only
-# rehearsal because `published` does not fire for drafts.
+# Trusted publishers for both projects are bound to release.yml / pypi.
+# A new evoxc tag runs the gates, stages a verified draft, then publishes it
+# only after PyPI has the exact same files. Manual runs stop after the gates.
 name: Release
 
 on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
   release:
     types: [published]
 
 permissions:
-  contents: write # `attach` uploads artifacts to the GitHub Release
-  id-token: write # OIDC token for PyPI trusted publishing
+  contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  route:
-    name: route + verify (${{ github.event.release.tag_name }})
+  verify:
+    name: Verify release source
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.event.created && !github.event.deleted) ||
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'evoxc-hf-v'))
     runs-on: ubuntu-latest
     outputs:
-      # Consumed by the build routes and the two publish jobs' `if:`.
-      package: ${{ steps.route.outputs.package }}
-      pyproject: ${{ steps.route.outputs.pyproject }}
-      prefix: ${{ steps.route.outputs.prefix }}
+      checkout_sha: ${{ steps.verify.outputs.checkout_sha }}
+      tag: ${{ steps.verify.outputs.tag }}
+      tag_oid: ${{ steps.verify.outputs.tag_oid }}
+      version: ${{ steps.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: verify
+        run: python3 .github/workflows/release_checks.py verify
 
-      - name: Set up uv (Python 3.12)
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-          enable-cache: true
+  ci:
+    name: Release CI
+    needs: verify
+    if: github.event_name != 'release'
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_sha: ${{ needs.verify.outputs.checkout_sha }}
 
-      # ONE routing decision for the whole run: the tag names the distribution.
-      # Everything downstream reads these outputs, so the accepted tag schemes
-      # live in exactly one place.
-      - name: Route the release tag to a distribution
-        id: route
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          tag="${TAG}"
-          # The two patterns are disjoint — one starts `v<digit>`, the other
-          # `evoxc-hf-v<digit>` — so the order does not matter; every other tag
-          # falls through to the `::error::` branch below.
-          case "${tag}" in
-            v[0-9]*)
-              package="evoxc"
-              pyproject="pyproject.toml"
-              prefix="v"
-              ;;
-            evoxc-hf-v[0-9]*)
-              package="evoxc-hf"
-              pyproject="evoxc_hf/pyproject.toml"
-              prefix="evoxc-hf-v"
-              ;;
-            *)
-              echo "::error::Unrecognised release tag '${tag}'. Accepted tag schemes: 'v<version>' for the 'evoxc' distribution (root project, e.g. v0.1.0) and 'evoxc-hf-v<version>' for the 'evoxc-hf' distribution (workspace member evoxc_hf/, e.g. evoxc-hf-v0.1.0). Nothing was built or published."
-              exit 1
-              ;;
-          esac
-          {
-            echo "package=${package}"
-            echo "pyproject=${pyproject}"
-            echo "prefix=${prefix}"
-          } >> "${GITHUB_OUTPUT}"
-          echo "tag '${tag}' -> distribution '${package}' (version source: ${pyproject}, tag prefix: ${prefix})"
-
-      - name: Fail if the release tag does not match the routed [project].version
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-          PACKAGE: ${{ steps.route.outputs.package }}
-          PYPROJECT: ${{ steps.route.outputs.pyproject }}
-          PREFIX: ${{ steps.route.outputs.prefix }}
-        run: |
-          set -euo pipefail
-          version="$(uv run --no-project python -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "${PYPROJECT}")"
-          echo "${PACKAGE} ${PYPROJECT} [project].version = ${version}"
-          echo "release tag                            = ${TAG}"
-          echo "expected tag                           = ${PREFIX}${version}"
-          if [ "${PREFIX}${version}" != "${TAG}" ]; then
-            echo "::error::Release tag '${TAG}' does not match ${PYPROJECT} version '${version}' (expected tag '${PREFIX}${version}'). Nothing will be published. Bump [project].version in ${PYPROJECT}, commit, tag '${PREFIX}<version>', and publish a GitHub Release for that tag."
-            exit 1
-          fi
-
-  # The `evoxc` route: the multi-platform abi3 wheel matrix + the sdist, defined
-  # ONCE in `wheels.yml` (also run build-only on pull_request/workflow_dispatch)
-  # and collected there into a single `dist` artifact. A Rust toolchain is not
-  # needed here — the called workflow installs what its own runners need.
   wheels:
-    name: evoxc wheels (multi-platform)
-    needs: route
-    if: needs.route.outputs.package == 'evoxc'
+    name: Release wheels
+    needs: verify
+    if: github.event_name != 'release'
     uses: ./.github/workflows/wheels.yml
+    with:
+      checkout_sha: ${{ needs.verify.outputs.checkout_sha }}
+      version: ${{ needs.verify.outputs.version }}
 
-  # The `evoxc-hf` route: unchanged pure-Python build (no Rust, no matrix).
-  build-evoxc-hf:
-    name: build + verify evoxc-hf (${{ github.event.release.tag_name }})
-    needs: route
-    if: needs.route.outputs.package == 'evoxc-hf'
+  prepare:
+    name: Prepare and verify evoxc GitHub draft
+    needs: [verify, ci, wheels]
+    if: github.event_name == 'push' && github.repository == 'EMI-Group/evoxc'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.prepare.outputs.release_id }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
-
-      - name: Set up uv (Python 3.12)
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-          enable-cache: true
-
-      # `--package` names the workspace project, so the root project is not
-      # built for an `evoxc-hf` release (and vice versa). Artifact names are
-      # normalized: `evoxc-hf` → `evoxc_hf-<version>-py3-none-any.whl`.
-      - name: Build sdist + wheel from the tagged tree
-        run: uv build --package evoxc-hf --out-dir dist
-
-      - name: Assert the two pure-Python artifacts exist
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          path: release-source
+          persist-credentials: false
+      - name: Require a pinned build artifact
+        env:
+          ARTIFACT_ID: ${{ needs.wheels.outputs.artifact_id }}
         run: |
-          set -euo pipefail
-          shopt -s nullglob
-          wheels=(dist/evoxc_hf-*-py3-none-any.whl)
-          sdists=(dist/evoxc_hf-*.tar.gz)
-          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one evoxc_hf-*-py3-none-any.whl and one evoxc_hf-*.tar.gz, found ${wheels[*]:-none} / ${sdists[*]:-none}"
-            exit 1
-          fi
-          ls -la dist
-
-      - name: Check distribution metadata
-        run: uvx twine check dist/*
-
-      - name: Upload built distributions
-        uses: actions/upload-artifact@v4
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          printf 'Tested evoxc-dist: https://github.com/%s/actions/runs/%s/artifacts/%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 7
+          artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
+          path: dist
+      - id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKOUT_SHA: ${{ needs.verify.outputs.checkout_sha }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          TAG_OID: ${{ needs.verify.outputs.tag_oid }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: python3 release-source/.github/workflows/release_checks.py prepare
 
-  # Exactly one of the next two jobs runs — the tag routed to its project. Two
-  # jobs (not one) so each can declare its own `environment.url`, which PyPI
-  # shows as the deployment target. A plain `if:` still requires the needed
-  # build jobs to have succeeded (GitHub applies an implicit success() status
-  # check), so a failed build publishes nothing. A skipped build route for the
-  # sibling distribution is not a failure — it is why each publish job depends
-  # only on its own route's build and is selected by the routed package.
   publish-evoxc:
-    name: publish evoxc to PyPI
-    needs: [route, wheels]
-    if: needs.route.outputs.package == 'evoxc'
+    name: Publish evoxc to PyPI
+    needs: [verify, wheels, prepare]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/evoxc
     permissions:
-      id-token: write # scope the OIDC token to this job only
+      contents: read
+      id-token: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          path: release-source
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
           path: dist
+      - name: Check tag and PyPI state before uploading
+        id: pypi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          TAG_OID: ${{ needs.verify.outputs.tag_oid }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: python3 release-source/.github/workflows/release_checks.py preflight
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: steps.pypi.outputs.upload == 'true'
 
-      # No `password` / `user` / token input on purpose: the action mints an
-      # OIDC token and the `evoxc` pending trusted publisher validates it.
-      - name: Publish evoxc to PyPI (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
+  finalize:
+    name: Publish verified evoxc GitHub draft
+    needs: [verify, wheels, prepare, publish-evoxc]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          path: release-source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKOUT_SHA: ${{ needs.verify.outputs.checkout_sha }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          TAG_OID: ${{ needs.verify.outputs.tag_oid }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: python3 release-source/.github/workflows/release_checks.py finalize
+
+  build-evoxc-hf:
+    name: Build and verify evoxc-hf
+    needs: verify
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.artifact.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uv build --package evoxc-hf --out-dir dist
+      - name: Check exact artifact names and metadata
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          rm -f -- dist/.gitignore
+          python3 .github/workflows/release_checks.py manifest
+          uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        id: artifact
+        with:
+          name: evoxc-hf-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require a pinned build artifact
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          printf 'Verified evoxc-hf-dist: https://github.com/%s/actions/runs/%s/artifacts/%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"
 
   publish-evoxc-hf:
-    name: publish evoxc-hf to PyPI
-    needs: [route, build-evoxc-hf]
-    if: needs.route.outputs.package == 'evoxc-hf'
+    name: Publish evoxc-hf to PyPI
+    needs: [verify, build-evoxc-hf]
+    if: github.event_name == 'release' && github.repository == 'EMI-Group/evoxc'
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/evoxc-hf
     permissions:
-      id-token: write # scope the OIDC token to this job only
+      contents: read
+      id-token: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          path: release-source
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          artifact-ids: ${{ needs.build-evoxc-hf.outputs.artifact_id }}
           path: dist
-
-      # Same OIDC path, different project: the `evoxc-hf` pending trusted
-      # publisher is bound to this workflow + the `pypi` environment too.
-      - name: Publish evoxc-hf to PyPI (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
-
-  attach:
-    name: attach artifacts to the GitHub Release
-    needs: [route, wheels, build-evoxc-hf, publish-evoxc, publish-evoxc-hf]
-    # Every release runs ONE build route and ONE publish job; GitHub propagates
-    # `skipped` through `needs` — without a status-check function this job would
-    # be skipped too and the artifacts would never be attached. `!failure()`
-    # lets it run when nothing failed (a skipped sibling is not a failure), and
-    # the explicit `route` result check guarantees the run was a real release.
-    if: ${{ !failure() && needs.route.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      # Both routes name their collected artifact `dist` (the `evoxc` one comes
-      # from `wheels.yml`'s `collect` job, the `evoxc-hf` one from
-      # `build-evoxc-hf`), and only one route runs per release.
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-      - name: Attach sdist + wheels to the release
+      - name: Check tag and PyPI state before uploading
+        id: pypi
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "${TAG}" dist/* --clobber
+          TAG: ${{ needs.verify.outputs.tag }}
+          TAG_OID: ${{ needs.verify.outputs.tag_oid }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: python3 release-source/.github/workflows/release_checks.py preflight
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: steps.pypi.outputs.upload == 'true'
+
+  attach-evoxc-hf:
+    name: Attach evoxc-hf distributions to GitHub Release
+    needs: [verify, build-evoxc-hf, publish-evoxc-hf]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          path: release-source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build-evoxc-hf.outputs.artifact_id }}
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          TAG_OID: ${{ needs.verify.outputs.tag_oid }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: python3 release-source/.github/workflows/release_checks.py attach-hf
