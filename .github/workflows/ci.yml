@@ -17,6 +17,7 @@
 #                end-to-end. `--extra` resolves per project, so `--extra
 #                compilers` reaches the root project even though the
 #                `evoxc-hf` member defines no such extra.
+#   rust       — locked native workspace tests and Clippy.
 #   packaging  — `uv build --all-packages` (FOUR artifacts: a wheel + an sdist
 #                per distribution) + `twine check` + a two-way
 #                distribution-boundary guard on the BUILT archives: the `evoxc`
@@ -43,18 +44,25 @@
 # `packaging` does not re-run pytest — it guards the built artifacts instead.
 name: CI
 
+# A caller supplies the commit; standalone runs leave checkout on the event ref/SHA.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      checkout_sha:
+        description: Exact commit SHA to test
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-# Superseded pushes/PR updates cancel their own in-flight runs.
+# Superseded pushes/PR updates cancel their own in-flight runs; calls are isolated by run.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ inputs.checkout_sha && format('call-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.checkout_sha }}
 
 jobs:
   test:
@@ -66,6 +74,8 @@ jobs:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up uv (Python ${{ matrix.python }})
         uses: astral-sh/setup-uv@v6
@@ -91,13 +101,15 @@ jobs:
 
       # One run covers both distributions (`testpaths = ["tests", "evoxc_hf/tests"]`).
       - name: Run pytest
-        run: uv run pytest -q
+        run: uv run --locked --python ${{ matrix.python }} --all-packages --extra dev pytest -q
 
   compilers:
     name: test (compilers, py3.12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up uv (Python 3.12)
         uses: astral-sh/setup-uv@v6
@@ -122,13 +134,42 @@ jobs:
         run: uv sync --locked --python 3.12 --all-packages --extra dev --extra compilers
 
       - name: Run pytest
-        run: uv run pytest -q
+        run: uv run --locked --python 3.12 --all-packages --extra dev --extra compilers pytest -q
+
+  rust:
+    name: Rust workspace (test + Clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
+
+      - name: Set up Rust with Clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
 
   packaging:
     name: packaging (build + metadata)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up uv (Python 3.12)
         uses: astral-sh/setup-uv@v6
