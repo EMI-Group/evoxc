@@ -436,7 +436,7 @@ The reusable crate is **`evoxc`**, with features `cpu` (the CPU execution engine
 
 The Python package `evoxc` binds that crate through PyO3 as the extension module `evoxc._evoxc_native`, which `pip install evoxc` loads; Python keeps the frontend duties (executing `defn` bodies, specs/pytree adaptation, the extension-rule bridge) and never a second transform implementation. Tensors cross that boundary as typed numpy views in and zero-copy numpy arrays out: an input is copied once into the engine's owned buffers, and a returned array is a fresh, C-contiguous, writeable array that shares no memory with any input.
 
-The published wheel is prebuilt abi3 (`cp311-abi3-*`, one wheel per platform serving every supported CPython, 3.11+): Linux x86_64 and aarch64 (manylinux and musllinux), macOS x86_64 and arm64, Windows x86_64 — plus one sdist that carries the whole Rust workspace, so a source install compiles the same crate with maturin.
+The release builds `cp311-abi3` wheels for Linux x86-64 and AArch64 (manylinux2014 and musllinux 1.2), macOS x86-64 and Arm64, and Windows x86-64, plus a source distribution with the whole Rust workspace. The wheels use the CPython 3.11 stable ABI and are smoke-tested on CPython 3.11; Ubuntu CI separately tests Python 3.11–3.14. See the [tested platforms](RELEASING.md#tested-distribution-artifacts) for details.
 
 ## Built on evoxc: `evoxc_hf`
 
@@ -486,9 +486,9 @@ pip install evoxc-hf            # the HuggingFace layer — a separate distribut
 pip install "evoxc-hf[hf]"      # + torch/transformers reference oracles for evoxc-hf (never runtime requirements)
 ```
 
-`evoxc` has one runtime dependency, NumPy. Its platform wheels include the compiled Rust/PyO3 extension, `evoxc._evoxc_native`. For source builds, maturin compiles the extension from `native/` using a Rust toolchain and a C compiler.
+`evoxc` has one runtime dependency, NumPy. Its wheels include the compiled Rust/PyO3 extension and need no compiler to install. If there is no compatible wheel, pip can build from source. With a Rust toolchain and C compiler on `PATH`, use `python -m pip install --no-binary=evoxc evoxc` to force a source build of just `evoxc` (dependencies can still use wheels).
 
-`evoxc` and `evoxc-hf` are independently versioned distributions in the same `uv` workspace. Install and upgrade them separately. The `evoxc-hf[hf]` extra adds PyTorch and Transformers for reference tests and benchmarks.
+`evoxc` and `evoxc-hf` are independently versioned and released. A new `v<version>` tag on `main` history starts the `evoxc` release; `evoxc-hf` still starts from a published GitHub Release for its own tag. See [RELEASING.md](RELEASING.md) for the non-publishing rehearsal and release steps.
 
 From source — the checkout, for development (`requires-python >= 3.11`):
 
