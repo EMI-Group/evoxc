@@ -69,6 +69,9 @@ use super::Storage;
 //  * A stock larger than its tier's byte cap is refused outright (the caller
 //    frees it); that can only happen for an incoming stock above
 //    [`POOL_MAX_BYTES_LARGE`].
+//  * The pool backs every full-overwrite destination, including `Storage::clone`
+//    and the public `Storage::from_slice_pooled` (the PyO3 binding's input
+//    hand-off), both through `storage::copy_slice_pooled`.
 //
 // Measured on this host: a fresh 64 MiB `vec![0.0; 16M]` plus one full write
 // pass costs 26.0 ms (0.4 ms per MiB) -- mmap page faults, not copy -- and a flat
