@@ -1762,7 +1762,11 @@ class IreeBackend(CompilerBackend):
         mlir_text = payload["mlir_text"]
         target_backends, extra_args = self._resolve_compile_options(options)
         vmfb = self._compile_mlir(
-            mlir_text, target_backends, extra_args, compiler_module
+            mlir_text,
+            target_backends,
+            extra_args,
+            compiler_module,
+            vulkan_profile=(options or {}).get("vulkan_target"),
         )
 
         artifact_target = _artifact_target(target_backends)
@@ -1930,6 +1934,7 @@ class IreeBackend(CompilerBackend):
         target_backends: tuple[str, ...],
         extra_args: list[str],
         compiler_module: Any = None,
+        vulkan_profile: str | None = None,
     ) -> bytes:
         """Invoke iree-compile on one MLIR text; diagnostics -> BackendError.
 
@@ -1937,6 +1942,16 @@ class IreeBackend(CompilerBackend):
         of the caller's options): ``compile_str`` and ``CompilerToolError``
         both come from THAT module, so a custom build is honored end to end
         (``None`` resolves the default/env module).
+
+        ``vulkan_profile`` is the raw ``vulkan_target`` compile option the
+        caller set (``None`` = unset) — passed ONLY so a compile failure can
+        be attributed: option VALUES are never validated by evoxc, so a
+        rejected profile surfaces here as iree-compile's own diagnostic, and
+        the appended note names the option, says the value was rejected by
+        the compiler (not evoxc), points at ``iree-compile --help`` for the
+        installed compiler's authoritative list, and states the 3.13
+        limitation (no Intel Xe/Panther-Lake profile). Nothing is rejected
+        or rewritten on evoxc's side and every other error is unchanged.
         """
         if compiler_module is None:
             compiler_module = _compiler_module(None)
@@ -1949,10 +1964,32 @@ class IreeBackend(CompilerBackend):
                 extra_args=extra_args,
             )
         except compiler_module.CompilerToolError as exc:
-            raise core.BackendError(
+            preface = (
                 f"iree-compile failed to compile the StableHLO program for "
                 f"the {self.name} backend (targets: "
-                f"{', '.join(target_backends)}):\n{exc}"
+                f"{', '.join(target_backends)}):"
+            )
+            if vulkan_profile is None:
+                raise core.BackendError(f"{preface}\n{exc}") from exc
+            note = (
+                f"\n\nNote: the {self.name} 'vulkan_target' compile option "
+                f"was set to {vulkan_profile!r}, which evoxc forwarded "
+                f"verbatim as --iree-vulkan-target={vulkan_profile} "
+                "WITHOUT validating the value (option values are the "
+                "compiler's to validate). If the diagnostics below say the "
+                "Vulkan target is unknown, the INSTALLED iree-compile "
+                f"rejected {vulkan_profile!r} — evoxc did not. List the "
+                "profiles the installed compiler accepts with "
+                "`iree-compile --help` (the --iree-vulkan-target entry, "
+                "which documents the AMD/NVIDIA/ARM/Qualcomm schemes) or "
+                "leave vulkan_target unset to use its default Vulkan "
+                "profile. iree-base-compiler 3.13.0 ships no Intel Xe / "
+                "Panther-Lake profile (Intel GPUs run through the default "
+                "profile), so an Intel profile name is expected to be "
+                "rejected."
+            )
+            raise core.BackendError(
+                f"{preface}{note}\n\nCompiler diagnostics:\n{exc}"
             ) from exc
 
     def _compile_segments(
@@ -1994,6 +2031,7 @@ class IreeBackend(CompilerBackend):
             ) from exc
 
         target_backends, extra_args = self._resolve_compile_options(options)
+        vulkan_profile = (options or {}).get("vulkan_target")
         segments = []
         for index, raw in enumerate(raw_segments):
             if not isinstance(raw, dict) or not isinstance(
@@ -2013,7 +2051,11 @@ class IreeBackend(CompilerBackend):
                     f"{index} records no entry functions"
                 )
             vmfb = self._compile_mlir(
-                raw["mlir_text"], target_backends, extra_args, compiler_module
+                raw["mlir_text"],
+                target_backends,
+                extra_args,
+                compiler_module,
+                vulkan_profile=vulkan_profile,
             )
             segments.append(
                 {
