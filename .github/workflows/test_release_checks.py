@@ -4,8 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-from urllib.error import HTTPError
+from unittest.mock import call, patch
+from urllib.error import HTTPError, URLError
 
 import release_checks as release
 
@@ -126,13 +126,131 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(posts[0].args[0], "releases/17/assets?name=source.tar.gz")
 
     def test_does_not_mutate_published_or_nonmatching_draft(self):
-        for draft in [{"tag_name": TAG, "draft": False, "body": "marker"},
-                      {"tag_name": TAG, "draft": True, "body": "other"}]:
+        for draft, message in [(False, "already published"), (True, "marker does not match")]:
+            remote = {"tag_name": TAG, "draft": draft, "body": "other"}
             with (self.subTest(draft=draft), patch.object(release, "release_assets", return_value={}),
-                  patch.object(release, "github", return_value=draft) as github):
-                with self.assertRaisesRegex(release.ReleaseError, "already published or draft does not match"):
+                  patch.object(release, "github", return_value=remote) as github):
+                with self.assertRaisesRegex(release.ReleaseError, message):
                     release.stage_assets(17, TAG, EXPECTED, "marker")
                 github.assert_called_once_with("releases/17")
+
+
+class EvoxcPublicationTests(unittest.TestCase):
+    def setUp(self):
+        env = {"VERSION": "1.2.3", "GITHUB_EVENT_NAME": "push", "TAG": TAG,
+               "TAG_OID": TAG_OID, "CHECKOUT_SHA": SHA, "RELEASE_ID": "17"}
+        self.enterContext(patch.object(release, "ENV", env))
+        self.enterContext(patch.object(release, "manifest", return_value=EXPECTED))
+        self.enterContext(patch.object(release.time, "sleep"))
+        self.output = self.enterContext(patch.object(release, "output"))
+        self.pypi_files = self.enterContext(patch.object(release, "pypi_files", return_value=EXPECTED))
+        self.github = self.enterContext(patch.object(release, "github", side_effect=self.remote))
+        self.staged = {"id": 17, "tag_name": TAG, "draft": True, "prerelease": False,
+                       "body": release.evoxc_marker(EXPECTED) + "\n\nRelease notes",
+                       "html_url": "https://github.com/example/project/releases/tag/v1.2.3"}
+        self.assets = EXPECTED.copy()
+        self.tag_oids = iter([TAG_OID] * 4)
+        self.lose_response = False
+
+    def remote(self, path, method="GET", payload=None):
+        if (path, method) == ("git/ref/tags/" + TAG, "GET"):
+            return {"ref": REF, "object": {"sha": next(self.tag_oids)}}
+        if (path, method) == ("releases/17", "GET"):
+            return self.staged.copy()
+        if (path, method) == ("releases/17/assets?per_page=100&page=1", "GET"):
+            return [{"name": name, "state": "uploaded", "digest": "sha256:" + digest}
+                    for name, digest in self.assets.items()]
+        if (path, method, payload) == ("releases/17", "PATCH", {"draft": False}):
+            self.staged["draft"] = False
+            if self.lose_response:
+                raise URLError("lost PATCH response")
+            return self.staged.copy()
+        self.fail(f"Unexpected GitHub request: {method} {path}")
+
+    def test_preflight_rechecks_the_pinned_draft_before_allowing_upload(self):
+        self.pypi_files.return_value = None
+        release.main("preflight")
+        self.assertEqual(self.github.call_args_list, [call("git/ref/tags/" + TAG), call("releases/17"),
+                         call("releases/17/assets?per_page=100&page=1"), call("git/ref/tags/" + TAG)])
+        self.pypi_files.assert_called_once_with("evoxc", "1.2.3")
+        self.output.assert_called_once_with("upload", "true")
+
+    def test_preflight_rejects_public_release_before_upload(self):
+        self.staged["draft"] = False
+        with self.assertRaisesRegex(release.ReleaseError, "already published"):
+            release.main("preflight")
+        self.pypi_files.assert_not_called()
+        self.output.assert_not_called()
+
+    def test_preflight_and_recovery_reject_release_or_asset_drift(self):
+        cases = [({"id": 18}, EXPECTED, "ID does not match"),
+                 ({"tag_name": "v1.2.4"}, EXPECTED, "tag does not match"),
+                 ({"body": "other"}, EXPECTED, "marker does not match"),
+                 ({"prerelease": True}, EXPECTED, "Unexpected GitHub prerelease"),
+                 ({}, {}, "missing"),
+                 ({}, {**EXPECTED, "wheel.whl": "c" * 64}, "non-matching files"),
+                 ({}, {**EXPECTED, "other.whl": "c" * 64}, "unexpected or non-matching files")]
+        original = self.staged.copy()
+        for command in ("preflight", "finalize"):
+            for changes, assets, message in cases:
+                with self.subTest(command=command, changes=changes, assets=assets):
+                    self.tag_oids = iter([TAG_OID])
+                    self.staged = {**original, "draft": command == "preflight", **changes}
+                    self.assets = assets
+                    self.github.reset_mock()
+                    self.pypi_files.reset_mock()
+                    with self.assertRaisesRegex(release.ReleaseError, message):
+                        release.main(command)
+                    self.assertTrue(all(len(c.args) == 1 for c in self.github.call_args_list))
+                    if command == "preflight":
+                        self.pypi_files.assert_not_called()
+                    self.output.assert_not_called()
+
+    def test_finalize_publishes_the_verified_draft(self):
+        release.main("finalize")
+        self.github.assert_called_with("releases/17", "PATCH", {"draft": False})
+        self.assertFalse(self.staged["draft"])
+        self.output.assert_not_called()
+
+    def test_finalize_can_recover_a_lost_publish_response_without_mutating(self):
+        self.lose_response = True
+        with self.assertRaisesRegex(URLError, "lost PATCH response"):
+            release.main("finalize")
+        self.assertEqual(self.github.call_args_list[-2:], [call("git/ref/tags/" + TAG),
+                         call("releases/17", "PATCH", {"draft": False})])
+        self.github.reset_mock()
+        self.pypi_files.reset_mock()
+        release.main("finalize")
+        self.assertEqual(self.github.call_args_list, [call("git/ref/tags/" + TAG), call("releases/17"),
+                         call("releases/17/assets?per_page=100&page=1"), call("git/ref/tags/" + TAG)])
+        self.pypi_files.assert_called_once_with("evoxc", "1.2.3")
+        self.output.assert_not_called()
+
+    def test_finalize_rejects_tag_moved_during_remote_checks(self):
+        for draft in (True, False):
+            with self.subTest(draft=draft):
+                self.staged["draft"] = draft
+                self.tag_oids = iter([TAG_OID, "c" * 40])
+                self.github.reset_mock()
+                with self.assertRaisesRegex(release.ReleaseError, "no longer matches the verified tag object"):
+                    release.main("finalize")
+                self.assertEqual(self.github.call_count, 4)
+                self.github.assert_called_with("git/ref/tags/" + TAG)
+                self.assertIs(self.staged["draft"], draft)
+
+    def test_already_public_recovery_still_requires_exact_pypi(self):
+        self.staged["draft"] = False
+        for files, message in [(None, "all tested files"), ({}, "all tested files"),
+                               ({**EXPECTED, "wheel.whl": "c" * 64}, "non-matching files"),
+                               ({**EXPECTED, "extra.whl": "c" * 64}, "unexpected or non-matching")]:
+            with self.subTest(files=files):
+                self.tag_oids = iter([TAG_OID])
+                self.pypi_files.return_value = files
+                self.github.reset_mock()
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    release.main("finalize")
+                self.github.assert_called_once_with("git/ref/tags/" + TAG)
+                self.output.assert_not_called()
 
 
 if __name__ == "__main__":

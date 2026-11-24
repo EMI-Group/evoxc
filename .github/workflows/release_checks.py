@@ -155,13 +155,30 @@ def release_assets(release_id):
     return assets
 
 
-def verify_release(release, tag, marker=None):
+def verify_release(release, tag, marker=None, *, release_id=None, allow_published=False):
+    if release_id is not None:
+        require(release["id"] == release_id, "GitHub Release ID does not match the staged release")
     require(release["tag_name"] == tag, "GitHub Release tag does not match")
     if marker is None:
         require(not release["draft"], "Expected a published HF release")
     else:
-        require(release["draft"] and marker in (release["body"] or ""),
-                "Release already published or draft does not match the verified source and artifacts; refusing to mutate it")
+        require(allow_published or release["draft"], "GitHub Release is already published; refusing to mutate it")
+        require(not release.get("prerelease"), "Unexpected GitHub prerelease; refusing to mutate it")
+        require(marker in (release["body"] or ""),
+                "GitHub Release marker does not match the verified source and artifacts; refusing to mutate it")
+
+
+def evoxc_marker(expected):
+    manifest_hash = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
+    return f"<!-- evoxc-release {ENV['CHECKOUT_SHA']} {ENV['TAG_OID']} {manifest_hash} -->"
+
+
+def checked_evoxc_release(release_id, tag, marker, expected, *, allow_published=False):
+    release = github(f"releases/{release_id}")
+    verify_release(release, tag, marker, release_id=release_id, allow_published=allow_published)
+    missing = compare_subset(release_assets(release_id), expected, "GitHub Release")
+    require(not missing, f"GitHub Release no longer contains all tested assets; missing {missing}")
+    return release
 
 
 def stage_assets(release_id, tag, expected, marker=None):
@@ -210,7 +227,8 @@ def wait_for_pypi(project, version, expected):
             return
         if attempt < 6:
             time.sleep(10)
-    raise ReleaseError(f"PyPI does not yet contain all tested files ({missing}); rerun failed jobs after checking the index")
+    raise ReleaseError(f"PyPI does not yet contain all tested files ({missing}); check the index, then rerun only "
+                       "the failed jobs in the original release run to reuse the tested artifact")
 
 
 def main(command):
@@ -225,24 +243,25 @@ def main(command):
     verify_live_tag(tag)
     project = "evoxc-hf" if hf else "evoxc"
     if command == "preflight":
+        release_id = int(ENV["RELEASE_ID"])
         if hf:
-            release_id = int(ENV["RELEASE_ID"])
             verify_release(github(f"releases/{release_id}"), tag)
             compare_subset(release_assets(release_id), expected, "GitHub Release")
+        else:
+            checked_evoxc_release(release_id, tag, evoxc_marker(expected), expected)
+            verify_live_tag(tag)
         return preflight_pypi(project, version, expected)
     if command == "attach-hf":
         wait_for_pypi(project, version, expected)
         verify_live_tag(tag)
         return stage_assets(int(ENV["RELEASE_ID"]), tag, expected)
 
-    manifest_hash = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
-    sha = ENV["CHECKOUT_SHA"]
-    marker = f"<!-- evoxc-release {sha} {ENV['TAG_OID']} {manifest_hash} -->"
+    marker = evoxc_marker(expected)
     if command == "prepare":
         matches = [release for release in pages("releases") if release["tag_name"] == tag]
         require(len(matches) <= 1, f"Multiple releases claim {tag}; inspect them manually")
         release = matches[0] if matches else github(
-            "releases", "POST", {"tag_name": tag, "target_commitish": sha, "draft": True,
+            "releases", "POST", {"tag_name": tag, "target_commitish": ENV["CHECKOUT_SHA"], "draft": True,
                                  "name": tag, "body": marker, "generate_release_notes": True})
         verify_release(release, tag, marker)
         stage_assets(release["id"], tag, expected, marker)
@@ -251,13 +270,14 @@ def main(command):
     elif command == "finalize":
         wait_for_pypi(project, version, expected)
         release_id = int(ENV["RELEASE_ID"])
-        path = f"releases/{release_id}"
-        verify_release(github(path), tag, marker)
-        require(not compare_subset(release_assets(release_id), expected, "GitHub draft"),
-                "GitHub draft no longer contains the tested assets")
+        release = checked_evoxc_release(release_id, tag, marker, expected, allow_published=True)
         verify_live_tag(tag)
-        release = github(path, "PATCH", {"draft": False})
-        require(not release["draft"] and release["tag_name"] == tag, "GitHub did not publish the expected release")
+        if not release["draft"]:
+            print(f"Already published with the tested distributions: {release['html_url']}")
+            return
+        release = github(f"releases/{release_id}", "PATCH", {"draft": False})
+        verify_release(release, tag, marker, release_id=release_id, allow_published=True)
+        require(not release["draft"], "GitHub did not publish the expected release")
         print(f"Published {release['html_url']}")
     else:
         raise ReleaseError(f"Unknown command: {command}")

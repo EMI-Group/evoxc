@@ -1,7 +1,9 @@
 # Trusted publishers for both projects are bound to release.yml / pypi.
-# A new evoxc tag runs the gates, stages a verified draft, then publishes it
-# only after PyPI has the exact same files. Manual runs stop after the gates.
+# An evoxc tag runs CI, then builds and smoke-tests the release distributions.
+# It stages a GitHub draft and makes it public only after PyPI has the same files.
+# Manual rehearsals stop after the CI and build checks, without publishing.
 name: Release
+run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (CI, then build and smoke tests)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
 
 on:
   push:
@@ -48,8 +50,8 @@ jobs:
       checkout_sha: ${{ needs.verify.outputs.checkout_sha }}
 
   wheels:
-    name: Release wheels
-    needs: verify
+    name: Build and smoke-test release wheels
+    needs: [verify, ci]
     if: github.event_name != 'release'
     uses: ./.github/workflows/wheels.yml
     with:
@@ -76,8 +78,11 @@ jobs:
           ARTIFACT_ID: ${{ needs.wheels.outputs.artifact_id }}
         run: |
           [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          printf 'Tested evoxc-dist: https://github.com/%s/actions/runs/%s/artifacts/%s\n' \
-            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"
+          {
+            printf 'Tested evoxc-dist: https://github.com/%s/actions/runs/%s/artifacts/%s\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$ARTIFACT_ID"
+            printf '\nIf finalization fails after PyPI publication, use **Re-run failed jobs** in this run. Do not rebuild or retag.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
@@ -100,7 +105,8 @@ jobs:
       name: pypi
       url: https://pypi.org/p/evoxc
     permissions:
-      contents: read
+      # GitHub requires write access for the workflow token to see draft releases.
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -112,19 +118,24 @@ jobs:
         with:
           artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
           path: dist
-      - name: Check tag and PyPI state before uploading
+      - name: Recheck the verified draft, tag, and PyPI before uploading
         id: pypi
         env:
           GH_TOKEN: ${{ github.token }}
+          CHECKOUT_SHA: ${{ needs.verify.outputs.checkout_sha }}
           TAG: ${{ needs.verify.outputs.tag }}
           TAG_OID: ${{ needs.verify.outputs.tag_oid }}
           VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: python3 release-source/.github/workflows/release_checks.py preflight
       - uses: pypa/gh-action-pypi-publish@release/v1
         if: steps.pypi.outputs.upload == 'true'
 
+  # If publication succeeded but its response was lost, rerun only the failed
+  # job(s) in this run: finalize checks the same artifact ID, without rebuilding
+  # wheels or reuploading to PyPI.
   finalize:
-    name: Publish verified evoxc GitHub draft
+    name: Publish or confirm verified evoxc GitHub release
     needs: [verify, wheels, prepare, publish-evoxc]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
