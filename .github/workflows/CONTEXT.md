@@ -2,31 +2,42 @@
 
 ## Intent
 
-Two GitHub Actions workflows that gate and publish the two distributions (`evoxc` from the workspace root, `evoxc-hf` from the `evoxc_hf` member) built from this one repository and one `uv.lock`.
-No application code lives here — these files only orchestrate install, test, build, metadata and boundary checks.
+These workflows test and package the two distributions from one workspace, release `evoxc` from a verified tag push, and retain the independent, manually initiated GitHub Release for `evoxc-hf`.
 
 ## API Surface
 
-- `ci.yml` — on push to `main` and on pull requests, three jobs: `test` (pytest matrix on Python 3.11–3.14 with only the `dev` extra), `compilers` (same suite on Python 3.12 with the `compilers` extra, the only job exercising the IREE/TVM adapter legs end-to-end) and `packaging` (build both distributions, check metadata, assert the four artifacts, guard the distribution boundary).
-- `packaging` step order: `uv build --all-packages --out-dir dist` → `uvx twine check dist/*` → the four-artifact assertion (`evoxc` + `evoxc_hf`, wheel + sdist, at the versions read from the two `pyproject.toml` files) → the two-way archive boundary guard (each wheel/sdist ships only its own top-level package, each sdist has a single versioned root, the `evoxc_hf` sdist ships `LICENSE`).
-- `release.yml` — on `release: published`, tag-driven and per package: `v<version>` routes to `evoxc`, `evoxc-hf-v<version>` routes to `evoxc-hf`; any other tag fails in `build`.
-- Job chain in `release.yml`: `build` → exactly one of `publish-evoxc` / `publish-evoxc-hf` → `attach` (which tolerates the skipped sibling), so a failed build or publish keeps artifacts off the GitHub Release.
+- `ci.yml` is the push-to-`main`/PR gate and a reusable `workflow_call` with required `checkout_sha`; callers pin their checked-out commit.
+- CI runs the Python 3.11–3.14 test matrix, the Python 3.12 compiler leg, the two-distribution packaging/boundary check, and `cargo test --locked --workspace` plus `cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings` in `native/`.
+- `release.yml` triggers on a new `v*` tag push, no-input `workflow_dispatch`, and a published GitHub Release tagged `evoxc-hf-v*`.
+- On an `evoxc` tag push, `verify` matches the peeled tag commit and tag object to the event and checkout, requires membership in `origin/main` history, and requires the exact tag `v<version>` from the root `pyproject.toml`.
+- `verify` → `ci` → `wheels` is shared by the tag and the `main`-only rehearsal (`gh workflow run release.yml --ref main`); rehearsals have no release-write or OIDC jobs.
+- `wheels.yml` is callable with `checkout_sha` and `version` and returns `artifact_id` for the single immutable `evoxc-dist` upload containing seven wheels and one sdist after platform smoke tests, matrix and archive verification, and strict Twine validation.
+- Linux wheels run on `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` (AArch64); on each architecture the manylinux2014/glibc 2.17 and musllinux 1.2 wheels are installed and tested inside their matching PyPA containers.
+- `macos-15-intel` builds x86-64 with macOS 10.12 deployment target, `macos-15` builds Arm64 with macOS 11.0 deployment target, and `windows-2025` builds x86-64 MSVC; the smoke tests run natively on those hosts, not on old macOS runtime versions.
+- The Maturin sdist runs a source-build/install smoke test on `ubuntu-24.04` with Rust available; every wheel and sdist smoke test uses CPython 3.11, a fresh venv outside the checkout, and `pip --isolated install --no-cache-dir` on the exact archive (`--only-binary=:all:` for wheel legs).
+- The smoke test verifies installed metadata and package versions and extension provenance, then traces a small graph, differentiates it through the Rust transform, and executes it using the native backend.
+- In `EMI-Group/evoxc`, successful gates enable `prepare` (stage and verify a GitHub draft), `publish-evoxc` (publish to PyPI), then `finalize` (make that exact checked draft public).
+- The separate HF path validates `evoxc-hf-v<version>` against the member `pyproject.toml` at the release event commit and runs `build-evoxc-hf` → `publish-evoxc-hf` → `attach-evoxc-hf` using only the separately built `evoxc-hf-dist` wheel and sdist.
 
 ## Constraints
 
-- Workspace installs MUST pass `--all-packages` (and `--locked`): a plain `uv sync` installs the root project only and uninstalls the member.
-- `uv build` writes its own 1-byte `dist/.gitignore` (content `*`) into `--out-dir`, so artifact counts in the packaging job must match `*.whl`/`*.tar.gz` only — a bare `find dist -maxdepth 1 -type f` counts a fifth file on a clean build.
-- The packaging step lists `dist` with `ls -la` so the auto-generated `.gitignore` stays visible in CI logs.
-- Shell globs (`twine check dist/*`, `release.yml`'s `dist/*` upload/artifact paths) skip dotfiles, so no glob needs the same restriction.
-- Built archive names are normalized: the `evoxc-hf` project becomes `evoxc_hf-<version>-py3-none-any.whl` / `evoxc_hf-<version>.tar.gz`.
-- Versions are never derived or bumped by a workflow: each project's `pyproject.toml` is the single source of truth and `release.yml` fails when `<tag prefix><version>` differs from the tag.
-- Publishing uses PyPI trusted publishing (OIDC); no token or password is stored in the repository or in secrets, and the `pypi` environment plus two pending trusted publishers (`evoxc`, `evoxc-hf`) must exist on the PyPI side.
-- Skipped tests in CI are host/dependency guards by design (no CUDA device, no compiler / PJRT plugin / Vulkan ICD, no torch/transformers) — they are never failures, and the `evoxc-hf` oracle legs run by hand rather than in CI.
+- CI uses `uv sync --locked --all-packages` and runs pytest with the same lock and workspace flags so the member remains installed and dependencies do not re-resolve.
+- CI's `uv build` writes `dist/.gitignore`, which is excluded from archive counts and publication; each project must ship only its own module.
+- The workflows never create or move a tag, change a version, or publish from manual-dispatch input; the two project `pyproject.toml` files are authoritative for their respective versions.
+- GitHub Release writes are job-scoped, and only `publish-evoxc` and `publish-evoxc-hf` have `id-token: write` and target the `pypi` environment; both PyPI trusted publishers bind to `release.yml` in `EMI-Group/evoxc`.
+- Per-tag concurrency prevents release runs from overlapping; maintainers should protect release tags against mutation and configure `pypi` deployment rules for the approved tags only.
+- Publishers download the tested artifact by numeric ID, recheck the live tag, and never use skip-existing or overwrite semantics; the evoxc publisher rechecks the draft and SHA-256 assets after environment approval before upload.
+- Recovery reruns failed jobs in the original run (`gh run rerun <run-id> --failed`) to retain the original artifacts, not a fresh build; an exact PyPI match skips upload, and an exact already-public GitHub release is accepted by finalization without mutation.
+- A partial PyPI release blocks automated upload; after comparing hashes, a maintainer can restore only missing files from the original artifact linked in the run summary, then rerun failed jobs.
+- A hash mismatch, conflicting draft, or expired original artifact requires investigation, not overwrites or rebuilding a partially published version; artifacts are retained for seven days.
 
 ## Routing Table
 
 | Path | Area |
 |---|---|
-| `./ci.yml` | Push/PR gate: test matrix, compilers job, and the packaging job (build + metadata + four-artifact assertion + distribution-boundary guard). |
-| `./release.yml` | Tag-driven per-package release: route by tag, build, verify version against the tag, publish via OIDC trusted publishing, attach artifacts. |
+| `./ci.yml` | Normal and reusable CI: Python, compiler, packaging, and Rust gates. |
+| `./wheels.yml` | Reusable gate for the supported evoxc wheel matrix, source archive and exact installs. |
+| `./smoke_evoxc.py` | Fresh-venv install and compiled-extension graph smoke for one exact archive. |
+| `./release.yml` | Tag preflight, rehearsal, artifact paths, GitHub draft/publication, and PyPI OIDC jobs. |
+| `./release_checks.py` / `./test_release_checks.py` | Source, artifact and remote-state validation; run `python -m unittest discover -s .github/workflows -p 'test_release_checks.py'` from the repository root. |
 | `../../RELEASING.md` | Human release procedure (sibling — read-only, escalate writes to parent). |
