@@ -77,14 +77,16 @@ These commands require a Rust toolchain and a C compiler on `PATH` to build
    update `CHANGELOG.md`, and refresh `uv.lock` with `uv lock`. Merge to `main`.
    Rehearse the candidate before tagging.
 2. Fetch `origin/main` and tag the intended merged commit, not an unmerged PR
-   commit or an unchecked local `HEAD`. For example, for root version `0.1.1`,
-   substitute the verified merge SHA for `RELEASE_SHA`:
+   commit or an unchecked local `HEAD`. These commands are illustrative for the
+   planned root release `0.2.0`. Run them only after the release change declaring
+   root `[project].version = "0.2.0"` has merged to `main` and the intended commit
+   has passed rehearsal. Substitute that commit's SHA for `RELEASE_SHA`:
 
    ```bash
    git fetch origin &&
      git merge-base --is-ancestor RELEASE_SHA origin/main &&
-     git tag -a v0.1.1 RELEASE_SHA -m 'evoxc 0.1.1' &&
-     git push origin refs/tags/v0.1.1
+     git tag -a v0.2.0 RELEASE_SHA -m 'evoxc 0.2.0' &&
+     git push origin refs/tags/v0.2.0
    ```
 
    The commit need not still be the tip of `main`. The tag must be exactly `v`
@@ -101,9 +103,9 @@ These commands require a Rust toolchain and a C compiler on `PATH` to build
    has the exact tested files and that the same draft and assets still match
    before making it public.
 4. Check the version-specific [PyPI files](https://pypi.org/project/evoxc/#files)
-   and the public GitHub Release for the seven wheels and one sdist below. Try a
-   version-pinned `python -m pip install evoxc==0.1.1` in a fresh environment
-   (use the actual version).
+   and the public GitHub Release for the seven wheels and one sdist below. After
+   publication, try `python -m pip install evoxc==0.2.0` in a fresh environment
+   (substitute the actual published version for other releases).
 
 ### Tested distribution artifacts
 
@@ -143,7 +145,10 @@ versions. Optional compiler adapters have their own platform requirements.
 
 If pip cannot find a compatible wheel, it can build from the sdist automatically.
 To explicitly build `evoxc` from the PyPI sdist, install a Rust toolchain and a C
-compiler/linker for your platform, then run:
+compiler/linker for your platform (MSVC Build Tools on Windows, Xcode Command
+Line Tools on macOS, or your distribution's C build tools, such as
+`build-essential` on Debian/Ubuntu). Use a supported standard CPython version
+with a compatible NumPy build (NumPy 1.24 or newer), then run:
 
 ```bash
 python -m pip install --no-binary=evoxc evoxc
