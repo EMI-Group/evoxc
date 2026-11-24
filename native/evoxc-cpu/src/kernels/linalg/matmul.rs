@@ -1,0 +1,1613 @@
+//! `dot` — numpy `matmul`: vector/matrix/batched contraction of the last two
+//! dims — together with the f32/f64 BLAS-3 fast path.
+//!
+//! # Why this file is allowed over the ~1000-line guideline
+//!
+//! The fast path must reproduce the general triple loop and is the engine's
+//! hottest kernel, so this ONE file owns both the semantics (numpy's rank-1
+//! promotion, batch broadcasting, compute-dtype promotion and result-shape
+//! check) and the BLAS-3 specialisation that has to agree with it.  Splitting
+//! the acceptance gate ("exactly these shapes take the fast path") away from
+//! the two implementations it gates would make the bit-exactness contract
+//! impossible to review in one place, and the whole point of the fast path is
+//! that it is *only* a speed change against the loop directly above it.
+//!
+//! # Layout
+//!
+//! N-dimensional addressing is ndarray's, never a hand-written offset/stride
+//! odometer: each operand is borrowed as an `ArrayViewD` of its own shape,
+//! broadcast onto `batch ++ [rows, cols]`, and every batch position is a typed
+//! `ArrayView2` block picked with one dynamic `slice`.  A size-1 (or missing)
+//! batch axis carries stride 0 in that broadcast view, so a shared block is the
+//! same block rather than a special case.
+//!
+//! The BLAS-3 kernel is [`faer::linalg::matmul::matmul`] — one call per
+//! contiguous `m x k @ k x n` block, `Accum::Replace` with `alpha = 1`, and
+//! `Par::Seq` / `Par::rayon(n)` chosen by [`gemm_threads`] (this is the crate's
+//! ONE sanctioned rayon use).  There is no `unsafe` in this file.  Only the
+//! plain matrix-matrix form — both operands f32/f64, rank >= 2, C-contiguous
+//! batch blocks — reaches it, so integer, complex and f16 results stay
+//! bit-exact on the general triple loop.
+
+use ndarray::{ArrayView2, ArrayViewD, Dimension, Ix2, IxDyn, SliceInfoElem};
+use evoxc_core::{DType, Error, Result};
+
+use crate::buffer::{array_view, broadcast_shape, broadcast_strides, Buffer, NdScalar, Storage};
+use crate::exec::{single, RunCtx, Value};
+use crate::kernels::util;
+use crate::kernels::KernelMap;
+use crate::plan::OpSpec;
+use crate::scalar::{Num, Scalar};
+use crate::with_same_type;
+
+use super::common::{check_result_shape, expect_arity};
+
+pub(super) fn register(map: &mut KernelMap) {
+    map.insert("dot", dot_kernel);
+}
+
+// ---------------------------------------------------------------------------
+// dot — numpy `matmul`: vector/matrix/batched contraction of the last two dims
+// ---------------------------------------------------------------------------
+
+/// Per-batch matmul geometry (`a` is `batch ++ [m, k]`, `b` is `batch ++ [k, n]`;
+/// a rank-1 operand is promoted to a `1`-row / `1`-column matrix and that dim
+/// is dropped from the result).
+struct MatMul {
+    m: usize,
+    k: usize,
+    n: usize,
+    batch: Vec<usize>,
+    a_strides: Vec<usize>,
+    b_strides: Vec<usize>,
+}
+
+/// One `dot` operand as the kernels see it: the whole typed storage plus that
+/// operand's MATRIX shape (`batch ++ [rows, cols]`; a rank-1 operand is handed
+/// over already promoted to `[1, k]` / `[k, 1]`, because numpy's promotion
+/// inserts an axis rather than right-aligning a broadcast).
+#[derive(Clone, Copy)]
+struct Operand<'a, T> {
+    values: &'a [T],
+    shape: &'a [usize],
+}
+
+fn dot_kernel(ctx: &mut RunCtx<'_>, spec: &OpSpec, operands: &[Value]) -> Result<Vec<Value>> {
+    let out_shape = util::result_shape(ctx, spec, 0)?;
+    dot_impl(operands, spec, out_shape)
+}
+
+fn dot_impl(operands: &[Value], spec: &OpSpec, out_shape: Vec<usize>) -> Result<Vec<Value>> {
+    expect_arity("dot", operands, 2)?;
+    let a: &Buffer = &operands[0];
+    let b: &Buffer = &operands[1];
+    let a_rank = a.shape.len();
+    let b_rank = b.shape.len();
+    if a_rank == 0 || b_rank == 0 {
+        return Err(Error::shape("dot: operands must have rank >= 1"));
+    }
+    let a_vec = a_rank == 1;
+    let b_vec = b_rank == 1;
+    let (m, ka) = if a_vec {
+        (1, a.shape[0])
+    } else {
+        (a.shape[a_rank - 2], a.shape[a_rank - 1])
+    };
+    let (kb, n) = if b_vec {
+        (b.shape[0], 1)
+    } else {
+        (b.shape[b_rank - 2], b.shape[b_rank - 1])
+    };
+    if ka != kb {
+        return Err(Error::shape(format!(
+            "dot: contracting dims {ka} and {kb} do not match"
+        )));
+    }
+    let a_batch: &[usize] = if a_vec { &[] } else { &a.shape[..a_rank - 2] };
+    let b_batch: &[usize] = if b_vec { &[] } else { &b.shape[..b_rank - 2] };
+    let batch = broadcast_shape(&[a_batch, b_batch]).map_err(|err| {
+        Error::shape(format!(
+            "dot: operand batch dims do not broadcast: {}",
+            err.message
+        ))
+    })?;
+    let mut expected = batch.clone();
+    if !a_vec {
+        expected.push(m);
+    }
+    if !b_vec {
+        expected.push(n);
+    }
+    check_result_shape("dot", &out_shape, &expected)?;
+
+    let dtype = spec.result_types[0].dtype;
+    // A same-dtype operand is BORROWED — `Buffer::cast` would copy it whole for
+    // nothing — and only a genuinely differing dtype is converted.
+    let cast_left;
+    let cast_right;
+    let left: &Buffer = if a.dtype == dtype { a } else { cast_left = a.cast(dtype)?; &cast_left };
+    let right: &Buffer = if b.dtype == dtype { b } else { cast_right = b.cast(dtype)?; &cast_right };
+    let geometry = MatMul {
+        m,
+        k: ka,
+        n,
+        a_strides: broadcast_strides(a_batch, &batch),
+        b_strides: broadcast_strides(b_batch, &batch),
+        batch,
+    };
+    let buffer = if let Some(fast) = dot_gemm(left, right, &geometry, dtype, &out_shape)? {
+        fast
+    } else {
+        // A rank-1 operand is promoted to a matrix by INSERTING an axis (numpy
+        // reads a left vector as one row and a right vector as one column), not
+        // by right-aligning, so the block view is built from the promoted shape.
+        let a_matrix = [1, ka];
+        let b_matrix = [kb, n];
+        let a_shape: &[usize] = if a_vec { &a_matrix } else { &left.shape };
+        let b_shape: &[usize] = if b_vec { &b_matrix } else { &right.shape };
+        with_same_type!(left, right, |left_values, right_values| dot_run(
+            Operand { values: left_values, shape: a_shape },
+            Operand { values: right_values, shape: b_shape },
+            &geometry,
+            dtype,
+            out_shape
+        ))?
+    };
+    single(buffer)
+}
+
+/// One operand borrowed as its own `ArrayViewD` (the shape/length mismatch is
+/// an engine invariant, never user input, but it is still a `Result`).
+fn operand_view<'a, T: NdScalar>(operand: Operand<'a, T>) -> Result<ArrayViewD<'a, T>> {
+    array_view(operand.values, operand.shape).map_err(|err| {
+        Error::shape(format!(
+            "dot: operand storage {} is not its shape {:?}: {}",
+            operand.values.len(),
+            operand.shape,
+            err.message
+        ))
+    })
+}
+
+/// `view` upcast onto `batch ++ [rows, cols]`, so every batch position indexes a
+/// `rows x cols` block and a broadcast (size-1 or missing) batch axis reuses one
+/// block.  The result borrows `view`, which therefore has to outlive the batch
+/// walk.
+fn broadcast_blocks<'v, T: NdScalar>(
+    view: &'v ArrayViewD<'_, T>,
+    batch: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<ArrayViewD<'v, T>> {
+    let mut target = batch.to_vec();
+    target.extend([rows, cols]);
+    view.broadcast(target).ok_or_else(|| {
+        Error::shape(format!(
+            "dot: operand of shape {:?} does not broadcast onto batch {batch:?}",
+            view.shape()
+        ))
+    })
+}
+
+/// The contiguous `rows x cols` block at ONE batch position of a broadcast
+/// operand view — `position.slice()` indexes the batch axes (ndarray's own
+/// coordinates) and the two matrix axes are taken whole, so the caller never
+/// adds an index times a stride itself.
+fn batch_block<'v, T: NdScalar>(
+    blocks: &'v ArrayViewD<'_, T>,
+    position: &IxDyn,
+) -> Result<ArrayView2<'v, T>> {
+    let index = position.slice();
+    let mut info: Vec<SliceInfoElem> = Vec::with_capacity(index.len() + 2);
+    info.extend(index.iter().map(|&at| SliceInfoElem::Index(at as isize)));
+    info.extend((0..2).map(|_| SliceInfoElem::Slice { start: 0, end: None, step: 1 }));
+    blocks.slice(info.as_slice()).into_dimensionality::<Ix2>().map_err(|err| {
+        Error::shape(format!(
+            "dot: batch position {index:?} of a rank-{} operand is not a matrix block: {err}",
+            blocks.ndim()
+        ))
+    })
+}
+
+/// Runs `body` on the block at ONE batch position as a standard-layout typed run.
+///
+/// The operand storage is C-contiguous and its batch view is a right-aligned
+/// broadcast, so a block IS standard layout and its run is a slice of the
+/// storage itself; a block that somehow is not leaves `owned` holding a
+/// standard-layout copy instead (nothing an engine-built buffer produces).
+/// `body` runs while the block view is alive, so the run never has to outlive
+/// it — no offset is ever recovered by hand.
+fn with_block<T: NdScalar, R>(
+    blocks: &ArrayViewD<'_, T>,
+    position: &IxDyn,
+    owned: &mut Option<ndarray::Array2<T>>,
+    body: impl FnOnce(&[T]) -> R,
+) -> Result<R> {
+    let block = batch_block(blocks, position)?;
+    if let Some(run) = block.as_slice() {
+        return Ok(body(run));
+    }
+    *owned = Some(block.as_standard_layout().into_owned());
+    let run = owned
+        .as_ref()
+        .and_then(|block| block.as_slice())
+        .ok_or_else(|| Error::shape("dot: batch block is not a contiguous run".to_string()))?;
+    Ok(body(run))
+}
+
+/// One batch position's `(left, right)` runs, handed to `body` together — the
+/// batch traversal the two operands share (they are indexed by the SAME
+/// broadcast position, which is what makes a shared or broadcast block reuse
+/// one matrix instead of a special case).
+fn with_block_pair<T: NdScalar, R>(
+    left_blocks: &ArrayViewD<'_, T>,
+    right_blocks: &ArrayViewD<'_, T>,
+    position: &IxDyn,
+    owned: &mut (Option<ndarray::Array2<T>>, Option<ndarray::Array2<T>>),
+    body: impl FnOnce(&[T], &[T]) -> R,
+) -> Result<R> {
+    let (left_owned, right_owned) = owned;
+    // The outer `?` unwraps the left block, the tail expression IS the right
+    // block's `Result` — so both blocks' errors reach the caller.
+    with_block(left_blocks, position, left_owned, |left_run| {
+        with_block(right_blocks, position, right_owned, |right_run| {
+            body(left_run, right_run)
+        })
+    })?
+}
+
+/// The GENERAL kernel: the triple loop, with its batch traversal driven by the
+/// ndarray views above.  Bit-exact for every dtype (the accumulation order is
+/// exactly `for row { for column { fold over inner } }`).
+fn dot_run<T: Num + NdScalar>(
+    a: Operand<'_, T>,
+    b: Operand<'_, T>,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: Vec<usize>,
+) -> Result<Buffer> {
+    let (m, k, n) = (g.m, g.k, g.n);
+    let a_view = operand_view(a)?;
+    let b_view = operand_view(b)?;
+    let a_blocks = broadcast_blocks(&a_view, &g.batch, m, k)?;
+    let b_blocks = broadcast_blocks(&b_view, &g.batch, k, n)?;
+    let mut out = vec![T::zero(); m * n * util::numel(&g.batch)];
+    let mut owned = (None, None);
+    // The result is C-order, so `chunks_exact_mut` walks the batch blocks in
+    // exactly `ndarray::indices`' C-order position sequence: each pair is one
+    // batch position and the output block it owns.
+    for (out_block, position) in
+        out.chunks_exact_mut(m * n).zip(ndarray::indices(&g.batch[..]))
+    {
+        with_block_pair(&a_blocks, &b_blocks, &position, &mut owned, |a_run, b_run| {
+            for row in 0..m {
+                let a_row = &a_run[row * k..(row + 1) * k];
+                for (column, cell) in out_block[row * n..(row + 1) * n].iter_mut().enumerate() {
+                    let mut acc = T::zero();
+                    for (inner, value) in a_row.iter().enumerate() {
+                        acc = acc.add(value.mul(b_run[inner * n + column]));
+                    }
+                    *cell = acc;
+                }
+            }
+        })?;
+    }
+    Buffer::new(dtype, out_shape, <T as Scalar>::into_storage(out))
+}
+
+// -- the f32/f64 BLAS-3 fast path -------------------------------------------
+//
+// `dot`'s plain matrix-matrix form is the inner loop of every model forward and
+// of the GP/ES populations this engine runs, and the triple loop above is not
+// memory-blocked.  `faer` is the crate's numerical-dependency gemm: packing,
+// register blocking and SIMD live inside it, exposed as one faer-major
+// `alpha * A * B + beta * C` call.  It is used ONLY for the plain form — both
+// operands f32/f64, rank >= 2, C-contiguous batch blocks — and every other
+// shape/dtype keeps the general kernel, so integer and complex results stay
+// bit-exact.
+//
+// Association order inside the kernel differs from the triple loop (blocked
+// accumulation), which is why the fast path is restricted to the two IEEE float
+// dtypes: floating-point sums are order-dependent and that is expected, while
+// integer/complex arithmetic is never routed here.
+//
+// Threading is faer's own: `Par::Seq` on the calling thread, `Par::rayon(n)` for
+// a matmul big enough to pay for it (see `gemm_threads`).  faer splits the
+// OUTPUT — every output element still reduces over K in the same order — so the
+// threaded result is bit-identical to the one-thread result (pinned by
+// `dot_parallel_matches_the_single_threaded_path_bit_for_bit`).
+
+/// The float dtypes [`faer`]'s gemm serves.  Only these two are implemented, so
+/// [`dot_gemm`]'s storage dispatch is the whole fast-path surface (no other
+/// dtype can reach [`gemm_run`]).
+trait FaerGemm: Scalar + NdScalar + faer::traits::ComplexField {
+    /// The gemm's `alpha` (`1.0`): the block is replaced, not accumulated onto.
+    const ONE: Self;
+
+    /// `dst = lhs * rhs` for a row-major `m x k` `lhs`, `k x n` `rhs` and
+    /// `m x n` `dst` (`Accum::Replace`, alpha `1`: `dst`'s prior contents are
+    /// irrelevant).
+    fn gemm_block(
+        m: usize,
+        k: usize,
+        n: usize,
+        lhs: &[Self],
+        rhs: &[Self],
+        dst: &mut [Self],
+        par: faer::Par,
+    ) {
+        // The three slices are exactly `m * k`, `k * n` and `m * n` long —
+        // `batch_blocks`/`block_run` derive them from the geometry, and a
+        // mismatch would be an engine bug, never a user error.
+        debug_assert!(
+            lhs.len() == m * k && rhs.len() == k * n && dst.len() == m * n,
+            "dot: gemm slices must match the geometry"
+        );
+        faer::linalg::matmul::matmul(
+            faer::MatMut::from_row_major_slice_mut(dst, m, n),
+            faer::Accum::Replace,
+            faer::MatRef::from_row_major_slice(lhs, m, k),
+            faer::MatRef::from_row_major_slice(rhs, k, n),
+            Self::ONE,
+            par,
+        );
+    }
+}
+
+impl FaerGemm for f32 {
+    const ONE: Self = 1.0;
+}
+
+impl FaerGemm for f64 {
+    const ONE: Self = 1.0;
+}
+
+/// True when the batch axes of one operand select CONTIGUOUS trailing blocks
+/// (`operand_batch ++ [rows, cols]` in C order): a broadcast axis carries the
+/// `0` stride [`broadcast_strides`] gives it (one shared block), every other
+/// axis the natural C-order stride.  `strides` are BLOCK-unit strides (one unit
+/// = one `rows x cols` matrix), compared against the operand's own batch shape —
+/// this is the fast path's ACCEPTANCE question only, never how a block is
+/// addressed (that is [`batch_block`]).
+fn blocks_contiguous(operand_batch: &[usize], batch: &[usize], strides: &[usize]) -> bool {
+    if operand_batch.len() > batch.len() || strides.len() != batch.len() {
+        return false;
+    }
+    // `batch` is `broadcast_shape`'s output, so the operand's batch shape is
+    // right-aligned against it (missing leading axes are size-one broadcasts).
+    let offset = batch.len() - operand_batch.len();
+    let mut natural = 1;
+    for axis in (0..batch.len()).rev() {
+        let extent = if axis >= offset { operand_batch[axis - offset] } else { 1 };
+        let expected = if extent == 1 { 0 } else { natural };
+        if strides[axis] != expected {
+            return false;
+        }
+        natural *= extent;
+    }
+    true
+}
+
+/// `dot` through the BLAS-3 kernel when the shape is the plain matrix-matrix
+/// one; `None` leaves the general kernel in charge (rank-1 operands, an empty
+/// contraction, a non-contiguous batch layout, or any dtype but f32/f64).
+fn dot_gemm(
+    left: &Buffer,
+    right: &Buffer,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+) -> Result<Option<Buffer>> {
+    if left.shape.len() < 2 || right.shape.len() < 2 || g.m == 0 || g.k == 0 || g.n == 0 {
+        return Ok(None);
+    }
+    let a_batch = &left.shape[..left.shape.len() - 2];
+    let b_batch = &right.shape[..right.shape.len() - 2];
+    if !blocks_contiguous(a_batch, &g.batch, &g.a_strides)
+        || !blocks_contiguous(b_batch, &g.batch, &g.b_strides)
+    {
+        return Ok(None);
+    }
+    match (dtype, &left.storage, &right.storage) {
+        (DType::Float32, Storage::F32(a), Storage::F32(b)) => gemm_run(
+            Operand { values: a, shape: &left.shape },
+            Operand { values: b, shape: &right.shape },
+            g,
+            dtype,
+            out_shape,
+        ),
+        (DType::Float64, Storage::F64(a), Storage::F64(b)) => gemm_run(
+            Operand { values: a, shape: &left.shape },
+            Operand { values: b, shape: &right.shape },
+            g,
+            dtype,
+            out_shape,
+        ),
+        _ => Ok(None),
+    }
+}
+
+/// Multiply-adds (`m * k * n * output blocks`) from which the plain matmul is
+/// worth splitting across threads.  Measured on a 16-cpu host with a row split
+/// of the output: a 256^3 matmul (2^24) is a wash at the median and a 512^3
+/// (2^27) is 1.1-1.9x faster threaded, so this floor sits above the 256^3 shape:
+/// below it the spawn is not repaid.
+const GEMM_PARALLEL_MIN_WORK: usize = 1 << 25;
+/// Multiply-adds one batch element must reach before the batch is worth
+/// splitting.  A batch of many small matmuls (measured: eight 128^3 blocks,
+/// 2^21 each) is 1.1-4x SLOWER threaded than serial at every thread count,
+/// because a straggler strip landing on an efficiency or low-power core sets the
+/// wall time while the total work is only one stripped gemm's worth.
+const GEMM_PARALLEL_MIN_BLOCK_WORK: usize = 1 << 23;
+/// Multiply-adds one thread should own before another thread is worth spawning.
+const GEMM_PARALLEL_WORK_PER_THREAD: usize = 1 << 23;
+/// Thread cap below [`GEMM_WIDE_WORK`]: the measured optimum for a matmul that
+/// is threaded but not wide (a 512^3 is fastest at 8 threads on the recorded
+/// host), and the count `gemm_threads` returns for every shape below the wide
+/// crossover.  The sweep recorded under [`GEMM_WIDE_WORK`] does not exercise it
+/// (all three of its shapes are wide).
+///
+/// This is a degree HINT, never a hard partition, and it cannot be raised past
+/// the machine: faer's `Par::rayon(n)` hands `n` to `spindle`, which clamps its
+/// worker count to `rayon::current_num_threads()` — the process-global rayon
+/// pool, sized `available_parallelism()` — and no crate here installs a rayon
+/// pool of its own, so a hint BELOW the pool is honoured while a hint above it
+/// only queues work the pool cannot run in parallel.
+const GEMM_PARALLEL_MAX_THREADS: usize = 8;
+/// Work from which every available cpu may be requested: a 1024^3 matmul (this
+/// many multiply-adds).
+///
+/// What threading actually costs in faer 0.24: the OUTPUT is split across
+/// threads (microtiles of `m x n`; never the contraction), so every output
+/// element keeps its single accumulation order over K and a threaded result is
+/// bit-identical to the one-thread result (pinned by
+/// `dot_parallel_matches_the_single_threaded_path_bit_for_bit`).  Each LHS/RHS
+/// panel is packed lazily exactly ONCE per gemm call, guarded by pack jobs — no
+/// thread re-packs another thread's operand — so the only per-thread costs are
+/// the pack jobs and the split itself.
+///
+/// MEASURED (2026-11-24, this host: 16 cpus, AVX2+FMA, shared; f32,
+/// `bench_dot_gemm`'s pooled leg, medians of 9 interleaved passes after 3
+/// warmups, the spread over four runs):
+///
+/// | shape | 1 thread | 4 | 8 | 16 (= `parallel_cpus()`) |
+/// |---|---|---|---|---|
+/// | 1024^3 | 17.9-23.1 ms | 6.6-7.7 ms | 3.7-4.5 ms | 3.0-3.9 ms |
+/// | 2048^3 | 142.7-143.2 ms | 41.3-42.2 ms | 23.9-26.2 ms | **15.2-17.2 ms** |
+/// | 4096x1024 . 1024x4096 | 284.0-284.5 ms | 76.1-77.3 ms | 48.1-49.5 ms | **30.7-31.9 ms** |
+///
+/// So a 1024^3 matmul is at worst a wash between the 8-thread cap and every cpu
+/// (16 never lost it), 2048^3 and the 4096x1024 . 1024x4096 pair want every
+/// cpu (1.6-1.7x over 8 threads), and the crossover therefore sits at 1024^3 —
+/// which is where it already was, so no threshold changed on this evidence.
+const GEMM_WIDE_WORK: usize = 1 << 30;
+
+/// The host's usable parallelism, probed once.
+fn parallel_cpus() -> usize {
+    static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CPUS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|cpus| cpus.get())
+            .unwrap_or(1)
+    })
+}
+
+/// How many threads a plain matmul with `work` multiply-adds per batch element
+/// (`m * k * n`) over `blocks` batch elements of `rows` rows should use.  `1`
+/// means "stay on the calling thread" (small matmuls, a batch of small
+/// matmuls, and every host with no usable parallelism); the result never exceeds
+/// the number of row strips the output can be cut into, because a strip is never
+/// split across threads.
+fn gemm_threads(work: usize, blocks: usize, rows: usize) -> usize {
+    if work < GEMM_PARALLEL_MIN_BLOCK_WORK {
+        return 1;
+    }
+    let work = work.saturating_mul(blocks);
+    if work < GEMM_PARALLEL_MIN_WORK {
+        return 1;
+    }
+    let cap = if work >= GEMM_WIDE_WORK {
+        parallel_cpus()
+    } else {
+        parallel_cpus().min(GEMM_PARALLEL_MAX_THREADS)
+    };
+    (work / GEMM_PARALLEL_WORK_PER_THREAD)
+        .min(cap)
+        .min(blocks.saturating_mul(rows))
+        .max(1)
+}
+
+/// The faer parallelism for one gemm call: the calling thread (`Par::Seq`) or
+/// faer's rayon gemm with `threads` threads.
+fn gemm_par(threads: usize) -> faer::Par {
+    if threads <= 1 {
+        faer::Par::Seq
+    } else {
+        faer::Par::rayon(threads)
+    }
+}
+
+/// One BLAS-3 call per batch element, writing straight into the result (every
+/// block is contiguous, so the kernel's out pointer is the block's own start).
+/// The destination comes from the thread-local pool (see
+/// [`pooled_destination`]) and the output is split across threads above
+/// [`GEMM_PARALLEL_MIN_WORK`] (see [`gemm_threads`]).
+fn gemm_run<T: FaerGemm>(
+    a: Operand<'_, T>,
+    b: Operand<'_, T>,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+) -> Result<Option<Buffer>> {
+    let blocks = util::numel(&g.batch);
+    let threads = gemm_threads(g.m * g.k * g.n, blocks, g.m);
+    gemm_run_threads(a, b, g, dtype, out_shape, threads)
+}
+
+/// [`gemm_run`] with an explicit thread count (`1` = the calling thread only).
+fn gemm_run_threads<T: FaerGemm>(
+    a: Operand<'_, T>,
+    b: Operand<'_, T>,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+    threads: usize,
+) -> Result<Option<Buffer>> {
+    gemm_run_with(a, b, g, dtype, out_shape, threads, |count| pooled_destination(count))
+}
+
+/// The shipping destination allocator: a recycled stock of exactly the result's
+/// size class when the thread-local pool has one, a fresh allocation otherwise.
+///
+/// Bit-safe because the gemm REPLACES the destination: `Accum::Replace` with
+/// `alpha = 1` means faer "does not read the preexisting values in `acc`" (its
+/// own documented contract) and writes every element of every `m x n` block, so
+/// a recycled stock's old bytes can never reach the result — pinned by
+/// `dot_reuses_a_pooled_destination_without_leaking_its_bytes`.
+///
+/// Measuring why this matters on a host where a fresh multi-megabyte allocation
+/// costs page faults, not copy: a 4096x4096 f32 result is 64 MiB, and the
+/// pre-pool `vec![T::zero(); n]` spent 32-45 ms per call of the `bench_dot_gemm`
+/// 64 MiB row faulting pages the kernel zeroes, only for faer to overwrite every
+/// byte.  The pool hands back an already-faulted stock (its `Drop` retains it,
+/// `take_pooled_vec` serves it), so that cost collapses to the gemm itself.
+fn pooled_destination<T: Scalar>(count: usize) -> Vec<T> {
+    crate::buffer::take_pooled_vec::<T>(count).unwrap_or_else(|| T::zeros(count))
+}
+
+/// [`gemm_run_threads`] with an explicit destination allocator (the bench keeps
+/// the pre-pool `vec![T::zero(); n]` as its "before" leg).
+fn gemm_run_with<T: FaerGemm>(
+    a: Operand<'_, T>,
+    b: Operand<'_, T>,
+    g: &MatMul,
+    dtype: DType,
+    out_shape: &[usize],
+    threads: usize,
+    destination: impl FnOnce(usize) -> Vec<T>,
+) -> Result<Option<Buffer>> {
+    let (m, k, n) = (g.m, g.k, g.n);
+    let block = m * n;
+    let a_view = operand_view(a)?;
+    let b_view = operand_view(b)?;
+    let a_blocks = broadcast_blocks(&a_view, &g.batch, m, k)?;
+    let b_blocks = broadcast_blocks(&b_view, &g.batch, k, n)?;
+    let par = gemm_par(threads);
+    let mut out = destination(block * util::numel(&g.batch));
+    let mut owned = (None, None);
+    // `chunks_exact_mut` and `ndarray::indices` are both C order, so each pair
+    // is one batch position and the contiguous output block it owns.
+    for (dest, position) in out.chunks_exact_mut(block).zip(ndarray::indices(&g.batch[..])) {
+        with_block_pair(&a_blocks, &b_blocks, &position, &mut owned, |lhs, rhs| {
+            T::gemm_block(m, k, n, lhs, rhs, dest, par);
+        })?;
+    }
+    Buffer::new(dtype, out_shape.to_vec(), <T as Scalar>::into_storage(out)).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::{assert_close, floats, spec, value};
+    use super::*;
+    use crate::buffer::Storage;
+    use crate::with_same_type;
+    use evoxc_core::{Attrs, Dim, ValueType};
+    use num_complex::Complex;
+
+    fn ints(buffer: &Buffer) -> Vec<i64> {
+        match &buffer.storage {
+            Storage::I64(values) => values.clone(),
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// The kernels' view of a test operand: its typed storage and its own shape.
+    fn operand<'a, T>(buffer: &'a Buffer, values: &'a [T]) -> Operand<'a, T> {
+        Operand { values, shape: &buffer.shape }
+    }
+
+    // --- dot ---------------------------------------------------------------
+
+    #[test]
+    fn dot_matrix_matrix() {
+        let a = value(DType::Float64, &[2, 3], Storage::F64(vec![1., 2., 3., 4., 5., 6.]));
+        let b = value(DType::Float64, &[3, 2], Storage::F64(vec![7., 8., 9., 10., 11., 12.]));
+        let op = spec("dot", DType::Float64, &[2, 2], Attrs::new());
+        let out = dot_impl(&[a, b], &op, vec![2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![2, 2]);
+        assert_close(&floats(&out[0]), &[58., 64., 139., 154.]);
+    }
+
+    #[test]
+    fn dot_batches_broadcast() {
+        // a batch (2,), b batch (1,) -> shared b, one result per a batch element.
+        let a = value(
+            DType::Float64,
+            &[2, 2, 2],
+            Storage::F64(vec![1., 2., 3., 4., 5., 6., 7., 8.]),
+        );
+        let b = value(DType::Float64, &[1, 2, 2], Storage::F64(vec![1., 0., 0., 1.]));
+        let op = spec("dot", DType::Float64, &[2, 2, 2], Attrs::new());
+        let out = dot_impl(&[a, b], &op, vec![2, 2, 2]).unwrap();
+        assert_eq!(out[0].shape, vec![2, 2, 2]);
+        assert_close(&floats(&out[0]), &[1., 2., 3., 4., 5., 6., 7., 8.]);
+    }
+
+    #[test]
+    fn dot_matrix_vector_and_vector_vector() {
+        let a = value(DType::Float64, &[2, 3], Storage::F64(vec![1., 2., 3., 4., 5., 6.]));
+        let vector = value(DType::Float64, &[3], Storage::F64(vec![1., 1., 1.]));
+        let op = spec("dot", DType::Float64, &[2], Attrs::new());
+        let out = dot_impl(&[a, vector], &op, vec![2]).unwrap();
+        assert_close(&floats(&out[0]), &[6., 15.]);
+
+        let left = value(DType::Float64, &[3], Storage::F64(vec![1., 2., 3.]));
+        let right = value(DType::Float64, &[3], Storage::F64(vec![4., 5., 6.]));
+        let op = spec("dot", DType::Float64, &[], Attrs::new());
+        let out = dot_impl(&[left, right], &op, Vec::new()).unwrap();
+        assert_eq!(out[0].shape, Vec::<usize>::new());
+        assert_close(&floats(&out[0]), &[32.]);
+    }
+
+    #[test]
+    fn dot_contracts_and_wraps_integer_accumulation() {
+        let a = value(DType::Int64, &[1, 2], Storage::I64(vec![2, 3]));
+        let b = value(DType::Int64, &[2, 1], Storage::I64(vec![4, 5]));
+        let op = spec("dot", DType::Int64, &[1, 1], Attrs::new());
+        let out = dot_impl(&[a.clone(), b], &op, vec![1, 1]).unwrap();
+        assert_eq!(ints(&out[0]), vec![23]);
+
+        let bad = value(DType::Int64, &[3, 1], Storage::I64(vec![1, 2, 3]));
+        let err = dot_impl(&[a, bad], &op, vec![1, 1]).unwrap_err();
+        assert!(err.message.contains("contracting dims 2 and 3"), "{}", err.message);
+    }
+
+    // --- dot: the f32/f64 BLAS-3 fast path ---------------------------------
+
+    /// The geometry `dot_impl` builds for two operands (natural C-order batch
+    /// blocks, so `blocks_contiguous` accepts it).
+    fn geometry(a: &Buffer, b: &Buffer) -> MatMul {
+        let (a_rank, b_rank) = (a.shape.len(), b.shape.len());
+        let (m, k) = (a.shape[a_rank - 2], a.shape[a_rank - 1]);
+        let n = b.shape[b_rank - 1];
+        let batch = broadcast_shape(&[&a.shape[..a_rank - 2], &b.shape[..b_rank - 2]]).unwrap();
+        MatMul {
+            m,
+            k,
+            n,
+            a_strides: broadcast_strides(&a.shape[..a_rank - 2], &batch),
+            b_strides: broadcast_strides(&b.shape[..b_rank - 2], &batch),
+            batch,
+        }
+    }
+
+    /// The GENERAL (pre-BLAS) kernel for the same operands — the reference the
+    /// fast path must agree with to within floating-point association.
+    fn general_dot(a: &Value, b: &Value, dtype: DType, out_shape: Vec<usize>) -> Buffer {
+        // A nested fn so `with_same_type!`'s dtype-mismatch `return` has a
+        // `Result` to return into.
+        fn run(a: &Buffer, b: &Buffer, g: &MatMul, dtype: DType, out: Vec<usize>) -> Result<Buffer> {
+            let left = a.cast(dtype)?;
+            let right = b.cast(dtype)?;
+            with_same_type!(left, right, |x, y| dot_run(
+                operand(&left, x),
+                operand(&right, y),
+                g,
+                dtype,
+                out.clone()
+            ))
+        }
+        run(a, b, &geometry(a, b), dtype, out_shape).unwrap()
+    }
+
+    fn f32s(buffer: &Buffer) -> Vec<f32> {
+        match &buffer.storage {
+            Storage::F32(values) => values.clone(),
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// Relative comparison (`tolerance * max(|want|, 1)`), the documented budget
+    /// for the blocked accumulation order.
+    fn assert_relative(actual: &[f32], expected: &[f32], tolerance: f32, what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            let budget = tolerance * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= budget,
+                "{what}: index {index}: {got} vs {want} (budget {budget})"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_matrix_matrix_uses_blas_and_matches_hand_and_general() {
+        // 2x3 @ 3x2, hand-computed: [[58, 64], [139, 154]].
+        let a = value(DType::Float32, &[2, 3], Storage::F32(vec![1., 2., 3., 4., 5., 6.]));
+        let b = value(DType::Float32, &[3, 2], Storage::F32(vec![7., 8., 9., 10., 11., 12.]));
+        let op = spec("dot", DType::Float32, &[2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2]).unwrap();
+        assert_eq!(fast[0].shape, vec![2, 2]);
+        assert_relative(&f32s(&fast[0]), &[58., 64., 139., 154.], 1e-5, "f32 2x3 @ 3x2");
+        let general = general_dot(&a, &b, DType::Float32, vec![2, 2]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "f32 fast vs general");
+
+        // The same shape in f64 (1e-12 relative).
+        let a = value(DType::Float64, &[2, 3], Storage::F64(vec![1., 2., 3., 4., 5., 6.]));
+        let b = value(DType::Float64, &[3, 2], Storage::F64(vec![7., 8., 9., 10., 11., 12.]));
+        let op = spec("dot", DType::Float64, &[2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2]).unwrap();
+        assert_close(&floats(&fast[0]), &[58., 64., 139., 154.]);
+        let general = general_dot(&a, &b, DType::Float64, vec![2, 2]);
+        for (got, want) in floats(&fast[0]).iter().zip(floats(&general).iter()) {
+            assert!((got - want).abs() <= 1e-12 * want.abs().max(1.0), "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn dot_blas_handles_a_non_square_shape() {
+        // (3, 5) @ (5, 7) f32, both operands ramp-shaped.
+        let a_values: Vec<f32> = (0..15).map(|i| i as f32).collect();
+        let b_values: Vec<f32> = (0..35).map(|i| i as f32 * 0.5).collect();
+        let a = value(DType::Float32, &[3, 5], Storage::F32(a_values.clone()));
+        let b = value(DType::Float32, &[5, 7], Storage::F32(b_values.clone()));
+        let op = spec("dot", DType::Float32, &[3, 7], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![3, 7]).unwrap();
+        assert_eq!(fast[0].shape, vec![3, 7]);
+        // Hand-computed reference product (the definition, not a kernel).
+        let mut expected = vec![0.0f32; 3 * 7];
+        for row in 0..3 {
+            for column in 0..7 {
+                let mut acc = 0.0f32;
+                for inner in 0..5 {
+                    acc += a_values[row * 5 + inner] * b_values[inner * 7 + column];
+                }
+                expected[row * 7 + column] = acc;
+            }
+        }
+        assert_relative(&f32s(&fast[0]), &expected, 1e-5, "f32 3x5 @ 5x7");
+        let general = general_dot(&a, &b, DType::Float32, vec![3, 7]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "3x5 @ 5x7 fast vs general");
+    }
+
+    /// The faer gemm block against the general triple loop for one small f32 and
+    /// one small f64 case (association differs, so a relative budget).
+    #[test]
+    fn dot_faer_gemm_agrees_with_the_triple_loop() {
+        for dtype in [DType::Float32, DType::Float64] {
+            let (m, k, n) = (5usize, 7usize, 4usize);
+            let a_values = ramp_f64(m * k);
+            let b_values = ramp_f64(k * n);
+            let (a, b) = if dtype == DType::Float32 {
+                (
+                    value(
+                        DType::Float32,
+                        &[m, k],
+                        Storage::F32(a_values.iter().map(|v| *v as f32).collect()),
+                    ),
+                    value(
+                        DType::Float32,
+                        &[k, n],
+                        Storage::F32(b_values.iter().map(|v| *v as f32).collect()),
+                    ),
+                )
+            } else {
+                (
+                    value(DType::Float64, &[m, k], Storage::F64(a_values.clone())),
+                    value(DType::Float64, &[k, n], Storage::F64(b_values.clone())),
+                )
+            };
+            let op = spec("dot", dtype, &[m, n], Attrs::new());
+            let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![m, n]).unwrap();
+            let general = general_dot(&a, &b, dtype, vec![m, n]);
+            if dtype == DType::Float32 {
+                assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "f32 5x7 @ 7x4 gemm");
+            } else {
+                for (got, want) in floats(&fast[0]).iter().zip(floats(&general).iter()) {
+                    assert!(
+                        (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                        "f64 5x7 @ 7x4 gemm: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dot_borrows_same_dtype_operands_and_casts_only_a_differing_one() {
+        // (2, 3) @ (3, 2) with values exact in f16/f32/f64, so the hand-computed
+        // product [[-9, -5.125], [26.125, -11.5]] is what every dtype combination
+        // below must return (the blocked association included).
+        let (m, k, n) = (2usize, 3usize, 2usize);
+        let a32 = value(DType::Float32, &[m, k], Storage::F32(vec![1.0, -2.0, 3.5, 4.0, 0.5, -6.0]));
+        let b32 = value(DType::Float32, &[k, n], Storage::F32(vec![2.0, -1.5, 0.25, 4.0, -3.0, 1.25]));
+        let a64 = value(DType::Float64, &[m, k], Storage::F64(vec![1.0, -2.0, 3.5, 4.0, 0.5, -6.0]));
+        let b64 = value(DType::Float64, &[k, n], Storage::F64(vec![2.0, -1.5, 0.25, 4.0, -3.0, 1.25]));
+        let b16 = value(DType::Float16, &[k, n], Storage::F16(
+            [2.0f32, -1.5, 0.25, 4.0, -3.0, 1.25].iter().map(|v| half::f16::from_f32(*v)).collect(),
+        ));
+        let hand32 = [-9.0f32, -5.125, 26.125, -11.5];
+        let hand64 = [-9.0f64, -5.125, 26.125, -11.5];
+        let f32_op = spec("dot", DType::Float32, &[m, n], Attrs::new());
+        let f64_op = spec("dot", DType::Float64, &[m, n], Attrs::new());
+
+        // Same dtype: NOTHING is cast, and the result is bit-identical to what
+        // the cloning (always-cast) path produced.
+        let out = dot_impl(&[a64.clone(), b64.clone()], &f64_op, vec![m, n]).unwrap();
+        let cast = general_dot(&a64, &b64, DType::Float64, vec![m, n]);
+        assert_bits_identical_f64(&floats(&out[0]), &floats(&cast), "same-dtype f64 vs cast");
+
+        // Exactly one operand casts: f16 -> f32, then f32 <-> f64 both ways.
+        let cases = [(&a32, &b16, &f32_op), (&a32, &b64, &f64_op), (&a64, &b32, &f64_op)];
+        for (a, b, op) in cases {
+            let out = dot_impl(&[a.clone(), b.clone()], op, vec![m, n]).unwrap();
+            if op.result_types[0].dtype == DType::Float32 {
+                assert_bit_identical(&f32s(&out[0]), &hand32, "f32 mixed-dtype dot");
+            } else {
+                assert_eq!(floats(&out[0]), hand64, "f64 mixed-dtype dot");
+            }
+        }
+    }
+
+    #[test]
+    fn dot_batched_3d_uses_blas_and_agrees_with_the_general_kernel() {
+        // Per-batch distinct operands: two independent 2x3 @ 3x2 products.
+        let a = value(
+            DType::Float32,
+            &[2, 2, 3],
+            Storage::F32(vec![1., 2., 3., 4., 5., 6., 6., 5., 4., 3., 2., 1.]),
+        );
+        let b = value(
+            DType::Float32,
+            &[2, 3, 2],
+            Storage::F32(vec![1., 0., 0., 1., 1., 1., 2., 0., 0., 2., 0., 0.]),
+        );
+        let op = spec("dot", DType::Float32, &[2, 2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2, 2]).unwrap();
+        let general = general_dot(&a, &b, DType::Float32, vec![2, 2, 2]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "batched 3-D");
+        // Batch 0 is [[1, 2, 3], [4, 5, 6]] @ [[1,0],[0,1],[1,1]] = [[4, 5], [10, 11]],
+        // batch 1 is [[6, 5, 4], [3, 2, 1]] @ 2-diagonal = [[12, 10], [6, 4]].
+        assert_relative(
+            &f32s(&fast[0]),
+            &[4., 5., 10., 11., 12., 10., 6., 4.],
+            1e-5,
+            "batched 3-D values",
+        );
+
+        // A broadcast batch (b has one shared matrix) also takes the fast path.
+        let shared = value(
+            DType::Float32,
+            &[1, 3, 2],
+            Storage::F32(vec![1., 0., 0., 1., 1., 1.]),
+        );
+        let op = spec("dot", DType::Float32, &[2, 2, 2], Attrs::new());
+        let fast = dot_impl(&[a.clone(), shared.clone()], &op, vec![2, 2, 2]).unwrap();
+        let general = general_dot(&a, &shared, DType::Float32, vec![2, 2, 2]);
+        assert_relative(&f32s(&fast[0]), &f32s(&general), 1e-5, "broadcast batch");
+    }
+
+    #[test]
+    fn dot_integers_stay_bit_exact_on_the_general_path() {
+        // i32 wraps like numpy: 2^30 * 4 overflows back to 0.
+        let a = value(DType::Int32, &[1, 1], Storage::I32(vec![1 << 30]));
+        let b = value(DType::Int32, &[1, 1], Storage::I32(vec![4]));
+        let op = spec("dot", DType::Int32, &[1, 1], Attrs::new());
+        let out = dot_impl(&[a.clone(), b.clone()], &op, vec![1, 1]).unwrap();
+        assert_eq!(out[0].storage, Storage::I32(vec![0]));
+        assert_eq!(out[0].storage, general_dot(&a, &b, DType::Int32, vec![1, 1]).storage);
+        assert!(
+            dot_gemm(&a, &b, &geometry(&a, &b), DType::Int32, &[1, 1]).unwrap().is_none(),
+            "an integer dot must never reach the BLAS-3 kernel"
+        );
+
+        // i8 wraps too, and a complex dot is likewise declined.
+        let a = value(DType::Int8, &[2, 2], Storage::I8(vec![100, 100, 100, 100]));
+        let b = value(DType::Int8, &[2, 2], Storage::I8(vec![3, 0, 3, 0]));
+        let op = spec("dot", DType::Int8, &[2, 2], Attrs::new());
+        let out = dot_impl(&[a.clone(), b.clone()], &op, vec![2, 2]).unwrap();
+        // 2 * (100 * 3) = 600 wraps to 88 in i8.
+        assert_eq!(out[0].storage, Storage::I8(vec![88, 0, 88, 0]));
+        assert_eq!(out[0].storage, general_dot(&a, &b, DType::Int8, vec![2, 2]).storage);
+
+        let a = value(
+            DType::Complex64,
+            &[1, 1],
+            Storage::C64(vec![Complex::new(1.0, 2.0)]),
+        );
+        let b = value(
+            DType::Complex64,
+            &[1, 1],
+            Storage::C64(vec![Complex::new(3.0, -1.0)]),
+        );
+        assert!(
+            dot_gemm(&a, &b, &geometry(&a, &b), DType::Complex64, &[1, 1])
+                .unwrap()
+                .is_none(),
+            "a complex dot must never reach the BLAS-3 kernel"
+        );
+    }
+
+    #[test]
+    fn dot_rank_one_forms_stay_on_the_general_path() {
+        // vec . vec -> rank 0.
+        let a = value(DType::Float32, &[3], Storage::F32(vec![1., 2., 3.]));
+        let b = value(DType::Float32, &[3], Storage::F32(vec![4., 5., 6.]));
+        let op = spec("dot", DType::Float32, &[], Attrs::new());
+        let out = dot_impl(&[a.clone(), b.clone()], &op, Vec::new()).unwrap();
+        assert_eq!(out[0].shape, Vec::<usize>::new());
+        assert_eq!(f32s(&out[0]), vec![32.]);
+        let g = MatMul {
+            m: 1,
+            k: 3,
+            n: 1,
+            a_strides: Vec::new(),
+            b_strides: Vec::new(),
+            batch: Vec::new(),
+        };
+        assert!(dot_gemm(&a, &b, &g, DType::Float32, &[]).unwrap().is_none(), "rank-1");
+
+        // matrix (2, 3) x vector (3,) -> rank 1.
+        let a = value(DType::Float32, &[2, 3], Storage::F32(vec![1., 2., 3., 4., 5., 6.]));
+        let v = value(DType::Float32, &[3], Storage::F32(vec![1., 1., 1.]));
+        let op = spec("dot", DType::Float32, &[2], Attrs::new());
+        let out = dot_impl(&[a.clone(), v.clone()], &op, vec![2]).unwrap();
+        assert_eq!(out[0].shape, vec![2]);
+        assert_relative(&f32s(&out[0]), &[6., 15.], 1e-5, "matrix x vector");
+        let g = MatMul {
+            m: 2,
+            k: 3,
+            n: 1,
+            a_strides: Vec::new(),
+            b_strides: Vec::new(),
+            batch: Vec::new(),
+        };
+        assert!(dot_gemm(&a, &v, &g, DType::Float32, &[2]).unwrap().is_none(), "matrix x vector");
+    }
+
+    // --- dot: the threaded gemm of the BLAS-3 fast path ---------------------
+
+    /// Deterministic pseudo-random f32 operands (a 32-bit LCG, so the test needs
+    /// no dev-dependency and every run uses the same numbers).
+    fn ramp_f32(count: usize) -> Vec<f32> {
+        let mut state = 0x1234_5678u32;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// The f64 twin of [`ramp_f32`].
+    fn ramp_f64(count: usize) -> Vec<f64> {
+        let mut state = 0x0BAD_F00Du32;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(2_265_480_577).wrapping_add(1);
+                (state >> 8) as f64 / (1u32 << 24) as f64 - 0.5
+            })
+            .collect()
+    }
+
+    fn f32_slice(buffer: &Buffer) -> &[f32] {
+        match &buffer.storage {
+            Storage::F32(values) => values,
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    fn f64_slice(buffer: &Buffer) -> &[f64] {
+        match &buffer.storage {
+            Storage::F64(values) => values,
+            other => panic!("unexpected storage {other:?}"),
+        }
+    }
+
+    /// Bit-for-bit equality with a first-mismatch report (an `assert_eq!` on two
+    /// 65k-element vectors prints megabytes).
+    fn assert_bit_identical(actual: &[f32], expected: &[f32], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                got.to_bits() == want.to_bits(),
+                "{what}: index {index}: {got:?} (0x{:08x}) vs {want:?} (0x{:08x})",
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    /// [`assert_bit_identical`] for the f64 path.
+    fn assert_bits_identical_f64(actual: &[f64], expected: &[f64], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length");
+        for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                got.to_bits() == want.to_bits(),
+                "{what}: index {index}: {got:?} (0x{:016x}) vs {want:?} (0x{:016x})",
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    /// The operands, geometry and declared result shape of a batch of plain
+    /// `m x k @ k x n` float matmuls (C-order batch blocks, so
+    /// `blocks_contiguous` accepts the layout).
+    fn gemm_pair(
+        m: usize,
+        k: usize,
+        n: usize,
+        batch: &[usize],
+        dtype: DType,
+    ) -> (Value, Value, MatMul, Vec<usize>) {
+        let blocks: usize = batch.iter().product::<usize>().max(1);
+        let a_shape: Vec<usize> = batch.iter().copied().chain([m, k]).collect();
+        let b_shape: Vec<usize> = batch.iter().copied().chain([k, n]).collect();
+        let mut out_shape: Vec<usize> = batch.to_vec();
+        out_shape.extend([m, n]);
+        let (a, b) = if dtype == DType::Float64 {
+            (
+                Buffer::new(dtype, a_shape, Storage::F64(ramp_f64(blocks * m * k))).unwrap(),
+                Buffer::new(dtype, b_shape, Storage::F64(ramp_f64(blocks * k * n))).unwrap(),
+            )
+        } else {
+            (
+                Buffer::new(dtype, a_shape, Storage::F32(ramp_f32(blocks * m * k))).unwrap(),
+                Buffer::new(dtype, b_shape, Storage::F32(ramp_f32(blocks * k * n))).unwrap(),
+            )
+        };
+        let g = geometry(&a, &b);
+        (std::rc::Rc::new(a), std::rc::Rc::new(b), g, out_shape)
+    }
+
+    #[test]
+    fn gemm_threads_gates_on_the_work_threshold() {
+        // Small matmuls must never thread: a 64^3 or 96^3 dot stays on the
+        // calling thread even on a 16-cpu host.
+        assert_eq!(gemm_threads(64 * 64 * 64, 1, 64), 1);
+        assert_eq!(gemm_threads(96 * 96 * 96, 1, 96), 1);
+        // A 256^3 matmul is under the total-work floor: it measures a wash at
+        // the median, so it must stay single-threaded.
+        assert_eq!(gemm_threads(256 * 256 * 256, 1, 256), 1);
+        assert_eq!(gemm_threads(GEMM_PARALLEL_MIN_WORK - 1, 1, 1024), 1);
+        // A 512^3 matmul is the measured sweet spot and does thread.
+        let threads = gemm_threads(512 * 512 * 512, 1, 512);
+        assert_eq!(
+            threads > 1,
+            parallel_cpus() > 1,
+            "512^3 must thread iff the host has more than one cpu"
+        );
+        assert!(threads <= parallel_cpus(), "never more threads than cpus");
+        assert!(threads <= 512, "never more threads than output rows");
+        if parallel_cpus() >= GEMM_PARALLEL_MAX_THREADS {
+            // Below the wide crossover the measured optimum is the 8-thread cap.
+            assert_eq!(threads, GEMM_PARALLEL_MAX_THREADS, "512^3 sits at the cap");
+            // ... from a 1024^3 matmul on the whole machine is at least as fast
+            // (measured: a wash at 1024^3, 1.6-1.7x over 8 threads at 2048^3).
+            assert_eq!(
+                gemm_threads(1024 * 1024 * 1024, 1, 1024),
+                parallel_cpus(),
+                "1024^3 may use every cpu"
+            );
+        }
+        // A batch of many small blocks stays on one thread however much total
+        // work it adds up to: eight 128^3 matmuls are slower threaded.
+        assert_eq!(gemm_threads(128 * 128 * 128, 8, 128), 1);
+        assert_eq!(gemm_threads(128 * 128 * 128, 64, 128), 1);
+        // ... while eight 256^3 blocks (2^27 of work, 2^24 per block) do thread.
+        assert_eq!(gemm_threads(256 * 256 * 256, 8, 256), threads);
+        // Never more threads than row strips: one row cannot be shared, and a
+        // single batch block caps the split at its rows.
+        assert_eq!(gemm_threads(4096 * 4096, 1, 1), 1);
+        assert_eq!(gemm_threads(1 << 30, 1, 3), 3);
+        // The work-per-thread target decides the count, so a bigger matmul never
+        // asks for fewer threads.
+        assert!(gemm_threads(768 * 768 * 768, 1, 768) >= threads);
+        // `Par::Seq` is the one-thread decision, `Par::rayon` everything else.
+        assert!(matches!(gemm_par(1), faer::Par::Seq));
+        assert!(matches!(gemm_par(0), faer::Par::Seq));
+        if parallel_cpus() > 1 {
+            assert!(matches!(gemm_par(threads), faer::Par::Rayon(_)));
+        }
+    }
+
+    #[test]
+    fn dot_parallel_matches_the_single_threaded_path_bit_for_bit() {
+        // 256^3 f32: the threaded gemm must reproduce the one-thread result
+        // exactly (each output element keeps its single accumulation order over
+        // K — faer splits the output, never the contraction).
+        let (a, b, g, out_shape) = gemm_pair(256, 256, 256, &[], DType::Float32);
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+        let one = gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        for threads in [2usize, 4, 8] {
+            let many =
+                gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, threads).unwrap().unwrap();
+            assert_eq!(many.shape, out_shape);
+            assert_bit_identical(&f32s(&many), &f32s(&one), "f32 threaded gemm");
+        }
+        // The result is still the product (blocked association order is the
+        // documented difference from the triple loop).
+        assert_relative(
+            &f32s(&one),
+            &f32s(&general_dot(&a, &b, DType::Float32, out_shape)),
+            1e-5,
+            "f32 threaded vs general",
+        );
+
+        // The same in f64: no dtype in the split may change an association.
+        let (a, b, g, out_shape) = gemm_pair(256, 256, 256, &[], DType::Float64);
+        let av = operand(&a, f64_slice(&a));
+        let bv = operand(&b, f64_slice(&b));
+        let one = gemm_run_threads(av, bv, &g, DType::Float64, &out_shape, 1).unwrap().unwrap();
+        let many = gemm_run_threads(av, bv, &g, DType::Float64, &out_shape, 8).unwrap().unwrap();
+        assert_bits_identical_f64(&floats(&many), &floats(&one), "f64 threaded gemm");
+    }
+
+    #[test]
+    fn dot_parallel_handles_a_batched_and_a_broadcast_batch() {
+        // Distinct per-batch operands: 4 independent 96^3 products, spread over
+        // both the batch and the row axis.
+        let (a, b, g, out_shape) = gemm_pair(96, 96, 96, &[4], DType::Float32);
+        assert_eq!(out_shape, vec![4, 96, 96]);
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+        let one = gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        for threads in [2usize, 4, 8, 13] {
+            let many =
+                gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, threads).unwrap().unwrap();
+            assert_bit_identical(&f32s(&many), &f32s(&one), "batched threaded gemm");
+        }
+
+        // A broadcast batch: b carries one shared 48x40 block (stride 0), so
+        // every slot reads the same operand while writing its own output.
+        let a = value(
+            DType::Float32,
+            &[5, 64, 48],
+            Storage::F32(ramp_f32(5 * 64 * 48)),
+        );
+        let b = value(DType::Float32, &[1, 48, 40], Storage::F32(ramp_f32(48 * 40)));
+        let g = geometry(&a, &b);
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+        let one =
+            gemm_run_threads(av, bv, &g, DType::Float32, &[5, 64, 40], 1).unwrap().unwrap();
+        let many =
+            gemm_run_threads(av, bv, &g, DType::Float32, &[5, 64, 40], 4).unwrap().unwrap();
+        assert_bit_identical(&f32s(&many), &f32s(&one), "broadcast batch threaded gemm");
+        assert_relative(
+            &f32s(&many),
+            &f32s(&general_dot(&a, &b, DType::Float32, vec![5, 64, 40])),
+            1e-5,
+            "broadcast batch split vs general",
+        );
+    }
+
+    #[test]
+    fn dot_parallel_handles_an_odd_row_count_and_a_single_row() {
+        // 251 rows, 173 contracting, 97 columns: an odd geometry must still be
+        // bit-identical to the one-thread result.
+        let (a, b, g, out_shape) = gemm_pair(251, 173, 97, &[], DType::Float32);
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+        let one = gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        let many = gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 7).unwrap().unwrap();
+        assert_bit_identical(&f32s(&many), &f32s(&one), "odd geometry");
+
+        // One row (a rank-2 row vector) cannot be split over rows, so the
+        // shipping decision is one thread — and with a single row faer's
+        // parallel gemm has to split the CONTRACTION instead, which changes the
+        // association order.  The forced-8-thread run therefore agrees with the
+        // one-thread run only to the documented float budget, never bit for bit.
+        let (a, b, g, out_shape) = gemm_pair(1, 1024, 128, &[], DType::Float32);
+        assert_eq!(gemm_threads(g.m * g.k * g.n, 1, g.m), 1, "one row must not thread");
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+        let one = gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        let many = gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 8).unwrap().unwrap();
+        assert_relative(&f32s(&many), &f32s(&one), 1e-5, "single-row matmul (forced threads)");
+
+        // A rank-1 x matrix dot (the promoted one-row form) never reaches the
+        // fast path at all, so its values are untouched by any threading.
+        let row = ramp_f32(1024);
+        let matrix = ramp_f32(1024 * 128);
+        let v = value(DType::Float32, &[1024], Storage::F32(row.clone()));
+        let m = value(DType::Float32, &[1024, 128], Storage::F32(matrix.clone()));
+        let op = spec("dot", DType::Float32, &[128], Attrs::new());
+        let out = dot_impl(&[v.clone(), m.clone()], &op, vec![128]).unwrap();
+        assert_eq!(out[0].shape, vec![128]);
+        let expected: Vec<f32> = (0..128)
+            .map(|column| {
+                (0..1024).map(|inner| row[inner] * matrix[inner * 128 + column]).sum()
+            })
+            .collect();
+        assert_relative(&f32s(&out[0]), &expected, 1e-4, "rank-1 x matrix");
+        assert!(
+            dot_gemm(
+                &v,
+                &m,
+                &MatMul { m: 1, k: 1024, n: 128, a_strides: Vec::new(), b_strides: Vec::new(), batch: Vec::new() },
+                DType::Float32,
+                &[128]
+            )
+            .unwrap()
+            .is_none(),
+            "a rank-1 dot must never reach the BLAS-3 kernel"
+        );
+    }
+
+    #[test]
+    fn dot_small_shapes_stay_on_the_single_threaded_path() {
+        // Below the work threshold the public entry point stays single-threaded
+        // and still equals the general kernel.
+        let (a, b, g, out_shape) = gemm_pair(64, 64, 64, &[], DType::Float32);
+        assert_eq!(gemm_threads(g.m * g.k * g.n, 1, g.m), 1, "64^3 must not thread");
+        let small = dot_gemm(&a, &b, &g, DType::Float32, &out_shape).unwrap().unwrap();
+        assert_relative(
+            &f32s(&small),
+            &f32s(&general_dot(&a, &b, DType::Float32, out_shape)),
+            1e-5,
+            "64^3 fast vs general",
+        );
+    }
+
+    // --- dot: the pooled gemm destination -----------------------------------
+
+    /// The gemm destination comes from the thread-local pool, and that is
+    /// BIT-SAFE: `Accum::Replace` + `alpha = 1` never reads the prior contents and
+    /// writes every element, so a recycled garbage-filled stock can only change
+    /// the destination's address, never a value.
+    #[test]
+    fn dot_reuses_a_pooled_destination_without_leaking_its_bytes() {
+        // 96^3 f32 -> one 96x96 block (36 KiB, above the pool's 4 KiB retention
+        // floor) and a single-threaded gemm, so the run is fully deterministic.
+        let (m, k, n) = (96usize, 96, 96);
+        let count = m * n;
+        let (a, b, g, out_shape) = gemm_pair(m, k, n, &[], DType::Float32);
+        let av = operand(&a, f32_slice(&a));
+        let bv = operand(&b, f32_slice(&b));
+
+        // A stock of exactly the destination's size class, filled with garbage
+        // that no product can contain (`ramp_f32` output is finite).  Dropping it
+        // hands it to the pool the test thread owns (a fresh thread starts with
+        // an empty pool), and `take` is LIFO, so the next take of this exact
+        // (dtype, count) is precisely these bytes.
+        drop(Storage::F32(vec![f32::NAN; count]));
+        let stock = crate::buffer::take_pooled_vec::<f32>(count)
+            .expect("the garbage stock was retained by the pool");
+        assert!(stock.iter().all(|value| value.is_nan()), "the pool served the garbage stock");
+        // Hand it straight back so the gemm's destination is the garbage stock.
+        drop(Storage::F32(stock));
+
+        let pooled =
+            gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        let pooled_values = f32s(&pooled);
+        assert!(
+            pooled_values.iter().all(|value| value.is_finite()),
+            "a pooled destination leaked a garbage value into the result"
+        );
+        assert_relative(
+            &pooled_values,
+            &f32s(&general_dot(&a, &b, DType::Float32, out_shape.clone())),
+            1e-5,
+            "pooled destination vs the triple loop",
+        );
+
+        // A second call recycles the first result's stock instead (the pool now
+        // holds correct values of the same class): still bit-identical, because
+        // the destination's CONTENTS are irrelevant to the gemm.
+        let again =
+            gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, 1).unwrap().unwrap();
+        assert_bit_identical(&f32s(&again), &pooled_values, "pooled destination reuse");
+
+        // The full `dot_impl` entry point takes the same path (the destination is
+        // chosen inside the kernel, not by the caller).
+        let op = spec("dot", DType::Float32, &[m, n], Attrs::new());
+        drop(Storage::F32(vec![f32::NAN; count]));
+        let through_dot = dot_impl(&[a.clone(), b.clone()], &op, vec![m, n]).unwrap();
+        assert!(
+            f32_slice(&through_dot[0]).iter().all(|value| value.is_finite()),
+            "dot_impl leaked a garbage destination value"
+        );
+        assert_bit_identical(
+            &f32s(&through_dot[0]),
+            &pooled_values,
+            "dot_impl through a pooled destination",
+        );
+
+        // The f64 twin, so the recycled-bytes proof is not a one-dtype accident.
+        let (a, b, g, out_shape) = gemm_pair(m, k, n, &[], DType::Float64);
+        let av = operand(&a, f64_slice(&a));
+        let bv = operand(&b, f64_slice(&b));
+        drop(Storage::F64(vec![f64::NAN; count]));
+        let served = crate::buffer::take_pooled_vec::<f64>(count)
+            .expect("the f64 garbage stock was retained by the pool");
+        assert!(served.iter().all(|value| value.is_nan()));
+        drop(Storage::F64(served));
+        let pooled =
+            gemm_run_threads(av, bv, &g, DType::Float64, &out_shape, 1).unwrap().unwrap();
+        let pooled_values = floats(&pooled);
+        assert!(
+            pooled_values.iter().all(|value| value.is_finite()),
+            "an f64 pooled destination leaked a garbage value into the result"
+        );
+        let general = floats(&general_dot(&a, &b, DType::Float64, out_shape));
+        for (got, want) in pooled_values.iter().zip(general.iter()) {
+            assert!((got - want).abs() <= 1e-12 * want.abs().max(1.0), "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn blocks_contiguous_classifies_the_batch_layouts() {
+        // Natural C-order block-unit strides for a (2, 3) matrix batch.
+        assert!(blocks_contiguous(&[2, 3], &[2, 3], &[3, 1]));
+        // A broadcast axis carries stride 0 and reuses one block.
+        assert!(blocks_contiguous(&[2, 1], &[2, 3], &[1, 0]));
+        assert!(blocks_contiguous(&[1, 3], &[2, 3], &[0, 1]));
+        // A missing leading batch axis is a size-one broadcast.
+        assert!(blocks_contiguous(&[3], &[2, 3], &[0, 1]));
+        assert!(blocks_contiguous(&[], &[2, 3], &[0, 0]));
+        // A permuted (non-contiguous) layout is declined.
+        assert!(!blocks_contiguous(&[2, 3], &[2, 3], &[1, 3]));
+        assert!(!blocks_contiguous(&[2, 3], &[2, 3], &[4, 1]));
+        // A shape/strides disagreement is declined, never indexed.
+        assert!(!blocks_contiguous(&[2, 3, 4], &[2, 3], &[3, 1]));
+        assert!(!blocks_contiguous(&[2, 3], &[2, 3], &[3]));
+    }
+
+    // --- measurement instruments -------------------------------------------
+
+    /// Median wall time of `iterations` runs, in milliseconds.
+    fn median_ms(warmup: usize, iterations: usize, mut body: impl FnMut()) -> f64 {
+        for _ in 0..warmup {
+            body();
+        }
+        let mut samples: Vec<f64> = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = std::time::Instant::now();
+            body();
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    }
+
+    /// The general triple-loop kernel on two already-f32 buffers — the bench's
+    /// reference leg (no dtype conversion in the timed path).
+    fn general_f32(a: &Buffer, b: &Buffer, g: &MatMul, out_shape: &[usize]) -> Buffer {
+        fn run(a: &Buffer, b: &Buffer, g: &MatMul, out: &[usize]) -> Result<Buffer> {
+            with_same_type!(a, b, |x, y| dot_run(
+                operand(a, x),
+                operand(b, y),
+                g,
+                DType::Float32,
+                out.to_vec()
+            ))
+        }
+        run(a, b, g, out_shape).unwrap()
+    }
+
+    /// The gemm A/B: the faer gemm block (the shipping path, threaded by
+    /// `gemm_threads`) against the general triple loop, on the four small shapes
+    /// that bracket the fast path, and the three wide shapes the thread policy
+    /// has to decide, each swept over explicit thread counts 1/4/8/16.
+    ///
+    /// The wide rows also print the PRE-FIX destination leg (`zero-fill`: a fresh
+    /// `vec![T::zero(); n]` per call, which is what the shipping path did before
+    /// the destination came from the pool) so the two are measured in one
+    /// process, interleaved.  Prints ms and GFLOP/s; asserts nothing (evidence,
+    /// run with `cargo test --release -p evoxc-cpu --lib bench_dot_gemm --
+    /// --ignored --nocapture`).
+    ///
+    /// MEASURED (2026-11-24, Intel Core Ultra 7 356H, 16 cpus, AVX2+FMA only,
+    /// shared host, f32, medians of 9 interleaved passes after 3 warmups, the
+    /// spread over four runs of this instrument; `*` marks the count
+    /// `gemm_threads` ships):
+    ///
+    /// | shape | threads | pooled (shipping) | zero-fill (pre-fix) |
+    /// |---|---|---|---|
+    /// | 1024x1024 . 1024x1024 | 1 | 17.9-23.1 ms (93-120 GFLOP/s) | 17.7-18.3 ms |
+    /// | | 4 | 6.6-7.7 ms (279-327) | 6.9-8.0 ms |
+    /// | | 8 | 3.7-4.5 ms (478-587) | 4.4 ms |
+    /// | | 16* | 3.0-3.9 ms (546-712) | 4.5-6.8 ms |
+    /// | 2048x2048 . 2048x2048 | 1 | 142.7-143.2 ms (120) | 142.8-143.0 ms |
+    /// | | 4 | 41.3-42.2 ms (407-416) | 41.7-47.0 ms |
+    /// | | 8 | 23.9-26.2 ms (657-718) | 24.8-25.8 ms |
+    /// | | 16* | 15.2-17.2 ms (1000-1129) | 16.0-20.1 ms |
+    /// | 4096x1024 . 1024x4096 | 1 | 284.0-284.5 ms (121) | 302.2-303.1 ms |
+    /// | | 4 | 76.1-77.3 ms (445-451) | 88.5-91.5 ms |
+    /// | | 8 | 48.1-49.5 ms (694-714) | 60.3 ms |
+    /// | | 16* | 30.7-31.9 ms (1079-1122) | 63.7-76.1 ms |
+    ///
+    /// The pooled destination is the whole story on the 64 MiB result: 2.0-2.5x
+    /// faster end to end at the shipping count, and the saving scales with the
+    /// result size (nothing at 4 MiB, ~1 ms at 16 MiB, ~32-45 ms at 64 MiB).
+    /// The thread policy is unchanged: the 8-thread cap and every-cpu crossover
+    /// at 1024^3 are both what the sweep measures as best (see the constants
+    /// above `gemm_threads`).
+    #[test]
+    #[ignore = "measurement instrument (release only)"]
+    fn bench_dot_gemm() {
+        let cases: [(&str, usize, usize, usize, usize); 4] = [
+            ("isolated 256x256 . 256x256", 256, 256, 256, 1),
+            ("batched 8 x (64x64 . 64x64)", 64, 64, 64, 8),
+            ("1x256 . 256x256", 1, 256, 256, 1),
+            ("256x256 . 256x1", 256, 256, 1, 1),
+        ];
+        for (name, m, k, n, blocks) in cases {
+            let a_values = ramp_f32(blocks * m * k);
+            let b_values = ramp_f32(blocks * k * n);
+            let a_shape: Vec<usize> = [blocks, m, k].to_vec();
+            let b_shape: Vec<usize> = [blocks, k, n].to_vec();
+            let a = Buffer::new(DType::Float32, a_shape, Storage::F32(a_values)).unwrap();
+            let b = Buffer::new(DType::Float32, b_shape, Storage::F32(b_values)).unwrap();
+            let g = geometry(&a, &b);
+            let mut out_shape: Vec<usize> = vec![blocks];
+            out_shape.extend([m, n]);
+            let av = operand(&a, f32_slice(&a));
+            let bv = operand(&b, f32_slice(&b));
+            let threads = gemm_threads(m * k * n, blocks, m);
+            let gemm_ms = median_ms(3, 15, || {
+                let out =
+                    gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, threads).unwrap();
+                std::hint::black_box(out);
+            });
+            let loop_ms = median_ms(3, 15, || {
+                std::hint::black_box(general_f32(&a, &b, &g, &out_shape));
+            });
+            let flops = 2.0 * (blocks * m * n * k) as f64;
+            println!(
+                "{name:<30} threads {threads:>2}   faer {:>8.3} ms ({:>7.1} GFLOP/s)   \
+                 triple loop {:>8.3} ms ({:>7.1} GFLOP/s)   speedup {:.2}x",
+                gemm_ms,
+                flops / gemm_ms / 1e6,
+                loop_ms,
+                flops / loop_ms / 1e6,
+                loop_ms / gemm_ms,
+            );
+        }
+
+        // The wide shapes, where the thread policy actually chooses: one shared
+        // interleaved rep loop, so every count sees the same host state.
+        let wide: [(&str, usize, usize, usize); 3] = [
+            ("1024x1024 . 1024x1024", 1024, 1024, 1024),
+            ("2048x2048 . 2048x2048", 2048, 2048, 2048),
+            ("4096x1024 . 1024x4096", 4096, 1024, 4096),
+        ];
+        const COUNTS: [usize; 4] = [1, 4, 8, 16];
+        const PASSES: usize = 9;
+        const WARMUPS: usize = 3;
+        for (name, m, k, n) in wide {
+            let (a, b, g, out_shape) = gemm_pair(m, k, n, &[], DType::Float32);
+            let av = operand(&a, f32_slice(&a));
+            let bv = operand(&b, f32_slice(&b));
+            let flops = 2.0 * (m * k * n) as f64;
+            let shipping = gemm_threads(m * k * n, 1, m);
+            for _ in 0..WARMUPS {
+                for count in COUNTS {
+                    let out =
+                        gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, count).unwrap();
+                    std::hint::black_box(out);
+                    let out = gemm_run_with(av, bv, &g, DType::Float32, &out_shape, count, |len| {
+                        vec![0.0f32; len]
+                    })
+                    .unwrap();
+                    std::hint::black_box(out);
+                }
+            }
+            let mut pooled: [Vec<f64>; COUNTS.len()] = Default::default();
+            let mut zeroed: [Vec<f64>; COUNTS.len()] = Default::default();
+            for _ in 0..PASSES {
+                for (index, count) in COUNTS.iter().copied().enumerate() {
+                    let start = std::time::Instant::now();
+                    let out =
+                        gemm_run_threads(av, bv, &g, DType::Float32, &out_shape, count).unwrap();
+                    std::hint::black_box(out);
+                    pooled[index].push(start.elapsed().as_secs_f64() * 1e3);
+                    let start = std::time::Instant::now();
+                    let out = gemm_run_with(av, bv, &g, DType::Float32, &out_shape, count, |len| {
+                        vec![0.0f32; len]
+                    })
+                    .unwrap();
+                    std::hint::black_box(out);
+                    zeroed[index].push(start.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            for (index, count) in COUNTS.iter().copied().enumerate() {
+                let median = |samples: &mut Vec<f64>| {
+                    samples.sort_by(f64::total_cmp);
+                    samples[samples.len() / 2]
+                };
+                let pooled_ms = median(&mut pooled[index]);
+                let zeroed_ms = median(&mut zeroed[index]);
+                println!(
+                    "{name:<24} threads {count:>2}{} pooled {:>9.3} ms ({:>7.1} GFLOP/s)   \
+                     zero-fill {:>9.3} ms ({:>7.1} GFLOP/s)",
+                    if count == shipping { "*" } else { " " },
+                    pooled_ms,
+                    flops / pooled_ms / 1e6,
+                    zeroed_ms,
+                    flops / zeroed_ms / 1e6,
+                );
+            }
+        }
+    }
+
+    // --- engine integration ------------------------------------------------
+    /// A hand-built `main` program (`dot` + `return`) compiled and executed
+    /// through the real plan/exec path: the DECLARED result type drives the
+    /// kernel's output shape and the engine's post-kernel validation, so this
+    /// pins the registration and the `util::result_shape` wiring.
+    #[test]
+    fn dot_runs_through_a_compiled_plan() {
+        use crate::exec::RunOptions;
+        use evoxc_core::{Block, Function, Op as IrOp, Program, Region, Value as IrValue};
+        let mut program = Program::new("smoke");
+        let block_id = program.new_block_id();
+        let a_id = program.new_value_id();
+        let b_id = program.new_value_id();
+        let out_id = program.new_value_id();
+        let dot_id = program.new_op_id();
+        let return_id = program.new_op_id();
+        let a_ty = ValueType::new(DType::Float64, vec![Dim::int(2), Dim::int(3)]);
+        let b_ty = ValueType::new(DType::Float64, vec![Dim::int(3), Dim::int(2)]);
+        let out_ty = ValueType::new(DType::Float64, vec![Dim::int(2), Dim::int(2)]);
+        program
+            .add_value(IrValue::block_argument(a_id, a_ty.clone(), block_id, 0))
+            .unwrap();
+        program
+            .add_value(IrValue::block_argument(b_id, b_ty.clone(), block_id, 1))
+            .unwrap();
+        program
+            .add_value(IrValue::op_result(out_id, out_ty.clone(), dot_id, 0))
+            .unwrap();
+        let mut dot = IrOp::new(dot_id, "dot");
+        dot.operands = vec![a_id, b_id];
+        dot.results = vec![out_id];
+        program.add_op(dot).unwrap();
+        let mut ret = IrOp::new(return_id, "return");
+        ret.operands = vec![out_id];
+        program.add_op(ret).unwrap();
+        let mut block = Block::new(block_id);
+        block.arguments = vec![a_id, b_id];
+        block.ops = vec![dot_id, return_id];
+        program.add_block(block).unwrap();
+        let mut function = Function::new("main", vec![a_ty.clone(), b_ty.clone()]);
+        function.output_types = vec![out_ty.clone()];
+        function.body = Region::single(block_id);
+        program.add_function(function).unwrap();
+        let a = Buffer::new(DType::Float64, vec![2, 3], Storage::F64(vec![1., 2., 3., 4., 5., 6.]))
+            .unwrap();
+        let b = Buffer::new(
+            DType::Float64,
+            vec![3, 2],
+            Storage::F64(vec![7., 8., 9., 10., 11., 12.]),
+        )
+        .unwrap();
+        let out = crate::evaluate(&program, vec![a, b], RunOptions::default(), None).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].shape, vec![2, 2]);
+        assert_close(&floats(&out[0]), &[58., 64., 139., 154.]);
+    }
+}

@@ -1,0 +1,7379 @@
+{
+ "abs#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "abs#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "acos#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "acos#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "acos#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "acos#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "acos#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "add#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "dim": "B"
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "add#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "dim": "B",
+      "size": 4
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "add#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "dim": "B"
+     }
+    ]
+   }
+  ]
+ },
+ "all_gather#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "all_gather#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 18
+     }
+    ]
+   }
+  ]
+ },
+ "all_gather#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "all_reduce#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "all_reduce#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "all_to_all#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 12
+     }
+    ]
+   }
+  ]
+ },
+ "all_to_all#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "all_to_all#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     null,
+     null
+    ]
+   }
+  ]
+ },
+ "argmax#0": {
+  "error": "argmax/argmin.axis: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "argmax#1": {
+  "error": "argmax/argmin.axis: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "argmax#10": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "argmax#11": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmax#12": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "argmax#13": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "argmax#14": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmax#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmax#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmax#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "argmax#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmax#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argmax#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argmax#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmax#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#0": {
+  "error": "argmax/argmin.axis: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "argmin#1": {
+  "error": "argmax/argmin.axis: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "argmin#10": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#11": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmin#12": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#13": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#14": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmin#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmin#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmin#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmin#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argmin#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argmin#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argsort#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "argsort#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "argsort#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_and#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_and#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_and#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "bitwise_and#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_and#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_left_shift#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_left_shift#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_left_shift#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "bitwise_left_shift#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_left_shift#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_or#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_or#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_or#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "bitwise_or#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_or#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_right_shift#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_right_shift#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_right_shift#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "bitwise_right_shift#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_right_shift#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_xor#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_xor#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_xor#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "bitwise_xor#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "bitwise_xor#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast_collective#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "broadcast_collective#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cast#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": []
+   }
+  ]
+ },
+ "cast#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cast#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cast#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "cast#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "ceil#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "ceil#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "ceil#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "ceil#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "ceil#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "cholesky#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "cholesky#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cholesky#2": {
+  "error": "cholesky: matrix must be square, got 3 vs 4",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "collective_permute#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "concatenate#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "concatenate#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "concatenate#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 8
+     }
+    ]
+   }
+  ]
+ },
+ "concatenate#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "expr": {
+       "args": [
+        {
+         "dim": "B"
+        },
+        {
+         "dim": "C"
+        }
+       ],
+       "op": "add"
+      }
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "concatenate#4": {
+  "error": "concatenate: dims must agree, got 3 vs 4",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "conv#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 8
+     },
+     {
+      "int": 8
+     }
+    ]
+   }
+  ]
+ },
+ "conv#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 6
+     },
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "conv#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 6
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "conv#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 8
+     },
+     {
+      "int": 8
+     }
+    ]
+   }
+  ]
+ },
+ "conv#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 8
+     },
+     {
+      "int": 6
+     },
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "conv#5": {
+  "error": "conv: kernel in-channels 2 != in_channels 3 // feature_group_count 1",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "cos#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "cos#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cos#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cos#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "cos#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "cumprod#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "cumprod#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cumprod#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cumprod#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "cumprod#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "cumsum#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "cumsum#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cumsum#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "cumsum#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "cumsum#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "dense_dot_sparse#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "diag#0": {
+  "error": "diag: input must have rank 1 or 2, got rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "diag#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "diag#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "diag#3": {
+  "error": "diag: input must have rank 1 or 2, got rank 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "diag#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "diagonal#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "diagonal#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "diagonal#2": {
+  "error": "diagonal: axis1 and axis2 must be different",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "divide#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "divide#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "divide#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "divide#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "divide#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "dot#0": {
+  "error": "dot: contracting dims 3 and 2 do not match",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "dot#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "dot#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "dot#3": {
+  "error": "dot: contracting dims 4 and 3 do not match",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "dot#4": {
+  "error": "dot: contracting dims 4 and 3 do not match",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "eigh#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "eigh#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "eigh#2": {
+  "error": "eigh: matrix must be square, got 2 vs 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "equal#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "equal#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "equal#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "equal#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "equal#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "erf#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "erf#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "erf#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "erf#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "erf#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "exp#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "exp#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "exp#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "exp#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "exp#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "flip#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "flip#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "flip#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "flip#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "flip#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "flip#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "flip#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "flip#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "flip#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "flip#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "floor#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "floor#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "floor#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "floor#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "floor#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "gather#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "gather#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "gather#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "gather#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "gather#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "gelu#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "gelu#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "gelu#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "gelu#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "gelu#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "greater#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "greater#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "greater#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "greater#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "greater#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "greater_equal#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "greater_equal#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "greater_equal#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "greater_equal#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "greater_equal#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "less#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "less#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "less#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "less#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "less#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "less_equal#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "less_equal#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "less_equal#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "less_equal#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "less_equal#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "log#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "log#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "log#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "log#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "log#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "log1p#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "log1p#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "log1p#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "log1p#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "log1p#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "logical_and#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "logical_and#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "logical_and#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "logical_and#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "logical_and#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "logical_not#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": []
+   }
+  ]
+ },
+ "logical_not#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "logical_not#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "logical_not#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "logical_not#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "logical_or#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "logical_or#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "logical_or#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "logical_or#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "logical_or#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "matrix_exp#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "matrix_exp#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "matrix_exp#2": {
+  "error": "matrix_exp: matrix must be square, got 2 vs 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "matrix_rank#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "matrix_rank#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "matrix_rank#2": {
+  "error": "matrix_rank: input must have rank >= 2, got rank 1",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "maximum#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "maximum#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "maximum#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "maximum#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "maximum#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "minimum#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "minimum#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "minimum#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "minimum#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "minimum#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "multiply#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "dim": "B"
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "nan_to_num#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "nan_to_num#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "nan_to_num#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "nan_to_num#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "nan_to_num#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "negate#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "negate#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "negate#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "negate#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "negate#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "not_equal#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "not_equal#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "not_equal#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "not_equal#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "not_equal#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "bool",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "pad#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "pad#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "pad#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "pad#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     },
+     {
+      "int": 5
+     }
+    ]
+   }
+  ]
+ },
+ "pad#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "power#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "power#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "power#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "power#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "power#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "qr#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "qr#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "qr#2": {
+  "error": "qr: input must have rank >= 2, got rank 1",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "random_key_mix#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "random_key_mix#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "random_key_mix#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "random_key_mix#3": {
+  "error": "random_key_mix: key must be a rank-0 int64 tensor (splitmix64), a shape (2,) int32 tensor (threefry2x32), or a shape (4,) int32 tensor (philox4x32_10), got dtype=float32 shape=(2,)",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "random_multinomial#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "random_multinomial#1": {
+  "error": "random_multinomial: num_samples must be a non-negative int, got -1",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "random_normal#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "random_normal#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "random_permutation#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "random_permutation#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "random_permutation#2": {
+  "error": "random_permutation: n attribute must be a non-negative int or None, got -1",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "random_randint#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "random_uniform#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "random_uniform#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "random_uniform#2": {
+  "error": "unknown random algorithm 'bogus'; expected one of splitmix64, threefry2x32, philox4x32_10",
+  "error_kind": "ValueError",
+  "ok": false
+ },
+ "rank#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#0": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_max#1": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_max#10": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_max#11": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#12": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_max#13": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_max#14": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_max#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_max#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_max#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_max#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#0": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_mean#1": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_mean#10": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#11": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_mean#12": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#13": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#14": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_mean#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_mean#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_mean#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_mean#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_mean#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_mean#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#0": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_min#1": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_min#10": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#11": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_min#12": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#13": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#14": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_min#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_min#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_min#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_min#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_min#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_min#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#0": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_prod#1": {
+  "error": "reduction.axes: axis 0 out of range for rank 0",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "reduce_prod#10": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#11": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_prod#12": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#13": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#14": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_prod#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_prod#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_prod#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_prod#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_prod#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "reduce_prod#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_scatter#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_scatter#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     null,
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "reduce_sum#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "dim": "B"
+     }
+    ]
+   }
+  ]
+ },
+ "relu#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "relu#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "relu#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "relu#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "relu#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "remainder#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "remainder#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "remainder#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "remainder#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "remainder#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 6
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 24
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 24
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "reshape#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "return#0": {
+  "ok": true,
+  "results": []
+ },
+ "return#1": {
+  "ok": true,
+  "results": []
+ },
+ "return#2": {
+  "ok": true,
+  "results": []
+ },
+ "roll#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "roll#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "roll#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "roll#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "roll#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "round#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "round#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "round#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "round#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "round#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "scatter#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "scatter#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "select#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "select#1": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sigmoid#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "sigmoid#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sigmoid#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sigmoid#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sigmoid#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sign#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "sign#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sign#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sign#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sign#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sin#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "sin#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sin#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sin#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sin#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "slice#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "slice#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "slice#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "slice#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "slice#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "slice#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "slice#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "slice#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "slice#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "slice#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 1
+     }
+    ]
+   }
+  ]
+ },
+ "solve#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "solve#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "solve#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "solve#3": {
+  "error": "solve: contracting dims 2 and 3 do not match",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sort#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "sort#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "sort#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sort#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sort#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sort#5": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sort#6": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sort#7": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sort#8": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sort#9": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_add#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_add#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_concatenate#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_concatenate#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_concatenate#2": {
+  "error": "sparse_concatenate: expected an even number of operands >= 4 (ia, va, ib, vb, ...), got 2",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sparse_coo_to_csc#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   },
+   {
+    "dtype": "int64",
+    "shape": [
+     null
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_coo_to_csr#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   },
+   {
+    "dtype": "int64",
+    "shape": [
+     null
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_coo_to_csr#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 4
+     }
+    ]
+   },
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     null
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_coo_to_csr#2": {
+  "error": "sparse_coo_to_csr: sparse operand must be rank-2, got dense_shape (3, 2, 4)",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sparse_csc_to_coo#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_csr_to_coo#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_csr_to_coo#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 2
+     },
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_dot_dense#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_from_dense#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_from_dense#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 1
+     }
+    ]
+   },
+   {
+    "dtype": "float64",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_from_dense#2": {
+  "error": "sparse_from_dense: dense rank 3 exceeds operand rank 2",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sparse_multiply#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_multiply_dense#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_negate#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_reduce_sum#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_reduce_sum#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 1
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_reduce_sum#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_reshape#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 1
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_reshape#1": {
+  "error": "sparse_reshape: element counts differ: 6 vs 5",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sparse_to_dense#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_to_dense#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "sparse_transpose#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": [
+     null,
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     null
+    ]
+   }
+  ]
+ },
+ "sparse_transpose#1": {
+  "error": "sparse_transpose: [0, 0] is not a permutation of 2 axes",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "sqrt#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "sqrt#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sqrt#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "sqrt#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "sqrt#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "square#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "square#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "square#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "square#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "square#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "stop_gradient#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "stop_gradient#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "stop_gradient#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "stop_gradient#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "stop_gradient#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "subtract#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "subtract#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "subtract#2": {
+  "error": "cannot broadcast incompatible dims 2 and 3",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "subtract#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "subtract#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "svd#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "svd#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "svd#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "complex64",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   },
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   },
+   {
+    "dtype": "complex64",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "svd#3": {
+  "error": "svd: input must have rank >= 2, got rank 1",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "tan#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "tan#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tan#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tan#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "tan#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "tanh#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "tanh#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tanh#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tanh#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "tanh#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "tile#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "expr": {
+       "args": [
+        {
+         "dim": "B"
+        },
+        {
+         "int": 2
+        }
+       ],
+       "op": "mul"
+      }
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tile#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tile#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 9
+     }
+    ]
+   }
+  ]
+ },
+ "transpose#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     },
+     {
+      "dim": "B"
+     }
+    ]
+   }
+  ]
+ },
+ "transpose#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 4
+     },
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "transpose#2": {
+  "error": "transpose: (0, 0) is not a permutation of 2 axes",
+  "error_kind": "ShapeError",
+  "ok": false
+ },
+ "tril#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "tril#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tril#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "tril#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "tril#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "triu#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   }
+  ]
+ },
+ "triu#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "triu#2": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "triu#3": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     },
+     {
+      "int": 4
+     }
+    ]
+   }
+  ]
+ },
+ "triu#4": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 2
+     }
+    ]
+   }
+  ]
+ },
+ "while#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": [
+     {
+      "int": 2
+     },
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "while#1": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "float32",
+    "shape": []
+   },
+   {
+    "dtype": "int32",
+    "shape": [
+     {
+      "int": 3
+     }
+    ]
+   }
+  ]
+ },
+ "world_size#0": {
+  "ok": true,
+  "results": [
+   {
+    "dtype": "int64",
+    "shape": []
+   }
+  ]
+ }
+}

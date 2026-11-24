@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["evoxc-core", "evoxc-compiler", "evoxc-runtime", "evoxc-cpu", "evoxc", "evoxc-python"]
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["The EvoX Authors"]
+repository = "https://github.com/EMI-Group/evoxc"
+homepage = "https://github.com/EMI-Group/evoxc"
+documentation = "https://docs.rs/evoxc"
+keywords = ["tensor", "compiler", "graph", "autodiff", "numerical"]
+categories = ["compilers", "science", "mathematics"]
+[workspace.dependencies]
+evoxc-core = { version = "0.1.0", path = "evoxc-core" }
+evoxc-compiler = { version = "0.1.0", path = "evoxc-compiler" }
+evoxc-runtime = { version = "0.1.0", path = "evoxc-runtime" }
+evoxc-cpu = { version = "0.1.0", path = "evoxc-cpu" }
+evoxc = { version = "0.1.0", path = "evoxc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py311"] }
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+# Native builds dominate the edit/test loop; keep debug info light but usable.
+[profile.dev]
+debug = 1

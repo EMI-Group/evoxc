@@ -1,16 +1,20 @@
-"""Batching: the vectorize primitive's rule registry and core algorithm.
+"""Shared per-op BATCHING-rule registry and rule-helper library.
 
-`vectorize` is THE primitive graph transformation of this package: it rewrites
-a traced `Graph` into a new `Graph` in which inputs mapped by `axes` carry
-explicit leading batch dims and every op has been rewritten by its batching
-rule. The result graph contains only ordinary `evoxc.ops` ops — backends never
-need to understand vectorization (binding: root CONTEXT.md design principle 7;
-`./CONTEXT.md` "The vectorize core" and "Rule-call signatures").
-
-Rule convention: while a rule runs, the machinery has pushed its `ir.Builder`
-onto the trace builder stack, so rules build replacement ops with ordinary
+Load-bearing, not transitional: the native (Rust) engine performs every
+rewrite (the five builtin transforms and the `batch_functions` merge); this
+module holds `batching_rules` / `register_batching_rule`, `_rule_key`,
+`_tensor_input_axes`, `_validate_rule_result`, `_remap_output_aux`, the
+batched-aux remap registry, the batch-depth context and
+`block_call_pass_through_rule`.
+Consumers: the native seam (`_native_bridge.py`, `_native_rules.py` — the
+extension-rule bridge, also reached through `_native_ad.py`), `vmap.py`,
+`batch_functions.py`, `rules.py`, `evoxc/block/rules.py`,
+`evoxc/external_rules.py` and `evoxc/transforms/__init__.py` (public
+`transforms.batching_rules`).
+Rule convention: the machinery pushes its `ir.Builder` onto the trace builder
+stack while a rule runs, so rules build replacement ops with ordinary
 `evoxc.ops.*` functions (`trace.current_builder()` resolves to the transform
-builder). Rules are pure graph builders: no Python loops over batch elements,
+builder); they are pure graph builders — no Python loops over batch elements,
 no silent fallbacks.
 """
 
@@ -23,8 +27,8 @@ from evoxc import core
 from evoxc import ir
 from evoxc import ops
 from evoxc.core import TransformError
-from evoxc.trace import Graph, StaticValue, current_builder, with_builder
-from evoxc.transforms._metadata import MappedAxes, UNMAPPED, ValueEnv
+from evoxc.trace import Graph, StaticValue, current_builder
+from evoxc.transforms._metadata import MappedAxes
 
 # Binding rule signature (see ./CONTEXT.md):
 #   rule(op, operands, axes) -> (new_values, new_axes)
@@ -59,28 +63,10 @@ def register_batching_rule(op_name: str, fn: BatchingRule) -> None:
     batching_rules[op_name] = fn
 
 
-def get_batching_rule(op_name: str) -> Optional[BatchingRule]:
-    """The registered rule for `op_name`, or `None` (never raises)."""
-    return batching_rules.get(op_name)
-
-
-def require_batching_rule(op_name: str) -> BatchingRule:
-    """Like `get_batching_rule`, but raises `TransformError` naming the op."""
-    rule = batching_rules.get(op_name)
-    if rule is None:
-        raise TransformError(
-            f"vectorize: no batching rule for op '{op_name}'. "
-            f"Register one with register_batching_rule('{op_name}', fn) "
-            f"(custom blocks: BlockOp.batching_rule); there is no silent "
-            f"Python-loop fallback."
-        )
-    return rule
-
-
 #: Pytree node type → batched-output aux remap fn. Registered pytree nodes
 #: whose children include STATIC leaves (e.g. a future sparse-tensor node:
 #: children = [tensor leaves..., dense_shape ints, dtype, format]) get their
-#: OUTPUT static leaves remapped at the vectorize boundary — `vectorize_graph`
+#: OUTPUT static leaves remapped at the vectorize boundary — `evoxc.vectorize`
 #: prepends a batch dim to the tensor outputs, which goes stale for node
 #: metadata derived from tensor shapes (the sparse value's dense_shape must
 #: gain the batch dim as a leading symbolic `Dim`). INPUT-side static values
@@ -91,7 +77,7 @@ _BATCHED_AUX_REMAP: Dict[type, Callable] = {}
 def register_batched_aux_remap(node_type: type, fn: Callable) -> None:
     """Register (or replace) the batched-output aux remap fn for `node_type`.
 
-    At the vectorize boundary (`vectorize_graph`, step 6), every registered
+    At the vectorize boundary (the `_remap_output_aux` boundary), every registered
     pytree node in the OUTPUT tree with static-leaf children hands its node
     spec, its direct static-leaf child values (in child order), and the
     current pass's fresh batch `Dim` to `fn`, and the returned values become
@@ -243,142 +229,6 @@ def _rule_key(op: ir.Op) -> str:
     return op.name
 
 
-def _resolve_batching_rule(op: ir.Op) -> BatchingRule:
-    """The rule vectorizing `op`.
-
-    Lookup: the registry first — block calls under the namespaced key
-    `block:<block_name>`, external calls under `external:<name>` (exactly
-    like autodiff's `_rule_name`; an explicitly registered rule always
-    wins). No registered rule ⇒ `TransformError` naming the op/block/kernel
-    with an adaptive registration hint — never a silent fallback.
-    """
-    key = _rule_key(op)
-    rule = batching_rules.get(key)
-    if rule is not None:
-        return rule
-    if key.startswith("block:"):
-        block_name = op.attributes["block_name"]
-        raise TransformError(
-            f"vectorize: no batching rule for block '{block_name}' — "
-            f"register one with register_batching_rule('{key}', fn) "
-            f"(custom blocks: BlockOp.batching_rule); there is no silent "
-            f"Python-loop fallback."
-        )
-    if key.startswith("external:"):
-        name = op.attributes["name"]
-        raise TransformError(
-            f"vectorize: no batching rule for op 'external_call' (key "
-            f"'{key}') — register one via the external-kernel handle "
-            f"returned by evoxc.register_external_kernel('{name}', fn) "
-            f"(.batching_rule/.vjp_rule/.jvp_rule) or register a portable "
-            f"decomposition; there is no silent Python-loop fallback."
-        )
-    return require_batching_rule(op.name)
-
-
-def vectorize_graph(graph: Graph, axes) -> Graph:
-    """Core vectorize algorithm: rewrite a traced graph with batched inputs.
-
-    Walks the graph's function blocks in topological order, rewrites each op
-    via its batching rule, seeds input metadata from the normalized `axes`
-    structure, and builds a NEW `Graph` (new module/function — the input graph
-    is never mutated) whose mapped inputs/outputs carry an extra leading
-    dimension. All mapped input specs share ONE fresh symbolic `Dim` (named
-    from the active pass depth — `_batch_dim`: `"batch"` at depth 0,
-    `"batch_1"` at depth 1, ...) as the leading dim — a single pass
-    introduces exactly one batch axis; `output_tree` and `static_values` are
-    preserved, except that registered output-tree nodes with static-leaf
-    children (e.g. a future sparse-tensor node) get their OUTPUT static
-    leaves remapped at this boundary via `register_batched_aux_remap`
-    (input-side statics are never remapped). Region-bearing control-flow ops
-    (`cond`/`while_loop`/`scan`) are not vectorizable in v1 and raise
-    `TransformError`.
-
-    Args:
-        graph: the traced graph to rewrite.
-        axes: the NORMALIZED axes pytree (produced by
-            `vectorize._normalize_axes`): `int 0` or `None` at every input-
-            tree leaf, matching the graph's input structure; `0` maps that
-            tensor input's leading axis, `None` leaves it unmapped (mandatory
-            for static leaves).
-
-    Output specs are NOT computed here: they are implicit in the return
-    values' `ir.ValueType`s (rules + type inference produce them), so mapped
-    outputs automatically carry the leading batch dim.
-    """
-    # 1. Split the normalized axes pytree into per-tensor-input entries and
-    #    guard the v1 module shape (exactly one function, one block).
-    tensor_axes = _tensor_input_axes(graph, axes)
-    old_function = _entry_function(graph)
-    old_block = old_function.entry_block
-    if len(old_block.arguments) != len(graph.tensor_specs):
-        raise TransformError(
-            "vectorize: the graph function has "
-            f"{len(old_block.arguments)} block args but "
-            f"{len(graph.tensor_specs)} tensor input specs"
-        )
-
-    # 2. New input specs: all mapped inputs share ONE fresh leading symbolic
-    #    dim (`batch`); unmapped specs are reused unchanged. The one fresh
-    #    `batch_dim` object is threaded into the output-aux remap (step 6) so
-    #    remapped static leaves share the batch Dim identity with the tensor
-    #    output/input specs.
-    batch_dim = _batch_dim()
-    new_specs, mapped_input_axes = _batched_input_specs(graph, tensor_axes, batch_dim)
-
-    # 3. Build the NEW module/function (the input graph is never mutated).
-    builder = ir.Builder()
-    module = builder.build_module(
-        name=graph.module.name, metadata=dict(graph.module.metadata)
-    )
-    input_types = tuple(
-        ir.ValueType(spec.dtype, tuple(spec.shape)) for spec in new_specs
-    )
-    function = builder.build_function(
-        name=old_function.name,
-        input_types=input_types,
-        metadata=dict(old_function.metadata),
-    )
-    new_block = function.entry_block
-
-    # 4. Seed the metadata env (new block args → MappedAxes) and the old→new
-    #    value remap; carry the input source locations forward.
-    env = ValueEnv()
-    remap: Dict[int, ir.Value] = {}
-    source_locations: Dict[int, object] = {}
-    for old_arg, new_arg, mapped in zip(
-        old_block.arguments, new_block.arguments, mapped_input_axes
-    ):
-        env.set(new_arg, mapped)
-        remap[old_arg.id] = new_arg
-        location = graph.source_locations.get(old_arg.id)
-        if location is not None:
-            source_locations[new_arg.id] = location
-
-    # 5. Rewrite the body with the transform builder active: rules build
-    #    replacement ops through ordinary `evoxc.ops.*` functions, which
-    #    resolve the builder via `trace.current_builder()`.
-    with with_builder(builder):
-        _rewrite_block(old_block, env, builder, remap, source_locations, graph)
-
-    # 6. Wrap the new IR into a NEW Graph: the input/output tree skeletons
-    #    and static values are reused unchanged — only the flat tensor specs
-    #    and the module are new. Registered output-tree nodes with static-leaf
-    #    children get their OUTPUT static leaves remapped here
-    #    (`_remap_output_aux` — e.g. a sparse node's dense_shape gains the
-    #    batch dim); input statics are never remapped.
-    output_tree, output_static_values = _remap_output_aux(graph, batch_dim)
-    return Graph(
-        module,
-        graph.input_specs,
-        new_specs,
-        output_tree,
-        graph.static_values,
-        output_static_values,
-        source_locations,
-    )
-
-
 def _tensor_input_axes(graph: Graph, axes) -> Tuple[Optional[int], ...]:
     """Split the normalized axes pytree into per-tensor-input entries.
 
@@ -425,8 +275,8 @@ def _tensor_input_axes(graph: Graph, axes) -> Tuple[Optional[int], ...]:
 
 
 #: Active vectorize-pass depth, contextvars-backed (the same pattern as the
-#: builder stack in `evoxc/trace/builder.py`). `_batched_input_specs` names each
-#: pass's shared batch dim from the CURRENT depth: depth 0 → `"batch"`,
+#: builder stack in `evoxc/trace/builder.py`). `_batch_dim` names each pass's
+#: shared batch dim from the CURRENT depth: depth 0 → `"batch"`,
 #: depth 1 → `"batch_1"`, depth 2 → `"batch_2"`, ... — nested vmap levels get
 #: level-distinct dim NAMES. The numpy interpreter binds symbolic dims BY
 #: NAME, so same-named dims from different nesting levels would collide at
@@ -477,55 +327,12 @@ def _batch_dim() -> core.Dim:
     return core.Dim("batch" if depth <= 0 else f"batch_{depth}")
 
 
-def _batched_input_specs(
-    graph: Graph,
-    tensor_axes: Tuple[Optional[int], ...],
-    batch_dim: Optional[core.Dim] = None,
-) -> Tuple[Tuple, Tuple[MappedAxes, ...]]:
-    """New flat tensor specs + per-input `MappedAxes`.
-
-    Mapped inputs all share ONE fresh symbolic `core.Dim` (named from the
-    active pass depth — `_batch_dim`; `"batch"` at depth 0, `"batch_1"` at
-    depth 1, ...) as their leading dim: a single vectorize pass introduces
-    exactly one batch axis, so every mapped input carries the same Dim object
-    — object identity IS the logical axis. Same-level dims therefore compare
-    equal in shape inference (no `max(batch, batch_1)` DimExprs in batched
-    result types), and the runtime's name-keyed dim binding rejects mismatched
-    batch extents WITHIN a level with a clear ShapeError. Level-distinct
-    names keep nested vmap levels from colliding at run time (unequal extents
-    run; equal extents keep working). Unmapped specs are reused unchanged.
-
-    `batch_dim` may be supplied by the caller (`vectorize_graph` threads the
-    SAME object into the output-aux remap so remapped static leaves share the
-    batch Dim identity with the specs); when omitted it is created here.
-    """
-    if batch_dim is None:
-        batch_dim = _batch_dim()
-    new_specs = []
-    mapped_axes = []
-    for spec, entry in zip(graph.tensor_specs, tensor_axes):
-        if entry is None:
-            new_specs.append(spec)
-            mapped_axes.append(UNMAPPED)
-            continue
-        new_specs.append(
-            core.TensorSpec(
-                shape=(batch_dim, *spec.shape),
-                dtype=spec.dtype,
-                device=spec.device,
-                name=spec.name,
-            )
-        )
-        mapped_axes.append(MappedAxes((0,)))
-    return tuple(new_specs), tuple(mapped_axes)
-
-
 def _remap_output_aux(
     graph: Graph, batch_dim: core.Dim
 ) -> Tuple["core.TreeSpec", Tuple[StaticValue, ...]]:
     """Rebuild the output tree + output static records at the vectorize boundary.
 
-    `vectorize_graph` prepends a leading batch dim to mapped tensor outputs,
+    `evoxc.vectorize` prepends a leading batch dim to mapped tensor outputs,
     which goes stale for registered pytree nodes whose children include
     STATIC leaves (e.g. a future sparse-tensor node: children = [tensor
     leaves..., dense_shape ints, dtype, format] — the sparse value's
@@ -719,109 +526,6 @@ def _entry_function(graph: Graph) -> ir.Function:
             "vectorize: multi-block function regions are not supported in v1"
         )
     return function
-
-
-def _rewrite_block(block, env, builder, remap, source_locations, graph) -> None:
-    """Rewrite one basic block into the builder's current (new) block.
-
-    Walks the ops in program order (topological for traced graphs), invoking
-    each op's batching rule and splicing the emitted replacement ops into the
-    new block. The `return` terminator's operands are mapped through `remap`
-    and re-emitted via `set_terminator` (the terminator is last by
-    construction — v1 guarantees nothing follows it). Ops carrying nested
-    regions (`cond`/`while_loop`/`scan`) are not vectorizable in v1.
-    """
-    new_block = builder.current_block
-    terminated = False
-    for op in block.ops:
-        if op.is_terminator:
-            if op.name != "return":
-                raise TransformError(
-                    f"vectorize: unsupported terminator '{op.name}' (v1 "
-                    "graphs terminate with 'return')"
-                )
-            new_operands = tuple(
-                _rewritten_operand(value, remap) for value in op.operands
-            )
-            builder.set_terminator(
-                new_block, "return", operands=new_operands, location=op.location
-            )
-            terminated = True
-            break  # v1: the terminator is the last op — nothing follows it.
-        if op.regions:
-            raise TransformError(
-                f"vectorize: cannot batch op '{op.name}': region-bearing "
-                "control-flow ops (cond/while_loop/scan) are not vectorizable "
-                "in v1"
-            )
-        _rewrite_op(op, env, builder, remap, source_locations, graph)
-    if not terminated:
-        raise TransformError(
-            "vectorize: the graph function has no 'return' terminator"
-        )
-
-
-def _rewrite_op(op: ir.Op, env, builder, remap, source_locations, graph):
-    """Dispatch one op to its batching rule and record the results.
-
-    The transform builder is active (pushed by `vectorize_graph`), so rules
-    build replacement ops through ordinary `evoxc.ops.*` functions. Operands
-    are passed to the rule as the REWRITTEN `ir.Value`s of the new module
-    (aligned with `op.operands`; rules read the original values from
-    `op.operands` when they need them) — replacement ops must be built over
-    new-module values so shape/dtype inference sees the batched types.
-    Afterwards the replacement ops inherit the original op's source location,
-    the rule's results are recorded in the env/remap, and the new value ids
-    are added to the new graph's `source_locations`.
-
-    Returns the rule's `(new_values, new_axes)` pair.
-    """
-    rule = _resolve_batching_rule(op)
-    rewritten_operands = tuple(
-        _rewritten_operand(operand, remap) for operand in op.operands
-    )
-    operand_axes = tuple(_operand_axes(op, value, env) for value in rewritten_operands)
-    new_block = builder.current_block
-    before = {emitted.id for emitted in new_block.ops}
-    new_values, new_axes = rule(op, rewritten_operands, operand_axes)
-    new_values, new_axes = _validate_rule_result(op, new_values, new_axes)
-    # The rule emitted into the active builder via evoxc.ops.*, whose location
-    # capture points at the rule code — overwrite with the ORIGINAL op's
-    # source location (None when the original op has none).
-    for emitted in new_block.ops:
-        if emitted.id not in before:
-            emitted.location = op.location
-    env.update(new_values, new_axes)
-    for old_result, new_value in zip(op.results, new_values):
-        remap[old_result.id] = new_value
-        location = graph.source_locations.get(old_result.id)
-        if location is None:
-            location = op.location
-        if location is not None:
-            source_locations[new_value.id] = location
-    return new_values, new_axes
-
-
-def _operand_axes(op: ir.Op, value: ir.Value, env: ValueEnv) -> MappedAxes:
-    """The `MappedAxes` of one rewritten operand (strict: must be recorded)."""
-    if value not in env:
-        raise TransformError(
-            f"vectorize: internal error — rewritten operand %{value.id} of "
-            f"op '{op.name}' has no recorded batching metadata"
-        )
-    return env.get(value)
-
-
-def _rewritten_operand(value: ir.Value, remap: Dict[int, ir.Value]) -> ir.Value:
-    """The rewritten value replacing `value` (mapped through `remap`)."""
-    new_value = remap.get(value.id)
-    if new_value is None:
-        raise TransformError(
-            f"vectorize: internal error — value %{value.id} has no rewritten "
-            "replacement; every value must be produced by an already-rewritten "
-            "op or be a function block argument"
-        )
-    return new_value
 
 
 def _validate_rule_result(

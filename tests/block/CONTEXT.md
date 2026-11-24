@@ -12,9 +12,9 @@ pytest suite for the `evoxc.block` subsystem (sibling `../../evoxc/block/` — r
 | `test_call.py` | block_call op construction, static-arg payload encoding, operand binding rules, dtype/shape errors, TraceError paths, multi-output | 30 |
 | `test_impl.py` | `impl("numpy")` registration, execution via evoxc.evaluate, static-args kwargs payload, multi-output impls, missing-impl BackendError | 7 |
 | `test_errors.py` | EVOXCError hierarchy, lower-time verification errors (unknown block, output-spec mismatch, non-tensor portable return) | 21 |
-| `test_portable.py` | portable inlining numerics, block_call removal at lower, spec derivation, non-defn portable errors | 9 |
+| `test_portable.py` | portable inlining numerics, block_call removal at lower, spec derivation, non-defn portable errors, structured (namedtuple/dataclass) returns through evaluate and vmap | 15 |
 | `test_rules.py` | batching/jvp/vjp rule registration + fallbacks (vmap/grad/jvp), TransformError paths, non-callable rules | 13 |
-| `test_portable_vjp_regression.py` | regression for the fixed portable-decomposition vjp fallback (commit 1a88219: post-inline seeding): correct NONZERO input cotangents via grad/vjp on portable-only blocks (two-input `x*w`, matmul, nested chain), non-ones cotangents, all-zero short-circuit, mixed multi-output cotangents, jvp derived from the vjp fallback, output-count guard; + 1 BUG(evoxc) (constant op inside a portable fails the local sweep) | 11 |
+| `test_portable_vjp_regression.py` | portable-decomposition vjp/jvp fallback: correct NONZERO input cotangents via grad/vjp on portable-only blocks (two-input `x*w`, matmul, nested chain), non-ones cotangents, all-zero short-circuit, mixed multi-output cotangents, jvp derived from the vjp fallback, output-count guard, and a `constant` op inside a portable differentiating like any other op | 11 |
 
 ## Constraints
 

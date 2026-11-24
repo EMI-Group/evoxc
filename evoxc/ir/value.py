@@ -17,7 +17,7 @@ stable).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from .types import ValueType
 
@@ -44,6 +44,31 @@ class Use:
         return self.owner.operands[self.operand_index]
 
 
+class _UseIndex:
+    """Private identity-dedup index over a ``Value``'s ``uses`` list.
+
+    Keys are ``(id(use.owner), use.operand_index)`` — the SSA structure a use
+    record describes — so a membership test never compares owners structurally
+    (``Op``/``Value`` are dataclasses whose generated ``__eq__`` walks the whole
+    owner graph, which made trace-time bookkeeping quadratic in the op count).
+
+    The index is a CACHE derived from ``uses``, not a second source of truth:
+    ``length`` pins the list length it was built from, so any mutation made
+    elsewhere in the IR (a caller rebinding ``uses``, the IR codec rebuilding
+    it) forces a rebuild on the next ``add_use``/``remove_use`` instead of
+    deduplicating against stale state. It is never part of the SSA structure:
+    excluded from ``Value.__repr__`` and ``Value.__eq__``.
+    """
+
+    __slots__ = ("keys", "length")
+
+    def __init__(self, uses: "list[Use]") -> None:
+        self.keys: "set[tuple[int, int]]" = {
+            (id(use.owner), use.operand_index) for use in uses
+        }
+        self.length = len(uses)
+
+
 @dataclass
 class Value:
     """An SSA value: a typed reference to a future runtime tensor in a graph.
@@ -63,6 +88,11 @@ class Value:
     owner: Union["Op", "Block"]
     index: int
     uses: list[Use] = field(default_factory=list)
+    # Private O(1) dedup index over `uses` (see `_UseIndex`); never structural,
+    # so `repr`/`__eq__` are unchanged and it is not a constructor parameter.
+    _use_index: Optional["_UseIndex"] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def is_block_arg(self) -> bool:
@@ -83,10 +113,37 @@ class Value:
             return None
         return self.owner  # type: ignore[return-value]
 
+    def _dedup_index(self) -> "_UseIndex":
+        """The dedup index over ``uses``, rebuilt if ``uses`` changed underneath."""
+        index = self._use_index
+        if index is None or index.length != len(self.uses):
+            index = self._use_index = _UseIndex(self.uses)
+        return index
+
     def add_use(self, use: Use) -> None:
-        """Record one use of this value (idempotent)."""
-        if use not in self.uses:
-            self.uses.append(use)
+        """Record one use of this value (idempotent, O(1) in the use count).
+
+        Duplicates are detected on owner IDENTITY plus operand index — the SSA
+        structure the record describes — not on structural ``Use`` equality,
+        which compares owners through their generated dataclass ``__eq__`` (the
+        whole owner graph, quadratic in the trace length). Two uses by the same
+        owner at different operand indices (``add(x, x)``) are both recorded.
+        ``uses`` stays the ordered, deduplicated list it always was.
+        """
+        index = self._dedup_index()
+        key = (id(use.owner), use.operand_index)
+        if key in index.keys:
+            return
+        index.keys.add(key)
+        self.uses.append(use)
+        index.length = len(self.uses)
+
+    def _drop_use_at(self, position: int) -> None:
+        """Remove ``uses[position]``, keeping the dedup index in sync (internal)."""
+        index = self._dedup_index()
+        use = self.uses.pop(position)
+        index.keys.discard((id(use.owner), use.operand_index))
+        index.length = len(self.uses)
 
     def remove_use(self, use: Use) -> None:
         """Forget one use of this value.
@@ -95,9 +152,10 @@ class Value:
             ValueError: If ``use`` is not recorded on this value.
         """
         try:
-            self.uses.remove(use)
+            position = self.uses.index(use)
         except ValueError:
             raise ValueError(f"use {use} is not recorded on value %{self.id}") from None
+        self._drop_use_at(position)
 
     def replace_all_uses_with(self, new: "Value") -> None:
         """Rewrite every use of this value to ``new`` (classic SSA RAUW).
@@ -108,3 +166,4 @@ class Value:
         for use in list(self.uses):
             use.owner._replace_operand(use.operand_index, new)
         self.uses.clear()
+        self._use_index = None

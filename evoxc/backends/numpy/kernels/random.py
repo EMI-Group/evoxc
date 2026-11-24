@@ -508,7 +508,11 @@ def _uniform_kernel(ctx, op, operands):
     high = operands[2].numpy()
     u = _uniforms_for(algorithm, key, _SALTS["uniform"], shape)
     vals = (low + u * (high - low)).astype(out_dtype)
-    return core.Tensor(vals)
+    # numpy 2.x returns a SCALAR (np.float32, with a ``device`` attribute!)
+    # for arithmetic on 0-d operands, so a rank-0 ``shape=()`` draw must be
+    # normalized back to the 0-d ndarray ``core.Tensor`` requires (the
+    # elementwise-kernel ``np.asarray`` convention; a no-op for real arrays).
+    return core.Tensor(np.asarray(vals))
 
 
 def _normal_kernel(ctx, op, operands):
@@ -546,7 +550,9 @@ def _normal_kernel(ctx, op, operands):
         cs = np.cos(_TWO_PI_F32 * u2)
         z = (rt * cs).reshape(shape)
         vals = np.asarray(mean, dtype=np.float32) + z * np.asarray(std, dtype=np.float32)
-        return core.Tensor(vals)
+        # 0-d operands make numpy 2.x return a SCALAR, not a 0-d array —
+        # normalize for ``shape=()`` (the numpy-backend scalar-shape contract).
+        return core.Tensor(np.asarray(vals))
     # Exact f64 math (f64/f16 outputs — UNCHANGED semantics, the StableHLO
     # export's bit-exactness reference; f16 casts the f64 result at the end).
     u1 = _word_uniforms(u1w)
@@ -558,7 +564,9 @@ def _normal_kernel(ctx, op, operands):
     z = np.sqrt(-2.0 * np.log(u1)) * np.cos(_TWO_PI * u2)
     z = z.reshape(shape)
     vals = (mean + z * std).astype(out_dtype)
-    return core.Tensor(vals)
+    # Scalar-shape contract: normalize a numpy 2.x 0-d-arithmetic SCALAR
+    # result back to the 0-d ndarray ``core.Tensor`` requires.
+    return core.Tensor(np.asarray(vals))
 
 
 def _randint_kernel(ctx, op, operands):
@@ -577,7 +585,10 @@ def _randint_kernel(ctx, op, operands):
     u = _uniforms_for(algorithm, key, _SALTS["randint"], shape)
     # Float scaling (exact for spans < 2^53; no modulo bias).
     vals = (low + np.floor(u * span)).astype(out_dtype)
-    return core.Tensor(vals)
+    # Scalar-shape contract: a rank-0 (``shape=()``) draw produces a numpy
+    # SCALAR under numpy 2.x 0-d arithmetic; normalize to the 0-d ndarray
+    # ``core.Tensor`` requires (a no-op for real arrays).
+    return core.Tensor(np.asarray(vals))
 
 
 def _permutation_kernel(ctx, op, operands):

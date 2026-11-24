@@ -1,13 +1,16 @@
 [build-system]
-# `uv_build` — a pure-Python-only build backend (no setuptools, no egg-info, no
-# SOURCES.txt manifest that a stale build can poison). It ships EXACTLY ONE
-# top-level module per distribution (see `[tool.uv.build-backend]` below), so
-# this `evoxc` distribution and the workspace-member `evoxc-hf` distribution can
-# never contain each other — a structural guarantee, not a config promise — and
-# it preserves the PEP 639 license metadata below verbatim
-# (`License-Expression` + `License-File` in the wheel METADATA).
-requires = ["uv_build>=0.13.6,<0.14"]
-build-backend = "uv_build"
+# `maturin` — this distribution is a MIXED project: the pure-Python `evoxc`
+# package plus the Rust/PyO3 `abi3-py311` extension module
+# `evoxc._evoxc_native`, built from the in-repo Rust workspace under `./native/`
+# (see `[tool.maturin]` below). `maturin` compiles the extension from source
+# and packages platform wheels (e.g. `...-cp311-abi3-linux_x86_64.whl`) with
+# one abi3 build covering every supported CPython; a source install needs a
+# Rust toolchain and a C compiler. It preserves the PEP 639 license metadata
+# below verbatim (`License-Expression` + `License-File` in the wheel METADATA).
+# The workspace member `evoxc-hf` stays a pure-Python `uv_build` project, so
+# neither distribution can ever contain the other's module.
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "evoxc"
@@ -35,18 +38,19 @@ keywords = [
     "numerical-computing",
     "jax-like",
 ]
-# Every classifier is factually true for this package: pure Python, numpy-only
-# runtime dependency, no native code, no OS-specific behaviour.
+# Every classifier is factually true for this package: a pure-Python `evoxc`
+# package with a Rust/PyO3 `abi3` extension built from source by maturin, and a
+# numpy-only runtime dependency.
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Compilers",
 ]
@@ -149,31 +153,52 @@ Genesis = "https://github.com/EMI-Group/genesis"
 # distribution.
 members = ["evoxc_hf"]
 
-[tool.uv.build-backend]
-# This repo uses a FLAT layout (`./evoxc/` sits at the root, not under `src/`),
-# so the module root is the repository root itself. Without `module-root = ""`
-# uv_build assumes src-layout and fails with
-# "Expected a Python module at: src/evoxc/__init__.py".
-module-root = ""
-# The ONLY shipped module of THIS distribution. uv_build packages exactly the
-# `<module-root>/<name>` directory, so this wheel/sdist carries `evoxc` and
+[tool.maturin]
+# A MIXED project: `python-source = "."` makes the repo-root `evoxc/` package
+# the Python half (the flat layout), and `module-name` installs the compiled
+# cdylib INSIDE it as `evoxc/_evoxc_native.abi3.so` — exactly the name
+# `evoxc/_native.py` discovers. The crate lives in the in-repo Rust workspace
+# (`./native/`) and builds `abi3-py311` through its own Cargo features, so one
+# wheel per platform serves every supported CPython (3.11+).
+manifest-path = "native/evoxc-python/Cargo.toml"
+python-source = "."
+module-name = "evoxc._evoxc_native"
+bindings = "pyo3"
+# Release wheels drop the Rust symbol table (a few hundred KiB per platform):
+# the extension is a self-contained abi3 cdylib, nothing links against its
+# exports. Complements the workspace's `[profile.release]` (opt-level 3,
+# thin LTO, codegen-units 1) — the CI `wheels` matrix builds with
+# `--release`, so this applies to every platform wheel.
+strip = true
+# The ONLY shipped Python module of THIS distribution: maturin packages the
+# `evoxc` package next to the extension, so the wheel carries `evoxc/` and
 # nothing else. The sibling `evoxc-hf` distribution is built from its OWN
-# workspace-member project at `./evoxc_hf/src/evoxc_hf/`, and since each
-# distribution ships exactly one module, neither can contain the other — not a
-# glob that could be widened by accident.
-module-name = "evoxc"
-# The sdist additionally ships these checkout paths (anchored patterns; `**`
-# recurses), so a built-from-sdist tree can still run the test suite:
+# workspace-member project at `./evoxc_hf/src/evoxc_hf/` (a pure-Python
+# `uv_build` project), and since each distribution ships exactly one module,
+# neither can contain the other.
+#
+# The checkout paths below ship in the SDIST ONLY (so a built-from-sdist tree
+# can still run the test suite); `format = "sdist"` keeps them out of the wheel.
 #   tests/**      — the pytest suite that mirrors the package layout
 #   assets/**     — README-only SVG diagrams referenced by the packaged README
 #   conftest.py   — the root pytest configuration that makes `tests/` importable
-#   CHANGELOG.md  — read by the packaged suite's release-hygiene leg, so that
-#                   leg works from an unpacked sdist too
+#   CHANGELOG.md  — read by the packaged suite's release-hygiene leg
+# The whole Rust workspace — `native/Cargo.toml`, `native/Cargo.lock` and every
+# crate under `native/` (including the reusable `evoxc` facade crate) — is part
+# of the cargo build graph, so maturin carries it in the sdist automatically;
+# a source install rebuilds `evoxc/_evoxc_native.abi3.so` from it (the
+# `test_evoxc_sdist_is_a_complete_buildable_source_tree` packaging test pins
+# that the manifest, the lock and the PyO3 crate are all present).
 # Deliberately NOT shipped: the workspace member `evoxc_hf/` (a SEPARATE
-# distribution built from its own project at `./evoxc_hf/`, hence never part of
-# this project's sdists) and the root
-# probe scripts (`probe_new_emitters.py`).
-source-include = ["tests/**", "assets/**", "conftest.py", "CHANGELOG.md"]
+# distribution built from its own project) and the dev-built extension (a
+# gitignored build product that maturin compiles itself).
+include = [
+    { path = "tests/**/*", format = "sdist" },
+    { path = "assets/**/*", format = "sdist" },
+    { path = "conftest.py", format = "sdist" },
+    { path = "CHANGELOG.md", format = "sdist" },
+]
+exclude = [{ path = "evoxc/_evoxc_native*.so", format = ["sdist", "wheel"] }]
 
 [tool.pytest.ini_options]
 # `tests/` mirrors the `evoxc` package; the workspace member distribution

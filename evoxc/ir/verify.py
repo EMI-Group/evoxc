@@ -484,6 +484,8 @@ def _verify_op(
         or not isinstance(attributes, dict)
     ):
         _verify_attrs(opdef_obj, op, loc)
+        if op.name in _OP_SPECIFIC_ATTR_OPS:
+            _verify_op_specific_attrs(op, loc)
     for i, operand in enumerate(op.operands):
         if not isinstance(operand, Value):
             _fail(
@@ -619,6 +621,57 @@ def _attr_matches(spec: AttrSpec, value: Any) -> bool:
     if tag == ATTR_NDARRAY:
         return isinstance(value, np.ndarray)
     return False
+
+
+#: Ops whose attribute VALUES carry constraints the tag checks cannot express
+#: (non-empty target names/bodies, an api version >= 1). The call site guards
+#: on this set, so no other op pays for the value checks.
+_OP_SPECIFIC_ATTR_OPS = frozenset({"custom_call", "inline_stablehlo"})
+
+
+def _verify_op_specific_attrs(op: Op, loc: Location | None) -> None:
+    """Value constraints for the opaque custom-op attributes.
+
+    The ``ATTR_STR``/``ATTR_INT``/``ATTR_BOOL`` tags already check the TYPE
+    (``_verify_attrs``); this pass checks the documented VALUES.
+    """
+    attributes = op.attributes
+    where = f"op '{op.name}' (id {op.id})"
+    if op.name == "custom_call":
+        target = attributes["call_target_name"]
+        if not isinstance(target, str) or not target:
+            _fail(
+                f"{where}: attribute 'call_target_name' must be a non-empty "
+                f"str, got {_value_desc(target)}",
+                loc,
+            )
+        api_version = attributes["api_version"]
+        if (
+            not isinstance(api_version, int)
+            or isinstance(api_version, bool)
+            or api_version < 1
+        ):
+            _fail(
+                f"{where}: attribute 'api_version' must be an int >= 1, got "
+                f"{api_version!r}",
+                loc,
+            )
+    else:  # inline_stablehlo
+        body = attributes["body"]
+        if not isinstance(body, str) or not body:
+            _fail(
+                f"{where}: attribute 'body' must be a non-empty str, got "
+                f"{_value_desc(body)}",
+                loc,
+            )
+    if "has_side_effect" in attributes:
+        side_effect = attributes["has_side_effect"]
+        if not isinstance(side_effect, bool):
+            _fail(
+                f"{where}: attribute 'has_side_effect' must be a bool, got "
+                f"{_value_desc(side_effect)}",
+                loc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +843,13 @@ def _verify_op_specific_results(module: Module, op: Op, loc: Location | None) ->
                 f"results are {result_types}",
                 loc,
             )
-    elif name in ("runtime_call", "block_call", "external_call"):
+    elif name in (
+        "runtime_call",
+        "block_call",
+        "external_call",
+        "custom_call",
+        "inline_stablehlo",
+    ):
         specs = op.attributes["result_specs"]
         if not isinstance(specs, (tuple, list)) or not all(
             isinstance(spec, ValueType) for spec in specs

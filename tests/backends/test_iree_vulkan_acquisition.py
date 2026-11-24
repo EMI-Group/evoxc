@@ -14,9 +14,15 @@ file pins WITHOUT a device, a Vulkan ICD or a compiler:
    Zero enumerated devices / an out-of-range index / a failing
    ``create_device`` each raise an actionable ``core.BackendError`` (an
    already-``EVOXCError`` propagates unwrapped, never double-wrapped).
-2. **Staging tier** (``iree._staged_input``): the CUDA pinned/DMA and ROCm
-   host-local tiers are CUDA/ROCm ONLY — ``"vulkan"`` has NO staging tier and
-   returns ``None`` immediately, so a vulkan upload IS the plain
+2. **Staging tier** (``iree._staged_input``): the staging fast path is chosen
+   EXPLICITLY by the resolved device kind. ``"cuda"`` runs the inline
+   pinned/DMA tiers, ``"rocm"`` takes ``_rocm_staged_input``, and ``"vulkan"``
+   delegates ONCE to ``_vulkan_staged_input`` (its mapped
+   ``DEVICE_LOCAL | HOST_VISIBLE`` tier up to ``_VULKAN_PINNED_MAX_BYTES``,
+   then the reusable host-source + ``queue_copy`` tier) with
+   ``one_shot=False`` on a plain run and ``one_shot=True`` from
+   ``upload_tensor`` (a placement call whose destination must be fresh). Any
+   OTHER kind returns ``None`` BEFORE any buffer work, so it takes the plain
    ``rt.asdevicearray`` copy.
 3. **Transfer provider** (``iree.register()``): the adapter registers
    ``upload_tensor`` under the PER-BACKEND slot ``("vulkan", "iree")`` AND —
@@ -83,8 +89,9 @@ class _FakeHalDevice:
 
     Deliberately carries NO ``allocator`` / ``create_semaphore`` /
     ``queue_copy``: any attempt to run a staging tier against it raises
-    ``AttributeError`` instead of silently succeeding, which is what makes
-    the "vulkan has no staging tier" pins structural rather than stylistic.
+    ``AttributeError`` instead of silently succeeding, so a test that wants a
+    staging attempt to stay out of the way gets the documented
+    ``rt.asdevicearray`` fallback — structurally, not by stylistic choice.
     """
 
     def __init__(self, index):
@@ -570,41 +577,82 @@ def test_create_device_evoxc_error_propagates_unwrapped(monkeypatch, error_type)
 
 
 # ---------------------------------------------------------------------------
-# 5. staging tier: vulkan has NONE (the cuda/rocm tiers are never reached)
+# 5. staging tier: vulkan has its OWN helper (the cuda/rocm tiers are never
+#    reached), and a kind with no tier falls back to ``asdevicearray``
 # ---------------------------------------------------------------------------
 
 
-def test_staged_input_returns_none_for_vulkan_without_touching_anything(
-    monkeypatch,
-):
-    """``"vulkan"`` returns None before ANY buffer work.
+def test_vulkan_staged_input_is_entered_once_with_oneshot_false(monkeypatch):
+    """``"vulkan"`` delegates to ``_vulkan_staged_input`` once, not one-shot.
 
-    The staged-inputs dict, the runtime HAL device and the tensor are all
-    access traps — the call can only succeed by not reading them (which also
-    pins that nothing is host-materialized and no ``asdevicearray`` upload
-    happens inside ``_staged_input``).
+    ``_vulkan_staged_input`` is monkeypatched, so this pins the DISPATCH — the
+    kind's own helper is the callee, it runs exactly once, and a plain run
+    passes ``one_shot=False`` (the segment-executable form, which may cache its
+    destination; ``upload_tensor`` passes ``one_shot=True`` — see section 7).
+    The cuda/rocm helpers are booby-trapped, so entering one fails the test.
+    The runtime HAL device and the tensor are otherwise untouched here: the
+    recorder is the callee, and the helper's own buffer work is its business.
     """
     driver = _FakeVulkanDriver(_INFOS)
     record = _install_fake_runtime(monkeypatch, {"vulkan": driver})
 
+    reached = []
+
+    def _boom(*args, **kwargs):
+        reached.append(args)
+        raise AssertionError("a cuda/rocm staging helper was entered for vulkan")
+
+    monkeypatch.setattr(iree_adapt, "_rocm_staged_input", _boom)
+    monkeypatch.setattr(iree_adapt, "_wait_copy_semaphore", _boom)
+
+    calls = []
+    sentinel = object()
+
+    def _record(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(iree_adapt, "_vulkan_staged_input", _record)
+
+    staged_inputs = {}
+    runtime_device = _Trap("runtime HAL device")
+    tensor = core.Tensor(np.arange(6, dtype=np.float32).reshape(2, 3))
+
     staged = iree_adapt._staged_input(
-        _Trap("staged_inputs"),
-        _Trap("runtime HAL device"),
-        0,
-        _Trap("tensor"),
-        "vulkan",
+        staged_inputs, runtime_device, 0, tensor, "vulkan"
     )
 
-    assert staged is None
+    assert staged is sentinel
+    assert reached == [], "no cuda/rocm helper may run for a vulkan input"
+    assert len(calls) == 1, "the vulkan helper is the callee, exactly once"
+    args, kwargs = calls[0]
+    assert args[:4] == (staged_inputs, runtime_device, 0, tensor)
+    assert kwargs == {"one_shot": False}
+    # ``_staged_input`` itself stages nothing and uploads nothing.
     assert record.asdevicearray == []
     assert record.get_driver == []
-    assert iree_adapt._HAL_DEVICE_CACHE.devices == {}
+
+    # The fallback half of the same contract: a kind with NO staging tier
+    # returns ``None`` BEFORE any buffer work — the staged-inputs dict, the
+    # runtime HAL device and the tensor are access traps here, so returning
+    # ``None`` is only possible by not reading any of them (the caller then
+    # takes the plain ``rt.asdevicearray`` copy).
+    assert (
+        iree_adapt._staged_input(
+            _Trap("staged_inputs"),
+            _Trap("runtime HAL device"),
+            0,
+            _Trap("tensor"),
+            "cpu",
+        )
+        is None
+    )
 
 
 def test_vulkan_staging_never_reaches_the_cuda_or_rocm_tiers(monkeypatch):
-    """The kind dispatch is explicit: no cuda/rocm staging helper is entered."""
+    """The kind dispatch is explicit: vulkan goes to ``_vulkan_staged_input``."""
     driver = _FakeVulkanDriver(_INFOS)
-    _install_fake_runtime(monkeypatch, {"vulkan": driver})
+    record = _install_fake_runtime(monkeypatch, {"vulkan": driver})
 
     reached = []
 
@@ -616,19 +664,35 @@ def test_vulkan_staging_never_reaches_the_cuda_or_rocm_tiers(monkeypatch):
     monkeypatch.setattr(iree_adapt, "_rocm_source_buffer", _boom)
     monkeypatch.setattr(iree_adapt, "_wait_copy_semaphore", _boom)
 
+    sentinel = object()
+    calls = []
+
+    def _vulkan(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(iree_adapt, "_vulkan_staged_input", _vulkan)
+
     tensor = core.Tensor(np.zeros((4,), np.float32))
     trap_device = _Trap("runtime HAL device")
 
-    assert iree_adapt._staged_input({}, trap_device, 0, tensor, "vulkan") is None
-    assert reached == []
+    assert (
+        iree_adapt._staged_input({}, trap_device, 0, tensor, "vulkan") is sentinel
+    )
+    assert reached == [], "only the vulkan helper may run for a vulkan input"
+    assert len(calls) == 1, "the vulkan helper is the callee"
+    assert record.asdevicearray == []
 
     # Positive controls: the SAME call DOES enter a tier for cuda and rocm,
     # which is what makes the vulkan pin above meaningful rather than vacuous.
+    # (cuda's tiers are inline in ``_staged_input``, so the trap device is what
+    # shows they were entered; rocm's helper is the booby trap itself.)
     with pytest.raises(AssertionError):
         iree_adapt._staged_input({}, trap_device, 0, tensor, "cuda")
     with pytest.raises(AssertionError):
         iree_adapt._staged_input({}, trap_device, 0, tensor, "rocm")
     assert len(reached) == 1, "exactly the rocm helper was entered"
+    assert len(calls) == 1, "the vulkan helper ran only for the vulkan call"
 
 
 # ---------------------------------------------------------------------------
@@ -733,20 +797,34 @@ def test_flat_slots_for_cuda_rocm_hip_keep_the_lazy_backends_thunks(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# 7. the vulkan upload IS the plain ``rt.asdevicearray`` copy
+# 7. ``upload_tensor``: ONE-SHOT vulkan staging, ``asdevicearray`` fallback
 # ---------------------------------------------------------------------------
 
 
-def test_vulkan_upload_is_the_plain_asdevicearray_copy(monkeypatch):
-    """``upload_tensor`` on vulkan: no staging tier, one ``asdevicearray``.
+def test_vulkan_upload_is_a_oneshot_staged_copy_that_falls_back_to_asdevicearray(
+    monkeypatch,
+):
+    """``upload_tensor`` on vulkan: ``one_shot=True``, then ``asdevicearray``.
 
-    The fake HAL device is a bare marker with no ``allocator`` /
-    ``create_semaphore`` / ``queue_copy``, so a staging attempt would raise
-    ``AttributeError`` — the plain copy path is what makes this test pass.
+    A placement upload goes through the vulkan staging helper with
+    ``one_shot=True`` (fresh DESTINATION buffers — the returned tensor owns
+    its buffer, never a cache entry). The fake HAL device here is a bare
+    marker with no ``allocator`` / ``create_semaphore`` / ``queue_copy``, so
+    every tier of that helper fails and returns ``None``, which is the
+    documented fallback: ONE plain ``rt.asdevicearray`` copy.
     """
     monkeypatch.delenv("EVOXC_IREE_RUNTIME_ARGS", raising=False)
     driver = _FakeVulkanDriver(_INFOS)
     record = _install_fake_runtime(monkeypatch, {"vulkan": driver})
+
+    one_shots = []
+    real_vulkan_staged_input = iree_adapt._vulkan_staged_input
+
+    def _record(*args, **kwargs):
+        one_shots.append(kwargs.get("one_shot"))
+        return real_vulkan_staged_input(*args, **kwargs)
+
+    monkeypatch.setattr(iree_adapt, "_vulkan_staged_input", _record)
 
     host = core.Tensor(np.arange(6, dtype=np.float32).reshape(2, 3))
     placed = iree_adapt.upload_tensor(host, VULKAN0)
@@ -757,12 +835,15 @@ def test_vulkan_upload_is_the_plain_asdevicearray_copy(monkeypatch):
     assert placed.shape == (2, 3)
     assert placed.dtype == np.dtype(np.float32)
 
+    # The staging helper was TRIED, as a one-shot placement upload ...
+    assert one_shots == [True]
+    # ... and its bare-device failure folded into the plain copy fallback.
     assert len(record.asdevicearray) == 1
     runtime_device, uploaded = record.asdevicearray[0]
     assert runtime_device is driver.devices[0]
     assert isinstance(uploaded, np.ndarray)
     np.testing.assert_array_equal(uploaded, host.numpy())
-    # The upload ran on a staging-free HAL device handle.
+    # The upload ran on a HAL device handle with no allocator at all.
     assert not hasattr(driver.devices[0], "allocator")
 
     # The explicit download path needs no vulkan-specific code (the payload's
@@ -771,7 +852,9 @@ def test_vulkan_upload_is_the_plain_asdevicearray_copy(monkeypatch):
         placed.to(core.Device("cpu", 0)).numpy(), host.numpy()
     )
 
-    # A second upload reuses the thread-local HAL device (one create_device).
+    # A second upload is one-shot again, and reuses the thread-local HAL
+    # device (one create_device).
     iree_adapt.upload_tensor(host, VULKAN0)
+    assert one_shots == [True, True]
     assert len(driver.create_calls) == 1
     assert len(record.asdevicearray) == 2

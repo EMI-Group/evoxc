@@ -123,8 +123,8 @@ class Op:
         operands = list(self.operands)
         operands[index] = new
         self.operands = tuple(operands)
-        for use in old.uses:
+        for position, use in enumerate(old.uses):
             if use.owner is self and use.operand_index == index:
-                old.uses.remove(use)
+                old._drop_use_at(position)
                 break
         new.add_use(Use(self, index))

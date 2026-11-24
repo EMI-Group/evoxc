@@ -1,10 +1,12 @@
 """Checkpoint readers for ``evoxc_hf`` — safetensors and both torch formats.
 
-Three readers, all pure ``numpy`` + stdlib (no ``torch``, no ``safetensors``
-package, no evoxc tensor API):
+Three readers, all pure ``numpy`` + stdlib + public ``evoxc`` (no ``torch``, no
+``safetensors`` package):
 
-* :func:`read_safetensors` — the safetensors container
-  (``u64 LE header length`` + JSON header + raw tensor buffer).
+* :func:`read_safetensors` — the safetensors container, parsed by the public
+  :func:`evoxc.formats.load_safetensors` reader (the ONE safetensors
+  implementation in this repository); this module only applies the dtype and
+  ownership policy below.
 * :func:`read_torch_bin` — ``pytorch_model.bin``, in **both** on-disk formats:
   the zip format (torch ≥ 1.6: ``*/data.pkl`` + ``*/data/<key>`` storage blobs,
   each blob being the storage's raw bytes with **no** length prefix) and the
@@ -52,6 +54,8 @@ from pathlib import Path
 
 import numpy as np
 
+from evoxc.core import PersistenceError
+from evoxc.formats import load_safetensors
 from evoxc_hf.errors import HFWeightError
 
 __all__ = [
@@ -62,23 +66,27 @@ __all__ = [
     "state_dict_parameter_count",
 ]
 
-#: safetensors dtype tag → numpy dtype (``None`` = bfloat16, handled specially:
-#: numpy has no bfloat16, so the raw u16 words are widened to float32).
-_SAFETENSORS_DTYPES: dict[str, np.dtype | None] = {
-    "F64": np.dtype(np.float64),
-    "F32": np.dtype(np.float32),
-    "F16": np.dtype(np.float16),
-    "BF16": None,
-    "I64": np.dtype(np.int64),
-    "I32": np.dtype(np.int32),
-    "I16": np.dtype(np.int16),
-    "I8": np.dtype(np.int8),
-    "U8": np.dtype(np.uint8),
-    "U16": np.dtype(np.uint16),
-    "U32": np.dtype(np.uint32),
-    "U64": np.dtype(np.uint64),
-    "BOOL": np.dtype(np.bool_),
-}
+#: safetensors dtype tags this package turns into parameter arrays.  The shared
+#: reader also accepts the fp8 tags (``F8_E4M3``/``F8_E5M2``), which it surfaces
+#: as raw ``uint8`` storage words because evoxc has no fp8 dtype — they (like any
+#: future tag) are rejected here instead of leaking an unusable parameter dtype.
+_SUPPORTED_SAFETENSORS_DTYPES = frozenset(
+    {
+        "F64",
+        "F32",
+        "F16",
+        "BF16",
+        "I64",
+        "I32",
+        "I16",
+        "I8",
+        "U8",
+        "U16",
+        "U32",
+        "U64",
+        "BOOL",
+    }
+)
 
 #: torch storage class name → numpy dtype (``_BF16`` = raw u16 bfloat16 words).
 _BF16 = "bfloat16"
@@ -163,111 +171,47 @@ def state_dict_parameter_count(state_dict: dict[str, np.ndarray]) -> int:
 def read_safetensors(path) -> dict[str, np.ndarray]:
     """Read a ``.safetensors`` file into ``{tensor_name: ndarray}``.
 
-    Layout: 8-byte little-endian header length, a UTF-8 JSON header of
-    ``{name: {"dtype", "shape", "data_offsets"}}`` (plus an optional
-    ``"__metadata__"`` entry, which is skipped), then the raw tensor buffer.
-    Offsets, element counts and dtype tags are validated against the file —
-    any inconsistency raises :class:`~evoxc_hf.errors.HFWeightError` naming the
-    tensor. Dtypes follow the module dtype policy (f16/bf16 → f32).
+    Container parsing, header validation and the ``__metadata__`` skip are the
+    public :func:`evoxc.formats.load_safetensors` reader's job — this function
+    is the ``evoxc_hf`` policy on top of it: the module dtype policy
+    (f16/bf16 → f32), an owning writable array per tensor (see
+    :func:`_safetensors_parameter`), and :class:`~evoxc_hf.errors.HFWeightError`
+    for every container failure (the reader's ``PersistenceError`` is wrapped
+    verbatim, so its file/tensor/offset diagnostics survive).
     """
     path = Path(path)
     try:
-        blob = path.read_bytes()
-    except OSError as exc:
-        raise HFWeightError(f"{path}: cannot read safetensors file: {exc}") from exc
-    if len(blob) < 8:
-        raise HFWeightError(
-            f"{path}: file is {len(blob)} bytes — too short to hold a safetensors header length"
-        )
-    (header_len,) = struct.unpack("<Q", blob[:8])
-    if header_len == 0 or 8 + header_len > len(blob):
-        raise HFWeightError(
-            f"{path}: safetensors header length {header_len} does not fit in a "
-            f"{len(blob)}-byte file"
-        )
-    try:
-        header = json.loads(blob[8 : 8 + header_len].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HFWeightError(f"{path}: invalid safetensors JSON header: {exc}") from exc
-    if not isinstance(header, dict):
-        raise HFWeightError(
-            f"{path}: safetensors header must be a JSON object, got {type(header).__name__}"
-        )
-    buffer = memoryview(blob)[8 + header_len :]
-    out: dict[str, np.ndarray] = {}
-    for name, info in header.items():
-        if name == "__metadata__":
-            continue
-        out[name] = _read_safetensors_tensor(path, name, info, buffer)
-    return {name: widen_to_float32(array) for name, array in out.items()}
+        container = load_safetensors(path)
+        with container:
+            return {
+                name: _safetensors_parameter(path, name, container)
+                for name in container.tensor_names()
+            }
+    except PersistenceError as exc:
+        raise HFWeightError(str(exc)) from exc
 
 
-def _read_safetensors_tensor(
-    path: Path, name: str, info, buffer: memoryview
-) -> np.ndarray:
-    """Decode one safetensors header entry into an owning ``ndarray``."""
-    if not isinstance(info, dict):
+def _safetensors_parameter(path: Path, name: str, container) -> np.ndarray:
+    """One container tensor → an owning, writable, dtype-policed ``ndarray``.
+
+    The shared reader returns **read-only zero-copy views** over the mapped
+    file.  A parameter must own writable memory instead: the per-family
+    canonicalisers build new trees from it, the pack layer concatenates it, and
+    a mapped view would pin the checkpoint file (and its pages) for as long as
+    the params live.  So the copy is explicit here, once per tensor — never a
+    mutation of the mapped view.
+    """
+    info = container.info(name)
+    tag = info.source_dtype
+    if tag not in _SUPPORTED_SAFETENSORS_DTYPES:
         raise HFWeightError(
-            f"{path}: safetensors entry {name!r} must be a JSON object, "
-            f"got {type(info).__name__}"
+            f"{path}: tensor {name!r} uses unsupported safetensors dtype {tag!r}; "
+            f"supported: {sorted(_SUPPORTED_SAFETENSORS_DTYPES)}"
         )
-    dtype_tag = info.get("dtype")
-    if not isinstance(dtype_tag, str):
-        raise HFWeightError(
-            f"{path}: safetensors entry {name!r} has no string 'dtype' (got {dtype_tag!r})"
-        )
-    if dtype_tag not in _SAFETENSORS_DTYPES:
-        raise HFWeightError(
-            f"{path}: tensor {name!r} uses unsupported safetensors dtype {dtype_tag!r}; "
-            f"supported: {sorted(_SAFETENSORS_DTYPES)}"
-        )
-    shape_raw = info.get("shape")
-    if not isinstance(shape_raw, (list, tuple)):
-        raise HFWeightError(
-            f"{path}: tensor {name!r} has no list 'shape' (got {shape_raw!r})"
-        )
-    shape = []
-    for dim in shape_raw:
-        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
-            raise HFWeightError(
-                f"{path}: tensor {name!r} has invalid dimension {dim!r} in shape {shape_raw!r}"
-            )
-        shape.append(dim)
-    offsets = info.get("data_offsets")
-    if (
-        not isinstance(offsets, (list, tuple))
-        or len(offsets) != 2
-        or not all(isinstance(o, int) and not isinstance(o, bool) for o in offsets)
-    ):
-        raise HFWeightError(
-            f"{path}: tensor {name!r} has invalid 'data_offsets' {offsets!r} "
-            f"(expected [begin, end])"
-        )
-    begin, end = offsets
-    if begin < 0 or end < begin:
-        raise HFWeightError(
-            f"{path}: tensor {name!r} has invalid data offsets [{begin}, {end}]"
-        )
-    if end > len(buffer):
-        raise HFWeightError(
-            f"{path}: tensor {name!r} claims data_offsets [{begin}, {end}] but the file's "
-            f"data buffer is only {len(buffer)} bytes"
-        )
-    numel = int(np.prod(shape, dtype=np.int64)) if shape else 1
-    np_dtype = _SAFETENSORS_DTYPES[dtype_tag]
-    itemsize = 2 if np_dtype is None else np_dtype.itemsize
-    expected = numel * itemsize
-    if end - begin != expected:
-        raise HFWeightError(
-            f"{path}: tensor {name!r} has shape {tuple(shape)} × {dtype_tag} "
-            f"({expected} bytes) but data_offsets span {end - begin} bytes"
-        )
-    raw = buffer[begin:end]
-    if np_dtype is None:
-        words = np.frombuffer(raw, dtype=np.dtype("<u2")).reshape(shape)
-        return _bf16_words_to_float32(words)
-    values = np.frombuffer(raw, dtype=np_dtype.newbyteorder("<")).reshape(shape)
-    return values.astype(np_dtype, copy=True)
+    values = np.array(container.tensor(name).numpy(), copy=True)
+    if tag == "BF16":
+        return _bf16_words_to_float32(values)
+    return widen_to_float32(values)
 
 
 # ---------------------------------------------------------------------------

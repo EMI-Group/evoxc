@@ -1,0 +1,39 @@
+[package]
+name = "evoxc-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "PyO3 extension module evoxc._evoxc_native: the inference/transform/CPU-engine bridge over the evoxc facade."
+[lib]
+name = "evoxc_python"
+crate-type = ["cdylib"]
+[dependencies]
+evoxc = { workspace = true, features = ["full"] }
+serde_json.workspace = true
+# `half` and `num-complex` type the `Storage` variants of `evoxc::cpu`'s
+# `Buffer`; the binding transfers them to/from numpy as typed arrays.  Same
+# semver as `evoxc::cpu` and as `numpy`'s own optional/mandatory deps, so cargo
+# unifies the crates and `Storage`'s `f16`/`Complex` are the very types numpy
+# expects.
+half = "2"
+num-complex = "0.4"
+# The typed numpy bridge: `numpy` 0.30 pairs with pyo3 0.30 (the `half` feature
+# adds the `f16` element type), and `ndarray` 0.17 is the array type it exposes.
+numpy = { version = "0.30", features = ["half"] }
+ndarray = "0.17"
+# Deliberately not `pyo3.workspace = true`: the workspace entry hard-enables
+# `extension-module`, and an extension-module build does not link libpython, so
+# a `cargo test` binary that touches the Python API cannot link.  The
+# `extension-module` feature below is on by DEFAULT (the cdylib build path used
+# by `scripts/build-native.sh`); `auto-init` is the test-only alternative that
+# links libpython and initializes an interpreter for the conversion/error tests.
+pyo3 = { version = "0.30", features = ["macros", "abi3-py311"], default-features = false }
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+auto-init = ["pyo3/auto-initialize"]

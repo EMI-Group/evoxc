@@ -333,7 +333,7 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
 
         graph = evoxc.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
-        artifact = compile(lowered, **options)
+        artifact = compile(lowered, backend=backend, **options)
         exe = load(artifact, backend=backend, device=device, **options)
 
     Semantics (binding):
@@ -347,6 +347,13 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
       graph = a distinct cache entry. A runtime tensor in the program slot
       is an ordinary graph input and is keyed ONCE on its ``TensorSpec`` —
       never specialized per value (documented; no runtime warning).
+    * A passed ``Backend`` INSTANCE is the one used at the ``lower``,
+      ``compile`` AND ``load`` hops (resolved once by
+      ``_resolve_backend_device``), exactly as in ``evoxc.build``. The key
+      records only the resolved backend NAME, so two distinct instances
+      sharing a name share a cache key — their options are still forwarded
+      per call, but a hit returns the executable built by the FIRST of
+      them; pass a fresh ``CompileCache`` to keep same-name instances apart.
     * Defaults: unset ``backend``/``device`` resolve exactly as in
       ``evoxc.build`` (``EVOXC_BACKEND``/``EVOXC_DEVICE``/``EVOXC_TARGET_BACKENDS``
       read lazily per call; the resolved values participate in the key).
@@ -428,7 +435,9 @@ def build_cached(fn, *specs, backend=None, device=None, cache=None, **options):
         # fallback (binding).
         graph = trace_fn(fn, *specs)
         lowered = lower(graph, backend=resolved_backend, **resolved_options)
-        artifact = compile(lowered, **resolved_options)
+        artifact = compile(
+            lowered, backend=resolved_backend, **resolved_options
+        )
         return load(
             artifact,
             backend=resolved_backend,

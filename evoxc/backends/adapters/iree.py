@@ -104,10 +104,12 @@ imported at module top level, so ``import evoxc`` stays light):
   first (see
   ``upload_tensor``), and a non-device input at a GPU run is rejected with
   ``core.DeviceError``. Host-mode external-kernel boundaries still stage
-  host tensors at kernel boundaries via ``_staged_input`` (cuda AND rocm
-  segment executables each have their own persistent staging cache — see
-  ``_staged_input`` for the two per-kind fast paths; a vulkan boundary has
-  NO staging tier and uses ``rt.asdevicearray`` directly);
+  host tensors at kernel boundaries via ``_staged_input`` (cuda, rocm and
+  vulkan segment executables each have their own persistent staging cache —
+  see ``_staged_input`` for the per-kind fast paths: the cuda pinned/DMA
+  tiers, the rocm and vulkan host-local source + ``queue_copy`` tiers, and
+  vulkan's extra mapped ``DEVICE_LOCAL | HOST_VISIBLE`` tier up to
+  ``_VULKAN_PINNED_MAX_BYTES`` when the allocation is host-coherent);
   ``rt.asdevicearray`` remains the fallback for oversized/unmappable inputs
   and for any failure on a kind's fast path.
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
@@ -165,9 +167,12 @@ to stdlib + ``evoxc.core`` + the sibling modules ``compiler`` / ``registry`` /
 from __future__ import annotations
 
 import base64
+import importlib
 import os
 import re
+import sys
 import threading
+import types
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -178,6 +183,260 @@ from ..backend import Capabilities
 from ..compiler import CompilerBackend, CompilerExecutable
 from ..program import CompiledArtifact, LoweredProgram, Signature
 from ..registry import register as _registry_register
+
+# ---------------------------------------------------------------------------
+# Custom IREE module resolution (``iree_compiler_module`` / ``iree_runtime_module``)
+# ---------------------------------------------------------------------------
+# ``evoxc`` normally imports the published ``iree.compiler`` / ``iree.runtime``
+# Python packages. A CUSTOM-BUILT IREE may ship its Python packages under a
+# different dotted name, so the compile stage accepts
+# ``iree_compiler_module`` and the load stage accepts ``iree_runtime_module``:
+# ``None`` (the default — today's ``iree.compiler`` / ``iree.runtime``), a
+# module object, or a non-empty dotted module-path string resolved with
+# ``importlib.import_module``. Precedence is the binding
+# ``explicit option > env var > default`` (env names below; empty/whitespace
+# env = unset). Every internal iree use routes through the resolvers, so a
+# custom module is honored end to end; the module OBJECT has no channel into
+# the option-less sites (placement/readback have no options dict), which
+# resolve the env var — the payloads/executables carry the resolved module.
+_COMPILER_MODULE_OPTION = "iree_compiler_module"
+_RUNTIME_MODULE_OPTION = "iree_runtime_module"
+_COMPILER_MODULE_ENV = "EVOXC_IREE_COMPILER_MODULE"
+_RUNTIME_MODULE_ENV = "EVOXC_IREE_RUNTIME_MODULE"
+_DEFAULT_COMPILER_MODULE = "iree.compiler"
+_DEFAULT_RUNTIME_MODULE = "iree.runtime"
+
+#: Resolved-module caches, keyed by the RESOLVED value (the dotted string, or
+#: the default module name for ``None``) — modules themselves are returned
+#: directly (a module object IS the resolution). A plain dict under the GIL is
+#: enough: the values are immutable module handles and every writer stores the
+#: same object for the same key.
+_COMPILER_MODULE_CACHE: dict[Any, Any] = {}
+_RUNTIME_MODULE_CACHE: dict[Any, Any] = {}
+
+
+def _resolve_module_option(
+    option: str,
+    value: Any,
+    env_var: str,
+    default_module_name: str,
+    cache: dict,
+) -> Any:
+    """Resolve one module-valued pipeline option (validated, loud on error).
+
+    ``value`` is the caller's option value: ``None`` (fall through to the env
+    var, then the default module name), a ``types.ModuleType`` (used as-is),
+    or a non-empty dotted module-path string (imported). Anything else — a
+    non-str/non-module value, an empty/whitespace string, or a string that
+    fails to import — raises ``core.BackendError`` naming the option, the
+    offending value and every accepted form; a raw ``ImportError`` /
+    ``TypeError`` never escapes. Resolved modules are cached in ``cache``
+    keyed by the resolved value, so the run path pays nothing after the first
+    call.
+    """
+    if value is None:
+        env_value = os.environ.get(env_var)
+        if env_value is not None and env_value.strip():
+            value = env_value.strip()
+    if isinstance(value, types.ModuleType):
+        return value
+    if value is None:
+        module_name = default_module_name
+    elif isinstance(value, str):
+        module_name = value.strip()
+        if not module_name:
+            raise core.BackendError(
+                f"the {IreeBackend.name} {option!r} option must be None, a "
+                f"module object, or a non-empty dotted module-path string "
+                f"(resolved with importlib.import_module); got {value!r}"
+            )
+    else:
+        raise core.BackendError(
+            f"the {IreeBackend.name} {option!r} option must be None, a "
+            f"module object (types.ModuleType), or a non-empty dotted "
+            f"module-path string (resolved with importlib.import_module); "
+            f"got {value!r} of type {type(value).__name__}"
+        )
+    cached = cache.get(module_name)
+    # The cache is keyed by the module NAME, so the entry is validated against
+    # the module CURRENTLY registered under that name: a process that re-binds
+    # ``sys.modules[module_name]`` (a swapped/reloaded module, or a fake
+    # installed by a test) is never served a stale handle. In the steady state
+    # both objects are identical, so this costs one dict lookup.
+    if cached is not None and sys.modules.get(module_name) is cached:
+        return cached
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        raise core.BackendError(
+            f"the {IreeBackend.name} {option!r} option names the module "
+            f"{module_name!r}, which could not be imported: {exc}. Pass "
+            f"None (the default {default_module_name!r}), a module object, "
+            f"or a non-empty dotted module-path string naming an importable "
+            f"module"
+        ) from exc
+    cache[module_name] = module
+    return module
+
+
+def _module_option_supplied(options: dict | None, option: str, env_var: str) -> bool:
+    """True when a CUSTOM module was supplied for ``option`` (option or env).
+
+    Drives the stage's dependency probe: a supplied custom module is validated
+    directly (its own attributes), while an unset option keeps the byte-for-
+    byte ``check_available()`` default probe (both IREE packages).
+    """
+    if (options or {}).get(option) is not None:
+        return True
+    env_value = os.environ.get(env_var)
+    return env_value is not None and bool(env_value.strip())
+
+
+def _compiler_module(options: dict | None = None) -> Any:
+    """The resolved IREE COMPILER module (``iree_compiler_module`` option).
+
+    Default/env-resolved to ``iree.compiler``; see ``_resolve_module_option``
+    for the accepted forms and the failure contract. The compiled module is
+    used by ``_compile_mlir`` (and its ``CompilerToolError`` comes from the
+    SAME module as ``compile_str``).
+    """
+    return _resolve_module_option(
+        _COMPILER_MODULE_OPTION,
+        (options or {}).get(_COMPILER_MODULE_OPTION),
+        _COMPILER_MODULE_ENV,
+        _DEFAULT_COMPILER_MODULE,
+        _COMPILER_MODULE_CACHE,
+    )
+
+
+def _runtime_module(options: dict | None = None) -> Any:
+    """The resolved IREE RUNTIME module (``iree_runtime_module`` option).
+
+    Default/env-resolved to ``iree.runtime``; see ``_resolve_module_option``
+    for the accepted forms and the failure contract. Every runtime use in this
+    module (device acquisition, staging, readback, DLPack, module loading)
+    routes through the module resolved here — carried explicitly on the
+    objects that outlive the options dict (payloads, executables).
+    """
+    return _resolve_module_option(
+        _RUNTIME_MODULE_OPTION,
+        (options or {}).get(_RUNTIME_MODULE_OPTION),
+        _RUNTIME_MODULE_ENV,
+        _DEFAULT_RUNTIME_MODULE,
+        _RUNTIME_MODULE_CACHE,
+    )
+
+
+def _default_runtime_module() -> Any:
+    """The module the DEFAULT runtime path resolves: ``iree.runtime``.
+
+    A plain ``sys.modules`` lookup through ``importlib.import_module`` — never a
+    memoized handle, because a reload (or a test double re-binding
+    ``sys.modules["iree.runtime"]``) must be visible to the identity test in
+    ``_module_cache_prefix``. Returns ``None`` when the default module is not
+    importable at all: a CUSTOM ``iree_runtime_module`` may be in play on a host
+    where ``iree.runtime`` is absent, and ``None`` is never a module, so the
+    prefix rule below still distinguishes the two exactly.
+    """
+    try:
+        return importlib.import_module(_DEFAULT_RUNTIME_MODULE)
+    except Exception:
+        return None
+
+
+def _module_cache_prefix(rt: Any) -> tuple:
+    """Leading component of a run-path cache key for the RESOLVED runtime ``rt``.
+
+    ``()`` for the DEFAULT module (``_default_runtime_module()``) — the default
+    path's key shape is a pinned EXTERNAL contract (the acquisition pins read
+    ``_HAL_DEVICE_CACHE.devices[("vulkan", 0, ())]`` directly), so no historical
+    key may gain a component — and ``(rt,)`` for a CUSTOM module (an explicit
+    ``iree_runtime_module`` option or ``EVOXC_IREE_RUNTIME_MODULE``).
+
+    A custom module must never share a cached entry with the default module:
+    two IREE builds have SEPARATE handle/allocator spaces, so a HAL device (or
+    staging buffer, or element-type mapping) cached from one is meaningless in
+    the other; distinct custom modules are separated by their own identity.
+    """
+    return () if rt is _default_runtime_module() else (rt,)
+
+
+def _validate_compiler_module(module: Any) -> None:
+    """Validate a SUPPLIED compiler module's adapter-facing surface.
+
+    A custom ``iree_compiler_module`` replaces the ``check_available()``
+    default probe: the adapter calls ``compile_str`` and catches
+    ``CompilerToolError`` on that SAME module, so both must be present —
+    otherwise a loud ``core.BackendError`` naming the option, the module and
+    the missing attribute (never a raw ``AttributeError`` mid-compile).
+    """
+    if not callable(getattr(module, "compile_str", None)):
+        raise core.BackendError(
+            f"the {IreeBackend.name} {_COMPILER_MODULE_OPTION!r} option "
+            f"resolved to module {getattr(module, '__name__', module)!r}, "
+            "which exposes no callable 'compile_str' — a custom IREE compiler "
+            "module must provide 'compile_str(text, target_backends=..., "
+            "input_type=..., extra_args=...)'"
+        )
+    if not hasattr(module, "CompilerToolError"):
+        raise core.BackendError(
+            f"the {IreeBackend.name} {_COMPILER_MODULE_OPTION!r} option "
+            f"resolved to module {getattr(module, '__name__', module)!r}, "
+            "which exposes no 'CompilerToolError' attribute — a custom IREE "
+            "compiler module must provide it (the adapter re-raises it as "
+            "core.BackendError carrying the compiler diagnostics)"
+        )
+
+
+def _validate_runtime_module(module: Any) -> None:
+    """Validate a SUPPLIED runtime module's adapter-facing surface.
+
+    A custom ``iree_runtime_module`` replaces the ``check_available()``
+    default probe: the adapter drives ``get_driver`` (device acquisition),
+    ``DeviceArray`` (run outputs/pass-through/staging) and ``load_vm_module``
+    (module loading) on that module, so all three must be present — otherwise
+    a loud ``core.BackendError`` naming the option, the module and the missing
+    attribute.
+    """
+    module_name = getattr(module, "__name__", module)
+    for attribute in ("get_driver", "DeviceArray", "load_vm_module"):
+        if not hasattr(module, attribute):
+            raise core.BackendError(
+                f"the {IreeBackend.name} {_RUNTIME_MODULE_OPTION!r} option "
+                f"resolved to module {module_name!r}, which exposes no "
+                f"{attribute!r} attribute — a custom IREE runtime module must "
+                "provide at least 'get_driver', 'DeviceArray' and "
+                "'load_vm_module'"
+            )
+
+
+def _runtime_submodule(runtime_module: Any, name: str) -> Any:
+    """Return ``runtime_module``'s ``name`` submodule.
+
+    A custom module object may expose its own submodules as ATTRIBUTES; the
+    real ``iree.runtime`` imports them lazily, so attribute access is tried
+    first and the resolved module's own package
+    (``f"{runtime_module.__name__}.{name}"``) is the fallback. A missing
+    submodule raises a loud ``core.BackendError`` naming the module and the
+    submodule — never a raw ``ImportError``.
+    """
+    submodule = getattr(runtime_module, name, None)
+    if isinstance(submodule, types.ModuleType):
+        return submodule
+    package = getattr(runtime_module, "__name__", None)
+    if package:
+        try:
+            return importlib.import_module(f"{package}.{name}")
+        except Exception as exc:
+            raise core.BackendError(
+                f"the resolved IREE runtime module {package!r} exposes no "
+                f"{name!r} submodule (and no {name!r} attribute): {exc}"
+            ) from exc
+    raise core.BackendError(
+        f"the resolved IREE runtime module {runtime_module!r} exposes no "
+        f"{name!r} submodule and has no module name to import it from"
+    )
+
 
 # ---------------------------------------------------------------------------
 # CUDA host->device upload configuration (measured on IREE 3.11.0, RTX A6000)
@@ -268,9 +527,46 @@ _ROCM_SOURCE_CACHE_MAX = 16
 # cache would hand the ``evoxc.io`` worker thread a device created on another
 # thread and break it.
 _HAL_DEVICE_CACHE = threading.local()
-# THREAD-LOCAL reusable host-source buffers for the rocm staging path,
-# keyed by (shape, dtype) with the owning runtime device checked by identity.
+# THREAD-LOCAL reusable host-source buffers for the rocm/vulkan copy-tier
+# staging paths, keyed by (shape, dtype) with the owning runtime device checked
+# by identity.
 _ROCM_SOURCE = threading.local()
+# ---------------------------------------------------------------------------
+# Vulkan host<->device transfer configuration (see ``_vulkan_staged_input``)
+# ---------------------------------------------------------------------------
+# MEASURED on this host: Intel Graphics (PTL) iGPU 8086:b0a0 through Mesa
+# 26.3.0 ANV on iree-base-runtime 3.13.0, f32, medians of interleaved A/B
+# rounds (>= 7 reps each after warmup; the host is SHARED with other workloads,
+# so absolute numbers drift 2-3x between windows — the RATIOS are stable).
+# Incoming direction, 64 MB, before -> after:
+#   rt.asdevicearray            16.4 ms  (4.1 GB/s)
+#   host source + queue_copy     6.0 ms  (11.1 GB/s)
+#   mapped DEVICE_LOCAL write    3.1 ms  (21.8 GB/s)
+# so the vulkan upload takes the same two tiers as cuda, dispatched
+# explicitly by kind: a mapped host-write tier (persistent per (index, shape,
+# dtype) buffer for the segment executables, FRESH buffer for the one-shot
+# ``upload_tensor`` placement path) and a host-source + ``queue_copy`` tier.
+# The mapped tier is used up to ``_VULKAN_PINNED_MAX_BYTES``; above it the
+# copy tier carries the upload (still 2.9-3.3x faster than asdevicearray at
+# 64-128 MB). Unlike the cuda pinned tier the mapped write is CORRECT on the
+# vulkan HAL by memory coherence (the allocator hands back a HOST_COHERENT
+# host-visible allocation and a coherent host write is visible to the next
+# queue submission), not by a driver serialization guarantee — see
+# ``_vulkan_pinned_buffer`` for the coherence gate.
+# MEASURED crossover for the ONE-SHOT (fresh destination) form — mapped write
+# vs host source + queue_copy, same run: 16 MB 1.38 vs 3.09 ms (mapped wins),
+# 32 MB 5.02 vs 4.40 (copy wins), 64 MB 9.11 vs 7.05, 128 MB 25.6 vs 18.7:
+# a fresh 16 MB host-visible allocation still first-touches cheaply, a fresh
+# 32 MB one does not. The single ``_VULKAN_PINNED_MAX_BYTES`` cutoff below
+# (16 MB) therefore sits on the measured crossover, and the CACHED mapped
+# tier — which pays no first-touch after the first call — stays faster at
+# every size measured (64 MB 11.6 vs 14.7, 128 MB 29.0 vs 40.5); the cutoff is
+# kept at 16 MB anyway so the staging footprint matches the cuda/rocm cap.
+_VULKAN_PINNED_MAX_BYTES = 16 * 1024 * 1024
+# Alignment a host allocation must satisfy to be imported into the vulkan HAL
+# (``minImportedHostPointerAlignment``); the readback below over-allocates and
+# offsets to reach it.
+_HOST_IMPORT_ALIGNMENT = 4096
 
 # ---------------------------------------------------------------------------
 # Compile-flag policy (the options-override contract — see ../options.py)
@@ -575,7 +871,8 @@ _GPU_DEVICE_KINDS = frozenset({"cuda", "rocm", "vulkan"})
 # placement provider's kind gate. It is NOT "takes the cuda staging tier": the
 # pinned/DMA tier in ``_staged_input`` stays CUDA-ONLY, because its
 # correctness rests on a CUDA-driver ordering guarantee that is unverified
-# elsewhere (a vulkan upload uses the plain ``rt.asdevicearray`` path).
+# elsewhere (rocm and vulkan have their own tiers — ``_rocm_staged_input`` and
+# ``_vulkan_staged_input``).
 
 
 def _normalize_device_kind(kind: str) -> str:
@@ -625,7 +922,10 @@ def _expected_target_for_kind(device_kind: str) -> str:
 
 
 def _acquire_runtime_device(
-    device_kind: str, device: Device | None, runtime_args: list[str]
+    device_kind: str,
+    device: Device | None,
+    runtime_args: list[str],
+    rt: Any = None,
 ) -> Any:
     """Acquire the IREE runtime HAL device (shared by single/segment loads).
 
@@ -650,10 +950,11 @@ def _acquire_runtime_device(
     the calling thread (``_acquire_vulkan_device``), which is what makes
     ``load()`` and the placement provider share ONE HAL device.
     """
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     if device_kind == "vulkan":
-        return _acquire_vulkan_device(device, runtime_args)
+        return _acquire_vulkan_device(device, runtime_args, rt)
     if device_kind in _GPU_DEVICE_KINDS:
         if device_kind == "cuda":
             _configure_cuda_runtime_flags()
@@ -701,7 +1002,9 @@ def _cached_hal_device(key: tuple, factory: Any) -> Any:
     return runtime_device
 
 
-def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> Any:
+def _acquire_vulkan_device(
+    device: Device | None, runtime_args: list[str], rt: Any = None
+) -> Any:
     """Acquire (or reuse) ONE Vulkan HAL device per thread.
 
     IREE Vulkan ``device_id`` values are QUERIED PER-PROCESS HASHES (the
@@ -712,7 +1015,10 @@ def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> An
     dict of ``Device("vulkan", index)``.
 
     The device is CACHED per ``(index, runtime args)`` on the calling thread
-    via ``_cached_hal_device`` — the same thread-local cache the rocm
+    via ``_cached_hal_device`` — prefixed with the resolved module only for a
+    CUSTOM runtime module, so the default module keeps the historical key shape
+    while a custom module never reuses a default-module HAL device (see
+    ``_module_cache_prefix``) — the same thread-local cache the rocm
     placement path uses, and for the same reason (HAL devices are
     thread-affine and repeated ``create_device`` calls are costly). Because
     the cache lookup lives HERE, ``load()`` and the ``upload_tensor``
@@ -733,7 +1039,8 @@ def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> An
     ``create_device`` failure is surfaced as ``core.BackendError`` naming the
     requested device, never a raw iree exception.
     """
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     index = 0 if device is None else device.index
 
@@ -782,18 +1089,24 @@ def _acquire_vulkan_device(device: Device | None, runtime_args: list[str]) -> An
             ) from exc
 
     return _cached_hal_device(
-        ("vulkan", index, tuple(runtime_args or ())), _create
+        _module_cache_prefix(rt) + ("vulkan", index, tuple(runtime_args or ())),
+        _create,
     )
 
 
-def _acquire_cached_rocm_device(device: Device, runtime_args: list[str]) -> Any:
+def _acquire_cached_rocm_device(
+    device: Device, runtime_args: list[str], rt: Any = None
+) -> Any:
     """Acquire (or reuse) ONE ROCm/HIP HAL device per thread.
 
     ``driver.create_device`` measured ~46 ms per call on the ROCm HIP driver
     (IREE 3.11.0 / MI300X) and does NOT warm up, so a fresh device per
     ``upload_tensor`` made every rocm placement pay ~34-40 ms of pure setup
     on top of the copy. This cache reuses the device across uploads on the
-    SAME THREAD, keyed by ``(normalized kind, device index, runtime args)``.
+    SAME THREAD, keyed by ``(normalized kind, device index, runtime args)``
+    (``_module_cache_prefix`` prepends the resolved module for a CUSTOM one, so
+    a custom module never reuses a default-module HAL device and vice versa,
+    while the default module keeps the historical key shape).
 
     THREAD-LOCAL IS REQUIRED (not an optimization choice): CUDA/ROCm HAL
     devices are THREAD-AFFINE — the ``evoxc.io`` worker thread separately calls
@@ -813,9 +1126,11 @@ def _acquire_cached_rocm_device(device: Device, runtime_args: list[str]) -> Any:
     # device_id = index + 1), with the same ValueError ->
     # core.BackendError surfacing; flags are applied by the caller
     # (``upload_tensor``) exactly as before.
+    if rt is None:
+        rt = _runtime_module(None)
     return _cached_hal_device(
-        ("rocm", device.index, tuple(runtime_args)),
-        lambda: _acquire_runtime_device("rocm", device, runtime_args),
+        _module_cache_prefix(rt) + ("rocm", device.index, tuple(runtime_args)),
+        lambda: _acquire_runtime_device("rocm", device, runtime_args, rt),
     )
 
 
@@ -935,6 +1250,7 @@ def _load_vm_module(
     device_kind: str,
     runtime_device: Any,
     segment_index: int | None = None,
+    rt: Any = None,
 ) -> Any:
     """Load one VM flatbuffer onto ``runtime_device`` (shared load path).
 
@@ -956,8 +1272,11 @@ def _load_vm_module(
     other failure propagates unchanged (GPU kinds) or takes the mixed-install
     wrapper (CPU, ``ValueError`` only). ``segment_index`` only annotates the
     binding-limit message for the split/external-kernel load path.
+    ``rt`` is the RESOLVED IREE runtime module (``_runtime_module`` of the
+    caller's load options, else the default/env-resolved module).
     """
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     if device_kind in _GPU_DEVICE_KINDS:
         config = rt.Config(device=runtime_device)
@@ -1026,7 +1345,9 @@ def _configure_cuda_runtime_flags(user_args: tuple[str, ...] = ()) -> None:
     _CUDA_FLAGS_CONFIGURED = True
 
 
-def _apply_iree_runtime_args(runtime_args: list[str] | None) -> None:
+def _apply_iree_runtime_args(
+    runtime_args: list[str] | None, rt: Any = None
+) -> None:
     """Parse user-provided iree runtime/loader flags (LOUD — never swallowed).
 
     ``iree.runtime.flags.parse_flags`` may be called multiple times per
@@ -1035,10 +1356,13 @@ def _apply_iree_runtime_args(runtime_args: list[str] | None) -> None:
     semantics. A flag the runtime rejects raises ``core.BackendError`` naming
     the option, the flags, and the iree error — per evoxc's error strategy, a
     user's flag value is never silently dropped.
+    ``rt`` is the RESOLVED IREE runtime module (defaults to the
+    default/env-resolved module).
     """
     if not runtime_args:
         return
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     try:
         rt.flags.parse_flags(*runtime_args)
@@ -1196,6 +1520,44 @@ class IreeBackend(CompilerBackend):
     #: emits the two-stage split reductions for rank-0-result reductions
     #: (7.1-8.1x on those ops, 2.7-3.5x end-to-end on population-scale SO
     #: steps); ``False`` emits the byte-identical single-stage text.
+    #: ``split_reduction_non_exact`` (bool, default ``False``) is the OPT-IN
+    #: companion that also splits float ``sum``/``prod`` (and therefore
+    #: ``reduce_mean``/``var``), reassociating the accumulation — the documented
+    #: workaround for the rank-0 float-reduction cliff on iree/vulkan, where a
+    #: full ``sum`` of 16M f32 lowers to ONE workgroup of ONE thread (measured
+    #: on this Intel iGPU, iree-base 3.13.0, 4096x4096 f32, 3 warm in-process
+    #: runs, medians: default profile 648.5 ms -> 10.9 ms split, ~59x).
+    #: ``split_reduction_threshold``
+    #: (int >= 2, default 1024, Writer-validated) sets the minimum reduced extent
+    #: that is split.
+    #:
+    #: CUSTOM IREE BUILDS — two module-valued options let a user plug in an
+    #: IREE whose Python packages are not named ``iree.compiler`` /
+    #: ``iree.runtime``: the compile-stage ``iree_compiler_module`` and the
+    #: load-stage ``iree_runtime_module``. Accepted values for each: ``None``
+    #: (the default = today's ``iree.compiler`` / ``iree.runtime``), a module
+    #: OBJECT (``types.ModuleType``), or a non-empty dotted MODULE-PATH STRING
+    #: resolved with ``importlib.import_module``. A bad value (a
+    #: non-None/non-str/non-module, an empty/whitespace string, or a string
+    #: that fails to import) raises a loud ``core.BackendError`` naming the
+    #: option, the value and the accepted forms. Precedence is the binding
+    #: explicit option > env var (``EVOXC_IREE_COMPILER_MODULE`` /
+    #: ``EVOXC_IREE_RUNTIME_MODULE``; empty/whitespace = unset) > default;
+    #: every internal iree import routes through the resolvers, and a supplied
+    #: module is VALIDATED in place of the default ``check_available`` probe
+    #: (compiler: a callable ``compile_str`` + ``CompilerToolError``; runtime:
+    #: ``get_driver`` / ``DeviceArray`` / ``load_vm_module``). The module
+    #: OBJECT must ALSO be reachable through the env var for the option-less
+    #: sites (``upload_tensor`` placement and payload readback have no options
+    #: dict — payloads/executables carry the resolved module they were built
+    #: with, but a fresh placement resolves the env default). Usage::
+    #:
+    #:     import evoxc, evoxc.backends
+    #:     from evoxc.backends.adapters.iree import iree_backend
+    #:     evoxc.backends.register(iree_backend, replace=True)
+    #:     exe = evoxc.build(fn, *specs, backend="iree",
+    #:                       iree_compiler_module="my_iree.compiler",
+    #:                       iree_runtime_module="my_iree.runtime")
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset(
             {
@@ -1205,6 +1567,8 @@ class IreeBackend(CompilerBackend):
                 "dot_precision",
                 "eigh_algorithm",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
             }
         ),
         "compile": frozenset(
@@ -1214,9 +1578,23 @@ class IreeBackend(CompilerBackend):
                 "opt_level",
                 "vulkan_target",
                 "dispatch_formation",
+                # The module the compiler half is imported from (None = the
+                # published ``iree.compiler``; a module object or a dotted
+                # module-path string for a custom build — see
+                # ``_compiler_module``).
+                "iree_compiler_module",
             }
         ),
-        "load": frozenset({"iree_runtime_args"}),
+        "load": frozenset(
+            {
+                "iree_runtime_args",
+                # The module the runtime half is imported from (None = the
+                # published ``iree.runtime``; a module object or a dotted
+                # module-path string for a custom build — see
+                # ``_runtime_module``).
+                "iree_runtime_module",
+            }
+        ),
         "run": frozenset(),
     }
     # "auto" sort emission: the iree-cuda HAL cannot bufferize multi-operand
@@ -1239,6 +1617,14 @@ class IreeBackend(CompilerBackend):
         collectives=False,
         runtime_calls=False,
         custom_blocks=False,
+        # ``custom_call`` / ``inline_stablehlo`` ops are forwarded VERBATIM
+        # into the emitted StableHLO text (``stablehlo.custom_call`` / the
+        # inline MLIR fragment) — evoxc adds no target registry and no
+        # pre-validation: whether the referenced target exists and the MLIR
+        # is valid is the external IREE compiler's verdict, whose diagnostic
+        # surfaces as-is (a ``core.BackendError`` carrying the compiler
+        # output).
+        custom_ops=True,
         async_collectives=False,
         # Round 2: adapter host-dispatch for ``external_call`` — graphs
         # containing the op are split at lower() time into compiled segments
@@ -1280,6 +1666,40 @@ class IreeBackend(CompilerBackend):
                 f"unavailable: {exc}. Install them with "
                 f"`pip install evoxc[iree]`"
             ) from exc
+
+    def _require_compiler(self, options: dict | None) -> Any:
+        """Resolve the compiler module, probing whichever source is in play.
+
+        A supplied ``iree_compiler_module`` (option OR env) is validated
+        directly (``compile_str`` + ``CompilerToolError``); with nothing
+        supplied, the byte-identical default ``check_available()`` probe runs.
+        Returns the resolved compiler module.
+        """
+        compiler_module = _compiler_module(options)
+        if _module_option_supplied(
+            options, _COMPILER_MODULE_OPTION, _COMPILER_MODULE_ENV
+        ):
+            _validate_compiler_module(compiler_module)
+        else:
+            self.check_available()
+        return compiler_module
+
+    def _require_runtime(self, options: dict | None) -> Any:
+        """Resolve the runtime module, probing whichever source is in play.
+
+        A supplied ``iree_runtime_module`` (option OR env) is validated
+        directly (``get_driver`` / ``DeviceArray`` / ``load_vm_module``);
+        with nothing supplied, the byte-identical default
+        ``check_available()`` probe runs. Returns the resolved runtime module.
+        """
+        runtime_module = _runtime_module(options)
+        if _module_option_supplied(
+            options, _RUNTIME_MODULE_OPTION, _RUNTIME_MODULE_ENV
+        ):
+            _validate_runtime_module(runtime_module)
+        else:
+            self.check_available()
+        return runtime_module
 
     def _exporter_options(self, options: dict | None) -> dict:
         """Shared exporter options + the iree-target ``sort_emission`` default.
@@ -1375,7 +1795,7 @@ class IreeBackend(CompilerBackend):
                 "shared StableHLO record (dict with format='stablehlo' and "
                 "an 'mlir_text' string)"
             )
-        self.check_available()
+        compiler_module = self._require_compiler(options)
 
         from ..options import validate_options
 
@@ -1393,7 +1813,13 @@ class IreeBackend(CompilerBackend):
             )
         mlir_text = payload["mlir_text"]
         target_backends, extra_args = self._resolve_compile_options(options)
-        vmfb = self._compile_mlir(mlir_text, target_backends, extra_args)
+        vmfb = self._compile_mlir(
+            mlir_text,
+            target_backends,
+            extra_args,
+            compiler_module,
+            vulkan_profile=(options or {}).get("vulkan_target"),
+        )
 
         artifact_target = _artifact_target(target_backends)
         artifact_payload = {
@@ -1555,23 +1981,67 @@ class IreeBackend(CompilerBackend):
         return target_backends, extra_args
 
     def _compile_mlir(
-        self, mlir_text: str, target_backends: tuple[str, ...], extra_args: list[str]
+        self,
+        mlir_text: str,
+        target_backends: tuple[str, ...],
+        extra_args: list[str],
+        compiler_module: Any = None,
+        vulkan_profile: str | None = None,
     ) -> bytes:
-        """Invoke iree-compile on one MLIR text; diagnostics -> BackendError."""
-        import iree.compiler as iree_compiler
+        """Invoke iree-compile on one MLIR text; diagnostics -> BackendError.
+
+        ``compiler_module`` is the RESOLVED compiler module (``_compiler_module``
+        of the caller's options): ``compile_str`` and ``CompilerToolError``
+        both come from THAT module, so a custom build is honored end to end
+        (``None`` resolves the default/env module).
+
+        ``vulkan_profile`` is the raw ``vulkan_target`` compile option the
+        caller set (``None`` = unset) — passed ONLY so a compile failure can
+        be attributed: option VALUES are never validated by evoxc, so a
+        rejected profile surfaces here as iree-compile's own diagnostic, and
+        the appended note names the option, says the value was rejected by
+        the compiler (not evoxc), points at ``iree-compile --help`` for the
+        installed compiler's authoritative list, and states the 3.13
+        limitation (no Intel Xe/Panther-Lake profile). Nothing is rejected
+        or rewritten on evoxc's side and every other error is unchanged.
+        """
+        if compiler_module is None:
+            compiler_module = _compiler_module(None)
 
         try:
-            return iree_compiler.compile_str(
+            return compiler_module.compile_str(
                 mlir_text,
                 target_backends=list(target_backends),
                 input_type="stablehlo",
                 extra_args=extra_args,
             )
-        except iree_compiler.CompilerToolError as exc:
-            raise core.BackendError(
+        except compiler_module.CompilerToolError as exc:
+            preface = (
                 f"iree-compile failed to compile the StableHLO program for "
                 f"the {self.name} backend (targets: "
-                f"{', '.join(target_backends)}):\n{exc}"
+                f"{', '.join(target_backends)}):"
+            )
+            if vulkan_profile is None:
+                raise core.BackendError(f"{preface}\n{exc}") from exc
+            note = (
+                f"\n\nNote: the {self.name} 'vulkan_target' compile option "
+                f"was set to {vulkan_profile!r}, which evoxc forwarded "
+                f"verbatim as --iree-vulkan-target={vulkan_profile} "
+                "WITHOUT validating the value (option values are the "
+                "compiler's to validate). If the diagnostics below say the "
+                "Vulkan target is unknown, the INSTALLED iree-compile "
+                f"rejected {vulkan_profile!r} — evoxc did not. List the "
+                "profiles the installed compiler accepts with "
+                "`iree-compile --help` (the --iree-vulkan-target entry, "
+                "which documents the AMD/NVIDIA/ARM/Qualcomm schemes) or "
+                "leave vulkan_target unset to use its default Vulkan "
+                "profile. iree-base-compiler 3.13.0 ships no Intel Xe / "
+                "Panther-Lake profile (Intel GPUs run through the default "
+                "profile), so an Intel profile name is expected to be "
+                "rejected."
+            )
+            raise core.BackendError(
+                f"{preface}{note}\n\nCompiler diagnostics:\n{exc}"
             ) from exc
 
     def _compile_segments(
@@ -1586,7 +2056,7 @@ class IreeBackend(CompilerBackend):
         re-lowering). The artifact format is ``iree-vmfb-segments`` — ``load``
         reconstructs an ``IreeExternalExecutable`` from it.
         """
-        self.check_available()
+        compiler_module = self._require_compiler(options)
 
         from ..options import validate_options
 
@@ -1613,6 +2083,7 @@ class IreeBackend(CompilerBackend):
             ) from exc
 
         target_backends, extra_args = self._resolve_compile_options(options)
+        vulkan_profile = (options or {}).get("vulkan_target")
         segments = []
         for index, raw in enumerate(raw_segments):
             if not isinstance(raw, dict) or not isinstance(
@@ -1632,7 +2103,11 @@ class IreeBackend(CompilerBackend):
                     f"{index} records no entry functions"
                 )
             vmfb = self._compile_mlir(
-                raw["mlir_text"], target_backends, extra_args
+                raw["mlir_text"],
+                target_backends,
+                extra_args,
+                compiler_module,
+                vulkan_profile=vulkan_profile,
             )
             segments.append(
                 {
@@ -1755,7 +2230,7 @@ class IreeBackend(CompilerBackend):
                 f"corrupt: the {self.name} artifact records no entry "
                 "functions"
             )
-        self.check_available()
+        runtime_module = self._require_runtime(options)
         from ..options import validate_options
 
         validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
@@ -1775,7 +2250,7 @@ class IreeBackend(CompilerBackend):
                 f"list/tuple of flag strings (e.g. "
                 f'["--cuda_async_allocations=false"]), got {raw_runtime!r}'
             )
-        _apply_iree_runtime_args(runtime_args)
+        _apply_iree_runtime_args(runtime_args, runtime_module)
         device_kind = "cpu"  # device=None = default CPU device
         if device is not None:
             if not isinstance(device, Device):
@@ -1813,11 +2288,13 @@ class IreeBackend(CompilerBackend):
                 f" — never silently recompile"
             )
 
-        import iree.runtime as rt
-
         vmfb = base64.b64decode(payload["vmfb_base64"].encode("ascii"))
-        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
-        module = _load_vm_module(vmfb, device_kind, runtime_device)
+        runtime_device = _acquire_runtime_device(
+            device_kind, device, runtime_args, runtime_module
+        )
+        module = _load_vm_module(
+            vmfb, device_kind, runtime_device, rt=runtime_module
+        )
         return IreeExecutable(
             artifact=artifact,
             signature=artifact.signature,
@@ -1825,6 +2302,7 @@ class IreeBackend(CompilerBackend):
             module=module,
             entry_functions=entry_functions,
             runtime_device=runtime_device,
+            runtime_module=runtime_module,
         )
 
     def _load_segments(
@@ -1845,7 +2323,7 @@ class IreeBackend(CompilerBackend):
         ``core.BackendError`` "corrupt"); the executable interprets it at
         run time.
         """
-        self.check_available()
+        runtime_module = self._require_runtime(options)
         from ..options import validate_options
 
         validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
@@ -1862,7 +2340,7 @@ class IreeBackend(CompilerBackend):
                 f"list/tuple of flag strings (e.g. "
                 f'["--cuda_async_allocations=false"]), got {raw_runtime!r}'
             )
-        _apply_iree_runtime_args(runtime_args)
+        _apply_iree_runtime_args(runtime_args, runtime_module)
         device_kind = "cpu"  # device=None = default CPU device
         if device is not None:
             if not isinstance(device, Device):
@@ -1900,7 +2378,9 @@ class IreeBackend(CompilerBackend):
                 f"plan: {exc}"
             ) from exc
 
-        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
+        runtime_device = _acquire_runtime_device(
+            device_kind, device, runtime_args, runtime_module
+        )
         segment_execs: list[_IreeSegmentExecutable] = []
         for index, raw in enumerate(raw_segments):
             if not isinstance(raw, dict) or not isinstance(
@@ -1937,7 +2417,11 @@ class IreeBackend(CompilerBackend):
                 )
             vmfb = base64.b64decode(raw["vmfb_base64"].encode("ascii"))
             module = _load_vm_module(
-                vmfb, device_kind, runtime_device, segment_index=index
+                vmfb,
+                device_kind,
+                runtime_device,
+                segment_index=index,
+                rt=runtime_module,
             )
             core_device = device if device is not None else Device("cpu", 0)
             input_specs = tuple(
@@ -1957,6 +2441,7 @@ class IreeBackend(CompilerBackend):
                     # generic asdevicearray upload a host-mode boundary
                     # would otherwise pay per kernel call).
                     device_kind=device_kind,
+                    runtime_module=runtime_module,
                 )
             )
         return IreeExternalExecutable(
@@ -1966,6 +2451,7 @@ class IreeBackend(CompilerBackend):
             segments=segment_execs,
             plan=decoded_plan,
             runtime_device=runtime_device,
+            runtime_module=runtime_module,
         )
 
 
@@ -2036,6 +2522,7 @@ class IreeExecutable(CompilerExecutable):
         module: Any,
         entry_functions: tuple[str, ...],
         runtime_device: Any,
+        runtime_module: Any = None,
     ) -> None:
         super().__init__(
             artifact=artifact,
@@ -2045,6 +2532,13 @@ class IreeExecutable(CompilerExecutable):
             entry_functions=entry_functions,
         )
         self.runtime_device = runtime_device
+        # The RESOLVED IREE runtime module this executable was loaded with
+        # (``_runtime_module`` of the load options, else the default/env
+        # module) — carried so the run path honors a custom
+        # ``iree_runtime_module`` with no options dict in scope.
+        self._runtime_module: Any = (
+            runtime_module if runtime_module is not None else _runtime_module(None)
+        )
         # Per-call invariants cached at load time (never re-derived per run):
         # the core.Device label of this executable (output tensors + the
         # same-device pass-through rule), the flat spec tuples, and the
@@ -2109,7 +2603,7 @@ class IreeExecutable(CompilerExecutable):
             )
         core_device = self._core_device
         runtime_device = self.runtime_device
-        np, rt = _runtime_modules()
+        np, rt = _runtime_modules(self._runtime_module)
         reject_foreign = core_device.kind != "cpu"
         # Pre-sized buffers filled by index: per-IO leaf work (validate +
         # buffer build) is the dominant non-invoke cost, so it happens in ONE
@@ -2209,7 +2703,9 @@ class IreeExecutable(CompilerExecutable):
                 )
             output_dtypes = self._output_dtypes
             for i, result in enumerate(results):
-                payload = IreeDevicePayload(result, core_device)
+                payload = IreeDevicePayload(
+                    result, core_device, runtime_module=self._runtime_module
+                )
                 tensor = core.Tensor(payload)
                 outputs[i] = tensor
                 dtype = payload._dtype
@@ -2220,7 +2716,11 @@ class IreeExecutable(CompilerExecutable):
                     )
         else:
             for i, result in enumerate(results):
-                outputs[i] = core.Tensor(IreeDevicePayload(result, core_device))
+                outputs[i] = core.Tensor(
+                    IreeDevicePayload(
+                        result, core_device, runtime_module=self._runtime_module
+                    )
+                )
         return outputs
 
     # --------------------------------------------------------- synchronize
@@ -2268,7 +2768,7 @@ class IreeExecutable(CompilerExecutable):
         self._entry = entry
         return entry
 
-def _wait_copy_semaphore(sem: Any) -> None:
+def _wait_copy_semaphore(sem: Any, rt: Any = None) -> None:
     """Block until a queue_copy's completion semaphore reaches 1.
 
     Query-first fast path: ``HalSemaphore.query()`` is a cheap host-side
@@ -2282,30 +2782,65 @@ def _wait_copy_semaphore(sem: Any) -> None:
     stream-ordered ahead of invoke dispatches on the iree cuda HAL).
     Semaphore values are monotonic, so query-then-wait is race-free.
     Falls back to the plain wait when the runtime lacks ``query``
-    (legacy iree-runtime distributions).
+    (legacy iree-runtime distributions). ``rt`` is the RESOLVED IREE runtime
+    module (defaults to the default/env-resolved module).
     """
     query = getattr(sem, "query", None)
     if query is None or query() >= 1:
         return
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     rt.HalFence.create_at(sem, 1).wait()
 
 
-def _buffer_is_host_mappable(buffer: Any) -> bool:
+#: HAL device ids whose memory IS host memory, so a mapped view is the data
+#: itself rather than a view of device memory (the id is iree's printable
+#: ``repr(hal_device)``: ``"local-task"`` on the CPU HAL, ``"vulkan"`` /
+#: ``"cuda:0"`` / ``"hip:0"`` on the GPU HALs — measured on iree-base 3.13.0).
+_HOST_MEMORY_HAL_IDS = frozenset({"local-task", "local-sync", "local", "cpu"})
+
+
+def _hal_is_host_memory(hal_device: Any) -> bool:
+    """True when a HAL device's buffers live in host memory.
+
+    ``local-task`` (llvm-cpu) allocations ARE host memory, so mapping them is
+    the data itself — the long-standing zero-copy readback. A GPU HAL
+    (``vulkan``/``cuda``/``hip``) can advertise a HOST_VISIBLE device buffer
+    too — measured on this host: a 1 MB vulkan run output is
+    ``memory_type = 62`` (DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT |
+    HOST_CACHED) with ``MAPPING_SCOPED`` allowed — so ``_buffer_is_host_mappable``
+    alone is NOT sufficient for a ``.to(cpu)``: mapping it would hand out a
+    ``Device("cpu", 0)`` tensor whose bytes still live in device memory.
+    Unknown/unprintable devices are treated as device memory (the safe side:
+    an explicit ``queue_copy``), never as host memory.
+    """
+    try:
+        device_id = repr(hal_device)
+    except Exception:  # pragma: no cover - a repr that raises is not a HAL id
+        return False
+    return device_id.split(":", 1)[0].strip().lower() in _HOST_MEMORY_HAL_IDS
+
+
+def _buffer_is_host_mappable(buffer: Any, rt: Any = None) -> bool:
     """True when ``buffer``'s memory can be read back by mapping it directly.
 
     The predicate iree's own runtime uses for its mapped readback path: the
     memory must be ``HOST_VISIBLE`` AND the buffer must have been allocated
     with ``BufferUsage.MAPPING_SCOPED`` in its allowed usage. The
     ``local-task`` (llvm-cpu) allocator satisfies both, so an llvm-cpu
-    readback stays a zero-copy mapping. A GPU allocation does not: a
-    cuda/rocm ``DEVICE_LOCAL`` buffer is not host-visible, and the vulkan
-    HAL's buffers are host-visible but carry no ``MAPPING_SCOPED`` usage —
-    both take the explicit ``queue_copy`` staging path in
-    ``_readback_device_array``.
+    readback stays a zero-copy mapping. A cuda/rocm ``DEVICE_LOCAL`` buffer is
+    not host-visible, so it takes the explicit ``queue_copy`` path in
+    ``_readback_device_array``. A vulkan buffer is USUALLY not mappable
+    either (measured: a 64 MB output is ``memory_type = 54``,
+    ``allowed_usage = 3075`` — TRANSFER | DISPATCH_STORAGE), but a SMALL one
+    (≤ 16 MB here) comes back host-visible and MAPPING_SCOPED, which is why
+    ``_readback_device_array`` ALSO gates on ``_hal_is_host_memory`` before
+    it maps. ``rt`` is the RESOLVED IREE runtime module (defaults to the
+    default/env-resolved module).
     """
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     memory_type = int(buffer.memory_type())
     allowed_usage = int(buffer.allowed_usage())
@@ -2317,15 +2852,19 @@ def _buffer_is_host_mappable(buffer: Any) -> bool:
 
 
 #: Reusable D2H staging buffers, held PER THREAD (see
-#: ``_readback_staging_buffer``): ``nbytes -> (HAL device, buffer)``.
+#: ``_readback_staging_buffer``): ``nbytes -> (HAL device, buffer, view)``,
+#: where ``view`` is the buffer's persistent coherent mapping (``None`` when
+#: the allocation is not ``HOST_COHERENT``).
 _READBACK_STAGING = threading.local()
 
 #: Bound on the per-thread staging cache (distinct byte lengths).
 _READBACK_STAGING_MAX = 4
 
 
-def _readback_staging_buffer(hal_device: Any, nbytes: int) -> Any:
-    """Return a reusable ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer.
+def _readback_staging_buffer(
+    hal_device: Any, nbytes: int, rt: Any = None
+) -> tuple[Any, Any]:
+    """Return a reusable ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer + view.
 
     ``_readback_device_array`` copies a device buffer into host staging
     memory and maps it. Allocating that staging buffer per call is CORRECT
@@ -2334,9 +2873,20 @@ def _readback_staging_buffer(hal_device: Any, nbytes: int) -> Any:
     the allocation, not the transfer, would dominate every large rocm
     readback (measured on IREE 3.13.0 / MI300X).
 
-    The buffer is safe to reuse: a readback is fully synchronous (the copy's
-    completion semaphore is awaited and the scoped mapping is released before
-    this helper returns), and every use overwrites the whole range.
+    Returns ``(buffer, view)``. Reuse is safe: a readback is fully
+    synchronous (the copy's completion semaphore is awaited), every use
+    overwrites the whole range, and the caller always COPIES OUT, so no
+    returned array ever aliases the staging memory. ``view`` is the buffer's
+    mapped flat array
+    when the allocation is ``HOST_COHERENT`` — the mapping is created ONCE
+    and HELD for the cache entry's lifetime, because MEASURED on the vulkan
+    HAL a per-call scoped map costs ~60 us/MB (4.3 ms for 64 MB — more than
+    the device->host copy it precedes), while a coherent mapping needs no
+    re-map: a coherent host read after the awaited copy sees the device
+    writes. A NON-coherent allocation would need an explicit range
+    invalidate, which the python HAL does not expose at all, so it keeps
+    ``view = None`` and the caller maps per call (the previous behaviour —
+    correct on every HAL, and never slower than before).
 
     THREAD-LOCAL because a HAL buffer and the device that owns it are both
     thread-affine (the ``evoxc.io`` worker reads back separately) — the same
@@ -2344,29 +2894,147 @@ def _readback_staging_buffer(hal_device: Any, nbytes: int) -> Any:
     device is checked by IDENTITY, so a thread that talks to two devices
     never reuses across them. Bounded at ``_READBACK_STAGING_MAX`` distinct
     sizes; clearing the cache is performance-only, never a correctness
-    change.
+    change. ``rt`` is the RESOLVED IREE runtime module (defaults to the
+    default/env-resolved module); ``_module_cache_prefix`` prepends it to the
+    ``(nbytes,)`` key only for a CUSTOM module, so a custom module never reuses
+    a default-module staging buffer and vice versa.
     """
-    import iree.runtime as rt
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
 
     cache = getattr(_READBACK_STAGING, "buffers", None)
     if cache is None:
         cache = {}
         _READBACK_STAGING.buffers = cache
-    entry = cache.get(nbytes)
+    key = _module_cache_prefix(rt) + (nbytes,)
+    entry = cache.get(key)
     if entry is not None and entry[0] is hal_device:
-        return entry[1]
+        return entry[1], entry[2]
     buffer = hal_device.allocator.allocate_buffer(
         int(rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE),
         int(rt.BufferUsage.TRANSFER_TARGET | rt.BufferUsage.MAPPING_SCOPED),
         nbytes,
     )
+    view = None
+    coherent = getattr(rt.MemoryType, "HOST_COHERENT", None)
+    if coherent is not None and (int(buffer.memory_type()) & int(coherent)) == int(
+        coherent
+    ):
+        view = buffer.map().asarray((nbytes,), np.dtype(np.uint8))
     if len(cache) >= _READBACK_STAGING_MAX:
         cache.clear()
-    cache[nbytes] = (hal_device, buffer)
-    return buffer
+    cache[key] = (hal_device, buffer, view)
+    return buffer, view
 
 
-def _readback_device_array(array: Any, dtype: Any = None) -> np.ndarray:
+def _readback_into_fresh_host_array(
+    source: Any,
+    hal_device: Any,
+    nbytes: int,
+    shape: tuple,
+    raw_dtype: Any,
+    rt: Any = None,
+) -> Any:
+    """Copy a device buffer straight into a fresh host array (zero copy-out).
+
+    The fastest device->host path found on the vulkan HAL: instead of
+    ``queue_copy`` into a staging buffer plus a SECOND host copy out of it,
+    an ALIGNED host array is imported into the HAL as a buffer
+    (``allocator.import_host_allocation``) and the single ``queue_copy``
+    writes the device data into it — so the array handed back IS the
+    transfer destination. MEASURED (Intel PTL iGPU / Mesa ANV,
+    iree-base-runtime 3.13.0, f32, interleaved rounds, 64/128 MB): 1.3-1.4x
+    faster than the held-mapping staging path and 1.7-2.3x faster than the
+    per-call-map path; at 1 MB the fixed costs dominate and the path is
+    cost-neutral, so the gate below is a plain capability check, not a size
+    threshold.
+
+    ``iree``'s own ``DeviceArray.to_host()`` fast path uses the same
+    primitive and fails on vulkan only because it passes an arbitrary
+    pointer (``minImportedHostPointerAlignment 4096``); this helper
+    over-allocates by ``_HOST_IMPORT_ALIGNMENT`` and offsets into it, and
+    gates the whole path on the allocator's own
+    ``query_buffer_compatibility`` report, so a HAL that cannot import host
+    memory (or a custom runtime module without the enums) keeps the staging
+    path. The returned array is a FRESH allocation owned by the caller —
+    never a view of reused staging memory, never an alias of the device
+    buffer, and never aliasing the user's data — and the imported buffer
+    does not own the memory (it is only registered for the duration of the
+    copy), so it is dropped on return.
+
+    Returns ``None`` when the import is unavailable or fails; the caller
+    then takes the staging path (identical bytes, identical semantics).
+    """
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
+
+    dtype = np.dtype(raw_dtype)
+    itemsize = dtype.itemsize
+    if itemsize <= 0 or nbytes % itemsize:
+        return None
+    align = _HOST_IMPORT_ALIGNMENT
+    memory_type = getattr(rt, "MemoryType", None)
+    usage = getattr(rt, "BufferUsage", None)
+    compat = getattr(rt, "BufferCompatibility", None)
+    if memory_type is None or usage is None or compat is None:
+        return None
+    importable = getattr(compat, "IMPORTABLE", None)
+    if importable is None:
+        return None
+    requested_type = (
+        int(memory_type.HOST_LOCAL)
+        | int(memory_type.DEVICE_VISIBLE)
+        | int(memory_type.HOST_COHERENT)
+    )
+    requested_usage = (
+        int(usage.TRANSFER_TARGET) | int(usage.MAPPING_SCOPED) | int(usage.MAPPING)
+    )
+    try:
+        allocator = hal_device.allocator
+        report = int(
+            allocator.query_buffer_compatibility(
+                requested_type,
+                requested_usage,
+                int(usage.TRANSFER),
+                nbytes,
+            )
+        )
+        if not report & int(importable):
+            return None
+        storage = np.empty(nbytes + align, dtype=np.uint8)
+        offset = int(-storage.ctypes.data % align)
+        if offset % itemsize:
+            return None
+        flat = storage[offset : offset + nbytes].view(dtype)
+        imported = allocator.import_host_allocation(
+            flat, requested_type, requested_usage
+        )
+        sem = hal_device.create_semaphore(0)
+        hal_device.queue_copy(
+            source,
+            imported,
+            wait_semaphores=rt.HalFence.create_at(sem, 0),
+            signal_semaphores=rt.HalFence.create_at(sem, 1),
+        )
+        _wait_copy_semaphore(sem, rt)
+    except core.EVOXCError:
+        raise
+    except Exception:
+        return None
+    return flat.reshape(shape)
+
+
+def _readback_device_array(
+    array: Any,
+    dtype: Any = None,
+    rt: Any = None,
+    *,
+    host_memory: bool | None = None,
+) -> np.ndarray:
     """Materialize a host ``np.ndarray`` from an iree runtime buffer (explicit D2H).
 
     THE device->host readback: every host materialization of an iree buffer
@@ -2381,28 +3049,55 @@ def _readback_device_array(array: Any, dtype: Any = None) -> np.ndarray:
     this module needs no fallback and no version branch — it performs the
     transfer with HAL primitives that are version-independent.
 
-    Two paths, chosen by ``_buffer_is_host_mappable``:
+    Two paths, chosen by ``_hal_is_host_memory`` + ``_buffer_is_host_mappable``:
+
+    * HOST MEMORY + MAPPABLE (llvm-cpu / ``local-task`` allocations): the
+      buffer view is mapped and returned as a ZERO-COPY numpy array -- no
+      allocation, no ``queue_copy``, no copy, exactly the cost the
+      runtime's own mapped path had. The mapping stays alive through the
+      returned array's base chain (numpy keeps the exporter of the
+      mapping's buffer alive). DELIBERATELY limited to a host-memory HAL:
+      a vulkan run output can be host-visible + MAPPING_SCOPED too
+      (measured: a 1 MB output is ``memory_type = 62``), and mapping it
+      would hand out live device memory as a ``Device('cpu', 0)`` array --
+      a placement lie and an alias of the device buffer. GPU kinds always
+      copy.
 
     * MAPPABLE (llvm-cpu / host-local allocations): the buffer view is
       mapped and returned as a ZERO-COPY numpy array — no allocation, no
       ``queue_copy``, no copy, exactly the cost the runtime's own mapped
       path had. The mapping stays alive through the returned array's base
       chain (numpy keeps the exporter of the mapping's buffer alive).
-    * NOT MAPPABLE (cuda/rocm/vulkan device memory): a
-      ``HOST_LOCAL | DEVICE_VISIBLE`` staging buffer of the buffer's byte
-      length (reused per thread, see ``_readback_staging_buffer``) receives
-      the device buffer through ``queue_copy``, the copy's completion
-      semaphore is awaited via the shared query-first
-      ``_wait_copy_semaphore``, the staging buffer is mapped and copied out,
-      and the scoped mapping is released. No host-memory IMPORT is attempted
-      (that is the primitive that fails on vulkan).
+    * NOT MAPPABLE (cuda/rocm/vulkan device memory): TWO paths, measured on
+      the vulkan HAL (Intel PTL, iree-base-runtime 3.13.0): (a) an ALIGNED
+      host array is IMPORTED into the HAL (``import_host_allocation``) and
+      ONE ``queue_copy`` writes the device data into it — no copy-out, the
+      fastest path, and the one taken whenever the allocator reports host
+      import as compatible (see ``_readback_into_fresh_host_array``); (b)
+      otherwise the per-thread ``HOST_LOCAL | DEVICE_VISIBLE`` staging
+      buffer receives the device buffer through ``queue_copy``, the copy's
+      completion semaphore is awaited via the shared query-first
+      ``_wait_copy_semaphore``, and the result is copied out of the buffer's
+      persistent coherent mapping (or a per-call mapping on a non-coherent
+      allocation). Both paths return a FRESH array that never aliases the
+      staging memory or the device buffer.
 
     ``dtype`` is the caller's requested output dtype (``None`` keeps the
     buffer's own dtype); a payload whose dtype is an OVERRIDE of the buffer's
     element type (e.g. bool results) is converted to the override first, so
     the returned array always carries the dtype the payload reports.
+    ``rt`` is the RESOLVED IREE runtime module (defaults to the
+    default/env-resolved module) — the same module the payload was built with,
+    so a custom ``iree_runtime_module`` is honored on the readback path.
+    ``host_memory`` says whether the SENDING device's memory IS host
+    memory (``IreeDevicePayload`` passes ``device.kind == "cpu"``); ``None``
+    falls back to ``_hal_is_host_memory``'s HAL-id test, so a direct call is
+    never more permissive than the payload path.
     """
     import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
 
     view = getattr(array, "_buffer_view", None)
     hal_device = getattr(array, "_device", None)
@@ -2414,29 +3109,41 @@ def _readback_device_array(array: Any, dtype: Any = None) -> np.ndarray:
         result = np.asarray(array.to_host())
         return result if dtype is None else result.__array__(dtype)
     source = view.get_buffer()
-    raw_dtype = _hal_element_dtype(view.element_type)
+    raw_dtype = _hal_element_dtype(view.element_type, rt=rt)
     shape = tuple(view.shape)
     nbytes = int(source.byte_length())
-    if _buffer_is_host_mappable(source):
+    if host_memory is None:
+        host_memory = _hal_is_host_memory(hal_device)
+    if host_memory and _buffer_is_host_mappable(source, rt):
         result = view.map().asarray(shape, raw_dtype)
     elif nbytes == 0:
         result = np.empty(shape, raw_dtype)
     else:
-        import iree.runtime as rt
-
-        staging = _readback_staging_buffer(hal_device, nbytes)
-        sem = hal_device.create_semaphore(0)
-        hal_device.queue_copy(
-            source,
-            staging,
-            wait_semaphores=rt.HalFence.create_at(sem, 0),
-            signal_semaphores=rt.HalFence.create_at(sem, 1),
+        # Fastest path first: import an ALIGNED host array into the HAL and let
+        # ONE queue_copy write the device data into it (no copy-out). Falls
+        # back to the staging buffer when the allocator cannot import host
+        # memory — identical bytes either way.
+        result = _readback_into_fresh_host_array(
+            source, hal_device, nbytes, shape, raw_dtype, rt
         )
-        _wait_copy_semaphore(sem)
-        # Copy OUT of the mapped staging buffer: the mapping must not outlive
-        # this call (the buffer is reused, and a scoped mapping is released
-        # with it) — so the result is a real copy, never an alias.
-        result = np.array(staging.map().asarray(shape, raw_dtype), copy=True)
+        if result is None:
+            staging, held_view = _readback_staging_buffer(hal_device, nbytes, rt)
+            sem = hal_device.create_semaphore(0)
+            hal_device.queue_copy(
+                source,
+                staging,
+                wait_semaphores=rt.HalFence.create_at(sem, 0),
+                signal_semaphores=rt.HalFence.create_at(sem, 1),
+            )
+            _wait_copy_semaphore(sem, rt)
+            # Copy OUT of the staging buffer: the buffer is reused across
+            # calls, so the result is a real copy, never an alias. ``held_view``
+            # is the buffer's persistent coherent mapping (None on a
+            # non-coherent allocation, which is re-mapped per call).
+            if held_view is not None:
+                result = np.array(held_view.view(raw_dtype).reshape(shape), copy=True)
+            else:
+                result = np.array(staging.map().asarray(shape, raw_dtype), copy=True)
     override = getattr(array, "_override_dtype", None)
     if override is not None and np.dtype(override) != np.dtype(raw_dtype):
         result = result.astype(override)
@@ -2451,26 +3158,29 @@ def _staged_input(
     index: int,
     tensor: core.Tensor,
     device_kind: str = "cuda",
+    rt: Any = None,
+    *,
+    one_shot: bool = False,
 ) -> Any | None:
     """Upload a host tensor through staging buffers (segment boundaries + placement).
 
     R6.2+ consumers (binding — plain ``IreeExecutable`` runs NEVER stage):
     this helper now serves (a) the split external-call SEGMENT executables
     (``_IreeSegmentExecutable``) — host-mode external kernels legitimately
-    stage host tensors at kernel boundaries, and (b) the ``upload_tensor``
-    placement provider, which passes a FRESH per-call staging dict so every
-    upload uses fresh buffers (one-shot, no cache).
+    stage host tensors at kernel boundaries — and (b) the ``upload_tensor``
+    placement provider, which passes a FRESH per-call staging dict and
+    ``one_shot=True`` so every upload gets fresh DESTINATION buffers (the
+    returned tensor owns its buffer, no cache).
 
     The staging fast path is chosen EXPLICITLY by the NORMALIZED device kind
     (``device_kind``): ``"cuda"`` takes the two-tier pinned/DMA path below,
     ``"rocm"`` takes ``_rocm_staged_input`` (host-local source + queue_copy,
-    the same shapes, wired for the hip HAL driver). Both are fully
-    synchronous. ANY OTHER KIND — notably ``"vulkan"`` — takes NO staging
-    tier and returns ``None`` immediately (before any buffer work), so the
-    caller uses the plain ``rt.asdevicearray`` path: the CUDA tiers'
-    correctness rests on a CUDA-driver host-write-vs-dispatch ordering
-    guarantee (see the fresh-semaphore note below) that is NOT verified on
-    IREE's vulkan HAL driver, so the plain path is the v1 choice for it.
+    the same shapes, wired for the hip HAL driver), and ``"vulkan"`` takes
+    ``_vulkan_staged_input`` (a mapped host-write tier made correct by memory
+    COHERENCE, plus the same host-source + queue_copy tier — see its
+    docstring for the measurements). All three are fully synchronous. ANY
+    OTHER KIND takes NO staging tier and returns ``None`` immediately (before
+    any buffer work), so the caller uses the plain ``rt.asdevicearray`` path.
     Anything the selected path cannot handle — oversized inputs, unmappable
     dtypes, or ANY failure on the fast path — returns ``None`` as well
     (semantics identical either way).
@@ -2515,29 +3225,50 @@ def _staged_input(
 
     Falls back to ``None`` (caller uses ``asdevicearray``) for
     non-cuda executables (``staged_inputs is None``), device kinds with no
-    staging tier (anything but ``"cuda"``/``"rocm"``), oversized inputs,
-    unmappable dtypes, and a full cache — semantics identical either way.
+    staging tier (anything but ``"cuda"``/``"rocm"``/``"vulkan"``), oversized
+    inputs, unmappable dtypes, and a full cache — semantics identical either
+    way.
     """
     if staged_inputs is None:
         return None
-    if device_kind not in ("cuda", "rocm"):
+    if device_kind not in ("cuda", "rocm", "vulkan"):
         # Explicit kind dispatch (never a "defaults to cuda" fallthrough):
-        # only the cuda and rocm kinds have a staging tier. ``"vulkan"``
-        # uploads therefore go through the plain ``rt.asdevicearray`` path
-        # (the CUDA tiers' ordering guarantee is unverified on the vulkan
-        # HAL driver). Returns BEFORE any buffer work.
+        # only these three kinds have a staging tier (see each helper's
+        # docstring for why its tier is correct on its HAL). Returns BEFORE
+        # any buffer work.
         return None
     import numpy as np
-    import iree.runtime as rt
-    from iree.runtime.array_interop import map_dtype_to_element_type
+    if rt is None:
+        rt = _runtime_module(None)
+    map_dtype_to_element_type = _runtime_submodule(
+        rt, "array_interop"
+    ).map_dtype_to_element_type
 
     dtype = tensor.dtype
     shape = tuple(tensor.shape)
     nbytes = int(np.prod(shape)) * dtype.itemsize
-    if nbytes > _STAGED_INPUT_MAX_BYTES:
-        return None
     element_type = map_dtype_to_element_type(dtype)
     if element_type is None:
+        return None
+    if device_kind == "vulkan":
+        # Its own ceiling and tier selection (``_vulkan_staged_input``: the
+        # mapped tier up to ``_VULKAN_PINNED_MAX_BYTES``, the host-source +
+        # queue_copy tier above it) — the cuda/rocm ``_STAGED_INPUT_MAX_BYTES``
+        # ceiling does not apply, because the vulkan copy tier is worth taking
+        # well past it (2.9x faster than asdevicearray at 128 MB, measured).
+        return _vulkan_staged_input(
+            staged_inputs,
+            runtime_device,
+            index,
+            tensor,
+            shape,
+            dtype,
+            element_type,
+            nbytes,
+            rt,
+            one_shot=one_shot,
+        )
+    if nbytes > _STAGED_INPUT_MAX_BYTES:
         return None
     if device_kind == "rocm":
         return _rocm_staged_input(
@@ -2549,6 +3280,7 @@ def _staged_input(
             dtype,
             element_type,
             nbytes,
+            rt,
         )
     key = (index, shape, dtype)
     cached = staged_inputs.get(key)
@@ -2567,7 +3299,7 @@ def _staged_input(
             rt.HalFence.create_at(sem, 0),
             rt.HalFence.create_at(sem, 1),
         )
-        _wait_copy_semaphore(sem)
+        _wait_copy_semaphore(sem, rt)
         return staging_da
     if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
         staged_inputs.clear()  # bounded cache; correctness unaffected
@@ -2615,52 +3347,77 @@ def _staged_input(
         rt.HalFence.create_at(sem, 0),
         rt.HalFence.create_at(sem, 1),
     )
-    _wait_copy_semaphore(sem)
+    _wait_copy_semaphore(sem, rt)
     staged_inputs[key] = ("dma", (hl_buf, hl_view, staging_da))
     return staging_da
 
 
-def _rocm_source_buffer(
-    runtime_device: Any, shape: tuple, dtype: Any, nbytes: int
+def _host_source_buffer(
+    runtime_device: Any, shape: tuple, dtype: Any, nbytes: int, rt: Any = None
 ) -> tuple[Any, Any]:
-    """Return a reusable THREAD-LOCAL host source buffer for the rocm path.
+    """Return a reusable THREAD-LOCAL host SOURCE buffer for the copy tier.
 
-    ``_rocm_staged_input`` memcpy's current host values into the mapped view
-    of a ``HOST_LOCAL | DEVICE_VISIBLE`` (``TRANSFER_SOURCE | MAPPING``)
-    buffer and then ``queue_copy``s it to the device. The SOURCE buffer is
-    safe to reuse across calls (runs are synchronous), and reusing it avoids
-    a per-call mapped-buffer allocation — the same idea as the cuda DMA
-    tier's persistent ``hl_buf``/``hl_view``, but shared across rocm
+    The rocm path (``_rocm_staged_input``) and the vulkan copy tier
+    (``_vulkan_staged_input``) both memcpy the current host values into the
+    mapped view of a ``HOST_LOCAL | DEVICE_VISIBLE`` (``TRANSFER_SOURCE |
+    MAPPING``) buffer and then ``queue_copy`` it to the device. The SOURCE
+    buffer is safe to reuse across calls (every staging path is synchronous:
+    the copy's completion semaphore is awaited before the helper returns), and
+    reusing it avoids a per-call mapped-buffer allocation — the same idea as
+    the cuda DMA tier's persistent ``hl_buf``/``hl_view``, but shared across
     uploads on the thread instead of per executable (the one-shot placement
-    path has no per-executable cache to hang it off).
+    path has no per-executable cache to hang it off). MEASURED (vulkan
+    iGPU, 64 MB f32): a cached source keeps the upload at 11.1 GB/s where a
+    fresh source allocation drops it to 4.2 GB/s — i.e. to the
+    ``asdevicearray`` baseline.
 
     THREAD-LOCAL because the mapped buffer and the HAL device that owns it
     are both thread-affine (``evoxc.io``'s worker thread uploads separately);
     keyed by ``(shape, dtype)`` with the owning runtime device checked by
     IDENTITY so a thread that talks to two devices never reuses across them.
     Bounded at ``_ROCM_SOURCE_CACHE_MAX`` entries (a bounded cache; clearing
-    it is performance-neutral, never a correctness change).
+    it is performance-neutral, never a correctness change). ``rt`` is the
+    RESOLVED IREE runtime module (defaults to the default/env-resolved
+    module); ``_module_cache_prefix`` prepends it to the ``(shape, dtype)`` key
+    only for a CUSTOM module, so a custom module never reuses a default-module
+    source buffer and vice versa.
     """
+    if rt is None:
+        rt = _runtime_module(None)
+
     cache = getattr(_ROCM_SOURCE, "buffers", None)
     if cache is None:
         cache = {}
         _ROCM_SOURCE.buffers = cache
-    entry = cache.get((shape, dtype))
+    key = _module_cache_prefix(rt) + (shape, dtype)
+    entry = cache.get(key)
     if entry is not None and entry[0] is runtime_device:
         return entry[1], entry[2]
     import numpy as np
-    import iree.runtime as rt
 
     buf = runtime_device.allocator.allocate_buffer(
-        rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
-        rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
+        int(rt.MemoryType.HOST_LOCAL) | int(rt.MemoryType.DEVICE_VISIBLE),
+        int(rt.BufferUsage.TRANSFER_SOURCE) | int(rt.BufferUsage.MAPPING),
         nbytes,
     )
     view = buf.map().asarray(shape, np.dtype(dtype))
     if len(cache) >= _ROCM_SOURCE_CACHE_MAX:
         cache.clear()
-    cache[(shape, dtype)] = (runtime_device, buf, view)
+    cache[key] = (runtime_device, buf, view)
     return buf, view
+
+
+def _rocm_source_buffer(
+    runtime_device: Any, shape: tuple, dtype: Any, nbytes: int, rt: Any = None
+) -> tuple[Any, Any]:
+    """The rocm path's host SOURCE buffer (``_host_source_buffer``).
+
+    Kept as the rocm entry point (the rocm staging path, the adapter docs and
+    the vulkan "no cuda/rocm tier is entered" pin all name it); the vulkan
+    copy tier calls the shared ``_host_source_buffer`` directly so the two
+    kinds share ONE thread-local source cache.
+    """
+    return _host_source_buffer(runtime_device, shape, dtype, nbytes, rt)
 
 
 def _rocm_staged_input(
@@ -2672,6 +3429,7 @@ def _rocm_staged_input(
     dtype: Any,
     element_type: Any,
     nbytes: int,
+    rt: Any = None,
 ) -> Any | None:
     """ROCm/HIP staging fast path replacing ``rt.asdevicearray``.
 
@@ -2706,11 +3464,13 @@ def _rocm_staged_input(
     it anyway).
     """
     import numpy as np
-    import iree.runtime as rt
+
+    if rt is None:
+        rt = _runtime_module(None)
 
     try:
         src_buf, src_view = _rocm_source_buffer(
-            runtime_device, shape, dtype, nbytes
+            runtime_device, shape, dtype, nbytes, rt
         )
         np.copyto(src_view, tensor.numpy())
         key = (index, shape, dtype)
@@ -2735,13 +3495,210 @@ def _rocm_staged_input(
             rt.HalFence.create_at(sem, 0),
             rt.HalFence.create_at(sem, 1),
         )
-        _wait_copy_semaphore(sem)
+        _wait_copy_semaphore(sem, rt)
         return dest
     except core.EVOXCError:
         raise
     except Exception:
         # Fall back to rt.asdevicearray — same bytes, same semantics.
         return None
+
+
+def _vulkan_pinned_buffer(
+    runtime_device: Any,
+    shape: tuple,
+    dtype: Any,
+    element_type: Any,
+    nbytes: int,
+    rt: Any = None,
+) -> tuple[Any, Any] | None:
+    """Allocate + map one host-writable ``DEVICE_LOCAL`` buffer (vulkan tier 1).
+
+    The vulkan counterpart of the cuda pinned tier: a ``DEVICE_LOCAL |
+    HOST_VISIBLE`` allocation, mapped ONCE, whose mapped view the caller
+    memcpy's the host values into; the dispatches then read the buffer
+    DIRECTLY (no ``queue_copy``, no semaphore, no wait). MEASURED on the
+    Intel PTL iGPU / Mesa ANV: 21.8 GB/s at 64 MB f32 against 11.1 GB/s for
+    the copy tier and 4.1 GB/s for ``rt.asdevicearray``.
+
+    CORRECTNESS — the ONE difference from the cuda tier, and the reason this
+    helper is gated rather than copied: cuda's direct write rests on a CUDA
+    driver guarantee that a host write into host-mapped DEVICE memory is
+    serialized against outstanding device reads of that memory. That
+    guarantee is not established on IREE's vulkan HAL, so the write is made
+    correct by MEMORY COHERENCE instead: the allocation must come back
+    ``HOST_COHERENT`` (a coherent host write is visible to the next queue
+    submission, needing no flush — and the python HAL exposes no
+    flush/invalidate primitive at all), and when the allocator cannot offer a
+    coherent host-visible allocation this returns ``None`` and the caller
+    takes the copy tier. Validated by a 1200-iteration alternating-value
+    stress through the public ``run`` path (see ``_vulkan_staged_input``).
+
+    Returns ``(device_array, mapped_view)``; the caller owns both (a
+    persistent staging entry for the segment executables, or the buffer handed
+    out by ``upload_tensor``'s one-shot placement).
+    """
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
+
+    coherent = getattr(rt.MemoryType, "HOST_COHERENT", None)
+    if coherent is None:
+        return None
+    buf = runtime_device.allocator.allocate_buffer(
+        int(rt.MemoryType.DEVICE_LOCAL) | int(rt.MemoryType.HOST_VISIBLE),
+        int(rt.BufferUsage.DEFAULT) | int(rt.BufferUsage.MAPPING),
+        nbytes,
+    )
+    # Coherence gate (see the docstring): without it a mapped host write is
+    # only visible to the device after a flush this HAL does not expose.
+    if (int(buf.memory_type()) & int(coherent)) != int(coherent):
+        return None
+    view = buf.map().asarray(shape, np.dtype(dtype))
+    device_array = rt.DeviceArray(
+        runtime_device,
+        rt.HalBufferView(buf, shape, element_type),
+        implicit_host_transfer=False,
+        override_dtype=dtype,
+    )
+    return device_array, view
+
+
+def _vulkan_staged_input(
+    staged_inputs: dict,
+    runtime_device: Any,
+    index: int,
+    tensor: core.Tensor,
+    shape: tuple,
+    dtype: Any,
+    element_type: Any,
+    nbytes: int,
+    rt: Any = None,
+    *,
+    one_shot: bool = False,
+) -> Any | None:
+    """Vulkan staging fast path replacing ``rt.asdevicearray``.
+
+    Two tiers, dispatched on size and ownership (measured on the Intel PTL
+    iGPU through Mesa ANV, iree-base-runtime 3.13.0; the host is shared, so
+    the numbers below are medians of interleaved A/B rounds):
+
+    * MAPPED tier (``nbytes <= _VULKAN_PINNED_MAX_BYTES``): the host values
+      are memcpy'd (``np.copyto``) straight into the mapped view of a
+      ``DEVICE_LOCAL | HOST_VISIBLE`` buffer the dispatches read directly —
+      no copy, no semaphore, no wait (``_vulkan_pinned_buffer``, which also
+      carries the coherence gate that makes the direct write correct).
+    * COPY tier (larger inputs, or a mapped allocation the HAL cannot make
+      coherent): the same shape as the rocm path — memcpy into a reusable
+      THREAD-LOCAL host source buffer (``_host_source_buffer``), then a
+      per-call ``queue_copy`` into a ``DEVICE_LOCAL`` destination, waiting on
+      a FRESH semaphore via the shared query-first ``_wait_copy_semaphore``.
+      The fresh semaphore and the wait are LOAD-BEARING exactly as on
+      cuda/rocm (reusing a waited event-semaphore aborts the HAL; the copy is
+      not ordered ahead of the invoke's dispatches without the wait).
+
+    OWNERSHIP — ``one_shot`` is ``upload_tensor``'s placement call: every
+    destination is FRESH (the returned tensor owns it, and it must never alias
+    the caller's host memory or a later upload), so the destination is never
+    read from / written to ``staged_inputs``. Both destinations are fresh
+    buffers, so the returned array can never alias the user's host memory (the
+    reusable state is only the copy tier's host SOURCE, which is never handed
+    out). Without ``one_shot`` (the segment executables) both destinations are
+    cached per ``(index, shape, dtype)`` in ``staged_inputs`` — the entries
+    are ``("pin", (da, view))`` or ``("copy", da)``, and every call re-copies
+    the current host values in (runs are synchronous, so reuse cannot race).
+
+    Returns ``None`` (caller falls back to ``rt.asdevicearray``; semantics
+    identical) on ANY failure of the fast paths — a HAL lacking one of the
+    primitives, an unmappable buffer, a full cache, or a host-materialization
+    error other than an explicit ``core.EVOXCError`` (which always propagates:
+    it is the documented no-implicit-transfer error and the fallback would
+    re-raise it anyway).
+    """
+    import numpy as np
+
+    if rt is None:
+        rt = _runtime_module(None)
+
+    try:
+        key = (index, shape, dtype)
+        cached = None if one_shot else staged_inputs.get(key)
+        if cached is not None:
+            kind, payload = cached
+            if kind == "pin":
+                da, view = payload
+                np.copyto(view, tensor.numpy())
+                return da
+            source_buf, source_view = _host_source_buffer(
+                runtime_device, shape, dtype, nbytes, rt
+            )
+            np.copyto(source_view, tensor.numpy())
+            _queue_copy_into(runtime_device, source_buf, payload, rt)
+            return payload
+        host = tensor.numpy()
+        if nbytes <= _VULKAN_PINNED_MAX_BYTES:
+            pinned = _vulkan_pinned_buffer(
+                runtime_device, shape, dtype, element_type, nbytes, rt
+            )
+            if pinned is not None:
+                da, view = pinned
+                np.copyto(view, host)
+                if not one_shot:
+                    _remember_staged_input(staged_inputs, key, ("pin", (da, view)))
+                return da
+        source_buf, source_view = _host_source_buffer(
+            runtime_device, shape, dtype, nbytes, rt
+        )
+        np.copyto(source_view, host)
+        dest_buf = runtime_device.allocator.allocate_buffer(
+            rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+        )
+        dest = rt.DeviceArray(
+            runtime_device,
+            rt.HalBufferView(dest_buf, shape, element_type),
+            implicit_host_transfer=False,
+            override_dtype=dtype,
+        )
+        _queue_copy_into(runtime_device, source_buf, dest, rt)
+        if not one_shot:
+            _remember_staged_input(staged_inputs, key, ("copy", dest))
+        return dest
+    except core.EVOXCError:
+        raise
+    except Exception:
+        # Fall back to rt.asdevicearray — same bytes, same semantics.
+        return None
+
+
+def _remember_staged_input(staged_inputs: dict, key: tuple, entry: Any) -> None:
+    """Store one staged-input cache entry, honouring ``_STAGED_INPUT_CACHE_MAX``.
+
+    A bounded cache: clearing it is performance-neutral, never a correctness
+    change (the next call simply stages into fresh buffers).
+    """
+    if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+        staged_inputs.clear()
+    staged_inputs[key] = entry
+
+
+def _queue_copy_into(
+    runtime_device: Any, source_buf: Any, destination: Any, rt: Any = None
+) -> None:
+    """``queue_copy`` a host source into a ``DeviceArray`` and wait for it.
+
+    Shared by the vulkan copy tier's cached and fresh forms: a FRESH
+    completion semaphore per call, awaited through the query-first
+    ``_wait_copy_semaphore`` (both load-bearing — see the tier docs).
+    """
+    sem = runtime_device.create_semaphore(0)
+    runtime_device.queue_copy(
+        source_buf,
+        destination._buffer_view.get_buffer(),
+        rt.HalFence.create_at(sem, 0),
+        rt.HalFence.create_at(sem, 1),
+    )
+    _wait_copy_semaphore(sem, rt)
 
 
 def _build_buffers(
@@ -2753,6 +3710,7 @@ def _build_buffers(
     *,
     reject_foreign: bool = False,
     device_kind: str,
+    rt: Any = None,
 ) -> list:
     """Build the HAL buffers for one invoke from validated input tensors.
 
@@ -2782,17 +3740,28 @@ def _build_buffers(
       explicitly via ``t.to(Device('cuda'|'rocm'|'vulkan', N))``).
     * segment executables pass their per-segment staging cache
       (``reject_foreign=False``): host-mode external-kernel boundaries
-      legitimately stage host tensors via ``_staged_input`` on cuda and rocm
-      (``device_kind`` selects the kind's fast path), else the asdevicearray
-      fallback (non-GPU kinds, llvm-cpu, and every other device kind —
-      notably vulkan, which has no staging tier).
+      legitimately stage host tensors via ``_staged_input`` on cuda, rocm and
+      vulkan (``device_kind`` selects the kind's fast path; ``"vulkan"`` is
+      delegated to ``_vulkan_staged_input`` — a mapped
+      ``DEVICE_LOCAL | HOST_VISIBLE`` tier up to ``_VULKAN_PINNED_MAX_BYTES``
+      (16 MiB, gated on host-coherence), and a reusable
+      ``HOST_LOCAL | DEVICE_VISIBLE`` source plus a per-call ``queue_copy``
+      above it, cached per ``(index, shape, dtype)``), else the asdevicearray
+      fallback (non-GPU kinds, llvm-cpu, every other device kind, or an
+      oversized/unmappable input). ``_staged_input`` is called without
+      ``one_shot`` here, so its destinations are cached; ``upload_tensor``
+      passes ``one_shot=True`` so every placement gets fresh destinations.
 
     ``device_kind`` is a REQUIRED keyword (the NORMALIZED kind) — there is
     deliberately no ``"cuda"`` default, so a caller with another kind can
-    never silently inherit the cuda staging tier.
+    never silently inherit the cuda staging tier. ``rt`` is the RESOLVED
+    IREE runtime module (defaults to the default/env-resolved module); a
+    caller with a custom module must pass its own so the buffers carry the
+    right ``DeviceArray`` class and staging cache.
     """
     import numpy as np
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     buffers = []
     for i, tensor in enumerate(flat_input_tensors):
@@ -2822,7 +3791,7 @@ def _build_buffers(
             )
         elif staged_inputs is not None:
             staged = _staged_input(
-                staged_inputs, runtime_device, i, tensor, device_kind
+                staged_inputs, runtime_device, i, tensor, device_kind, rt
             )
             if staged is not None:
                 buffers.append(staged)
@@ -2863,7 +3832,11 @@ class _IreeSegmentExecutable:
         core_device: Device,
         input_specs: tuple,
         device_kind: str,
+        runtime_module: Any = None,
     ) -> None:
+        self._runtime_module = (
+            runtime_module if runtime_module is not None else _runtime_module(None)
+        )
         self.module = module
         self.runtime_device = runtime_device
         self.core_device = core_device
@@ -2888,7 +3861,7 @@ class _IreeSegmentExecutable:
                 # cuda-only classic-allocator pool anchor (see the staging
                 # notes at the top of this module) — the rocm and vulkan
                 # paths need no anchor.
-                import iree.runtime as rt
+                rt = self._runtime_module
 
                 try:
                     self._pool_anchor = runtime_device.allocator.allocate_buffer(
@@ -2937,6 +3910,7 @@ class _IreeSegmentExecutable:
             self.core_device,
             self._staged_inputs,
             device_kind=self.device_kind,
+            rt=self._runtime_module,
         )
         results = self._entry_function()(*buffers)
         if results is None:
@@ -2944,7 +3918,11 @@ class _IreeSegmentExecutable:
         elif not isinstance(results, tuple):
             results = (results,)
         return [
-            core.Tensor(IreeDevicePayload(result, self.core_device))
+            core.Tensor(
+                IreeDevicePayload(
+                    result, self.core_device, runtime_module=self._runtime_module
+                )
+            )
             for result in results
         ]
 
@@ -3011,7 +3989,11 @@ class IreeExternalExecutable(CompilerExecutable):
         segments: list[_IreeSegmentExecutable],
         plan: list[dict],
         runtime_device: Any,
+        runtime_module: Any = None,
     ) -> None:
+        self._runtime_module = (
+            runtime_module if runtime_module is not None else _runtime_module(None)
+        )
         super().__init__(
             artifact=artifact,
             signature=signature,
@@ -3202,11 +4184,17 @@ class IreeExternalExecutable(CompilerExecutable):
         returning a buffer still pending on another runtime's stream
         requires that stream to be synchronized by the kernel (the adapter
         adds no fence; see ``evoxc.external``).
+
+        Every helper and payload here uses the executable's RESOLVED runtime
+        module (``self._runtime_module``), so a custom
+        ``iree_runtime_module`` is honored on the whole device-result path.
         """
-        import iree.runtime as rt
+        rt = self._runtime_module
 
         if isinstance(entry, rt.DeviceArray):
-            return core.Tensor(IreeDevicePayload(entry, self._core_device))
+            return core.Tensor(
+                IreeDevicePayload(entry, self._core_device, runtime_module=rt)
+            )
         if isinstance(entry, IreeDevicePayload):
             # Already a device payload (the duck-payload contract): wrap it
             # directly, unchanged — never re-imported through DLPack.
@@ -3215,9 +4203,11 @@ class IreeExternalExecutable(CompilerExecutable):
             getattr(entry, "__dlpack_device__", None)
         ):
             array = _device_array_from_dlpack(
-                entry, self.runtime_device, self._core_device
+                entry, self.runtime_device, self._core_device, rt
             )
-            return core.Tensor(IreeDevicePayload(array, self._core_device))
+            return core.Tensor(
+                IreeDevicePayload(array, self._core_device, runtime_module=rt)
+            )
         return core.Tensor(entry)
 
 
@@ -3228,28 +4218,38 @@ class IreeExternalExecutable(CompilerExecutable):
 # metadata (plans, dtype mappings) or module handles, re-checked against the
 # ACTUAL run arguments on every call.
 #
-# ``numpy`` / ``iree.runtime`` memoized once for the run path: the heavy-import
-# rule keeps them out of module top level, but a per-call ``import`` statement
-# still pays a ``sys.modules`` lookup on every run.
-_RUNTIME_MODULES: list = []
+# ``numpy`` / the RESOLVED ``iree.runtime`` module memoized for the run path:
+# the heavy-import rule keeps them out of module top level, but a per-call
+# ``import`` statement still pays a ``sys.modules`` lookup on every run.
+_RUNTIME_MODULES: dict[Any, tuple[Any, Any]] = {}
 
 
-def _runtime_modules() -> tuple[Any, Any]:
-    """Return the memoized ``(numpy, iree.runtime)`` module pair."""
-    mods = _RUNTIME_MODULES
-    if not mods:
+def _runtime_modules(rt: Any = None) -> tuple[Any, Any]:
+    """Return the memoized ``(numpy, resolved iree.runtime)`` module pair.
+
+    The memo is keyed by the RESOLVED runtime module OBJECT (modules are
+    hashable), so a custom ``iree_runtime_module`` and the default module
+    never share an entry. ``rt`` defaults to the default/env-resolved module
+    (``_runtime_module(None)``), so an executable carrying a custom module
+    passes ``self._runtime_module`` and gets numpy plus THAT module back.
+    """
+    if rt is None:
+        rt = _runtime_module(None)
+    pair = _RUNTIME_MODULES.get(rt)
+    if pair is None:
         import numpy as np
 
-        import iree.runtime as rt
-
-        mods += (np, rt)
-    return mods[0], mods[1]
+        pair = (np, rt)
+        _RUNTIME_MODULES[rt] = pair
+    return pair
 
 
 # HAL element-type int -> numpy dtype, resolved lazily through iree's own
 # mapping helper and memoized per element type (a STATIC mapping: an element
-# type's numpy dtype never changes).
-_HAL_ELEMENT_DTYPES: dict[int, Any] = {}
+# type's numpy dtype never changes). The key is ``(element_type,)`` for the
+# default runtime module, ``(module, element_type)`` for a custom one — see
+# ``_module_cache_prefix``.
+_HAL_ELEMENT_DTYPES: dict[tuple, Any] = {}
 
 
 #: DLPack device-type codes (dlpack.h) for the device kinds a payload can
@@ -3284,7 +4284,9 @@ def _dlpack_device_id(device: Device) -> tuple[int, int]:
     return (code, device.index)
 
 
-def _device_array_from_dlpack(entry: Any, runtime_device: Any, core_device: Device) -> Any:
+def _device_array_from_dlpack(
+    entry: Any, runtime_device: Any, core_device: Device, rt: Any = None
+) -> Any:
     """Import a DLPack-capable object as an iree ``DeviceArray`` (zero-copy).
 
     The ``device_resident=True`` external-kernel result path for a producer
@@ -3299,9 +4301,12 @@ def _device_array_from_dlpack(entry: Any, runtime_device: Any, core_device: Devi
     raises ``core.BackendError`` instead. ``stream=None`` is passed to the
     producer (no synchronization request: iree's HAL uses its own HIP queue,
     so the KERNEL must have completed its writes before returning; see
-    ``evoxc.external``).
+    ``evoxc.external``). ``rt`` is the RESOLVED IREE runtime module
+    (defaults to the default/env-resolved module) — the imported
+    ``DeviceArray`` is built with THAT module's class.
     """
-    import iree.runtime as rt
+    if rt is None:
+        rt = _runtime_module(None)
 
     expected = _dlpack_device_id(core_device)
     try:
@@ -3335,19 +4340,29 @@ def _device_array_from_dlpack(entry: Any, runtime_device: Any, core_device: Devi
     return rt.DeviceArray(runtime_device, view)
 
 
-def _hal_element_dtype(element_type: int) -> Any:
+def _hal_element_dtype(element_type: int, rt: Any = None) -> Any:
     """numpy dtype for an IREE HAL element-type int (memoized lookup).
 
     ``DeviceArray.dtype`` resolves this through nanobind on EVERY access
     (~0.4-0.5 us, measured) — the dominant cost of wrapping run outputs in
     ``IreeDevicePayload`` before the memo existed.
-    """
-    dtype = _HAL_ELEMENT_DTYPES.get(element_type)
-    if dtype is None:
-        from iree.runtime.array_interop import HalElementType
 
-        dtype = HalElementType.map_to_dtype(element_type)
-        _HAL_ELEMENT_DTYPES[element_type] = dtype
+    ``rt`` is the RESOLVED IREE runtime module (defaults to the
+    default/env-resolved module); ``HalElementType`` is resolved from that
+    module's own ``array_interop`` submodule (attribute first, then import),
+    and the memo is keyed on ``(element type)`` — ``_module_cache_prefix``
+    prepends the module for a CUSTOM one — so a custom module's mapping never
+    shadows the default module's and vice versa.
+    """
+    if rt is None:
+        rt = _runtime_module(None)
+
+    key = _module_cache_prefix(rt) + (element_type,)
+    dtype = _HAL_ELEMENT_DTYPES.get(key)
+    if dtype is None:
+        array_interop = _runtime_submodule(rt, "array_interop")
+        dtype = array_interop.HalElementType.map_to_dtype(element_type)
+        _HAL_ELEMENT_DTYPES[key] = dtype
     return dtype
 
 
@@ -3437,11 +4452,18 @@ class IreeDevicePayload:
     cuda/rocm/vulkan it is an explicit staging-buffer ``queue_copy`` — a
     fresh D2H copy per call, the explicit ``t.to(Device("cpu", 0))`` download
     path with no per-kind code.
+
+    The ``runtime_module`` the buffer belongs to is carried on the payload (a
+    private slot; ``None`` = the default/env-resolved ``iree.runtime``), so
+    the adapter-owned readback and the DLPack export use the SAME module
+    instance every other stage of that pipeline resolves.
     """
 
-    __slots__ = ("_array", "_shape", "_dtype", "device")
+    __slots__ = ("_array", "_shape", "_dtype", "_runtime", "device")
 
-    def __init__(self, array: Any, device: Device) -> None:
+    def __init__(
+        self, array: Any, device: Device, runtime_module: Any = None
+    ) -> None:
         # Metadata cached at construction: an iree runtime ``DeviceArray`` is
         # immutable in shape/dtype for its lifetime (run outputs, staged
         # inputs, and external-kernel results are all created once with fixed
@@ -3458,7 +4480,16 @@ class IreeDevicePayload:
         # output wrapping at 12 outputs). The buffer view is the same source
         # those accessors read: the shape is a tuple of ints and the dtype is
         # the element-type int resolved through the module-level memo.
+        #
+        # ``runtime_module`` is the RESOLVED IREE runtime module this payload's
+        # buffer belongs to (``None`` = the default/env-resolved module). The
+        # two-positional-argument form stays valid; the module is carried so
+        # the readback and the DLPack export use the SAME runtime the payload
+        # was produced with.
         self._array = array
+        self._runtime = (
+            runtime_module if runtime_module is not None else _runtime_module(None)
+        )
         try:
             view = array._buffer_view
             # ``DeviceArray``'s explicit dtype override WINS whenever set,
@@ -3466,7 +4497,7 @@ class IreeDevicePayload:
             # dtypes the HAL element type cannot express).
             dtype = array._override_dtype
             if dtype is None:
-                dtype = _hal_element_dtype(view.element_type)
+                dtype = _hal_element_dtype(view.element_type, self._runtime)
             shape = tuple(view.shape)
         except (AttributeError, ValueError):
             # Defensive: a runtime without the private buffer-view protocol —
@@ -3523,7 +4554,11 @@ class IreeDevicePayload:
         returned array is always a fresh host array for those kinds; it never
         aliases the device buffer.
         """
-        return _readback_device_array(self._array)
+        return _readback_device_array(
+            self._array,
+            rt=self._runtime,
+            host_memory=self.device.kind == "cpu",
+        )
 
     def __dlpack_device__(self) -> tuple[int, int]:
         """Report the DLPack ``(device_type, device_id)`` of this buffer.
@@ -3602,7 +4637,7 @@ class IreeDevicePayload:
                 "t.to(core.Device('cpu', 0)) instead."
             )
         try:
-            raw_dtype = _hal_element_dtype(view.element_type)
+            raw_dtype = _hal_element_dtype(view.element_type, self._runtime)
         except (AttributeError, ValueError) as exc:
             raise core.DeviceError(
                 f"Tensor.__dlpack__: the HAL element type of this payload "
@@ -3635,7 +4670,12 @@ class IreeDevicePayload:
         mappable llvm-cpu buffer stays zero-copy and device memory pays one
         explicit D2H copy per call.
         """
-        return _readback_device_array(self._array, dtype=dtype)
+        return _readback_device_array(
+            self._array,
+            dtype=dtype,
+            rt=self._runtime,
+            host_memory=self.device.kind == "cpu",
+        )
 
 
 # Backward-compat alias: the payload was private (``_IreeDevicePayload``)
@@ -3696,12 +4736,26 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
        FRESH per-call staging dict (fresh DESTINATION buffers, no cache —
        the returned tensor owns its buffer): the correctness-pinned
        pinned/DMA tiers on cuda (the DMA tier's fresh-semaphore wait is
-       load-bearing), the host-local-source + queue_copy path on rocm —
-       both falling back to ``rt.asdevicearray`` for oversized/unmappable
-       inputs or any failure on the fast path. VULKAN has NO staging tier
-       in v1 (``_staged_input`` returns ``None`` for it), so its upload IS
-       the plain ``rt.asdevicearray`` copy.
+       load-bearing), the host-local-source + queue_copy path on rocm, and
+       on vulkan ``_vulkan_staged_input``'s mapped ``DEVICE_LOCAL |
+       HOST_VISIBLE`` tier up to ``_VULKAN_PINNED_MAX_BYTES`` (16 MiB, gated
+       on host-coherence) or its reusable ``HOST_LOCAL | DEVICE_VISIBLE``
+       source + per-call ``queue_copy`` tier above it. The ``one_shot=True``
+       keyword keeps every destination out of the staging cache, so the
+       returned tensor never aliases a later upload. All paths fall back to
+       ``rt.asdevicearray`` for oversized/unmappable inputs or any failure
+       on the fast path.
     5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
+
+    The IREE RUNTIME MODULE resolves option-less here (the provider protocol
+    has no options dict): ``EVOXC_IREE_RUNTIME_MODULE`` -> ``iree.runtime``
+    (``_runtime_module(None)``), and that SAME module is passed into every
+    helper this provider calls and into the returned payload (so the
+    readback/DLPack export use it too). A module OBJECT cannot reach placement
+    through the option — to place data with a custom runtime module, also
+    expose it via ``EVOXC_IREE_RUNTIME_MODULE`` (a dotted importable path);
+    the other direction needs nothing, because payloads and executables carry
+    their resolved module.
 
     The DOWNLOAD direction needs no kind-specific code here: ``t.to(cpu)`` on
     a vulkan-resident tensor goes through the payload's host copy
@@ -3715,7 +4769,11 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     actionable message — never a raw iree exception.
     """
     import numpy as np
-    import iree.runtime as rt
+
+    # The placement-provider protocol has no options channel, so the runtime
+    # module resolves option -> env (EVOXC_IREE_RUNTIME_MODULE) -> default —
+    # the same resolution `load` performs for an unset `iree_runtime_module`.
+    rt = _runtime_module(None)
 
     if not isinstance(tensor, core.Tensor):
         raise core.DeviceError(
@@ -3748,13 +4806,13 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     # fresh-per-call path, rocm reuses one THREAD-LOCAL device
     # (create_device measured ~46 ms per call on the hip driver).
     runtime_args = _runtime_args_from_env()
-    _apply_iree_runtime_args(runtime_args)
+    _apply_iree_runtime_args(runtime_args, rt)
     try:
         if device_kind == "rocm":
-            runtime_device = _acquire_cached_rocm_device(device, runtime_args)
+            runtime_device = _acquire_cached_rocm_device(device, runtime_args, rt)
         else:
             runtime_device = _acquire_runtime_device(
-                device_kind, device, runtime_args
+                device_kind, device, runtime_args, rt
             )
     except core.EVOXCError:
         raise
@@ -3768,11 +4826,17 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     # buffer is fresh every time (the returned tensor owns it) while the
     # reusable SOURCE machinery is the kind's fast path (pinned/DMA on cuda
     # with the load-bearing fresh-semaphore wait; host-local source +
-    # queue_copy on rocm). A kind with NO staging tier -- vulkan -- always
-    # returns None here and takes the plain asdevicearray copy below, as do
-    # oversized/unmappable inputs or any failure on a fast path.
+    # queue_copy on rocm; on vulkan the mapped host-write tier or the same
+    # host-local source + queue_copy tier — see ``_vulkan_staged_input``).
+    # ``one_shot=True`` is what keeps the vulkan destination out of the
+    # staging cache, so the returned tensor never aliases a later upload. A
+    # kind with NO staging tier always returns None here and takes the plain
+    # asdevicearray copy below, as do oversized/unmappable inputs or any
+    # failure on a fast path.
     try:
-        staged = _staged_input({}, runtime_device, 0, tensor, device_kind)
+        staged = _staged_input(
+            {}, runtime_device, 0, tensor, device_kind, rt, one_shot=True
+        )
         if staged is None:
             staged = rt.asdevicearray(runtime_device, tensor.numpy())
     except core.EVOXCError:
@@ -3782,7 +4846,7 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
             f"Tensor.to could not upload the host tensor to {device!r} via "
             f"the {IreeBackend.name} backend: {exc}"
         ) from exc
-    return core.Tensor(IreeDevicePayload(staged, device))
+    return core.Tensor(IreeDevicePayload(staged, device, runtime_module=rt))
 
 
 # ---------------------------------------------------------------------------

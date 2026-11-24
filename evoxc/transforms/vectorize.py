@@ -13,7 +13,7 @@ from __future__ import annotations
 from evoxc import core
 from evoxc.core import tree as _core_tree
 from evoxc.trace import Graph
-from evoxc.transforms.batching import vectorize_graph
+from evoxc.transforms._native_bridge import vectorize_graph
 
 # The registered-custom-node table of core's pytrees. `register_pytree_node`
 # mutates this dict in place, so the alias stays live (same convention as
@@ -39,7 +39,7 @@ def vectorize(graph: Graph, axes) -> Graph:
         extra leading dimension (one fresh symbolic dim per pass, named from
         the active pass depth — `"batch"` at depth 0, `"batch_1"` at depth 1,
         ... — shared by all mapped inputs of the pass; see
-        `batching._batched_input_specs`). Unsupported ops — no registered
+        `batching._batch_dim`). Unsupported ops — no registered
         batching rule, control-flow regions in v1 — raise
         `core.TransformError` naming the op; there is never a Python-loop
         fallback. `output_tree` and `static_values` are preserved; the input

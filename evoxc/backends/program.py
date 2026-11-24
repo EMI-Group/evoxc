@@ -14,11 +14,12 @@ Import acyclicity:
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from evoxc.core import BackendError, PersistenceError
+from evoxc.core import BackendError, EVOXCError, PersistenceError
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from .backend import Backend  # noqa: F401
@@ -121,6 +122,172 @@ def _require_registered_backend(name: str) -> None:
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# Pure-inspection helpers shared by LoweredProgram and CompiledArtifact
+# ---------------------------------------------------------------------------
+# Everything below is read-only reporting: it never traces, lowers, compiles,
+# caches, verifies or deserializes (``source_text`` is the ONE exception — it
+# asks the existing ``text()`` rendering for its output and downgrades any
+# rendering failure to ``None``).
+
+#: Payload dict ``"format"`` discriminators whose name IS the payload kind.
+_KNOWN_PAYLOAD_FORMATS = frozenset({"stablehlo", "stablehlo-segments"})
+
+
+def _payload_kind(payload: Any) -> str | None:
+    """Classify a staged payload for ``__repr__``/``summary()`` (pure).
+
+    * ``None`` — an absent payload (both staged objects default ``payload`` to
+      ``None``), reported as ``None`` rather than an invented kind.
+    * ``"serialized-ir"`` — a dict carrying ``version`` + ``module``
+      (``ir.serialize_module`` output, the numpy backend's payload).
+    * ``"mlir"`` — MLIR text itself (a ``str``) or a dict carrying
+      ``mlir_text`` (the single-segment compiler payload).
+    * ``"stablehlo"`` / ``"stablehlo-segments"`` — a dict whose ``format``
+      field names one of the known compiler payload formats.
+    * ``"json"`` — any other dict; the payload's type name for anything else.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        if "version" in payload and "module" in payload:
+            return "serialized-ir"
+        if "mlir_text" in payload:
+            return "mlir"
+        fmt = payload.get("format")
+        if isinstance(fmt, str) and fmt in _KNOWN_PAYLOAD_FORMATS:
+            return fmt
+        return "json"
+    if isinstance(payload, str):
+        return "mlir"
+    return type(payload).__name__
+
+
+def _payload_bytes(payload: Any) -> int | None:
+    """Size of the payload in bytes, or ``None`` when not computable (pure).
+
+    ``str`` payloads report their UTF-8 length; ``dict`` payloads the length of
+    the canonical JSON encoding (sorted keys, compact separators, ``default=str``
+    so an odd leaf can never raise). Anything else — or a canonicalization
+    failure — reports ``None``.
+    """
+    if isinstance(payload, str):
+        return len(payload.encode("utf-8"))
+    if isinstance(payload, dict):
+        try:
+            encoded = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), default=str
+            )
+        except Exception:  # noqa: BLE001 - inspection must never raise
+            return None
+        return len(encoded.encode("utf-8"))
+    return None
+
+
+def _signature_field(signature: "Signature | None", attr: str) -> tuple:
+    """A ``Signature`` sequence field as a tuple (empty without a signature)."""
+    if signature is None:
+        return ()
+    value = getattr(signature, attr, ())
+    return tuple(value) if value else ()
+
+
+def _spec_shapes(specs: tuple) -> list[list[str]]:
+    """Per-leaf symbolic shape rendered as strings (``[str(dim), ...]``)."""
+    return [[str(dim) for dim in (getattr(spec, "shape", ()) or ())] for spec in specs]
+
+
+def _spec_dtypes(specs: tuple) -> list[str]:
+    """Per-leaf dtype rendered as a string."""
+    return [str(spec.dtype) for spec in specs]
+
+
+def _program_summary(
+    *,
+    backend: str,
+    target: str | None,
+    signature: "Signature | None",
+    payload: Any,
+    required_custom_ops: tuple = (),
+    runtime_dependencies: "dict[str, str] | None" = None,
+) -> dict:
+    """Build the ``summary()`` dict shared by both staged objects (pure)."""
+    input_specs = _signature_field(signature, "input_specs")
+    output_specs = _signature_field(signature, "output_specs")
+    return {
+        "backend": backend,
+        "target": target,
+        "payload_kind": _payload_kind(payload),
+        "payload_bytes": _payload_bytes(payload),
+        "input_count": len(input_specs),
+        "output_count": len(output_specs),
+        "input_shapes": _spec_shapes(input_specs),
+        "output_shapes": _spec_shapes(output_specs),
+        "input_dtypes": _spec_dtypes(input_specs),
+        "static_value_count": len(_signature_field(signature, "static_values")),
+        "required_custom_ops": list(required_custom_ops),
+        "runtime_dependencies": dict(runtime_dependencies or {}),
+    }
+
+
+def _program_repr(
+    cls_name: str,
+    *,
+    backend: str,
+    target: str | None,
+    signature: "Signature | None",
+    payload: Any,
+) -> str:
+    """One-line ``__repr__`` body shared by both staged objects.
+
+    Reports the backend, the target (``CompiledArtifact`` only), the payload
+    kind + byte size and the signature's leaf counts. An absent payload renders
+    as ``payload=None``; a not-computable size renders as ``?``; anything that
+    could make an attribute unreadable is caught by the callers, so a ``repr``
+    never raises.
+    """
+    parts = [f"backend={backend!r}"]
+    if target is not None:
+        parts.append(f"target={target!r}")
+    if payload is None:
+        parts.append("payload=None")
+    else:
+        size = _payload_bytes(payload)
+        parts.append(
+            f"payload={_payload_kind(payload)} {'?' if size is None else f'{size} B'}"
+        )
+    parts.append(f"inputs={len(_signature_field(signature, 'input_specs'))}")
+    parts.append(f"outputs={len(_signature_field(signature, 'output_specs'))}")
+    return f"{cls_name}({', '.join(parts)})"
+
+
+def _render_payload_text(backend: str, payload: Any) -> str:
+    """Human-readable rendering of a payload (backend-specific).
+
+    * MLIR-style payloads (``str``) are returned verbatim.
+    * Compiler-backend payloads (dict with ``"format": "stablehlo"`` and an
+      ``"mlir_text"`` field — see ``compiler.CompilerBackend``) render their
+      MLIR text.
+    * Serialized ``ir.Module`` payloads (dict carrying ``version`` + ``module``
+      keys) are deserialized and pretty-printed.
+    * Anything else raises ``core.BackendError`` naming the backend.
+    """
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict) and "mlir_text" in payload:
+        return payload["mlir_text"]
+    if isinstance(payload, dict) and "version" in payload and "module" in payload:
+        from evoxc import ir
+
+        module = ir.deserialize_module(payload)
+        return ir.pretty_print(module)
+    raise BackendError(
+        f"backend {backend!r}: cannot render lowered payload of type "
+        f"{type(payload).__name__} — expected MLIR text (str) or a "
+        f"serialized ir.Module dict"
+    )
+
+
 @dataclass(frozen=True)
 class Signature:
     """Input/output contract recorded at ``lower()`` time, passed down from the Graph.
@@ -172,6 +339,49 @@ class LoweredProgram:
     signature: Signature | None = None
     payload: Any = None
 
+    def __repr__(self) -> str:
+        """One-line inspection line: backend, payload kind + size, leaf counts."""
+        try:
+            return _program_repr(
+                "LoweredProgram",
+                backend=self.backend,
+                target=None,
+                signature=self.signature,
+                payload=self.payload,
+            )
+        except Exception:  # noqa: BLE001 - inspection must never raise
+            return f"LoweredProgram(backend={self.backend!r}, payload=<unavailable>)"
+
+    def summary(self) -> dict:
+        """Pure-inspection snapshot of this lowered program.
+
+        Reads attributes only — never verifies, deserializes, lowers or caches.
+        The returned dict has exactly these keys: ``backend``, ``target``
+        (``None`` — a lowered program has no compiled target), ``payload_kind``,
+        ``payload_bytes``, ``input_count``, ``output_count``, ``input_shapes``,
+        ``output_shapes``, ``input_dtypes``, ``static_value_count``,
+        ``required_custom_ops`` (``[]``) and ``runtime_dependencies`` (``{}``).
+        """
+        return _program_summary(
+            backend=self.backend,
+            target=None,
+            signature=self.signature,
+            payload=self.payload,
+        )
+
+    def source_text(self) -> str | None:
+        """The human-readable program text, or ``None`` when there is none.
+
+        Returns exactly what ``text()`` renders (MLIR text verbatim, the
+        compiler payload's MLIR text, or the pretty-printed serialized IR) and
+        — unlike ``text()`` — catches the rendering/deserialization failure and
+        returns ``None`` instead of raising ``core.BackendError``.
+        """
+        try:
+            return self.text()
+        except (EVOXCError, ValueError, TypeError, KeyError, IndexError):
+            return None
+
     def text(self) -> str:
         """Human-readable rendering of the payload (backend-specific).
 
@@ -183,21 +393,7 @@ class LoweredProgram:
           ``module`` keys) are deserialized and pretty-printed.
         * Anything else raises ``core.BackendError`` naming the backend.
         """
-        payload = self.payload
-        if isinstance(payload, str):
-            return payload
-        if isinstance(payload, dict) and "mlir_text" in payload:
-            return payload["mlir_text"]
-        if isinstance(payload, dict) and "version" in payload and "module" in payload:
-            from evoxc import ir
-
-            module = ir.deserialize_module(payload)
-            return ir.pretty_print(module)
-        raise BackendError(
-            f"backend {self.backend!r}: cannot render lowered payload of type "
-            f"{type(payload).__name__} — expected MLIR text (str) or a "
-            f"serialized ir.Module dict"
-        )
+        return _render_payload_text(self.backend, self.payload)
 
     def save(self, path: str | os.PathLike) -> None:
         """Serialize via the evoxc.persist container (lazy import).
@@ -264,6 +460,52 @@ class CompiledArtifact:
     payload: Any = None
     required_custom_ops: tuple[str, ...] = ()
     runtime_dependencies: dict[str, str] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        """One-line inspection line: backend, target, payload kind + size, leaves."""
+        try:
+            return _program_repr(
+                "CompiledArtifact",
+                backend=self.backend,
+                target=self.target,
+                signature=self.signature,
+                payload=self.payload,
+            )
+        except Exception:  # noqa: BLE001 - inspection must never raise
+            return f"CompiledArtifact(backend={self.backend!r}, payload=<unavailable>)"
+
+    def summary(self) -> dict:
+        """Pure-inspection snapshot of this compiled artifact.
+
+        Reads attributes only — never verifies, deserializes, compiles or
+        caches. The returned dict has exactly these keys: ``backend``,
+        ``target``, ``payload_kind``, ``payload_bytes``, ``input_count``,
+        ``output_count``, ``input_shapes``, ``output_shapes``,
+        ``input_dtypes``, ``static_value_count``, ``required_custom_ops`` and
+        ``runtime_dependencies``.
+        """
+        return _program_summary(
+            backend=self.backend,
+            target=self.target,
+            signature=self.signature,
+            payload=self.payload,
+            required_custom_ops=self.required_custom_ops,
+            runtime_dependencies=self.runtime_dependencies,
+        )
+
+    def source_text(self) -> str | None:
+        """The human-readable program text, or ``None`` when there is none.
+
+        Renders the payload through the SAME shared helper ``LoweredProgram.text()``
+        uses (MLIR text verbatim, the compiler payload's MLIR text, or the
+        pretty-printed serialized IR) and — unlike ``text()`` — catches the
+        rendering/deserialization failure and returns ``None`` instead of
+        raising ``core.BackendError``.
+        """
+        try:
+            return _render_payload_text(self.backend, self.payload)
+        except (EVOXCError, ValueError, TypeError, KeyError, IndexError):
+            return None
 
     def save(self, path: str | os.PathLike) -> None:
         """Serialize via the evoxc.persist container (lazy import).

@@ -1,48 +1,51 @@
-"""Pins for `batch_functions`' TWO INTERNAL PERFORMANCE HOOKS — deterministically.
+"""Pins for `batch_functions`' NATIVE merge contract — deterministically.
 
-Contract under test (binding): `evoxc/transforms/_emit.py`
-(`emit_merged_graph`, `_stamp_locations`, `finish_merged_graph`),
-`evoxc/transforms/_bands.py` (`emit_banded_graph`, `_combine_bands`),
-`evoxc/ops/_utils.py` (`get_location`, `_inside_evoxc_package`,
-`_suppress_location_capture`), summarised in `evoxc/transforms/CONTEXT.md`
-§ "Phase 2 — emission (`_emit.py`)".
+Contract under test (binding): `evoxc/transforms/CONTEXT.md`
+§ "`batch_functions` frontend", `native/evoxc-compiler/src/batch_functions/CONTEXT.md`
+§ "Emission contract" / "Deviations from the Python contract" /
+"Bands merged graph", plus `evoxc/transforms/_report.py` (`BatchReport`, the
+12 keys) and `evoxc/ops/_utils.py` (`get_location`).
 
-A merge is an EMITTER: it builds a whole graph of ordinary ops in one go, so the
-per-op call-site capture of `ops` would be pure overhead. Instead the merged
-graph is re-stamped afterwards with its contributing ORIGINAL ops' locations
-(`_stamp_locations`), and the helper ops the mux / band machinery emits itself
-get ONE call site captured once per merge. Two hooks implement that, and this
-module pins BOTH without ever measuring wall-clock time:
+`batch_functions` merges in the NATIVE engine
+(`evoxc._evoxc_native.batch_functions`): Rust builds the merged module, stamps
+every rule-emitted op with its contributing source op's `Location` (carried
+through the native envelope from TRACING) and returns the 12-key report.
+Python keeps only validation, `Graph` reconstruction and report rehydration.
+The merge runs entirely in the native engine
+(`native/evoxc-compiler/src/batch_functions/` — `bands.rs`, `emit.rs`; contract
+in `native/evoxc-compiler/src/batch_functions/CONTEXT.md`), so there is no
+Python emitter and no per-call-site location-capture suppression left; what
+this module pins is the native contract:
 
-1. **One call site per merge.** `_suppress_location_capture()` is a private,
-   re-entrant context manager that makes `get_location()` return
-   `ir.Location.unknown()` without walking a single frame. Both drivers do
-   `call_site = get_location()` exactly ONCE, OUTSIDE the suppression block, and
-   then emit every op (rules, stacked constants, band slices/gathers/
-   concatenations, mux `select`s) INSIDE it. The drivers reach `get_location`
-   through their own module-level binding (`from evoxc.ops._utils import
-   get_location`), so the natural seam for the pin is those bindings:
-   `evoxc.transforms._emit.get_location` and `evoxc.transforms._bands.get_location`
-   are each wrapped in a DELEGATING counter, and **a merge invokes exactly ONE
-   of them, exactly once** — the flat driver (`_emit`, which also serves
-   `bands=1` and an auto-resolved single band) or the banded driver (`_bands`),
-   never both — independently of how many ops the merge emits, and the value
-   captured there is REAL (never `Location.unknown()`).
-   `inspect.stack` is a SECOND invariant: location capture is a cheap
-   `sys._getframe` walk that never touches `inspect.stack()`, so the raising
-   `inspect.stack` stand-in installed by every case must be called ZERO times.
-
-2. **Location preservation.** Suppressing capture must not lose source
-   information: every non-terminator op of the merged graph carries a REAL
-   `ir.Location` drawn from the contributing programs' source lines, the
-   `return` terminator keeps `location is None`, and `graph.source_locations`
-   carries the contributing values' locations forward.
+1. **Zero merge-time Python work.** A merge calls
+   `evoxc.ops._utils.get_location` ZERO times and never reaches
+   `inspect.stack()`: every source location was captured at TRACE time and
+   survives the native round trip. A positive control shows the same live
+   counter DOES fire during tracing, so the zero is a real interception and not
+   a patch that misses its target. The cost is therefore independent of the
+   emission size (chain lengths 12/24/48 → 25/49/97 emitted ops, 0 captures).
+2. **The report is the instrumentation.** Emitted-op counts, class counts,
+   switch/constant/mux counts and the band/cost fields are read from
+   `graph.batch_report` (the documented 12-key `BatchReport`) and cross-checked
+   against the merged IR's entry block — never from private emitter helpers.
+   Every count in `MERGE_CASES` is the MEASURED native value at this HEAD for a
+   fixed population, stated next to the `alignment` policy its kwargs select.
+3. **Locations are inherited, never invented.** Merged rule-emitted ops carry
+   their contributing program op's real `(file, line)`; ops the merge machinery
+   emits itself (switch/mask constants, `select`s, band `slice`s, the output
+   `concatenate`) and the `return` terminator carry `location is None` (Rust
+   has no frame-capture call site); programs traced with capture disabled keep
+   the `<unknown>` placeholder; `graph.source_locations` still holds one entry
+   per merged input, carried from the source graphs.
+4. **`EVOXC_DISABLE_LOCATIONS=1` changes locations only** — the merged graph is
+   still row-exact against the per-program runs.
 
 Determinism: numpy backend, CPU, small shapes, fixed populations, and NO timing
 assertions whatsoever — no `time` / `perf_counter` import anywhere in this
-module. The pins are exact structural constants (call counts and emitted-op
-counts), so they hold identically on a slow machine and a fast one.
+module. The pins are exact structural constants (call counts and report
+fields), so they hold identically on a slow machine and a fast one.
 """
+
 import inspect
 
 import numpy as np
@@ -51,9 +54,27 @@ import pytest
 import evoxc
 from evoxc import core
 from evoxc import ir
-from evoxc.transforms import _bands, _emit
+from evoxc.ops import _utils as ops_utils
 
 F32 = evoxc.float32
+
+#: The exact 12-key `BatchReport` surface, pinned independently of
+#: `evoxc.transforms._report.REPORT_KEYS` (a contract, not a mirror of the
+#: implementation — `test_batch_functions.py::test_public_surface` pins it too).
+REPORT_KEYS = (
+    "n_functions",
+    "value_classes",
+    "shared_classes",
+    "switched",
+    "stacked_constants",
+    "output_muxes",
+    "emitted_ops",
+    "bands",
+    "band_sizes",
+    "band_strategy",
+    "cost_estimate",
+    "flat_cost_estimate",
+)
 
 # ---------------------------------------------------------------------------
 # helpers (module level — no fixtures, no conftest changes)
@@ -110,34 +131,12 @@ class _StackCounter:
 
 
 class _CaptureCounter:
-    """A DELEGATING stand-in for one driver's module-level `get_location` binding.
+    """A DELEGATING counter for `evoxc.ops._utils.get_location`.
 
-    The drivers import `get_location` by value, so wrapping `_emit.get_location`
-    / `_bands.get_location` intercepts exactly the ONE call each driver makes
-    outside its suppression block. The stand-in delegates with `depth + 1` so it
-    skips its OWN frame: the captured location is byte-identical to the one the
-    driver's own call would have produced (the merge call site), never the
-    wrapper's line.
-    """
-
-    def __init__(self, real):
-        self._real = real
-        self.calls = 0
-        self.locations = []
-
-    def __call__(self, depth=1, **kwargs):
-        location = self._real(depth + 1, **kwargs)
-        self.calls += 1
-        self.locations.append(location)
-        return location
-
-
-class _CountingProxy:
-    """A verbatim PASS-THROUGH counter for a helper called with its own args.
-
-    Used for `evoxc.ops._utils._inside_evoxc_package`, whose single positional
-    argument is a FILENAME (so it must be delegated unchanged, never with a
-    shifted `depth`).
+    The op modules reach `get_location` through the `_utils` module attribute
+    (`_utils.get_location(depth=2)`), so replacing that attribute intercepts
+    every capture attempt. The stand-in delegates verbatim, keeping the captured
+    location byte-identical to the real one's (`depth` is not shifted).
     """
 
     def __init__(self, real):
@@ -149,71 +148,27 @@ class _CountingProxy:
         return self._real(*args, **kwargs)
 
 
-class _MergeHooks:
-    """Both seams ONE merge touches: its driver call site and `inspect.stack`.
+class _MergeCounters:
+    """Both merge-time seams: the Python capture hook and `inspect.stack`.
 
     Installed for the duration of a single merge (the `monkeypatch` fixture
-    restores all three bindings afterwards).
+    restores both bindings afterwards). Tracing happens BEFORE the merge, so
+    `locations.calls` is the merge's own capture cost — the quantity the native
+    engine keeps at zero.
     """
 
     def __init__(self, monkeypatch):
-        self.emit = _CaptureCounter(_emit.get_location)
-        self.bands = _CaptureCounter(_bands.get_location)
+        self.locations = _CaptureCounter(ops_utils.get_location)
         self.stack = _StackCounter()
-        monkeypatch.setattr(_emit, "get_location", self.emit)
-        monkeypatch.setattr(_bands, "get_location", self.bands)
+        monkeypatch.setattr(ops_utils, "get_location", self.locations)
         monkeypatch.setattr(inspect, "stack", self.stack)
-
-    @property
-    def calls(self):
-        """Total driver `get_location` invocations made by the merge."""
-        return self.emit.calls + self.bands.calls
-
-    @property
-    def locations(self):
-        """Every location the merge captured, in call order."""
-        return self.emit.locations + self.bands.locations
 
 
 def counting_merge(monkeypatch, graphs, **kwargs):
-    """`batch_functions(graphs, **kwargs)` + the hooks it exercised.
-
-    The seams are installed ONLY around the merge — tracing happens before, so
-    the counts are the merge's own capture cost (exactly the quantity the
-    suppression hook exists to keep at one).
-    """
-    hooks = _MergeHooks(monkeypatch)
+    """`batch_functions(graphs, **kwargs)` + the merge-time counters."""
+    counters = _MergeCounters(monkeypatch)
     graph = evoxc.batch_functions(graphs, **kwargs)
-    return graph, hooks
-
-
-def assert_one_call_site_capture(graph, hooks):
-    """ONE real call site captured per merge, on ONE driver, never `inspect.stack`."""
-    assert hooks.calls == 1, (
-        "batch_functions must capture its ONE call-site location outside the "
-        "suppression block, got "
-        f"{hooks.emit.calls} _emit + {hooks.bands.calls} _bands get_location() "
-        "calls"
-    )
-    # Exactly one of the two drivers owns the capture: the flat emitter (also
-    # for `bands=1` and an auto-resolved single band) or the banded driver.
-    expected = (1, 0) if graph.batch_report.bands == 1 else (0, 1)
-    assert (hooks.emit.calls, hooks.bands.calls) == expected, (
-        "a merge with "
-        f"bands={graph.batch_report.bands} must capture its call site on "
-        f"{'_emit' if expected[0] else '_bands'} only, got "
-        f"_emit={hooks.emit.calls} _bands={hooks.bands.calls}"
-    )
-    (location,) = hooks.locations
-    assert location != ir.Location.unknown(), (
-        "the merge's ONE call site must be a REAL location — the suppression "
-        "block must not swallow it"
-    )
-    assert location.file == __file__ and location.line > 0
-    assert hooks.stack.calls == 0, (
-        "location capture is a sys._getframe walk — it must never reach "
-        f"inspect.stack(), got {hooks.stack.calls} call(s)"
-    )
+    return graph, counters
 
 
 # --- populations (fixed, deterministic) ------------------------------------
@@ -273,6 +228,20 @@ def divergent_population(variants=_DIVERGENT_VARIANTS, n_functions=10):
     return graphs
 
 
+def stacked_constant_population(n_functions=6):
+    """Every program carries its OWN constant payload in one shared skeleton."""
+    spec = evoxc.TensorSpec((1024,), F32)
+    graphs = []
+    for index in range(n_functions):
+        constant = float(index + 1)
+
+        def program(x, _constant=constant):
+            return _times_plus(x, _constant)
+
+        graphs.append(evoxc.trace(program, spec))
+    return graphs
+
+
 def three_op_program(x):
     """Three ops on three DISTINCT source lines (the location-set anchor)."""
     y = x + 1.0
@@ -280,187 +249,320 @@ def three_op_program(x):
     return z * 3.0
 
 
+def two_input_program(x, y):
+    """Two tensor inputs on one source line (the `source_locations` anchor)."""
+    return (x * y) + 1.0
+
+
 # ---------------------------------------------------------------------------
-# 1. One call site per merge — one driver capture, zero `inspect.stack` calls
+# 1. Zero Python location/introspection work during a merge
 # ---------------------------------------------------------------------------
 
-#: `(id, population factory, merge kwargs, canonical emitted-op count)`.
-#: Every count below is the measured value at this HEAD for the `alignment`
-#: policy its `kwargs` STATE (`"occurrence"` unless the merge omits the option,
-#: in which case the default `"variant"` applies) — the class-alignment policy
-#: changes how many classes a switched position emits, so a count is only
-#: meaningful next to its policy. The assertion that matters for the hook is the
-#: invariant ALSO pinned for all of them: exactly ONE driver `get_location()`
-#: invocation per merge, and ZERO `inspect.stack` calls, whatever the alignment
-#: emits.
-SUPPRESSION_CASES = [
+#: `(population factory, merge kwargs, expected report fields)`.
+#: Every count is the MEASURED native value at this HEAD for that fixed
+#: population. `alignment` is stated whenever a count depends on it (the class
+#: alignment policy changes how many classes a switched position emits, so a
+#: count is only meaningful next to its policy); an omitted `alignment` means
+#: the default `"variant"` applies.
+MERGE_CASES = [
     pytest.param(
         lambda: chain_population(12, 32),
         {"switch_ops": True},
-        25,
+        {
+            "n_functions": 32,
+            "value_classes": 13,
+            "shared_classes": 13,
+            "switch_classes": 0,
+            "stacked_constants": 0,
+            "output_muxes": 0,
+            "emitted_ops": 25,
+            "bands": 1,
+            "band_sizes": (32,),
+            "band_strategy": "flat",
+            "costs": None,
+        },
         id="flat-identical-32x12op-chain",
     ),
     pytest.param(
         divergent_population,
         {"switch_ops": True, "alignment": "occurrence"},
-        17,
+        {
+            "n_functions": 10,
+            "value_classes": 5,
+            "shared_classes": 5,
+            "switch_classes": 2,
+            "stacked_constants": 1,
+            "output_muxes": 1,
+            "emitted_ops": 17,
+            "bands": 1,
+            "band_sizes": (10,),
+            "band_strategy": "flat",
+            "costs": None,
+        },
         id="flat-divergent-10-occurrence",
     ),
     pytest.param(
         divergent_population,
         {"switch_ops": True, "bands": 3, "alignment": "occurrence"},
-        55,
+        {
+            "n_functions": 10,
+            "value_classes": 15,
+            "shared_classes": 12,
+            "switch_classes": 6,
+            "stacked_constants": 3,
+            "output_muxes": 3,
+            "emitted_ops": 55,
+            "bands": 3,
+            "band_sizes": (4, 3, 3),
+            "band_strategy": "explicit",
+            "costs": None,
+        },
         id="banded-explicit-3-occurrence",
     ),
     pytest.param(
         divergent_population,
         {"switch_ops": True, "bands": "auto", "alignment": "occurrence"},
-        17,
+        {
+            "n_functions": 10,
+            "value_classes": 5,
+            "shared_classes": 5,
+            "switch_classes": 2,
+            "stacked_constants": 1,
+            "output_muxes": 1,
+            "emitted_ops": 17,
+            "bands": 1,
+            "band_sizes": (10,),
+            "band_strategy": "auto",
+            # The model ran and found nothing cheaper than the flat merge.
+            "costs": (86144.0, 86144.0),
+        },
         id="banded-auto-flat-partition-occurrence",
     ),
     pytest.param(
-        lambda: divergent_population(variants=(_plus_minus, _plus_plus, _times_plus)),
+        lambda: divergent_population(
+            variants=(_plus_minus, _plus_plus, _times_plus)
+        ),
         {"switch_ops": True, "bands": "auto"},
-        21,
+        {
+            "n_functions": 10,
+            "value_classes": 8,
+            "shared_classes": 8,
+            "switch_classes": 0,
+            "stacked_constants": 2,
+            "output_muxes": 1,
+            "emitted_ops": 21,
+            "bands": 2,
+            "band_sizes": (7, 3),
+            "band_strategy": "auto",
+            # The auto plan's exact static-cost output for this population.
+            "costs": (54528.0, 75392.0),
+        },
         id="banded-auto-two-bands",
     ),
-    # The DEFAULT policy (`alignment` omitted → `_merge.DEFAULT_ALIGNMENT`, i.e.
-    # `"variant"`): the same `bands=3` merge as `banded-explicit-3-occurrence`
-    # emits 40 ops instead of 55, because sibling variants share one class per
-    # skeleton. Both policies therefore stay pinned.
+    # The DEFAULT policy (`alignment` omitted → `"variant"`): the same `bands=3`
+    # merge as `banded-explicit-3-occurrence` emits 40 ops instead of 55,
+    # because sibling variants share one class per skeleton. Both policies stay
+    # pinned.
     pytest.param(
         divergent_population,
         {"switch_ops": True, "bands": 3},
-        40,
+        {
+            "n_functions": 10,
+            "value_classes": 18,
+            "shared_classes": 10,
+            "switch_classes": 0,
+            "stacked_constants": 3,
+            "output_muxes": 3,
+            "emitted_ops": 40,
+            "bands": 3,
+            "band_sizes": (4, 3, 3),
+            "band_strategy": "explicit",
+            "costs": None,
+        },
         id="banded-explicit-3-default-variant",
     ),
 ]
 
 
-@pytest.mark.parametrize("build, kwargs, emitted_ops", SUPPRESSION_CASES)
-def test_merge_walks_the_stack_exactly_once(monkeypatch, build, kwargs, emitted_ops):
-    """ONE call-site capture per merge, whatever the emission size.
+@pytest.mark.parametrize("build, kwargs, expected", MERGE_CASES)
+def test_merge_does_no_python_location_or_introspection_work(
+    monkeypatch, build, kwargs, expected
+):
+    """A merge captures NO Python location and never walks `inspect.stack`.
 
-    The merge must call its driver's `get_location` exactly once (on ONE of the
-    two drivers) and never touch `inspect.stack` — the suppression block is what
-    keeps the per-op captures of `ops` from walking the frames again.
+    All source locations are captured while TRACING and travel through the
+    native envelope, so the merge itself must make zero `get_location()` calls —
+    whatever the emission size — and must never reach `inspect.stack()`.
     """
     graphs = build()
-    graph, hooks = counting_merge(monkeypatch, graphs, **kwargs)
+    graph, counters = counting_merge(monkeypatch, graphs, **kwargs)
     verifies(graph)
 
-    assert_one_call_site_capture(graph, hooks)
-    assert graph.batch_report.emitted_ops == emitted_ops, kwargs
-    # The count is a small CONSTANT — it never scales with the emission.
-    assert graph.batch_report.emitted_ops >= 17
-    assert len(entry_ops(graph)) == emitted_ops + 1  # + the `return`
+    assert counters.locations.calls == 0, (
+        "the native merge must capture no Python call site, got "
+        f"{counters.locations.calls} get_location() call(s)"
+    )
+    assert counters.stack.calls == 0, (
+        "location capture is a sys._getframe walk — it must never reach "
+        f"inspect.stack(), got {counters.stack.calls} call(s)"
+    )
+    # The merged IR really does carry source locations: they came from the
+    # traced programs, not from a capture the merge would have made.
+    assert any(
+        op.location is not None and op.location.file == __file__
+        for op in non_terminator_ops(graph)
+    )
+    # …and the report still describes the merge.
+    assert graph.batch_report.emitted_ops == expected["emitted_ops"]
 
 
-def test_long_chain_merge_emits_many_ops_for_one_stack_walk(monkeypatch):
-    """`emitted_ops >> 1` and ONE capture: the hook is size-independent.
+def test_tracing_is_where_locations_are_captured(monkeypatch):
+    """Positive control: the live counter fires while TRACING, not while merging.
 
-    A 32-program population of 12-op chains emits 25 ops for ONE call-site
-    capture; the ratio is the point — the per-op capture of `ops` is what the
-    suppression block removes.
+    Without this leg the zero counts above could come from a patch that misses
+    the ops' lookup. Tracing three ops increments the counter; the merge that
+    follows leaves it untouched.
     """
-    graphs = chain_population(12, 32)
-    graph, hooks = counting_merge(monkeypatch, graphs, switch_ops=True)
-    verifies(graph)
+    counter = _CaptureCounter(ops_utils.get_location)
+    stack = _StackCounter()
+    monkeypatch.setattr(ops_utils, "get_location", counter)
+    monkeypatch.setattr(inspect, "stack", stack)
 
-    report = graph.batch_report
-    assert report.emitted_ops == 25
-    assert report.n_functions == 32
-    assert_one_call_site_capture(graph, hooks)
-    assert report.emitted_ops > 10 * hooks.calls  # a small constant vs a big emission
+    spec = evoxc.TensorSpec((4,), F32)
+    traced = evoxc.trace(three_op_program, spec)
+    assert counter.calls > 0, "tracing must capture its op call sites"
+    assert stack.calls == 0, "tracing uses sys._getframe, never inspect.stack"
+    for op in non_terminator_ops(traced):
+        assert op.location is not None and op.location.file == __file__
+
+    captured_at_trace_time = counter.calls
+    merged = verifies(evoxc.batch_functions([traced, traced], switch_ops=True))
+    assert counter.calls == captured_at_trace_time
+    assert stack.calls == 0
+    assert merged.batch_report.emitted_ops == len(non_terminator_ops(merged))
 
 
 @pytest.mark.parametrize("length, emitted_ops", [(12, 25), (24, 49), (48, 97)])
-def test_call_count_does_not_scale_with_the_emitted_op_count(
+def test_merge_cost_does_not_scale_with_the_emitted_op_count(
     monkeypatch, length, emitted_ops
 ):
-    """4× the emitted ops ⇒ the SAME single capture (the hook's whole point).
+    """4× the emitted ops ⇒ the SAME zero captures (the native contract's point).
 
     The same 32 identical programs are merged at three chain lengths; only the
-    emission grows (2·length + 1 ops), the driver capture count stays at 1.
+    emission grows (2·length + 1 ops), the merge-time capture count stays at 0.
     """
     graphs = chain_population(length, 32)
-    graph, hooks = counting_merge(monkeypatch, graphs, switch_ops=True)
+    graph, counters = counting_merge(monkeypatch, graphs, switch_ops=True)
     verifies(graph)
+
     assert graph.batch_report.emitted_ops == emitted_ops
-    assert_one_call_site_capture(graph, hooks)
-
-
-def test_constant_stacking_merge_walks_the_stack_once(monkeypatch):
-    """The stacked-constant path emits a `(N, ...)` constant per class — 1 capture."""
-    spec = evoxc.TensorSpec((1024,), F32)
-    graphs = []
-    for index in range(6):
-        constant = float(index + 1)
-
-        def program(x, _constant=constant):
-            return _times_plus(x, _constant)
-
-        graphs.append(evoxc.trace(program, spec))
-
-    graph, hooks = counting_merge(monkeypatch, graphs, switch_ops=True)
-    verifies(graph)
-    assert_one_call_site_capture(graph, hooks)
-    assert graph.batch_report.stacked_constants == 1
-    assert graph.batch_report.emitted_ops == 5
-
-
-def test_suppression_context_manager_returns_unknown_without_a_walk(monkeypatch):
-    """Direct pin of the MECHANISM behind the counts above (internal API).
-
-    While a `_suppress_location_capture()` block is active, `get_location()`
-    answers `ir.Location.unknown()` immediately — it short-circuits on the
-    suppression depth BEFORE any frame work, so `_inside_evoxc_package` is never
-    consulted (0 calls) and `inspect.stack` is never reached — and the block is
-    RE-ENTRANT (nested blocks restore the previous depth).
-
-    Outside every block one direct `get_location()` from THIS test body is a
-    real capture again: exactly ONE `_inside_evoxc_package` classification (this
-    module's own filename) and a non-unknown location.
-    """
-    from evoxc.ops import _utils as ops_utils
-    from evoxc.ops._utils import _suppress_location_capture, get_location
-
-    stack_counter = _StackCounter()
-    monkeypatch.setattr(inspect, "stack", stack_counter)
-    # The merge drivers' seam is installed too (no merge runs in this test), so
-    # its zero count shows the block sits BELOW both drivers' capture path.
-    hooks = _MergeHooks(monkeypatch)
-    inside = _CountingProxy(ops_utils._inside_evoxc_package)
-    monkeypatch.setattr(ops_utils, "_inside_evoxc_package", inside)
-
-    with _suppress_location_capture():
-        assert get_location() == ir.Location.unknown()
-        with _suppress_location_capture():  # re-entrant: still suppressed
-            assert get_location() == ir.Location.unknown()
-        assert get_location() == ir.Location.unknown()
-        # Suppressed capture short-circuits before classifying any frame.
-        assert inside.calls == 0
-        assert hooks.calls == 0
-    assert stack_counter.calls == 0, (
-        "get_location() must short-circuit on the suppression depth without "
-        "touching inspect.stack()"
-    )
-
-    # Positive control: outside the block a real capture happens — exactly one
-    # candidate frame is classified and the location is this module's own line.
-    location = get_location()
-    assert location != ir.Location.unknown()
-    assert location.file == __file__
-    assert location.line > 0
-    assert inside.calls == 1, (
-        "one real capture classifies exactly ONE frame filename, got "
-        f"{inside.calls} _inside_evoxc_package calls"
-    )
-    assert stack_counter.calls == 0
+    assert graph.batch_report.emitted_ops > 10
+    assert counters.locations.calls == 0
+    assert counters.stack.calls == 0
+    assert len(entry_ops(graph)) == emitted_ops + 1  # + the `return`
 
 
 # ---------------------------------------------------------------------------
-# 2. Location preservation — suppression must not cost source information
+# 2. Emitted-op pins read the 12-key `graph.batch_report`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("build, kwargs, expected", MERGE_CASES)
+def test_report_counts_describe_the_merge(build, kwargs, expected):
+    """Every structural count comes from `graph.batch_report`, cross-checked.
+
+    The report is plain transform metadata (never persisted), but it is the
+    documented description of what one merge did — these pins read it instead
+    of any private emit helper.
+    """
+    graph = verifies(evoxc.batch_functions(build(), **kwargs))
+    report = graph.batch_report
+
+    assert isinstance(report, evoxc.BatchReport)
+    assert tuple(report.as_dict()) == REPORT_KEYS  # the 12 keys, in order
+    assert len(REPORT_KEYS) == 12
+
+    for field in (
+        "n_functions",
+        "value_classes",
+        "shared_classes",
+        "stacked_constants",
+        "output_muxes",
+        "emitted_ops",
+        "bands",
+        "band_sizes",
+        "band_strategy",
+    ):
+        assert getattr(report, field) == expected[field], field
+
+    # Switch records are the group/variant/rows description of a switched
+    # position; their rows partition the functions they cover.
+    assert isinstance(report.switched, tuple)
+    assert len(report.switched) == expected["switch_classes"]
+    for record in report.switched:
+        assert isinstance(record, evoxc.SwitchRecord)
+        assert record.variants
+        assert len(record.variants) == len(record.rows_per_variant)
+        rows = [
+            row for variant_rows in record.rows_per_variant for row in variant_rows
+        ]
+        assert len(rows) == len(set(rows)), "a function appears twice in one class"
+        assert all(0 <= row < report.n_functions for row in rows)
+
+    # The class counters describe a subset relation, the band fields a partition.
+    assert 0 <= report.shared_classes <= report.value_classes
+    assert len(report.band_sizes) == report.bands
+    assert sum(report.band_sizes) == report.n_functions
+
+    # The report's op count IS the entry block minus its terminator, and these
+    # populations all have a rank-1 output leaf, so the entry block holds
+    # exactly `emitted_ops + 1` ops.
+    assert report.emitted_ops == len(non_terminator_ops(graph))
+    assert len(entry_ops(graph)) == report.emitted_ops + 1
+    assert entry_ops(graph)[-1].name == "return"
+
+    # Cost estimates are the static model's — reported only for `"auto"`.
+    if expected["costs"] is None:
+        assert report.cost_estimate is None
+        assert report.flat_cost_estimate is None
+    else:
+        assert (
+            report.cost_estimate,
+            report.flat_cost_estimate,
+        ) == expected["costs"]
+        assert report.cost_estimate <= report.flat_cost_estimate
+
+
+def test_stacked_constants_report_one_row_per_function():
+    """`stacked_constants` counts the ONE `(N, …)` constant folding N payloads.
+
+    Distinct per-program payloads in one shared skeleton collapse into a single
+    stacked constant whose row i is program i's payload — visible both in the
+    report and in the merged IR (the old emitter helper is not consulted).
+    """
+    graphs = stacked_constant_population()
+    graph = verifies(evoxc.batch_functions(graphs, switch_ops=True))
+    report = graph.batch_report
+
+    assert (report.n_functions, report.stacked_constants) == (6, 1)
+    assert report.output_muxes == 0
+    assert report.switched == ()
+    assert report.emitted_ops == 5
+    assert len(entry_ops(graph)) == report.emitted_ops + 1
+
+    constants = [
+        op for op in non_terminator_ops(graph) if op.name == "constant"
+    ]
+    assert len(constants) == 1, "one stacked constant, no mask constants"
+    payload = constants[0].attributes["value"]
+    assert payload.shape == (6,)
+    np.testing.assert_array_equal(
+        payload, np.arange(1, 7, dtype=payload.dtype)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. Locations — inherited from the contributing ops, never invented
 # ---------------------------------------------------------------------------
 
 
@@ -468,10 +570,10 @@ def test_merged_ops_inherit_the_contributing_source_locations():
     """Set equality: the merged emission covers EXACTLY the source lines.
 
     Three identical programs, each with three ops on three distinct source
-    lines. The merged graph inserts alignment `reshape` ops, but every one of
-    them is stamped with its contributing op's location, so the merged
-    `(file, line)` set equals the source program's — no line invented, none
-    lost.
+    lines. The merged graph inserts alignment `reshape` ops, but every ruled
+    op is stamped by the native engine with its contributing op's location, so
+    the merged `(file, line)` set equals the source program's — no line
+    invented (in particular not the `batch_functions` call site), none lost.
     """
     spec = evoxc.TensorSpec((4,), F32)
     graphs = [evoxc.trace(three_op_program, spec) for _ in range(3)]
@@ -481,115 +583,130 @@ def test_merged_ops_inherit_the_contributing_source_locations():
     source_lines = {(op.location.file, op.location.line) for op in source_ops}
     assert len(source_lines) == 3, "the probe program must span three lines"
 
-    merged_ops = non_terminator_ops(graph)
-    assert merged_ops, "the merge emitted nothing"
-    assert {(op.location.file, op.location.line) for op in merged_ops} == source_lines
-    # Every merged op points into THIS module, on one of the program's lines.
-    for op in merged_ops:
-        assert op.location is not None, f"op '{op.name}' lost its location"
-        assert op.location.file == __file__
-        assert op.location.line in {line for _file, line in source_lines}
+    stamped = [
+        op for op in non_terminator_ops(graph) if op.location is not None
+    ]
+    assert stamped, "the merge emitted nothing with a contributing location"
+    for op in stamped:
+        assert isinstance(op.location, ir.Location)
+        assert (op.location.file, op.location.line) in source_lines
         assert op.location.col == 0
+    assert {(op.location.file, op.location.line) for op in stamped} == source_lines
+    assert all(op.location.file == __file__ for op in stamped)
 
 
-def test_alignment_helper_ops_are_stamped_with_their_contributing_op():
-    """`_stamp_locations` gives the merge's OWN helper ops the source location.
+def test_merge_owned_helper_ops_and_the_terminator_carry_no_location():
+    """Mask/stack/`select`/band helpers and the `return` have `location is None`.
 
-    Constant/broadcast alignment inserts `reshape` ops; each one is stamped with
-    the contributing op's location rather than the merge call site (which is a
-    different, later source line from `evoxc.batch_functions`).
+    Rust has no frame-capture call site, so the ops the merge machinery emits
+    itself carry no location at all — distinct from the inherited locations of
+    the rule-emitted ops above.
     """
-    spec = evoxc.TensorSpec((4,), F32)
-    graphs = [evoxc.trace(three_op_program, spec) for _ in range(2)]
-    graph = verifies(evoxc.batch_functions(graphs, switch_ops=True))
-
-    ops = non_terminator_ops(graph)
-    reshapes = [op for op in ops if op.name == "reshape"]
-    assert reshapes, "this population must exercise the alignment reshape"
-    for index, op in enumerate(ops):
-        if op.name != "reshape":
-            continue
-        previous = ops[index - 1]
-        assert op.location == previous.location, (
-            "a merge-inserted helper op must inherit the contributing op's "
-            f"location, got {op.location} vs {previous.location}"
-        )
-
-
-def test_terminator_location_and_the_source_location_map():
-    """The `return` keeps `location is None`; `source_locations` is carried over.
-
-    `graph.source_locations` records the CONTRIBUTING values — the input args
-    plus one entry per re-stamped original op — with real `ir.Location`s that
-    point into this module; the helper ops the merge inserts itself are not
-    recorded, and nothing is re-captured from the merge call site.
-    """
-    spec = evoxc.TensorSpec((4,), F32)
-    graphs = [evoxc.trace(three_op_program, spec) for _ in range(2)]
-    graph = verifies(evoxc.batch_functions(graphs, switch_ops=True))
-
-    # The `return` terminator carries no location (tracing does not stamp it).
-    terminator = entry_ops(graph)[-1]
-    assert terminator.name == "return"
-    assert terminator.location is None
-
-    source_locations = graph.source_locations
-    assert source_locations, "the merge dropped every source location"
-    for value_id, location in source_locations.items():
-        assert isinstance(location, ir.Location), (
-            f"source_locations[{value_id}] is {type(location).__name__}, "
-            "expected an ir.Location"
-        )
-        assert location.file == __file__
-        assert location.line > 0
-
-    # One entry per CONTRIBUTING value: every tensor input leaf (carried over
-    # from the traced programs) plus the original op results the merge
-    # re-stamped — the merge's own helper ops add none.
-    contributing = len(graphs[0].source_locations) + len(
-        non_terminator_ops(graphs[0])
+    graphs = divergent_population()
+    graph = verifies(
+        evoxc.batch_functions(graphs, switch_ops=True, alignment="occurrence")
     )
-    assert len(source_locations) == contributing
+    ops = entry_ops(graph)
+    assert ops[-1].name == "return"
+    assert ops[-1].location is None
 
-    # Every recorded `(file, line)` is a real source position: one of the
-    # program's own op lines, or the line the program was TRACED from (the
-    # input-arg location, which `evoxc.trace` records separately).
-    op_lines = {op.location.line for op in non_terminator_ops(graphs[0])}
-    argument_lines = {
-        location.line for location in graphs[0].source_locations.values()
+    unlocated = [op for op in ops[:-1] if op.location is None]
+    assert unlocated, "this switched merge must emit mask/select helpers"
+    assert {op.name for op in unlocated} >= {"constant", "select"}
+
+    # The banded machinery's band views and output glue are merge-owned too.
+    banded = verifies(
+        evoxc.batch_functions(divergent_population(), switch_ops=True, bands=3)
+    )
+    banded_ops = entry_ops(banded)
+    assert banded_ops[-1].name == "return"
+    assert banded_ops[-1].location is None
+    assert {op.name for op in banded_ops[:-1] if op.location is None} >= {
+        "slice",
+        "concatenate",
     }
-    for location in source_locations.values():
-        assert location.line in op_lines | argument_lines
-    assert op_lines <= {location.line for location in source_locations.values()}
 
 
-# ---------------------------------------------------------------------------
-# 3. `EVOXC_DISABLE_LOCATIONS=1` — the env-var half of the same hook
-# ---------------------------------------------------------------------------
+def test_uncaptured_program_locations_stay_the_unknown_placeholder(monkeypatch):
+    """A contributor's `<unknown>` placeholder is kept, never upgraded.
 
-
-def test_disable_locations_env_forces_unknown_locations(monkeypatch):
-    """With the env var set, tracing AND merging produce `Location.unknown()`.
-
-    The variable is read at TRACE time too, so the programs are traced inside
-    the env context; the merged graph then carries no real location at all —
-    while still verifying as ordinary IR.
+    With capture disabled the traced programs carry `ir.Location.unknown()`
+    (file `<unknown>`, line 0); the merge does not invent a call site for them —
+    every stamped merged op carries that SAME placeholder, and the merge-owned
+    helper ops / `return` stay `None`.
     """
     monkeypatch.setenv("EVOXC_DISABLE_LOCATIONS", "1")
     spec = evoxc.TensorSpec((4,), F32)
     graphs = [evoxc.trace(three_op_program, spec) for _ in range(2)]
-
     for op in non_terminator_ops(graphs[0]):
         assert op.location == ir.Location.unknown()
 
     graph = verifies(evoxc.batch_functions(graphs, switch_ops=True))
-    merged_ops = non_terminator_ops(graph)
-    assert merged_ops
-    for op in merged_ops:
-        assert op.location == ir.Location.unknown(), (
-            f"op '{op.name}' captured {op.location} under "
-            "EVOXC_DISABLE_LOCATIONS=1"
+    unknown = ir.Location.unknown()
+    stamped = [
+        op for op in non_terminator_ops(graph) if op.location is not None
+    ]
+    assert stamped
+    for op in stamped:
+        assert op.location == unknown, (
+            f"op '{op.name}' was rewritten with location {op.location} instead "
+            "of the contributor's <unknown> placeholder"
         )
+    for op in non_terminator_ops(graph):
+        assert op.location is None or op.location == unknown
+    assert entry_ops(graph)[-1].name == "return"
+    assert entry_ops(graph)[-1].location is None
+
+
+def test_source_locations_survive_the_merge():
+    """`graph.source_locations` keeps one entry per MERGED input argument.
+
+    The entries are the contributing programs' recorded input locations (the
+    `evoxc.trace` call sites), remapped onto the merged block arguments; the
+    merge's own ops add none.
+    """
+    spec = evoxc.TensorSpec((4,), F32)
+    graphs = [evoxc.trace(three_op_program, spec) for _ in range(3)]
+    graph = verifies(evoxc.batch_functions(graphs, switch_ops=True))
+
+    block_args = list(graph.module.main.entry_block.arguments)
+    assert len(block_args) == 1
+    assert len(graphs[0].source_locations) == 1
+    assert set(graph.source_locations) == {argument.id for argument in block_args}
+
+    location = next(iter(graph.source_locations.values()))
+    assert isinstance(location, ir.Location)
+    assert location.file == __file__
+    assert location.line > 0
+    assert location == next(iter(graphs[0].source_locations.values()))
+
+    # The map describes INPUTS: no merged op result gets an entry.
+    result_ids = {
+        value.id for op in non_terminator_ops(graph) for value in op.results
+    }
+    assert not (set(graph.source_locations) & result_ids)
+
+
+def test_every_merged_input_keeps_a_source_location_entry():
+    """A two-input population carries BOTH input entries through the merge."""
+    spec = evoxc.TensorSpec((4,), F32)
+    graphs = [evoxc.trace(two_input_program, spec, spec) for _ in range(2)]
+    graph = verifies(
+        evoxc.batch_functions(graphs, axes=(0, None), switch_ops=True)
+    )
+
+    block_args = list(graph.module.main.entry_block.arguments)
+    assert len(block_args) == 2
+    assert set(graph.source_locations) == {argument.id for argument in block_args}
+    for location in graph.source_locations.values():
+        assert isinstance(location, ir.Location)
+        assert location.file == __file__
+        assert location.line > 0
+
+
+# ---------------------------------------------------------------------------
+# 4. `EVOXC_DISABLE_LOCATIONS=1` — locations only, never semantics
+# ---------------------------------------------------------------------------
 
 
 def test_merge_under_disable_locations_still_runs_row_exact(monkeypatch):

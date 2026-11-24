@@ -455,6 +455,19 @@ def test_safetensors_skips_metadata_and_returns_writable_arrays(tmp_path):
     assert array[0, 0] == 42.0
 
 
+def test_safetensors_arrays_own_their_data_and_outlive_the_file(tmp_path):
+    """The shared reader's mapped views are copied: params never alias the file."""
+    path = write_safetensors(
+        tmp_path / "model.safetensors",
+        {"w": (np.arange(6, dtype=np.float32).reshape(2, 3), "F32")},
+    )
+    array = read_safetensors(path)["w"]
+    assert array.flags.writeable and array.flags.owndata
+    path.unlink()  # the checkpoint file is gone; the parameter still owns its data
+    array[0, 0] = 42.0  # mutating a parameter touches no mapping
+    np.testing.assert_array_equal(array[0], np.array([42.0, 1.0, 2.0], dtype=np.float32))
+
+
 def test_safetensors_corrupt_header_cases(tmp_path):
     good = np.arange(4, dtype=np.float32).tobytes()
     # header length far beyond the file

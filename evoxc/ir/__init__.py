@@ -5,7 +5,9 @@ What lives here:
 * the SSA data model: ``Module``, ``Function``, ``Region``, ``Block``, ``Op``,
   ``Value`` (with ``Use``), typed by ``ValueType`` (dtype + symbolic shape);
 * the op-definition registry (``opdef``/``OpDef``/``AttrSpec``) declaring the
-  full canonical v1 op set (97 ops, split by category under ``op_defs/``);
+  full canonical v1 op set (121 ops in 12 categories — elementwise,
+  comparison, structure, reduction, sorting, linalg, control, terminator,
+  collective, sparse, random, custom — split under ``op_defs/``);
 * the ``Builder`` — the only op-construction API;
 * ``verify`` — structural/type/attribute validation raising
   ``VerificationError``;

@@ -8,6 +8,12 @@ pick the package → bump its [project].version → commit → tag → push tag 
                                                                                  ▼
      .github/workflows/release.yml: route the tag to its package → build → verify tag == version
                                     → PyPI (OIDC) → attach artifacts
+                                       │
+             ┌─────────────────────────┴──────────────────────────┐
+             ▼                                                    ▼
+  evoxc: wheels.yml matrix + sdist            evoxc-hf: uv build --package evoxc-hf
+  7 × cp311-abi3 platform wheels + 1 sdist    (pure Python: py3-none-any wheel + sdist)
+  → collect + twine check → `dist`
 ```
 
 There is no version bump and no token anywhere in the automation — the tagged
@@ -39,17 +45,47 @@ This repository publishes two independent PyPI distributions from one
 - **Release `evoxc` first** when `evoxc-hf`'s minimum requirement on it is new:
   `evoxc_hf/pyproject.toml` depends on `evoxc>=0.1.0`, so a published `evoxc-hf`
   must never require an `evoxc` version PyPI does not have yet.
-- **Neither distribution can contain the other.** Both build with `uv_build`,
-  which ships exactly one module per distribution — `evoxc` from the repository
-  root, `evoxc_hf` from `evoxc_hf/src/evoxc_hf/` — pinned by
-  `tests/test_packaging.py`.
+- **Neither distribution can contain the other.** The root `evoxc` project is a
+  MIXED `maturin` build (the `evoxc` package plus the compiled
+  `evoxc/_evoxc_native.abi3.so`), the member is pure-Python `uv_build` — each
+  ships exactly one module (`evoxc` from the repository root, `evoxc_hf` from
+  `evoxc_hf/src/evoxc_hf/`), pinned by `tests/test_packaging.py` and by the
+  `packaging` CI job.
+
+### The `evoxc` wheel matrix
+
+The PyO3 crate is built `abi3-py311`, so ONE wheel per platform serves every
+supported CPython (3.11+); every wheel is tagged `cp311-abi3-<platform>`.
+`.github/workflows/wheels.yml` is the single definition of the matrix — it runs
+build-only on `pull_request`/`workflow_dispatch` and is called by `release.yml`
+for a `v<version>` release, then `collect` merges everything into one `dist`
+artifact:
+
+| runner | Rust target | wheel platform tag | libc |
+| --- | --- | --- | --- |
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `manylinux_2_*_x86_64` | manylinux |
+| `ubuntu-latest` | `x86_64-unknown-linux-musl` | `musllinux_1_2_x86_64` | musllinux |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | `manylinux_2_*_aarch64` | manylinux |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-musl` | `musllinux_1_2_aarch64` | musllinux |
+| `macos-13` | `x86_64-apple-darwin` | `macosx_*_x86_64` | — |
+| `macos-14` | `aarch64-apple-darwin` | `macosx_*_arm64` | — |
+| `windows-latest` | `x86_64-pc-windows-msvc` | `win_amd64` | — |
+
+plus **one sdist** (`evoxc-<version>.tar.gz`) from the complete source tree — the
+`evoxc` package and the whole Rust workspace (including the reusable
+`native/evoxc/` crate), never `evoxc_hf/` and never a built extension. A source
+install (`pip install --no-binary evoxc evoxc`) compiles the extension with
+maturin and therefore needs a Rust toolchain and a C compiler; the platform
+wheels need neither. `evoxc-hf` stays a single pure-Python
+`evoxc_hf-<version>-py3-none-any.whl` + sdist — no Rust, no matrix.
 
 ---
 
 ## 1. One-time setup (do this once, before the first release)
 
 1. **Create and push the GitHub repository** — `EMI-Group/evoxc` — and push `main`
-   (with `.github/workflows/ci.yml` and `.github/workflows/release.yml`).
+   (with `.github/workflows/ci.yml`, `.github/workflows/wheels.yml` and
+   `.github/workflows/release.yml`).
 2. **Confirm the repository name everywhere it is hard-coded** — both
    `[project.urls]` tables (`pyproject.toml` and `evoxc_hf/pyproject.toml`), the
    pending-publisher fields in step 3 below, and the absolute
@@ -90,17 +126,41 @@ Pick the package you are releasing (`evoxc` → `pyproject.toml` / `v<version>`;
 `evoxc-hf` → `evoxc_hf/pyproject.toml` / `evoxc-hf-v<version>`) and follow the
 same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
 
-0. **Local pre-flight** (catches metadata/packaging mistakes in seconds):
+0. **Local pre-flight** (catches metadata/packaging mistakes in minutes):
 
    ```bash
    uv sync --locked --all-packages --extra dev
    uv run pytest -q
    uv build --all-packages && uvx twine check dist/*
    ```
+   The `evoxc` build compiles the Rust/PyO3 extension, so it needs a Rust
+   toolchain and a C compiler on `PATH`.
+
+   Verify the artifacts by hand (same checks the `wheels.yml` `collect` job and
+   `tests/test_packaging.py` make):
+
+   ```bash
+   # one per-platform abi3 wheel + one sdist for evoxc; pure-Python pair for evoxc-hf
+   ls -la dist
+   unzip -l dist/evoxc-*-cp311-abi3-*.whl     # evoxc/… incl. evoxc/_evoxc_native.abi3.so, no evoxc_hf/
+   tar tzf dist/evoxc-*.tar.gz | head -40     # pyproject/README/LICENSE, evoxc/, tests/, native/
+   tar tzf dist/evoxc-*.tar.gz | grep native/ # the whole Rust workspace, incl. native/evoxc/ — no .so
+   unzip -l dist/evoxc_hf-*-py3-none-any.whl  # evoxc_hf/… only, no compiled artifact
+
+   # the same abi3 wheel maturin produces in the matrix, built by hand
+   uvx --from 'maturin>=1.7,<2' maturin build --release --out dist
+   # (from native/evoxc-python/Cargo.toml, default `extension-module` features)
+
+   # and prove the wheel alone is a working install
+   uv venv "$TMPDIR/wheelcheck"
+   uv pip install --python "$TMPDIR/wheelcheck/bin/python" dist/evoxc-*-cp311-abi3-*.whl
+   "$TMPDIR/wheelcheck/bin/python" -c \
+       "import evoxc; from evoxc.backends.native import engine; print(evoxc.__version__, engine.engine_available())"
+   ```
 
 1. **Bump `[project].version`** in that package's project file (e.g. `0.1.0` →
-   `0.1.1`). The version is static: `uv_build` requires it, and nothing else
-   derives it.
+   `0.1.1`). The version is static: both build backends require it, and nothing
+   else derives it.
 2. **Add a `CHANGELOG.md` entry** for the new version (newest version at the top),
    naming which distribution it belongs to.
 3. **Commit** both changes on `main`:
@@ -125,10 +185,13 @@ same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
    (`release: types: [published]`). Drafts and pre-releases do **not** publish;
    only *publishing* the release starts `release.yml`. Releasing both packages
    means publishing two releases, one per tag.
-6. **Watch the `Release` workflow**: `build` (routes the tag to its project,
-   builds it, asserts the tag matches that project's version, `twine check`) →
-   `publish` (PyPI via OIDC; may wait for environment approval) → `attach`
-   (uploads `dist/*` to the GitHub Release).
+6. **Watch the `Release` workflow**: `route` (routes the tag to its project,
+   asserts the tag matches that project's version) → `wheels` (an `evoxc`
+   release: the `wheels.yml` matrix — seven `cp311-abi3` wheels + the sdist,
+   collected and `twine check`ed) or `build-evoxc-hf` (an `evoxc-hf` release:
+   `uv build --package evoxc-hf` + `twine check`) → `publish` (PyPI via OIDC;
+   may wait for environment approval) → `attach` (uploads `dist/*` to the GitHub
+   Release).
 
 ### Afterwards, check
 
@@ -138,13 +201,22 @@ same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
   `pip install evoxc-hf==X.Y.Z` (and `pip install "evoxc[dev]"` /
   `pip install "evoxc-hf[hf]"` where relevant) — `pip install evoxc` must still
   pull numpy only and never `evoxc-hf`;
-- the GitHub Release has the right artifacts attached (the `attach` job):
-  `evoxc-X.Y.Z-py3-none-any.whl` + `evoxc-X.Y.Z.tar.gz` for `v<version>`,
+- all SEVEN `evoxc` platform wheels resolve for their platforms: check the
+  `<https://pypi.org/project/evoxc/#files>` page lists
+  `evoxc-X.Y.Z-cp311-abi3-<platform>.whl` for every row of the matrix table
+  above (manylinux and musllinux × x86_64/aarch64, macOS x86_64/arm64,
+  `win_amd64`) plus `evoxc-X.Y.Z.tar.gz` — nothing is `py3-none-any`;
+- the GitHub Release has the right artifacts attached (the `attach` job): the
+  seven `evoxc-X.Y.Z-cp311-abi3-<platform>.whl` wheels +
+  `evoxc-X.Y.Z.tar.gz` for `v<version>`,
   `evoxc_hf-X.Y.Z-py3-none-any.whl` + `evoxc_hf-X.Y.Z.tar.gz` for
-  `evoxc-hf-v<version>`;
-- each wheel contains only its own module — the `packaging` CI job pins that
-  boundary, but a quick eyeball is cheap:
-  `unzip -l dist/evoxc-X.Y.Z-py3-none-any.whl` shows only `evoxc/…`, and
+  `evoxc-hf-v<version>`.
+  The `evoxc` wheels are per-platform abi3 wheels because they embed the
+  Rust/PyO3 extension; the `evoxc-hf` wheel stays pure Python (`py3-none-any`);
+- each wheel contains only its own module — the `packaging` CI job and the
+  `wheels.yml` `collect` job pin that boundary, but a quick eyeball is cheap:
+  `unzip -l dist/evoxc-X.Y.Z-cp311-abi3-<platform>.whl` shows only `evoxc/…`
+  (including `evoxc/_evoxc_native.abi3.so`), and
   `unzip -l dist/evoxc_hf-X.Y.Z-py3-none-any.whl` only `evoxc_hf/…`.
 
 ---
@@ -174,6 +246,14 @@ same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
 - **The upload succeeded but `attach` failed.** PyPI is already published; just
   re-run the failed `attach` job from the Actions UI (`gh release upload` uses
   `--clobber`, so re-running is safe and idempotent).
+- **A `wheels.yml` matrix leg failed (or `collect` failed its verification).**
+  Nothing was published — `publish-evoxc` needs `wheels`, so a failed matrix
+  keeps PyPI and the GitHub Release untouched. Fix the cause, then run
+  **Wheels → Run workflow** (`workflow_dispatch`) to re-exercise the full matrix
+  build-only; the matrix also runs on every PR that touches `pyproject.toml`,
+  `native/**`, `scripts/**` or `wheels.yml`. Re-publishing the same tag is not
+  needed if nothing was uploaded: re-run the failed jobs from the same release
+  run instead.
 - **Run the local pre-flight** at any point to reproduce build/metadata problems
   without touching PyPI:
   ```bash
@@ -184,7 +264,51 @@ same steps. Release `evoxc` first when the new `evoxc-hf` needs a new `evoxc`.
 
 ---
 
-## 4. Why no token
+## 4. Rust crates (crates.io)
+
+The native core is published as a set of crates from `./native/` — a **separate
+channel from the Python distributions**: a crates.io release needs no PyPI
+release and vice versa.
+
+**One version per workspace.** Every crate takes its version from
+`[workspace.package] version` in `native/Cargo.toml`, so a Rust release bumps ONE
+number there; all crates ship that same version (the Python `evoxc` distribution
+keeps its own independent `[project].version`).
+
+**Publish order** (a crate's path dependencies must already resolve on
+crates.io before it can be published, so publish left to right):
+
+1. `evoxc-core` — dtypes, shapes, op schemas, graph IR, inference.
+2. `evoxc-compiler` — builder, `vectorize`/`vmap`, `jvp`/`vjp`/`grad`,
+   `batch_functions`.
+3. `evoxc-runtime` — session/buffer/executable skeleton.
+4. `evoxc-cpu` — the CPU execution engine.
+5. `evoxc` — the reusable facade crate: features `cpu` / `runtime` / `full`;
+   `default-features = false` is the graph/transform-only core without the CPU
+   engine.
+
+`evoxc-python` — the PyO3 cdylib crate that compiles to
+`evoxc/_evoxc_native` — is `publish = false`: it is an implementation detail of
+the Python distribution and ships only inside the `evoxc` wheel/sdist.
+
+Per crate (`cd native` first — that is the cargo workspace root):
+
+```bash
+cargo test --workspace                     # the gate
+cargo clippy --workspace --all-targets --no-deps -- -D warnings
+cargo publish --dry-run -p evoxc-core      # package + verify; uploads nothing
+cargo package --no-verify -p evoxc-core    # inspect target/package/*.crate without compiling it
+cargo publish -p evoxc-core                # then: evoxc-compiler, evoxc-runtime, evoxc-cpu, evoxc
+```
+
+Repeat `--dry-run` for each crate left to right before publishing in that same
+order — a crate whose dependency version is not on the index yet fails, which is
+exactly the ordering guard. Nothing in the GitHub workflows publishes crates
+(`release.yml` is PyPI-only), so this step is manual and needs a `cargo login`.
+
+---
+
+## 5. Why no token
 
 PyPI **trusted publishing** uses OpenID Connect: GitHub mints a short-lived,
 workflow-scoped identity token (`id-token: write`) at publish time, and PyPI verifies
@@ -197,5 +321,6 @@ only rotating part is the environment — which is why protecting the `pypi`
 environment with required reviewers is the recommended extra guard.
 
 `.github/workflows/ci.yml` covers the pre-merge gate (tests on Python 3.11–3.14,
-a compiler-adapter job, and a packaging/`twine`/distribution-boundary job); release
-automation only ever *publishes* what CI already validated.
+a compiler-adapter job, and a packaging/`twine`/distribution-boundary job) and
+`.github/workflows/wheels.yml` builds the release wheel matrix build-only on
+pull requests; release automation only ever *publishes* what those validated.

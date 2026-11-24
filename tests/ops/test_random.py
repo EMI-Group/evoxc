@@ -226,6 +226,32 @@ def test_split_n_two_matches_split():
     assert np.array_equal(a, c) and np.array_equal(b, d)
 
 
+def test_split_n_salts_are_masked_to_u64():
+    """Every ``split_n`` salt in the traced graph stays a ``u64``.
+
+    ``split_n`` is ``mix(key ^ ((i * GOLDEN) mod 2**64))``. Unmasked, the salt
+    for ``i >= 2`` exceeds ``2**64`` — a range no integer attribute (and no
+    native envelope) can carry. The builder masks every salt, and the numpy
+    kernels mask the very same way, so the derived keys are unchanged.
+    """
+    GOLDEN = 0x9E3779B97F4A7C15
+
+    @evoxc.defn
+    def f(k):
+        return evoxc.random.split_n(k, 8)
+
+    graph = evoxc.trace(f, evoxc.TensorSpec((), evoxc.int64))
+    ops = graph.module.functions[0].entry_block.ops
+    salts = [op.attributes["salt"] for op in ops if op.name == "random_key_mix"]
+    assert len(salts) == 8
+    assert all(isinstance(s, int) and 0 <= s < 2**64 for s in salts), salts
+    # salt i is (i * GOLDEN) mod 2**64 — in particular i=2 is masked, not
+    # 2 * GOLDEN (which is above u64::MAX).
+    assert salts[0] == 0
+    assert salts[2] == (2 * GOLDEN) % 2**64
+    assert 2 * GOLDEN > 2**64  # the masking is load-bearing, not a no-op
+
+
 def test_split_derived_keys_drive_independent_draws():
     """Samples drawn from split-derived keys are decorrelated: two uniform
     draws from split(key) differ from two draws sharing one key's stream."""

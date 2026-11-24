@@ -37,10 +37,11 @@ by the 2025-08 cleanup refactor):
   `output_tree` (`core.TreeSpec`), `static_values` /
   `output_static_values` (tuples of `StaticValue` records: index, path,
   value, kind), `source_locations` (dict: input value ids →
-  `ir.Location`). Methods: `print()`, `verify()`, `save(path)` /
+  `ir.Location`). Methods: `print()`, `text()`, `verify()`, `save(path)` /
   `load(path)` (classmethod; lazy-import `evoxc.persist`),
   `flatten_inputs(args) -> list[core.Tensor]`, `validate_inputs(args)`
-  (alias), `unflatten_outputs(flat) -> structured`, `signature_info()`.
+  (alias), `unflatten_outputs(flat) -> structured`, `signature_info()`,
+  `summary()`, `digest()` (see "Inspection" below).
   Constructor accepts a prebuilt module + trees (transforms build Graphs
   directly).
 - `current_builder() -> ir.Builder` — innermost active builder; raises
@@ -51,6 +52,19 @@ by the 2025-08 cleanup refactor):
 - `while_loop(cond_fn, body_fn, init) -> outputs`
 - `scan(f, init, xs, length=None) -> (carry, stacked_outputs)`
 - `StaticValue` — frozen dataclass record for static leaves.
+
+## Inspection (pure, side-effect-free)
+
+`Graph` and `Defn` expose read-only inspection; none of it traces, compiles, mutates the IR, or touches a cache.
+
+- `repr(graph)` — one line: total op count across every nesting level (nested `if`/`while` bodies, hence `cond`/`while_loop`/`scan`, included), function count, tensor-input count, static-value count, tensor-output leaf count, plus a `batch report` marker when `batch_functions` attached `graph.batch_report`. Keeps the pinned substrings `<n> tensor inputs` / `<n> static values`.
+- `graph.summary() -> dict` — a JSON-safe structural summary with exact keys: `functions` (list of names), `op_count` (all nesting levels), `op_counts_by_category` (sorted dict; `ir.has_opdef`-guarded `ir.opdef(op.name).category`, unregistered names bucketed under `"unknown"`), `tensor_inputs` / `tensor_outputs` (lists of `{"path": list, "shape": [str(dim)…], "dtype": str}` in `tensor_specs` / `return`-leaf order, paths from the input/output trees), `static_values` (list of `{"path", "kind", "value_repr"}` with `repr(value)` truncated to 80 chars), `source_location_count`, `has_batch_report`, `digest`.
+- `graph.digest() -> str` — SHA-256 hex over the canonical JSON (`sort_keys=True`, compact separators, length-prefixed) of TWO parts: the module's STRUCTURE and `signature_info()`.
+  The structural part is `ir.serialize_module(self.module)` with each op entry's `location` removed and the payload's own `sha256` field dropped, so it covers only module/function names + metadata, block arguments (SSA ids + types), every op's name, attributes, operand ids and result ids/types, the nested regions, and the constant table.
+  Process-stable and identifying graph STRUCTURE + I/O signature only: `source_locations` (the `file:line` a graph was DEFINED at), the location-derived payload hash and `batch_report` are excluded, and the module carries no path- or memory-address-dependent data, so the same graph defined in a DIFFERENT FILE, re-traced in a different PROCESS, or deserialized from disk digests identically.
+  Structural changes — an op name, an attribute value, a dtype/shape, a static value, the I/O trees — change the digest; `summary()["digest"]` is this same string.
+- `graph.text() -> str` — `ir.pretty_print(self.module)`; the same string `print()` writes to stdout (`print()` itself is unchanged).
+- `repr(defn)` — `<Defn <qualname> (<__module__>)>` (module dropped when absent), metadata-only; keeps the qualname substring.
 
 ## Module layout & routing table
 
@@ -373,7 +387,8 @@ editing messages, keep the wording of existing paths intact.
   carries exactly the `SymbolicTensor` leaves of `init` (one `while`-op
   operand + one region block arg each — no dedup, reordering, or packing);
   `evoxc/transforms` REJECTS region-bearing ops outright
-  (`transforms/batching.py:751` → `TransformError`), and the stablehlo
+  (the native `vectorize` engine raises `TransformError`, and
+  `batch_functions._check_ops` names the function index), and the stablehlo
   writer emits every operand positionally with no count gate
   (`backends/stablehlo/writer.py::_emit_while`). Known consequence (iree
   3.9.0): a ≥4-carry `stablehlo.while` in a large module (NSGA3 tell

@@ -144,9 +144,11 @@ class TvmBackend(CompilerBackend):
     #: BIT-IDENTICAL to the ``"DEFAULT"`` export (probed on llvm); the
     #: attribute only hints reduced-precision relaxations a backend may
     #: apply, and TVM's llvm target applies none here. The reserved exporter
-    #: lower options ``eigh_algorithm`` and ``split_reduction`` are declared
-    #: alongside it so they pass validation (the Writer validates their
-    #: values).
+    #: lower options ``eigh_algorithm``, ``split_reduction`` and its
+    #: ``split_reduction_non_exact`` (OPT-IN float ``sum``/``prod`` split,
+    #: default ``False``) / ``split_reduction_threshold`` (int >= 2, default
+    #: 1024) companions are declared alongside it so they pass validation (the
+    #: Writer validates their values).
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset(
             {
@@ -154,6 +156,8 @@ class TvmBackend(CompilerBackend):
                 "dot_precision",
                 "eigh_algorithm",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
             }
         ),
         "compile": frozenset({"tvm_target", "tvm_pass_configs", "opt_level"}),
@@ -166,6 +170,12 @@ class TvmBackend(CompilerBackend):
         collectives=False,
         runtime_calls=False,
         custom_blocks=False,
+        # custom_ops: ``custom_call`` / ``inline_stablehlo`` ops are
+        # forwarded VERBATIM into the emitted StableHLO text; whether the
+        # target exists and the MLIR is valid is the TVM StableHLO
+        # frontend/compiler's verdict, surfaced as-is (evoxc adds no target
+        # registry and no pre-validation).
+        custom_ops=True,
         async_collectives=False,
         # frozenset(): the TVM StableHLO frontend has no rng_bit_generator
         # support — the exporter's bit-exact inline expansions are used

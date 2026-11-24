@@ -1,8 +1,8 @@
 """Tests for `evoxc.batch_functions(..., alignment=...)` — the class-alignment
 policy of `switch_ops` positions.
 Contract under test (binding): `evoxc/transforms/CONTEXT.md` § "Alignment of
-switched positions (`alignment=`, `_merge.py`)", plus `_merge.ALIGNMENTS` /
-`_merge.DEFAULT_ALIGNMENT` / `_merge.normalize_alignment` and the public
+switched positions (`alignment=`)", plus `ALIGNMENTS` /
+`DEFAULT_ALIGNMENT` / `_normalize_alignment` and the public
 `evoxc.batch_functions` signature + docstring.
 
 `alignment` chooses WHICH class a program's op joins at a skeleton covered by a
@@ -27,7 +27,7 @@ alignment; G validation/errors (non-str → `TypeError`, unknown spelling →
 `core.TransformError`, both before any tracing) and inertness outside
 `switch_ops` groups.
 
-DEFAULT-ALIGNMENT NOTE: the default is `"variant"` (`_merge.DEFAULT_ALIGNMENT`
+DEFAULT-ALIGNMENT NOTE: the default is `"variant"` (`DEFAULT_ALIGNMENT`
 and the public signature default) — exactly what `evoxc/transforms/CONTEXT.md`
 documents, and what the default pins here assert. `"occurrence"` remains an
 accepted EXPLICIT value: it is the byte-stable LEGACY policy (the pre-`alignment`
@@ -46,7 +46,14 @@ import pytest
 import evoxc
 from evoxc import core
 from evoxc.backends import stablehlo
-from evoxc.transforms import _merge
+from evoxc.transforms.batch_functions import (
+    ALIGNMENTS,
+    ALIGNMENT_AUTO,
+    ALIGNMENT_OCCURRENCE,
+    ALIGNMENT_VARIANT,
+    DEFAULT_ALIGNMENT,
+    _normalize_alignment,
+)
 F32 = evoxc.float32
 # ---------------------------------------------------------------------------
 # helpers (module level, copied locally — test modules never import each
@@ -104,8 +111,8 @@ def assert_rowwise(out, reference, rtol=1e-5, atol=1e-6):
     reference = np.asarray(reference, dtype=out_np.dtype)
     assert out_np.shape == reference.shape
     np.testing.assert_allclose(out_np, reference, rtol=rtol, atol=atol)
-#: The three accepted spellings, in `_merge.ALIGNMENTS` preference order.
-ALIGNMENT_MODES = ("occurrence", "variant", "auto")
+#: The three accepted spellings, in `ALIGNMENTS` preference order.
+ALIGNMENT_MODES = ("variant", "occurrence", "auto")
 #: Length-1024 row spec of the measured "branchy" population. The population
 #: uses the SAME constant payload (``c = 2.0``) in BOTH branches, which is what
 #: makes alignment matter: distinct payloads would put the two branch ops in two
@@ -191,14 +198,14 @@ def test_signature_default_is_variant():
     # The implementation's single source of truth agrees with the public
     # signature, and `DEFAULT_ALIGNMENT` is one of the accepted spellings (the
     # `ALIGNMENTS` listing order only shapes the validation error text).
-    assert _merge.ALIGNMENT_VARIANT == "variant"
-    assert _merge.DEFAULT_ALIGNMENT == _merge.ALIGNMENT_VARIANT
-    assert _merge.DEFAULT_ALIGNMENT in _merge.ALIGNMENTS
-    assert _merge.normalize_alignment(_merge.DEFAULT_ALIGNMENT) == "variant"
-    assert _merge.ALIGNMENTS == ("occurrence", "variant", "auto")
+    assert ALIGNMENT_VARIANT == "variant"
+    assert DEFAULT_ALIGNMENT == ALIGNMENT_VARIANT
+    assert DEFAULT_ALIGNMENT in ALIGNMENTS
+    assert _normalize_alignment(DEFAULT_ALIGNMENT) == "variant"
+    assert ALIGNMENTS == ("variant", "occurrence", "auto")
     # `"occurrence"` stays a valid explicit spelling (the legacy policy).
-    assert _merge.ALIGNMENT_OCCURRENCE == "occurrence"
-    assert _merge.normalize_alignment("occurrence") == "occurrence"
+    assert ALIGNMENT_OCCURRENCE == "occurrence"
+    assert _normalize_alignment("occurrence") == "occurrence"
 def test_omitted_alignment_is_byte_identical_to_variant():
     """Omitting `alignment` == `alignment="variant"`, byte for byte.
 
@@ -238,7 +245,6 @@ def test_variant_and_auto_produce_a_valid_graph(alignment):
     report = graph.batch_report
     assert isinstance(report, evoxc.BatchReport)
     assert report.n_functions == len(graphs)
-    # The report's op count is the entry block's emitted-op count.
     assert report.emitted_ops == emitted_count(graph)
     assert counts(graph) == BRANCHY_COUNTS[alignment]
     # ONE class per variant at the two branch skeletons, no mixed class left to
@@ -465,7 +471,7 @@ def test_unknown_alignment_spelling_is_a_transform_error(value):
 )
 def test_alignment_spelling_is_normalized(spelling, canonical):
     """Spellings are case-insensitive and whitespace-stripped (byte-identical)."""
-    assert _merge.normalize_alignment(spelling) == canonical
+    assert _normalize_alignment(spelling) == canonical
     graphs = branchy_graphs()
     normalized = merged(graphs, switch_ops=True, alignment=spelling)
     reference = merged(graphs, switch_ops=True, alignment=canonical)

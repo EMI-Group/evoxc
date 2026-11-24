@@ -224,7 +224,10 @@ class XlaBackend(CompilerBackend):
     #: ``"jacobi_batched"``, default ``"jacobi_batched"`` — 65-74x faster at
     #: n=100) and ``split_reduction`` (bool, default ``True`` — two-stage
     #: split reductions for rank-0-result reductions) are likewise declared
-    #: here so they pass validation; the Writer validates their values.
+    #: here so they pass validation; the Writer validates their values —
+    #: including ``split_reduction_non_exact`` (bool, default ``False``, the
+    #: OPT-IN float ``sum``/``prod`` split — reassociates, hence not default)
+    #: and ``split_reduction_threshold`` (int >= 2, default 1024).
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset(
             {
@@ -232,6 +235,8 @@ class XlaBackend(CompilerBackend):
                 "dot_precision",
                 "eigh_algorithm",
                 "split_reduction",
+                "split_reduction_non_exact",
+                "split_reduction_threshold",
             }
         ),
         "compile": frozenset(
@@ -265,6 +270,12 @@ class XlaBackend(CompilerBackend):
         # (shared lower() rejects collective graphs explicitly).
         runtime_calls=False,
         custom_blocks=False,
+        # custom_ops: ``custom_call`` / ``inline_stablehlo`` ops are
+        # forwarded VERBATIM into the emitted StableHLO text; whether the
+        # target exists and the MLIR is valid is the external XLA
+        # compiler's verdict, surfaced as-is (evoxc adds no target
+        # registry and no pre-validation).
+        custom_ops=True,
         async_collectives=False,
         # frozenset() — empty by design. XLA ships RngBitGenerator with
         # THREE_FRY/PHILOX, but real-plugin validation (jax_cuda12_pjrt

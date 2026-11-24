@@ -1,14 +1,25 @@
-"""Builtin batching/JVP/VJP rules for the standard op set.
+"""Builtin batching/JVP/VJP rule tables for the standard op set.
 
-The op-name → rule-category tables below are the design record of how each
-builtin op vectorizes and differentiates; registration happens at import
-time. Ops deliberately absent from every table — runtime_call, collectives,
+The NATIVE (Rust) engine is the authority for `grad`/`jvp`/`vjp`, for
+`vectorize`/`vmap`/`batch_functions`, and for every builtin batching and
+derivative rule. The op-name → rule-category tables and rule functions below
+are registered at import into the PUBLIC Python registries (`batching_rules` /
+`jvp_rules` / `vjp_rules` via `register_batching_rule` / `register_jvp_rule` /
+`register_vjp_rule`). They back the extension-rule owners (`evoxc/block`,
+`evoxc/external_rules`, `evoxc/sparse`), the availability gate
+`batch_functions._check_ops` (which accepts an op only when `batching_rules`
+holds its key) and any caller of the public `register_*` API.
+The native engine's builtin rules are compiled in and never read these dicts,
+so a builtin rule gap must be closed natively AND mirrored here (the Python
+`batching_rules` copy is what gates `batch_functions`).
+
+Ops deliberately absent from every table — runtime_call, collectives,
 control-flow ops — raise `core.TransformError` when transformed (no silent
-fallback). `constant` has a batching rule only; the AD sweep handles it
+fallback). `constant` has a batching rule only; the AD machinery handles it
 structurally (fixed data ⇒ zero tangent).
 
 Rules build replacement ops with ordinary `evoxc.ops.*` functions into the
-machinery's pushed builder (raw `trace.current_builder()` only for multi-axis
+bridge's pushed builder (raw `trace.current_builder()` only for multi-axis
 `gather` and batched `scatter`). v1 gaps are explicit `TransformError`s: conv
 VJP, mapped-kernel conv batching, mapped-operand slice batching, and
 differentiating `mean`/segment-splitting over symbolic dims.

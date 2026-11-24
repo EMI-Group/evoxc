@@ -1,15 +1,12 @@
-"""Regression tests for the fixed block portable-decomposition VJP fallback.
+"""Pins for the block portable-decomposition VJP fallback.
 
-Context: commit 1a88219 fixed ``evoxc/block/rules.py::_portable_vjp_rule`` —
-the fallback used to seed its local reverse sweep on the block_call's
-PRE-inline result ids (which are never inserted into the builder), so it
-returned all-``ZeroTangent`` whenever a real cotangent existed. The
-``_repair_portable_vjp`` workaround in ``evoxc/transforms/autodiff.py`` that
-compensated was deleted. The fixed rule seeds on the POST-inline
-decomposition outputs and guards output-count mismatches with
-``TransformError`` (never guessing).
+Contract pinned here (``evoxc/block/rules.py::_portable_vjp_rule``): the
+fallback seeds its local reverse sweep on the POST-inline decomposition
+outputs — the inlined values the builder actually holds — so a real cotangent
+propagates into the decomposition's inputs, and an output-count mismatch
+raises ``TransformError`` (never guessing).
 
-These tests pin the fixed contract for blocks declared with ONLY a portable
+These tests pin that contract for blocks declared with ONLY a portable
 decomposition (decorator form, no explicit batching/jvp/vjp rules, default
 policy resolution ``batching_rule``):
 
@@ -20,7 +17,7 @@ policy resolution ``batching_rule``):
   — no constants);
 * the all-``ZeroTangent`` short-circuit (a path that does not influence the
   loss → zeros) and the per-entry zero-skip for multi-output blocks;
-* ``evoxc.jvp`` derived from the fixed vjp fallback;
+* ``evoxc.jvp`` derived from the vjp fallback;
 * the output-count guard (portable returning a different number of outputs
   than the declared results → ``TransformError``).
 
@@ -33,8 +30,10 @@ Notes:
 * All blocks are decorator-form portable-only declarations — the fallback
   rules registered at declaration time are exactly what the transforms
   resolve to (nothing explicit overrides them).
-* ``# BUG(evoxc)`` on ``test_grad_portable_containing_constant_op``: the
-  fixed local sweep still does not skip ``constant`` ops (see the marker).
+* A ``constant`` op inside a portable: ``reg_const`` multiplies by the literal
+  ``2.0``, so its decomposition carries a ``constant`` op — the local sweep
+  skips it (zero operands, nothing to propagate backward, mirroring the main
+  sweep in ``evoxc/transforms/autodiff.py``) and grad/vjp stay exact.
 """
 
 import numpy as np
@@ -295,7 +294,7 @@ def test_grad_multi_output_portable_mixed_cotangents():
 
 
 # ---------------------------------------------------------------------------
-# jvp derived from the fixed vjp fallback
+# jvp derived from the vjp fallback
 # ---------------------------------------------------------------------------
 
 
@@ -336,19 +335,12 @@ def test_portable_output_count_mismatch_raises_transform_error():
 # ---------------------------------------------------------------------------
 
 
-# BUG(evoxc): a portable decomposition whose body contains a `constant` op (any
-# literal or evoxc.constant value feeding an inlined op) fails grad/vjp with
-# "grad/vjp: no VJP rule for op 'constant'": the local reverse sweep in
-# evoxc/block/rules.py::_portable_vjp_rule looks up a rule for EVERY inlined op
-# whose result carries a cotangent, but `constant` has NO registry entry by
-# design — the main sweep in evoxc/transforms/autodiff.py skips
-# `proxy.name == "constant"` (zero operands, nothing to propagate backward).
-# The decomposition is a graph of ordinary ops; constants in it must
-# differentiate fine (post-inline seeding), like the batching fallback's
-# "constant ops are unmapped" handling. Minimal repro: block with portable
-# `evoxc.multiply(x, 2.0)` — the 2.0 traces to a `constant` op — and
-# `grad(sum(block(x)))` raises TransformError instead of returning 2.0.
-# Do NOT skip/xfail/weaken it.
+# Contract: a portable decomposition is a graph of ordinary ops, so a
+# `constant` inside it (a literal, or an evoxc.constant value feeding an inlined
+# op) differentiates like any other op. The local reverse sweep in
+# evoxc/block/rules.py::_portable_vjp_rule seeds on the POST-inline outputs and
+# skips `constant` (zero operands — nothing to propagate backward), exactly like
+# the main sweep in evoxc/transforms/autodiff.py, so d/dx sum(2x) == 2.
 def test_grad_portable_containing_constant_op():
     """A constant in the portable must not break grad: d/dx sum(2x) == 2."""
     x = np.array([0.5, 1.0, 2.0, 3.0])

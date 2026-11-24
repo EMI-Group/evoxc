@@ -19,16 +19,16 @@ from __future__ import annotations
 import re
 
 from evoxc import core
-from evoxc import ir
-from evoxc.ir.builder import InsertionPoint
 from evoxc.trace import Graph, trace
 from evoxc.trace.graph import _normalize_leaf_types
 from evoxc.transforms._wrappers import TransformCallable
-from evoxc.transforms.batching import with_batch_depth
+from evoxc.transforms._native_bridge import vmap_graph as _native_vmap_graph
+from evoxc.transforms.batching import _tensor_input_axes, with_batch_depth
 from evoxc.transforms.vectorize import (
     _broadcast_registered_axes,
     _is_int,
     _normalize_axis_entries,
+    _normalize_axes,
     _registered_node_tensor_positions,
     _tree_has_registered_node,
     vectorize,
@@ -48,13 +48,6 @@ function exactly once) and vectorizes the returned Graph with the outer
 axes, then rearranges outputs per out_axes — each level adds one leading
 mapped dim."""
 
-#: Reserved name pattern of the fresh batch dims `vectorize_graph` introduces
-#: (ONE shared `Dim` per pass, named from the active pass depth — `"batch"`
-#: at depth 0, `"batch_1"` at depth 1, ... — see
-#: `batching._batched_input_specs`). These are the ONLY dims mapped-output
-#: detection keys on (by identity); the `_\d+` suffix stays accepted for dims
-#: named `batch_1` in pre-existing or user-built graphs.
-_BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
 
 
 def vmap(fn_or_graph, in_axes=0, out_axes=0):
@@ -92,8 +85,7 @@ def vmap(fn_or_graph, in_axes=0, out_axes=0):
     required batching rules exist (each level adds one leading mapped dim).
     """
     if isinstance(fn_or_graph, Graph):
-        graph = vectorize(fn_or_graph, in_axes)
-        return _rearrange_outputs(graph, out_axes)
+        return _vmap_graph(fn_or_graph, in_axes, out_axes)
 
     if callable(fn_or_graph) or getattr(fn_or_graph, "__evoxc_defn__", False):
         return TransformCallable(
@@ -132,11 +124,23 @@ def _vmap_fn(fn, args, in_axes, out_axes) -> Graph:
         # collide at run time (unequal extents raise a misleading ShapeError).
         with with_batch_depth():
             inner_graph = fn(*unvectorized)
-        graph = vectorize(inner_graph, in_axes)
-    else:
-        graph = trace(fn, *unvectorized)
-        graph = vectorize(graph, in_axes)
-    return _rearrange_outputs(graph, out_axes)
+        return _vmap_graph(inner_graph, in_axes, out_axes)
+    graph = trace(fn, *unvectorized)
+    return _vmap_graph(graph, in_axes, out_axes)
+
+
+def _vmap_graph(graph: Graph, in_axes, out_axes) -> Graph:
+    """`vmap`'s graph composition: validate/normalize, then let native rewrite.
+
+    Python keeps every frontend validation (input axes normalization, output
+    axes structure/`{0, None}` rules) with the historical message wording;
+    the op rewrite AND the output rearrangement (leading transpose / size-one
+    axis insertion / the "a batch axis is never silently dropped" error) are
+    the native engine's (see `_native_bridge.vmap_graph`).
+    """
+    tensor_entries = _tensor_input_axes(graph, _normalize_axes(graph, in_axes))
+    out_entries = _normalize_out_axes(graph, out_axes)
+    return _native_vmap_graph(graph, tensor_entries, out_entries)
 
 
 def _derive_unvectorized_args(args, in_axes):
@@ -229,7 +233,7 @@ def _derive_unvectorized_args_and_entries(args, in_axes, what="vmap"):
     # node's indices/values leaves) keep their shape UNCHANGED when mapped:
     # their leading dim is NOT a batch dim (sparse COO indices are
     # (None, ndim) — dim 0 is the runtime-dynamic nnz). The batch dim is
-    # prepended later by vectorize (`_batched_input_specs`), and the
+    # prepended later by vectorize (`_batch_dim`), and the
     # output-side dense_shape remap is `register_batched_aux_remap`'s job.
     under_registered = _registered_node_tensor_positions(
         args_spec, tensor_positions
@@ -257,19 +261,26 @@ def _derive_unvectorized_args_and_entries(args, in_axes, what="vmap"):
 
 # --- output-axis rearrangement ----------------------------------------------
 
+#: Reserved name pattern of the fresh batch dims a vectorize pass introduces
+#: (`batch` at depth 0, `batch_1` at depth 1, ...).
+_BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
+
 
 def _collect_batch_dims(graph: Graph):
-    """The fresh batch `Dim` objects this vectorization introduced.
+    """The fresh batch `Dim` objects one vectorization pass introduced.
 
-    `vectorize_graph` prepends ONE fresh symbolic batch `Dim` (named from the
-    active pass depth — `"batch"` at depth 0, `"batch_1"` at depth 1, ...)
-    shared by all mapped input specs of the pass (unmapped specs are reused
-    unchanged), so the batch dims of THIS vectorization are exactly the
-    leading entries of the input specs whose names follow that reserved
-    pattern. Collected as objects — nested vmap levels create their OWN fresh
-    Dims with level-distinct names, and only the current level's objects must
-    count (output detection compares by identity, `is`). An empty list (no
-    mapped inputs) makes every output unmapped.
+    A pass prepends ONE fresh symbolic batch `Dim` to every mapped input spec
+    (unmapped specs are reused unchanged), named from the pass depth, so the
+    batch dims of a graph are exactly the leading entries of its input specs
+    whose names follow `_BATCH_DIM_NAME`. They are returned as OBJECTS: nested
+    vmap levels create their own level-distinct `Dim`s and only the current
+    level's objects count (mapped detection compares by identity). An empty
+    list (no mapped inputs) makes every output unmapped.
+
+    Consumed by the native parity oracle
+    (`native/evoxc-compiler/tests/parity_transform/run_parity.py`), which uses
+    it to decide where the batch axis of each output sits; the engine itself
+    takes the mapped/output-axis structure from the native transform metadata.
     """
     batch_dims = []
     for spec in graph.tensor_specs:
@@ -317,46 +328,20 @@ def _leading_batch_count(shape, batch_dims) -> int:
     return count
 
 
-def _rearrange_outputs(graph: Graph, out_axes) -> Graph:
-    """Post-vectorize output-axis rearrangement, as ordinary ops added to the
-    already-vectorized graph (never inside batching rules).
 
-    `out_axes` is normalized against the graph's output tree (pytree of
-    0|None; bare 0/None allowed with at most one tensor output — a no-op
-    when there are none; static output leaves must be None; v1 entries
-    {None, 0}). Each tensor output's
-    mapped-ness is detected by identity against the fresh batch Dims in the
-    input specs (see `_collect_batch_dims`). Per output:
+def _normalize_out_axes(graph: Graph, out_axes):
+    """Validate/normalize `out_axes` against the graph's OUTPUT structure.
 
-    * `out_axes` = 0 keeps the mapped axis leading — if the output is
-      unmapped, an explicitly requested size-one axis is inserted at 0 via a
-      reshape op;
-    * `out_axes` = None requires the output to be unmapped, otherwise
-      `core.TransformError` (axis mismatch — a batch axis is never silently
-      dropped).
-
-    With `out_axes` = 0 for every mapped output, NO extra op is added and the
-    result is IR-identical to plain `vectorize` — the graph is returned
-    untouched (this is the vmap≡vectorize equivalence path).
+    Returns one ``0``/``None`` entry per TENSOR output leaf (output-leaf
+    order). This is the Python half of `vmap`'s rearrangement: the native
+    engine applies it (leading transpose / size-one axis insertion / the "a
+    batch axis is never silently dropped" error, which needs the vectorized
+    module) while the structural and v1 restrictions keep their historical
+    wording here (pytree of 0|None; a bare 0/None only with at most one
+    tensor output; static output leaves must be None; v1 entries {None, 0}).
     """
-    function = graph.module.main
-    block = function.entry_block
-    terminator = block.terminator
-    if terminator is None or terminator.name != "return":
-        raise core.TransformError(
-            "vmap: the vectorized graph's entry block has no 'return' "
-            "terminator — cannot rearrange outputs"
-        )
-    outputs = terminator.operands  # tensor outputs, in output-leaf order
-
     static_positions = {record.index for record in graph.output_static_values}
     tensor_positions = set(range(graph.output_tree.num_leaves)) - static_positions
-    if len(outputs) != len(tensor_positions):
-        raise core.TransformError(
-            "vmap: internal error — the return terminator yields "
-            f"{len(outputs)} values but the output tree has "
-            f"{len(tensor_positions)} tensor leaves"
-        )
     has_registered = _tree_has_registered_node(graph.output_tree)
 
     if out_axes is None or _is_int(out_axes):
@@ -400,82 +385,9 @@ def _rearrange_outputs(graph: Graph, out_axes) -> Graph:
             )
     # No rank range-check for outputs: entry 0 on a rank-0 unmapped output is
     # the legal size-one-axis insertion, not an error.
-    out_entries = _normalize_axis_entries(
-        entries, tensor_positions, None, "vmap"
-    )
-    tensor_entries = [out_entries[pos] for pos in sorted(tensor_positions)]
-
-    batch_dims = _collect_batch_dims(graph)
-    mapped = [
-        _leading_batch_count(value.type.shape, batch_dims) > 0
-        for value in outputs
-    ]
-
-    for index, (entry, is_mapped) in enumerate(zip(tensor_entries, mapped)):
-        if entry is None and is_mapped:
-            raise core.TransformError(
-                f"vmap: out_axes=None at output leaf {index} requires the "
-                "output to be unmapped, but it carries a mapped batch axis "
-                "— a batch axis is never silently dropped"
-            )
-    needs_insert = [
-        entry == 0 and not is_mapped
-        for entry, is_mapped in zip(tensor_entries, mapped)
-    ]
-    if not any(needs_insert):
-        return graph
-    return _insert_size_one_axes(graph, outputs, needs_insert, terminator)
-
-
-def _insert_size_one_axes(graph, outputs, needs_insert, old_terminator) -> Graph:
-    """Insert size-one leading axes for unmapped outputs, as ordinary
-    `reshape` ops spliced into the module right before the `return`
-    terminator. The graph is mutated IN PLACE — its module/trees stay the
-    same objects, only the IR body changes.
-
-    Splice mechanism (Use-bookkeeping-safe):
-
-    1. Clear the `Use` records the old terminator left on its operand values,
-       then `block.erase` it (erase only clears `op.parent` — stale Use
-       records would fail `verify`'s forward check).
-    2. Create a fresh `ir.Builder` over the SAME module (op/value id counters
-       continue) and set its insertion point to the END of the block via
-       `InsertionPoint` — the public builder API (`push_region`/
-       `set_insertion_point`) only offers position 0, which would put the new
-       ops before their operand definitions.
-    3. Emit one `reshape` per changed output through `builder.create` (the IR
-       path accepts `None` dims in the shape attr, which the frontend
-       `ops.reshape` rejects).
-    4. Re-emit the `return` terminator with the new operand tuple via
-       `set_terminator`, which wires fresh Use records.
-    """
-    function = graph.module.main
-    block = function.entry_block
-    for operand in old_terminator.operands:
-        operand.uses = [
-            use for use in operand.uses if use.owner is not old_terminator
-        ]
-    block.erase(old_terminator)
-
-    builder = ir.Builder(graph.module)
-    builder._insertion_stack.append(InsertionPoint(block, len(block.ops)))
-
-    new_operands = []
-    for value, changed in zip(outputs, needs_insert):
-        if not changed:
-            new_operands.append(value)
-            continue
-        op = builder.create(
-            "reshape",
-            operands=(value,),
-            attributes={"shape": (1, *value.type.shape)},
-            location=old_terminator.location,
-        )
-        new_operands.append(op.result)
-    builder.set_terminator(
-        block,
-        "return",
-        operands=tuple(new_operands),
-        location=old_terminator.location,
-    )
-    return graph
+    normalized = _normalize_axis_entries(entries, tensor_positions, None, "vmap")
+    # One entry per TENSOR output (the native engine's `out_axes` contract),
+    # not per output-tree leaf: a registered pytree output node (e.g. a
+    # sparse-tensor node) contributes several leaves but ONE tensor output per
+    # returned operand.
+    return [normalized[position] for position in sorted(tensor_positions)]

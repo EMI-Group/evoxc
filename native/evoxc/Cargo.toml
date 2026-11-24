@@ -1,0 +1,29 @@
+[package]
+name = "evoxc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "EvoX Compiler: reusable Rust core — graph IR, inference, transforms, and the native CPU engine."
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+evoxc-core.workspace = true
+evoxc-compiler.workspace = true
+evoxc-runtime = { workspace = true, optional = true }
+evoxc-cpu = { workspace = true, optional = true }
+
+[features]
+default = ["cpu"]
+cpu = ["dep:evoxc-cpu"]
+runtime = ["dep:evoxc-runtime"]
+full = ["cpu", "runtime"]

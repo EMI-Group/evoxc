@@ -22,10 +22,11 @@ The frozen dataclasses prevent normal field reassignment but do not recursively 
 `ATTR_TYPE_NAMES` enumerates known tags but `AttrSpec` construction and `register_opdef` do not enforce membership or validate field values.
 The schema allows arbitrary values only under explicitly declared `ATTR_ANY` keys, not arbitrary undeclared attribute names at Builder construction.
 `ATTR_ANY` is documented as JSON-able but its Python representation is unrestricted at this layer.
-Built-in uses include structured `result_specs`, block `static_args`, convolution padding, optional matrix-rank tolerance, flip/roll axes, and nan-to-num replacements.
+Built-in uses include structured `result_specs` (`runtime_call`, `block_call`, `external_call`, `custom_call`, `inline_stablehlo`), block `static_args`, convolution padding, optional matrix-rank tolerance, flip/roll axes, and nan-to-num replacements.
 `runtime_call` stores a string callback identifier, `external_call` stores a string kernel name, and `block_call` stores a string block name rather than executable code in their schemas.
 Their `result_specs` attributes use `ATTR_ANY` for structured result-type data.
-`runtime_call` and `external_call` have callback effect, whereas `block_call` has read effect and its description delegates actual effects to its declaration.
+`runtime_call`, `external_call`, `custom_call` and `inline_stablehlo` have callback effect, whereas `block_call` has read effect and its description delegates actual effects to its declaration.
+`custom_call` stores a StableHLO target symbol (`call_target_name`) plus an opaque `backend_config` string, an `api_version` int and a `has_side_effect` bool, while `inline_stablehlo` stores a raw StableHLO/MLIR `body` string and the same `has_side_effect`; both declare `result_specs` and are the only ops whose attribute VALUES (non-empty strings, `api_version >= 1`, real bools) the verifier checks on top of the tag checks.
 
 ## Portability Boundary
 
@@ -50,5 +51,6 @@ A native transform must preserve the existing IR-level callback contract rather 
 | `./linalg.py` | Dot, convolution, matrix and factorization definitions |
 | `./control.py` | Constants, control flow, named callback/block/kernel calls, return terminator |
 | `./collective.py` | Communication definitions and rank/world-size reads |
+| `./custom.py` | Opaque custom operations: `custom_call` (StableHLO target symbol + backend config) and `inline_stablehlo` (raw StableHLO/MLIR snippet) |
 | `./sparse.py` | Sparse operation definitions |
 | `./random.py` | Algorithm names/key types and functional random operation definitions |

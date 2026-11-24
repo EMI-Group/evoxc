@@ -13,9 +13,19 @@ captures an arbitrary Python callback object under an auto-generated,
 process-lifetime registry id (``callback_N``) — it is the generic escape
 hatch. ``external_call`` is the NAMED, contract-stable variant: the name is
 user-chosen and survives graph save/load and process boundaries (the kernel
-must be re-registered in any process that runs the graph). Compiler backends
-reject it explicitly in v1 (adapter host-dispatch is round 2); the numpy
-backend dispatches through ``evoxc.external``.
+must be re-registered in any process that runs the graph).
+
+Backend coverage: the numpy backend dispatches the call through
+``evoxc.external`` (the per-backend registry: the exact backend slot, then
+the default slot). The iree adapter declares
+``Capabilities.external_calls=True`` and SPLITS the graph at
+``external_call`` ops (``evoxc/backends/external_split.py``) into compiled
+segments plus a kernel-call plan, dispatching each boundary in its
+registered mode — host staging via ``Tensor.to(cpu)`` for the default host
+mode, or a zero-host-round-trip device dispatch for
+``device_resident=True`` kernels. xla/tvm inline a registered ``portable``
+decomposition with a ``UserWarning`` when one exists, and otherwise raise an
+explicit ``BackendError``.
 
 Binding rules (see ``evoxc/CONTEXT.md``, "External kernels"):
 
@@ -50,9 +60,11 @@ def external_call(name, *operands, result) -> Union[
     numpy backend resolves the name through ``evoxc.external.get_external_kernel``
     (per-backend registry: the exact backend slot, then the default slot) and
     executes the callable with the operand tensors as numpy arrays; the iree
-    adapter host-dispatches via segment-split at ``lower()``/``run()``
-    (``evoxc/backends/external_split.py``); xla/tvm reject the op with an
-    explicit ``BackendError``.
+    adapter splits the graph at ``lower()`` and dispatches each boundary in
+    its registered mode (host staging, or device-resident dispatch) via
+    ``evoxc/backends/external_split.py``; xla/tvm inline a registered
+    ``portable`` decomposition with a ``UserWarning`` when one exists and
+    otherwise raise an explicit ``BackendError``.
 
     Args:
         name: The registered kernel name (non-empty str). Same name at trace

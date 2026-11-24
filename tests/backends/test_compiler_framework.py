@@ -177,9 +177,30 @@ def compiler_framework_portable_double(x: evoxc.TensorSpec((2, 3), evoxc.float32
     return evoxc.add(x, x)
 
 
+#: A block with NO portable decomposition: a compiler adapter cannot inline a
+#: decomposition and has no per-backend impl for it, so the capability
+#: pre-check must reject it when ``custom_blocks`` is False (the case the
+#: portable block above deliberately does NOT exercise — a portable block is
+#: spliced and never reaches the rejection).
+compiler_framework_backend_only = evoxc.block(
+    "compiler_framework_backend_only",
+    inputs=[evoxc.TensorSpec((2, 3), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((2, 3), evoxc.float32)],
+)
+
+
 def _block_graph():
+    """A graph built from a PORTABLE block (spliced at lower() time)."""
     def fn(x):
         return compiler_framework_portable_double(x)
+
+    return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
+
+
+def _backend_only_block_graph():
+    """A graph built from a block WITHOUT a portable decomposition."""
+    def fn(x):
+        return compiler_framework_backend_only(x)
 
     return evoxc.trace(fn, evoxc.TensorSpec((2, 3), evoxc.float32))
 
@@ -231,7 +252,10 @@ _CAPABILITY_REJECT_CASES = [
     ("runtime_call", _runtime_call_graph, {"runtime_calls": False}),
     ("dynamic", _symbolic_graph, {"dynamic_shapes": False}),
     ("float64", _float64_graph, {"dtypes": frozenset({np.dtype("float32")})}),
-    ("block", _block_graph, {"custom_blocks": False}),
+    # A PORTABLE block is spliced at lower() time (see the positive case
+    # below), so the rejection fixture must be a block with NO portable
+    # decomposition — that is what a compiler adapter cannot execute.
+    ("block", _backend_only_block_graph, {"custom_blocks": False}),
 ]
 
 
@@ -278,6 +302,20 @@ def test_full_capability_stub_lowers_exportable_graphs(name, graph_fn):
     assert isinstance(lowered, evoxc.backends.LoweredProgram)
     assert lowered.backend == "full-caps"
     assert lowered.payload["format"] == "stablehlo"
+
+
+def test_portable_block_lowers_and_inlines_on_a_compiler_backend():
+    # A block WITH a portable decomposition is spliced by ``inline_portables``
+    # even when the adapter declares ``custom_blocks=False`` (a compiler
+    # backend has no per-backend block impls): ``block_call`` never survives
+    # into the exported program, and the portable's ``stablehlo.add`` does.
+    stub = _make_stub("portable-inline", custom_blocks=False)
+    graph = _block_graph()
+    graph.verify()
+    mlir = stub.lower(graph).payload["mlir_text"]
+    assert "block_call" not in mlir
+    assert "compiler_framework_portable_double" not in mlir
+    assert "stablehlo.add" in mlir
 
 
 # ---------------------------------------------------------------------------

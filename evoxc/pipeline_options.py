@@ -14,7 +14,9 @@ The env-option table (backend, stage) -> (env var, option key, parser):
 | Env var                     | Backend | Stage   | Option key            | Format                                        |
 |-----------------------------|---------|---------|-----------------------|-----------------------------------------------|
 | ``EVOXC_IREE_COMPILE_ARGS``   | iree    | compile | ``iree_compile_args`` | space-separated flag list (shlex syntax)      |
+| ``EVOXC_IREE_COMPILER_MODULE``| iree    | compile | ``iree_compiler_module`` | dotted module path (whitespace-stripped; the adapter imports it, a module OBJECT is explicit-kwarg only) |
 | ``EVOXC_IREE_RUNTIME_ARGS``   | iree    | load    | ``iree_runtime_args`` | space-separated flag list (shlex syntax)      |
+| ``EVOXC_IREE_RUNTIME_MODULE`` | iree    | load    | ``iree_runtime_module`` | dotted module path (whitespace-stripped; the adapter imports it, a module OBJECT is explicit-kwarg only) |
 | ``EVOXC_IREE_VULKAN_TARGET``  | iree    | compile | ``vulkan_target``     | SPIR-V target profile string (whitespace-stripped; the VALUE is validated by the compiler) |
 | ``EVOXC_XLA_COMPILE_OPTIONS`` | xla     | compile | ``xla_compile_options`` | base64 of a serialized CompileOptionsProto  |
 | ``EVOXC_TVM_TARGET``          | tvm     | compile | ``tvm_target``        | TVM target string                             |
@@ -193,6 +195,13 @@ def _parse_bool_option(var: str, value: str) -> bool:
 ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
     ("iree", "compile"): (
         ("EVOXC_IREE_COMPILE_ARGS", "iree_compile_args", _parse_flag_list),
+        # The custom-IREE-build seam: a dotted module PATH the adapter
+        # resolves with ``importlib.import_module`` (a module OBJECT can only
+        # be passed as an explicit kwarg). Only the whitespace is stripped —
+        # the adapter validates the value (unimportable path -> loud
+        # BackendError naming the option and value).
+        ("EVOXC_IREE_COMPILER_MODULE", "iree_compiler_module",
+         lambda var, value: value.strip()),
         # The SPIR-V target profile selects workgroup-memory/thread budgets:
         # the whitespace-stripped string is handed to the adapter, which
         # derives ``--iree-vulkan-target=<profile>``; the compiler validates
@@ -210,6 +219,11 @@ ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
     ),
     ("iree", "load"): (
         ("EVOXC_IREE_RUNTIME_ARGS", "iree_runtime_args", _parse_flag_list),
+        # The load-stage half of the custom-IREE-build seam (dotted module
+        # path; the adapter validates it on get_driver/DeviceArray/
+        # load_vm_module; a module OBJECT is explicit-kwarg only).
+        ("EVOXC_IREE_RUNTIME_MODULE", "iree_runtime_module",
+         lambda var, value: value.strip()),
     ),
     ("xla", "compile"): (
         ("EVOXC_XLA_COMPILE_OPTIONS", "xla_compile_options", _parse_base64_bytes),

@@ -57,7 +57,8 @@ Encoding notes (binding):
 - Tuples are wrapped as ``{"__evoxc_tuple__": [...]}`` so the tuple/list
   distinction survives the JSON round-trip (``json`` itself flattens tuples
   to arrays); attribute sequence tags decode back to the original shape.
-- ``runtime_call``/``block_call`` ``result_specs``: encoded as a list of type
+- ``runtime_call``/``block_call``/``external_call``/``custom_call``/
+  ``inline_stablehlo`` ``result_specs``: encoded as a list of type
   dicts ``{"dtype": str, "shape": [dim, ...]}`` (one per declared result);
   on decode every entry is NORMALIZED back to a ``ValueType`` instance (the
   in-memory form the Builder produces), so ``verify``'s in-memory comparison
@@ -80,9 +81,7 @@ Encoding notes (binding):
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import io
 import json
 from itertools import count
 
@@ -98,6 +97,14 @@ from evoxc.core import (
     dtype,
 )
 
+from ._npy import (
+    _NDARRAY_TAG,
+    _decode_ndarray_ref,
+    _dtype_from_name,
+    _dtype_name,
+    _encode_ndarray,
+    _is_int,
+)
 from .block import Block
 from .function import Function
 from .location import Location
@@ -115,21 +122,32 @@ __all__ = ["IR_FORMAT_VERSION", "serialize_module", "deserialize_module"]
 #: Wire discriminator of the payload.
 IR_FORMAT = "evoxc-ir"
 
-#: Attribute-value marker replacing numpy arrays (value = constants-table key).
-_NDARRAY_TAG = "__evoxc_ndarray__"
-
 #: Attribute-value marker preserving tuples through the JSON round-trip.
 _TUPLE_TAG = "__evoxc_tuple__"
+
+#: Memo tables for the two conversions that repeat once per encoded value.
+_ATTR_SCHEMA_CACHE: dict = {}
+_VALUE_TYPE_CACHE: dict = {}
+
+
+def _attr_schema(op_name: str) -> dict:
+    """The ``OpDef`` attribute schema of ``op_name`` as ``{attr: AttrSpec}``.
+
+    Rebuilt whenever the registered ``OpDef`` object changes identity, so a
+    runtime ``register_opdef`` that replaces a definition is never masked.
+    """
+    definition = opdef(op_name)
+    cached = _ATTR_SCHEMA_CACHE.get(op_name)
+    if cached is not None and cached[0] is definition:
+        return cached[1]
+    schema = {spec.name: spec for spec in definition.attributes}
+    _ATTR_SCHEMA_CACHE[op_name] = (definition, schema)
+    return schema
 
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
-
-
-def _is_int(value) -> bool:
-    """True for plain ints (bools excluded)."""
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _require(mapping, key: str, where: str):
@@ -267,7 +285,7 @@ def _encode_type(value_type: ValueType) -> dict:
             f"expected a ValueType to encode, got {type(value_type).__name__}"
         )
     return {
-        "dtype": value_type.dtype.name,
+        "dtype": _dtype_name(value_type.dtype),
         "shape": [_encode_dim(dim) for dim in value_type.shape],
     }
 
@@ -280,7 +298,7 @@ def _decode_type(encoded) -> ValueType:
     if not isinstance(dtype_name, str):
         raise VerificationError(f"invalid type encoding {encoded!r}: missing 'dtype'")
     try:
-        dtype_obj = np.dtype(dtype_name)
+        dtype_obj = _dtype_from_name(dtype_name)
     except TypeError as exc:
         raise VerificationError(
             f"invalid type encoding {encoded!r}: bad dtype name {dtype_name!r}"
@@ -288,7 +306,24 @@ def _decode_type(encoded) -> ValueType:
     shape_data = encoded.get("shape")
     if not isinstance(shape_data, list):
         raise VerificationError(f"invalid type encoding {encoded!r}: missing 'shape'")
-    return ValueType(dtype_obj, tuple(_decode_dim(dim) for dim in shape_data))
+    # Static shapes repeat heavily across a large module; a frozen ValueType is
+    # immutable, so one instance can serve every value with the same type.
+    for dim in shape_data:
+        if not (
+            isinstance(dim, dict)
+            and len(dim) == 1
+            and "int" in dim
+            and _is_int(dim["int"])
+        ):
+            return ValueType(dtype_obj, tuple(_decode_dim(dim) for dim in shape_data))
+    key = (dtype_name, tuple(dim["int"] for dim in shape_data))
+    cached = _VALUE_TYPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value_type = ValueType(dtype_obj, key[1])
+    if len(_VALUE_TYPE_CACHE) < 4096:
+        _VALUE_TYPE_CACHE[key] = value_type
+    return value_type
 
 
 def _encode_location(location) -> dict | None:
@@ -324,83 +359,17 @@ def _decode_location(encoded) -> Location | None:
 
 
 # ---------------------------------------------------------------------------
-# Constant table (numpy array payloads)
-# ---------------------------------------------------------------------------
-
-
-def _npy_to_b64(array: np.ndarray) -> str:
-    """Base64 of the ``np.save`` bytes of ``array``."""
-    buffer = io.BytesIO()
-    np.save(buffer, array, allow_pickle=False)
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def _npy_from_b64(data_b64) -> np.ndarray:
-    """Rebuild an ndarray from base64 ``np.save`` bytes."""
-    if not isinstance(data_b64, str):
-        raise VerificationError("constant 'data_b64' must be a base64 string")
-    try:
-        raw = base64.b64decode(data_b64.encode("ascii"), validate=True)
-    except ValueError as exc:
-        raise VerificationError(f"constant 'data_b64' is not valid base64: {exc}") from exc
-    try:
-        with io.BytesIO(raw) as buffer:
-            return np.load(buffer, allow_pickle=False)
-    except ValueError as exc:
-        raise VerificationError(f"constant payload is corrupt: {exc}") from exc
-
-
-def _encode_ndarray(array: np.ndarray, constants: dict) -> dict:
-    """Store ``array`` in the constants table; return the attribute marker."""
-    key = f"c{len(constants)}"
-    constants[key] = {
-        "dtype": str(array.dtype.name),
-        "shape": [int(dim) for dim in array.shape],
-        "data_b64": _npy_to_b64(array),
-    }
-    return {_NDARRAY_TAG: key}
-
-
-def _decode_ndarray_ref(encoded, constants: dict) -> np.ndarray:
-    """Resolve a ``{"__evoxc_ndarray__": key}`` marker to its ndarray."""
-    if not isinstance(encoded, dict) or set(encoded.keys()) != {_NDARRAY_TAG}:
-        raise VerificationError(f"invalid ndarray reference {encoded!r}")
-    key = encoded[_NDARRAY_TAG]
-    entry = constants.get(key)
-    if not isinstance(entry, dict):
-        raise VerificationError(
-            f"constant '{key}' is referenced but not present in the constants table"
-        )
-    try:
-        array = _npy_from_b64(entry["data_b64"])
-    except (KeyError, TypeError) as exc:
-        raise VerificationError(f"constant '{key}' is malformed: {exc}") from exc
-    recorded_shape = entry.get("shape")
-    if not isinstance(recorded_shape, list) or not all(
-        _is_int(dim) for dim in recorded_shape
-    ):
-        raise VerificationError(f"constant '{key}' has no valid recorded 'shape'")
-    if array.dtype.name != entry.get("dtype") or tuple(int(d) for d in array.shape) != tuple(
-        recorded_shape
-    ):
-        raise VerificationError(
-            f"constant '{key}': payload does not match its recorded dtype/shape"
-        )
-    return array
-
-
-# ---------------------------------------------------------------------------
 # Generic attribute-value encoding (JSON-able scalars, containers, specials)
 # ---------------------------------------------------------------------------
 
 
-def _encode_generic(value, constants: dict):
+def _encode_generic(value, constants: dict, inline: bool = False):
     """Recursively encode a JSON-able attribute value.
 
     Plain scalars pass through; numpy scalars normalize to Python scalars;
     tuples are wrapped in a marker so they survive JSON as tuples; numpy
-    arrays go to the constants table; ``Dim``/``DimExpr`` use the dim
-    encoding; ``ValueType`` uses the type encoding.
+    arrays go to the constants table (or the inline envelope form); ``Dim``/
+    ``DimExpr`` use the dim encoding; ``ValueType`` uses the type encoding.
     """
     if isinstance(value, (np.bool_, np.integer, np.floating, np.str_)):
         value = value.item()
@@ -409,18 +378,23 @@ def _encode_generic(value, constants: dict):
     if isinstance(value, float):
         return value
     if isinstance(value, np.ndarray):
-        return _encode_ndarray(value, constants)
+        return _encode_ndarray(value, constants, inline)
     if isinstance(value, (Dim, DimExpr)):
         return _encode_dim(value)
     if isinstance(value, ValueType):
         return _encode_type(value)
     if isinstance(value, tuple):
-        return {_TUPLE_TAG: [_encode_generic(item, constants) for item in value]}
+        return {
+            _TUPLE_TAG: [
+                _encode_generic(item, constants, inline) for item in value
+            ]
+        }
     if isinstance(value, list):
-        return [_encode_generic(item, constants) for item in value]
+        return [_encode_generic(item, constants, inline) for item in value]
     if isinstance(value, dict):
         return {
-            str(key): _encode_generic(item, constants) for key, item in value.items()
+            str(key): _encode_generic(item, constants, inline)
+            for key, item in value.items()
         }
     raise VerificationError(
         f"attribute value {value!r} is not serializable (JSON-able scalars/"
@@ -461,7 +435,8 @@ def _decode_generic(value, constants: dict):
 
 
 # ---------------------------------------------------------------------------
-# result_specs (runtime_call / block_call)
+# result_specs (runtime_call / block_call / external_call / custom_call /
+# inline_stablehlo)
 # ---------------------------------------------------------------------------
 
 
@@ -500,9 +475,9 @@ def _decode_spec(encoded) -> ValueType:
 # ---------------------------------------------------------------------------
 
 
-def _encode_attrs(op: Op, constants: dict) -> dict:
+def _encode_attrs(op: Op, constants: dict, inline: bool = False) -> dict:
     """Encode an op's attributes per its ``OpDef`` schema."""
-    schema = {spec.name: spec for spec in opdef(op.name).attributes}
+    schema = _attr_schema(op.name)
     encoded = {}
     for key, value in op.attributes.items():
         spec = schema.get(key)
@@ -514,13 +489,13 @@ def _encode_attrs(op: Op, constants: dict) -> dict:
                 raise VerificationError(
                     f"op '{op.name}': attribute '{key}' must be a numpy array"
                 )
-            encoded[key] = _encode_ndarray(value, constants)
+            encoded[key] = _encode_ndarray(value, constants, inline)
         elif spec.type == ATTR_SHAPE:
             encoded[key] = [_encode_dim(dim) for dim in value]
         elif spec.type == ATTR_ANY and key == "result_specs":
             encoded[key] = [_encode_spec(spec) for spec in value]
         else:
-            encoded[key] = _encode_generic(value, constants)
+            encoded[key] = _encode_generic(value, constants, inline)
     return encoded
 
 
@@ -529,10 +504,16 @@ def _decode_attrs(op_name: str, encoded_attrs, constants: dict) -> dict:
     if not isinstance(encoded_attrs, dict):
         raise VerificationError(f"op '{op_name}': attributes must be a dict")
     try:
-        definition = opdef(op_name)
+        schema = _attr_schema(op_name)
     except KeyError as exc:
         raise VerificationError(f"unknown op '{op_name}'") from exc
-    schema = {spec.name: spec for spec in definition.attributes}
+    return _decode_attrs_with_schema(op_name, schema, encoded_attrs, constants)
+
+
+def _decode_attrs_with_schema(
+    op_name: str, schema: dict, encoded_attrs: dict, constants: dict
+) -> dict:
+    """Decode attribute values against an already-resolved ``OpDef`` schema."""
     decoded = {}
     for key, value in encoded_attrs.items():
         spec = schema.get(key)
@@ -653,7 +634,7 @@ def _build_region(
 # ---------------------------------------------------------------------------
 
 
-def _encode_op(op: Op, constants: dict) -> dict:
+def _encode_op(op: Op, constants: dict, inline: bool = False) -> dict:
     """Encode one op into the flat ops table entry."""
     return {
         "id": op.id,
@@ -663,28 +644,30 @@ def _encode_op(op: Op, constants: dict) -> dict:
             {"id": result.id, "type": _encode_type(result.type)}
             for result in op.results
         ],
-        "attributes": _encode_attrs(op, constants),
+        "attributes": _encode_attrs(op, constants, inline),
         "regions": [_encode_region(region) for region in op.regions],
         "location": _encode_location(op.location),
     }
 
 
-def _collect_ops(block: Block, ops_data: list, constants: dict) -> None:
+def _collect_ops(
+    block: Block, ops_data: list, constants: dict, inline: bool = False
+) -> None:
     """Depth-first walk appending every op to the flat table."""
     for op in block.ops:
-        ops_data.append(_encode_op(op, constants))
+        ops_data.append(_encode_op(op, constants, inline))
         for region in op.regions:
             for nested in region.blocks:
-                _collect_ops(nested, ops_data, constants)
+                _collect_ops(nested, ops_data, constants, inline)
 
 
-def _encode_function(function: Function, constants: dict) -> dict:
+def _encode_function(function: Function, constants: dict, inline: bool = False) -> dict:
     """Encode one function entry (block refs resolve against the ops table)."""
     return {
         "name": function.name,
         "input_types": [_encode_type(t) for t in function.input_types],
         "output_types": [_encode_type(t) for t in function.output_types],
-        "metadata": _encode_generic(function.metadata, constants),
+        "metadata": _encode_generic(function.metadata, constants, inline),
         "block": _encode_block(function.entry_block),
     }
 
@@ -698,29 +681,49 @@ def serialize_module(module: Module) -> dict:
     Raises:
         VerificationError: If the module fails ``verify``.
     """
+    return _serialize_module(module)
+
+
+def _serialize_module(
+    module: Module,
+    *,
+    inline_arrays: bool = False,
+    include_sha256: bool = True,
+) -> dict:
+    """The shared serializer behind :func:`serialize_module` and the native seam.
+
+    ``inline_arrays`` emits self-contained ndarray payloads instead of a
+    ``constants`` table (the ``evoxc-native-ir`` envelope body), and
+    ``include_sha256=False`` skips the integrity hash for an in-process
+    consumer that never stores the payload.  The module is always verified.
+    """
     if not isinstance(module, Module):
         raise TypeError(
             f"serialize_module() expects an ir.Module, got {type(module).__name__}"
         )
     verify(module)
     constants: dict = {}
-    functions_data = [_encode_function(function, constants) for function in module.functions]
+    functions_data = [
+        _encode_function(function, constants, inline_arrays)
+        for function in module.functions
+    ]
     ops_data: list = []
     for function in module.functions:
         for block in function.region.blocks:
-            _collect_ops(block, ops_data, constants)
+            _collect_ops(block, ops_data, constants, inline_arrays)
     payload = {
         "format": IR_FORMAT,
         "version": IR_FORMAT_VERSION,
         "module": {
             "name": module.name,
-            "metadata": _encode_generic(module.metadata, constants),
+            "metadata": _encode_generic(module.metadata, constants, inline_arrays),
         },
         "functions": functions_data,
         "ops": ops_data,
         "constants": constants,
     }
-    payload["sha256"] = _sha256(payload)
+    if include_sha256:
+        payload["sha256"] = _sha256(payload)
     return payload
 
 
@@ -896,6 +899,40 @@ def deserialize_module(payload: dict) -> Module:
     body = {key: value for key, value in payload.items() if key != "sha256"}
     if _sha256(body) != recorded:
         raise VerificationError("IR payload integrity check failed: sha256 mismatch")
+    module = _build_module(body)
+    verify(module)
+    return module
+
+
+def _serialize_native_payload(module: Module) -> dict:
+    """Serialize ``module`` for the native envelope: inline arrays, no hash.
+
+    The module is verified exactly as :func:`serialize_module` does — the
+    verification is part of the contract, not an optimisation the caller may
+    assume away.  The result carries ``format``/``version``/``module``/
+    ``functions``/``ops`` and an EMPTY ``constants`` table (every ndarray
+    payload is self-contained), and no ``sha256`` (an in-process envelope is
+    never stored, so there is nothing to checksum).
+    """
+    return _serialize_module(module, inline_arrays=True, include_sha256=False)
+
+
+def _deserialize_envelope_body(body: dict) -> Module:
+    """Rebuild a module from an ``evoxc-native-ir`` body (inline arrays).
+
+    The caller (the private native codec) has already validated the envelope
+    discriminator and version, so only the IR version is restored here: the
+    body is rebuilt with :func:`_build_module` and re-verified exactly like
+    :func:`deserialize_module`.  No sha256 is recomputed (an in-process
+    envelope carries none).
+
+    Raises:
+        VerificationError: For any body violation or a failed ``verify``.
+    """
+    if not isinstance(body, dict):
+        raise VerificationError("malformed IR payload: body must be a dict")
+    body = dict(body)
+    body["version"] = IR_FORMAT_VERSION
     module = _build_module(body)
     verify(module)
     return module

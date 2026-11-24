@@ -11,8 +11,9 @@ semantics.
 ``shape_fn=None`` on an ``OpDef`` means result types are *op-specific* and are
 resolved by the ``Builder`` from the op's attributes, regions, or the
 enclosing module (``constant``: from payload; ``call``: from callee signature;
-``if``: from region terminators; ``runtime_call``/``block_call``: from declared
-specs), or must be passed explicitly via
+``if``: from region terminators; ``runtime_call``/``block_call``/
+``external_call``/``custom_call``/``inline_stablehlo``: from declared specs),
+or must be passed explicitly via
 ``Builder.create(..., result_types=...)``. ``verify`` enforces agreement in
 both cases.
 

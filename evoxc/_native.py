@@ -1,0 +1,505 @@
+"""Optional Rust/PyO3 extension loader and typed façade.
+
+``evoxc._evoxc_native`` is the compiled numerical core being built under
+``native/`` (dtypes/dims/shapes, op schemas and shape inference, the graph IR,
+the batching and AD engines). It is an **optional** acceleration seam:
+
+* ``import evoxc`` never imports or requires it;
+* the extension is discovered lazily on first use — the ``EVOXC_NATIVE_LIB``
+  path when set, otherwise the first match of
+  ``_evoxc_native.abi3.so`` / ``_evoxc_native*.so`` / ``*.pyd`` / ``*.dylib``
+  in the package directory (deterministic sorted order);
+* loading is serialized by one module lock, with the loaded module and any
+  load failure cached, so ``available()`` is stable across calls;
+* a missing or broken extension produces one actionable error naming
+  ``scripts/build-native.sh`` (and its ``source scripts/dev-env.sh``
+  prerequisite), the expected ``evoxc/_evoxc_native.abi3.so`` file, and the
+  ``EVOXC_NATIVE_LIB`` override, chaining the underlying loader error.
+
+The façade converts evoxc's own IR objects to and from the ``evoxc-native-ir``
+v1 envelope in :mod:`evoxc._native_codec` and maps the extension's
+``NativeError.kind`` onto the public ``evoxc.core`` error family (message
+preserved verbatim).
+
+Three graph entry points exist, plus one read-only registry query:
+
+* :func:`infer` — op result-type inference; operands and result types travel
+  as native type dicts, ``attributes`` pass through verbatim and the optional
+  ``module`` context is an ``ir.Module`` (or an already-encoded envelope) that
+  the native ``call`` inference resolves callees from.
+* :func:`transform` — one native graph transform (``vectorize``/``vmap``/
+  ``grad``/``jvp``/``vjp``). The module is encoded, the extension returns the
+  transformed envelope plus its top-level ``"transform"`` metadata, and the
+  façade returns ``{"module": ir.Module, "transform": {...}, **extras}``.
+  The returned envelope is TRUSTED (it was produced in-process from the module
+  just encoded), so it is rebuilt with the fast
+  :func:`evoxc._native_codec.decode_native_module` — direct object
+  construction, no generic validation and no ``ir.verify`` (set
+  ``EVOXC_NATIVE_DECODE_CHECK=1`` to enable the verification cross-check).
+  :func:`evoxc._native_codec.decode_module` stays the validated decoder for
+  an envelope of uncertain provenance.
+
+* :func:`batch_functions` — one native ``batch_functions`` merge over a
+  population of programs; returns ``{"module": ir.Module, "batch_report":
+  {...}, **extras}`` (the merged program through the same trusted fast decode
+  plus the 12-key report payload).
+* :func:`batching_rule_keys` — the sorted rule keys of the native builtin
+  batching registry (a read-only availability query; host namespaces
+  ``block:*`` / ``external:*`` / ``sparse_*`` are never listed).
+The seam is consumed by ``evoxc.transforms`` — all five builtin transforms
+plus ``batch_functions`` — and by the parity harnesses; trace-time inference
+still runs in Python through ``evoxc.ir``.
+"""
+
+from __future__ import annotations
+
+import glob
+import importlib.util
+import os
+import sys
+import threading
+from types import ModuleType
+from typing import Any, Iterable, Mapping, Sequence
+
+from evoxc import core, ir
+
+from . import _native_codec
+
+__all__ = [
+    "NATIVE_LIB_ENV",
+    "EXTENSION_MODULE_NAME",
+    "available",
+    "require",
+    "version",
+    "infer",
+    "transform",
+    "batch_functions",
+    "batching_rule_keys",
+]
+
+#: Environment variable naming an explicit extension path (``.so``/``.pyd``).
+NATIVE_LIB_ENV = "EVOXC_NATIVE_LIB"
+
+#: Fully qualified name the extension is imported under.
+EXTENSION_MODULE_NAME = "evoxc._evoxc_native"
+
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+#: Discovery patterns, in deterministic priority order.
+_DISCOVERY_PATTERNS = (
+    "_evoxc_native.abi3.so",
+    "_evoxc_native*.so",
+    "_evoxc_native*.pyd",
+    "_evoxc_native*.dylib",
+)
+
+_EXPECTED_FILE = os.path.join("evoxc", "_evoxc_native.abi3.so")
+
+_REMEDY = (
+    "the evoxc native extension is not available. Build it with "
+    "`source scripts/dev-env.sh && scripts/build-native.sh` "
+    f"(it produces {_EXPECTED_FILE}), or set {NATIVE_LIB_ENV} to the path of "
+    "a built extension (.so/.pyd)."
+)
+
+#: ``NativeError.kind`` -> public ``evoxc.core`` error class.
+_KIND_TO_ERROR = {
+    "ShapeError": core.ShapeError,
+    "VerificationError": core.VerificationError,
+    "DTypeError": core.DTypeError,
+    "TransformError": core.TransformError,
+    "BackendError": core.BackendError,
+    "DeviceError": core.DeviceError,
+    "TraceError": core.TraceError,
+}
+
+_LOCK = threading.RLock()
+_MODULE: ModuleType | None = None
+_LOAD_ERROR: ImportError | None = None
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+
+def _discover_paths() -> list[str]:
+    """Candidate extension paths (the env override, or sorted package matches)."""
+    override = os.environ.get(NATIVE_LIB_ENV)
+    if override:
+        return [override]
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern in _DISCOVERY_PATTERNS:
+        for path in sorted(glob.glob(os.path.join(_PACKAGE_DIR, pattern))):
+            if path not in seen:
+                seen.add(path)
+                found.append(path)
+    return found
+
+
+def _load_extension() -> ModuleType:
+    """Discover and import the extension, raising ``ImportError`` with context."""
+    override = os.environ.get(NATIVE_LIB_ENV)
+    paths = _discover_paths()
+    if override and not os.path.isfile(override):
+        raise ImportError(
+            f"{NATIVE_LIB_ENV} is set to {override!r}, but that file does not exist"
+        )
+    if not paths:
+        raise ImportError(
+            f"no native extension was found in {_PACKAGE_DIR!r} "
+            f"(looked for {', '.join(_DISCOVERY_PATTERNS)})"
+        )
+    path = paths[0]
+    spec = importlib.util.spec_from_file_location(EXTENSION_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"could not create an import spec for the native extension at {path!r}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except ImportError:
+        raise
+    except Exception as exc:  # a broken .so must not crash the interpreter
+        raise ImportError(f"failed to load the native extension from {path!r}: {exc}") from exc
+    sys.modules[EXTENSION_MODULE_NAME] = module
+    return module
+
+
+def _get_module() -> ModuleType:
+    """Return the loaded extension (double-checked, cached; raises ``ImportError``)."""
+    global _MODULE, _LOAD_ERROR
+    module = _MODULE
+    if module is not None:
+        return module
+    with _LOCK:
+        if _MODULE is not None:
+            return _MODULE
+        if _LOAD_ERROR is not None:
+            raise _LOAD_ERROR
+        try:
+            module = _load_extension()
+        except ImportError as exc:
+            _LOAD_ERROR = exc
+            raise
+        except Exception as exc:  # available() must never raise
+            error = ImportError(
+                f"failed to load the evoxc native extension: {exc}"
+            )
+            _LOAD_ERROR = error
+            raise error from exc
+        _MODULE = module
+        return module
+
+
+def _reset() -> None:
+    """Forget the cached module and load failure (private; for tests)."""
+    global _MODULE, _LOAD_ERROR
+    with _LOCK:
+        _MODULE = None
+        _LOAD_ERROR = None
+
+
+def available() -> bool:
+    """True if the native extension can be loaded; never raises and is cached."""
+    try:
+        _get_module()
+    except ImportError:
+        return False
+    return True
+
+
+def require() -> ModuleType:
+    """Return the loaded extension or raise an actionable ``ImportError``."""
+    try:
+        return _get_module()
+    except ImportError as exc:
+        raise ImportError(f"{_REMEDY} Loader error: {exc}") from exc
+
+
+def version() -> str:
+    """The extension's reported version string."""
+    return require().version()
+
+
+def batching_rule_keys() -> list[str]:
+    """The sorted rule keys of the native builtin batching registry.
+
+    Exactly the ops the native ``vectorize``/``batch_functions`` engines can
+    map. Host rules (``block:*`` / ``external:*`` / ``sparse_*``) are never
+    listed — those come from the extension-rule bridge.
+    """
+    keys = require().batching_rule_keys()
+    if not isinstance(keys, (list, tuple)):
+        raise TypeError(
+            "the native extension's batching_rule_keys returned "
+            f"{type(keys).__name__} where a list was expected"
+        )
+    return [str(key) for key in keys]
+
+
+# ---------------------------------------------------------------------------
+# Error mapping
+# ---------------------------------------------------------------------------
+
+
+def _translate(module: ModuleType, exc: BaseException) -> None:
+    """Re-raise a ``NativeError`` as its public ``evoxc.core`` counterpart.
+
+    Only exceptions that are instances of this extension's ``NativeError`` and
+    whose ``kind`` is known are translated (message verbatim, chained). Any
+    other exception or unknown kind is re-raised unchanged — never swallowed.
+    """
+    native_error = getattr(module, "NativeError", None)
+    if native_error is None or not isinstance(exc, native_error):
+        raise exc
+    kind = getattr(exc, "kind", None)
+    error_cls = _KIND_TO_ERROR.get(kind) if isinstance(kind, str) else None
+    if error_cls is None:
+        raise exc
+    raise error_cls(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Typed façade
+# ---------------------------------------------------------------------------
+
+
+def _encode_types(value_types: Iterable[ir.ValueType]) -> list[dict]:
+    return [_native_codec.encode_type(value_type) for value_type in value_types]
+
+
+def _decode_types(payload: Any) -> list[ir.ValueType]:
+    if not isinstance(payload, (list, tuple)):
+        raise TypeError(
+            f"the native extension returned {type(payload).__name__} where a list "
+            "of value types was expected"
+        )
+    return [_native_codec.decode_type(entry) for entry in payload]
+
+
+def _encode_module_context(module: ir.Module | Mapping[str, Any] | None) -> dict | None:
+    """Encode the optional ``infer`` module context.
+
+    Accepts an :class:`ir.Module` (encoded as an ``evoxc-native-ir`` envelope)
+    or an already-encoded envelope mapping (copied, passed through verbatim) —
+    the native ``call`` inference resolves the callee's signature from it.
+    """
+    if module is None:
+        return None
+    if isinstance(module, ir.Module):
+        return _native_codec.encode_module(module)
+    if isinstance(module, Mapping):
+        return dict(module)
+    raise TypeError(
+        "infer: 'module' must be an ir.Module or an already-encoded "
+        f"'evoxc-native-ir' envelope mapping, got {type(module).__name__}"
+    )
+
+
+def infer(
+    op_name: str,
+    operand_types: Sequence[ir.ValueType],
+    attributes: dict[str, Any],
+    result_types: Sequence[ir.ValueType] | None = None,
+    module: ir.Module | Mapping[str, Any] | None = None,
+) -> list[ir.ValueType]:
+    """Infer result types through the native core.
+
+    Operands (and ``result_types`` when given) are encoded as native type dicts
+    (``{"dtype": name, "shape": [dim, ...]}``); ``attributes`` pass through
+    verbatim. ``module`` may supply the callee context ``call`` inference needs
+    — an :class:`ir.Module` (encoded as an ``evoxc-native-ir`` envelope) or an
+    already-encoded envelope mapping (``None``/absent leaves it out).
+    """
+    if not isinstance(op_name, str):
+        raise TypeError(f"infer: 'op_name' must be a string, got {type(op_name).__name__}")
+    if not isinstance(attributes, dict):
+        raise TypeError(
+            f"infer: 'attributes' must be a dict, got {type(attributes).__name__}"
+        )
+    operand_payload = _encode_types(operand_types)
+    result_payload = None if result_types is None else _encode_types(result_types)
+    module_payload = _encode_module_context(module)
+
+    native = require()
+    try:
+        raw = native.infer(
+            op_name, operand_payload, attributes, result_payload, module_payload
+        )
+    except Exception as exc:  # translated only for a known NativeError.kind
+        _translate(native, exc)
+        raise  # unreachable; keeps linters/type-checkers honest
+    return _decode_types(raw)
+
+
+#: Required keys of the extension's top-level ``"transform"`` metadata object.
+_TRANSFORM_META_KEYS = ("kind", "output_ids", "input_ids", "batch_dim")
+
+
+def _decode_transform_meta(raw: Any) -> dict[str, Any]:
+    """Validate and copy the extension's top-level ``"transform"`` metadata."""
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "the native extension's transform result 'transform' must be a "
+            f"mapping, got {type(raw).__name__}"
+        )
+    meta = dict(raw)
+    for key in _TRANSFORM_META_KEYS:
+        if key not in meta:
+            raise TypeError(
+                f"the native extension's transform metadata is missing key {key!r}"
+            )
+    if not isinstance(meta["kind"], str):
+        raise TypeError(
+            "the native extension's transform metadata 'kind' must be a string, "
+            f"got {type(meta['kind']).__name__}"
+        )
+    for key in ("output_ids", "input_ids"):
+        ids = meta[key]
+        if not isinstance(ids, (list, tuple)) or not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in ids
+        ):
+            raise TypeError(
+                f"the native extension's transform metadata {key!r} must be a "
+                f"list of int ids, got {ids!r}"
+            )
+        meta[key] = [int(item) for item in ids]
+    batch_dim = meta["batch_dim"]
+    if batch_dim is not None and not isinstance(batch_dim, str):
+        raise TypeError(
+            "the native extension's transform metadata 'batch_dim' must be a "
+            f"string or None, got {type(batch_dim).__name__}"
+        )
+    return meta
+
+
+def transform(kind: str, module: ir.Module, config: dict[str, Any]) -> dict[str, Any]:
+    """Run a native graph transform over ``module``.
+
+    Encodes the module with :func:`evoxc._native_codec.encode_module`, calls
+    the extension, and decodes the returned ``evoxc-native-ir`` envelope back
+    into an :class:`ir.Module`. The extension's top-level ``"transform"``
+    metadata (``kind``, ``output_ids``, ``input_ids``, ``batch_dim``) becomes
+    the ``"transform"`` entry; any other top-level key is preserved verbatim.
+
+    ``config`` passes through untouched — a callable
+    ``config["extension_rule"]`` is never encoded.
+    """
+    if not isinstance(kind, str):
+        raise TypeError(f"transform: 'kind' must be a string, got {type(kind).__name__}")
+    if not isinstance(module, ir.Module):
+        raise TypeError(
+            f"transform: 'module' must be an ir.Module, got {type(module).__name__}"
+        )
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"transform: 'config' must be a dict, got {type(config).__name__}"
+        )
+    envelope = _native_codec.encode_module(module)
+
+    native = require()
+    try:
+        result = native.transform(kind, envelope, config)
+    except Exception as exc:  # translated only for a known NativeError.kind
+        _translate(native, exc)
+        raise  # unreachable; keeps linters/type-checkers honest
+    if not isinstance(result, Mapping):
+        raise TypeError(
+            f"the native extension's transform returned {type(result).__name__} "
+            "where a mapping was expected"
+        )
+    if "transform" not in result:
+        raise TypeError(
+            "the native extension's transform result is missing its 'transform' "
+            "metadata object"
+        )
+    extras = {
+        key: value
+        for key, value in result.items()
+        if key != "transform" and key not in _native_codec._ENVELOPE_KEYS
+    }
+    output = {
+        "module": _native_codec.decode_native_module(dict(result)),
+        "transform": _decode_transform_meta(result["transform"]),
+    }
+    output.update(extras)
+    return output
+
+
+def batch_functions(
+    programs: Sequence[ir.Module | Mapping[str, Any]], config: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the native ``batch_functions`` merge over ``programs``.
+
+    Each program is an :class:`ir.Module` (encoded here with
+    :func:`evoxc._native_codec.encode_module`) or an ALREADY-encoded
+    ``evoxc-native-ir`` envelope mapping (the rank-0 bridge re-encodes edited
+    copies and passes them straight through, so nothing is encoded twice).
+
+    The extension's result nests the merged envelope under ``"module"`` and its
+    12-key payload under ``"batch_report"``; the merged module is rebuilt with
+    the trusted fast :func:`evoxc._native_codec.decode_native_module` (it was
+    produced in-process from these programs), and any other top-level key is
+    preserved verbatim. ``config`` passes through untouched — a callable
+    ``config["extension_rule"]`` is never encoded.
+    """
+    if isinstance(programs, (str, bytes, bytearray)) or not isinstance(
+        programs, Sequence
+    ):
+        raise TypeError(
+            "batch_functions: 'programs' must be a sequence of ir.Module "
+            f"programs or encoded envelopes, got {type(programs).__name__}"
+        )
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"batch_functions: 'config' must be a dict, got {type(config).__name__}"
+        )
+    envelopes: list[dict[str, Any]] = []
+    for index, program in enumerate(programs):
+        if isinstance(program, ir.Module):
+            envelopes.append(_native_codec.encode_module(program))
+        elif isinstance(program, Mapping):
+            envelopes.append(dict(program))
+        else:
+            raise TypeError(
+                f"batch_functions: 'programs[{index}]' must be an ir.Module or "
+                f"an encoded envelope mapping, got {type(program).__name__}"
+            )
+    native = require()
+    try:
+        result = native.batch_functions(envelopes, config)
+    except Exception as exc:  # translated only for a known NativeError.kind
+        _translate(native, exc)
+        raise  # unreachable; keeps linters/type-checkers honest
+    if not isinstance(result, Mapping):
+        raise TypeError(
+            "the native extension's batch_functions returned "
+            f"{type(result).__name__} where a mapping was expected"
+        )
+    envelope = result.get("module")
+    if not isinstance(envelope, Mapping):
+        raise TypeError(
+            "the native extension's batch_functions result 'module' must be an "
+            "evoxc-native-ir envelope mapping"
+        )
+    report = result.get("batch_report")
+    if not isinstance(report, Mapping):
+        raise TypeError(
+            "the native extension's batch_functions result 'batch_report' must "
+            f"be a mapping, got {type(report).__name__}"
+        )
+    output: dict[str, Any] = {
+        "module": _native_codec.decode_native_module(dict(envelope)),
+        "batch_report": dict(report),
+    }
+    output.update(
+        {
+            key: value
+            for key, value in result.items()
+            if key not in ("module", "batch_report")
+        }
+    )
+    return output

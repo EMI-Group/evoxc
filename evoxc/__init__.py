@@ -126,6 +126,7 @@ from .ops import (  # noqa: F401
     cos,
     cumprod,
     cumsum,
+    custom_call,
     diag,
     diagonal,
 
@@ -143,6 +144,7 @@ from .ops import (  # noqa: F401
     gelu,
     greater,
     greater_equal,
+    inline_stablehlo,
     isnan,
     less,
     less_equal,
@@ -291,6 +293,7 @@ from .pipeline import (  # noqa: F401
     bind,
     build,
     compile,
+    compile_text,
     evaluate,
     load,
     lower,
@@ -299,3 +302,7 @@ from .pipeline import (  # noqa: F401
 
 # --- Memoized build sugar (evoxc.build_cache) ---------------------------------
 from .build_cache import CompileCache, build_cached  # noqa: F401
+
+# The public surface is every non-underscore module global re-exported above
+# (the contract in ./CONTEXT.md); sorted so the order is deterministic.
+__all__ = sorted(name for name in globals() if not name.startswith("_"))

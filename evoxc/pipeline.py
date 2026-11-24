@@ -71,6 +71,7 @@ from typing import Any, Iterator, Tuple
 
 import numpy as np
 
+from evoxc import _inspect
 from evoxc import backends
 from evoxc import core
 from evoxc.backends import CompiledArtifact, LoweredProgram
@@ -81,8 +82,46 @@ from evoxc.trace import Graph
 from evoxc.trace._tree import _static_equal
 from evoxc.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
-__all__ = ["Executable", "BoundExecutable", "lower", "compile", "load", "run",
-           "bind", "build", "evaluate"]
+__all__ = ["Executable", "BoundExecutable", "lower", "compile", "compile_text",
+           "load", "run", "bind", "build", "evaluate"]
+
+
+# ---------------------------------------------------------------------------
+# Inspection helpers (pure rendering lives in `evoxc._inspect`; the registry
+# lookup and the trace-time leaf markers stay here, in the module that owns
+# them — see `_inspect.executable_summary` / `_inspect.tree_summary`)
+# ---------------------------------------------------------------------------
+
+# Trace-time tensor-leaf markers, per direction, handed to `evoxc._inspect` so
+# that module keeps its `core`-only import rule. `_TensorSpecLeaf` /
+# `_SymbolicLeaf` are the trace-built markers, `core.TensorSpec` /
+# `core.SymbolicTensor` the transform-built ones (jvp tangent trees etc.).
+_TENSOR_LEAF_TYPES = ((_TensorSpecLeaf, core.TensorSpec),
+                      (_SymbolicLeaf, core.SymbolicTensor))
+
+
+def _backend_capabilities(backend_name):
+    """Capabilities summary of the REGISTERED backend ``backend_name``, or
+    ``None`` when there is no name, the backend cannot be resolved (a missing
+    optional adapter dependency) or it declares no ``capabilities``.
+
+    Inspection only: reads the registry's backend object and its static
+    ``Capabilities`` declaration — no trace/lower/compile/load, no cache
+    mutation. Resolution goes through ``backends.get`` (so an optional adapter
+    registered under that name resolves exactly as it does for ``lower``); a
+    resolution failure (e.g. a missing optional dependency) is reported as
+    ``None`` because an inspection snapshot must never raise.
+    """
+    if not backend_name:
+        return None
+    try:
+        backend = backends.get(backend_name)
+        capabilities = getattr(backend, "capabilities", None)
+        if capabilities is None:
+            return None
+        return _inspect.capabilities_summary(capabilities)
+    except Exception:  # noqa: BLE001 - inspection must never raise
+        return None
 
 
 class Executable:
@@ -147,6 +186,72 @@ class Executable:
         """Device the executable is bound to (delegates to the backend
         executable)."""
         return self.backend_executable.device
+
+    def __repr__(self) -> str:
+        """One-line inspection line: backend, device, input/output leaf counts.
+
+        E.g. ``<Executable backend=numpy device=cpu:0 inputs=1 outputs=1>``;
+        an unknown backend name or device renders as ``None``. Pure inspection
+        — never runs, traces, compiles, or populates the fast-path caches.
+        Rendering: ``evoxc._inspect.executable_repr``.
+        """
+        return _inspect.executable_repr(
+            backend=self.backend,
+            device=_inspect.backend_device(self.backend_executable),
+            signature=self.signature,
+        )
+
+    def summary(self) -> dict:
+        """JSON-safe inspection snapshot of this loaded executable.
+
+        Pure inspection — reads the wrapper's signature and the backend
+        executable's already-built metadata only; never traces, compiles,
+        loads, runs, or populates a cache. Keys:
+
+        * ``backend`` — backend name (or ``None``).
+        * ``device`` — ``str(device)`` (or ``None``).
+        * ``functions`` — function names exported by the loaded program.
+        * ``input_count`` / ``output_count`` — tensor leaf counts, i.e.
+          ``len(signature.input_specs)`` / ``len(signature.output_specs)``.
+        * ``input_specs`` / ``output_specs`` — one dict
+          ``{"shape": [str(dim), ...], "dtype": str, "device": str | None}``
+          per tensor leaf, in flat leaf order.
+        * ``input_tree`` / ``output_tree`` — the one-line description of the
+          recorded TreeSpec (``None`` when absent): ``core.describe_node``'s
+          wording for containers and static leaves, with tensor leaves
+          rendered as ``tensor input leaf`` / ``tensor output leaf`` /
+          ``tensor leaf`` instead of a private trace marker class name.
+        * ``static_value_count`` — ``len(signature.static_values)``.
+        * ``required_ops`` — the compiled artifact's ``required_custom_ops``
+          (``[]`` when the backend executable exposes no artifact).
+        * ``capabilities`` — the registered backend's ``Capabilities`` as a
+          dict (``dtypes`` as ``"dtype_count"``; other sets as sorted lists),
+          or ``None`` when the backend cannot be resolved.
+
+        A missing signature yields zeroed counts, ``None`` trees and an empty
+        ``input_specs``/``output_specs`` — it never raises.
+        Rendering: ``evoxc._inspect.executable_summary``.
+        """
+        return _inspect.executable_summary(
+            backend=self.backend,
+            device=_inspect.backend_device(self.backend_executable),
+            backend_executable=self.backend_executable,
+            signature=self.signature,
+            capabilities=_backend_capabilities(self.backend),
+            tensor_leaf_types=_TENSOR_LEAF_TYPES,
+        )
+
+    def plan_text(self):
+        """The backend's execution-plan text, or ``None`` when it has none.
+
+        Delegates to the backend executable's optional ``plan_text`` (the numpy
+        interpreter implements it — ``NumpyExecutable.plan_text`` renders the
+        per-block execution plan). Backends without a textual plan return
+        ``None``, exactly like ``CompiledArtifact.source_text()``. Pure
+        inspection: rendering a plan executes nothing, reads no cached plan,
+        and populates none. Rendering: ``evoxc._inspect.plan_text``.
+        """
+        return _inspect.plan_text(self.backend_executable)
 
     def synchronize(self):
         """Wait until all device work submitted by previous ``run()`` calls on
@@ -299,6 +404,66 @@ class BoundExecutable:
     def backend(self):
         """Backend name the wrapped executable runs on (delegates)."""
         return self.executable.backend
+
+    def _reduced_input_specs(self):
+        """Tensor specs a caller must still supply after the bindings, or
+        ``None`` when the cheap derivation is unavailable.
+
+        Derives the REDUCED (unbound) input signature by dropping the bound
+        flat leaf indices — the same pre-order flat leaf indexing
+        ``bind``/``run`` use. Pure inspection: never traces, validates a
+        binding value, or touches a plan; a missing/malformed signature yields
+        ``None`` so callers fall back to the wrapped executable's full
+        signature. Derivation: ``evoxc._inspect.bindings_reduced_input_specs``.
+        """
+        return _inspect.bindings_reduced_input_specs(
+            self.signature, self.bindings, _walk_leaves, _is_tensor_leaf_spec
+        )
+
+    def __repr__(self) -> str:
+        """One-line inspection line: backend, device, remaining input/output
+        leaf counts and the bound-leaf count.
+
+        E.g. ``<BoundExecutable backend=numpy device=cpu:0 inputs=1 outputs=1
+        bound=1>``; ``inputs`` counts the UNBOUND tensor inputs (the ones a
+        caller still passes to ``run``). Pure inspection — never runs, traces,
+        compiles, or populates the fast-path caches.
+        Rendering: ``evoxc._inspect.bound_executable_repr``.
+        """
+        return _inspect.bound_executable_repr(
+            backend=self.backend,
+            device=self.device,
+            signature=self.signature,
+            bound_count=len(self.bindings),
+            reduced_input_specs=self._reduced_input_specs(),
+        )
+
+    def summary(self) -> dict:
+        """JSON-safe inspection snapshot of this bound executable.
+
+        Delegates to the wrapped ``Executable.summary()`` and adds a
+        ``bound_count`` key; the input side is REDUCED to the unbound
+        signature whenever the cheap derivation is available (``input_count``
+        and ``input_specs`` then describe only the inputs a caller still
+        supplies, while ``input_tree`` stays the full recorded tree), and
+        delegated unchanged otherwise. Pure inspection — never runs, traces,
+        compiles, or populates a cache.
+        Rendering: ``evoxc._inspect.bound_executable_summary``.
+        """
+        return _inspect.bound_executable_summary(
+            self.executable.summary(),
+            bound_count=len(self.bindings),
+            reduced_input_specs=self._reduced_input_specs(),
+        )
+
+    def plan_text(self):
+        """The backend's execution-plan text, or ``None`` when it has none.
+
+        Delegates to the wrapped ``Executable.plan_text()`` (backends without a
+        textual plan return ``None``). Pure inspection: executes nothing and
+        populates no plan cache.
+        """
+        return self.executable.plan_text()
 
     def synchronize(self):
         """Wait for all device work submitted by previous ``run`` calls on the
@@ -513,7 +678,8 @@ def load(artifact, backend=None, device=None, **options):
 
     ``backend`` may be omitted (taken from the artifact) but must match if
     given (``core.PersistenceError`` naming both otherwise — never a silent
-    recompile). ``device`` normalizes: None -> ``core.Device("cpu", 0)`` (the
+    recompile); a passed ``Backend`` instance is the one used for the load
+    hop (after that name check), never re-resolved by name. ``device`` normalizes: None -> ``core.Device("cpu", 0)`` (the
     v1 default), str -> ``core.Device(name)``, ``core.Device`` -> as-is,
     anything else -> ``core.DeviceError``. Returns the user-facing wrapper
     carrying the structured signature (the artifact's live decoded
@@ -532,8 +698,12 @@ def load(artifact, backend=None, device=None, **options):
             f"load expects an evoxc.backends.CompiledArtifact (from "
             f"evoxc.compile), got {type(artifact).__name__}"
         )
+    resolved = None
     if backend is not None:
         if isinstance(backend, backends.Backend):
+            # A passed Backend INSTANCE is the one used for loading (after the
+            # name-match check) — never re-resolved by name.
+            resolved = backend
             given_name = backend.name
         elif isinstance(backend, str):
             given_name = backend
@@ -548,14 +718,143 @@ def load(artifact, backend=None, device=None, **options):
                 f"cannot load it with backend {given_name!r} — never "
                 f"silently recompile"
             )
-    resolved = backends.get(artifact.backend)
+    if resolved is None:
+        resolved = backends.get(artifact.backend)
     device = _normalize_device(device)
-    options = apply_env_options(artifact.backend, options, "load")
+    options = apply_env_options(resolved.name, options, "load")
     if options:
         backend_executable = resolved.load(artifact, device, options)
     else:
         backend_executable = resolved.load(artifact, device)
     return Executable(backend_executable, artifact.signature)
+
+
+def _text_spec_sequence(argname, value):
+    """Validate a ``compile_text`` spec sequence and return it as a tuple.
+
+    Accepts any non-string sequence of ``core.TensorSpec`` (an empty
+    ``input_specs`` is allowed); anything else raises ``TypeError`` naming
+    the argument and the offending value.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(
+        value, collections.abc.Sequence
+    ):
+        raise TypeError(
+            f"compile_text: {argname} must be a sequence of core.TensorSpec, "
+            f"got {type(value).__name__}"
+        )
+    specs = tuple(value)
+    for index, spec in enumerate(specs):
+        if not isinstance(spec, core.TensorSpec):
+            raise TypeError(
+                f"compile_text: {argname}[{index}] must be a core.TensorSpec, "
+                f"got {type(spec).__name__}"
+            )
+    return specs
+
+
+def compile_text(mlir_text, input_specs, output_specs, *, backend=None,
+                 device=None, entry_functions=("main",), **options):
+    """``compile_text(mlir_text, input_specs, output_specs) -> Executable``.
+
+    The explicit-staging escape hatch for hand-authored or hand-EDITED
+    StableHLO text (for example, the output of ``Executable.source_text()``
+    after manual surgery — or a fully hand-written StableHLO module)::
+
+        lowered = LoweredProgram(
+            backend=backend.name,
+            signature=Signature(
+                input_tree=core.flatten(tuple(input_specs))[1],
+                output_tree=core.flatten(tuple(output_specs))[1],
+                input_specs=..., output_specs=...,
+                static_values=(), output_static_values=(),
+            ),
+            payload={"format": "stablehlo", "format_version": 1,
+                     "mlir_text": mlir_text,
+                     "entry_functions": list(entry_functions)},
+        )
+        artifact = compile(lowered, backend=backend, **options)
+        return load(artifact, backend=backend, device=device, **options)
+
+    There is NO tracing and NO ``Graph`` here: the text IS the program, and
+    the compiler validates it end to end (a malformed module or a missing
+    entry function fails in the compiler with its own diagnostic). Both
+    spec lists describe the OUTER tuple of arguments/results: the signature
+    trees are ``core.flatten(tuple(input_specs))`` /
+    ``core.flatten(tuple(output_specs))``, so ``evoxc.run(exe, a, b)``
+    matches the flat tuple of inputs and the outputs come back as a tuple of
+    tensors. ``input_specs`` may be empty; ``output_specs`` must contain at
+    least one ``core.TensorSpec``.
+
+    ``backend`` must be a compiler backend that consumes StableHLO text
+    (``evoxc.backends.CompilerBackend`` — e.g. ``"iree"``); the numpy
+    interpreter and the native CPU engine reject the call with a
+    ``core.BackendError`` naming the backend. ``device``/``**options`` are
+    forwarded unchanged to the normal ``compile`` and ``load`` stages (same
+    env-option precedence: explicit kwarg > env var > evoxc default), which
+    keep all their validation — no stage is bypassed and nothing is
+    re-lowered.
+    """
+    if not isinstance(mlir_text, str):
+        raise TypeError(
+            f"compile_text: mlir_text must be a non-empty StableHLO/MLIR "
+            f"string, got {type(mlir_text).__name__}"
+        )
+    if not mlir_text.strip():
+        raise TypeError(
+            "compile_text: mlir_text must be a non-empty StableHLO/MLIR "
+            "string, got an empty/whitespace-only string"
+        )
+    input_specs = _text_spec_sequence("input_specs", input_specs)
+    output_specs = _text_spec_sequence("output_specs", output_specs)
+    if not output_specs:
+        raise TypeError(
+            "compile_text: output_specs must contain at least one "
+            "core.TensorSpec"
+        )
+    if not isinstance(entry_functions, (tuple, list)) or not entry_functions:
+        raise TypeError(
+            f"compile_text: entry_functions must be a non-empty tuple/list of "
+            f"strings, got {type(entry_functions).__name__}"
+        )
+    entry_functions = tuple(entry_functions)
+    for index, name in enumerate(entry_functions):
+        if not isinstance(name, str) or not name:
+            raise TypeError(
+                f"compile_text: entry_functions[{index}] must be a non-empty "
+                f"string, got {type(name).__name__}"
+            )
+
+    resolved = _resolve_backend(backend)
+    if not isinstance(resolved, backends.CompilerBackend):
+        raise core.BackendError(
+            f"compile_text requires a compiler backend that consumes "
+            f"StableHLO text, got backend {resolved.name!r} — pass a compiler "
+            f"backend such as backend='iree'"
+        )
+
+    input_leaves, input_tree = core.flatten(input_specs)
+    output_leaves, output_tree = core.flatten(output_specs)
+    signature = backends.Signature(
+        input_tree=input_tree,
+        output_tree=output_tree,
+        input_specs=tuple(input_leaves),
+        output_specs=tuple(output_leaves),
+        static_values=(),
+        output_static_values=(),
+    )
+    lowered = LoweredProgram(
+        backend=resolved.name,
+        signature=signature,
+        payload={
+            "format": "stablehlo",
+            "format_version": 1,
+            "mlir_text": mlir_text,
+            "entry_functions": list(entry_functions),
+        },
+    )
+    artifact = compile(lowered, backend=resolved, **options)
+    return load(artifact, backend=resolved, device=device, **options)
 
 
 # ---------------------------------------------------------------------------
@@ -1552,13 +1851,19 @@ def build(fn, *specs, backend=None, device=None, **options):
     """``build(f, *specs) -> Executable``.
 
     Documented shorthand for ``load(compile(lower(trace(fn, *specs),
-    backend), **options), backend, device, **options)`` — no other behavior
+    backend=backend, **options), backend=backend, **options),
+    backend=backend, device=device, **options)`` — no other behavior
     (docstring must stay in sync with the expansion)::
 
         graph = evoxc.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
-        artifact = compile(lowered, **options)
+        artifact = compile(lowered, backend=backend, **options)
         return load(artifact, backend=backend, device=device, **options)
+
+    ``backend`` is resolved ONCE (``_resolve_backend_device``) and the
+    resolved ``Backend`` instance is the one used by the ``lower``,
+    ``compile`` AND ``load`` hops — an explicitly passed ``Backend``
+    instance is therefore never dropped or re-resolved by name.
 
     ``options`` are forwarded to ``lower``, ``compile`` AND ``load``
     (stage-appropriate: each stage uses the keys it understands, validates
@@ -1597,7 +1902,7 @@ def build(fn, *specs, backend=None, device=None, **options):
         )
     graph = trace_fn(fn, *specs)
     lowered = lower(graph, backend=backend, **options)
-    artifact = compile(lowered, **options)
+    artifact = compile(lowered, backend=backend, **options)
     return load(artifact, backend=backend, device=device, **options)
 
 
