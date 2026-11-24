@@ -8,12 +8,13 @@ Known-Issue sections here use the SAME numbers as `CONTEXT.md` (`## Known Issue 
 ## IREE — host→device staging tiers (byte-level machinery)
 
 Scope: the `_staged_input` machinery in `iree.py`. It serves ONLY (a) host-mode `external_call` boundaries and (b) the explicit-placement provider `upload_tensor`. Plain GPU runs never stage: the run boundary rejects device-mismatched inputs.
+Vulkan is not served by the cuda/rocm tiers below: `_staged_input` dispatches `("cuda", "rocm", "vulkan")` by kind and hands the vulkan leg to `_vulkan_staged_input`, whose mapped/copy tiers are measured in `## IREE — Vulkan host->device upload tiers (measured)`.
 
 Buffer lifetime and bounds:
 - Staging buffers are cached per `(input index, shape, dtype)` so no per-call device allocation happens — each cuda SEGMENT executable keeps one staging set per segment.
 - The cache is bounded by `_STAGED_INPUT_CACHE_MAX = 64` and cleared wholesale on overflow (correctness unaffected — only the next allocation).
 - `upload_tensor` uses a FRESH one-shot dict (no cache) and returns a destination owned by the returned tensor.
-- Inputs larger than `_STAGED_INPUT_MAX_BYTES = 16 * 1024 * 1024`, inputs with an unmappable dtype, non-GPU paths, and any fast-path failure fall back to `rt.asdevicearray`.
+- Inputs larger than `_STAGED_INPUT_MAX_BYTES = 16 * 1024 * 1024` (a cuda/rocm-only gate), inputs with an unmappable dtype, non-GPU paths, and any fast-path failure fall back to `rt.asdevicearray`.
 
 The two tiers, split at `_PINNED_DIRECT_MAX_BYTES = 4 * 1024` (`4 KB`):
 - **Tier 1 — `nbytes <= 4 KB`** (the DE rank-0 key is the motivating case): one persistent `DEVICE_LOCAL | HOST_VISIBLE` (`DEFAULT | MAPPING`) buffer, mapped once, then a single `np.copyto` into the mapped view per call — no `queue_copy`, no semaphore, no wait.
@@ -24,6 +25,160 @@ Why the cutoff is 4 KB and not larger: host writes into `DEVICE_LOCAL | HOST_VIS
 **The tier-2 semaphore wait is LOAD-BEARING (do not remove):** the cuda HAL does not reliably stream-order `queue_copy` ahead of invoke dispatches — un-fenced copies exposed ~0.4 % garbage results. Each call therefore waits on a FRESH semaphore (reusing one ABORTS), query-first: `_wait_copy_semaphore` calls `HalSemaphore.query()` and skips the fence wait (~0.02 ms) when the copy is already done. Runtimes without `query` fall back to the plain fence wait.
 
 Each cuda SEGMENT executable also keeps a 4 KB `DEVICE_LOCAL` `_pool_anchor`, which warms the CLASSIC allocator pool for users who opt into `--cuda_async_allocations=false`. Plain `IreeExecutable`s allocate no anchor (the default async allocator needs none).
+
+## IREE — Vulkan host->device upload tiers (measured)
+
+Scope: `_staged_input` dispatches `("cuda", "rocm", "vulkan")` by kind; the vulkan leg is `_vulkan_staged_input`, which serves the SAME two callers as the cuda/rocm tiers (host-mode `external_call` segment boundaries and the `upload_tensor` placement provider).
+Environment of record: Intel Core Ultra 7 356H (16 cores) with Intel Graphics (PTL) `8086:b0a0` through Mesa 26.3.0 ANV, iree-base-compiler/runtime 3.13.0, Python 3.14.10, numpy 2.5.2 (scipy-openblas `SkylakeX`, MAX_THREADS=64), f32, on a SHARED CONTENDED host (loadavg 5.5-17 — the same `dot(1024^3)` cell moved 1.9 -> 4.0 -> 7.2 ms across rounds, so ±20 % is noise).
+Every number is an interleaved A/B median of 7-12 warm rounds.
+Contract in `./CONTEXT.md`.
+
+Two tiers, mirroring cuda's shape but not its correctness argument:
+- **MAPPED tier — `nbytes <= _VULKAN_PINNED_MAX_BYTES` (16 MiB):** one persistent `DEVICE_LOCAL | HOST_VISIBLE` buffer mapped ONCE, one `np.copyto` into the mapped view per call, and the dispatches read the buffer directly (no `queue_copy`, no semaphore, no wait).
+  It is GATED on the allocation reporting `HOST_COHERENT`: the 3.13 python HAL exposes no flush/invalidate primitive at all, so a coherent host write (visible to the next queue submission) is the ONLY correct basis for the direct write, and `_vulkan_pinned_buffer` returns `None` without coherence so the copy tier takes over.
+- **COPY tier — above the cutoff:** a reusable THREAD-LOCAL `HOST_LOCAL | DEVICE_VISIBLE` source (`_host_source_buffer`, shared with the rocm path) plus a per-call `queue_copy` into a `DEVICE_LOCAL` destination, waiting on a FRESH semaphore through the query-first `_wait_copy_semaphore` (fresh + wait are load-bearing exactly as on cuda/rocm).
+
+`_staged_input` takes a keyword-only `one_shot`: `upload_tensor` passes `one_shot=True` (fresh destinations owned by the returned tensor, never aliasing user host memory or a later upload), while the external-call segment executables cache per `(index, shape, dtype)` under `_STAGED_INPUT_CACHE_MAX = 64`.
+`_STAGED_INPUT_MAX_BYTES` (16 MB) still gates cuda/rocm only.
+
+**(a) Fresh destination — the `Tensor.to` placement path, ms:**
+
+| size | mapped-fresh | host-source + fresh dest | `rt.asdevicearray` |
+|---|---|---|---|
+| 4 KB | 0.035 | 0.527 | 0.666 |
+| 1 MB | 0.174 | 1.054 | 0.745 |
+| 16 MB | 1.38 | 3.09 | 2.90 |
+| 32 MB | 5.02 | 4.40 | 7.05 |
+| 64 MB | 9.11 | 7.05 | 18.80 |
+| 128 MB | 25.6 | 18.65 | 38.77 |
+
+The mapped/copy crossover for the fresh form sits between 16 and 32 MB (a fresh 16 MB host-visible allocation still first-touches cheaply, a fresh 32 MB one does not), which is why `_VULKAN_PINNED_MAX_BYTES = 16 MiB`.
+
+**(b) Cached (segment boundary) vs fresh, mapped tier, ms:**
+
+| size | cached mapped | fresh mapped |
+|---|---|---|
+| 64 MB | 11.6 | 14.7 |
+| 128 MB | 29.0 | 40.5 |
+
+The per-`(index, shape, dtype)` cache is what makes the mapped tier pay off above 16 MB — it pays no first-touch after the first call.
+
+**(c) `t.to(Device("vulkan", 0))` before -> after:**
+
+| size | before ms | after ms | before GB/s | after GB/s |
+|---|---|---|---|---|
+| 1 MB | 0.88 | 0.19 | 1.2 | 5.5 |
+| 16 MB | 4.18 | 3.04 | 4.0 | 5.5 |
+| 64 MB | 18.95 | 7.95 | 3.5 | 8.4 |
+| 128 MB | 39.41 | 19.30 | 3.4 | 7.0 |
+
+Old-path root cause: `rt.asdevicearray`'s whole cost is `allocate_buffer_copy(DEVICE_LOCAL, DEFAULT)` (verified in the installed `iree/runtime/array_interop.py`), a 3.4-4.0 GB/s floor.
+
+**(d) Independent manager re-check (a quieter window):**
+
+| size | `t.to` ms | GB/s | `asdevicearray` ms | GB/s |
+|---|---|---|---|---|
+| 16 MB | 2.27 | 6.9 | — | — |
+| 64 MB | 5.79 | 10.8 | 15.87 | 3.9 |
+| 128 MB | 18.97 | 6.6 | — | — |
+
+Bit-exact (`np.array_equal`) at every size.
+
+**(e) End to end (128 MB host input: upload + 3.5 ms kernel + readback), ms:**
+
+| size | before | after |
+|---|---|---|
+| 1 MB | 2.42 | 1.17 |
+| 16 MB | 12.49 | 9.63 |
+| 64 MB | 55.07 | 42.94 |
+| 128 MB | 112.22 | 68.66 |
+
+**(f) Correctness licensing:** 1200 iterations, host values rewritten to alternating patterns every round, upload -> identity run -> readback, `np.array_equal` every time: 1200/1200 exact.
+
+**(g) Rejected on measurement:**
+- Uncached `queue_copy` (a fresh destination allocation every call): allocation dominates, 16.1 ms at 64 MB.
+- `BufferUsage.MAPPING_PERSISTENT`: the HAL rejects it (`PERMISSION_DENIED ... requires MAPPING_SCOPED`).
+- Plain `rt.asdevicearray`: the 3.4-4.0 GB/s floor in (c).
+
+## IREE — Vulkan per-run launch overhead (measured)
+
+Scope: a 64K-element f32 `a*b+a` graph, warm, device-resident buffers, medians; the warm medians are 0.17-0.21 ms, and a 0.60 ms figure from a contended round is not the launch cost.
+Environment of record: the upload section's host and pin.
+
+| measurement | ms |
+|---|---|
+| bare HAL invoke (`_entry_function()` called directly with device-resident buffers) | 0.173-0.210 |
+| backend executable `run` (pass-through inputs) | +0.0005-0.0012 (0.5-1.2 us) |
+| public `evoxc.run` | +<=0.005 (<=5 us) |
+| placement-inclusive (2 x `t.to`) | 0.789 (upload ~0.2425/tensor) |
+| output-buffer allocation (pooled) | 0.0006 (0.6 us) |
+| 1-element identity graph (fixed launch cost) | 0.19-0.23 |
+
+Inside `run` (medians): option validation 0.04 us, `_runtime_modules` 0.06 us (memoized), the fused validate+buffer pass ~2 us, output wrapping 1.75 us/output, and `entry(*buffers)` 0.204 ms of 0.220 ms.
+So ~97 % of the call sits inside iree's `FunctionInvoker` -> HAL invoke, while the evoxc wrapper is 2-3 us typical (<= 16 us worst).
+
+Rejected candidates with their measurements:
+- Device-buffer OUTPUT pool: rejected on OWNERSHIP — outputs escape as device-resident `IreeDevicePayload`, so reuse would alias a live output; it is the only remaining lever and it breaks semantics.
+- `--iree-vulkan-dispatch-abi=bda`: 0.2097 ms vs the default 0.2076, and `=all` 0.2093 — flat.
+- `vulkan_target="rdna3"`: 0.2056 ms vs 0.2076 — flat, the launch path is profile-insensitive.
+- A cached `(np, rt)` pair: already memoized (`_runtime_modules` at 0.06 us).
+- Skipping option validation when `options is None`: below noise, and it contradicts the no-validation-skipped contract.
+
+Conclusion: no code change was justified — this call is HAL-bound, not evoxc-bound.
+
+## IREE — Vulkan target profiles on iree-base 3.13.0 (measured)
+
+Accepted set: 68 profiles.
+- AMD: `gfx908 gfx90a gfx942 gfx950 gfx1010 gfx1030 gfx1100 gfx1101 gfx1102 gfx1150 gfx1200 gfx1201 gfx1250 cdna1 cdna2 cdna3 cdna4 cdna5 rdna1 rdna2 rdna3 rdna4` plus products `rx7900xtx rx7900xt rx7800xt rx7700xt rx9070 rx9070xt rx9060xt`.
+- NVIDIA: `sm_60 sm_70 sm_72 sm_75 sm_80 sm_86 sm_89 sm_120 sm_121 ampere ada turing pascal volta` plus products `rtx3070 rtx3080 rtx3090 rtx4060 rtx4070 rtx4080 rtx4090`.
+- ARM/Qualcomm: `mali-g310 mali-g510 mali-g57 mali-g615 mali-g710 mali-g715 mali-g720 mali-g725 mali-g77 mali-g78 valhall valhall1 valhall2 valhall3 valhall4 adreno`.
+- Plus the default `vp_android_baseline_2022` and `llvmpipe`.
+
+Method/provenance: 110 candidate names probed through `iree.compiler.compile_str(..., target_backends=["vulkan-spirv"])`, cross-checked against `iree-compile --help` and the profile strings in `libIREECompiler.so`; no IREE was patched or vendored.
+Unset == explicit `vp_android_baseline_2022` (byte-identical 6617-byte vmfb).
+
+NO Intel profile exists: 42 rejected candidates include `pantherlake alderlake meteorlake lunarlake novalake wildcatlake tigerlake rocketlake cascadelake cooperlake skylake cannonlake intel intel-arc arc xe xecore xehp xehpg dg2 gen9 gen12` (the lake names in `libIREECompiler.so` are LLVM CPU `-mcpu` names), so Intel GPUs run the default profile.
+
+Matmul (f32, GF/s; 1024^3 / 2048^3 / 4096x1024 @ 1024x4096):
+
+| profile | 1024^3 | 2048^3 | 4096x1024 @ 1024x4096 |
+|---|---|---|---|
+| default | 768-1122 | 570-586 | 531 |
+| rdna3 | 667-1197 | 1590 | 1556 |
+| rdna4 | 537-1349 | 1571-1618 | 1566 |
+| rx7900xtx | 878-1195 | 1577-1618 | 1561 |
+| ampere | 614-836 | 806-809 | 699-714 |
+| rtx4090 & sm_80 | ~843-859 | 806 | 698 |
+| valhall4 | 1266 | 275 | 254 |
+| adreno | 734 | 975 | 962 |
+| llvmpipe | 1199 | 579 | 497 |
+| numpy OpenBLAS | 206-243 | 390-428 | 424-471 |
+
+Correctness: every row is verified against an f64 numpy reference (`max|Δ|/max|ref| = 1.96e-06`).
+
+Rank-0 reduction `sum(10000x100)`, us (split-reduction left at its default — that knob is owned by `../stablehlo/`):
+
+| profile | us |
+|---|---|
+| default | 39 160 |
+| rdna3 | 6 458 |
+| rdna4 | 6 458 |
+| rx7900xtx | 6 483 |
+| ampere / rtx4090 / sm_80 / valhall4 | 6 435-6 592 |
+| default with `split_reduction=False` | ≈39 250 |
+| numpy | 161-188 |
+
+So the default profile — not the reduction-structure knob — is the outlier, and any real-GPU profile lands in the same 6.4-6.6 ms band.
+
+Correctness traps: `llvmpipe` compiled and returned EXACTLY 2x the true reduction and `adreno` exactly 0.5x, while both gave a correct matmul.
+`gfx942` compiles but is rejected at LOAD (`pipelines[0] requires subgroup size 64 outside device range [16, 32]`).
+Therefore an accepted profile is not a device contract, evoxc must never validate or set the value, and a profile is a user opt-in that needs a correctness check on the real device.
+
+Diagnostic: `IreeBackend._compile_mlir` takes keyword-only `vulkan_profile` (forwarded from `compile` and `_compile_segments`); when the compiler raises and `vulkan_target` was set, the message keeps its unchanged preface and prepends this attribution note (verbatim):
+
+> Note: the iree 'vulkan_target' compile option was set to '<value>', which evoxc forwarded verbatim as --iree-vulkan-target=<value> WITHOUT validating the value (option values are the compiler's to validate). If the diagnostics below say the Vulkan target is unknown, the INSTALLED iree-compile rejected '<value>' — evoxc did not. List the profiles the installed compiler accepts with 'iree-compile --help' (the --iree-vulkan-target entry, which documents the AMD/NVIDIA/ARM/Qualcomm schemes) or leave vulkan_target unset to use its default Vulkan profile. iree-base-compiler 3.13.0 ships no Intel Xe / Panther-Lake profile (Intel GPUs run through the default profile), so an Intel profile name is expected to be rejected.
+
+An unset `vulkan_target` leaves the message byte-identical; no value is parsed, rejected or rewritten by evoxc.
 
 ## IREE — device-resident vs staging-dominated call costs
 
@@ -374,16 +529,67 @@ Fix (binding shape, now in `xla_util.acquire_client`): creation moved OUT of the
 Exercise: 8 threads × 200 cycles, 1600 clients created = 1600 closed, 1197 finalizers run, ~6.9 s, no hang.
 The binding locking discipline itself lives in `CONTEXT.md`; the committed test is still a gap (see `CONTEXT.md` "Test strategy").
 
+## IREE — Vulkan readback paths (measured)
+
+Environment of record: the upload section's host and pin, f32, interleaved A/B medians of 7-12 warm rounds.
+Every returned array is a FRESH allocation — never an alias of staging memory or of the device buffer.
+Contract in `./CONTEXT.md`.
+
+Design: llvm-cpu keeps the ZERO-COPY mapping; a GPU HAL first tries `_readback_into_fresh_host_array` — a 4096-byte-aligned host array (`_HOST_IMPORT_ALIGNMENT`) imported through `allocator.import_host_allocation`, gated on `query_buffer_compatibility` reporting `IMPORTABLE`, so ONE `queue_copy` fills the array that is handed back (no copy-out) — then falls back to the per-thread staging buffer, which holds a PERSISTENT COHERENT mapping (a per-call scoped map measures ~60 us/MB, i.e. 4.3 ms at 64 MB, more than the copy it precedes; a non-coherent allocation still maps per call because no range invalidate exists).
+
+Alternatives at 1 / 16 / 64 / 128 MB, ms:
+
+| path | 1 MB | 16 MB | 64 MB | 128 MB |
+|---|---|---|---|---|
+| direct map | 0.01 | 0.01 | n/a | n/a |
+| host import (`_readback_into_fresh_host_array`) | 0.31 | 1.52 | 8.73 | 15.50 |
+| staging + held map | — | — | 11.80 | 29.43 |
+| staging + per-call map | — | — | 11.95 | 30.71 |
+
+Before -> after, ms (GB/s):
+
+| size | before ms | after ms | before GB/s | after GB/s |
+|---|---|---|---|---|
+| 1 MB | 0.67 | 0.73 | — | — |
+| 16 MB | 2.57 | 1.63 | 6.5 | 10.3 |
+| 64 MB | 13.44 | 11.56 | 5.0 | 5.8 |
+| 128 MB | 18.19 | 15.39 | 7.4 | 8.7 |
+
+The 1 MB row is cost-neutral; a small readback is LAUNCH/LATENCY-bound at a ~0.7 ms floor.
+
+Independent manager re-check:
+
+| size | ms | GB/s |
+|---|---|---|
+| 1 MB | 0.72 | 1.4 |
+| 16 MB | 1.60 | 9.7 |
+| 64 MB | 8.19 | 7.6 |
+| 128 MB | 15.28 | 8.2 |
+
+Why the direct map is refused (it is the fastest path measured at <= 16 MB): a <= 16 MB vulkan run output IS host-visible + `MAPPING_SCOPED` (`memory_type` 62 at 1 MB) and maps ~100x faster (0.01 ms), but the HAL is not host memory, so the mapped array would be a `Device("cpu", 0)` tensor over device memory — a placement lie and a live alias.
+A 64 MB output is `memory_type` 54, `allowed_usage` 3075 (not mappable) and never host-visible anyway.
+`_buffer_is_host_mappable` therefore cannot stand alone: `_readback_device_array` also gates on `_hal_is_host_memory`, which keys on iree's printable HAL id (`repr(hal_device)` = `"local-task"` on the CPU HAL, `"vulkan"`/`"cuda:0"`/`"hip:0"` on the GPU HALs — verified on 3.13.0) and treats unknown/unprintable devices as device memory (the safe side).
+
+Residual limitations: no flush/invalidate primitive in the 3.13 python bindings (hence the coherence gate); host import needs 4096-byte alignment (hence the over-allocate + offset); large vulkan outputs are not host-visible at all; a small readback keeps its ~0.7 ms latency floor.
+
 ## Known Issue 21 — adapter-owned readback costs
+
 Readback cost per size/kind through `iree.py::_readback_device_array` (3.13.0, explicit `.to(cpu)`):
 
-| payload | rocm before → after | vulkan | llvm-cpu |
+| payload | rocm before → after | vulkan before → after | llvm-cpu |
 |---|---|---|---|
 | 96 B | 43.6 → 37.6 µs | — | — |
 | 4 KB | 44.4 → 39.3 µs | — | — |
-| 16 MB | 0.37 → 1.51 ms | 2.44 ms | 0.001 → 0.003 ms |
+| 1 MB | — | 0.67 → 0.73 ms | — |
+| 16 MB | 0.37 → 1.51 ms | 2.57 → 1.63 ms | 0.001 → 0.003 ms |
+| 64 MB | — | 13.44 → 11.56 ms | — |
+| 128 MB | — | 18.19 → 15.39 ms | — |
 
-Small payloads are dominated by the queue/fence fixed cost; the 16 MB rocm row is the staging `queue_copy` (the old 0.37 ms was the runtime's import path that the adapter no longer uses); llvm-cpu keeps the zero-copy mapping.
-A vulkan readback pays a ~5 ms first-call host-visible allocation plus ~0.95 ms map+copy-out per 16 MB.
+Small payloads are dominated by the queue/fence fixed cost.
+The 16 MB rocm row is the staging `queue_copy`; its 0.37 ms was the RUNTIME's `DeviceArray.to_host()` import path, which passes an arbitrary (unaligned) pointer and which the adapter never calls.
+llvm-cpu keeps the zero-copy mapping.
+The vulkan rows are the adapter's two readback paths — the aligned fresh-host-array import plus the persistent coherent staging fallback — with their alternatives and the direct-map refusal measured in `## IREE — Vulkan readback paths (measured)`; the helper is GPU-HAL-generic and gated on `query_buffer_compatibility`, so it is attempted on every GPU HAL, while rocm has not been re-measured against it.
+
 Root cause of the ownership switch (`allocator.c:1985`): the runtime's `_copy_to_host` prefers `allocator.import_host_allocation` whenever `query_buffer_compatibility` reports `IMPORTABLE`, and the Vulkan allocator then rejects the very buffer it advertised — `ValueError: could not import host allocation: … allocator.c:1985: INVALID_ARGUMENT; host allocation import pointer does not satisfy Vulkan minImportedHostPointerAlignment 4096`, reproduced with PLAIN iree and no evoxc in the process.
-Hence no iree-version branch and no `try: to_host() except: …` fallback (both would silently redefine what a readback is), and host-memory IMPORT stays unused even where it works (HIP/CUDA), because one implementation serving every kind is what keeps the vulkan leg honest.
+Hence no iree-version branch and no `try: to_host() except: …` fallback (both would silently redefine what a readback is).
+The adapter does use `allocator.import_host_allocation` on the READBACK direction — with the 4096-byte over-allocation and offset (`_HOST_IMPORT_ALIGNMENT`) that satisfies `minImportedHostPointerAlignment`, attempted only behind `query_buffer_compatibility` reporting `IMPORTABLE` — and it is the fastest vulkan path measured (numbers in the new section), so the allocator's own rejection cannot be hit on the vulkan leg.
