@@ -104,10 +104,12 @@ imported at module top level, so ``import evoxc`` stays light):
   first (see
   ``upload_tensor``), and a non-device input at a GPU run is rejected with
   ``core.DeviceError``. Host-mode external-kernel boundaries still stage
-  host tensors at kernel boundaries via ``_staged_input`` (cuda AND rocm
-  segment executables each have their own persistent staging cache — see
-  ``_staged_input`` for the two per-kind fast paths; a vulkan boundary has
-  NO staging tier and uses ``rt.asdevicearray`` directly);
+  host tensors at kernel boundaries via ``_staged_input`` (cuda, rocm and
+  vulkan segment executables each have their own persistent staging cache —
+  see ``_staged_input`` for the per-kind fast paths: the cuda pinned/DMA
+  tiers, the rocm and vulkan host-local source + ``queue_copy`` tiers, and
+  vulkan's extra mapped ``DEVICE_LOCAL | HOST_VISIBLE`` tier up to
+  ``_VULKAN_PINNED_MAX_BYTES`` when the allocation is host-coherent);
   ``rt.asdevicearray`` remains the fallback for oversized/unmappable inputs
   and for any failure on a kind's fast path.
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
@@ -869,7 +871,8 @@ _GPU_DEVICE_KINDS = frozenset({"cuda", "rocm", "vulkan"})
 # placement provider's kind gate. It is NOT "takes the cuda staging tier": the
 # pinned/DMA tier in ``_staged_input`` stays CUDA-ONLY, because its
 # correctness rests on a CUDA-driver ordering guarantee that is unverified
-# elsewhere (a vulkan upload uses the plain ``rt.asdevicearray`` path).
+# elsewhere (rocm and vulkan have their own tiers — ``_rocm_staged_input`` and
+# ``_vulkan_staged_input``).
 
 
 def _normalize_device_kind(kind: str) -> str:
@@ -3725,10 +3728,17 @@ def _build_buffers(
       explicitly via ``t.to(Device('cuda'|'rocm'|'vulkan', N))``).
     * segment executables pass their per-segment staging cache
       (``reject_foreign=False``): host-mode external-kernel boundaries
-      legitimately stage host tensors via ``_staged_input`` on cuda and rocm
-      (``device_kind`` selects the kind's fast path), else the asdevicearray
-      fallback (non-GPU kinds, llvm-cpu, and every other device kind —
-      notably vulkan, which has no staging tier).
+      legitimately stage host tensors via ``_staged_input`` on cuda, rocm and
+      vulkan (``device_kind`` selects the kind's fast path; ``"vulkan"`` is
+      delegated to ``_vulkan_staged_input`` — a mapped
+      ``DEVICE_LOCAL | HOST_VISIBLE`` tier up to ``_VULKAN_PINNED_MAX_BYTES``
+      (16 MiB, gated on host-coherence), and a reusable
+      ``HOST_LOCAL | DEVICE_VISIBLE`` source plus a per-call ``queue_copy``
+      above it, cached per ``(index, shape, dtype)``), else the asdevicearray
+      fallback (non-GPU kinds, llvm-cpu, every other device kind, or an
+      oversized/unmappable input). ``_staged_input`` is called without
+      ``one_shot`` here, so its destinations are cached; ``upload_tensor``
+      passes ``one_shot=True`` so every placement gets fresh destinations.
 
     ``device_kind`` is a REQUIRED keyword (the NORMALIZED kind) — there is
     deliberately no ``"cuda"`` default, so a caller with another kind can
@@ -4714,11 +4724,15 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
        FRESH per-call staging dict (fresh DESTINATION buffers, no cache —
        the returned tensor owns its buffer): the correctness-pinned
        pinned/DMA tiers on cuda (the DMA tier's fresh-semaphore wait is
-       load-bearing), the host-local-source + queue_copy path on rocm —
-       both falling back to ``rt.asdevicearray`` for oversized/unmappable
-       inputs or any failure on the fast path. VULKAN has NO staging tier
-       in v1 (``_staged_input`` returns ``None`` for it), so its upload IS
-       the plain ``rt.asdevicearray`` copy.
+       load-bearing), the host-local-source + queue_copy path on rocm, and
+       on vulkan ``_vulkan_staged_input``'s mapped ``DEVICE_LOCAL |
+       HOST_VISIBLE`` tier up to ``_VULKAN_PINNED_MAX_BYTES`` (16 MiB, gated
+       on host-coherence) or its reusable ``HOST_LOCAL | DEVICE_VISIBLE``
+       source + per-call ``queue_copy`` tier above it. The ``one_shot=True``
+       keyword keeps every destination out of the staging cache, so the
+       returned tensor never aliases a later upload. All paths fall back to
+       ``rt.asdevicearray`` for oversized/unmappable inputs or any failure
+       on the fast path.
     5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
 
     The IREE RUNTIME MODULE resolves option-less here (the provider protocol
