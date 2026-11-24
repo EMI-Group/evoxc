@@ -1,6 +1,6 @@
 """Benchmark: native CPU engine vs the numpy backend, plus native compile time.
 
-Eight workloads, each one ``@evoxc.defn`` graph:
+Seventeen workloads, each one ``@evoxc.defn`` graph:
 
 ``ew_chain_1e6``    an 8-op ARITHMETIC elementwise f32 chain over 1e6 elements
 ``ew_transcendental_1e6``  four transcendental ops (tanh/sigmoid/gelu/erf) over
@@ -20,6 +20,27 @@ Eight workloads, each one ``@evoxc.defn`` graph:
                     random draws, broadcast adds/select.  This is the ONE
                     workload where the numpy interpreter beats the native
                     engine — it pins that real regression.
+
+The nine ``large_*`` rows are the large-tensor evidence: 16M-element
+elementwise/reduce graphs and the square f32 ``dot``:
+
+``large_ew2_16m``         ``a * b + a`` over 16M f32 elements (2 ops)
+``large_tanh_16m``        ``tanh(a) * b + a`` over 16M f32 elements (3 ops)
+``large_chain4_16m``      ``(a * b + a) * c - d`` over 16M f32 elements (4 ops)
+``large_sum_all_16m``     ``sum(x)`` over a flat 16M f32 operand (rank-0)
+``large_sum_axis_4096``   ``sum(x, axes=1)`` over a (4096, 4096) f32 grid
+``large_sum_axis0_4096``  ``sum(x, axes=0)`` over the same (4096, 4096) grid
+``large_dot_1024``        ``dot((1024,1024), (1024,1024))`` f32
+``large_dot_2048``        ``dot((2048,2048), (2048,2048))`` f32
+``large_dot_4096x1024``   ``dot((4096,1024), (1024,4096))`` f32
+
+The large rows allocate ~0.45 GB of input data up front (four 16M-f32 chains,
+the 16M reduction operand, the (4096, 4096) grid and the dot matrices), so run
+them on a host with the headroom; ``--filter large_`` selects just these.
+The three large ``dot`` rows compare at ``atol 1e-2`` (relative tolerance
+unchanged) because ``faer`` and OpenBLAS reassociate the same f32 gemm
+differently, the residual ``parity_cpu.py``'s ``dot_f32_large`` pins; every
+other row keeps the script's ``rtol 1e-3`` / ``atol 1e-4``.
 
 For each workload the script measures
 
@@ -235,7 +256,7 @@ def tn_step_pop500(genome, genes, scores, flags, flat_pop, proj_w, gate_w):
     This is the workload where the numpy interpreter WINS: its slice/reshape
     are views and its ufuncs/``take`` run over strides, while the native engine
     pays its per-call slice/gather/scatter/broadcast/random cost.  It pins that
-    real downstream regression; the other seven workloads are native-favourable.
+    real downstream regression; the other workloads are native-favourable.
     """
     pop, lanes, wide = TN_POP, TN_LANES, TN_WIDE
     keys = evoxc.random.split_n(evoxc.random.key(20261122), 8)
@@ -312,6 +333,71 @@ def tn_step_pop500(genome, genes, scores, flags, flat_pop, proj_w, gate_w):
     )
 
 
+#: Element count of the large flat elementwise/reduction operands.
+LARGE_ELEMS = 16_000_000
+#: Side length of the (4096, 4096) grid the per-axis reductions run over.
+LARGE_GRID = 4096
+#: Element-wise ``atol`` of the large ``dot`` rows against the numpy leg: the
+#: near-zero outputs of a 1024/2048-wide f32 gemm differ by more than the
+#: script's 1e-4 default because ``faer`` and OpenBLAS reassociate the sum
+#: differently (the same residual ``parity_cpu.py``'s ``dot_f32_large`` pins).
+LARGE_DOT_ATOL = 1e-2
+
+
+@evoxc.defn
+def large_ew2_16m(a, b):
+    """Two chained elementwise ops over 16M f32 elements: ``a * b + a``."""
+    return evoxc.add(evoxc.multiply(a, b), a)
+
+
+@evoxc.defn
+def large_tanh_16m(a, b):
+    """``tanh(a) * b + a`` over 16M f32 elements (3 ops, one transcendental)."""
+    return evoxc.add(evoxc.multiply(evoxc.tanh(a), b), a)
+
+
+@evoxc.defn
+def large_chain4_16m(a, b, c, d):
+    """A four-op elementwise chain over 16M f32 elements: ``(a*b + a)*c - d``."""
+    return evoxc.subtract(evoxc.multiply(evoxc.add(evoxc.multiply(a, b), a), c), d)
+
+
+@evoxc.defn
+def large_sum_all_16m(x):
+    """A full reduction of a flat 16M f32 operand (every axis -> rank 0)."""
+    return evoxc.sum(x)
+
+
+@evoxc.defn
+def large_sum_axis_4096(x):
+    """``sum(x, axes=1)`` over a (4096, 4096) f32 grid: 4096 row sums."""
+    return evoxc.sum(x, axes=(1,))
+
+
+@evoxc.defn
+def large_sum_axis0_4096(x):
+    """``sum(x, axes=0)`` over a (4096, 4096) f32 grid: 4096 column sums."""
+    return evoxc.sum(x, axes=(0,))
+
+
+@evoxc.defn
+def large_dot_1024(a, b):
+    """``dot((1024,1024), (1024,1024))`` f32."""
+    return evoxc.dot(a, b)
+
+
+@evoxc.defn
+def large_dot_2048(a, b):
+    """``dot((2048,2048), (2048,2048))`` f32."""
+    return evoxc.dot(a, b)
+
+
+@evoxc.defn
+def large_dot_4096x1024(a, b):
+    """``dot((4096,1024), (1024,4096))`` f32 — a 16.8M-element product."""
+    return evoxc.dot(a, b)
+
+
 @dataclass
 class Workload:
     name: str
@@ -319,6 +405,13 @@ class Workload:
     specs: tuple
     inputs: tuple
     note: str = ""
+    #: Element-wise comparison tolerances against the numpy leg.  ``rtol`` is the
+    #: script's 1e-3 everywhere; only the large f32 ``dot`` rows loosen ``atol``,
+    #: because ``faer`` and OpenBLAS reassociate the same gemm differently and the
+    #: near-zero outputs of a 1024/2048-wide dot then differ by more than 1e-4 in
+    #: absolute terms — the residual ``parity_cpu.py``'s ``dot_f32_large`` pins.
+    rtol: float = 1e-3
+    atol: float = 1e-4
 
 
 def build_workloads() -> list:
@@ -340,6 +433,29 @@ def build_workloads() -> list:
     flat_pop = rng.standard_normal(TN_FLAT).astype(np.float32)
     proj_w = rng.standard_normal((TN_LANES, 16)).astype(np.float32)
     gate_w = rng.standard_normal((4, 4)).astype(np.float32)
+    # Large-tensor inputs come from their OWN seeded rng, so the eight rows
+    # above keep byte-identical data.
+    large_rng = np.random.default_rng(20261124)
+    huge_a = large_rng.standard_normal(LARGE_ELEMS, dtype=np.float32)
+    huge_b = large_rng.standard_normal(LARGE_ELEMS, dtype=np.float32)
+    huge_c = large_rng.standard_normal(LARGE_ELEMS, dtype=np.float32)
+    huge_d = large_rng.standard_normal(LARGE_ELEMS, dtype=np.float32)
+    # The reduction operands are drawn uniform in [0.5, 1.5) instead of
+    # zero-mean: a 16M-term or 4096-wide sum of zero-mean noise can land near
+    # cancellation, where the element-wise allclose would compare rounding
+    # noise against its absolute tolerance rather than the values themselves.
+    flat_sum = large_rng.random(LARGE_ELEMS, dtype=np.float32) + np.float32(0.5)
+    grid = large_rng.random((LARGE_GRID, LARGE_GRID), dtype=np.float32) + np.float32(0.5)
+    dot_1024 = (
+        large_rng.standard_normal((1024, 1024), dtype=np.float32),
+        large_rng.standard_normal((1024, 1024), dtype=np.float32),
+    )
+    dot_2048 = (
+        large_rng.standard_normal((2048, 2048), dtype=np.float32),
+        large_rng.standard_normal((2048, 2048), dtype=np.float32),
+    )
+    dot_tall = large_rng.standard_normal((4096, 1024), dtype=np.float32)
+    dot_wide = large_rng.standard_normal((1024, 4096), dtype=np.float32)
     return [
         Workload("ew_chain_1e6", ew_chain_1e6, (evoxc.TensorSpec((1_000_000,), f32),) * 2, (big, big_other)),
         Workload(
@@ -386,6 +502,72 @@ def build_workloads() -> list:
             ),
             (genome, genes, scores, flags, flat_pop, proj_w, gate_w),
             note="tensorneat-shape generation step: slice/gather/scatter/random — native LOSES here",
+        ),
+        Workload(
+            "large_ew2_16m",
+            large_ew2_16m,
+            (evoxc.TensorSpec((LARGE_ELEMS,), f32),) * 2,
+            (huge_a, huge_b),
+            note="a * b + a over 16M f32 elements",
+        ),
+        Workload(
+            "large_tanh_16m",
+            large_tanh_16m,
+            (evoxc.TensorSpec((LARGE_ELEMS,), f32),) * 2,
+            (huge_a, huge_b),
+            note="tanh(a) * b + a over 16M f32 elements",
+        ),
+        Workload(
+            "large_chain4_16m",
+            large_chain4_16m,
+            (evoxc.TensorSpec((LARGE_ELEMS,), f32),) * 4,
+            (huge_a, huge_b, huge_c, huge_d),
+            note="four-op elementwise chain over 16M f32 elements",
+        ),
+        Workload(
+            "large_sum_all_16m",
+            large_sum_all_16m,
+            (evoxc.TensorSpec((LARGE_ELEMS,), f32),),
+            (flat_sum,),
+            note="full 16M-element reduction to rank 0",
+        ),
+        Workload(
+            "large_sum_axis_4096",
+            large_sum_axis_4096,
+            (evoxc.TensorSpec((LARGE_GRID, LARGE_GRID), f32),),
+            (grid,),
+            note="sum over the last axis of a (4096, 4096) f32 grid",
+        ),
+        Workload(
+            "large_sum_axis0_4096",
+            large_sum_axis0_4096,
+            (evoxc.TensorSpec((LARGE_GRID, LARGE_GRID), f32),),
+            (grid,),
+            note="sum over axis 0 of the same (4096, 4096) f32 grid",
+        ),
+        Workload(
+            "large_dot_1024",
+            large_dot_1024,
+            (evoxc.TensorSpec((1024, 1024), f32),) * 2,
+            dot_1024,
+            note="dot(1024x1024, 1024x1024) f32; atol 1e-2 for the gemm reassociation residual",
+            atol=LARGE_DOT_ATOL,
+        ),
+        Workload(
+            "large_dot_2048",
+            large_dot_2048,
+            (evoxc.TensorSpec((2048, 2048), f32),) * 2,
+            dot_2048,
+            note="dot(2048x2048, 2048x2048) f32; atol 1e-2 for the gemm reassociation residual",
+            atol=LARGE_DOT_ATOL,
+        ),
+        Workload(
+            "large_dot_4096x1024",
+            large_dot_4096x1024,
+            (evoxc.TensorSpec((4096, 1024), f32), evoxc.TensorSpec((1024, 4096), f32)),
+            (dot_tall, dot_wide),
+            note="(4096,1024) @ (1024,4096) f32; atol 1e-2 for the gemm reassociation residual",
+            atol=LARGE_DOT_ATOL,
         ),
     ]
 
@@ -452,7 +634,9 @@ def measure(extension, workload: Workload, args) -> Measurement:
     match = len(native_reference) == len(numpy_reference) and all(
         got.shape == want.shape
         and got.dtype == want.dtype
-        and np.allclose(got, want, rtol=1e-3, atol=1e-4, equal_nan=True)
+        and np.allclose(
+            got, want, rtol=workload.rtol, atol=workload.atol, equal_nan=True
+        )
         for got, want in zip(native_reference, numpy_reference)
     )
     return Measurement(
