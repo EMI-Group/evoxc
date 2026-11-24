@@ -45,25 +45,11 @@ pub(crate) use pool::take_pooled_vec;
 use self::storage::{cast_storage, decode_storage};
 
 /// One materialized value: dtype + concrete shape + typed storage.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Buffer {
     pub dtype: DType,
     pub shape: Vec<usize>,
     pub storage: Storage,
-}
-
-/// A deep copy that copies the elements into recycled storage when a stock of
-/// the exact size is pooled (`Storage::clone_pooled`), so cloning a
-/// multi-megabyte value — a `constant` payload per use, a caller's input —
-/// does not first-touch a fresh allocation for a buffer it fully overwrites.
-impl Clone for Buffer {
-    fn clone(&self) -> Buffer {
-        Buffer {
-            dtype: self.dtype,
-            shape: self.shape.clone(),
-            storage: self.storage.clone_pooled(),
-        }
-    }
 }
 
 impl Buffer {

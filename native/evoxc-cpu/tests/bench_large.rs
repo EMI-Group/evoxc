@@ -3,7 +3,11 @@
 //! `run_program`), so a row is what a caller pays.
 //!
 //! Run it with
-//! `cargo test --release -p evoxc-cpu --test bench_large -- --ignored --nocapture`.
+//! `cargo test --release -p evoxc-cpu --test bench_large -- --ignored --nocapture --test-threads=1`
+//! (`--test-threads=1` matters: the three rows below run in the default
+//! multi-threaded harness otherwise and contend for the same DRAM bandwidth,
+//! which inflates every row — measured, `mul_add` read 38.1 ms interleaved
+//! against 13.5 ms serialized on the 16-cpu host).
 //! Every row is the MEDIAN of `REPS` timed runs after `WARMUPS` warmups (this
 //! host is shared, so the minimum is reported beside it as the low-load
 //! reading).  It is a measurement aid, never a correctness test.
