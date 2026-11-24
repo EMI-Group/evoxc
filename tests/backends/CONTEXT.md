@@ -88,7 +88,7 @@ This file owns the test-side contracts, the skip/host-guard policy and the recor
 | `test_split_reduction.py` | the two-stage split-reduction emission goldens (exactness classes, gates, geometry, `split_reduction=False` byte identity) | 67 |
 | `test_iree_eigh_diag_parity.py` | llvm-cpu `eigh`/`diag` parity on scale-normalized invariants, plus `eigh` inside `cond`/`while` regions | 24 |
 | `test_mixed_dtype.py` | mixed-dtype compile+run parity on every available adapter via `_xla_plugin_probe`/`importorskip` gates | 18 |
-| `test_options_override.py` | the backend half of the options contract: validation, `KNOWN_OPTIONS`, flag policy, overrides, rocm defaults, the strict-xfail sub-option pin | 97 |
+| `test_options_override.py` | the backend half of the options contract: validation, `KNOWN_OPTIONS`, flag policy, overrides, rocm defaults, the split-reduction sub-option plumbing | 97 |
 | `test_opt_level.py` | `normalize_opt_level`, the derived iree flag, the xla wire-format editor, env precedence, end-to-end smokes | 53 |
 | `test_vulkan_target.py` | device-less `vulkan_target` derivation, validation, `KNOWN_OPTIONS`, target labels and the load gate on both load paths | 73 |
 | `test_dispatch_formation.py` | `dispatch_formation` derivation and validation, and result parity of a merged population with the option on/off | 28 |
