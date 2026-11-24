@@ -38,15 +38,25 @@ use super::Storage;
 //    a result -- pinned by `recycled_results_are_fully_overwritten` below.
 //  * The pool is thread-local: a value is only recycled on the thread that
 //    dropped it, and nothing is shared or synchronized.
-//  * Retention is bounded and never grows across unrelated calls: at most
-//    [`POOL_MAX_ENTRIES`] values totalling [`POOL_MAX_BYTES`], and only values
-//    of at least [`POOL_MIN_BYTES`] (small results keep the system allocator,
-//    whose bin free lists already make them cheap, and would only crowd out the
-//    entries that matter).
-//  * The caps are enforced by evicting the LEAST RECENTLY USED entry, never by
-//    refusing the incoming one: a pool that refuses new stocks once it is full
-//    is poisoned for the rest of the thread's life by whichever workload filled
-//    it.  Measured on this host, `gp_gather_4096` (a `(4096, 64)` f32 graph, so
+//  * Retention is bounded PER TIER and never grows across unrelated calls.
+//    The SMALL tier keeps values of at least [`POOL_MIN_BYTES`] and below
+//    [`POOL_LARGE_MIN_BYTES`]: at most [`POOL_MAX_ENTRIES`] of them totalling
+//    [`POOL_MAX_BYTES`], and at most [`POOL_MAX_PER_SIZE`] per exact size class.
+//    The LARGE tier keeps values at or above [`POOL_LARGE_MIN_BYTES`]: at most
+//    [`POOL_LARGE_PER_SIZE`] per exact size class, totalling
+//    [`POOL_MAX_BYTES_LARGE`].
+//    Values below [`POOL_MIN_BYTES`] always keep the system allocator, whose
+//    bin free lists already make them cheap, so they cannot crowd out the
+//    entries that matter.
+//  * Eviction never crosses tiers: a small stock displaces only small stocks
+//    and a large stock only large ones, so the workload that just ran keeps its
+//    stocks whatever the following workload is -- the order-independent
+//    contract above, extended to the two tiers.
+//  * Within a tier the caps are enforced by evicting the LEAST RECENTLY USED
+//    entry of that tier, never by refusing the incoming one: a pool that
+//    refuses new stocks once it is full is poisoned for the rest of the
+//    thread's life by whichever workload filled it.  Measured on this host,
+//    `gp_gather_4096` (a `(4096, 64)` f32 graph, so
 //    1 MiB temporaries) runs a warm `run` in 0.55-0.60 ms with its own stocks
 //    pooled and 1.5-2.1 ms when the pool instead holds sixteen 4 MiB stocks
 //    from a preceding `ew_chain_1e6` -- the same engine, the same graph, only
@@ -56,12 +66,37 @@ use super::Storage;
 //    LRU eviction keeps the stocks of whatever is RUNNING and discards the ones
 //    that stopped being used, so the numbers are order-independent.
 //    `a_full_pool_evicts_instead_of_poisoning_later_workloads` pins it.
+//  * A stock larger than its tier's byte cap is refused outright (the caller
+//    frees it); that can only happen for an incoming stock above
+//    [`POOL_MAX_BYTES_LARGE`].
+//
+// Measured on this host: a fresh 64 MiB `vec![0.0; 16M]` plus one full write
+// pass costs 26.0 ms (0.4 ms per MiB) -- mmap page faults, not copy -- and a flat
+// `a * b` over 16M f32 measures 5.71 ms with the pool warm against 25.96 ms
+// with the pool emptied before every call, so a 64 MiB result the pool cannot
+// serve wastes ~20 ms of zero-fill-then-overwrite per op.
+// A single flat 64 MiB cap retained at most ONE 64 MiB stock, while a real
+// large graph keeps 2 inputs + 1 result (or a whole chain) live per run and so
+// re-faulted ~2 x 64 MiB (~52 ms) on every run; one large size class at
+// [`POOL_LARGE_PER_SIZE`] (4 x 64 MiB = 256 MiB) covers that live set with one
+// spare.
 pub(super) const POOL_MIN_BYTES: usize = 1 << 12;
-/// Total bytes the pool may retain per thread (the documented retention cap).
+/// Total bytes the SMALL tier may retain per thread (its documented cap).
 pub(super) const POOL_MAX_BYTES: usize = 64 << 20;
-/// Number of retained storages per thread, across every size class.
+/// Stocks at or above this size belong to the LARGE tier, with its own caps.
+pub(super) const POOL_LARGE_MIN_BYTES: usize = 8 << 20;
+/// Total bytes the LARGE tier may retain per thread (its documented cap).
+pub(super) const POOL_MAX_BYTES_LARGE: usize = 256 << 20;
+/// Stocks retained per exact size class within the LARGE tier.
+///
+/// 4 x 64 MiB = 256 MiB covers the 2 inputs + 1 result (+ 1 spare) a real large
+/// graph keeps live per run, which is what removes the repeated first-touch
+/// faults the one-flat-cap policy paid (see the measured numbers above).
+pub(super) const POOL_LARGE_PER_SIZE: usize = 4;
+/// Number of retained storages per thread, within the SMALL tier.
 pub(super) const POOL_MAX_ENTRIES: usize = 64;
-/// Stocks retained per exact `(dtype, element count)` size class.
+/// Stocks retained per exact `(dtype, element count)` size class in the SMALL
+/// tier (the LARGE tier uses [`POOL_LARGE_PER_SIZE`]).
 ///
 /// A graph reuses a couple of temporaries per size at most (one live result plus
 /// the one it replaced), and a size-blind cap makes a graph with several
@@ -99,10 +134,13 @@ struct PoolEntry {
     last_use: u64,
 }
 
-/// The thread-local free list of large result storages.
+/// The thread-local free list of result storages, tiered by size.
 pub(super) struct StoragePool {
     entries: Vec<PoolEntry>,
-    bytes: usize,
+    /// Bytes retained in the SMALL tier (< [`POOL_LARGE_MIN_BYTES`] per stock).
+    small_bytes: usize,
+    /// Bytes retained in the LARGE tier (>= [`POOL_LARGE_MIN_BYTES`] per stock).
+    large_bytes: usize,
     /// Monotonic use counter stamped into [`PoolEntry::last_use`]; `u64` never
     /// wraps in a process's lifetime (one tick per retained or served value).
     tick: u64,
@@ -110,7 +148,7 @@ pub(super) struct StoragePool {
 
 impl StoragePool {
     const fn new() -> StoragePool {
-        StoragePool { entries: Vec::new(), bytes: 0, tick: 0 }
+        StoragePool { entries: Vec::new(), small_bytes: 0, large_bytes: 0, tick: 0 }
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -118,34 +156,95 @@ impl StoragePool {
         self.tick
     }
 
+    /// Whether a retained value of this size belongs to the LARGE tier.
+    fn is_large(storage: &Storage) -> bool {
+        storage.bytes() >= POOL_LARGE_MIN_BYTES
+    }
+
+    /// `(byte cap, per-size cap, entry cap)` of the tier `large` selects.
+    ///
+    /// The large entry cap is implied by its byte cap: at least
+    /// [`POOL_LARGE_MIN_BYTES`] bytes per stock means at most
+    /// [`POOL_MAX_BYTES_LARGE`] / [`POOL_LARGE_MIN_BYTES`] of them can fit.
+    const fn tier_caps(large: bool) -> (usize, usize, usize) {
+        if large {
+            (
+                POOL_MAX_BYTES_LARGE,
+                POOL_LARGE_PER_SIZE,
+                POOL_MAX_BYTES_LARGE / POOL_LARGE_MIN_BYTES,
+            )
+        } else {
+            (POOL_MAX_BYTES, POOL_MAX_PER_SIZE, POOL_MAX_ENTRIES)
+        }
+    }
+
+    /// Bytes this pool retains in the tier `large` selects.
+    fn tier_bytes(&self, large: bool) -> usize {
+        if large {
+            self.large_bytes
+        } else {
+            self.small_bytes
+        }
+    }
+
+    /// Number of retained entries in the tier `large` selects.
+    fn tier_entries(&self, large: bool) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| Self::is_large(&entry.storage) == large)
+            .count()
+    }
+
+    /// Add or subtract `storage`'s bytes from its own tier's counter.
+    fn account(&mut self, storage: &Storage, add: bool) {
+        let large = Self::is_large(storage);
+        let bytes = storage.bytes();
+        let counter = if large {
+            &mut self.large_bytes
+        } else {
+            &mut self.small_bytes
+        };
+        if add {
+            *counter += bytes;
+        } else {
+            *counter -= bytes;
+        }
+    }
+
     /// Retain `storage`'s allocation, returning `false` (and leaving `storage`
     /// intact, so the caller frees it as before) when it cannot usefully be
-    /// retained: it is outside `POOL_MIN_BYTES .. POOL_MAX_BYTES`, or
-    /// [`POOL_MAX_PER_SIZE`] stocks of its exact size are already retained.
+    /// retained: it is below [`POOL_MIN_BYTES`], above its tier's byte cap, or
+    /// its tier already holds its per-size cap of exactly this size.
     ///
-    /// Room within the global caps is made by evicting the least recently used
-    /// entry of ANOTHER size class, so a workload's own stocks are never the
-    /// victim of its own churn, and a saturated pool of a different size can
-    /// never starve the workload that is running (see the contract block above).
+    /// Room within a tier's caps is made by evicting the least recently used
+    /// entry of that tier, so a workload's own stocks are never the victim of
+    /// its own churn, and a saturated other tier can never starve the workload
+    /// that is running (see the contract block above).
     pub(super) fn push(&mut self, storage: &mut Storage) -> bool {
         let bytes = storage.bytes();
-        if !(POOL_MIN_BYTES..=POOL_MAX_BYTES).contains(&bytes) {
+        if bytes < POOL_MIN_BYTES {
+            return false;
+        }
+        let large = bytes >= POOL_LARGE_MIN_BYTES;
+        let (byte_cap, per_size, entry_cap) = Self::tier_caps(large);
+        if bytes > byte_cap {
+            // A single value above its tier's byte cap can never be retained.
             return false;
         }
         let dtype = storage.dtype();
         let len = storage.len();
-        if self.count_of(dtype, len) >= POOL_MAX_PER_SIZE {
+        if self.count_of(dtype, len) >= per_size {
             // A full size class keeps its newest stocks: evict this class's own
             // oldest spare rather than freeing the incoming one, so a workload
             // that keeps one more buffer of this size in flight than it retains
             // never pays a malloc round trip per run.
-            if !self.evict_same_size(dtype, len) {
+            if !self.evict_same_size(dtype, len, large) {
                 return false;
             }
         }
-        while self.entries.len() >= POOL_MAX_ENTRIES || self.bytes + bytes > POOL_MAX_BYTES {
-            if !self.evict_for(dtype, len) {
-                // Nothing of another size can be evicted (only possible when the
+        while self.tier_entries(large) >= entry_cap || self.tier_bytes(large) + bytes > byte_cap {
+            if !self.evict_for(dtype, len, large) {
+                // Nothing of this tier can be evicted (only possible when the
                 // value alone exceeds the byte cap, excluded above), so the pool
                 // keeps what it has and this stock is freed.
                 return false;
@@ -153,7 +252,7 @@ impl StoragePool {
         }
         let last_use = self.next_tick();
         let retained = std::mem::replace(storage, Storage::Bool(Vec::new()));
-        self.bytes += bytes;
+        self.account(&retained, true);
         self.entries.push(PoolEntry { storage: retained, last_use });
         true
     }
@@ -166,40 +265,51 @@ impl StoragePool {
             .count()
     }
 
-    /// Evict the least recently used entry of exactly `dtype` and `len`, so the
-    /// incoming stock can take its place.  False when the class is empty.
-    fn evict_same_size(&mut self, dtype: DType, len: usize) -> bool {
+    /// Evict the least recently used entry of exactly `dtype` and `len` in the
+    /// tier `large` selects, so the incoming stock can take its place.  False
+    /// when the class is empty.
+    fn evict_same_size(&mut self, dtype: DType, len: usize, large: bool) -> bool {
         let victim = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.storage.dtype() == dtype && entry.storage.len() == len)
+            .filter(|(_, entry)| {
+                Self::is_large(&entry.storage) == large
+                    && entry.storage.dtype() == dtype
+                    && entry.storage.len() == len
+            })
             .min_by_key(|(_, entry)| entry.last_use)
             .map(|(index, _)| index);
         let Some(index) = victim else { return false };
         let entry = self.entries.swap_remove(index);
-        self.bytes -= entry.storage.bytes();
+        self.account(&entry.storage, false);
         true
     }
-    /// Evict the least recently used entry that is NOT of the incoming size
-    /// class (falling back to the plain LRU entry when every entry is).
-    fn evict_for(&mut self, dtype: DType, len: usize) -> bool {
+    /// Evict the least recently used entry of the tier `large` selects that is
+    /// NOT of the incoming size class (falling back to the tier's plain LRU
+    /// entry when every entry is).
+    fn evict_for(&mut self, dtype: DType, len: usize, large: bool) -> bool {
+        let in_tier = |entry: &PoolEntry| Self::is_large(&entry.storage) == large;
         let victim = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !(entry.storage.dtype() == dtype && entry.storage.len() == len))
+            .filter(|(_, entry)| {
+                in_tier(entry)
+                    && !(entry.storage.dtype() == dtype && entry.storage.len() == len)
+            })
             .min_by_key(|(_, entry)| entry.last_use)
             .or_else(|| {
                 self.entries
                     .iter()
                     .enumerate()
+                    .filter(|(_, entry)| in_tier(entry))
                     .min_by_key(|(_, entry)| entry.last_use)
             })
             .map(|(index, _)| index);
         let Some(index) = victim else { return false };
         let entry = self.entries.swap_remove(index);
-        self.bytes -= entry.storage.bytes();
+        self.account(&entry.storage, false);
         true
     }
 
@@ -217,7 +327,7 @@ impl StoragePool {
             .max_by_key(|(_, entry)| entry.last_use)
             .map(|(index, _)| index)?;
         let entry = self.entries.swap_remove(index);
-        self.bytes -= entry.storage.bytes();
+        self.account(&entry.storage, false);
         Some(entry.storage)
     }
 
@@ -272,7 +382,8 @@ mod tests {
         STORAGE_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
             pool.entries.clear();
-            pool.bytes = 0;
+            pool.small_bytes = 0;
+            pool.large_bytes = 0;
         });
     }
 
@@ -352,21 +463,138 @@ mod tests {
         // The oldest sizes went first, and no entry ever exceeds the caps.
         assert_eq!(pool.count_of(DType::Float32, base), 0, "the oldest stock was evicted");
         assert_eq!(pool.count_of(DType::Float32, base + 1), 0);
-        assert!(pool.bytes <= POOL_MAX_BYTES);
+        assert!(pool.small_bytes <= POOL_MAX_BYTES);
         // ... while a size that is still represented survives.
         assert_eq!(pool.count_of(DType::Float32, base + POOL_MAX_ENTRIES - 1), 1);
     }
 
     #[test]
-    fn a_stock_larger_than_the_byte_cap_is_refused_and_evicts_nothing() {
+    fn a_stock_above_its_tier_byte_cap_is_refused_and_evicts_nothing() {
+        // The SMALL tier never holds a stock this large (anything at or above
+        // POOL_LARGE_MIN_BYTES is classified large), so the refusal is a LARGE
+        // stock above POOL_MAX_BYTES_LARGE.  `bytes()` counts a bool storage's
+        // logical elements (one byte each) while `Vec<bool>` packs bits, so the
+        // >256 MiB declared size here is only ~32 MiB of real allocation.
         let count = (1 << 20) / std::mem::size_of::<f32>();
         let mut pool = StoragePool::new();
         let mut stock = pool_stock_f32(count, 1.0);
         assert!(pool.push(&mut stock));
-        let mut huge = pool_stock_f32(POOL_MAX_BYTES / std::mem::size_of::<f32>() + 1, 2.0);
-        assert!(!pool.push(&mut huge), "a value above the byte cap is never retained");
+        let mut huge = Storage::Bool(vec![false; POOL_MAX_BYTES_LARGE + 1]);
+        assert!(!pool.push(&mut huge), "a value above its tier's byte cap is never retained");
         assert_eq!(pool.entries.len(), 1);
         assert!(pool.take(DType::Float32, count).is_some(), "the small stock was not evicted");
+    }
+
+    #[test]
+    fn a_large_size_class_retains_its_own_cap_and_evicts_its_oldest() {
+        let mut pool = StoragePool::new();
+        let count = POOL_LARGE_MIN_BYTES / std::mem::size_of::<f32>();
+        for value in 0..POOL_LARGE_PER_SIZE + 3 {
+            let mut stock = pool_stock_f32(count, value as f32);
+            assert!(pool.push(&mut stock), "large stock {value} fits its own tier");
+        }
+        assert_eq!(
+            pool.count_of(DType::Float32, count),
+            POOL_LARGE_PER_SIZE,
+            "a large size class keeps at most its own per-size cap"
+        );
+        assert!(pool.large_bytes <= POOL_MAX_BYTES_LARGE);
+        // LIFO serve plus per-size eviction means the oldest stocks are gone and
+        // the newest one is handed back first.
+        let taken = pool.take(DType::Float32, count).expect("a large stock is pooled");
+        match &taken {
+            Storage::F32(values) => {
+                assert_eq!(values[0], (POOL_LARGE_PER_SIZE + 2) as f32, "the newest stock is served first")
+            }
+            _ => panic!("expected f32 storage"),
+        }
+    }
+
+    #[test]
+    fn the_two_tiers_evict_only_within_their_own_tier() {
+        let mut pool = StoragePool::new();
+        let small = (1 << 20) / std::mem::size_of::<f32>();
+        // A bool storage reports one byte per element while `Vec<bool>` packs
+        // bits, so this 8 MiB-declared stock allocates ~1 MiB.
+        let large = POOL_LARGE_MIN_BYTES;
+        let mut small_stock = pool_stock_f32(small, 1.0);
+        assert!(pool.push(&mut small_stock));
+        let mut large_stock = Storage::Bool(vec![false; large]);
+        assert!(pool.push(&mut large_stock));
+        // Overflow the LARGE tier's per-size cap: only large stocks may go.
+        for _ in 0..POOL_LARGE_PER_SIZE + 3 {
+            let mut stock = Storage::Bool(vec![false; large]);
+            assert!(pool.push(&mut stock), "the large tier makes room within itself");
+        }
+        assert_eq!(pool.count_of(DType::Float32, small), 1, "large churn left the small tier alone");
+        assert_eq!(pool.count_of(DType::Bool, large), POOL_LARGE_PER_SIZE);
+        let large_kept = pool.count_of(DType::Bool, large);
+        // Overflow the SMALL tier's entry cap with distinct sizes: only small
+        // stocks may go.
+        for index in 0..POOL_MAX_ENTRIES + 10 {
+            let mut stock = pool_stock_f32(POOL_MIN_BYTES / 4 + index, 2.0);
+            assert!(pool.push(&mut stock), "the small tier makes room within itself");
+        }
+        assert_eq!(
+            pool.count_of(DType::Bool, large),
+            large_kept,
+            "small churn left the large tier alone"
+        );
+        assert!(pool.tier_entries(false) <= POOL_MAX_ENTRIES);
+        assert!(pool.small_bytes <= POOL_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_large_stock_at_the_large_byte_cap_evicts_the_lru_large_stock() {
+        // Fill the large tier just below its 256 MiB byte cap with DISTINCT
+        // 8 MiB classes (so no per-size cap triggers) and then push one more:
+        // the incoming stock must displace the least recently used large stock,
+        // never be refused.  `bytes()` counts a bool storage's logical elements
+        // while `Vec<bool>` packs bits, so the ~256 MiB this reports is only
+        // ~31 MiB of real allocation.
+        let base = POOL_LARGE_MIN_BYTES;
+        let classes = POOL_MAX_BYTES_LARGE / POOL_LARGE_MIN_BYTES - 1;
+        let mut pool = StoragePool::new();
+        for index in 0..classes {
+            let mut stock = Storage::Bool(vec![false; base + index]);
+            assert!(pool.push(&mut stock), "large class {index} fits below the byte cap");
+        }
+        assert!(pool.large_bytes <= POOL_MAX_BYTES_LARGE);
+        let mut incoming = Storage::Bool(vec![false; base + classes]);
+        assert!(
+            pool.push(&mut incoming),
+            "an at-cap large push evicts its LRU stock instead of freeing the incoming one"
+        );
+        assert!(pool.large_bytes <= POOL_MAX_BYTES_LARGE);
+        assert_eq!(pool.count_of(DType::Bool, base), 0, "the oldest large stock was the victim");
+        assert_eq!(
+            pool.count_of(DType::Bool, base + classes),
+            1,
+            "the incoming stock was retained"
+        );
+    }
+
+    #[test]
+    fn a_stock_between_the_tiers_is_classified_and_capped_as_expected() {
+        // One byte short of 8 MiB is a SMALL stock (8 per size class); exactly
+        // 8 MiB is LARGE (4 per size class).
+        let mut pool = StoragePool::new();
+        let below = POOL_LARGE_MIN_BYTES - 1;
+        let mut below_stocks: Vec<Storage> = (0..POOL_MAX_PER_SIZE + 2)
+            .map(|_| Storage::Bool(vec![false; below]))
+            .collect();
+        for stock in below_stocks.iter_mut() {
+            assert!(pool.push(stock), "a just-below-boundary stock is retained as a small one");
+        }
+        assert_eq!(pool.count_of(DType::Bool, below), POOL_MAX_PER_SIZE);
+        let at = POOL_LARGE_MIN_BYTES;
+        let mut at_stocks: Vec<Storage> = (0..POOL_LARGE_PER_SIZE + 2)
+            .map(|_| Storage::Bool(vec![false; at]))
+            .collect();
+        for stock in at_stocks.iter_mut() {
+            assert!(pool.push(stock), "the boundary stock is retained as a large one");
+        }
+        assert_eq!(pool.count_of(DType::Bool, at), POOL_LARGE_PER_SIZE);
     }
 
     #[test]
@@ -472,7 +700,7 @@ mod tests {
         });
         let (entries, bytes) = STORAGE_POOL.with(|pool| {
             let pool = pool.borrow();
-            (pool.entries.len(), pool.bytes)
+            (pool.entries.len(), pool.small_bytes + pool.large_bytes)
         });
         assert_eq!((entries, bytes), (0, 0), "a small value must not be retained");
         // Then overfill: the caps hold.
@@ -486,7 +714,7 @@ mod tests {
                 pool.push(value);
             }
             assert!(pool.entries.len() <= POOL_MAX_ENTRIES);
-            assert!(pool.bytes <= POOL_MAX_BYTES);
+            assert!(pool.small_bytes <= POOL_MAX_BYTES);
         });
     }
 }
