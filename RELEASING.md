@@ -157,6 +157,12 @@ persistence. Collection verifies the exact matrix and archive
 contents and runs `twine check --strict`. Each wheel carries `evoxc` and the
 native extension, not `evoxc_hf`; the sdist carries the whole Rust workspace,
 including the facade crate, but no compiled extension and no `evoxc_hf`.
+Both musllinux wheels additionally carry maturin's repair directory
+`evoxc.libs/` with a renamed `libgcc_s-<hash>.so.1` (the extension's RPATH
+points at it and the dist-info RECORD lists it). That directory holds flat
+shared-library files only and is not a Python module, so the
+one-module-per-distribution boundary still holds; on the manylinux, macOS and
+Windows wheels it is absent.
 
 `cp311-abi3` uses the CPython stable ABI with a 3.11 floor: one wheel per target
 is intended for compatible, standard CPython versions, not one build per Python
