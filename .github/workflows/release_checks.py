@@ -1,4 +1,4 @@
-"""Fail-closed release checks; run from the checkout (verify) or beside dist/ (other commands)."""
+"""Fail-closed release checks; run from the checkout (verify, dist) or beside dist/ (other commands)."""
 
 import hashlib
 import json
@@ -6,8 +6,10 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import time
 import tomllib
+import zipfile
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
@@ -77,6 +79,112 @@ def verify_source():
     for name, value in dict(checkout_sha=commit, tag=tag, tag_oid=tag_oid, version=version).items():
         output(name, value)
     print(f"Verified {tag or 'main rehearsal'} at {commit} ({version})")
+
+
+def version_of(pyproject):
+    with open(pyproject, "rb") as stream:
+        return tomllib.load(stream)["project"]["version"]
+
+
+def top_level(entries):
+    return {entry.split("/")[0] for entry in entries}
+
+
+def wheel_entries(artifact):
+    with zipfile.ZipFile(artifact) as archive:
+        return archive.namelist()
+
+
+def sdist_entries(artifact):
+    with tarfile.open(artifact) as archive:
+        return archive.getnames()
+
+
+def dist_check(directory=DIST):
+    """Assert the four expected archives exist and each ships only its own package.
+
+    Runs from the checkout holding both `pyproject.toml` files; it needs no
+    release environment, git state, network access or third-party package.
+    """
+    directory = Path(directory)
+    version = version_of("pyproject.toml")
+    hf_version = version_of("evoxc_hf/pyproject.toml")
+
+    # 1. Exactly one platform abi3 wheel for the root `evoxc` project — never `py3-none-any`.
+    wheels = sorted(directory.glob(f"evoxc-{version}-*-*.whl"))
+    require(len(wheels) == 1, f"{directory}/evoxc-{version}-*-*.whl: expected exactly one platform abi3 "
+                              f"evoxc wheel, found {[wheel.name for wheel in wheels]}")
+    wheel = wheels[0]
+    pure = directory / f"evoxc-{version}-py3-none-any.whl"
+    require(not pure.is_file(), f"{pure}: the root `evoxc` project embeds a Rust/PyO3 extension, "
+                                "so its wheel must be platform-specific")
+    require(re.fullmatch(rf"evoxc-{re.escape(version)}-cp\d+-abi3-[a-z0-9_]+\.whl", wheel.name),
+            f"{wheel}: the evoxc wheel must be a per-platform cp<digits>-abi3 wheel "
+            "(it embeds a Rust/PyO3 extension)")
+
+    # 2. All four expected archives are present and nothing else is.
+    hf_wheel = directory / f"evoxc_hf-{hf_version}-py3-none-any.whl"
+    for artifact in (wheel, directory / f"evoxc-{version}.tar.gz", hf_wheel,
+                     directory / f"evoxc_hf-{hf_version}.tar.gz"):
+        require(artifact.is_file(), f"missing artifact {artifact} — expected four: an evoxc platform "
+                                    "wheel + sdist and an evoxc_hf pure-Python wheel + sdist")
+    count = sum(1 for path in directory.iterdir() if path.name.endswith((".whl", ".tar.gz")))
+    require(count == 4, f"{directory}: expected exactly 4 wheel/sdist artifacts (evoxc + evoxc_hf, a "
+                        f"wheel and an sdist each), got {count} file(s)")
+
+    # 3. The `evoxc` wheel ships exactly `evoxc` (including the compiled extension) + its dist-info.
+    entries = wheel_entries(wheel)
+    tops = top_level(entries)
+    bad = sorted(entry for entry in tops if entry.startswith("evoxc_hf"))
+    require(not bad, f"{wheel}: ships {bad} — `evoxc_hf` belongs to the SEPARATE distribution "
+                     "`evoxc-hf` (`evoxc_hf/pyproject.toml`) and must never be inside the `evoxc` one")
+    expected = {"evoxc", f"evoxc-{version}.dist-info"}
+    require(tops == expected, f"{wheel}: top-level entries must be exactly {sorted(expected)}, "
+                              f"got {sorted(tops)}")
+    extension = "evoxc/_evoxc_native.abi3.so"
+    require(extension in entries, f"{wheel}: ships no {extension} — maturin must compile the extension "
+                                  "from ./native/ and install it in the `evoxc` package")
+
+    # 4. The `evoxc_hf` wheel ships exactly `evoxc_hf` + its dist-info, never `evoxc` or a compiled file.
+    entries = wheel_entries(hf_wheel)
+    tops = top_level(entries)
+    bad = sorted(entry for entry in entries if entry == "evoxc" or entry.startswith("evoxc/"))
+    require(not bad, f"{hf_wheel}: ships the `evoxc` package ({bad[:5]}) — `evoxc` is the workspace ROOT "
+                     "distribution and a declared runtime dependency, never vendored into `evoxc-hf`")
+    expected = {"evoxc_hf", f"evoxc_hf-{hf_version}.dist-info"}
+    require(tops == expected, f"{hf_wheel}: top-level entries must be exactly {sorted(expected)}, "
+                              f"got {sorted(tops)}")
+    compiled = sorted(entry for entry in entries if entry.endswith((".so", ".pyd", ".dylib")))
+    require(not compiled, f"{hf_wheel}: ships compiled artifacts ({compiled[:5]}) — `evoxc-hf` is pure Python")
+
+    # 5. The `evoxc` sdist has a single `evoxc-<version>` root, carries the Rust workspace needed to
+    #    build the extension, and no `evoxc_hf` path at all.
+    artifact = directory / f"evoxc-{version}.tar.gz"
+    entries = sdist_entries(artifact)
+    root = f"evoxc-{version}"
+    require(top_level(entries) == {root}, f"{artifact}: must have the single root {root!r}, "
+                                          f"got {sorted(top_level(entries))}")
+    bad = sorted(entry for entry in entries if "evoxc_hf" in entry)
+    require(not bad, f"{artifact}: ships {len(bad)} `evoxc_hf` path(s), e.g. {bad[:5]} — the workspace member "
+                     "is a separate distribution and never part of the root sdist")
+    for required in (f"{root}/native/Cargo.toml", f"{root}/native/evoxc-python/Cargo.toml"):
+        require(required in entries, f"{artifact}: does not ship {required} — a source install must be able "
+                                     "to build the extension from the sdist")
+
+    # 6. The `evoxc_hf` sdist has a single `evoxc_hf-<version>` root, no `evoxc` package, and a license file.
+    artifact = directory / f"evoxc_hf-{hf_version}.tar.gz"
+    entries = sdist_entries(artifact)
+    root = f"evoxc_hf-{hf_version}"
+    require(top_level(entries) == {root}, f"{artifact}: must have the single root {root!r}, "
+                                          f"got {sorted(top_level(entries))}")
+    bad = sorted(entry for entry in entries if entry == f"{root}/evoxc" or entry.startswith(f"{root}/evoxc/"))
+    require(not bad, f"{artifact}: ships the `evoxc` package ({bad[:5]}) — build `evoxc` from the workspace "
+                     "ROOT project instead")
+    require(any(entry.split("/")[-1] == "LICENSE" for entry in entries),
+            f'{artifact}: does not ship the LICENSE file (license-files = ["LICENSE"] in evoxc_hf/pyproject.toml)')
+
+    print(f"ok: evoxc {version} wheel/sdist ship `evoxc` + the abi3 extension only; "
+          f"evoxc_hf {hf_version} wheel/sdist ship `evoxc_hf` only")
 
 
 def manifest(version, hf):
@@ -231,7 +339,9 @@ def wait_for_pypi(project, version, expected):
                        "the failed jobs in the original release run to reuse the tested artifact")
 
 
-def main(command):
+def main(command, dist_dir=None):
+    if command == "dist":
+        return dist_check(Path(dist_dir) if dist_dir else DIST)
     if command == "verify":
         return verify_source()
     version = ENV["VERSION"]
@@ -285,6 +395,6 @@ def main(command):
 
 if __name__ == "__main__":
     try:
-        main(sys.argv[1])
+        main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
     except (ReleaseError, HTTPError, subprocess.CalledProcessError) as exc:
         sys.exit(str(exc))
