@@ -94,6 +94,92 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, "Not a regular distribution file"):
                 release.manifest("1.2.3", hf=True)
 
+    def test_manifest_requires_a_flat_dist_directory(self):
+        version = "1.2.3"
+        platforms = ("manylinux2014_x86_64", "musllinux_1_2_x86_64",
+                     "manylinux2014_aarch64", "musllinux_1_2_aarch64",
+                     "macosx_10_12_x86_64", "macosx_11_0_arm64", "win_amd64")
+        wheels = [f"evoxc-{version}-cp311-abi3-{platform}.whl" for platform in platforms]
+        sdist = f"evoxc-{version}.tar.gz"
+        with tempfile.TemporaryDirectory() as tmp, patch.object(release, "DIST", Path(tmp)):
+            for name in (*wheels, sdist):
+                Path(tmp, name).write_bytes(b"artifact")
+            self.assertEqual(set(release.manifest(version, hf=False)), {*wheels, sdist})
+            # A flat-but-wrong set keeps the generic message.
+            Path(tmp, "extra").touch()
+            with self.assertRaisesRegex(release.ReleaseError, "Unexpected distributions"):
+                release.manifest(version, hf=False)
+            Path(tmp, "extra").unlink()
+            # actions/download-artifact@v4 nests each artifact unless merge-multiple is set.
+            nested = Path(tmp, "evoxc-dist")
+            nested.mkdir()
+            Path(nested, sdist).write_bytes(b"artifact")
+            for hf in (False, True):
+                with (self.subTest(hf=hf),
+                      self.assertRaisesRegex(release.ReleaseError,
+                                             r"FLAT; found nested directory/directories \['evoxc-dist'\]")):
+                    release.manifest(version, hf=hf)
+            with self.assertRaisesRegex(release.ReleaseError, "merge-multiple: true"):
+                release.manifest(version, hf=False)
+
+
+WORKFLOW_DIR = Path(__file__).resolve().parent
+DOWNLOAD_ARTIFACT = "actions/download-artifact@"
+
+
+def download_artifact_steps(text):
+    """Return the `with:` inputs of every actions/download-artifact step (indentation-aware scan)."""
+    lines = text.splitlines()
+    steps = []
+    for index, line in enumerate(lines):
+        if not line.strip().startswith("- uses:") or DOWNLOAD_ARTIFACT not in line:
+            continue
+        step_indent = len(line) - len(line.lstrip())
+        inputs, in_with = {}, False
+        for follower in lines[index + 1:]:
+            body = follower.strip()
+            if not body or body.startswith("#"):
+                continue
+            indent = len(follower) - len(follower.lstrip())
+            if indent <= step_indent:
+                break
+            if indent == step_indent + 2:
+                in_with = body == "with:"
+                continue
+            if in_with:
+                key, _, value = body.partition(":")
+                inputs[key.strip()] = value.strip().strip("'\"")
+        steps.append(inputs)
+    return steps
+
+
+def writes_into_dist(inputs):
+    path = inputs.get("path", "").removeprefix("./").rstrip("/")
+    return path.split("/")[0] == "dist"
+
+
+class WorkflowWiringTests(unittest.TestCase):
+    def test_download_artifact_steps_extract_flat_into_dist(self):
+        # release_checks.py treats dist/ as a FLAT directory (manifest, stage_assets, Twine), while
+        # actions/download-artifact@v4 extracts each artifact into dist/<artifact-name>/ unless
+        # merge-multiple: true is set. So a step writing into dist/ must either download ONE named
+        # artifact (`name:`) or merge its artifacts (`merge-multiple: true`).
+        workflows = sorted(WORKFLOW_DIR.glob("*.yml"))
+        self.assertTrue(workflows)
+        checked = []
+        for path in workflows:
+            for inputs in download_artifact_steps(path.read_text()):
+                if not writes_into_dist(inputs):
+                    continue
+                checked.append(path.name)
+                with self.subTest(workflow=path.name, inputs=inputs):
+                    self.assertTrue("name" in inputs or inputs.get("merge-multiple") == "true",
+                                    f"{path.name}: a download-artifact step writing into dist/ must set "
+                                    f"`name:` or `merge-multiple: true`, got {inputs}")
+        self.assertGreaterEqual(len(checked), 7)
+        self.assertIn("release.yml", checked)
+        self.assertIn("wheels.yml", checked)
+
 
 class RemoteTests(unittest.TestCase):
     def test_pypi_upload_requires_absent_release_and_complete_match_skips(self):

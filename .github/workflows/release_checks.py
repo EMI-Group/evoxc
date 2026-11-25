@@ -212,7 +212,14 @@ def dist_check(directory=DIST):
 
 def manifest(version, hf):
     prefix = f"{'evoxc_hf' if hf else 'evoxc'}-{version}"
-    names = [p.name for p in DIST.iterdir()]
+    entries = list(DIST.iterdir())
+    # actions/download-artifact@v4 extracts every artifact into `dist/<artifact-name>/` unless
+    # `merge-multiple: true` is set, so a nested directory means the flat-manifest contract is broken.
+    nested = sorted(entry.name for entry in entries if not entry.is_file())
+    require(not nested, f"{DIST}/ must hold the distribution files FLAT; found nested "
+                        f"directory/directories {nested} — actions/download-artifact@v4 extracts each "
+                        "artifact into dist/<artifact-name>/ unless merge-multiple: true is set")
+    names = [entry.name for entry in entries]
     sdist = f"{prefix}.tar.gz"
     if hf:
         valid = set(names) == {sdist, f"{prefix}-py3-none-any.whl"}
