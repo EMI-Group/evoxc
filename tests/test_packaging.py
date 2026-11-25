@@ -14,9 +14,10 @@ Both are built from this single workspace (one `uv.lock` at the root):
 
 The member's distribution name (`evoxc-hf`) differs from its import name
 (`evoxc_hf`) — that is what its ``module-name`` declares. The root project ships
-``evoxc`` plus the compiled extension and nothing else; the member ships exactly
-``evoxc_hf`` from its own src layout. Neither distribution can contain the
-sibling.
+``evoxc`` plus the compiled extension, plus (where maturin's auditwheel-style
+repair bundles one, e.g. ``libgcc_s`` on musllinux) an ``evoxc.libs/`` directory
+of shared libraries — and nothing else; the member ships exactly ``evoxc_hf``
+from its own src layout. Neither distribution can contain the sibling.
 
 The HuggingFace integration lives in the member, so its reference oracles (torch
 + transformers) sit behind ``evoxc-hf[hf]``: ``evoxc`` has no ``hf`` extra, stays
@@ -82,6 +83,13 @@ ROOT_EXTRAS = frozenset({"interop", "dev", "iree", "tvm", "compilers", "bench"})
 # Directories that never contain distributable source packages.
 _SKIP_DIRS = frozenset({".git", ".genesis", ".eggs", ".venv", ".mypy_cache", ".pytest_cache"})
 _SKIP_DIRS |= frozenset({"__pycache__", "build", "dist", "node_modules", "venv"})
+
+# maturin performs auditwheel-style repair: the COMPILED `evoxc` wheel may carry a
+# `<dist>.libs/` directory of bundled shared libraries (musllinux bundles libgcc_s and
+# patches the extension's RPATH/NEEDED). It is not a Python module, and the pure-Python
+# member wheel never carries one.
+_BUNDLED_LIBS_MODULES = frozenset({ROOT_MODULE})
+_SHARED_LIBRARY_SUFFIX = re.compile(r"\.(?:so(?:\.\d+)?|dylib|dll)$")
 
 
 # ---- helpers: read the two project files, walk the checkout ------------------
@@ -735,6 +743,55 @@ def _dist_info_dir(archive: Path) -> str:
     return roots[0]
 
 
+def _wheel_roots(names: Iterable[str]) -> list[str]:
+    """The sorted top-level entries of a wheel (`evoxc`, `evoxc.libs`, `<dist>.dist-info`)."""
+    return sorted({name.split("/", 1)[0] for name in names})
+
+
+def _bundled_libs_root(module: str) -> str:
+    """The bundled-shared-library directory a repaired wheel carries (`evoxc.libs`)."""
+    return f"{module}.libs"
+
+
+def _is_shared_library_name(name: str) -> bool:
+    """A shared-library filename: `libfoo.so`, `libfoo.so.1`, `libfoo.dylib`, `foo.dll`."""
+    return bool(_SHARED_LIBRARY_SUFFIX.search(name))
+
+
+def _bundled_lib_entries(names: Iterable[str], module: str) -> list[str]:
+    """Every entry under `<module>.libs/` (empty when the wheel carries no bundled libs)."""
+    root = _bundled_libs_root(module)
+    return [name for name in names if name == root or name.startswith(root + "/")]
+
+
+def _assert_bundled_libs(names: Iterable[str], module: str) -> list[str]:
+    """Validate the OPTIONAL `<module>.libs/` directory; returns its entries.
+
+    It is maturin's bundled shared-library directory, never a Python module: only the
+    compiled distribution may carry one, every entry must be a single file directly inside
+    it, and that file's basename must be a shared library (`.so`, `.so.<digits>`, `.dylib`,
+    `.dll`). A bare `evoxc.libs/` directory entry is tolerated.
+    """
+    bundled = _bundled_lib_entries(names, module)
+    if not bundled:
+        return []
+    root = _bundled_libs_root(module)
+    assert module in _BUNDLED_LIBS_MODULES, (
+        f"`{root}/` is maturin's bundled-shared-library directory and only the compiled "
+        f"`{ROOT_MODULE}` wheel may carry one: `{module}` stays pure Python"
+    )
+    bad = []
+    for entry in sorted(bundled):
+        inner = entry[len(root) :].lstrip("/")
+        if inner and ("/" in inner or not _is_shared_library_name(inner)):
+            bad.append(entry)  # a nested directory, or a non-shared-library file
+    assert not bad, (
+        f"`{root}/` must hold shared libraries directly (`.so`, `.so.<digits>`, `.dylib`, "
+        f"`.dll`), got {bad}"
+    )
+    return bundled
+
+
 def _metadata_headers(text: str) -> dict[str, list[str]]:
     """The RFC822 header block of a METADATA file (the body is the README): key -> values."""
     headers: dict[str, list[str]] = {}
@@ -814,7 +871,7 @@ def test_workspace_build_produces_exactly_the_four_artifacts(built_artifacts):
     assert len(root_wheels) == 1, names
     root_wheel = root_wheels[0]
     assert re.fullmatch(
-        rf"{re.escape(ROOT_DIST)}-{re.escape(root_version)}-cp\d+-abi3-[a-z0-9_]+\.whl", root_wheel
+        rf"{re.escape(ROOT_DIST)}-{re.escape(root_version)}-cp\d+-abi3-[a-z0-9_.]+\.whl", root_wheel
     ), f"the `evoxc` wheel {root_wheel!r} is not a cp<X>-abi3 platform wheel"
     assert f"{ROOT_DIST}-{root_version}.tar.gz" in names, names
 
@@ -825,16 +882,31 @@ def test_workspace_build_produces_exactly_the_four_artifacts(built_artifacts):
 
 
 def test_each_wheel_ships_only_its_own_top_level_modules(built_artifacts):
-    """Each wheel's root set is exactly {its own module, its own `.dist-info`} — no sibling."""
+    """Each wheel's root set is {its own module, its own `.dist-info`} — plus, on the compiled
+    `evoxc` wheel only, maturin's optional `<dist>.libs/` directory of bundled shared libraries.
+
+    `evoxc.libs` is not a Python module: it holds shared libraries only (musllinux bundles
+    libgcc_s there), and neither wheel may ever contain the sibling distribution.
+    """
     versions = {ROOT_MODULE: _project_version(PYPROJECT), MEMBER_MODULE: _project_version(MEMBER_PYPROJECT)}
     for module in (ROOT_MODULE, MEMBER_MODULE):
         wheel = _artifact(built_artifacts, module, "wheel")
-        roots = sorted({entry.split("/", 1)[0] for entry in _wheel_names(wheel)})
-        modules = [root for root in roots if not root.endswith(".dist-info")]
+        names = _wheel_names(wheel)
+        roots = _wheel_roots(names)
+        libs_root = _bundled_libs_root(module)
+        modules = [root for root in roots if not root.endswith(".dist-info") and root != libs_root]
         assert modules == [module], (
             f"{wheel.name} root set is {roots}: each distribution ships exactly the `{module}` "
-            f"module\n{_STALE_HINT}"
+            f"module (plus an optional `{libs_root}/` of bundled shared libraries on the "
+            f"compiled wheel)\n{_STALE_HINT}"
         )
+        if module == ROOT_MODULE:
+            _assert_bundled_libs(names, module)
+        else:
+            assert libs_root not in roots, (
+                f"{wheel.name} ships `{libs_root}/`: the pure-Python member carries no bundled "
+                "shared libraries"
+            )
         assert [root for root in roots if root.endswith(".dist-info")] == [
             f"{module}-{versions[module]}.dist-info"
         ], f"{wheel.name} .dist-info does not carry its own project version {versions[module]!r}"
@@ -843,13 +915,17 @@ def test_each_wheel_ships_only_its_own_top_level_modules(built_artifacts):
         for forbidden in ("etl", "bench_logs", "assets", "conftest.py"):
             assert forbidden not in roots, (wheel.name, forbidden, roots)
 
-        # The RECORD agrees: only this module (and its .dist-info) may be shipped.
-        record = next((n for n in _wheel_names(wheel) if n.endswith(".dist-info/RECORD")), None)
+        # The RECORD agrees: only this module (and its .dist-info, plus the compiled wheel's
+        # bundled shared libraries) may be shipped.
+        record = next((n for n in names if n.endswith(".dist-info/RECORD")), None)
         assert record is not None, f"{wheel.name} has no RECORD"
         shipped = [line.split(",", 1)[0] for line in _wheel_read(wheel, record).splitlines()]
-        tops = sorted({entry.split("/", 1)[0] for entry in shipped if entry.split(",", 1)[0].strip()})
-        assert tops and all(top == module or top.endswith(".dist-info") for top in tops), (
-            f"{wheel.name} RECORD lists {tops}: only `{module}` (and its .dist-info) may ship"
+        _assert_bundled_libs(shipped, module)
+        tops = _wheel_roots(entry for entry in shipped if entry.strip())
+        allowed = {module, libs_root}
+        assert tops and all(top in allowed or top.endswith(".dist-info") for top in tops), (
+            f"{wheel.name} RECORD lists {tops}: only `{module}` (and its .dist-info, plus "
+            f"`{libs_root}/` on the compiled wheel) may ship"
         )
 
 
@@ -871,12 +947,59 @@ def test_root_wheel_ships_the_compiled_native_extension(built_artifacts):
     assert record_entries.count(extension) == 1, (
         f"{wheel.name} RECORD lists {extension} {record_entries.count(extension)} times"
     )
-    assert len([n for n in names if n.endswith(".so")]) == 1, [n for n in names if n.endswith(".so")]
+    # maturin's repair may bundle shared libraries: every OTHER compiled artifact may only live
+    # under `evoxc.libs/` (musllinux bundles libgcc_s there) and must be a shared-library filename.
+    libs_root = _bundled_libs_root(ROOT_MODULE)
+    shared = [n for n in names if _is_shared_library_name(n)]
+    assert shared.count(extension) == 1, f"{wheel.name} ships {shared}"
+    stray = [n for n in shared if n != extension and not n.startswith(libs_root + "/")]
+    assert not stray, (
+        f"{wheel.name} ships compiled artifacts outside `{extension}` and `{libs_root}/`: {stray}"
+    )
+    _assert_bundled_libs(names, ROOT_MODULE)
 
-    # The member stays pure: no compiled artifact of any kind.
+    # The member stays pure: no compiled artifact of any kind, and no bundled-libs directory.
     member_wheel = _artifact(built_artifacts, MEMBER_MODULE, "wheel")
-    compiled = [n for n in _wheel_names(member_wheel) if n.endswith((".so", ".pyd", ".dylib"))]
+    member_names = _wheel_names(member_wheel)
+    compiled = [n for n in member_names if _is_shared_library_name(n) or n.endswith(".pyd")]
     assert not compiled, f"{member_wheel.name} ships compiled artifacts: {compiled}"
+    assert not _bundled_lib_entries(member_names, MEMBER_MODULE), member_wheel.name
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param(["evoxc.libs/libgcc_s-0123abcd.so.1"], id="musllinux-libgcc-s"),
+        pytest.param(["evoxc.libs/libfoo.so"], id="plain-so"),
+        pytest.param(["evoxc.libs/libfoo.1.dylib"], id="dylib"),
+        pytest.param(["evoxc.libs/foo.dll"], id="dll"),
+        pytest.param(["evoxc.libs/"], id="bare-directory-entry"),
+        pytest.param([], id="no-bundled-libs"),
+    ],
+)
+def test_bundled_libs_accepts_shared_libraries_directly_inside(entries):
+    """A `<dist>.libs/` directory holds single shared-library files — one level, no nesting."""
+    assert _assert_bundled_libs(entries, ROOT_MODULE) == _bundled_lib_entries(entries, ROOT_MODULE)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param(["evoxc.libs/junk.py"], id="python-module"),
+        pytest.param(["evoxc.libs/nested/libfoo.so"], id="nested-directory"),
+        pytest.param(["evoxc.libs/nested/"], id="nested-bare-directory"),
+        pytest.param(["evoxc.libs/libfoo"], id="no-library-suffix"),
+    ],
+)
+def test_bundled_libs_rejects_non_shared_library_entries(entries):
+    with pytest.raises(AssertionError, match="must hold shared libraries directly"):
+        _assert_bundled_libs(entries, ROOT_MODULE)
+
+
+def test_bundled_libs_is_never_allowed_on_the_pure_python_wheel():
+    """Only the COMPILED `evoxc` wheel may carry a bundled shared-library directory."""
+    with pytest.raises(AssertionError, match="stays pure Python"):
+        _assert_bundled_libs([f"{MEMBER_MODULE}.libs/libfoo.so"], MEMBER_MODULE)
 
 
 def test_evoxc_sdist_is_a_complete_buildable_source_tree(built_artifacts):
@@ -901,7 +1024,14 @@ def test_wheel_top_level_txt_when_present_declares_one_module(built_artifacts):
         names = _wheel_names(wheel)
         entry = next((n for n in names if n.endswith("/top_level.txt")), None)
         if entry is None:  # maturin/uv_build write no top_level.txt — conditional on purpose
-            modules = sorted({n.split("/", 1)[0] for n in names if not n.startswith(f"{module}-")})
+            libs_root = _bundled_libs_root(module)
+            modules = sorted(
+                {
+                    n.split("/", 1)[0]
+                    for n in names
+                    if not n.startswith(f"{module}-") and n.split("/", 1)[0] != libs_root
+                }
+            )
             assert modules == [module], wheel.name  # ... the root set still pins one module
             continue
         declared = [line.strip() for line in _wheel_read(wheel, entry).splitlines() if line.strip()]
