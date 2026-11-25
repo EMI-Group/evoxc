@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-25
+
 ## [0.2.2] - 2026-11-25
 ### Fixed
 - The release staging and publishing jobs now unpack the pinned artifact flat into `dist/` (`merge-multiple: true` on every numeric-ID `actions/download-artifact` step): the action otherwise creates `dist/<artifact-name>/`, which made `release_checks.py prepare` reject the tested artifact (`Unexpected distributions for evoxc-0.2.2: ['evoxc-dist']`) before it could stage the GitHub draft. `manifest()` now fails closed with an explicit "must hold the distribution files FLAT" diagnostic naming the nested directory, a workflow-wiring test requires every `dist/` download step to declare `name:` or `merge-multiple: true`, and a `workflow_dispatch` rehearsal runs that same flat-`dist/` manifest check (read-only) so the last-mile staging step is exercised before a tag.
@@ -93,6 +95,7 @@ scheduling and code generation are delegated to external compilers.
   `uv sync --all-packages` (e.g. `uv sync --all-packages --extra dev`); a plain
   `uv sync` installs the root project only and uninstalls the workspace member.
 
+[0.2.3]: https://github.com/EMI-Group/evoxc/releases/tag/v0.2.3
 [0.2.2]: https://github.com/EMI-Group/evoxc/releases/tag/v0.2.2
 [0.2.1]: https://github.com/EMI-Group/evoxc/releases/tag/v0.2.1
 [0.2.0]: https://github.com/EMI-Group/evoxc/releases/tag/v0.2.0
