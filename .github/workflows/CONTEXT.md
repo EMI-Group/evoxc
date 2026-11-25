@@ -9,6 +9,7 @@ These workflows test and package the two distributions from one workspace, relea
 - `ci.yml` is the push-to-`main`/PR gate and a reusable `workflow_call` with required `checkout_sha`; callers pin their checked-out commit.
 - CI runs the Python 3.11–3.14 test matrix, the Python 3.12 compiler leg, the two-distribution packaging/boundary check, and `cargo test --locked --workspace` plus `cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings` in `native/`.
 - The `packaging` job runs the release helper regression suite once on Python 3.12 in both normal and reusable CI with `uv run --no-project --python 3.12 python -m unittest discover -s .github/workflows -p 'test_release_checks.py'`.
+- The same `packaging` job runs the version-bump helper suite on Python 3.12 with `uv run --no-project --python 3.12 python -m unittest discover -s scripts -p 'test_*.py'`, which discovers `scripts/test_bump_version.py` from the repository root.
 - `release.yml` triggers on a new `v*` tag push, no-input `workflow_dispatch`, and a published GitHub Release tagged `evoxc-hf-v*`.
 - On an `evoxc` tag push, `verify` matches the peeled tag commit and tag object to the event and checkout, requires membership in `origin/main` history, and requires the exact tag `v<version>` from the root `pyproject.toml`.
 - `verify` → `ci` → `wheels` is shared by the tag and the `main`-only rehearsal (`gh workflow run release.yml --ref main`); rehearsals have no release-write or OIDC jobs.
@@ -24,6 +25,7 @@ These workflows test and package the two distributions from one workspace, relea
 
 - CI uses `uv sync --locked --all-packages` and runs pytest with the same lock and workspace flags so the member remains installed and dependencies do not re-resolve.
 - CI's `uv build` writes `dist/.gitignore`, which is excluded from archive counts and publication; each project must ship only its own module.
+- The version-bump helper (`scripts/bump_version.py`) and its tests are stdlib-only and run in the `packaging` job, so that gate needs no project environment.
 - The workflows never create or move a tag, change a version, or publish from manual-dispatch input; the two project `pyproject.toml` files are authoritative for their respective versions.
 - GitHub Release writes are job-scoped, and only `publish-evoxc` and `publish-evoxc-hf` have `id-token: write` and target the `pypi` environment; both PyPI trusted publishers bind to `release.yml` in `EMI-Group/evoxc`.
 - Per-tag concurrency prevents release runs from overlapping; maintainers should protect release tags against mutation and configure `pypi` deployment rules for the approved tags only.
