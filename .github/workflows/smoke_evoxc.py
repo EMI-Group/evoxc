@@ -34,7 +34,22 @@ lowered = evoxc.lower(gradient, backend="native")
 executable = evoxc.load(evoxc.compile(lowered))
 result = evoxc.run(executable, evoxc.tensor([2.0, -3.0], dtype=evoxc.float32))
 np.testing.assert_array_equal(result.numpy(), np.array([4.0, -6.0], dtype=np.float32))
-print(f"evoxc {expected}: installed native extension at {_evoxc_native.__file__}; graph OK")
+
+# The same graph through the default numpy backend, staged just as explicitly.
+lowered_np = evoxc.lower(gradient, backend="numpy")
+executable_np = evoxc.load(evoxc.compile(lowered_np))
+result_np = evoxc.run(executable_np, evoxc.tensor([2.0, -3.0], dtype=evoxc.float32))
+np.testing.assert_array_equal(result_np.numpy(), np.array([4.0, -6.0], dtype=np.float32))
+
+# Graph.save/Graph.load is the documented persistence round-trip; it delegates
+# to persist.save_object/load_object, whose own signatures take encoded payloads.
+path = "smoke.graph"
+graph.save(path)
+loaded = evoxc.Graph.load(path)
+assert loaded.digest() == graph.digest(), (loaded.digest(), graph.digest())
+
+print(f"evoxc {expected}: installed native extension at {_evoxc_native.__file__}; "
+      "graph OK on native and numpy backends; graph persistence round-trip OK")
 """
 
 
