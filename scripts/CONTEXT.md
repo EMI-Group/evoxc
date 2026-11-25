@@ -10,13 +10,14 @@ Flags: `--dry-run` (print the plan and unified diffs, write nothing), `--yes`/`-
 Files it bumps: `pyproject.toml` (`[project].version` only), `native/Cargo.toml` (`[workspace.package].version` plus the `version` of the five internal `[workspace.dependencies]` entries `evoxc-core`/`evoxc-compiler`/`evoxc-runtime`/`evoxc-cpu`/`evoxc`), `native/Cargo.lock` (the six workspace-member `[[package]]` blocks), `uv.lock` (the `[[package]]` block `name = "evoxc"` only) and `CHANGELOG.md` (release `## [Unreleased]` as `## [X.Y.Z] - <today>`, open a fresh empty `## [Unreleased]` above it, and add the `[X.Y.Z]: .../releases/tag/vX.Y.Z` link reference in descending order).
 Files it deliberately never touches: `evoxc_hf/pyproject.toml` and the `evoxc-hf` `uv.lock` block (that distribution is versioned and released independently), `RELEASING.md`, any `CONTEXT.md`, the README and every doc, and every byte of the bumped files outside the listed values.
 `CHANGELOG.md` patching is idempotent: an existing version heading or link reference is never duplicated, so re-running the same bump changes nothing.
-`scripts/test_bump_version.py` — stdlib `unittest` suite for the pure patch functions and the full flow, run with `python -m unittest discover -s scripts -p 'test_*.py'` from the repository root (wired into CI with that exact command).
+`scripts/test_bump_version.py` — stdlib `unittest` suite for the pure patch functions and the full flow, run with `python -m unittest discover -s scripts -p 'test_*.py'` from the repository root (wired into CI by that command run twice, on the 3.12 leg and the 3.11 floor).
 ## Constraints
 Standard library only (`argparse`, `difflib`, `re`, `shlex`, `subprocess`, `sys`, `tomllib`, `dataclasses`, `datetime`, `pathlib`); no uv, cargo, ruff or pytest dependency at runtime.
 Never moves, reuses or deletes a tag: a bump onto an existing `v<version>` fails up front, before a single byte is written.
 Commits only its own files — `git add -- <paths>` then `git commit -m <msg> -- <paths>` (a path-limited commit builds a temporary index from the listed paths) — and verifies the result against `git show --name-only --format= HEAD`, so an unrelated staged or dirty file can never ride along.
 Leaves the working tree otherwise untouched: every other file keeps its bytes, and `--no-commit` / a declined commit leaves the modified files in place for inspection.
-Files are read and written with `newline=""` and `encoding="utf-8"`, so a CRLF checkout is not mass-rewritten.
+File reads go through the `_read_text` helper (`path.open("r", encoding="utf-8", newline="")`) and writes through `Path.write_text(..., encoding="utf-8", newline="")`, so a CRLF checkout is not mass-rewritten.
+`Path.read_text(newline=...)` is Python 3.13+ while this script and its CI suite run on the 3.11 floor / the CI 3.12 leg, so no read may use it, and `./test_bump_version.py` guards that statically (plus a test that the helper does not translate `\r\n`).
 Lock files are patched in place, so `uv sync --locked` and `cargo --locked` stay green without re-locking.
 Push is `git push --atomic <remote> <branch>:refs/heads/<branch> refs/tags/v<version>` (branch-only with `--no-tag`); it never force-pushes, and git's stderr is surfaced verbatim on failure.
 Non-interactive stdin without `--yes` fails closed before making changes, and the non-`main` branch guard warns that the release gate requires the tagged commit on `origin/main` (default answer NO; `--allow-branch` skips it).
@@ -25,6 +26,6 @@ Non-interactive stdin without `--yes` fails closed before making changes, and th
 | Path | Area |
 |---|---|
 | `./bump_version.py` | the release-version bump CLI: pure patch helpers (`normalize_version`, `patch_pyproject`, `patch_cargo_manifest`, `patch_cargo_lock`, `patch_uv_lock`, `patch_changelog`) plus the thin `main` that plans, confirms, writes, commits, tags and pushes. |
-| `./test_bump_version.py` | its stdlib `unittest` suite: fixture-based patch tests and end-to-end runs in throwaway `tempfile` git repositories (never the real checkout). |
+| `./test_bump_version.py` | its stdlib `unittest` suite: fixture-based patch tests and end-to-end runs in throwaway `tempfile` git repositories (never the real checkout), plus the Python-floor guard that no `read_text` call passes `newline` (Python 3.13+) and that the `_read_text` helper preserves `\r\n`. |
 | `./build-native.sh` | builds the Rust/PyO3 extension for the local dev environment. |
 | `./dev-env.sh` | sets up the NixOS/uv/`CARGO_HOME` development environment. |

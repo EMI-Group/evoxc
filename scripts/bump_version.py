@@ -110,6 +110,10 @@ def _body(line: str) -> str:
 def _eol(line: str) -> str:
     """The line's exact terminator (``""`` for an unterminated last line)."""
     return line[len(_body(line)) :]
+def _read_text(path: Path) -> str:
+    """Read UTF-8 text without newline translation (works on the Python 3.11 floor)."""
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def _set_key_value(body: str, key_pattern: str, value: str) -> tuple[str, str | None]:
@@ -405,7 +409,7 @@ def build_patches(
         if not file_path.is_file():
             print(f"warning: {path} not found; skipping", file=sys.stderr)
             continue
-        original = file_path.read_text(encoding="utf-8", newline="")
+        original = _read_text(file_path)
         updated, edits = patcher(original, version)
         patches.append(FilePatch(path, original, updated, edits))
     return patches
@@ -426,7 +430,7 @@ def read_project_version(root: Path) -> str:
     """The declared root ``[project].version``."""
     path = root / PYPROJECT
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        data = tomllib.loads(_read_text(path))
     except FileNotFoundError:
         raise BumpError(f"{path} does not exist") from None
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:

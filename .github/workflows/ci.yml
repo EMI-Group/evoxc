@@ -181,8 +181,10 @@ jobs:
       - name: Run release helper unit tests
         run: uv run --no-project --python 3.12 python -m unittest discover -s .github/workflows -p 'test_release_checks.py'
 
-      - name: Run version-bump helper unit tests
+      - name: Run version-bump helper unit tests (3.12)
         run: uv run --no-project --python 3.12 python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Run version-bump helper unit tests (3.11 floor)
+        run: uv run --no-project --python 3.11 python -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Set up Rust (maturin builds evoxc._evoxc_native)
         uses: dtolnay/rust-toolchain@stable
