@@ -5,7 +5,7 @@
 # publishing: the pinned artifact must also unpack into a flat dist/ with the expected
 # release names and SHA-256s, but a rehearsal makes no GitHub API call and no upload.
 name: Release
-run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (gate, then build and smoke tests)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (gate, build, smoke and staging checks)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
 
 on:
   push:
