@@ -331,6 +331,57 @@ class DistTests(unittest.TestCase):
             release.main("dist", str(directory))
             release.main("dist")
 
+    def test_accepts_maturin_bundled_shared_libraries(self):
+        variants = (
+            (self.WHEEL, []),
+            (f"evoxc-{self.VERSION}-cp311-abi3-musllinux_1_2_x86_64.whl",
+             ["evoxc.libs/libgcc_s-f685abf1.so.1"]),
+            (f"evoxc-{self.VERSION}-cp311-abi3-musllinux_1_2_aarch64.whl",
+             ["evoxc.libs/libgcc_s-0bf60adc.so.1"]),
+            (f"evoxc-{self.VERSION}-cp311-abi3-manylinux_2_17_x86_64.whl",
+             ["evoxc.libs/", "evoxc.libs/libfoo.so", "evoxc.libs/libbar.so.1",
+              "evoxc.libs/libbaz.dylib", "evoxc.libs/libqux.dll"]),
+        )
+        for name, bundled in variants:
+            with self.subTest(wheel=name, bundled=bundled):
+                directory = self.fixture()
+                (directory / self.WHEEL).unlink()
+                self.wheel(directory, name, [*self.WHEEL_ENTRIES, *bundled])
+                release.dist_check(directory)
+
+    def test_rejects_non_shared_library_files_in_bundled_libs(self):
+        def with_python_file(directory):
+            self.wheel(directory, self.WHEEL, [*self.WHEEL_ENTRIES, "evoxc.libs/notes.py"])
+
+        def with_nested_library(directory):
+            self.wheel(directory, self.WHEEL, [*self.WHEEL_ENTRIES, "evoxc.libs/nested/libfoo.so"])
+
+        def with_libs_file(directory):
+            self.wheel(directory, self.WHEEL, [*self.WHEEL_ENTRIES, "evoxc.libs"])
+
+        for mutation in (with_python_file, with_nested_library, with_libs_file):
+            self.assert_dist_fails(mutation, "shared-library files")
+        for entry in ("evoxc.libs/notes.py", "evoxc.libs/nested/libfoo.so", "evoxc.libs"):
+            directory = self.fixture()
+            self.wheel(directory, self.WHEEL, [*self.WHEEL_ENTRIES, entry])
+            with self.assertRaises(release.ReleaseError) as caught:
+                release.dist_check(directory)
+            self.assertIn(entry, str(caught.exception))
+
+    def test_rejects_bundled_library_directory_in_the_evoxc_hf_wheel(self):
+        def with_bundled_library(directory):
+            self.wheel(directory, self.HF_WHEEL, [*self.HF_WHEEL_ENTRIES, "evoxc_hf.libs/libfoo.so"])
+
+        self.assert_dist_fails(with_bundled_library, "top-level entries must be exactly")
+
+    def test_accepts_compressed_multi_tag_wheel_names(self):
+        directory = self.fixture()
+        (directory / self.WHEEL).unlink()
+        self.wheel(directory,
+                   f"evoxc-{self.VERSION}-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+                   self.WHEEL_ENTRIES)
+        release.dist_check(directory)
+
     def test_rejects_wrong_evoxc_wheel_set(self):
         def duplicate_wheel(directory):
             self.wheel(directory, f"evoxc-{self.VERSION}-cp312-abi3-macosx_11_0_arm64.whl",

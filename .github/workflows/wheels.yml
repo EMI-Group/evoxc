@@ -226,9 +226,20 @@ jobs:
               seen.update(tags)
               with zipfile.ZipFile(wheel) as archive:
                   entries = archive.infolist()
-                  assert {entry.filename.split("/", 1)[0] for entry in entries} == {
-                      "evoxc", f"evoxc-{version}.dist-info",
-                  }, wheel.name
+                  names = [entry.filename for entry in entries]
+                  tops = {name.split("/", 1)[0] for name in names}
+                  expected_tops = {"evoxc", f"evoxc-{version}.dist-info"}
+                  unexpected = sorted(tops - expected_tops - {"evoxc.libs"})
+                  assert not unexpected, (wheel.name, "unexpected top-level entries", unexpected, sorted(tops))
+                  missing = sorted(expected_tops - tops)
+                  assert not missing, (wheel.name, "missing top-level entries", missing, sorted(tops))
+                  bundled = [name for name in names
+                             if name == "evoxc.libs" or name.startswith("evoxc.libs/")]
+                  bad = [name for name in bundled if name != "evoxc.libs/" and not re.fullmatch(
+                      r"evoxc\.libs/[^/]+\.(?:so(?:\.\d+)?|dylib|dll)", name
+                  )]
+                  assert not bad, (wheel.name, "evoxc.libs/ may hold only flat shared-library files "
+                                   "(.so, .so.<digits>, .dylib, .dll)", bad, sorted(bundled))
                   extensions = [entry for entry in entries if re.fullmatch(
                       r"evoxc/_evoxc_native\.(abi3\.)?(so|pyd|dylib)", entry.filename
                   )]
