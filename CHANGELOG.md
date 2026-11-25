@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-11-25
 ### Changed
 - The `xla` adapter now **registers without probing** for a plugin: its dependency is a per-call artifact (`plugin_path`, `EVOXC_PJRT_PLUGIN` or a discovered plugin `.so`), so a class-level probe could never see the option that makes it usable. `evoxc.backends.get("xla")` therefore succeeds on any machine, availability is decided where the options exist (`compile`/`load`), and the actionable four-step discovery message is raised there — `XlaBackend.check_available()` remains the explicit option-less preflight.
 - `evoxc.build` and `evoxc.build_cached` now forward their resolved options to the `load` hop as their docstrings always promised (previously dropped), so a load-stage option works through the sugar: `evoxc.build(fn, spec, backend="xla", device="rocm", plugin_path=<plugin .so>)` no longer fails with the plugin-missing error at the load hop. `Backend.load` gained the matching `options=None` parameter (numpy and tvm accept and ignore it, as they already do in `run`); no public signature changed positionally.
@@ -84,4 +86,5 @@ scheduling and code generation are delegated to external compilers.
   `uv sync --all-packages` (e.g. `uv sync --all-packages --extra dev`); a plain
   `uv sync` installs the root project only and uninstalls the workspace member.
 
+[0.2.0]: https://github.com/EMI-Group/evoxc/releases/tag/v0.2.0
 [0.1.0]: https://github.com/EMI-Group/evoxc/releases/tag/v0.1.0

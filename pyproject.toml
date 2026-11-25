@@ -14,7 +14,7 @@ build-backend = "maturin"
 
 [project]
 name = "evoxc"
-version = "0.1.0"
+version = "0.2.0"
 description = "EvoX Compiler — a minimal, explicit, compiler-neutral tensor graph compiler and runtime"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"

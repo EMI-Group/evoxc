@@ -2,7 +2,7 @@
 resolver = "2"
 members = ["evoxc-core", "evoxc-compiler", "evoxc-runtime", "evoxc-cpu", "evoxc", "evoxc-python"]
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -12,11 +12,11 @@ documentation = "https://docs.rs/evoxc"
 keywords = ["tensor", "compiler", "graph", "autodiff", "numerical"]
 categories = ["compilers", "science", "mathematics"]
 [workspace.dependencies]
-evoxc-core = { version = "0.1.0", path = "evoxc-core" }
-evoxc-compiler = { version = "0.1.0", path = "evoxc-compiler" }
-evoxc-runtime = { version = "0.1.0", path = "evoxc-runtime" }
-evoxc-cpu = { version = "0.1.0", path = "evoxc-cpu" }
-evoxc = { version = "0.1.0", path = "evoxc" }
+evoxc-core = { version = "0.2.0", path = "evoxc-core" }
+evoxc-compiler = { version = "0.2.0", path = "evoxc-compiler" }
+evoxc-runtime = { version = "0.2.0", path = "evoxc-runtime" }
+evoxc-cpu = { version = "0.2.0", path = "evoxc-cpu" }
+evoxc = { version = "0.2.0", path = "evoxc" }
 serde_json = "1"
 base64 = "0.22"
 [profile.release]
