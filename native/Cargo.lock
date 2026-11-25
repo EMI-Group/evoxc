@@ -240,7 +240,7 @@ checksum = "2b14b339eb76d07f052cdbad76ca7c1310e56173a138095d3bf42a23c06ef5d8"
 
 [[package]]
 name = "evoxc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "evoxc-compiler",
  "evoxc-core",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "evoxc-compiler"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "evoxc-core",
  "serde_json",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "evoxc-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "serde_json",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "evoxc-cpu"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "evoxc-core",
  "faer",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "evoxc-python"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "evoxc",
  "half",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "evoxc-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "evoxc-core",
 ]
