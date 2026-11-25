@@ -56,11 +56,17 @@ gh workflow run release.yml --ref main
 ```
 
 There are no inputs and no release-write or OIDC jobs in a rehearsal. It pins the
-selected `main` commit and follows the same `verify → ci → wheels` gates as a real
-`evoxc` release. `wheels.yml` is a reusable workflow, not a separate dispatch or
-PR trigger. `ci.yml` runs Python 3.11–3.14 tests on Ubuntu, the Python 3.12 compiler
-leg, the two-project packaging check, and locked Rust tests and Clippy. It also
-runs normally on PRs and pushes to `main`.
+selected `main` commit and follows the same `verify → gate → wheels` checks as a
+real `evoxc` release. `release_gate.yml` is the quick end-to-end gate (a few
+minutes): it builds both distributions, checks the built archives with
+`release_checks.py dist`, installs the built `evoxc` wheel in fresh venvs on the
+abi3 floor (Python 3.11) and ceiling (Python 3.14) and runs a small
+trace/differentiate/compile/run smoke there, then installs both wheels together
+and runs a tiny `evoxc_hf` forward against the numpy oracle. It deliberately runs
+no pytest, no Rust test suite and no compiler extras; `ci.yml` keeps the full
+Python 3.11–3.14 matrix, the Python 3.12 compiler leg, the two-project packaging
+check, and locked Rust tests and Clippy, and runs on PRs and pushes to `main`.
+`wheels.yml` is a reusable workflow, not a separate dispatch or PR trigger.
 
 For local checks from the checkout (use an empty output directory):
 
@@ -69,6 +75,7 @@ uv sync --locked --all-packages --extra dev
 uv run --locked --all-packages --extra dev pytest -q
 uv build --all-packages --out-dir dist
 uvx twine check dist/*
+python3 .github/workflows/release_checks.py dist
 ```
 
 These commands require a Rust toolchain and a C compiler on `PATH` to build
@@ -109,10 +116,10 @@ These commands require a Rust toolchain and a C compiler on `PATH` to build
    The commit need not still be the tip of `main`. The tag must be exactly `v`
    plus the version declared **at that commit**. The source gate checks the tag
    object and peeled commit against the event and checkout, checks ancestry, and
-   passes the pinned SHA to CI and the wheel build. An update to an existing tag
-   is not a release trigger. Do not create a draft or public release manually for
-   this tag.
-3. Watch **Release** in Actions. After `verify → ci → wheels`, `prepare` stages a
+   passes the pinned SHA to the release gate and the wheel build. An update to an
+   existing tag is not a release trigger. Do not create a draft or public release
+   manually for this tag.
+3. Watch **Release** in Actions. After `verify → gate → wheels`, `prepare` stages a
    GitHub draft with the tested archives and checks their SHA-256 digests. A
    matching draft from an earlier attempt can be resumed; a conflicting one is
    rejected. If `pypi` has required reviewers, `publish-evoxc` waits for their
@@ -144,8 +151,9 @@ The exact sdist is built and installed from source on x86-64 `ubuntu-24.04` with
 Rust available. All eight smoke tests use ordinary **CPython 3.11**, a fresh venv
 outside the checkout and `pip --isolated install --no-cache-dir` on the exact
 archive (`--only-binary=:all:` on wheel legs). They verify the installed versions
-and extension provenance, trace a graph, differentiate it in Rust, and execute
-it on the native backend. Collection verifies the exact matrix and archive
+and extension provenance, trace a graph, differentiate it in Rust, execute it on
+the native and default numpy backends, and round-trip the graph through
+persistence. Collection verifies the exact matrix and archive
 contents and runs `twine check --strict`. Each wheel carries `evoxc` and the
 native extension, not `evoxc_hf`; the sdist carries the whole Rust workspace,
 including the facade crate, but no compiled extension and no `evoxc_hf`.
@@ -206,7 +214,7 @@ failure, use **Re-run failed jobs**, not **Re-run all jobs**, a new run or a new
 gh run rerun RUN_ID --failed
 ```
 
-- **Source, CI or build gate failed:** `evoxc` has not reached draft or publish.
+- **Source, release-gate or wheel-build step failed:** `evoxc` has not reached draft or publish.
   Retry transient failures in the same run. If a committed fix is needed, rehearse
   it on `main` and use a new valid version/tag; do not move the old tag.
 - **Draft staging failed:** retry with the same tested artifact. Staging fills in
