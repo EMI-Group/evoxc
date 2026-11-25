@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- The release artifact checks accept maturin's `evoxc.libs/` bundled shared-library directory, which its manylinux/musllinux repair creates (both musllinux wheels carry `evoxc.libs/libgcc_s-<hash>.so.1` with the extension's RPATH pointing at it, and the dist-info RECORD lists it). The `wheels.yml` matrix check and `release_checks.py dist` now require that directory to hold flat `.so`/`.so.<digits>`/`.dylib`/`.dll` files only instead of rejecting the wheel, while the pure-Python `evoxc-hf` wheel still carries no such directory and the one-module-per-distribution boundary is unchanged.
 
 ## [0.2.1] - 2026-11-25
 
