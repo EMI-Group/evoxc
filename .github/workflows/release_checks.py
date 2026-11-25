@@ -90,6 +90,21 @@ def top_level(entries):
     return {entry.split("/")[0] for entry in entries}
 
 
+BUNDLED_LIBS = "evoxc.libs"
+SHARED_LIBRARY_BASENAME = re.compile(r"[^/]+\.(?:so(?:\.\d+)?|dylib|dll)")
+
+
+def check_bundled_libraries(entries, artifact):
+    """Validate maturin's optional `evoxc.libs/` repair directory: flat shared libraries only."""
+    prefix = BUNDLED_LIBS + "/"
+    invalid = sorted(entry for entry in entries
+                     if entry == BUNDLED_LIBS
+                     or (entry.startswith(prefix) and entry != prefix
+                         and not SHARED_LIBRARY_BASENAME.fullmatch(entry[len(prefix):])))
+    require(not invalid, f"{artifact}: {prefix} may hold only flat shared-library files "
+                         f"(.so, .so.<digits>, .dylib, .dll); found {invalid}")
+
+
 def wheel_entries(artifact):
     with zipfile.ZipFile(artifact) as archive:
         return archive.namelist()
@@ -118,7 +133,7 @@ def dist_check(directory=DIST):
     pure = directory / f"evoxc-{version}-py3-none-any.whl"
     require(not pure.is_file(), f"{pure}: the root `evoxc` project embeds a Rust/PyO3 extension, "
                                 "so its wheel must be platform-specific")
-    require(re.fullmatch(rf"evoxc-{re.escape(version)}-cp\d+-abi3-[a-z0-9_]+\.whl", wheel.name),
+    require(re.fullmatch(rf"evoxc-{re.escape(version)}-cp\d+-abi3-[a-z0-9_.]+\.whl", wheel.name),
             f"{wheel}: the evoxc wheel must be a per-platform cp<digits>-abi3 wheel "
             "(it embeds a Rust/PyO3 extension)")
 
@@ -132,28 +147,36 @@ def dist_check(directory=DIST):
     require(count == 4, f"{directory}: expected exactly 4 wheel/sdist artifacts (evoxc + evoxc_hf, a "
                         f"wheel and an sdist each), got {count} file(s)")
 
-    # 3. The `evoxc` wheel ships exactly `evoxc` (including the compiled extension) + its dist-info.
+    # 3. The `evoxc` wheel ships exactly `evoxc` (including the compiled extension) + its dist-info,
+    #    plus at most maturin's `evoxc.libs/` repair directory holding flat shared libraries.
     entries = wheel_entries(wheel)
     tops = top_level(entries)
     bad = sorted(entry for entry in tops if entry.startswith("evoxc_hf"))
     require(not bad, f"{wheel}: ships {bad} — `evoxc_hf` belongs to the SEPARATE distribution "
                      "`evoxc-hf` (`evoxc_hf/pyproject.toml`) and must never be inside the `evoxc` one")
     expected = {"evoxc", f"evoxc-{version}.dist-info"}
-    require(tops == expected, f"{wheel}: top-level entries must be exactly {sorted(expected)}, "
-                              f"got {sorted(tops)}")
+    unexpected = sorted(tops - expected - {BUNDLED_LIBS})
+    require(not unexpected, f"{wheel}: top-level entries must be exactly {sorted(expected)} plus at most "
+                            f"a `{BUNDLED_LIBS}/` bundled shared-library directory; found unexpected "
+                            f"{unexpected} among {sorted(tops)}")
+    missing = sorted(expected - tops)
+    require(not missing, f"{wheel}: top-level entries must be exactly {sorted(expected)} plus at most a "
+                         f"`{BUNDLED_LIBS}/` directory; missing {missing} among {sorted(tops)}")
+    check_bundled_libraries(entries, wheel)
     extension = "evoxc/_evoxc_native.abi3.so"
     require(extension in entries, f"{wheel}: ships no {extension} — maturin must compile the extension "
                                   "from ./native/ and install it in the `evoxc` package")
 
-    # 4. The `evoxc_hf` wheel ships exactly `evoxc_hf` + its dist-info, never `evoxc` or a compiled file.
+    # 4. The `evoxc_hf` wheel ships exactly `evoxc_hf` + its dist-info, never `evoxc`, a compiled file
+    #    or a bundled-library directory (it is pure Python).
     entries = wheel_entries(hf_wheel)
     tops = top_level(entries)
     bad = sorted(entry for entry in entries if entry == "evoxc" or entry.startswith("evoxc/"))
     require(not bad, f"{hf_wheel}: ships the `evoxc` package ({bad[:5]}) — `evoxc` is the workspace ROOT "
                      "distribution and a declared runtime dependency, never vendored into `evoxc-hf`")
     expected = {"evoxc_hf", f"evoxc_hf-{hf_version}.dist-info"}
-    require(tops == expected, f"{hf_wheel}: top-level entries must be exactly {sorted(expected)}, "
-                              f"got {sorted(tops)}")
+    require(tops == expected, f"{hf_wheel}: top-level entries must be exactly {sorted(expected)} — the "
+                              f"pure-Python wheel carries no bundled-library directory; got {sorted(tops)}")
     compiled = sorted(entry for entry in entries if entry.endswith((".so", ".pyd", ".dylib")))
     require(not compiled, f"{hf_wheel}: ships compiled artifacts ({compiled[:5]}) — `evoxc-hf` is pure Python")
 
