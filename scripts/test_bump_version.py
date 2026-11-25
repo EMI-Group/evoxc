@@ -23,7 +23,8 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 import bump_version  # noqa: E402  (path bootstrap above)
 
@@ -529,6 +530,37 @@ class BuildAndWriteTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Python-floor guards                                                          #
+# --------------------------------------------------------------------------- #
+class PythonFloorGuardTests(unittest.TestCase):
+    """Guard the Python 3.11 floor (and the CI 3.12 leg) of these two modules."""
+
+    SOURCES = ("bump_version.py", "test_bump_version.py")
+
+    def test_no_read_text_call_passes_a_newline_argument(self):
+        # `Path.read_text` only gained `newline` in Python 3.13; the CI 3.12 leg
+        # and the documented 3.11 floor reject it with a TypeError.
+        pattern = re.compile(r"read_text\s*\([^)]*?newline\s*=", re.DOTALL)
+        for name in self.SOURCES:
+            path = SCRIPTS_DIR / name
+            source = path.read_bytes().decode("utf-8")
+            match = pattern.search(source)
+            self.assertIsNone(
+                match,
+                f"{name}: `Path.read_text` with a newline keyword is Python 3.13+ "
+                "but this script and its CI suite run on the 3.11 floor / the CI "
+                "3.12 leg; open the file with newline='' instead",
+            )
+
+    def test_read_text_helper_does_not_translate_newlines(self):
+        payload = b"a = 1\r\nb = 2\rc = 3\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mixed.txt"
+            path.write_bytes(payload)
+            self.assertEqual(bump_version._read_text(path), payload.decode("utf-8"))
+
+
+# --------------------------------------------------------------------------- #
 # Integration in throwaway git repositories                                    #
 # --------------------------------------------------------------------------- #
 
@@ -585,7 +617,8 @@ class RepoTestCase(unittest.TestCase):
         return _git(self.root, "rev-parse", ref).stdout.strip()
 
     def read(self, relative: str) -> str:
-        return (self.root / relative).read_text(encoding="utf-8", newline="")
+        with (self.root / relative).open("r", encoding="utf-8", newline="") as handle:
+            return handle.read()
 
     def status(self) -> str:
         return _git(self.root, "status", "--porcelain").stdout
