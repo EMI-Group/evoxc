@@ -1,8 +1,12 @@
 """Local tests: python3 -m unittest discover -s .github/workflows -p 'test_release_checks.py'."""
 
+import io
 import json
+import os
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import call, patch
 from urllib.error import HTTPError, URLError
@@ -251,6 +255,173 @@ class EvoxcPublicationTests(unittest.TestCase):
                     release.main("finalize")
                 self.github.assert_called_once_with("git/ref/tags/" + TAG)
                 self.output.assert_not_called()
+
+
+class DistTests(unittest.TestCase):
+    VERSION = "1.2.3"
+    HF_VERSION = "4.5.6"
+    WHEEL = f"evoxc-{VERSION}-cp311-abi3-linux_x86_64.whl"
+    WHEEL_ENTRIES = ["evoxc/__init__.py", "evoxc/_evoxc_native.abi3.so",
+                     f"evoxc-{VERSION}.dist-info/METADATA"]
+    SDIST = f"evoxc-{VERSION}.tar.gz"
+    SDIST_ENTRIES = [f"evoxc-{VERSION}/pyproject.toml", f"evoxc-{VERSION}/native/Cargo.toml",
+                     f"evoxc-{VERSION}/native/evoxc-python/Cargo.toml"]
+    HF_WHEEL = f"evoxc_hf-{HF_VERSION}-py3-none-any.whl"
+    HF_WHEEL_ENTRIES = ["evoxc_hf/__init__.py", f"evoxc_hf-{HF_VERSION}.dist-info/METADATA"]
+    HF_SDIST = f"evoxc_hf-{HF_VERSION}.tar.gz"
+    HF_SDIST_ENTRIES = [f"evoxc_hf-{HF_VERSION}/LICENSE", f"evoxc_hf-{HF_VERSION}/pyproject.toml"]
+
+    def setUp(self):
+        self.old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.old_cwd)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def wheel(self, directory, name, entries):
+        with zipfile.ZipFile(directory / name, "w") as archive:
+            for entry in entries:
+                archive.writestr(entry, "")
+
+    def sdist(self, directory, name, entries):
+        with tarfile.open(directory / name, "w:gz") as archive:
+            for entry in entries:
+                info = tarfile.TarInfo(entry)
+                info.size = 0
+                archive.addfile(info, io.BytesIO(b""))
+
+    def build(self, directory):
+        self.wheel(directory, self.WHEEL, self.WHEEL_ENTRIES)
+        self.sdist(directory, self.SDIST, self.SDIST_ENTRIES)
+        self.wheel(directory, self.HF_WHEEL, self.HF_WHEEL_ENTRIES)
+        self.sdist(directory, self.HF_SDIST, self.HF_SDIST_ENTRIES)
+
+    def fixture(self):
+        """Build a fresh valid four-archive tree in a new directory and chdir into it."""
+        root = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        os.chdir(root)
+        Path(root, "pyproject.toml").write_text(f'[project]\nversion = "{self.VERSION}"\n')
+        Path(root, "evoxc_hf").mkdir()
+        Path(root, "evoxc_hf", "pyproject.toml").write_text(f'[project]\nversion = "{self.HF_VERSION}"\n')
+        directory = Path(root, "dist")
+        directory.mkdir()
+        self.build(directory)
+        return directory
+
+    def assert_dist_fails(self, mutation, message):
+        with self.subTest(mutation=mutation.__name__):
+            directory = self.fixture()
+            mutation(directory)
+            with self.assertRaisesRegex(release.ReleaseError, message):
+                release.dist_check(directory)
+
+    def test_valid_tree_passes_with_default_and_explicit_directory(self):
+        directory = self.fixture()
+        release.dist_check()
+        release.dist_check(directory)
+        release.dist_check(str(directory))
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            release.dist_check(directory)
+        self.assertEqual(stdout.getvalue().splitlines(), [
+            f"ok: evoxc {self.VERSION} wheel/sdist ship `evoxc` + the abi3 extension only; "
+            f"evoxc_hf {self.HF_VERSION} wheel/sdist ship `evoxc_hf` only"])
+
+    def test_main_dispatches_dist_without_release_environment(self):
+        directory = self.fixture()
+        with patch.object(release, "ENV", {}):
+            release.main("dist", str(directory))
+            release.main("dist")
+
+    def test_rejects_wrong_evoxc_wheel_set(self):
+        def duplicate_wheel(directory):
+            self.wheel(directory, f"evoxc-{self.VERSION}-cp312-abi3-macosx_11_0_arm64.whl",
+                       [f"evoxc-{self.VERSION}.dist-info/METADATA"])
+
+        def drop_wheel(directory):
+            (directory / self.WHEEL).unlink()
+
+        def pure_python_wheel(directory):
+            (directory / self.WHEEL).unlink()
+            self.wheel(directory, f"evoxc-{self.VERSION}-py3-none-any.whl", self.WHEEL_ENTRIES)
+
+        self.assert_dist_fails(duplicate_wheel, "exactly one platform")
+        self.assert_dist_fails(drop_wheel, "exactly one platform")
+        self.assert_dist_fails(pure_python_wheel, "platform-specific")
+
+    def test_rejects_extra_or_missing_archives(self):
+        def extra_wheel(directory):
+            self.wheel(directory, "stray-1.0-py3-none-any.whl", ["stray/__init__.py"])
+
+        def extra_sdist(directory):
+            self.sdist(directory, "stray-1.0.tar.gz", ["stray-1.0/pyproject.toml"])
+
+        def missing_hf_wheel(directory):
+            (directory / self.HF_WHEEL).unlink()
+
+        for mutation in (extra_wheel, extra_sdist):
+            self.assert_dist_fails(mutation, "expected exactly 4")
+        self.assert_dist_fails(missing_hf_wheel, "missing artifact")
+
+    def test_rejects_evoxc_wheel_boundary_breaks(self):
+        def with_hf(directory):
+            self.wheel(directory, self.WHEEL, [*self.WHEEL_ENTRIES, "evoxc_hf/__init__.py"])
+
+        def without_extension(directory):
+            self.wheel(directory, self.WHEEL, [entry for entry in self.WHEEL_ENTRIES
+                                               if not entry.endswith(".so")])
+
+        def with_extra_top_level(directory):
+            self.wheel(directory, self.WHEEL, [*self.WHEEL_ENTRIES, "other/__init__.py"])
+
+        self.assert_dist_fails(with_hf, "evoxc_hf")
+        self.assert_dist_fails(without_extension, "ships no evoxc/_evoxc_native.abi3.so")
+        self.assert_dist_fails(with_extra_top_level, "top-level entries must be exactly")
+
+    def test_rejects_evoxc_sdist_boundary_breaks(self):
+        def wrong_root(directory):
+            self.sdist(directory, self.SDIST, [f"evoxc-9.9.9/{entry.split('/', 1)[1]}"
+                                               for entry in self.SDIST_ENTRIES])
+
+        def with_hf_path(directory):
+            self.sdist(directory, self.SDIST, [*self.SDIST_ENTRIES, f"evoxc-{self.VERSION}/evoxc_hf/pyproject.toml"])
+
+        def without_native_cargo(directory):
+            self.sdist(directory, self.SDIST, [entry for entry in self.SDIST_ENTRIES
+                                               if entry != f"evoxc-{self.VERSION}/native/Cargo.toml"])
+
+        self.assert_dist_fails(wrong_root, "single root")
+        self.assert_dist_fails(with_hf_path, "evoxc_hf")
+        self.assert_dist_fails(without_native_cargo, "native/Cargo.toml")
+
+    def test_rejects_evoxc_hf_wheel_boundary_breaks(self):
+        def with_evoxc(directory):
+            self.wheel(directory, self.HF_WHEEL, [*self.HF_WHEEL_ENTRIES, "evoxc/__init__.py"])
+
+        def with_compiled(directory):
+            self.wheel(directory, self.HF_WHEEL, [*self.HF_WHEEL_ENTRIES, "evoxc_hf/_extension.so"])
+
+        def with_extra_top_level(directory):
+            self.wheel(directory, self.HF_WHEEL, [*self.HF_WHEEL_ENTRIES, "other/__init__.py"])
+
+        self.assert_dist_fails(with_evoxc, "ships the `evoxc` package")
+        self.assert_dist_fails(with_compiled, "compiled artifacts")
+        self.assert_dist_fails(with_extra_top_level, "top-level entries must be exactly")
+
+    def test_rejects_evoxc_hf_sdist_boundary_breaks(self):
+        def without_license(directory):
+            self.sdist(directory, self.HF_SDIST, [entry for entry in self.HF_SDIST_ENTRIES
+                                                  if not entry.endswith("/LICENSE")])
+
+        def with_evoxc(directory):
+            self.sdist(directory, self.HF_SDIST, [*self.HF_SDIST_ENTRIES,
+                                                  f"evoxc_hf-{self.HF_VERSION}/evoxc/__init__.py"])
+
+        def wrong_root(directory):
+            self.sdist(directory, self.HF_SDIST, [f"evoxc_hf-9.9.9/{entry.split('/', 1)[1]}"
+                                                  for entry in self.HF_SDIST_ENTRIES])
+
+        self.assert_dist_fails(without_license, "LICENSE")
+        self.assert_dist_fails(with_evoxc, "ships the `evoxc` package")
+        self.assert_dist_fails(wrong_root, "single root")
 
 
 if __name__ == "__main__":
