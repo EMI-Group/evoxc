@@ -1,9 +1,11 @@
 # Trusted publishers for both projects are bound to release.yml / pypi.
 # An evoxc tag runs the quick release gate, then builds and smoke-tests the release distributions.
 # It stages a GitHub draft and makes it public only after PyPI has the same files.
-# Manual rehearsals stop after the gate and build checks, without publishing.
+# Manual rehearsals stop after the gate, the build checks and the staging check without
+# publishing: the pinned artifact must also unpack into a flat dist/ with the expected
+# release names and SHA-256s, but a rehearsal makes no GitHub API call and no upload.
 name: Release
-run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (gate, then build and smoke tests)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (gate, build, smoke and staging checks)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
 
 on:
   push:
@@ -59,6 +61,32 @@ jobs:
       checkout_sha: ${{ needs.verify.outputs.checkout_sha }}
       version: ${{ needs.verify.outputs.version }}
 
+  # A rehearsal dry-runs `prepare`'s local artifact check — the pinned artifact must unpack into a
+  # FLAT dist/ with the exact expected wheel/sdist names and SHA-256s — without creating, staging,
+  # uploading or otherwise touching any GitHub release, PyPI project or workflow token permission.
+  rehearse-stage:
+    name: Rehearse pinned-artifact staging checks
+    needs: [verify, wheels]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
+          path: release-source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
+          path: dist
+          merge-multiple: true
+      - name: Check the pinned artifact unpacks into a flat dist/
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: python3 release-source/.github/workflows/release_checks.py manifest
+
   prepare:
     name: Prepare and verify evoxc GitHub draft
     needs: [verify, gate, wheels]
@@ -88,6 +116,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
           path: dist
+          merge-multiple: true
       - id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,6 +148,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
           path: dist
+          merge-multiple: true
       - name: Recheck the verified draft, tag, and PyPI before uploading
         id: pypi
         env:
@@ -152,6 +182,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.wheels.outputs.artifact_id }}
           path: dist
+          merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
           CHECKOUT_SHA: ${{ needs.verify.outputs.checkout_sha }}
@@ -220,6 +251,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.build-evoxc-hf.outputs.artifact_id }}
           path: dist
+          merge-multiple: true
       - name: Check tag and PyPI state before uploading
         id: pypi
         env:
@@ -249,6 +281,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.build-evoxc-hf.outputs.artifact_id }}
           path: dist
+          merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.verify.outputs.tag }}
