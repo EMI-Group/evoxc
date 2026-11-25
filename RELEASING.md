@@ -77,14 +77,27 @@ These commands require a Rust toolchain and a C compiler on `PATH` to build
 
 ## Release `evoxc`
 
-1. In a reviewed change, set `[project].version` in the root `pyproject.toml`,
-   update `CHANGELOG.md`, and refresh `uv.lock` with `uv lock`. Merge to `main`.
-   Rehearse the candidate before tagging.
-2. Fetch `origin/main` and tag the intended merged commit, not an unmerged PR
-   commit or an unchecked local `HEAD`. These commands are illustrative for the
-   planned root release `0.2.0`. Run them only after the release change declaring
-   root `[project].version = "0.2.0"` has merged to `main` and the intended commit
-   has passed rehearsal. Substitute that commit's SHA for `RELEASE_SHA`:
+1. In a reviewed change, run `python scripts/bump_version.py <version>` from the
+   repository root (it accepts `vX.Y.Z` or `X.Y.Z`; pass `--dry-run` first to
+   preview the changes). The helper normalizes the version and bumps the root
+   `[project].version`, the `native/` Rust workspace version and its internal
+   dependency requirements, `uv.lock`, `native/Cargo.lock` and `CHANGELOG.md`,
+   then asks before committing those files only, creating the annotated
+   `v<version>` tag, and pushing the commit and tag. It never moves an existing
+   tag and commits only the version files, leaving a dirty working tree
+   otherwise alone. Options: `--no-cargo`, `--no-changelog`, `--no-push` and
+   `--yes` (use `--yes` for non-interactive use). Keep the release change
+   reviewed and merged to `main` before or around tagging, and rehearse the
+   candidate before tagging. Tagging through the helper keeps the tag and the
+   declared version in step; a tag created by hand must still be exactly `v`
+   plus the version declared at that commit.
+2. If the helper did not create and push the tag (for example with
+   `--no-push`), or you tag by hand, fetch `origin/main` and tag the intended
+   merged commit, not an unmerged PR commit or an unchecked local `HEAD`. These
+   commands are illustrative for the planned root release `0.2.0`. Run them only
+   after the release change declaring root `[project].version = "0.2.0"` has
+   merged to `main` and the intended commit has passed rehearsal. Substitute that
+   commit's SHA for `RELEASE_SHA`:
 
    ```bash
    git fetch origin &&
@@ -167,7 +180,9 @@ support guarantee for untested targets.
 ## Release `evoxc-hf` separately
 
 Set the version in `evoxc_hf/pyproject.toml`, update `CHANGELOG.md`, refresh
-`uv.lock`, and merge the change. Create and push `evoxc-hf-v<version>` for that
+`uv.lock`, and merge the change. `evoxc-hf` has an independent version and
+release tag (`evoxc-hf-v<version>`) and is not bumped by the `evoxc` version
+helper, so this stays manual. Create and push `evoxc-hf-v<version>` for that
 commit, then publish a GitHub Release for that existing tag as a maintainer (for
 example, `gh release create evoxc-hf-v0.1.1 --verify-tag --generate-notes`). Use
 the member's actual version. A draft or a tag push alone does not trigger the HF
