@@ -27,6 +27,9 @@ A release tag never runs the full CI suite: it runs the quick gate and then the 
 - `release.yml` triggers on a new `v*` tag push, no-input `workflow_dispatch`, and a published GitHub Release tagged `evoxc-hf-v*`.
 - On an `evoxc` tag push, `verify` matches the peeled tag commit and tag object to the event and checkout, requires membership in `origin/main` history, and requires the exact tag `v<version>` from the root `pyproject.toml`.
 - An `evoxc` tag runs `verify` → `gate` (the caller of `release_gate.yml`) → `wheels`; the same order is shared by the `main`-only rehearsal (`gh workflow run release.yml --ref main`), and rehearsals have no release-write or OIDC jobs.
+- A `workflow_dispatch` rehearsal also runs `rehearse-stage` (needs `verify` + `wheels`, `contents: read` only), which downloads the pinned artifact by numeric ID with `merge-multiple: true` and runs `release_checks.py manifest` on the flat `dist/`.
+- That rehearsal job exercises the same last-mile staging check `prepare` performs — flat `dist/`, exact expected wheel/sdist names, SHA-256s — before a tag push can fail on it.
+- It performs no GitHub API call, no draft/release mutation and no upload, so a rehearsal stays read-only.
 - `wheels.yml` is callable with `checkout_sha` and `version` and returns `artifact_id` for the single immutable `evoxc-dist` upload containing seven wheels and one sdist after platform smoke tests, matrix and archive verification, and strict Twine validation.
 - Linux wheels run on `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` (AArch64); on each architecture the manylinux2014/glibc 2.17 and musllinux 1.2 wheels are installed and tested inside their matching PyPA containers.
 - `macos-15-intel` builds x86-64 with macOS 10.12 deployment target, `macos-15` builds Arm64 with macOS 11.0 deployment target, and `windows-2025` builds x86-64 MSVC; the smoke tests run natively on those hosts, not on old macOS runtime versions.
