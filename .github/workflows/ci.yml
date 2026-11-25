@@ -1,5 +1,10 @@
-# CI — the evoxc uv workspace: TWO PyPI distributions (`evoxc` and `evoxc-hf`)
-# built from ONE repo and locked by ONE `uv.lock`.
+# CI — the PR/main gate for the evoxc uv workspace: TWO PyPI distributions
+# (`evoxc` and `evoxc-hf`) built from ONE repo and locked by ONE `uv.lock`.
+#
+# This is the FULL gate: the pytest matrix, the compilers leg, the Rust tests +
+# Clippy and the packaging job. A release tag does NOT run this workflow — it
+# runs `release_gate.yml` (a quick ~5-minute end-to-end check) and then
+# `wheels.yml` (which builds and smoke-tests the exact release wheel matrix).
 #
 # Job split:
 #   test       — the full pytest suite on every supported Python (3.11–3.14)
@@ -19,13 +24,14 @@
 #                `evoxc-hf` member defines no such extra.
 #   rust       — locked native workspace tests and Clippy.
 #   packaging  — `uv build --all-packages` (FOUR artifacts: a wheel + an sdist
-#                per distribution) + `twine check` + a two-way
-#                distribution-boundary guard on the BUILT archives: the `evoxc`
+#                per distribution) + `twine check` + the two-way
+#                distribution-boundary guard on the BUILT archives
+#                (`.github/workflows/release_checks.py dist`): the `evoxc`
 #                wheel/sdist must ship `evoxc` (plus the compiled
 #                `evoxc/_evoxc_native.abi3.so`) only, and the `evoxc_hf`
 #                wheel/sdist must ship `evoxc_hf` only — neither distribution
 #                may ever contain the other. Also runs the release-helper
-#                regression suite once on Python 3.12.
+#                regression suite and the version-bump helper tests.
 #
 # The root `evoxc` project is a MIXED maturin project: its wheel embeds a
 # Rust/PyO3 abi3 extension compiled from `./native/`. Every job that installs
@@ -45,25 +51,20 @@
 # `packaging` does not re-run pytest — it guards the built artifacts instead.
 name: CI
 
-# A caller supplies the commit; standalone runs leave checkout on the event ref/SHA.
+# A push to `main` or a pull request update; the release tag does not call this
+# workflow (it runs `release_gate.yml` + `wheels.yml` instead).
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_call:
-    inputs:
-      checkout_sha:
-        description: Exact commit SHA to test
-        required: true
-        type: string
 
 permissions:
   contents: read
 
-# Superseded pushes/PR updates cancel their own in-flight runs; calls are isolated by run.
+# Superseded pushes/PR updates cancel their own in-flight runs.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ inputs.checkout_sha && format('call-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ !inputs.checkout_sha }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -75,8 +76,6 @@ jobs:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up uv (Python ${{ matrix.python }})
         uses: astral-sh/setup-uv@v6
@@ -109,8 +108,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up uv (Python 3.12)
         uses: astral-sh/setup-uv@v6
@@ -145,8 +142,6 @@ jobs:
         working-directory: native
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up Rust with Clippy
         uses: dtolnay/rust-toolchain@stable
@@ -169,8 +164,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.checkout_sha }}
 
       - name: Set up uv (Python 3.12)
         uses: astral-sh/setup-uv@v6
@@ -211,147 +204,9 @@ jobs:
       - name: Check distribution metadata
         run: uvx twine check dist/*
 
-      - name: Assert the four expected artifacts exist
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          evoxc_version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          evoxc_hf_version="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("evoxc_hf/pyproject.toml", "rb"))["project"]["version"])')"
-          echo "evoxc    version: ${evoxc_version}"
-          echo "evoxc-hf version: ${evoxc_hf_version}"
-          ls -la dist
-
-          # The `evoxc` wheel is the ONE platform abi3 wheel — never `py3-none-any`.
-          evoxc_wheels=(dist/"evoxc-${evoxc_version}"-cp*-abi3-*.whl)
-          if [ "${#evoxc_wheels[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one platform abi3 wheel dist/evoxc-${evoxc_version}-cp*-abi3-*.whl, found ${#evoxc_wheels[@]}"
-            exit 1
-          fi
-          evoxc_wheel="${evoxc_wheels[0]}"
-          if [ -f "dist/evoxc-${evoxc_version}-py3-none-any.whl" ]; then
-            echo "::error::dist/evoxc-${evoxc_version}-py3-none-any.whl exists — the root project has a native extension, so its wheel must be platform-specific"
-            exit 1
-          fi
-
-          for artifact in \
-            "${evoxc_wheel}" \
-            "dist/evoxc-${evoxc_version}.tar.gz" \
-            "dist/evoxc_hf-${evoxc_hf_version}-py3-none-any.whl" \
-            "dist/evoxc_hf-${evoxc_hf_version}.tar.gz" ; do
-            if [ ! -f "${artifact}" ]; then
-              echo "::error::missing artifact ${artifact} — expected four: an evoxc platform wheel + sdist and an evoxc_hf pure-Python wheel + sdist"
-              exit 1
-            fi
-          done
-          # Count the DISTRIBUTION ARCHIVES only. `uv build` writes its own
-          # 1-byte `dist/.gitignore` (content `*`) into the out dir alongside
-          # the archives, so a bare `find dist -maxdepth 1 -type f` counts a
-          # fifth file and this assertion would fail on a clean build (that is
-          # exactly the gotcha that broke CI). Matching `*.whl`/`*.tar.gz`
-          # still fails loudly on a stray extra wheel or sdist, and ignores
-          # dotfiles (`twine check dist/*` skips them for the same reason).
-          count="$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)"
-          if [ "${count}" -ne 4 ]; then
-            echo "::error::expected exactly 4 wheel/sdist artifacts (evoxc + evoxc_hf, a wheel and an sdist each) in dist/, got ${count} file(s)"
-            exit 1
-          fi
-
-      - name: Guard the distribution boundary (each archive ships its own package only)
-        run: |
-          set -euo pipefail
-          uv run --no-project python - <<'PY'
-          import glob
-          import re
-          import sys
-          import tarfile
-          import tomllib
-          import zipfile
-
-          def version_of(path):
-              with open(path, "rb") as fh:
-                  return tomllib.load(fh)["project"]["version"]
-
-          def fail(artifact, message):
-              print(f"::error::{artifact}: {message}")
-              sys.exit(1)
-
-          def wheel_entries(artifact):
-              with zipfile.ZipFile(artifact) as zf:
-                  return zf.namelist()
-
-          def sdist_entries(artifact):
-              with tarfile.open(artifact) as tf:
-                  return tf.getnames()
-
-          def top_level(entries):
-              return {entry.split("/")[0] for entry in entries}
-
-          V = version_of("pyproject.toml")
-          V_HF = version_of("evoxc_hf/pyproject.toml")
-
-          # 1. The `evoxc` wheel is a platform abi3 wheel that ships exactly
-          #    `evoxc` (including the compiled extension) + its own dist-info.
-          wheels = glob.glob(f"dist/evoxc-{V}-*-*.whl")
-          if len(wheels) != 1:
-              fail(f"dist/evoxc-{V}-*-*.whl", f"expected exactly one platform wheel, found {wheels}")
-          artifact = wheels[0]
-          if not re.fullmatch(rf"dist/evoxc-{re.escape(V)}-cp\d+-abi3-[a-z0-9_]+\.whl", artifact):
-              fail(artifact, "the `evoxc` wheel must be a per-platform cp<X>-abi3 wheel (it embeds a Rust/PyO3 extension)")
-          entries = wheel_entries(artifact)
-          tops = top_level(entries)
-          bad = sorted(t for t in tops if t.startswith("evoxc_hf"))
-          if bad:
-              fail(artifact, f"ships {bad} — `evoxc_hf` belongs to the SEPARATE distribution `evoxc-hf` (`evoxc_hf/pyproject.toml`) and must never be inside the `evoxc` one")
-          expected = {"evoxc", f"evoxc-{V}.dist-info"}
-          if tops != expected:
-              fail(artifact, f"top-level entries must be exactly {sorted(expected)}, got {sorted(tops)}")
-          extension = "evoxc/_evoxc_native.abi3.so"
-          if extension not in entries:
-              fail(artifact, f"ships no {extension} — maturin must compile the extension from ./native/ and install it in the `evoxc` package")
-
-          # 2. The `evoxc_hf` wheel ships exactly `evoxc_hf` + its own dist-info.
-          artifact = f"dist/evoxc_hf-{V_HF}-py3-none-any.whl"
-          entries = wheel_entries(artifact)
-          tops = top_level(entries)
-          bad = sorted(n for n in entries if n == "evoxc" or n.startswith("evoxc/"))
-          if bad:
-              fail(artifact, f"ships the `evoxc` package ({bad[:5]}) — `evoxc` is the workspace ROOT distribution and a declared runtime dependency, never vendored into `evoxc-hf`")
-          expected = {"evoxc_hf", f"evoxc_hf-{V_HF}.dist-info"}
-          if tops != expected:
-              fail(artifact, f"top-level entries must be exactly {sorted(expected)}, got {sorted(tops)}")
-          compiled = sorted(n for n in entries if n.endswith((".so", ".pyd", ".dylib")))
-          if compiled:
-              fail(artifact, f"ships compiled artifacts ({compiled[:5]}) — `evoxc-hf` is pure Python")
-
-          # 3. The `evoxc` sdist has a single `evoxc-<version>` root, carries the
-          #    Rust workspace needed to build the extension, and no `evoxc_hf`
-          #    path at all.
-          artifact = f"dist/evoxc-{V}.tar.gz"
-          entries = sdist_entries(artifact)
-          root = f"evoxc-{V}"
-          roots = top_level(entries)
-          if roots != {root}:
-              fail(artifact, f"must have the single root {root!r}, got {sorted(roots)}")
-          bad = sorted(n for n in entries if "evoxc_hf" in n)
-          if bad:
-              fail(artifact, f"ships {len(bad)} `evoxc_hf` path(s), e.g. {bad[:5]} — the workspace member is a separate distribution and never part of the root sdist")
-          for required in (f"{root}/native/Cargo.toml", f"{root}/native/evoxc-python/Cargo.toml"):
-              if required not in entries:
-                  fail(artifact, f"does not ship {required} — a source install must be able to build the extension from the sdist")
-
-          # 4. The `evoxc_hf` sdist has a single `evoxc_hf-<version>` root, no
-          #    `evoxc` package and ships the license file.
-          artifact = f"dist/evoxc_hf-{V_HF}.tar.gz"
-          entries = sdist_entries(artifact)
-          root = f"evoxc_hf-{V_HF}"
-          roots = top_level(entries)
-          if roots != {root}:
-              fail(artifact, f"must have the single root {root!r}, got {sorted(roots)}")
-          bad = sorted(n for n in entries if n == f"{root}/evoxc" or n.startswith(f"{root}/evoxc/"))
-          if bad:
-              fail(artifact, f"ships the `evoxc` package ({bad[:5]}) — build `evoxc` from the workspace ROOT project instead")
-          if not any(n.split("/")[-1] == "LICENSE" for n in entries):
-              fail(artifact, 'does not ship the LICENSE file (license-files = ["LICENSE"] in evoxc_hf/pyproject.toml)')
-
-          print(f"ok: evoxc {V} wheel/sdist ship `evoxc` + the abi3 extension only; evoxc_hf {V_HF} wheel/sdist ship `evoxc_hf` only")
-          PY
+      # The shared boundary check (this packaging job and the release gate):
+      # FOUR artifacts, each archive shipping its own package only — the `evoxc`
+      # wheel/sdist ship `evoxc` (plus `evoxc/_evoxc_native.abi3.so`) and the
+      # `evoxc_hf` wheel/sdist ship `evoxc_hf`, never the other distribution.
+      - name: Verify the release distribution boundary
+        run: python3 .github/workflows/release_checks.py dist

@@ -1,0 +1,90 @@
+# Release gate — the QUICK end-to-end check for a release tag (~5 minutes).
+#
+# IT IS DELIBERATELY NOT A FULL GATE. There is NO pytest, NO `cargo test`,
+# NO Clippy, NO compiler extras (iree/tvm/xla) and NO sdist source build here.
+# Those belong to the two workflows that own them:
+#   ci.yml     — the PR/main gate: the full pytest suite on Python 3.11–3.14,
+#                the `compilers` leg, the Rust workspace tests + Clippy, and
+#                the packaging (build + metadata + boundary) job.
+#   wheels.yml — the AUTHORITATIVE artifact check: it builds and smoke-tests
+#                the exact release matrix (seven cp311-abi3 wheels + one sdist)
+#                in matching containers/hosts.
+# This tag exists for a ~5-minute end-to-end confirmation that the release
+# distributions build, install into fresh venvs, load the compiled extension,
+# run a few simple tasks, and coexist when installed together.
+#
+# Reusable only: `release.yml` calls it with the commit `verify` selected.
+# The built `evoxc` wheel is pinned to `--python 3.11` so it is `cp311-abi3`
+# (the release tag shape), which is exactly why ONE wheel installs on both the
+# abi3 floor (3.11) and the abi3 ceiling (3.14) below. `uv build
+# --all-packages` produces FOUR artifacts: the evoxc cp311-abi3 wheel + sdist
+# and the evoxc_hf py3-none-any wheel + sdist.
+name: Release gate
+
+on:
+  workflow_call:
+    inputs:
+      checkout_sha:
+        description: Commit selected by the release workflow
+        required: true
+        type: string
+      version:
+        description: Expected evoxc distribution version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Quick end-to-end release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
+
+      - name: Set up uv (Python 3.11)
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+          enable-cache: true
+
+      # The gate needs the abi3 floor and ceiling interpreters to install the
+      # one cp311-abi3 wheel.
+      - name: Install the abi3 floor and ceiling interpreters
+        run: uv python install 3.11 3.14
+
+      # The gate CALLS release_checks.py (`dist`), so its regression suite gates
+      # the gate. The scripts/ version-bump helper tests stay in ci.yml.
+      - name: Run release helper unit tests
+        run: uv run --no-project --python 3.12 python -m unittest discover -s .github/workflows -p 'test_release_checks.py'
+
+      - name: Set up Rust (maturin builds evoxc._evoxc_native)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+
+      # `--python 3.11` makes the evoxc wheel `cp311-abi3` (the release tag
+      # shape), so that single wheel installs on both 3.11 and 3.14.
+      - name: Build release distributions (both packages)
+        run: uv build --python 3.11 --all-packages --out-dir dist
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      - name: Verify the release distribution boundary
+        run: python3 .github/workflows/release_checks.py dist
+
+      - name: Smoke the compiled extension on the abi3 floor (3.11)
+        run: uv run --no-project --python 3.11 python -I .github/workflows/smoke_evoxc.py dist 'evoxc-*.whl' "${{ inputs.version }}"
+
+      - name: Smoke the compiled extension on the abi3 ceiling (3.14)
+        run: uv run --no-project --python 3.14 python -I .github/workflows/smoke_evoxc.py dist 'evoxc-*.whl' "${{ inputs.version }}"
+
+      - name: Smoke both distributions installed together (3.12)
+        run: uv run --no-project --python 3.12 python -I .github/workflows/smoke_evoxc_hf.py dist "${{ inputs.version }}"

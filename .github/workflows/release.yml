@@ -1,9 +1,9 @@
 # Trusted publishers for both projects are bound to release.yml / pypi.
-# An evoxc tag runs CI, then builds and smoke-tests the release distributions.
+# An evoxc tag runs the quick release gate, then builds and smoke-tests the release distributions.
 # It stages a GitHub draft and makes it public only after PyPI has the same files.
-# Manual rehearsals stop after the CI and build checks, without publishing.
+# Manual rehearsals stop after the gate and build checks, without publishing.
 name: Release
-run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (CI, then build and smoke tests)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release rehearsal (gate, then build and smoke tests)' || format('Release {0}', github.event.release.tag_name || github.ref_name) }}
 
 on:
   push:
@@ -41,17 +41,18 @@ jobs:
       - id: verify
         run: python3 .github/workflows/release_checks.py verify
 
-  ci:
-    name: Release CI
+  gate:
+    name: Release gate (quick end-to-end)
     needs: verify
     if: github.event_name != 'release'
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/release_gate.yml
     with:
       checkout_sha: ${{ needs.verify.outputs.checkout_sha }}
+      version: ${{ needs.verify.outputs.version }}
 
   wheels:
     name: Build and smoke-test release wheels
-    needs: [verify, ci]
+    needs: [verify, gate]
     if: github.event_name != 'release'
     uses: ./.github/workflows/wheels.yml
     with:
@@ -60,7 +61,7 @@ jobs:
 
   prepare:
     name: Prepare and verify evoxc GitHub draft
-    needs: [verify, ci, wheels]
+    needs: [verify, gate, wheels]
     if: github.event_name == 'push' && github.repository == 'EMI-Group/evoxc'
     runs-on: ubuntu-latest
     permissions:
