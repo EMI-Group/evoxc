@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- The release staging and publishing jobs now unpack the pinned artifact flat into `dist/` (`merge-multiple: true` on every numeric-ID `actions/download-artifact` step): the action otherwise creates `dist/<artifact-name>/`, which made `release_checks.py prepare` reject the tested artifact (`Unexpected distributions for evoxc-0.2.2: ['evoxc-dist']`) before it could stage the GitHub draft. `manifest()` now fails closed with an explicit "must hold the distribution files FLAT" diagnostic naming the nested directory, a workflow-wiring test requires every `dist/` download step to declare `name:` or `merge-multiple: true`, and a `workflow_dispatch` rehearsal runs that same flat-`dist/` manifest check (read-only) so the last-mile staging step is exercised before a tag.
 - The release artifact checks accept maturin's `evoxc.libs/` bundled shared-library directory, which its manylinux/musllinux repair creates (both musllinux wheels carry `evoxc.libs/libgcc_s-<hash>.so.1` with the extension's RPATH pointing at it, and the dist-info RECORD lists it). The `wheels.yml` matrix check and `release_checks.py dist` now require that directory to hold flat `.so`/`.so.<digits>`/`.dylib`/`.dll` files only instead of rejecting the wheel, while the pure-Python `evoxc-hf` wheel still carries no such directory and the one-module-per-distribution boundary is unchanged.
 
 ## [0.2.1] - 2026-11-25

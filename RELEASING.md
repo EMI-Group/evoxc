@@ -57,7 +57,11 @@ gh workflow run release.yml --ref main
 
 There are no inputs and no release-write or OIDC jobs in a rehearsal. It pins the
 selected `main` commit and follows the same `verify → gate → wheels` checks as a
-real `evoxc` release. `release_gate.yml` is the quick end-to-end gate (a few
+real `evoxc` release, then runs the read-only `rehearse-stage` job: the pinned
+`evoxc-dist` artifact is downloaded by numeric ID with `merge-multiple: true` and
+`release_checks.py manifest` re-checks the FLAT `dist/` names and SHA-256s, the
+same local check `prepare` performs before it stages the draft. A rehearsal makes
+no GitHub API call, no draft or release mutation and no upload. `release_gate.yml` is the quick end-to-end gate (a few
 minutes): it builds both distributions, checks the built archives with
 `release_checks.py dist`, installs the built `evoxc` wheel in fresh venvs on the
 abi3 floor (Python 3.11) and ceiling (Python 3.14) and runs a small
@@ -135,7 +139,12 @@ These commands require a Rust toolchain and a C compiler on `PATH` to build
 
 The `evoxc` release gate collects **seven** `evoxc-<version>-cp311-abi3-<platform>.whl`
 files and **one** Maturin `evoxc-<version>.tar.gz` sdist into the immutable
-`evoxc-dist` artifact. The wheel platform tags and smoke environments are:
+`evoxc-dist` artifact. Every publishing and staging job downloads that artifact
+by numeric ID with `merge-multiple: true`, so `dist/` is always FLAT
+(`dist/<file>`), which is what `release_checks.py manifest`, asset staging and
+Twine read; a missing `merge-multiple` produces `dist/evoxc-dist/` and fails
+closed with an explicit "must hold the distribution files FLAT" message.
+The wheel platform tags and smoke environments are:
 
 | Platform tag | GitHub runner | Smoke environment |
 | --- | --- | --- |
