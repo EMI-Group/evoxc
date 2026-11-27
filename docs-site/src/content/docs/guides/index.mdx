@@ -2,7 +2,7 @@
 title: Guides
 description: Task-focused walkthroughs of the evoxc frontend, transforms, backends and utilities.
 sidebar:
-  order: 2
+  order: 0
   group:
     label: Guides
 ---
@@ -80,7 +80,7 @@ Start here if you have not traced anything yet: [Graphs and tracing](/guides/gra
 
 <CardGrid>
   <Card title="Backends and options" href="/guides/backends/">
-    The numpy interpreter, the native Rust engine, and the options every stage forwards.
+    The NumPy interpreter, the native Rust engine, and the options every stage forwards.
   </Card>
   <Card title="Compiler adapters" href="/guides/compiler-adapters/">
     IREE, XLA through a PJRT plugin, and TVM: device kinds, target flags, validation state.
@@ -117,10 +117,10 @@ These pages all rest on one rule: a tensor's `device` says where its data actual
 
 ## Conventions in these pages
 
-- **Backend.** Code examples run on the default numpy interpreter unless the snippet names a backend. `backend="native"` selects the in-process Rust CPU engine; the compiler adapters need their own extra (see [Compiler adapters](/guides/compiler-adapters/)).
+- **Backend.** Code examples run on the default NumPy interpreter unless the snippet names a backend. `backend="native"` selects the in-process Rust CPU engine; the compiler adapters need their own extra (see [Compiler adapters](/guides/compiler-adapters/)).
 - **Specs.** `TensorSpec(shape, dtype)` describes a future runtime tensor and holds no data. `evoxc.dim("B")` is a named symbolic extent; a plain `int` is a static one.
 - **Values.** Inside a traced function every graph value is a `SymbolicTensor`: it has a dtype and a shape, and no data. Concrete `Tensor`s only exist outside a trace.
-- **Errors.** Every failure is a subclass of `evoxc.EVOXCError` — `TraceError`, `ShapeError`, `DTypeError`, `TransformError`, `BackendError`, `DeviceError`, `PersistenceError`, `VerificationError`. Messages quote the source location of the op when a graph location exists.
+- **Errors.** Every failure is a subclass of `evoxc.EVOXCError` — `TraceError`, `ShapeError`, `DTypeError`, `TransformError`, `BackendError`, `DeviceError`, `PersistenceError`, `VerificationError`, `BlockError`. Messages quote the source location of the op when a graph location exists.
 - **Deferrals.** A feature that v1 refuses raises an explicit error naming the op or option. There is no silent fallback, so "it raised" is documentation too — see [Limitations and deferrals](/reference/deferrals/).
 
 ## Reading paths

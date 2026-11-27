@@ -105,7 +105,7 @@ y        = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))  # Tensor
 print(y.numpy())
 ```
 
-Six lines to run a graph, and six objects you could have stopped at.
+Six lines to run a graph, and five objects you could have stopped at.
 
 ## The same pipeline in one call
 
@@ -150,13 +150,8 @@ y   = evoxc.run(exe, evoxc.ones((8, 4)), evoxc.ones((4,)))
 print(y.shape)      # (8, 4)
 ```
 
-`in_axes` is `0` or `None` per input (v1 supports only those two): `0` maps that input's leading axis, `None` leaves it shared across the batch. Transforms compose, so batched per-sample gradients are one expression:
-
-```python
-per_sample_grad = evoxc.vmap(evoxc.grad(loss, argnums=(2,)), in_axes=(0, 0, None), out_axes=(0,))
-```
-
-See [Graph transforms](/guides/graph-transforms/) for `grad`, `jvp`, `vjp` and the `batch_functions` merge.
+`in_axes` is `0` or `None` per input (v1 supports only those two): `0` maps that input's leading axis, `None` leaves it shared across the batch.
+Transforms compose — a transformed callable can be transformed again, each level adding one batch depth — so per-sample gradients are `vmap(grad(loss))`; see [Graph transforms](/guides/graph-transforms/) for `grad`, `jvp`, `vjp`, composition and the `batch_functions` merge.
 
 ## Switch the backend
 

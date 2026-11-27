@@ -12,14 +12,14 @@ Nothing is saved behind your back, nothing is cached implicitly, and loading nev
 
 Every stage object writes the same self-describing container (`evoxc.persist`), with a payload type that identifies the stage:
 
-| Object | Method | Payload | Typical suffix |
+| Object | Method | Payload | Suffix named by the contract |
 |---|---|---|---|
 | `Graph` | `graph.save(path)` / `evoxc.Graph.load(path)` | the serialized IR module, input/output trees, specs, static values, source locations | `.evoxcgraph` |
-| `LoweredProgram` | `.save(path)` / `evoxc.LoweredProgram.load(path)` | the backend's program (for a StableHLO lowering, the MLIR text inside the compiler payload) | `.evoxc` |
+| `LoweredProgram` | `.save(path)` / `evoxc.LoweredProgram.load(path)` | the backend's program (for a StableHLO lowering, the MLIR text inside the compiler payload) | any path — a persist container |
 | `CompiledArtifact` | `.save(path)` / `evoxc.CompiledArtifact.load(path)` | the compiled form plus required custom ops and runtime dependencies | `.evoxcartifact` |
-| `Executable` | `.save(path)` / `evoxc.Executable.load(path, backend=None, device=None)` | delegates to the backend executable, which saves the artifact and reconstructs explicitly | `.evoxcexe` |
+| `Executable` | `.save(path)` / `evoxc.Executable.load(path, backend=None, device=None)` | delegates to the backend executable, which saves the artifact and reconstructs explicitly | backend-defined |
 
-Each save records the backend name, the target, the signature (TreeSpecs plus per-leaf specs and static values) and the format version, so a load can validate what it is about to hand back.
+Each save records the backend name (and, for a compiled artifact, the target), the signature (TreeSpecs plus per-leaf specs and static values) and the format version, so a load can validate what it is about to hand back.
 
 ```python
 import evoxc
@@ -106,7 +106,7 @@ Keying is a **caller** contract: the components must include everything that aff
 One sharp edge: a top-level `dict` passed as the key contributes its *keys* only — pass `[options_dict]` when the values must affect the key.
 Corrupt entries are treated as a miss (recompute and overwrite atomically when a compute function was given, otherwise `None`); that is the one documented place evoxc swallows an error.
 
-<Aside type="warning" title="Invalidate by key, never by luck">
+<Aside type="caution" title="Invalidate by key, never by luck">
 A cache entry is only as correct as the key you assembled. Persistence does not expire, version-bump or re-validate your entries, and no API will notice that a compiler flag changed. If a key component can change the bytes, put it in the key — otherwise pass a fresh cache.
 </Aside>
 

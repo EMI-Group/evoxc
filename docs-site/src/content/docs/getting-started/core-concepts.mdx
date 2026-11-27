@@ -74,26 +74,9 @@ No API silently traces, compiles, specializes, moves or reshares tensors, insert
 - **No implicit caching or binding.** Builds happen when you call `build`; caching happens when you pass a cache; arguments are supplied when you call `bind` or `run`.
 - **No implicit device movement.** See [physical devices](#physical-devices) below.
 
-The rule you will meet first is Python control flow over symbolic values:
-
-```python
-@evoxc.defn
-def g(x):
-    if evoxc.sum(x) > 0:      # TraceError: SymbolicTensor cannot be used as a Python boolean
-        return x
-    return evoxc.negate(x)
-```
-
-Comparison ops on a `SymbolicTensor` *build* graph nodes; the failure comes when Python asks the result for a truth value, and the message says exactly that. Runtime tensor control flow is spelled with the graph control-flow ops:
-
-```python
-@evoxc.defn
-def h(x):
-    pred = evoxc.greater(evoxc.sum(x), 0.0)     # a 0-d bool SymbolicTensor, not a Python bool
-    return evoxc.cond(pred, lambda v: v, lambda v: evoxc.negate(v), x)
-```
-
-`evoxc.cond`, `evoxc.while_loop` and `evoxc.scan` put the branch or loop *inside* the graph, where the compiler can see it. Python `if`/`for` over static values stays legal and is simply unrolled or specialized at trace time.
+The rule you will meet first is Python control flow over symbolic values: `if evoxc.sum(x) > 0:` fails at trace time, because a `SymbolicTensor` refuses to be used as a Python boolean — comparisons *build* graph nodes, and the failure comes when Python asks the result for a truth value.
+Runtime tensor control flow is spelled with `evoxc.cond`, `evoxc.while_loop` and `evoxc.scan`, which put the branch or loop *inside* the graph where the compiler can see it; [In-graph control flow](/guides/control-flow/) shows all three and quotes the error.
+Python `if`/`for` over static values stays legal and is simply unrolled or specialized at trace time.
 
 <Aside type="caution" title="No silent fallbacks anywhere">
   If a backend cannot express an operation, you get a `BackendError` naming the operation and usually a remedy. If a transform has no rule for an op, you get a `TransformError`. Nothing degrades to a Python loop, a NumPy call inside a compiled program, or a different backend.
@@ -119,7 +102,7 @@ graph = evoxc.trace(good, TensorSpec((4, 1024), evoxc.float32), TensorSpec((1024
 
 Capturing a `Tensor` from a closure raises `TraceError` rather than baking the bytes into the graph. The one deliberate exception is `evoxc.constant(tensor)`: an explicit, graph-time embedding that snapshots the data — and warns above `EVOXC_LARGE_CONSTANT_BYTES` (default 1 MiB), because embedding a large tensor is usually a mistake that silently duplicates weights into every saved artifact.
 
-`evoxc.constant` accepts host data only. A device tensor raises `DeviceError` first; bring it back with `.to(Device("cpu", 0))` if embedding is genuinely what you want.
+`evoxc.constant` accepts host data only: a device tensor raises `DeviceError` first, so bring it back with `.to(Device("cpu", 0))` if embedding is genuinely what you want — see [Embedding data in a graph](/guides/tensors-and-devices/#embedding-data-in-a-graph).
 
 `evoxc.bind` does not change any of this. It supplies arguments to an executable, validating names, dtypes, shapes and devices — it never rewrites the graph and never captures data.
 
@@ -131,20 +114,13 @@ A `Tensor`'s `device` always says where its data actually lives. There are no la
 - A device payload carries its real device. A CUDA output says `cuda`; a Vulkan output says `vulkan`.
 - Accepted device kinds are `cpu`, `cuda`, `rocm` (canonical AMD spelling; `hip` is an accepted alias) and `vulkan`. `evoxc.devices()` lists the devices this host can actually offer.
 
-`Tensor.to(device)` is the **only** device ↔ host movement primitive:
-
-```python
-host = evoxc.ones((4, 8))
-gpu  = host.to(evoxc.Device("cuda", 0))     # explicit upload
-back = gpu.to(evoxc.Device("cpu", 0))       # explicit readback
-print(back.numpy())                         # .numpy() is host-only
-```
-
-Three rules follow from that single primitive:
+`Tensor.to(device)` is the **only** device ↔ host movement primitive, and three rules follow from it:
 
 1. **Run outputs stay where they ran.** A device-resident executable returns device-resident tensors; nothing auto-copies to the host "for convenience".
-2. **`.numpy()` is host-only.** On a non-CPU tensor it raises `DeviceError` telling you to call `.to(...)` first. That is why you cannot accidentally trigger a hidden readback — or a hidden synchronization — by printing a value.
+2. **`.numpy()` is host-only.** On a non-CPU tensor it raises `DeviceError` telling you to call `.to(...)` first, so you cannot trigger a hidden readback by printing a value.
 3. **Data in the wrong place is an error, not a copy.** Passing a host tensor to a device-resident executable raises `DeviceError` at the run boundary.
+
+[Tensors and devices](/guides/tensors-and-devices/) covers the transfers, the DLPack interop and the provider registry in full.
 
 The multi-device helpers are honest about being data preparation, not sharding: `evoxc.split_tensor` and `evoxc.replicate_tensor` are v1 CPU-only host-memory utilities, and collectives (`evoxc.dist.*`) appear explicitly in the program — the compiler may optimize communication but never invents it.
 

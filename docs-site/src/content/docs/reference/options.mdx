@@ -65,18 +65,18 @@ On the pinned IREE 3.13 the flag's own default is opt-level dependent (off at O0
 
 ## Exporter options (lower stage)
 
-These are forwarded by the shared compiler-frontend to the StableHLO exporter, so all three compiler adapters declare and honour them; numpy and `native` have no exporter and reject them as unknown keys.
+These are forwarded by the shared compiler-frontend to the StableHLO exporter. numpy and `native` have no exporter and reject them as unknown keys.
 
-| Option | Accepted values | Env var | Default |
-|---|---|---|---|
-| `rng_bit_generator` | `bool`, or a collection of algorithm names | — | the adapter's native-RNG capability set |
-| `dot_precision` | `"DEFAULT"`, `"HIGH"`, `"HIGHEST"` (case-insensitive) | — | `"DEFAULT"` (emits no `precision_config`) |
-| `eigh_algorithm` | `"jacobi"`, `"jacobi_batched"` (case-insensitive, whitespace-stripped) | `EVOXC_EIGH_ALGORITHM` | `"jacobi_batched"` |
-| `split_reduction` | bool spellings (coerced) | `EVOXC_SPLIT_REDUCTION` | `True` |
-| `split_reduction_non_exact` | bool spellings (coerced) | — | `False` |
-| `split_reduction_threshold` | `int` ≥ 2 | — | `1024` |
-| `sort_emission` | `"pair"`, `"count"`, `"auto"` | — | `"auto"` on iree (`"count"` when the sorted axis is ≥ 32) |
-| `while_init_rewrite` | bool spellings (coerced) | — | on at export |
+| Option | Declared by | Accepted values | Env var | Default |
+|---|---|---|---|---|
+| `rng_bit_generator` | iree, xla, tvm | `bool`, or a collection of algorithm names | — | the adapter's native-RNG capability set |
+| `dot_precision` | iree, xla, tvm | `"DEFAULT"`, `"HIGH"`, `"HIGHEST"` (case-insensitive) | — | `"DEFAULT"` (emits no `precision_config`) |
+| `eigh_algorithm` | iree, xla, tvm | `"jacobi"`, `"jacobi_batched"` (case-insensitive, whitespace-stripped) | `EVOXC_EIGH_ALGORITHM` | `"jacobi_batched"` |
+| `split_reduction` | iree, xla, tvm | bool spellings (coerced) | `EVOXC_SPLIT_REDUCTION` | `True` |
+| `split_reduction_non_exact` | iree, xla, tvm | bool spellings (coerced) | — | `False` |
+| `split_reduction_threshold` | iree, xla, tvm | `int` ≥ 2 | — | `1024` |
+| `sort_emission` | iree | `"pair"`, `"count"`, `"auto"` | — | `"auto"` on iree (`"count"` when the sorted axis is ≥ 32) |
+| `while_init_rewrite` | iree | bool spellings (coerced) | — | `True` |
 
 What they do, in one line each:
 
@@ -86,11 +86,11 @@ What they do, in one line each:
 - **`split_reduction`** emits two-stage reductions for rank-0-result reductions, which is numerically exact and keeps first-occurrence tie-breaks for min/argmin.
 - **`split_reduction_non_exact`** opts in to *also* splitting float `sum`/`prod` (and therefore `reduce_mean`/`var`). It reassociates the accumulation, so it is not bit-exact against the single-stage text — hence opt-in. It is the documented workaround for the rank-0 float-reduction cliff on some GPU targets.
 - **`split_reduction_threshold`** is the minimum total reduced extent for which a reduce is split, and also lets you force or suppress splitting on small shapes.
-- **`sort_emission`** picks the `stablehlo.sort` emission: the pair form, or the count composition that some GPU targets can bufferize when the axis is large.
-- **`while_init_rewrite`** is the computed-zeros init rewrite that keeps population-rank loops compilable; it is on at export and is not a per-call switch.
+- **`sort_emission`** picks the `stablehlo.sort` emission: the pair form, or the count composition that some GPU targets can bufferize when the axis is large. It is an iree-declared key; xla/tvm reject it.
+- **`while_init_rewrite`** is the computed-zeros init rewrite that keeps population-rank loops compilable; it defaults to on and is an iree-declared key, so `False` is available where the adapter accepts it.
 
 An invalid value for any of them raises `BackendError` from the exporter, naming the option and the accepted values.
-`split_reduction_non_exact` and `split_reduction_threshold` are deliberately **not** in any adapter's `KNOWN_OPTIONS` and have no env rows: pass them to `evoxc.backends.stablehlo.export(graph, options=...)` directly, or `lower(..., backend="iree")` will reject the key.
+`split_reduction_non_exact` and `split_reduction_threshold` are real `lower()` keys on all three adapters (each declares them in its lower-stage known set), so `lower(..., backend="iree", split_reduction_non_exact=True)` is the documented way to reach them; they have no env rows because no adapter reads an environment default for them.
 
 ## Adapter options (compile and load)
 

@@ -5,7 +5,7 @@ sidebar:
   order: 0
 ---
 
-**evoxc** (EvoX Compiler) is a Python tensor graph compiler and runtime: it builds computational graphs, transforms them, and hands them to a compiler that generates code. The graph is the program — there is no eager mode, no implicit tracing, and no hidden compilation.
+**evoxc** (EvoX Compiler) is a Python tensor graph compiler and runtime: it builds computational graphs, transforms them, and hands them to a backend — an interpreter, or a compiler that generates code. The graph is the program — there is no eager mode, no implicit tracing, and no hidden compilation.
 
 It is for people who write numerical programs — optimisation loops, batched simulations, model forwards — and want to see, save, transform and reuse the graph instead of treating a framework call as opaque. A NumPy interpreter runs graphs on a CPU with no compiler toolchain installed; IREE, XLA via PJRT and TVM are optional backends that receive StableHLO.
 
@@ -36,7 +36,7 @@ Convenience APIs are compositions, not a second semantics: `vmap` is sugar over 
 
 ### Explicit
 
-Every stage of the pipeline is a public function with a distinct result object, and you can inspect, save or transfer the object at any point. Communication between devices is an explicit collective in the graph; moving data between host and device is the explicit `Tensor.to(device)`; a large tensor enters a graph as an input or through the warned `evoxc.constant`, never by silent capture.
+Every stage of the pipeline is a public function with a distinct result object, and you can inspect, save or reuse the object at any point. Communication between devices is an explicit collective in the graph; moving data between host and device is the explicit `Tensor.to(device)`; a large tensor enters a graph as an input or through the warned `evoxc.constant`, never by silent capture.
 
 ### Compiler-neutral
 
@@ -87,7 +87,7 @@ y   = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))
 
 `build` and `evaluate` are documented shorthand for the same stages (`evaluate` derives the specs from concrete tensors, then builds and runs), never a separate execution mode. Install evoxc with `pip install evoxc` — NumPy only, with the compiled extension in the wheel — and add a compiler extra when you want one.
 
-<img src="/evoxc-stack.svg" alt="The explicit evoxc stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="1200" height="560" />
+<img src="/evoxc-stack.svg" alt="The explicit evoxc stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (NumPy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="1200" height="560" />
 
 ## What evoxc leaves to other tools
 

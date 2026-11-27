@@ -190,7 +190,7 @@ exe.synchronize()                        # explicit completion boundary
 `Executable.synchronize()` waits for all device work submitted by earlier `run()` calls.
 It is not a read barrier — output values are already valid, any read awaits — it is a **timing** primitive, and you must call it yourself when you measure wall clocks:
 
-- `numpy` and `iree` block inside `run`, so their `synchronize()` is a documented no-op.
+- `numpy` and `iree` block inside `run`, so there is nothing to wait for: `numpy` omits `synchronize()` entirely and `iree` declares it as a documented no-op.
 - The XLA device-resident `run` only *enqueues*, so a wall-clock number is `run` + `synchronize()`.
 - `BoundExecutable.synchronize()` delegates, so a `evoxc.bind(...)` result has the same shape.
 - Nothing calls it implicitly; per-call dispatch overlap stays a feature of `evoxc.run`.

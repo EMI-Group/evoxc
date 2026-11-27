@@ -37,7 +37,7 @@ Because the extension ships inside the wheel:
 
 ## Extras
 
-Each extra enables exactly one capability and nothing else. `evoxc`'s own extras never pull in torch/transformers unless the extra *is* the PyTorch-facing one (`interop`, `bench`).
+Each extra enables exactly one capability and nothing else. `interop` and `bench` are the only two that pull in torch, and neither is ever a runtime requirement; no extra installs transformers.
 
 | extra | installs | enables |
 |---|---|---|
@@ -137,11 +137,10 @@ See [HuggingFace models](/huggingface/) for the API.
 <Aside type="note" title="A compiler backend reports that it is absent">
   Compiler adapters are optional and fail loudly, with the exact pip command, rather than falling back:
 
-  - `backend="iree"` or `backend="tvm"` probes its pip package when the backend is activated and raises `BackendError` with `pip install evoxc[iree]` / `pip install evoxc[tvm]` when it is missing.
-  - `backend="xla"` activates unconditionally — its plugin is a runtime artifact — so the four-step discovery message comes from `compile`/`load` instead. The XLA backend class exposes `check_available()` as the explicit option-less preflight if you want to ask before you build.
-  - Compiler and runtime versions must match: IREE artifacts are version-specific and a mismatch is rejected at load.
+  - `backend="iree"` or `backend="tvm"` probes its pip package when the backend is activated and raises `BackendError` with the pip hint when it is missing.
+  - `backend="xla"` activates unconditionally — its plugin is a runtime artifact — so its four-step discovery message comes from `compile`/`load` instead.
 
-  No execution path silently switches to another backend or to a Python loop. If an unsupported operation reaches a backend, it raises `BackendError` naming the operation.
+  No execution path silently switches to another backend or to a Python loop. Per-adapter failure points and remedies: [Compiler adapters](/guides/compiler-adapters/#activation-and-explicit-failure).
 </Aside>
 
 ## Next

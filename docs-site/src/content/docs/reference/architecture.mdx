@@ -60,7 +60,7 @@ Ops are not an open namespace: every op a graph can contain is declared in `evox
 | `AttrSpec(name, tag, default=…)` | One attribute of an op: name, type tag, optional default |
 | `OpDef` | Name, category, arity, result count, regions, effect, terminator flag, attribute schema, optional shape-inference hook |
 
-The v1 canonical set is **121 ops in 12 categories**:
+The v1 canonical set is **121 ops in 12 categories** (`terminator` is its own category, counted separately from `control` below):
 
 | Category | Ops | Notes |
 |---|---|---|
@@ -111,7 +111,7 @@ The cost of that hop is measured, not estimated: whole-graph `grad`/`vjp` costs 
 
 ### Crossing the boundary: the envelope
 
-Python and Rust exchange **one JSON-able dict per call**, never a callback per node. `evoxc._native_codec` (`ENVELOPE_FORMAT = 1`) encodes an `ir.Module` into that envelope and decodes the result back into a `Module`:
+Python and Rust exchange **one JSON-able dict per call**, never a callback per node. A private codec module inside the package (`ENVELOPE_FORMAT = 1`) encodes an `ir.Module` into that envelope and decodes the result back into a `Module`:
 
 ```text
 {
@@ -150,11 +150,14 @@ The package is a strict layering: each layer imports only lower layers, so no cy
 |---|---|
 | `core` | nothing from evoxc (numpy + stdlib only) |
 | `ir` | `core` |
-| `ops` | `core`, `ir`, `trace` (only for the active-builder hook) |
-| `trace`, `numpy` (enp) | `core`, `ir`, `ops` |
-| `block`, `transforms`, `backends`, `dist`, `sparse`, `pipeline`, `persist` | the layers above them |
+| `ops` | `core`, `ir`, `trace` (only for the active-builder hook — `trace` never imports `ops`) |
+| `trace` | `core`, `ir` |
+| `numpy` (enp) | `core`, `ir`, `ops` |
+| `block`, `transforms`, `backends`, `dist`, `sparse`, `pipeline`, `persist` | only the layers above them |
+| `io` | `core` only |
+| `build_cache` | `core` and `persist`, with `pipeline`/`trace` imported lazily inside `build_cached` |
 
-Two documented exceptions: the numpy interpreter reaches `dist` for single-process collective emulation (`backends → dist`), and `sparse` registers its rules one-way into `transforms`' public registries without `transforms` ever importing `sparse`. The `evoxc-hf` distribution is not a submodule — it imports only evoxc's *public* API, and `evoxc` never imports it.
+Two documented exceptions: the numpy interpreter reaches `dist` for single-process collective emulation (`backends → dist`, the one such edge), and `sparse` registers its rules one-way into `transforms`' public registries without `transforms` ever importing `sparse`. `dist` itself imports only `core`, `ir` and `trace`, and never `backends`. The `evoxc-hf` distribution is not a submodule — it imports only evoxc's *public* API, and `evoxc` never imports it.
 
 ## The runtime boundary
 

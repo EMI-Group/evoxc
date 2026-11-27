@@ -22,7 +22,7 @@ Two consequences to internalize:
 
 ## Why a Python `if` cannot decide
 
-<Aside type="caution" title="Warning: a Python control flow statement on a graph value raises">
+<Aside type="caution" title="A Python branch on a graph value raises">
 `if evoxc.sum(x) > 0:` fails at trace time, because `SymbolicTensor` refuses to be used as a Python boolean.
 The correct runtime alternative is `evoxc.cond` for a branch, `evoxc.while_loop` (or `evoxc.scan`) for a loop — and plain Python `if`/`for` when the value is a static Python value, where specialization is the intended behaviour.
 </Aside>
@@ -158,7 +158,7 @@ See [Graph transforms](/guides/graph-transforms/) for what the vectorizer does a
 
 ## Control flow under a compiler backend
 
-Regions lower like any other op: the StableHLO exporter emits `stablehlo.if` and `stablehlo.while`, and the numpy interpreter selects regions natively, so both backends agree without transform support.
+Regions lower like any other op: the StableHLO exporter emits `stablehlo.if` and `stablehlo.while`, and the NumPy interpreter selects regions natively, so both backends agree without transform support.
 IREE has been validated on `while_loop`, `scan`, a `while` nested inside a `cond`, and the multi-objective/NSGA2-class loops, with numpy parity — see [Compiler adapters](/guides/compiler-adapters/) for the current validation state and the known traps.
 
 Symbolic shapes and control flow interact per op: a carry whose shape contains a `Dim` is fine as long as every op inside the regions supports symbolic dims.

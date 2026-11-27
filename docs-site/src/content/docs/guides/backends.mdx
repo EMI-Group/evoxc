@@ -6,7 +6,7 @@ sidebar:
 ---
 
 A backend owns exactly the three stages below `lower`: turning a verified `Graph` into a `LoweredProgram`, compiling that into a `CompiledArtifact`, and loading the artifact into an `Executable` you can `run`.
-The frontend never picks one for you silently — the default is the numpy interpreter, and everything else is named explicitly.
+The frontend never picks one for you silently — the default is the NumPy interpreter, and everything else is named explicitly.
 
 ## The backend interface
 
@@ -30,15 +30,15 @@ Optional adapters are **activated on first use**: `get("iree")` imports the adap
 
 | Backend | How to enable | What it owns | Validated on |
 |---|---|---|---|
-| **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
+| **NumPy interpreter** | nothing — the default | interprets EvoXIR directly with NumPy kernels; all symbolic shapes | CPU (always) |
 | **`native`** | `backend="native"` (shipped in the wheel) | the in-process Rust CPU engine: immutable plans over typed host buffers | CPU |
 | **compiler adapters** | `lower(..., backend="iree"\|"xla"\|"tvm")` | StableHLO → an external compiler and its runtime | see [compiler adapters](/guides/compiler-adapters/) |
 
-### The numpy interpreter
+### The NumPy interpreter
 
-The default backend is the **reference behaviour**, not a fallback: a pure-Python numpy interpreter that executes the IR op by op and supports every symbolic shape the frontend can express.
+The default backend is the **reference behaviour**, not a fallback: a pure-Python NumPy interpreter that executes the IR op by op and supports every symbolic shape the frontend can express.
 It is CPU only, documents-ignores unknown options, and exposes `Executable.plan_text()` with its per-block execution plan.
-When two backends disagree, the numpy interpreter is the definition of what the graph means.
+When two backends disagree, the NumPy interpreter is the definition of what the graph means.
 
 ### The `native` Rust CPU engine
 
@@ -51,13 +51,13 @@ evoxc.run(exe, x)
 ```
 
 - **Host data only.** `cpu:0` in, `cpu:0` out; a non-CPU device or non-CPU input tensor is an explicit `DeviceError`, never an implicit copy.
-- **numpy-mirroring staging.** Same verify → capability pre-check → portable inlining order, and the payload is the serialized EvoXIR module (portable and savable), not machine code.
+- **NumPy-mirroring staging.** Same verify → capability pre-check → portable inlining order, and the payload is the serialized EvoXIR module (portable and savable), not machine code.
 - **Engine gate at `lower()`.** Any op the engine does not implement is reported there as a `BackendError` naming the ops and pointing at `backend="numpy"`.
 - **Capabilities.** Symbolic shapes, all 14 evoxc dtypes, single-rank collectives, `runtime_call`, host-mode external kernels and custom blocks — but `sparse_ops=False` (sparse is numpy-only in v1) and `async_collectives=False`.
 - **No pipeline options in v1.** All four stage option sets are empty, so passing a compiler option here fails loudly instead of being ignored.
 - **Diagnostics.** `Executable.summary()` reports through the engine, and the executable adds `plan_text()`, `stats()` and `required_ops()`.
 
-Numerically it matches numpy exactly on bool/integer paths and on every float op built from one-rounding primitives; the only documented windows are the platform libm transcendentals and f32 `dot` reassociation — see [reference architecture](/reference/architecture/).
+Numerically it matches the NumPy interpreter exactly on bool/integer paths and on every float op built from one-rounding primitives; the only documented windows are the platform libm transcendentals and f32 `dot` reassociation — see [reference architecture](/reference/architecture/).
 
 ### Compiler adapters
 
@@ -91,7 +91,7 @@ Option **keys are validated by the framework, values never are** — with two de
 graph    = evoxc.trace(fn, evoxc.TensorSpec((128, 128), evoxc.float32))
 lowered  = evoxc.lower(graph, backend="iree", opt_level="O2")
 artifact = evoxc.compile(lowered, backend="iree", iree_compile_args=["--iree-opt-data-tiling"])
-exe      = evoxc.load(artifact, backend="iree", device="cpu", iree_runtime_args=["--cuda_async_allocations=true"])
+exe      = evoxc.load(artifact, backend="iree", device="cpu", iree_runtime_args=["--task_topology_max_group_count=8"])
 ```
 
 Each backend declares `KNOWN_OPTIONS` per stage (`lower`/`compile`/`load`/`run`) and a caller's dict is validated against the **union** of those sets — a key valid for any stage passes and is accepted-and-ignored at the others, so one dict can be forwarded to every stage.
@@ -106,7 +106,7 @@ The first evoxc-defined option, and the one evoxc validates itself: `"O0"`–`"O
 exe = evoxc.build(fn, spec, backend="iree", opt_level="O3")
 ```
 
-Per backend it becomes: iree's derived `--iree-opt-level=O{N}` flag (the `O` form is required — the compiler rejects numeric levels), XLA's `executable_build_options` field 24 in its compile-options proto, TVM's build `opt_level=` kwarg (which raises rather than dropping it on an installed TVM without the kwarg), and numpy documents it as ignored.
+Per backend it becomes: iree's derived `--iree-opt-level=O{N}` flag (the `O` form is required — the compiler rejects numeric levels), XLA's `executable_build_options` field 24 in its compile-options proto, TVM's build `opt_level=` kwarg (which raises rather than dropping it on an installed TVM without the kwarg), and the NumPy interpreter documents it as ignored.
 Unset means byte-identical behaviour everywhere.
 
 ### `dispatch_formation`
@@ -123,7 +123,7 @@ exe = evoxc.build(population_step, spec, backend="iree", device="rocm",
 - Any other value is a loud `BackendError`.
 - Case and surrounding whitespace are normalized; a user flag with the same name wins over the derived one.
 
-It ships **opt-in** because the measurement is mixed: measured on iree 3.11 over a merged GP-population graph it takes 596 → 548 dispatches (2191 → 2021 ops), i.e. −5 % compile at population 4000 and −7…−9 % warm on rocm, while llvm-cpu is flat-to-worse.
+It ships **opt-in** because the measurement is mixed: on iree 3.11, over a merged GP-population graph, it takes 596 → 548 dispatches at population 1000 and 2191 → 2021 at population 4000 — i.e. −5 % compile and −7…−9 % warm on rocm, while llvm-cpu is flat-to-worse.
 That is why it is enabled for rocm merged plans and left off elsewhere — evidence, probe and raw records: `evoxc/bench/dispatch_formation_findings.md`.
 On iree-base 3.13 the flag's own default is opt-level-dependent (off at `O0`, on at `O2` and above), so at `O2`/`O3` it yields a byte-identical vmfb.
 
@@ -158,7 +158,8 @@ exe = evoxc.build(fn, spec, backend="xla", device="rocm",
                   plugin_path="/opt/pjrt/xla_plugin.so")
 ```
 
-reaches `load` without repeating it — and a persisted artifact loads without re-passing it either.
+reaches `load` without repeating it.
+A persisted artifact is deliberately different: it never serializes a plugin handle, so loading one standalone resolves the plugin again — pass `plugin_path` to `evoxc.load`, or set `EVOXC_PJRT_PLUGIN` once.
 
 <Aside type="note" title="Where the option tables live">
 Per-adapter keys, defaults and conflict rules are listed in [options](/reference/options/) and in the adapter contract (`evoxc/backends/adapters/CONTEXT.md`). This page covers the mechanism, not the full inventory.
@@ -233,7 +234,7 @@ out = evoxc.run(exe, evoxc.tensor([1.0, 4.0, 9.0, 16.0]))[0]
 ```
 
 Specs describe the outer tuple, so `evoxc.run(exe, a, b)` matches `tuple(input_specs)` and the outputs come back as a tuple; `output_specs` needs at least one spec.
-`backend` must be a compiler backend — numpy and native raise a `BackendError` naming themselves and suggesting `"iree"` — and the external compiler is the authority on whether the module is legal.
+`backend` must be a compiler backend — the `numpy` and `native` backends raise a `BackendError` naming themselves and suggesting `"iree"` — and the external compiler is the authority on whether the module is legal.
 This is also the round trip for `Executable.source_text()`: read the emitted text, edit it, compile it back.
 
 Next: [compiler adapters](/guides/compiler-adapters/) for the per-adapter semantics, or [tensors and devices](/guides/tensors-and-devices/) for the placement rules the options above assume.
