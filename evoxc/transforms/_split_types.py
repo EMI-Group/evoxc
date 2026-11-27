@@ -218,6 +218,8 @@ class SplitPlan:
         varying_leaves: Sequence[int],
         boundary: Sequence[BoundaryValue],
         unused_varying_leaves: Sequence[int] = (),
+        prepare_op_ids: Optional[Sequence[int]] = None,
+        apply_op_ids: Optional[Sequence[int]] = None,
     ) -> None:
         self.source = source
         self.prepare = prepare
@@ -226,6 +228,20 @@ class SplitPlan:
         self.varying_leaves = tuple(int(index) for index in varying_leaves)
         self.boundary = tuple(boundary)
         self.unused_varying_leaves = tuple(int(index) for index in unused_varying_leaves)
+        if prepare_op_ids is None or apply_op_ids is None:
+            # No recorded provenance (a plan assembled outside `split_graph`):
+            # re-derive the SOURCE op partition from the plan's own inputs, so
+            # `summary()`'s op counts stay exact instead of falling back to
+            # clone counts that double-count a shared op.
+            from evoxc.transforms import _split_core  # local: it imports this module
+
+            prepare_op_ids, apply_op_ids = _split_core.op_id_partition(
+                source, self.fixed_leaves
+            )
+        # SOURCE op ids each half emits — private accounting for `summary()`,
+        # so a `constant` emitted by BOTH halves is one id in the union.
+        self._prepare_op_ids = frozenset(int(op_id) for op_id in prepare_op_ids)
+        self._apply_op_ids = frozenset(int(op_id) for op_id in apply_op_ids)
 
     # --- boundary -------------------------------------------------------
 
@@ -250,6 +266,26 @@ class SplitPlan:
     def _source_ops(self) -> int:
         return len(_entry_ops(self.source))
 
+    def _op_accounting(self) -> Tuple[int, int, int]:
+        """``(prepare_ops, apply_ops, dropped_ops)`` from DISTINCT SOURCE ops.
+
+        Each half clones every SOURCE op it emits exactly once, so a half's op
+        count is the size of its source-op-id set (== its entry-block op
+        count). ``dropped_ops`` is the residual
+        ``source_ops - len(prepare_ids | apply_ids)``: the source ops in
+        NEITHER half. An op emitted by BOTH halves — today only a `constant`
+        whose result feeds a fixed-only producer of the boundary AND a mixed
+        op — is counted in each half's count and ONCE in the union, so
+        ``prepare_ops + apply_ops >= source_ops - dropped_ops`` with equality
+        iff no op is shared, and ``dropped_ops`` is never negative (both id
+        sets are subsets of the source's op ids).
+        """
+
+        prepare_ops = len(self._prepare_op_ids)
+        apply_ops = len(self._apply_op_ids)
+        shared = self._prepare_op_ids | self._apply_op_ids
+        return prepare_ops, apply_ops, self._source_ops() - len(shared)
+
     # --- inspection -----------------------------------------------------
 
     def summary(self) -> dict:
@@ -259,14 +295,21 @@ class SplitPlan:
         ``boundary_values``, ``boundary_bytes``, ``source_ops``,
         ``prepare_ops``, ``apply_ops``, ``dropped_ops``,
         ``unused_varying_leaves``, ``prepare_digest``, ``apply_digest``.
-        Op counts are NON-TERMINATOR ops of the entry block. ``dropped_ops``
-        counts source ops that are in neither half (dead or folded into the
-        boundary). ``boundary_bytes`` is ``None`` when any boundary value's
-        static size is unknown.
+        Op counts are NON-TERMINATOR ops. ``prepare_ops`` / ``apply_ops`` are
+        the numbers of SOURCE ops each half emits, and ``dropped_ops`` counts
+        the source ops in NEITHER half (dead or folded into the boundary).
+        An op emitted by BOTH halves — today only a `constant` whose result
+        feeds a fixed-only producer of the boundary AND a mixed op — is
+        counted in each half's count and once in the union ``dropped_ops`` is
+        derived from, so ``prepare_ops + apply_ops`` exceeds
+        ``source_ops - dropped_ops`` by the number of shared ops (they are
+        equal when nothing is shared) and ``dropped_ops`` is never negative.
+        ``boundary_bytes`` is ``None`` when any boundary value's static size is
+        unknown.
         """
+
         source_ops = self._source_ops()
-        prepare_ops = len(_entry_ops(self.prepare))
-        apply_ops = len(_entry_ops(self.apply))
+        prepare_ops, apply_ops, dropped_ops = self._op_accounting()
         return {
             "fixed_leaves": self.fixed_leaves,
             "varying_leaves": self.varying_leaves,
@@ -275,7 +318,7 @@ class SplitPlan:
             "source_ops": source_ops,
             "prepare_ops": prepare_ops,
             "apply_ops": apply_ops,
-            "dropped_ops": source_ops - (prepare_ops + apply_ops),
+            "dropped_ops": dropped_ops,
             "unused_varying_leaves": self.unused_varying_leaves,
             "prepare_digest": self.prepare.digest(),
             "apply_digest": self.apply.digest(),
