@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `evoxc.split_by_inputs` and `evoxc.analyze_inputs`: the first structural (non-numeric) graph passes. `split_by_inputs(graph_or_fn, fixed=… | fixed_leaves=…)` slices one traced graph at its input structure into a `SplitPlan` whose `prepare` graph computes the fixed inputs' contribution once and returns a flat tuple of boundary tensors, and whose `apply` graph evaluates the varying inputs on top of that tuple, so `apply(prepare(f), v)` agrees with `f(f, v)`; `plan.verify()` checks the wiring and `plan.summary()`/`text()` report both halves' op counts and the boundary size. `analyze_inputs(graph)` reports, per tensor input, its direct consumers, transitive op count, influenced outputs and the boundary bytes/count that fixing it alone would export (computed with the same helpers the split uses), plus `splittable`/`blocked_reason`. Both reject region-bearing control flow and every effectful op with an explicit `TransformError` naming the op, and both are Python-only by design — they slice the graph data structure and carry no numerical authority, unlike the five numeric transforms and the `batch_functions` merge.
 
 ## [0.2.3] - 2026-11-25
 

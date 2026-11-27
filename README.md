@@ -13,7 +13,7 @@
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
-<p><a href="https://github.com/EMI-Group/evox">EvoX</a> · <a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#batch-transformation--one-graph-for-a-whole-population">Batch</a> · <a href="#backends">Backends</a> · <a href="#hardware-support">Hardware</a> · <a href="#how-evoxc-compares">Compared</a> · <a href="#install">Install</a></p>
+<p><a href="https://github.com/EMI-Group/evox">EvoX</a> · <a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#batch-transformation--one-graph-for-a-whole-population">Batch</a> · <a href="#reusing-part-of-a-computation--split_by_inputs">Split</a> · <a href="#backends">Backends</a> · <a href="#hardware-support">Hardware</a> · <a href="#how-evoxc-compares">Compared</a> · <a href="#install">Install</a></p>
 </div>
 
 **evoxc (EvoX Compiler)** is a Python tensor graph compiler and runtime for building, transforming, and executing numerical programs. It provides explicit computation graphs, composable vectorization and automatic differentiation, and StableHLO integration with IREE, XLA, and TVM — plus explicit escape hatches for custom kernels, custom calls and hand-written StableHLO. A NumPy interpreter lets you get started without a compiler toolchain.
@@ -32,7 +32,7 @@ The site is built from this repository's `./docs-site/` directory through the sh
 
 Evolutionary computation repeatedly evaluates populations of candidates and updates their state. These workloads benefit from batching evaluations and reusing an executable across iterations, with state kept on the execution device. When the candidates are programs, as in genetic programming and algorithm synthesis, evaluating them separately can also repeat compilation and dispatch work.
 
-evoxc makes these computations explicit tensor graphs that you can inspect, transform, save, and execute. `vmap` batches a computation over inputs, while [`batch_functions`](#batch-transformation--one-graph-for-a-whole-population) combines compatible candidate programs into a single graph. The explicit pipeline lets an application build an executable once and reuse it throughout a search loop.
+evoxc makes these computations explicit tensor graphs that you can inspect, transform, save, and execute. `vmap` batches a computation over inputs, [`batch_functions`](#batch-transformation--one-graph-for-a-whole-population) combines compatible candidate programs into a single graph, and [`split_by_inputs`](#reusing-part-of-a-computation--split_by_inputs) computes a graph's fixed half once so later calls re-run only the varying part. The explicit pipeline lets an application build an executable once and reuse it throughout a search loop.
 
 The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, and the staging contract — every stage is a public function with a public result object. **External compilers** — IREE, XLA via PJRT, and TVM — receive StableHLO and handle optimization, scheduling, memory planning, and code generation. This separation lets applications choose a backend while keeping the graph's meaning explicit.
 
@@ -54,7 +54,7 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 |---|---|---|---|
 | graph function | `@evoxc.defn` | `Defn` | a Python callable marked as a graph *definition* |
 | trace | `evoxc.trace(fn, *specs)` | `Graph` | EvoXIR: a region-based SSA module + input/output trees + snapshotted static values |
-| transform | `evoxc.vectorize` / `vmap` / `batch_functions` / `grad` / `jvp` / `vjp` | `Graph` | an ordinary graph of ordinary ops |
+| transform | `evoxc.vectorize` / `vmap` / `batch_functions` / `grad` / `jvp` / `vjp` / `split_by_inputs` | `Graph` | an ordinary graph of ordinary ops (`split_by_inputs` returns a `SplitPlan` holding two graphs, `prepare` and `apply`) |
 | lower | `evoxc.lower(graph, backend=…)` | `LoweredProgram` | StableHLO MLIR text, or the backend's own payload |
 | compile | `evoxc.compile(lowered, **opts)` | `CompiledArtifact` | the compiler's artifact (vmfb, PJRT executable, serialized program) |
 | load | `evoxc.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called |
@@ -171,7 +171,7 @@ module @"main" version 1 {
 
 ### Graph → graph transforms
 
-`evoxc.vectorize`, `vmap`, `grad`, `jvp`, `vjp`, and `batch_functions` transform graphs into ordinary operations that backends can execute. `vectorize` operates on a traced `Graph`. The other transforms also accept graph definitions and can return a callable that builds a graph from specs. Missing batching or derivative rules raise `TransformError` naming the operation.
+`evoxc.vectorize`, `vmap`, `grad`, `jvp`, `vjp`, and `batch_functions` transform graphs into ordinary operations that backends can execute. `vectorize` operates on a traced `Graph`. The other transforms also accept graph definitions and can return a callable that builds a graph from specs. Missing batching or derivative rules raise `TransformError` naming the operation. The structural pair below — `split_by_inputs` and `analyze_inputs` — slices a graph at its input structure instead of rewriting its numbers.
 
 ```python
 @evoxc.defn
@@ -183,6 +183,36 @@ g  = evoxc.trace(scalar_loss, *specs)
 gb = evoxc.vmap(g, in_axes=(0, 0, None))    # batch the samples, share the weights
 gw = evoxc.grad(g, argnums=(2,))            # d/dw — still just a Graph
 ```
+
+### Reusing part of a computation — `split_by_inputs`
+
+`vmap` re-batches inputs and `batch_functions` merges programs, but neither reuses the *result* of part of a computation: every call re-executes the whole graph. When an outer loop evaluates many varying inputs against the **same** fixed data — a dataset, a checkpoint, a set of parameters — `evoxc.split_by_inputs` slices one traced graph at that boundary into two ordinary graphs:
+
+- `prepare` runs over the **fixed** inputs and returns a flat tuple of tensors: the *boundary*, every value `apply` still needs from the fixed half.
+- `apply` runs over the **varying** inputs on top of that prepared tuple and returns the source graph's output tree.
+
+```python
+@evoxc.defn
+def fitness(dataset, params, candidate):        # params stays fixed across calls
+    return evoxc.sum(evoxc.tanh(evoxc.matmul(dataset * candidate, evoxc.tanh(params))))
+
+graph = evoxc.trace(fitness, TensorSpec((768, 32), evoxc.float32),
+                    TensorSpec((32,), evoxc.float32), TensorSpec((32,), evoxc.float32))
+plan  = evoxc.split_by_inputs(graph, fixed_leaves=[1])   # or fixed=(False, True, False)
+
+prepare = evoxc.load(evoxc.compile(evoxc.lower(plan.prepare)), device="cpu")
+apply   = evoxc.load(evoxc.compile(evoxc.lower(plan.apply)),   device="cpu")
+
+boundary = evoxc.run(prepare, params)                        # flat tuple of boundary tensors — once
+score    = evoxc.run(apply, (dataset, candidate), boundary)  # the traced output tree — per call
+```
+
+`apply`'s signature is the synthetic two-child root `(varying inputs, prepared tuple)`; `prepare` takes only the pruned fixed-input tree.
+The correctness law is `apply(prepare(f), v)` agreeing with `f(f, v)`: both halves carry the same ops, cloned, in the same order, so the backend's normal numerical contract applies unchanged. The boundary is a **snapshot**, not a cache — neither graph carries state or invalidation logic, so a changed fixed input means re-running `prepare`. `plan.verify()` checks the wiring (boundary arity, per-position shape/dtype, `apply`'s output count), and `plan.summary()`/`plan.text()` report both halves' op counts and the boundary's byte size.
+
+`evoxc.analyze_inputs(graph)` is the inspection companion: for each tensor input it reports the ops that consume it directly, the ops that transitively depend on it, the outputs it influences, and the boundary bytes/count that fixing *that* input alone would export — computed with the same helpers the split uses, alongside `splittable`/`blocked_reason` for graphs the pass refuses. `report.split(...)` turns a report into a plan.
+
+Prefer the split when one fixed data set serves many calls per `prepare`: the fixed half runs once instead of once per call. Prefer `vmap` when a handful of varying inputs arrive together, where one batched executable costs a single dispatch and no boundary round trip; and expect no win when the varying half is a thin consumer of a large boundary, because moving the boundary dominates. The pass is straight-line only — a graph carrying control-flow regions or effectful ops raises `TransformError` naming the op (see [current limitations](#status--deferrals)).
 
 ### Batch transformation — one graph for a whole population
 
@@ -432,7 +462,7 @@ Move data with `Tensor.to(device)`. Inputs must match the executable's device; m
 
 ## Rust core
 
-The numerical authority is the reusable Rust workspace in [`native/`](native/CONTEXT.md): op schemas and inference, the graph IR, the `vectorize`/`vmap` and AD (`jvp`/`vjp`/`grad`) engines, the `batch_functions` merge, and the CPU execution engine behind the `native` backend.
+The numerical authority is the reusable Rust workspace in [`native/`](native/CONTEXT.md): op schemas and inference, the graph IR, the `vectorize`/`vmap` and AD (`jvp`/`vjp`/`grad`) engines, the `batch_functions` merge, and the CPU execution engine behind the `native` backend. The structural `split_by_inputs`/`analyze_inputs` passes are the exception: Python-only, because they slice the graph structure and carry no numerical authority.
 
 The CPU engine builds on mature crates rather than hand-rolled N-dimensional machinery: [`ndarray`](https://crates.io/crates/ndarray) for typed N-d views, broadcasting and iteration, and [`faer`](https://crates.io/crates/faer) for BLAS-3 `dot`. The few kernels that remain hand-written (the deterministic factorizations and the sorting segment walk) are documented with the measurement that rules out the library path.
 
@@ -541,6 +571,8 @@ Docs map: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchma
 
 Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops (their portables inline on every compiler backend), `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), the `evoxc.custom_call`/`evoxc.inline_stablehlo` compiler escape hatches and `evoxc.compile_text`, pluggable backends (`register`/`unregister`/`replace=True` and `evoxc.backends` entry-point discovery), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the optional `native` Rust CPU-engine backend, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the committed bench evidence under [`evoxc/bench/`](evoxc/bench).
 
+The structural passes [`split_by_inputs`](#reusing-part-of-a-computation--split_by_inputs) and `analyze_inputs` are Python-only by design — they slice a graph's data structure and carry no numerical authority — so they need no Rust engine and no backend support.
+
 The recorded November 24, 2026 baseline for `tests/` was **8,018 passed, 88 skipped, and 1 expected failure** with IREE installed and the native extension built. See the [test baseline and environment](tests/CONTEXT.md#baseline-measured-at-this-head).
 
 The separate `evoxc_hf` suite recorded **695 passed and 33 skipped** in the base environment. See the [HuggingFace integration notes](evoxc_hf/CONTEXT.md).
@@ -555,6 +587,7 @@ The separate `evoxc_hf` suite recorded **695 passed and 33 skipped** in the base
 - Collectives and `runtime_call` are not compiled by any adapter in v1 (multi-rank runtime channels are not wired).
 - Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
 - `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`.
+- `split_by_inputs` handles straight-line graphs only: control-flow regions and effectful ops (collectives, `runtime_call`/`external_call`/`custom_call`/`inline_stablehlo`) raise `TransformError`, a fixed-arity container cannot lose only some children, and nothing re-prepares a changed fixed input automatically.
 
 Unsupported operations raise `BackendError` or `TransformError` with the operation name and a suggested remedy. Execution does not silently fall back to another backend or a Python loop.
 
