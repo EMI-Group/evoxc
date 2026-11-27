@@ -17,9 +17,9 @@ Nothing here traces, compiles or moves data: a loaded tensor is ordinary host da
 
 | Name | Signature | What it does |
 |---|---|---|
-| `load_safetensors` | `(path, *, mmap=True) -> SafetensorsFile` | parse and validate; `mmap=True` maps the file and hands back zero-copy read-only views |
-| `save_safetensors` | `(path, tensors, *, metadata=None)` | canonical layout, atomic write |
-| `SafetensorsFile` | `metadata`, `tensor_names()`, `info(name)`, `tensor(name)`, `as_dict()`, `close()`, `in`, `len`, iteration, context manager | the open container |
+| [`load_safetensors`](/api/evoxc/formats/load-safetensors/) | `(path, *, mmap=True) -> SafetensorsFile` | parse and validate; `mmap=True` maps the file and hands back zero-copy read-only views |
+| [`save_safetensors`](/api/evoxc/formats/save-safetensors/) | `(path, tensors, *, metadata=None)` | canonical layout, atomic write |
+| [`SafetensorsFile`](/api/evoxc/formats/safetensorsfile/) | `metadata`, `tensor_names()`, `info(name)`, `tensor(name)`, `as_dict()`, `close()`, `in`, `len`, iteration, context manager | the open container |
 
 The layout is the format's own: a little-endian `u64` header length, a JSON header of tensor descriptors, then the data buffer.
 The writer pads the header to an 8-byte multiple and aligns each tensor start to 8 bytes inside the data buffer; the reader also accepts a header length that is not a multiple of 8, because the offsets are validated independently.
@@ -61,8 +61,8 @@ evoxc has no bf16 or fp8 dtype, so those two families surface as their raw stora
 
 | Name | Signature | What it does |
 |---|---|---|
-| `load_gguf` | `(path, *, mmap=True) -> GGUFFile` | parse the v2/v3 header, the metadata KV table and the tensor infos; data is mapped lazily |
-| `GGUFFile` | `metadata`, `version`, `alignment`, `tensor_names()`, `info(name)`, `tensor(name)`, `raw(name)`, `close()`, `in`, `len`, iteration, context manager | the open container |
+| [`load_gguf`](/api/evoxc/formats/load-gguf/) | `(path, *, mmap=True) -> GGUFFile` | parse the v2/v3 header, the metadata KV table and the tensor infos; data is mapped lazily |
+| [`GGUFFile`](/api/evoxc/formats/gguffile/) | `metadata`, `version`, `alignment`, `tensor_names()`, `info(name)`, `tensor(name)`, `raw(name)`, `close()`, `in`, `len`, iteration, context manager | the open container |
 
 GGUF stores dimensions fastest-axis-first (`ne[0]` first); the reader reverses them, so every shape you see is the ordinary numpy row-major one: `tensor(name).numpy().shape == info.shape`.
 The data section starts at `align_up(end_of_tensor_infos, alignment)` with `alignment` defaulting to `32`; a metadata-only file (zero tensors, e.g. a tokenizer container) may end without that padding and is accepted.
@@ -95,7 +95,7 @@ raw = gguf.raw("blk.0.attn_q.weight")            # the stored quantized bytes
 
 ## `TensorInfo`
 
-Both readers describe tensors with the same dataclass:
+Both readers describe tensors with the same dataclass, [`TensorInfo`](/api/evoxc/formats/tensorinfo/):
 
 | Field | Meaning |
 |---|---|

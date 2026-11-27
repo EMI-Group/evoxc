@@ -22,9 +22,9 @@ class Backend:
 The executable side is a runtime-checkable protocol: `run(flat_input_tensors, options=None)` returning flat output tensors, plus `.functions` and `.device` attributes, and *optional* `save(path)` / `load(path, device=None)` / `synchronize()`.
 `save` must persist the underlying artifact — device handles are never serialized — and `synchronize()` must not become a required protocol member (executables without it stay structurally valid).
 
-`evoxc.backends.get(name)` resolves a backend and raises `BackendError` for an unknown name.
+[`evoxc.backends.get(name)`](/api/evoxc/backends/get/) resolves a backend and raises `BackendError` for an unknown name.
 Optional adapters are **activated on first use**: `get("iree")` imports the adapter module and calls its `register()`, so `import evoxc` never imports a compiler.
-`lower`, `compile` and `load` accept either a name or a `Backend` instance; `build`, `evaluate` and `build_cached` forward the instance they were given through both hops.
+`lower`, `compile` and `load` accept either a name or a [`Backend`](/api/evoxc/backends/backend/) instance; `build`, `evaluate` and `build_cached` forward the instance they were given through both hops.
 
 ## The three kinds of backend
 
@@ -66,7 +66,7 @@ They are activated by use, fail explicitly when absent, and own device kinds, ta
 
 ## Capabilities: what a backend may refuse
 
-Every backend declares a frozen `Capabilities` record:
+Every backend declares a frozen [`Capabilities`](/api/evoxc/backends/capabilities/) record:
 
 ```python
 caps = evoxc.backends.get("numpy").capabilities
@@ -79,7 +79,7 @@ The flags are `dynamic_shapes`, `dtypes`, `collectives`, `runtime_calls`, `exter
 A `False` flag is a **promise to reject explicitly** — never to emulate silently: a sparse op on a compiler backend raises `BackendError` suggesting `evoxc.sparse.to_dense`, a `runtime_call` there raises at `lower()`, and a block without a portable decomposition is refused with the remedies listed.
 
 `custom_ops` deserves its own line: it is true only on the three compiler adapters, and it claims the ops are **forwarded**, not that they are valid.
-`numpy` and `native` leave it false and reject `custom_call`/`inline_stablehlo` by name in their own capability pre-check, pointing at `external_call`, `runtime_call`, `evoxc.block` or `backend="iree"`.
+`numpy` and `native` leave it false and reject [`custom_call`](/api/evoxc/ops/custom-call/)/[`inline_stablehlo`](/api/evoxc/ops/inline-stablehlo/) by name in their own capability pre-check, pointing at `external_call`, `runtime_call`, `evoxc.block` or `backend="iree"`.
 `rng_bit_generator` is the per-algorithm set for which a backend can emit native `stablehlo.rng_bit_generator`; every algorithm outside it is an inline expansion.
 
 ## Options
@@ -167,7 +167,7 @@ Per-adapter keys, defaults and conflict rules are listed in [options](/reference
 
 ## Registering a backend out of tree
 
-The registry is extensible without touching evoxc:
+The registry is extensible without touching evoxc, through [`register`](/api/evoxc/backends/register/) and [`unregister`](/api/evoxc/backends/unregister/):
 
 ```python
 import evoxc.backends as backends
@@ -189,7 +189,7 @@ my-compiler = "my_pkg.backend:my_backend"
 A `get(name)` miss probes the optional in-tree adapters first, then scans the `evoxc.backends` entry-point group **once per process** (sorted by name) and retries.
 A loaded `Backend` instance is registered as-is, a module with `register()` has it called, any other callable is called; a failing entry point raises a `BackendError` naming it and chaining the cause.
 
-To write one, subclass `evoxc.backends.CompilerBackend`, declare `name` and `capabilities` (including `dtypes`), and implement only the compiler half — `compile` and `load`:
+To write one, subclass [`evoxc.backends.CompilerBackend`](/api/evoxc/backends/compilerbackend/), declare `name` and `capabilities` (including `dtypes`), and implement only the compiler half — `compile` and `load`:
 
 ```python
 class MyStableHloBackend(evoxc.backends.CompilerBackend):
@@ -209,7 +209,7 @@ The shared `lower()` already verifies the graph, checks capabilities, inlines po
 
 ## Raw StableHLO with `compile_text`
 
-`evoxc.compile_text` is the explicit-staging escape hatch that skips tracing and `lower` entirely: hand-written or hand-edited StableHLO goes through the normal `compile` → `load`.
+[`evoxc.compile_text`](/api/evoxc/pipeline/compile-text/) is the explicit-staging escape hatch that skips tracing and `lower` entirely: hand-written or hand-edited StableHLO goes through the normal `compile` → `load`.
 
 ```python
 MLIR = """

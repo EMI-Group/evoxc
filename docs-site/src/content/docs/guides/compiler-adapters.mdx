@@ -6,7 +6,7 @@ sidebar:
 ---
 
 The compiler adapters are how a traced graph reaches real hardware.
-They share everything above the compiler: verification, the capability pre-check, portable-decomposition inlining and the StableHLO export are done once by the shared `CompilerBackend.lower()`, so each adapter owns only its compiler half — `compile` (drive the external compiler on the MLIR text) and `load` (rebuild the executable, never recompiling).
+They share everything above the compiler: verification, the capability pre-check, portable-decomposition inlining and the StableHLO export are done once by the shared [`CompilerBackend.lower()`](/api/evoxc/backends/compilerbackend/), so each adapter owns only its compiler half — `compile` (drive the external compiler on the MLIR text) and `load` (rebuild the executable, never recompiling).
 Two adapters fed the same graph therefore compile byte-identical MLIR, which is a useful property when you compare them.
 
 <img src="/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through a compiler adapter — IREE reaching llvm-cpu, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV; XLA reaching CUDA and ROCm through a PJRT plugin it discovers (a pip-installed jax_plugins plugin, or an explicit plugin path) and CPU only through a compiled test plugin (dashed); TVM reaching CPU end-to-end with ROCm compile-only (dashed). Placement is physical: Tensor.to(device) is the only transfer primitive and run outputs stay on the device they ran on." width="100%" />
@@ -74,7 +74,7 @@ A device is a `Device(kind, index)` and the indices are **per-kind enumeration i
 - A device kind an adapter does not accept is an explicit `BackendError`; a non-`Device` object is a `DeviceError`.
 
 `target_backends` is the iree compile option behind all of this: it defaults to `["llvm-cpu"]`, accepts `{"llvm-cpu", "cuda", "rocm", "vulkan-spirv"}`, and drives `--iree-hal-target-backends` (passing that flag yourself is refused).
-Through the `build`/`evaluate` sugar it is inferred from the resolved device when neither the option nor `EVOXC_TARGET_BACKENDS` is set; explicit-stage users pass it to `compile()` themselves.
+Through the [`build`](/api/evoxc/pipeline/build/)/[`evaluate`](/api/evoxc/pipeline/evaluate/) sugar it is inferred from the resolved device when neither the option nor `EVOXC_TARGET_BACKENDS` is set; explicit-stage users pass it to `compile()` themselves.
 
 ## `vulkan_target`
 
@@ -151,8 +151,8 @@ These are explicit errors, never silent fallbacks:
 
 - **Collectives are not compiled** by any adapter: multi-rank runtime channels are not wired, so a graph containing `evoxc.dist.*` collectives fails. See [collectives](/guides/collectives/).
 - **`runtime_call` is not compiled** — a Python callback cannot run inside a compiled module.
-- **`custom_call` and `inline_stablehlo` are forwarded verbatim** and the target compiler decides: evoxc keeps no target registry and pre-validates nothing, so an unknown `stablehlo.custom_call` target parses and then fails the compiler's legality check. There is no IREE custom-dispatch object-linking path and no PJRT custom-call registration, so **a kernel cannot be fused into a compiled module**.
-- **The supported kernel path is segmentation**: `evoxc.external_call` splits the graph into segments with the kernel at the boundary (host-mode, or device-resident and zero-copy through DLPack, with the kernel owning synchronization), or a `block` with a portable decomposition that the adapter inlines at `lower()`.
+- **[`custom_call`](/api/evoxc/ops/custom-call/) and [`inline_stablehlo`](/api/evoxc/ops/inline-stablehlo/) are forwarded verbatim** and the target compiler decides: evoxc keeps no target registry and pre-validates nothing, so an unknown `stablehlo.custom_call` target parses and then fails the compiler's legality check. There is no IREE custom-dispatch object-linking path and no PJRT custom-call registration, so **a kernel cannot be fused into a compiled module**.
+- **The supported kernel path is segmentation**: [`evoxc.external_call`](/api/evoxc/ops/external-call/) splits the graph into segments with the kernel at the boundary (host-mode, or device-resident and zero-copy through DLPack, with the kernel owning synchronization), or a [`block`](/api/evoxc/block/block/) with a portable decomposition that the adapter inlines at `lower()`.
 - **Sparse ops defer**: the 16 `sparse_*` ops are numpy-backend-only and raise a `BackendError` suggesting `evoxc.sparse.to_dense`.
 - **Unsigned and complex dtypes vary per adapter**: iree supports no unsigned and no complex (nondeterministic upstream unsigned reduce legalization; the exporter defers complex), xla supports all 14, tvm supports unsigned but no complex.
 - **Function shape gates the compile**: iree needs a `main` function or exactly one entry function, TVM needs exactly one `func.func` with a single-operand return, and external-call splitting needs a single-function graph.

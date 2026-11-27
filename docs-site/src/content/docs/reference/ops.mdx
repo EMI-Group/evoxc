@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Every numerical operation that can appear in an EvoXIR graph is a function in the frontend op namespace (`evoxc.ops`, re-exported at the top level of `evoxc`): `evoxc.ops.__all__` holds 104 names, plus `evoxc.arange` from `evoxc.numpy`, the eight `evoxc.random` functions, the `evoxc.dist` collectives and the `evoxc.sparse` surface.
+Every numerical operation that can appear in an EvoXIR graph is a function in the frontend op namespace (`evoxc.ops`, re-exported at the top level of `evoxc`): `evoxc.ops.__all__` holds 104 names, plus [`evoxc.arange`](/api/evoxc/numpy/arange/) from `evoxc.numpy`, the eight `evoxc.random` functions, the `evoxc.dist` collectives and the `evoxc.sparse` surface.
 This page groups them by area; exact signatures, defaults and per-op docstrings are in the generated Python API reference published at `/api/` on this site, which is built from those docstrings.
 
 ## How ops are called
@@ -42,10 +42,10 @@ Every non-tensor parameter — an axis, a shape, a padding table, `k`, a dtype, 
 
 | Expression | Op |
 |---|---|
-| `x + y`, `x - y`, `x * y`, `x / y`, `x ** y`, `-x` | `add`, `subtract`, `multiply`, `divide`, `power`, `negate` |
-| `x @ y` | `dot` (rank ≥ 2; use `matmul` for 1-D operands) |
-| `x == y`, `x != y`, `x < y`, `x <= y`, `x > y`, `x >= y` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` |
-| `x[key]` | `slice` / `gather` for static keys |
+| `x + y`, `x - y`, `x * y`, `x / y`, `x ** y`, `-x` | [`add`](/api/evoxc/ops/add/), [`subtract`](/api/evoxc/ops/subtract/), [`multiply`](/api/evoxc/ops/multiply/), [`divide`](/api/evoxc/ops/divide/), [`power`](/api/evoxc/ops/power/), [`negate`](/api/evoxc/ops/negate/) |
+| `x @ y` | [`dot`](/api/evoxc/ops/dot/) (rank ≥ 2; use [`matmul`](/api/evoxc/ops/matmul/) for 1-D operands) |
+| `x == y`, `x != y`, `x < y`, `x <= y`, `x > y`, `x >= y` | [`equal`](/api/evoxc/ops/equal/), [`not_equal`](/api/evoxc/ops/not-equal/), [`less`](/api/evoxc/ops/less/), [`less_equal`](/api/evoxc/ops/less-equal/), [`greater`](/api/evoxc/ops/greater/), [`greater_equal`](/api/evoxc/ops/greater-equal/) |
+| `x[key]` | [`slice`](/api/evoxc/ops/slice/) / [`gather`](/api/evoxc/ops/gather/) for static keys |
 
 `__eq__` on two symbolic values builds a graph comparison, not a Python boolean — that is why `if x > 0:` on a symbolic value fails instead of silently picking a branch.
 
@@ -53,7 +53,7 @@ Every non-tensor parameter — an axis, a shape, a padding table, `k`, a dtype, 
 
 - **Tensor ⨯ tensor promotes by `numpy.result_type`**, including its subtleties: `int8`+`uint8` → `int16`, `float32`+`int64` → `float64`, `float16`+`float16` → `float16`.
 - **Python scalar ⨯ tensor follows NEP 50 weak promotion**, implemented explicitly so the behavior is identical on numpy 1.x and 2.x: `int` scalars promote down to a `float16`/`float32`/`float64` tensor when exactly representable, `float` scalars are weak toward every float/complex tensor, `complex` scalars toward `complex64`/`complex128` only.
-- **Unary math** (`sqrt`, `exp`, `log`, `log1p`, trig, `tanh`, `sigmoid`, `relu`, `gelu`, `erf`) turns integer/bool input into `float64` and keeps a float dtype; **unary preserving** (`abs`, `negate`, `square`, `sign`, `floor`, `ceil`, `round`) keeps the dtype.
+- **Unary math** ([`sqrt`](/api/evoxc/ops/sqrt/), [`exp`](/api/evoxc/ops/exp/), [`log`](/api/evoxc/ops/log/), [`log1p`](/api/evoxc/ops/log1p/), trig, [`tanh`](/api/evoxc/ops/tanh/), [`sigmoid`](/api/evoxc/ops/sigmoid/), [`relu`](/api/evoxc/ops/relu/), [`gelu`](/api/evoxc/ops/gelu/), [`erf`](/api/evoxc/ops/erf/)) turns integer/bool input into `float64` and keeps a float dtype; **unary preserving** ([`abs`](/api/evoxc/ops/abs/), [`negate`](/api/evoxc/ops/negate/), [`square`](/api/evoxc/ops/square/), [`sign`](/api/evoxc/ops/sign/), [`floor`](/api/evoxc/ops/floor/), [`ceil`](/api/evoxc/ops/ceil/), [`round`](/api/evoxc/ops/round/)) keeps the dtype.
 - **Broadcasting** aligns shapes right. Two concrete extents that disagree is a `ShapeError` at trace time — a statically known failure is never deferred; when a symbolic dim is involved the result dim is the `DimExpr.max` of the two, which is numpy's own result shape, and the runtime enforces exact compatibility.
 - **Reductions** take `axes=None` (all axes), negative axes, or a tuple; `keepdims=True` leaves the reduced axes as extent 1. A rank-0 result is the scalar shape `()`.
 - Shape arithmetic over symbolic dims uses `Dim`/`DimExpr`, so rank is always known at trace time even when extents are not.
@@ -66,10 +66,10 @@ Every non-tensor parameter — an axis, a shape, a padding table, `k`, a dtype, 
 | `native` Rust engine | The dense operation set, at parity with the numpy reference (exact bool/integer paths, measured float tolerances); sparse ops are off |
 | Compiler adapters (`iree`, `xla`, `tvm`) | The StableHLO-exportable subset; the rest raises an explicit `BackendError` at `lower()` |
 
-The compiler-relevant deferrals today: `tril`, `triu`, `cumsum`, `cumprod`, `flip`, `roll`, `nan_to_num`, `solve`, `erf` and `gelu` (there is no StableHLO error function, so GELU is deferred with it rather than approximated), `diagonal`, the factorizations `cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp`, `random_multinomial`, every `sparse_*` op (densify with `evoxc.sparse.to_dense` first), and the callback ops `runtime_call`/`external_call`/`dist.rank`/`dist.world_size`.
-The frontend compositions below work through their components, so `topk`, `stack`, `clamp`, `matmul`, `isnan`, `eye` and `linspace` inherit the coverage of the ops they expand into.
-`diag` is a single IR op whose own v1 emission is a flatten-plus-gather (rank 2) or an iota mask plus `select` (rank 1), so it needs neither a separate mnemonic nor a composition.
-The two escape hatches `custom_call`/`inline_stablehlo` are gated on the backend's `Capabilities.custom_ops`: the numpy interpreter and the native engine reject them explicitly and the compiler decides their validity.
+The compiler-relevant deferrals today: [`tril`](/api/evoxc/ops/tril/), [`triu`](/api/evoxc/ops/triu/), [`cumsum`](/api/evoxc/ops/cumsum/), [`cumprod`](/api/evoxc/ops/cumprod/), [`flip`](/api/evoxc/ops/flip/), [`roll`](/api/evoxc/ops/roll/), [`nan_to_num`](/api/evoxc/ops/nan-to-num/), [`solve`](/api/evoxc/ops/solve/), [`erf`](/api/evoxc/ops/erf/) and [`gelu`](/api/evoxc/ops/gelu/) (there is no StableHLO error function, so GELU is deferred with it rather than approximated), [`diagonal`](/api/evoxc/ops/diagonal/), the factorizations [`cholesky`](/api/evoxc/ops/cholesky/)/[`qr`](/api/evoxc/ops/qr/)/[`matrix_rank`](/api/evoxc/ops/matrix-rank/)/[`svd`](/api/evoxc/ops/svd/)/[`matrix_exp`](/api/evoxc/ops/matrix-exp/), [`random_multinomial`](/api/evoxc/random/multinomial/), every `sparse_*` op (densify with `evoxc.sparse.to_dense` first), and the callback ops [`runtime_call`](/api/evoxc/ops/runtime-call/)/[`external_call`](/api/evoxc/ops/external-call/)/[`dist.rank`](/api/evoxc/dist/rank/)/[`dist.world_size`](/api/evoxc/dist/world-size/).
+The frontend compositions below work through their components, so [`topk`](/api/evoxc/ops/topk/), [`stack`](/api/evoxc/ops/stack/), [`clamp`](/api/evoxc/ops/clamp/), [`matmul`](/api/evoxc/ops/matmul/), [`isnan`](/api/evoxc/ops/isnan/), [`eye`](/api/evoxc/ops/eye/) and [`linspace`](/api/evoxc/ops/linspace/) inherit the coverage of the ops they expand into.
+[`diag`](/api/evoxc/ops/diag/) is a single IR op whose own v1 emission is a flatten-plus-gather (rank 2) or an iota mask plus [`select`](/api/evoxc/ops/select/) (rank 1), so it needs neither a separate mnemonic nor a composition.
+The two escape hatches [`custom_call`](/api/evoxc/ops/custom-call/)/[`inline_stablehlo`](/api/evoxc/ops/inline-stablehlo/) are gated on the backend's `Capabilities.custom_ops`: the numpy interpreter and the native engine reject them explicitly and the compiler decides their validity.
 
 ## IR op or composition
 
@@ -77,8 +77,8 @@ Some frontend names are one IR op; others are documented compositions of ordinar
 
 | Kind | Names |
 |---|---|
-| One IR op each | the arithmetic, comparison, logical, bitwise and unary-math ops, `cast`, `broadcast`, `reshape`, `transpose`, `slice`, `gather`, `scatter`, `concatenate`, `pad`, the `reduce_*` ops, `argmax`/`argmin`, `dot`, `conv`, `tril`/`triu`, `diagonal`, `solve`, the factorizations, `sort`/`argsort`, `tile`/`flip`/`roll`/`diag`/`nan_to_num`, `stop_gradient`, `constant` |
-| Composition over IR ops | `sum`/`max`/`min`/`mean`/`prod` (shorthand for `reduce_*`), `cumsum`/`cumprod`, `matmul`, `topk`, `stack`, `clamp`, `isnan`, `eye`, `linspace`, `trace`, `norm`, `var`, `std`, `median`, `nansum`, `evoxc.arange` |
+| One IR op each | the arithmetic, comparison, logical, bitwise and unary-math ops, [`cast`](/api/evoxc/ops/cast/), [`broadcast`](/api/evoxc/ops/broadcast/), [`reshape`](/api/evoxc/ops/reshape/), [`transpose`](/api/evoxc/ops/transpose/), [`slice`](/api/evoxc/ops/slice/), [`gather`](/api/evoxc/ops/gather/), [`scatter`](/api/evoxc/ops/scatter/), [`concatenate`](/api/evoxc/ops/concatenate/), [`pad`](/api/evoxc/ops/pad/), the `reduce_*` ops, [`argmax`](/api/evoxc/ops/argmax/)/[`argmin`](/api/evoxc/ops/argmin/), [`dot`](/api/evoxc/ops/dot/), [`conv`](/api/evoxc/ops/conv/), [`tril`](/api/evoxc/ops/tril/)/[`triu`](/api/evoxc/ops/triu/), [`diagonal`](/api/evoxc/ops/diagonal/), [`solve`](/api/evoxc/ops/solve/), the factorizations, [`sort`](/api/evoxc/ops/sort/)/[`argsort`](/api/evoxc/ops/argsort/), [`tile`](/api/evoxc/ops/tile/)/[`flip`](/api/evoxc/ops/flip/)/[`roll`](/api/evoxc/ops/roll/)/[`diag`](/api/evoxc/ops/diag/)/[`nan_to_num`](/api/evoxc/ops/nan-to-num/), [`stop_gradient`](/api/evoxc/ops/stop-gradient/), `constant` |
+| Composition over IR ops | [`sum`](/api/evoxc/ops/sum/)/[`max`](/api/evoxc/ops/max/)/[`min`](/api/evoxc/ops/min/)/[`mean`](/api/evoxc/ops/mean/)/[`prod`](/api/evoxc/ops/prod/) (shorthand for `reduce_*`), [`cumsum`](/api/evoxc/ops/cumsum/)/[`cumprod`](/api/evoxc/ops/cumprod/), [`matmul`](/api/evoxc/ops/matmul/), [`topk`](/api/evoxc/ops/topk/), [`stack`](/api/evoxc/ops/stack/), [`clamp`](/api/evoxc/ops/clamp/), [`isnan`](/api/evoxc/ops/isnan/), [`eye`](/api/evoxc/ops/eye/), [`linspace`](/api/evoxc/ops/linspace/), [`trace`](/api/evoxc/ops/trace/), [`norm`](/api/evoxc/ops/norm/), [`var`](/api/evoxc/ops/var/), [`std`](/api/evoxc/ops/std/), [`median`](/api/evoxc/ops/median/), [`nansum`](/api/evoxc/ops/nansum/), [`evoxc.arange`](/api/evoxc/numpy/arange/) |
 
 A composition adds no new semantics: it is the same graph you would have written by hand, and its name in the catalogue is a convenience, not a backend feature.
 
@@ -91,106 +91,106 @@ The documented exceptions are the compiler escape hatches `custom_call`/`inline_
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `evoxc.constant(t)` | Embed host tensor data in the graph as a `constant` op | Trace-time only; snapshots a copy of the data; warns above `EVOXC_LARGE_CONSTANT_BYTES` (1 MiB default); host data only — a non-cpu tensor raises `DeviceError` |
-| `evoxc.arange(start, stop=None, step=1, dtype=None)` | A 1-D index vector | A `constant` op, so bounds must be concrete Python numbers; symbolic bounds defer |
-| `evoxc.eye(n, m=None, dtype=evoxc.float32)` | Identity matrix | Composition over constants; `float32` default |
-| `evoxc.linspace(start, stop, num, dtype=None)` | Evenly spaced values | `float64` default (a deliberate deviation from the float32 creation convention); symbolic bounds raise |
-| `evoxc.numpy.zeros/ones/full/empty` | Graph-side array fillers | Graph ops; the **top-level** `evoxc.zeros/ones/full/empty` are concrete host creators, not graph ops |
+| [`evoxc.constant(t)`](/api/evoxc/core/constant/) | Embed host tensor data in the graph as a `constant` op | Trace-time only; snapshots a copy of the data; warns above `EVOXC_LARGE_CONSTANT_BYTES` (1 MiB default); host data only — a non-cpu tensor raises `DeviceError` |
+| [`evoxc.arange(start, stop=None, step=1, dtype=None)`](/api/evoxc/numpy/arange/) | A 1-D index vector | A `constant` op, so bounds must be concrete Python numbers; symbolic bounds defer |
+| [`evoxc.eye(n, m=None, dtype=evoxc.float32)`](/api/evoxc/ops/eye/) | Identity matrix | Composition over constants; `float32` default |
+| [`evoxc.linspace(start, stop, num, dtype=None)`](/api/evoxc/ops/linspace/) | Evenly spaced values | `float64` default (a deliberate deviation from the float32 creation convention); symbolic bounds raise |
+| [`evoxc.numpy.zeros`](/api/evoxc/numpy/zeros/)/[`ones`](/api/evoxc/numpy/ones/)/[`full`](/api/evoxc/numpy/full/)/[`empty`](/api/evoxc/numpy/empty/) | Graph-side array fillers | Graph ops; the **top-level** `evoxc.zeros/ones/full/empty` are concrete host creators, not graph ops |
 
 ## Elementwise unary
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `abs`, `negate`, `square`, `sign` | Absolute value, sign flip, square, sign | Dtype preserved (complex `abs` gives the real magnitude dtype) |
-| `sqrt`, `exp`, `log`, `log1p` | Roots and logarithms | Integer/bool input → `float64` |
-| `sin`, `cos`, `tan`, `acos`, `tanh` | Trigonometric and hyperbolic | Integer/bool input → `float64` |
-| `sigmoid`, `relu` | Logistic sigmoid, rectifier (clamped at zero) | Integer/bool input → `float64` |
-| `gelu` | Gaussian error linear unit | The **exact** erf form `0.5·x·(1+erf(x/√2))`, not the tanh approximation some model code uses |
-| `erf` | Error function | No StableHLO emission exists; compiler backends defer |
-| `floor`, `ceil`, `round` | Rounding | Dtype preserving |
-| `cast(x, dtype)` | Exact dtype conversion | The target dtype is a static dtype object; a bad target is a `DTypeError` |
-| `isnan(x)` | NaN predicate | Composition returning `bool`; use it with `select` or a reduce for a guard |
-| `nan_to_num(x, nan=0.0, posinf=None, neginf=None)` | Replace non-finite values | Compiler backends defer |
+| [`abs`](/api/evoxc/ops/abs/), [`negate`](/api/evoxc/ops/negate/), [`square`](/api/evoxc/ops/square/), [`sign`](/api/evoxc/ops/sign/) | Absolute value, sign flip, square, sign | Dtype preserved (complex `abs` gives the real magnitude dtype) |
+| [`sqrt`](/api/evoxc/ops/sqrt/), [`exp`](/api/evoxc/ops/exp/), [`log`](/api/evoxc/ops/log/), [`log1p`](/api/evoxc/ops/log1p/) | Roots and logarithms | Integer/bool input → `float64` |
+| [`sin`](/api/evoxc/ops/sin/), [`cos`](/api/evoxc/ops/cos/), [`tan`](/api/evoxc/ops/tan/), [`acos`](/api/evoxc/ops/acos/), [`tanh`](/api/evoxc/ops/tanh/) | Trigonometric and hyperbolic | Integer/bool input → `float64` |
+| [`sigmoid`](/api/evoxc/ops/sigmoid/), [`relu`](/api/evoxc/ops/relu/) | Logistic sigmoid, rectifier (clamped at zero) | Integer/bool input → `float64` |
+| [`gelu`](/api/evoxc/ops/gelu/) | Gaussian error linear unit | The **exact** erf form `0.5·x·(1+erf(x/√2))`, not the tanh approximation some model code uses |
+| [`erf`](/api/evoxc/ops/erf/) | Error function | No StableHLO emission exists; compiler backends defer |
+| [`floor`](/api/evoxc/ops/floor/), [`ceil`](/api/evoxc/ops/ceil/), [`round`](/api/evoxc/ops/round/) | Rounding | Dtype preserving |
+| [`cast(x, dtype)`](/api/evoxc/ops/cast/) | Exact dtype conversion | The target dtype is a static dtype object; a bad target is a `DTypeError` |
+| [`isnan(x)`](/api/evoxc/ops/isnan/) | NaN predicate | Composition returning `bool`; use it with `select` or a reduce for a guard |
+| [`nan_to_num(x, nan=0.0, posinf=None, neginf=None)`](/api/evoxc/ops/nan-to-num/) | Replace non-finite values | Compiler backends defer |
 
 ## Elementwise binary and comparisons
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `add`, `subtract`, `multiply` | Ring arithmetic | Operator sugar: `+`, `-`, `*` |
-| `divide` | True division | `int`/`int` → `float64`; `truediv` handler |
-| `power` | `x ** y` | Reproduces numpy's integer/fractional special table — exponents `0`, `1`, `2`, `3`, `0.5` and `-1`, with one libm `pow` for every other exponent |
-| `remainder` | Floored modulo | The result takes the **sign of the divisor** and satisfies `x == (x // y) * y + x % y`; bit-identical on numpy and on `iree` (the exporter emits `stablehlo.remainder` plus the inline sign correction) |
-| `maximum`, `minimum` | Elementwise max/min | Not the reductions `max`/`min` |
-| `bitwise_and`, `bitwise_or`, `bitwise_xor` | Bitwise logic | Integer/bool only; other dtypes are a `DTypeError` |
-| `bitwise_left_shift`, `bitwise_right_shift` | Shifts | Integer/bool only |
-| `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` | Comparisons | Result dtype is `bool`; `==`, `!=`, `<`, `<=`, `>`, `>=` route here |
-| `logical_and`, `logical_or`, `logical_not` | Boolean connective | `bool` operands only (`DTypeError`) |
-| `select(pred, on_true, on_false)` | Elementwise choice | Broadcasting applies; this is the frontend's `where` |
+| [`add`](/api/evoxc/ops/add/), [`subtract`](/api/evoxc/ops/subtract/), [`multiply`](/api/evoxc/ops/multiply/) | Ring arithmetic | Operator sugar: `+`, `-`, `*` |
+| [`divide`](/api/evoxc/ops/divide/) | True division | `int`/`int` → `float64`; `truediv` handler |
+| [`power`](/api/evoxc/ops/power/) | `x ** y` | Reproduces numpy's integer/fractional special table — exponents `0`, `1`, `2`, `3`, `0.5` and `-1`, with one libm `pow` for every other exponent |
+| [`remainder`](/api/evoxc/ops/remainder/) | Floored modulo | The result takes the **sign of the divisor** and satisfies `x == (x // y) * y + x % y`; bit-identical on numpy and on `iree` (the exporter emits `stablehlo.remainder` plus the inline sign correction) |
+| [`maximum`](/api/evoxc/ops/maximum/), [`minimum`](/api/evoxc/ops/minimum/) | Elementwise max/min | Not the reductions `max`/`min` |
+| [`bitwise_and`](/api/evoxc/ops/bitwise-and/), [`bitwise_or`](/api/evoxc/ops/bitwise-or/), [`bitwise_xor`](/api/evoxc/ops/bitwise-xor/) | Bitwise logic | Integer/bool only; other dtypes are a `DTypeError` |
+| [`bitwise_left_shift`](/api/evoxc/ops/bitwise-left-shift/), [`bitwise_right_shift`](/api/evoxc/ops/bitwise-right-shift/) | Shifts | Integer/bool only |
+| [`equal`](/api/evoxc/ops/equal/), [`not_equal`](/api/evoxc/ops/not-equal/), [`less`](/api/evoxc/ops/less/), [`less_equal`](/api/evoxc/ops/less-equal/), [`greater`](/api/evoxc/ops/greater/), [`greater_equal`](/api/evoxc/ops/greater-equal/) | Comparisons | Result dtype is `bool`; `==`, `!=`, `<`, `<=`, `>`, `>=` route here |
+| [`logical_and`](/api/evoxc/ops/logical-and/), [`logical_or`](/api/evoxc/ops/logical-or/), [`logical_not`](/api/evoxc/ops/logical-not/) | Boolean connective | `bool` operands only (`DTypeError`) |
+| [`select(pred, on_true, on_false)`](/api/evoxc/ops/select/) | Elementwise choice | Broadcasting applies; this is the frontend's `where` |
 
 ## Reductions and statistics
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `reduce_sum`, `reduce_prod` | Sum, product | `bool` → `int64` |
-| `reduce_max`, `reduce_min` | Maximum, minimum | `bool` keeps `bool` |
-| `reduce_mean` | Mean | Integer/bool → `float64` |
-| `argmax`, `argmin` | Index of the extreme | `int64`; `axis=None` reduces over all elements |
-| `sum`, `max`, `min`, `mean`, `prod` | Documented shorthand for the `reduce_*` ops | Same keyword arguments, nothing else |
-| `var`, `std` | Variance, standard deviation | Compositions over ordinary ops (`ddof` static); no dedicated IR op |
-| `median` | Median along an axis | Composition: cast to `float64`, `sort`, `slice` the middle element(s), `reduce_mean` |
-| `nansum` | NaN-skipping sum | Composition |
-| `cumsum(x, axis=0, reverse=False)` | Running sum | Compiler backends defer |
-| `cumprod(x, axis=0, reverse=False)` | Running product | Compiler backends defer |
+| [`reduce_sum`](/api/evoxc/ops/reduce-sum/), [`reduce_prod`](/api/evoxc/ops/reduce-prod/) | Sum, product | `bool` → `int64` |
+| [`reduce_max`](/api/evoxc/ops/reduce-max/), [`reduce_min`](/api/evoxc/ops/reduce-min/) | Maximum, minimum | `bool` keeps `bool` |
+| [`reduce_mean`](/api/evoxc/ops/reduce-mean/) | Mean | Integer/bool → `float64` |
+| [`argmax`](/api/evoxc/ops/argmax/), [`argmin`](/api/evoxc/ops/argmin/) | Index of the extreme | `int64`; `axis=None` reduces over all elements |
+| [`sum`](/api/evoxc/ops/sum/), [`max`](/api/evoxc/ops/max/), [`min`](/api/evoxc/ops/min/), [`mean`](/api/evoxc/ops/mean/), [`prod`](/api/evoxc/ops/prod/) | Documented shorthand for the `reduce_*` ops | Same keyword arguments, nothing else |
+| [`var`](/api/evoxc/ops/var/), [`std`](/api/evoxc/ops/std/) | Variance, standard deviation | Compositions over ordinary ops (`ddof` static); no dedicated IR op |
+| [`median`](/api/evoxc/ops/median/) | Median along an axis | Composition: cast to `float64`, `sort`, `slice` the middle element(s), `reduce_mean` |
+| [`nansum`](/api/evoxc/ops/nansum/) | NaN-skipping sum | Composition |
+| [`cumsum(x, axis=0, reverse=False)`](/api/evoxc/ops/cumsum/) | Running sum | Compiler backends defer |
+| [`cumprod(x, axis=0, reverse=False)`](/api/evoxc/ops/cumprod/) | Running product | Compiler backends defer |
 
 ## Shape manipulation
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `broadcast(x, shape)` | Materialize a broadcast | Target dims may be `int`, `Dim`/`DimExpr` or `None` |
-| `reshape(x, shape)` | Reinterpret the shape | At most one `-1`, inferred from the element count |
-| `transpose(x, axes=None)` | Permute axes | `None` reverses; a bad permutation is a `ShapeError` |
-| `concatenate(tensors, axis=0)` | Join along an existing axis | Variadic (one op, N operands); non-axis dims must match |
-| `tile(x, reps)` | Repeat whole blocks | Exports as a reshape + broadcast decomposition |
-| `stack(tensors, axis=0)` | Join along a new axis | Composition: reshape + `concatenate` |
-| `flip(x, axes)` | Reverse along axes | Compiler backends defer |
-| `roll(x, shift, axis=None)` | Cyclic shift | Compiler backends defer |
-| `diag(x)` | Vector → diagonal matrix, matrix → diagonal vector | One IR op (dtype preserved); exports as flatten + gather or an iota mask |
-| `evoxc.numpy.expand_dims` / `squeeze` | Insert/drop extent-1 axes | `evoxc.numpy` spellings only (reshape sugar) |
+| [`broadcast(x, shape)`](/api/evoxc/ops/broadcast/) | Materialize a broadcast | Target dims may be `int`, `Dim`/`DimExpr` or `None` |
+| [`reshape(x, shape)`](/api/evoxc/ops/reshape/) | Reinterpret the shape | At most one `-1`, inferred from the element count |
+| [`transpose(x, axes=None)`](/api/evoxc/ops/transpose/) | Permute axes | `None` reverses; a bad permutation is a `ShapeError` |
+| [`concatenate(tensors, axis=0)`](/api/evoxc/ops/concatenate/) | Join along an existing axis | Variadic (one op, N operands); non-axis dims must match |
+| [`tile(x, reps)`](/api/evoxc/ops/tile/) | Repeat whole blocks | Exports as a reshape + broadcast decomposition |
+| [`stack(tensors, axis=0)`](/api/evoxc/ops/stack/) | Join along a new axis | Composition: reshape + `concatenate` |
+| [`flip(x, axes)`](/api/evoxc/ops/flip/) | Reverse along axes | Compiler backends defer |
+| [`roll(x, shift, axis=None)`](/api/evoxc/ops/roll/) | Cyclic shift | Compiler backends defer |
+| [`diag(x)`](/api/evoxc/ops/diag/) | Vector → diagonal matrix, matrix → diagonal vector | One IR op (dtype preserved); exports as flatten + gather or an iota mask |
+| [`evoxc.numpy.expand_dims`](/api/evoxc/numpy/expand-dims/) / [`squeeze`](/api/evoxc/numpy/squeeze/) | Insert/drop extent-1 axes | `evoxc.numpy` spellings only (reshape sugar) |
 
 ## Indexing, gather, scatter, slice and pad
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `slice(x, start, lengths, strides=1)` | Static strided slice | Starts/strides must be static ints; lengths may be symbolic; shape is exactly `lengths` |
-| `gather(x, indices, axis=0)` | Take entries along an axis | `indices` must be `int32`/`int64` (else `DTypeError`); result shape is `x.shape[:axis] + indices.shape + x.shape[axis+1:]` |
-| `scatter(x, indices, updates, axis=0)` | Update along an axis | Functional: `x` is never mutated, a copy is updated; `updates` is cast to `x.dtype` |
-| `pad(x, config, value=0)` | Constant padding | One entry per axis, each an `int` (symmetric) or a `(before, after)` pair; negative padding is a `ShapeError`; the fill value is cast to `x.dtype` |
+| [`slice(x, start, lengths, strides=1)`](/api/evoxc/ops/slice/) | Static strided slice | Starts/strides must be static ints; lengths may be symbolic; shape is exactly `lengths` |
+| [`gather(x, indices, axis=0)`](/api/evoxc/ops/gather/) | Take entries along an axis | `indices` must be `int32`/`int64` (else `DTypeError`); result shape is `x.shape[:axis] + indices.shape + x.shape[axis+1:]` |
+| [`scatter(x, indices, updates, axis=0)`](/api/evoxc/ops/scatter/) | Update along an axis | Functional: `x` is never mutated, a copy is updated; `updates` is cast to `x.dtype` |
+| [`pad(x, config, value=0)`](/api/evoxc/ops/pad/) | Constant padding | One entry per axis, each an `int` (symmetric) or a `(before, after)` pair; negative padding is a `ShapeError`; the fill value is cast to `x.dtype` |
 | `x[key]` | `getitem` operator handler | Static ints and `slice` objects only → `slice`/`gather`; symbolic indices, masks, `None`/newaxis and ellipsis are `TraceError`s |
 
 ## Linear algebra
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `dot(a, b)` | Batched matrix product | Both operands rank ≥ 2; batch dims broadcast; `k` dims must agree (a size-1 `k` broadcasts); `@` routes here |
-| `matmul(a, b)` | numpy `matmul` semantics | Composition over `dot` with rank-1 promote/squeeze |
-| `conv(x, w, strides=1, padding="VALID", input_dilation=1, kernel_dilation=1, feature_group_size=1, channels_last=False)` | N-dimensional convolution | NCHW by default; out dim `(d + 2·pad − kdil·(k−1) − 1) // stride + 1`; the only spatial op — pooling is written by the caller as `slice` + a reduction |
-| `tril`, `triu` | Lower/upper triangle mask | `k` is a static diagonal offset; compiler backends defer |
-| `solve(a, b)` | Linear solve | Integer input → `float64`; compiler backends defer |
-| `diagonal(x, offset=0, axis1=0, axis2=1)` | Extract a diagonal | Compiler backends defer (distinct from `diag`) |
-| `trace(x, offset=0)` | Sum of the main diagonal | Composition |
-| `norm(x, axis=None, keepdims=False, ord=2)` | Vector norm | `ord` accepts only 1, 2, `inf` and `-inf` — anything else is an explicit `NotImplementedError`; `axis=None` on rank > 1 is the flat-vector norm, not a matrix norm |
-| `eigh(x)` | Symmetric eigendecomposition | Multi-result (values, vectors); v1 exports via a while-loop cyclic-Jacobi composition |
-| `cholesky(x)` | Lower-triangular factorization | Non-positive-definite input raises at run time |
-| `qr`, `svd` | Factorizations | Multi-result tuple ops |
-| `matrix_rank`, `matrix_exp` | Rank, matrix exponential | v1 deferrals on compiler backends |
+| [`dot(a, b)`](/api/evoxc/ops/dot/) | Batched matrix product | Both operands rank ≥ 2; batch dims broadcast; `k` dims must agree (a size-1 `k` broadcasts); `@` routes here |
+| [`matmul(a, b)`](/api/evoxc/ops/matmul/) | numpy `matmul` semantics | Composition over `dot` with rank-1 promote/squeeze |
+| [`conv(x, w, strides=1, padding="VALID", input_dilation=1, kernel_dilation=1, feature_group_size=1, channels_last=False)`](/api/evoxc/ops/conv/) | N-dimensional convolution | NCHW by default; out dim `(d + 2·pad − kdil·(k−1) − 1) // stride + 1`; the only spatial op — pooling is written by the caller as `slice` + a reduction |
+| [`tril`](/api/evoxc/ops/tril/), [`triu`](/api/evoxc/ops/triu/) | Lower/upper triangle mask | `k` is a static diagonal offset; compiler backends defer |
+| [`solve(a, b)`](/api/evoxc/ops/solve/) | Linear solve | Integer input → `float64`; compiler backends defer |
+| [`diagonal(x, offset=0, axis1=0, axis2=1)`](/api/evoxc/ops/diagonal/) | Extract a diagonal | Compiler backends defer (distinct from `diag`) |
+| [`trace(x, offset=0)`](/api/evoxc/ops/trace/) | Sum of the main diagonal | Composition |
+| [`norm(x, axis=None, keepdims=False, ord=2)`](/api/evoxc/ops/norm/) | Vector norm | `ord` accepts only 1, 2, `inf` and `-inf` — anything else is an explicit `NotImplementedError`; `axis=None` on rank > 1 is the flat-vector norm, not a matrix norm |
+| [`eigh(x)`](/api/evoxc/ops/eigh/) | Symmetric eigendecomposition | Multi-result (values, vectors); v1 exports via a while-loop cyclic-Jacobi composition |
+| [`cholesky(x)`](/api/evoxc/ops/cholesky/) | Lower-triangular factorization | Non-positive-definite input raises at run time |
+| [`qr`](/api/evoxc/ops/qr/), [`svd`](/api/evoxc/ops/svd/) | Factorizations | Multi-result tuple ops |
+| [`matrix_rank`](/api/evoxc/ops/matrix-rank/), [`matrix_exp`](/api/evoxc/ops/matrix-exp/) | Rank, matrix exponential | v1 deferrals on compiler backends |
 
 ## Sorting and search
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `sort(x, axis=-1, descending=False, stable=False)` | Sort values | Exports as v1 StableHLO (descending = reverse after the sort) |
-| `argsort(x, axis=-1, descending=False, stable=False)` | Sort indices | Exports as v1 StableHLO |
-| `topk(x, k, axis=-1, largest=True)` | Top-`k` values **and** indices | Composition returning a pair; `k` is a static int ≤ the extent (a symbolic extent defers to run time); `k=1` uses an argmax/reduce fast path |
+| [`sort(x, axis=-1, descending=False, stable=False)`](/api/evoxc/ops/sort/) | Sort values | Exports as v1 StableHLO (descending = reverse after the sort) |
+| [`argsort(x, axis=-1, descending=False, stable=False)`](/api/evoxc/ops/argsort/) | Sort indices | Exports as v1 StableHLO |
+| [`topk(x, k, axis=-1, largest=True)`](/api/evoxc/ops/topk/) | Top-`k` values **and** indices | Composition returning a pair; `k` is a static int ≤ the extent (a symbolic extent defers to run time); `k=1` uses an argmax/reduce fast path |
 
 ## Convolution and pooling
 
@@ -203,22 +203,22 @@ Windowed reductions are written out by the caller from `slice`, `reshape` and th
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `key(seed, algorithm="splitmix64")` | Create a key | The only polymorphic creator; accepts a name or an `Algorithm` member (`SPLITMIX64`, `THREEFRY2X32`, `PHILOX4X32_10`) |
-| `split(key)`, `split_n(key, n)` | Derive independent keys | Keys are never mutated, so splitting is how you get more of them |
-| `uniform(key, shape, low=0.0, high=1.0, dtype=float32)` | Uniform sample | The key's form determines the algorithm; a mismatched key is a `ShapeError`/`DTypeError` |
-| `normal(key, shape, mean=0.0, std=1.0, dtype=float32)` | Normal sample | |
-| `randint(key, shape, low, high, dtype=int32)` | Integer sample | |
-| `permutation(key, n, dtype=int32)` | Random permutation | |
-| `multinomial(key, input, num_samples)` | Categorical sample | `int32`; the one random op that defers on compiler backends |
+| [`key(seed, algorithm="splitmix64")`](/api/evoxc/random/key/) | Create a key | The only polymorphic creator; accepts a name or an `Algorithm` member (`SPLITMIX64`, `THREEFRY2X32`, `PHILOX4X32_10`) |
+| [`split(key)`](/api/evoxc/random/split/), [`split_n(key, n)`](/api/evoxc/random/split-n/) | Derive independent keys | Keys are never mutated, so splitting is how you get more of them |
+| [`uniform(key, shape, low=0.0, high=1.0, dtype=float32)`](/api/evoxc/random/uniform/) | Uniform sample | The key's form determines the algorithm; a mismatched key is a `ShapeError`/`DTypeError` |
+| [`normal(key, shape, mean=0.0, std=1.0, dtype=float32)`](/api/evoxc/random/normal/) | Normal sample | |
+| [`randint(key, shape, low, high, dtype=int32)`](/api/evoxc/random/randint/) | Integer sample | |
+| [`permutation(key, n, dtype=int32)`](/api/evoxc/random/permutation/) | Random permutation | |
+| [`multinomial(key, input, num_samples)`](/api/evoxc/random/multinomial/) | Categorical sample | `int32`; the one random op that defers on compiler backends |
 
 ## Control flow and graph annotations
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `evoxc.cond(pred, true_fn, false_fn, *operands)` | Runtime branch | The two callables are traced into IR regions; both must return the same structure |
-| `evoxc.while_loop(cond_fn, body_fn, init)` | Runtime loop | The predicate and the carry must involve at least one symbolic value |
-| `evoxc.scan(f, init, xs, length=None)` | Loop with stacked outputs | A symbolic-length `scan` is a v1 deferral |
-| `stop_gradient(x)` | Gradient barrier | Marks a value a derivative rule must not differentiate through |
+| [`evoxc.cond(pred, true_fn, false_fn, *operands)`](/api/evoxc/trace/cond/) | Runtime branch | The two callables are traced into IR regions; both must return the same structure |
+| [`evoxc.while_loop(cond_fn, body_fn, init)`](/api/evoxc/trace/while-loop/) | Runtime loop | The predicate and the carry must involve at least one symbolic value |
+| [`evoxc.scan(f, init, xs, length=None)`](/api/evoxc/trace/scan/) | Loop with stacked outputs | A symbolic-length `scan` is a v1 deferral |
+| [`stop_gradient(x)`](/api/evoxc/ops/stop-gradient/) | Gradient barrier | Marks a value a derivative rule must not differentiate through |
 
 The most common control-flow hazard is deliberate: `if evoxc.sum(x) > 0:` raises, because a graph value cannot be a Python boolean — `cond` is the runtime alternative. See [in-graph control flow](/guides/control-flow/).
 
@@ -226,22 +226,22 @@ The most common control-flow hazard is deliberate: `if evoxc.sum(x) > 0:` raises
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `evoxc.dist.group(name, ranks)`, `dist.rank()`, `dist.world_size()` | Group handle and graph scalars | `rank`/`world_size` are graph values, effects `read` |
-| `dist.all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast`, `collective_permute` | Explicit communication | Effect `collective`; the shape contract is the local tensor shape (a 4-rank `all_gather` on axis 0: `[256,1024] → [1024,1024]`); not compiled in v1 — see [collectives](/guides/collectives/) |
-| `runtime_call(callback, *operands, result=...)` | Run a Python callback at that point in the graph | Effect `callback`; the callback is carried as an op attribute, never silently dropped or reordered; the numpy interpreter runs it, compiler adapters reject it |
-| `external_call(name, *operands, result=...)` | Call a registered external kernel by name | Effect `callback`; the kernel need not be registered at trace time; see [custom ops and kernels](/guides/custom-blocks/) |
-| `evoxc.block(...)` | A custom op with a portable decomposition and optional per-backend impls | Declares its own inputs/outputs/effects; see [custom ops and kernels](/guides/custom-blocks/) |
+| `evoxc.dist.group(name, ranks)`, [`dist.rank()`](/api/evoxc/dist/rank/), [`dist.world_size()`](/api/evoxc/dist/world-size/) | Group handle and graph scalars | `rank`/`world_size` are graph values, effects `read` |
+| [`dist.all_reduce`](/api/evoxc/dist/all-reduce/), [`all_gather`](/api/evoxc/dist/all-gather/), [`reduce_scatter`](/api/evoxc/dist/reduce-scatter/), [`all_to_all`](/api/evoxc/dist/all-to-all/), [`broadcast`](/api/evoxc/dist/broadcast/), [`collective_permute`](/api/evoxc/dist/collective-permute/) | Explicit communication | Effect `collective`; the shape contract is the local tensor shape (a 4-rank `all_gather` on axis 0: `[256,1024] → [1024,1024]`); not compiled in v1 — see [collectives](/guides/collectives/) |
+| [`runtime_call(callback, *operands, result=...)`](/api/evoxc/ops/runtime-call/) | Run a Python callback at that point in the graph | Effect `callback`; the callback is carried as an op attribute, never silently dropped or reordered; the numpy interpreter runs it, compiler adapters reject it |
+| [`external_call(name, *operands, result=...)`](/api/evoxc/ops/external-call/) | Call a registered external kernel by name | Effect `callback`; the kernel need not be registered at trace time; see [custom ops and kernels](/guides/custom-blocks/) |
+| [`evoxc.block(...)`](/api/evoxc/block/block/) | A custom op with a portable decomposition and optional per-backend impls | Declares its own inputs/outputs/effects; see [custom ops and kernels](/guides/custom-blocks/) |
 
 ## Sparse ops
 
-`evoxc.sparse` exposes 16 graph ops — `sparse_from_dense`, `sparse_to_dense`, the `coo`/`csr`/`csc` conversions, `negate`, `add`, `multiply`, `multiply_dense`, `reduce_sum`, `transpose`, `reshape`, `concatenate` and the two `dot` variants — and they are **numpy-backend-only in v1**: a compiler backend raises an explicit `BackendError` suggesting `evoxc.sparse.to_dense`. Sparse tensors are pytree composites over ordinary tensor values, not a new IR value kind. See [sparse tensors](/guides/sparse-tensors/).
+`evoxc.sparse` exposes 16 graph ops — [`sparse_from_dense`](/api/evoxc/sparse/from-dense/), [`sparse_to_dense`](/api/evoxc/sparse/to-dense/), the [`coo`](/api/evoxc/sparse/coo/)/[`csr`](/api/evoxc/sparse/csr/)/[`csc`](/api/evoxc/sparse/csc/) conversions, [`negate`](/api/evoxc/sparse/negate/), [`add`](/api/evoxc/sparse/add/), [`multiply`](/api/evoxc/sparse/multiply/), [`multiply_dense`](/api/evoxc/sparse/multiply-dense/), [`reduce_sum`](/api/evoxc/sparse/sum/), [`transpose`](/api/evoxc/sparse/transpose/), [`reshape`](/api/evoxc/sparse/reshape/), [`concatenate`](/api/evoxc/sparse/concatenate/) and the two `dot` variants — and they are **numpy-backend-only in v1**: a compiler backend raises an explicit `BackendError` suggesting `evoxc.sparse.to_dense`. Sparse tensors are pytree composites over ordinary tensor values, not a new IR value kind. See [sparse tensors](/guides/sparse-tensors/).
 
 ## Custom and escape-hatch ops
 
 | Op | Meaning | Notes |
 |---|---|---|
-| `custom_call(call_target_name, *operands, result=..., backend_config="", api_version=1, has_side_effect=False)` | Emit `stablehlo.custom_call @target` | The compiler validates the target and its configuration; numpy/native reject it |
-| `inline_stablehlo(body, *operands, result=..., has_side_effect=False)` | Splice a raw StableHLO snippet verbatim | Operand *i* is `%in<i>`, result *i* must be assigned as `%out<i>` exactly once; the snippet is static text |
+| [`custom_call(call_target_name, *operands, result=..., backend_config="", api_version=1, has_side_effect=False)`](/api/evoxc/ops/custom-call/) | Emit `stablehlo.custom_call @target` | The compiler validates the target and its configuration; numpy/native reject it |
+| [`inline_stablehlo(body, *operands, result=..., has_side_effect=False)`](/api/evoxc/ops/inline-stablehlo/) | Splice a raw StableHLO snippet verbatim | Operand *i* is `%in<i>`, result *i* must be assigned as `%out<i>` exactly once; the snippet is static text |
 
 Both are effect-`callback` opaque ops with no kernel anywhere. A user *kernel* does not go through them: it plugs in as `external_call` or a `block` with a portable decomposition, which both numpy and the compiler adapters accept.
 

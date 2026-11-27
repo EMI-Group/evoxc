@@ -6,7 +6,7 @@ sidebar:
 ---
 
 A branch on tensor data cannot be a Python `if`, because at trace time the data does not exist.
-evoxc answers with three explicit constructs — `evoxc.cond`, `evoxc.while_loop` and `evoxc.scan` — that trace their branch and body callables into IR regions.
+evoxc answers with three explicit constructs — [`evoxc.cond`](/api/evoxc/trace/cond/), [`evoxc.while_loop`](/api/evoxc/trace/while-loop/) and [`evoxc.scan`](/api/evoxc/trace/scan/) — that trace their branch and body callables into IR regions.
 The regions are part of the program: they are printed by `graph.print()`, saved by `graph.save()`, lowered to StableHLO and executed by every backend, with no Python callback anywhere at run time.
 
 ## The callables run once, at trace time
@@ -23,7 +23,7 @@ Two consequences to internalize:
 ## Why a Python `if` cannot decide
 
 <Aside type="caution" title="A Python branch on a graph value raises">
-`if evoxc.sum(x) > 0:` fails at trace time, because `SymbolicTensor` refuses to be used as a Python boolean.
+`if evoxc.sum(x) > 0:` fails at trace time, because [`SymbolicTensor`](/api/evoxc/core/symbolictensor/) refuses to be used as a Python boolean.
 The correct runtime alternative is `evoxc.cond` for a branch, `evoxc.while_loop` (or `evoxc.scan`) for a loop — and plain Python `if`/`for` when the value is a static Python value, where specialization is the intended behaviour.
 </Aside>
 
@@ -53,7 +53,7 @@ evoxc.cond(pred, true_fn, false_fn, *operands) -> outputs
 
 | Requirement | What fails if you break it |
 |---|---|
-| `pred` is a 0-d **bool** `SymbolicTensor` | `TraceError` naming the construct |
+| `pred` is a 0-d **bool** `SymbolicTensor` | [`TraceError`](/api/evoxc/core/traceerror/) naming the construct |
 | `*operands` are `SymbolicTensor`s, static values, or pytrees of those | `TraceError` naming the leaf |
 | Both branches are callables taking the operands positionally | Python `TypeError` |
 | Both branches return the **same tree** | `TraceError` |
@@ -116,7 +116,7 @@ def power_iteration(a, v0, steps):        # steps: static int → specializes th
 ```
 
 Note what is *not* in the carry: `steps` is a static Python value, so the comparison bound is baked into the traced condition region and no tensor for it exists.
-Loop-carried types must stay constant across iterations, which the tracer enforces at trace time — a body that returns a differently shaped value is a `ShapeError`, not a run-time surprise.
+Loop-carried types must stay constant across iterations, which the tracer enforces at trace time — a body that returns a differently shaped value is a [`ShapeError`](/api/evoxc/core/shapeerror/), not a run-time surprise.
 
 Each symbolic leaf of `init` becomes one loop-carried operand and one region block argument. That is a 1:1 mapping with no packing, deduplication or region rewriting, so keeping the carry small (two or three values, with derived quantities recomputed in the body) keeps the emitted `while` small too.
 
@@ -162,7 +162,7 @@ Regions lower like any other op: the StableHLO exporter emits `stablehlo.if` and
 IREE has been validated on `while_loop`, `scan`, a `while` nested inside a `cond`, and the multi-objective/NSGA2-class loops, with numpy parity — see [Compiler adapters](/guides/compiler-adapters/) for the current validation state and the known traps.
 
 Symbolic shapes and control flow interact per op: a carry whose shape contains a `Dim` is fine as long as every op inside the regions supports symbolic dims.
-When one does not (a `reshape`, a `pad`, a reduction over a dynamic reduced dim, …), `lower()` raises an explicit `BackendError` naming the op — the graph is never silently specialized to one extent, and you never get a wrong answer from a dim the exporter guessed.
+When one does not (a `reshape`, a `pad`, a reduction over a dynamic reduced dim, …), `lower()` raises an explicit [`BackendError`](/api/evoxc/core/backenderror/) naming the op — the graph is never silently specialized to one extent, and you never get a wrong answer from a dim the exporter guessed.
 
 <Aside type="caution" title="A fully input-independent loop is still a graph">
 Both the predicate and the carry must involve at least one symbolic value; a loop whose condition and state are all static is Python control flow, and `while_loop` rejects it with a message saying so.

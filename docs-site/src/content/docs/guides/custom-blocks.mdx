@@ -12,16 +12,16 @@ Each mechanism makes a different promise, so the choice is a contract decision r
 
 | Mechanism | You own | The graph carries | Executes on |
 |---|---|---|---|
-| `evoxc.block` | a decomposition written as a normal graph (optional per-backend impls) | a `block_call` op | numpy, `native`, and every compiler adapter |
-| `evoxc.external_call` + `evoxc.register_external_kernel` | the kernel body, outside evoxc | an `external_call` op | numpy (host dispatch), iree (host or device-resident); xla/tvm inline a registered portable |
-| `evoxc.custom_call` / `evoxc.inline_stablehlo` / `evoxc.compile_text` | compiler-side IR | a compiler op, or verbatim MLIR | iree / xla / tvm only |
+| [`evoxc.block`](/api/evoxc/block/block/) | a decomposition written as a normal graph (optional per-backend impls) | a `block_call` op | numpy, `native`, and every compiler adapter |
+| [`evoxc.external_call`](/api/evoxc/ops/external-call/) + [`evoxc.register_external_kernel`](/api/evoxc/external/register-external-kernel/) | the kernel body, outside evoxc | an `external_call` op | numpy (host dispatch), iree (host or device-resident); xla/tvm inline a registered portable |
+| [`evoxc.custom_call`](/api/evoxc/ops/custom-call/) / [`evoxc.inline_stablehlo`](/api/evoxc/ops/inline-stablehlo/) / [`evoxc.compile_text`](/api/evoxc/pipeline/compile-text/) | compiler-side IR | a compiler op, or verbatim MLIR | iree / xla / tvm only |
 
 The rule of thumb: if you can express the computation as a graph, write a **block**; if a real kernel has to run, declare an **external call**; if the answer only exists in the compiler's dialect, use an **escape hatch** and accept that the CPU backends refuse it.
 
 ## Custom ops with `evoxc.block`
 
 `evoxc.block` declares an op with input/output specs, an attribute schema, an optional portable decomposition written as an `@evoxc.defn` graph, and optional per-backend implementations.
-The declaration is the registration — the returned `BlockOp` is callable inside any trace.
+The declaration is the registration — the returned [`BlockOp`](/api/evoxc/block/blockop/) is callable inside any trace.
 
 ```python
 import numpy as np

@@ -84,10 +84,10 @@ The site ships two kinds of API material, and they answer different questions.
 | Material | Question it answers | Where it comes from |
 |---|---|---|
 | These reference pages | What does this name *mean*, which stage does it belong to, what does it refuse? | This repository's contracts, maintained by hand |
-| The generated tree under `/api/` | What is the exact signature, docstring and module path of this symbol? | Griffe reading the installed package's docstrings |
+| The generated tree under [`/api/`](/api/) | What is the exact signature, docstring and module path of this symbol? | Griffe reading the installed package's docstrings |
 
-The generated pages are grouped by module and their URL shape is `/api/<module-path>/<symbol>/` — `/api/evoxc.pipeline/compile/` is the page for `evoxc.compile`.
-Start from the generated index when you need a signature.
+The generated tree ships two kinds of page. Every public symbol gets its own page, addressed by its public name split on dots with each segment lowercased and `_` written as `-` — `/api/evoxc/pipeline/compile/` is the page for `evoxc.compile`, and `/api/evoxc/pipeline/compile-text/` is the page for `evoxc.compile_text`. Every module also gets an index page listing what it exports, such as [`/api/evoxc/ops/`](/api/evoxc/ops/), [`/api/evoxc/core/`](/api/evoxc/core/) or [`/api/evoxc/pipeline/`](/api/evoxc/pipeline/), and the grouped index at [`/api/`](/api/) lists every page by module.
+Start from that grouped index when you need a signature.
 
 Two consequences worth knowing:
 
