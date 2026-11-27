@@ -5,4 +5,186 @@ sidebar:
   order: 2
 ---
 
-<!-- TODO(content): write the Quickstart page. -->
+This page takes one small graph through every stage of the explicit pipeline, using nothing but the public API.
+Nothing is hidden behind a decorator: each stage is a function call that hands you an object you can inspect, print, save or throw away.
+
+```python
+import evoxc
+from evoxc import TensorSpec
+```
+
+## The pipeline, stage by stage
+
+<Steps>
+  <Step title="Mark the graph function">
+    `@evoxc.defn` marks a Python function as a graph *definition*. It does not compile it, trace it, or run it — a `Defn` is a callable that refuses concrete tensors and tells you to trace or evaluate instead.
+
+    ```python
+    @evoxc.defn
+    def f(x, w):
+        return evoxc.sum(evoxc.tanh(evoxc.dot(x, w)), axes=1)
+    ```
+  </Step>
+  <Step title="Describe the inputs with specs">
+    A `TensorSpec` describes a future runtime tensor: a shape (symbolic dims allowed), a dtype, and an optional device. It has no storage. Python values — `int`s, `bool`s, strings, dtypes, `None` — are *also* legal trace inputs, and they specialize the graph.
+
+    ```python
+    spec_x = TensorSpec((4, 8), evoxc.float32)
+    spec_w = TensorSpec((8, 4), evoxc.float32)
+    ```
+  </Step>
+  <Step title="Trace it into a Graph">
+    `evoxc.trace` runs your function in graph-building mode and returns a `Graph`: EvoXIR, a region-based SSA module plus the input/output trees and the snapshotted static values. Nothing has executed.
+
+    ```python
+    graph = evoxc.trace(f, spec_x, spec_w)
+    ```
+  </Step>
+  <Step title="Inspect the graph">
+    Every pipeline object is inspectable, and inspection is a pure read — it never traces, compiles, executes or transfers anything.
+
+    ```python
+    print(graph)                     # <Graph … ops, 1 function, 2 tensor inputs, 0 static values, 1 output>
+    print(graph.summary()["tensor_inputs"])   # [{'path': '…', 'shape': …, 'dtype': …}, …]
+    print(graph.digest())            # sha256 over the structural payload
+    print(graph.text())              # the pretty-printed IR
+    ```
+
+    `digest()` is deliberately structural: it hashes names, attributes, operands, results, types and constants, and excludes source locations. The same program therefore has the same digest across processes, files and a `save`/`load` round trip, which makes it usable as a cache key or as a regression check.
+  </Step>
+  <Step title="Lower it">
+    `evoxc.lower` turns a `Graph` into a `LoweredProgram` for one backend. For a compiler backend that means StableHLO MLIR text; for the NumPy interpreter it is the serialized IR it will interpret.
+
+    ```python
+    lowered = evoxc.lower(graph)          # default backend: the NumPy interpreter
+    print(lowered)                        # backend, payload kind and size, leaf counts
+    print(lowered.source_text())          # the human-readable program text
+    ```
+  </Step>
+  <Step title="Compile it">
+    `evoxc.compile` produces a `CompiledArtifact` — the thing the backend actually knows how to load. Both objects save and load through the persistence container, so a graph can be compiled on one machine and shipped.
+
+    ```python
+    artifact = evoxc.compile(lowered)
+    ```
+  </Step>
+  <Step title="Load it onto a device">
+    `evoxc.load` binds the artifact to a device and returns an `Executable`. `device="cpu"` normalizes to `Device("cpu", 0)`.
+
+    ```python
+    exe = evoxc.load(artifact, device="cpu")
+    print(exe.device)                     # Device(kind='cpu', index=0)
+    ```
+  </Step>
+  <Step title="Run it">
+    `evoxc.run` takes the executable and the inputs in the same pytree shape you traced, validates them, and returns the outputs in the same shape you declared.
+
+    ```python
+    y = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))
+    print(y.numpy())     # [3.999999 3.999999 3.999999 3.999999]
+    ```
+  </Step>
+</Steps>
+
+## The whole thing, without the commentary
+
+```python
+import evoxc
+from evoxc import TensorSpec
+
+@evoxc.defn
+def f(x, w):
+    return evoxc.sum(evoxc.tanh(evoxc.dot(x, w)), axes=1)
+
+spec_x, spec_w = TensorSpec((4, 8), evoxc.float32), TensorSpec((8, 4), evoxc.float32)
+graph    = evoxc.trace(f, spec_x, spec_w)                        # Graph          (EvoXIR)
+lowered  = evoxc.lower(graph)                                    # LoweredProgram
+artifact = evoxc.compile(lowered)                                # CompiledArtifact
+exe      = evoxc.load(artifact, device="cpu")                    # Executable
+y        = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))  # Tensor
+print(y.numpy())
+```
+
+Six lines to run a graph, and six objects you could have stopped at.
+
+## The same pipeline in one call
+
+`evoxc.build` and `evoxc.evaluate` are documented shorthand for exactly the calls above — same stages, same options, no extra semantics:
+
+```python
+exe = evoxc.build(f, spec_x, spec_w, device="cpu")               # trace → lower → compile → load
+y   = evoxc.evaluate(f, evoxc.ones((4, 8)), evoxc.ones((8, 4)))  # derive specs → build → run
+```
+
+`evaluate` derives specs from the concrete arguments you pass (it snapshots shape and dtype only) and then runs the same pipeline. Because both are compositions, every option you would pass to `lower`/`compile`/`load` — `backend=`, `opt_level=`, `plugin_path=` — passes through `build`, `evaluate` and `build_cached` unchanged.
+
+<Aside type="tip" title="Use the shorthand, keep the escape hatch">
+  Reach for `build`/`evaluate` when you want an executable and nothing else. Reach for the explicit stages when you want to inspect the IR, save the graph, compile it once and reuse the artifact, or run the same graph on two backends.
+</Aside>
+
+A third composition, `evoxc.build_cached`, memoizes the build. It keys the cache on the function identity, the full spec tree, the resolved backend/device and the canonicalized options — *before* tracing — so a meta-level loop that rebuilds the same shape pays the compile cost once:
+
+```python
+exe = evoxc.build_cached(f, spec_x, spec_w, cache=evoxc.CompileCache())
+```
+
+<Aside type="note" title="Caching is explicit">
+  Nothing in evoxc caches implicitly. `evoxc.build` always traces, lowers, compiles and loads; `evoxc.build_cached` caches because you asked it to.
+</Aside>
+
+## Transform the graph
+
+Transforms are graph → graph: they take a definition and hand you a `Graph` of ordinary ops. They never execute anything, and calling the result with concrete tensors is an error rather than a silent eager run.
+
+```python
+@evoxc.defn
+def scale(x, w):
+    return evoxc.multiply(x, w)
+
+batched = evoxc.vmap(scale, in_axes=(0, None), out_axes=0)   # sugar over evoxc.vectorize
+graph   = batched(TensorSpec((8, 4), evoxc.float32),         # 8 samples of shape (4,)
+                 TensorSpec((4,), evoxc.float32))            # one shared weight vector
+
+exe = evoxc.load(evoxc.compile(evoxc.lower(graph)), device="cpu")
+y   = evoxc.run(exe, evoxc.ones((8, 4)), evoxc.ones((4,)))
+print(y.shape)      # (8, 4)
+```
+
+`in_axes` is `0` or `None` per input (v1 supports only those two): `0` maps that input's leading axis, `None` leaves it shared across the batch. Transforms compose, so batched per-sample gradients are one expression:
+
+```python
+per_sample_grad = evoxc.vmap(evoxc.grad(loss, argnums=(2,)), in_axes=(0, 0, None), out_axes=(0,))
+```
+
+See [Graph transforms](/guides/graph-transforms/) for `grad`, `jvp`, `vjp` and the `batch_functions` merge.
+
+## Switch the backend
+
+The same graph runs on a compiler backend by naming it at `lower()` time. Nothing about the graph changes — the exporter emits StableHLO and the compiler owns optimization and code generation from there.
+
+```python
+lowered  = evoxc.lower(graph, backend="iree")                        # needs `pip install evoxc[iree]`
+artifact = evoxc.compile(lowered, opt_level="O3", target_backends=["llvm-cpu"])
+exe      = evoxc.load(artifact, device="cpu")
+```
+
+<Aside type="caution" title="Compiler adapters are extras">
+  `backend="iree"` and `backend="tvm"` need their extra; `backend="xla"` needs a discoverable PJRT plugin. A missing adapter raises `BackendError` with the install hint — it never falls back to NumPy silently.
+</Aside>
+
+For a device-resident run (CUDA, ROCm, Vulkan) the executable is bound to that device, inputs must already be there, and `.to(device)` is the only way to place them:
+
+```python
+device = evoxc.Device("cuda", 0)
+exe    = evoxc.build(f, spec_x, spec_w, backend="iree", device=device, target_backends=["cuda"])
+y      = evoxc.run(exe, evoxc.ones((4, 8)).to(device), evoxc.ones((8, 4)).to(device))
+```
+
+## Where to go next
+
+- [Core concepts](/getting-started/core-concepts/) — the value kinds and the rules behind this page.
+- [Graphs and tracing](/guides/graphs-and-tracing/) — `defn`, `trace`, source locations, `digest()`.
+- [Graph transforms](/guides/graph-transforms/) — `vectorize`, `vmap`, `grad`, `jvp`, `vjp`, `batch_functions`.
+- [Backends and options](/guides/backends/) — the option surface and `EVOXC_*` defaults.
+- [Tensors and devices](/guides/tensors-and-devices/) — physical placement, `Tensor.to`, DLPack.
+- [Persistence and caching](/guides/persistence-and-caching/) — saving graphs, artifacts and executables.

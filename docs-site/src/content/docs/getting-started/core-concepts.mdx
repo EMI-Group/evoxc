@@ -1,8 +1,176 @@
 ---
 title: Core concepts
-description: The graph is the program: explicit staging, the four value kinds, and why nothing happens behind your back.
+description: "The graph is the program: explicit staging, the four value kinds, and why nothing happens behind your back."
 sidebar:
   order: 3
 ---
 
-<!-- TODO(content): write the Core concepts page. -->
+evoxc has a small vocabulary. Learn these ideas once and the rest of the site — and the error messages — read as consequences of them.
+
+## Four kinds of value
+
+A single misreading of evoxc is thinking of it as an eager array library with a compile step bolted on. It is a graph library: the values you handle while *building* a computation are not the values you handle while *running* it.
+
+| Concept | Meaning | Has storage? | Key capabilities |
+|---|---|---|---|
+| Python/static value | `None`, bool, int, float, complex, str, `Enum`, dtype, slice, config objects | n/a | Evaluated at trace time; specializes the graph. Changing it means tracing a new graph. No hidden guards, no implicit recompile. |
+| `TensorSpec` | Describes a future runtime tensor | No | `shape` (symbolic dims allowed), `dtype`, optional `device`. Lifecycle: spec → trace → `SymbolicTensor` → run → `Tensor`. |
+| `SymbolicTensor` | An SSA value inside a graph | **No** | dtype, symbolic shape, source location, SSA identity. `.numpy()`, `data_ptr()` and `__dlpack__` do not exist on it. |
+| `Tensor` | A materialized runtime tensor | Yes | Concrete shape and dtype, **physical** device, `.numpy()` (host data only), explicit `Tensor.to(device)`, DLPack interop. |
+
+What each kind lets you do:
+
+- **Python/static values** are the trace-time control plane. `for i in range(3)` unrolls at trace time, `if flag:` is a Python decision baked into the graph, and an `int` axis argument becomes an op attribute. Because the value is snapshotted, changing it produces a *different* graph — there is no recompilation machinery that watches your Python variables.
+- **`TensorSpec`** is the only thing you can pass as a tensor input to `evoxc.trace` besides static values. It is a description, not data: no arithmetic, no `.numpy()`, no values.
+- **`SymbolicTensor`** is what your function receives inside a trace. It answers questions about *shape and dtype* and builds IR when you call ops on it. It has no storage, so anything that would need bytes — printing values, exporting a buffer, branching on a result — is either impossible or an explicit error.
+- **`Tensor`** is what `evoxc.run` returns and what the concrete creators (`evoxc.tensor`, `evoxc.zeros`, `evoxc.ones`, `evoxc.from_numpy`, …) produce. It is the only kind that can be an input to a run.
+
+<Aside type="tip" title="The lifecycle in one line">
+  A `TensorSpec` describing `(4, 8)` float32 becomes a `SymbolicTensor` while tracing, is matched by a concrete `Tensor` at run time, and the run returns a `Tensor` with a real device and real bytes.
+</Aside>
+
+## Explicit staging
+
+The pipeline is the program's life cycle, and each stage is a public function with a distinct public result type:
+
+```text
+defn → trace → Graph → transform → Graph
+     → lower → LoweredProgram → compile → CompiledArtifact
+     → load → Executable → run → Tensor
+```
+
+| object | you get it from | what you can do with it |
+|---|---|---|
+| `Defn` | `@evoxc.defn` | call it with specs to build a graph (calling it with tensors raises) |
+| `Graph` | `evoxc.trace`, or any transform | `summary()`, `digest()`, `text()`, save/load, transform again |
+| `LoweredProgram` | `evoxc.lower` | `source_text()`, save/load, compile |
+| `CompiledArtifact` | `evoxc.compile` | save/load, load onto a device |
+| `Executable` | `evoxc.load` | `run`, `bind`, `summary()`, `plan_text()`, `synchronize()` |
+| `Tensor` | `evoxc.run`, concrete creators | `.numpy()`, `.to(device)`, DLPack, structured repr |
+
+Two consequences are worth stating explicitly:
+
+1. **Every stage is inspectable, and inspection is a pure read.** `summary()`, `digest()`, `text()`, `source_text()`, `plan_text()` and `__repr__` never trace, compile, execute, transfer or mutate anything.
+2. **No function performs a missing step for you.** `evoxc.compile` wants a `LoweredProgram`; hand it a `Graph` and it raises. That strictness is what makes it safe to persist an artifact, cache a build, or compile once and load in many processes.
+
+Convenience APIs are *documented shorthand compositions* of those stages and nothing more:
+
+| shorthand | composition |
+|---|---|
+| `evoxc.build(fn, *specs, backend=…, device=…, **options)` | trace → lower → compile → load |
+| `evoxc.evaluate(fn, *args, …)` | derive specs from the arguments → build → run |
+| `evoxc.build_cached(fn, *specs, …)` | memoized `build`, keyed before tracing |
+| `evoxc.vmap(f)` | transparent wrapper over `evoxc.vectorize` |
+| `evoxc.bind(exe, **kwargs)` | argument-passing sugar over `run` |
+
+If you cannot reproduce what a shorthand did by calling the primitives yourself, that is a bug, not a feature.
+
+## Minimal magic
+
+No API silently traces, compiles, specializes, moves or reshares tensors, inserts collectives, executes Python callbacks, or switches semantics.
+
+- **No implicit tracing.** Calling a `Defn` with concrete tensors is a `TraceError` that points you at `evoxc.trace` / `evoxc.evaluate`, never a background trace.
+- **No eager/graph mode switching.** There is one mode at a time and you chose it: you are tracing, or you are running.
+- **No implicit caching or binding.** Builds happen when you call `build`; caching happens when you pass a cache; arguments are supplied when you call `bind` or `run`.
+- **No implicit device movement.** See [physical devices](#physical-devices) below.
+
+The rule you will meet first is Python control flow over symbolic values:
+
+```python
+@evoxc.defn
+def g(x):
+    if evoxc.sum(x) > 0:      # TraceError: SymbolicTensor cannot be used as a Python boolean
+        return x
+    return evoxc.negate(x)
+```
+
+Comparison ops on a `SymbolicTensor` *build* graph nodes; the failure comes when Python asks the result for a truth value, and the message says exactly that. Runtime tensor control flow is spelled with the graph control-flow ops:
+
+```python
+@evoxc.defn
+def h(x):
+    pred = evoxc.greater(evoxc.sum(x), 0.0)     # a 0-d bool SymbolicTensor, not a Python bool
+    return evoxc.cond(pred, lambda v: v, lambda v: evoxc.negate(v), x)
+```
+
+`evoxc.cond`, `evoxc.while_loop` and `evoxc.scan` put the branch or loop *inside* the graph, where the compiler can see it. Python `if`/`for` over static values stays legal and is simply unrolled or specialized at trace time.
+
+<Aside type="caution" title="No silent fallbacks anywhere">
+  If a backend cannot express an operation, you get a `BackendError` naming the operation and usually a remedy. If a transform has no rule for an op, you get a `TransformError`. Nothing degrades to a Python loop, a NumPy call inside a compiled program, or a different backend.
+</Aside>
+
+## Large tensors are explicit inputs
+
+The graph is meant to be a *function of its inputs*, so a big tensor belongs in the argument list, not in the closure.
+
+```python
+w = evoxc.ones((1024, 1024))          # a concrete Tensor, 4 MB of storage
+
+@evoxc.defn
+def bad(x):
+    return evoxc.dot(x, w)            # TraceError: concrete tensors are never silently captured
+
+@evoxc.defn
+def good(x, w):                       # w is an explicit input — its bytes live in the caller
+    return evoxc.dot(x, w)
+
+graph = evoxc.trace(good, TensorSpec((4, 1024), evoxc.float32), TensorSpec((1024, 1024), evoxc.float32))
+```
+
+Capturing a `Tensor` from a closure raises `TraceError` rather than baking the bytes into the graph. The one deliberate exception is `evoxc.constant(tensor)`: an explicit, graph-time embedding that snapshots the data — and warns above `EVOXC_LARGE_CONSTANT_BYTES` (default 1 MiB), because embedding a large tensor is usually a mistake that silently duplicates weights into every saved artifact.
+
+`evoxc.constant` accepts host data only. A device tensor raises `DeviceError` first; bring it back with `.to(Device("cpu", 0))` if embedding is genuinely what you want.
+
+`evoxc.bind` does not change any of this. It supplies arguments to an executable, validating names, dtypes, shapes and devices — it never rewrites the graph and never captures data.
+
+## Physical devices
+
+A `Tensor`'s `device` always says where its data actually lives. There are no label-only "virtual" devices and no relabeling:
+
+- Host NumPy data can only be `Device("cpu", 0)`. The concrete creators (`evoxc.tensor`, `evoxc.zeros`, `evoxc.ones`, `evoxc.from_numpy`, `evoxc.from_dlpack`) produce host tensors, so their `device=` argument accepts only `None` or `Device("cpu", 0)`.
+- A device payload carries its real device. A CUDA output says `cuda`; a Vulkan output says `vulkan`.
+- Accepted device kinds are `cpu`, `cuda`, `rocm` (canonical AMD spelling; `hip` is an accepted alias) and `vulkan`. `evoxc.devices()` lists the devices this host can actually offer.
+
+`Tensor.to(device)` is the **only** device ↔ host movement primitive:
+
+```python
+host = evoxc.ones((4, 8))
+gpu  = host.to(evoxc.Device("cuda", 0))     # explicit upload
+back = gpu.to(evoxc.Device("cpu", 0))       # explicit readback
+print(back.numpy())                         # .numpy() is host-only
+```
+
+Three rules follow from that single primitive:
+
+1. **Run outputs stay where they ran.** A device-resident executable returns device-resident tensors; nothing auto-copies to the host "for convenience".
+2. **`.numpy()` is host-only.** On a non-CPU tensor it raises `DeviceError` telling you to call `.to(...)` first. That is why you cannot accidentally trigger a hidden readback — or a hidden synchronization — by printing a value.
+3. **Data in the wrong place is an error, not a copy.** Passing a host tensor to a device-resident executable raises `DeviceError` at the run boundary.
+
+The multi-device helpers are honest about being data preparation, not sharding: `evoxc.split_tensor` and `evoxc.replicate_tensor` are v1 CPU-only host-memory utilities, and collectives (`evoxc.dist.*`) appear explicitly in the program — the compiler may optimize communication but never invents it.
+
+## Errors carry their location
+
+Every public error derives from `EVOXCError`:
+
+| error | raised when |
+|---|---|
+| `TraceError` | using a concrete tensor where a graph value belongs, truth-testing a `SymbolicTensor`, calling ops outside a trace |
+| `ShapeError` | incompatible shapes during inference or validation |
+| `DTypeError` | incompatible or unsupported dtype |
+| `TransformError` | a transform cannot express the program (no rule for an op, axis mismatch) — never a silent fallback |
+| `BackendError` | a backend is absent or cannot lower/compile the program |
+| `DeviceError` | data is not on the device an API needs, or a device kind is not served |
+| `VerificationError` | IR verification fails |
+| `PersistenceError` | a save/load container is malformed or mismatched |
+| `BlockError` | a custom-op (`evoxc.block`) contract violation |
+
+Messages include the source location of the offending operation when the graph carries one (for example `model.py:83`), because "an op failed" is not a useful report about a graph you cannot see.
+
+## Where to go next
+
+- [Graphs and tracing](/guides/graphs-and-tracing/) — everything about `defn`, `trace`, locations and `digest()`.
+- [Graph transforms](/guides/graph-transforms/) — the transform set and its rules.
+- [In-graph control flow](/guides/control-flow/) — `cond`, `while_loop`, `scan`.
+- [Tensors and devices](/guides/tensors-and-devices/) — placement, transfers, DLPack.
+- [Inspection and errors](/guides/inspection-and-errors/) — the inspection surface and the error taxonomy.
+- [Limitations and deferrals](/reference/deferrals/) — what v1 refuses, and the error it raises.

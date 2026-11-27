@@ -5,4 +5,232 @@ sidebar:
   order: 2
 ---
 
-<!-- TODO(content): write the Graph transforms page. -->
+A transform in evoxc takes a `Graph` and returns a `Graph`. It never runs anything, never asks a backend for help, and never leaves a marker op behind: the result is a program made of ordinary `evoxc.ops` ops with static shapes, so numpy, the native engine and every compiler adapter execute it without knowing a transform happened.
+That is design principle 7, and it is why `vmap`-ed or differentiated code can be persisted, inspected and lowered exactly like the graph it came from.
+
+## One Rust implementation, no fallback
+
+`vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge are a single implementation in the Rust core, reached through the compiled `evoxc._evoxc_native` extension (`scripts/build-native.sh` builds it; `EVOXC_NATIVE_LIB` can point at a prebuilt library).
+There is no Python fallback: if the extension is missing, the first transform call raises `ImportError` with the build instructions instead of silently taking a slower, subtly different path.
+
+Python keeps only frontend duties — argument validation with fixed error wording, `TensorSpec`/pytree adaptation, `Graph` reconstruction, and the rules bridge.
+That bridge is how custom `block` ops (`block:<name>`), external kernels (`external:<name>`) and sparse ops (`sparse_*`) contribute batching and derivative rules: their Python rules run inside the native rewrite and produce subgraphs that the engine splices in.
+A backend therefore only ever sees plain ops — there is no "vectorized" or "autodiff" runtime support to implement anywhere.
+
+## Graph in, graph out — or a callable of specs
+
+Every transform accepts a traced `Graph` or a function/`Defn`.
+
+```python
+graph = evoxc.trace(fn, *specs)
+
+batched = evoxc.vmap(graph, in_axes=(0, None))   # Graph → Graph
+gw      = evoxc.grad(graph, argnums=(0,))        # Graph → Graph
+```
+
+A function cannot be transformed before its shapes are known, and `evoxc.transforms` may not import the pipeline, so a callable input returns a `TransformCallable`: call it with specs and it traces once and transforms.
+
+```python
+tf = evoxc.vmap(per_sample, in_axes=(None, 0))
+graph = tf(w_spec, x_spec)          # a fresh Graph per call; tf.kind == "vmap"
+```
+
+Two rules follow from "transforms never execute":
+
+- A `TransformCallable` rejects concrete `Tensor` arguments with `TraceError` ("never execute") — pass `TensorSpec`s.
+- `evoxc.build` accepts a function or `Defn`, not a `Graph`; it raises `TypeError` telling you to use the explicit `lower`/`compile`/`load` pipeline. Stage a transformed graph the long way:
+
+```python
+exe = evoxc.load(evoxc.compile(evoxc.lower(graph)))
+out = evoxc.run(exe, *args)
+```
+
+## `vectorize` — the batching primitive
+
+```python
+evoxc.vectorize(graph, axes) -> Graph
+```
+
+`axes` is an `int`, `None`, or a pytree of those over the input structure: `0` maps a tensor input's leading axis into a fresh batch dimension, and `None` leaves it unmapped (mandatory for a static input, since a static leaf has no axis).
+Only leading axes are accepted in v1 — anything else is a `TransformError` naming the rule ("must be 0 (the leading axis) in v1").
+
+`vectorize` is a graph→graph function and takes a traced `Graph` only; handing it a bare callable is a `TypeError` that points at `evoxc.vmap`.
+
+## `vmap` — transparent sugar over `vectorize`
+
+```python
+evoxc.vmap(fn_or_graph, in_axes=0, out_axes=0) -> Graph | TransformCallable
+```
+
+`vmap` is `vectorize` plus output rearrangement, and the equivalence is tested, not asserted:
+
+1. `vmap(graph, in_axes, out_axes=0)` produces the same IR as `vectorize(graph, in_axes)`.
+2. `vmap(f)(*batched_specs)` produces the same IR as `vectorize(trace(f, *stripped_specs), in_axes)`, where `stripped_specs` drops the leading mapped dim of each mapped spec.
+3. `out_axes` handling happens *after* the vectorize pass, as ordinary ops: a transpose for a mapped axis, a size-one axis insertion for an unmapped output. With `out_axes=0` on every mapped output, no extra op is emitted at all.
+4. The wrapped function is traced exactly once per call.
+5. Running the vectorized graph on a batch equals running the unvectorized graph per row and stacking.
+
+`out_axes=None` requires the output to be unmapped; on a mapped output it raises `TransformError`, because a batch axis is never silently dropped.
+
+```python
+@evoxc.defn
+def per_sample(w, x):
+    """One sample in, one scalar out."""
+    return evoxc.tanh(evoxc.dot(w, x))
+
+B = evoxc.dim("B")
+batched = evoxc.vmap(per_sample, in_axes=(None, 0))    # share w, map over samples
+graph = batched(evoxc.TensorSpec((4,), evoxc.float32),
+                evoxc.TensorSpec((B, 4), evoxc.float32))
+
+exe = evoxc.load(evoxc.compile(evoxc.lower(graph)))
+scores = evoxc.run(exe, W, X)          # X: (5, 4) → scores: (5,)
+```
+
+### Axis levels and the batch dimension
+
+One batching pass creates **one** fresh batch `Dim` shared by all of its mapped inputs, named after the pass depth: `batch` at depth 0, `batch_1` at depth 1, and so on.
+The name must be level-distinct because the numpy interpreter binds symbolic dims by name: a mismatch then raises a clear `ShapeError` ("dimension 'batch' is already bound to 4, got 1") instead of silently broadcasting.
+
+The depth counter follows `TransformCallable` composition, which is why `vmap(vmap(f))` and `vmap(grad(f))` nest cleanly.
+`vectorize(vectorize(g))` on the Graph path runs both passes at depth 0 and yields same-named dims — a documented v1 fail-explicit: unequal extents raise `ShapeError`.
+
+## `grad` — reverse mode
+
+```python
+evoxc.grad(fn_or_graph, argnums=None) -> Graph | TransformCallable
+```
+
+`grad` requires exactly one scalar tensor output (`ShapeError` otherwise) and returns one gradient per selected input, in selector order.
+`argnums` indexes the **flattened tensor inputs**, not pytree positions, and `None` means all of them; a selected input that is not floating or complex raises `TransformError` ("cannot be differentiated").
+
+```python
+@evoxc.defn
+def loss(params, x, y):
+    pred = evoxc.dot(x, params["w"]) + params["b"]
+    err = pred - y
+    return evoxc.mean(err * err)
+
+specs = ({"w": evoxc.TensorSpec((4,), evoxc.float32),
+          "b": evoxc.TensorSpec((), evoxc.float32)},
+         evoxc.TensorSpec((8, 4), evoxc.float32),
+         evoxc.TensorSpec((8,), evoxc.float32))
+
+graph = evoxc.trace(loss, *specs)
+grads = evoxc.grad(graph, argnums=(0, 1))     # → Graph with TWO outputs
+# flat tensor inputs are 0 = params["b"], 1 = params["w"], 2 = x, 3 = y
+# (dict keys are sorted when flattened, so "b" precedes "w")
+
+exe = evoxc.load(evoxc.compile(evoxc.lower(grads)))
+d_b, d_w = evoxc.run(exe, params, X, Y)
+```
+
+Semantics worth knowing:
+
+- Multiply-used values accumulate cotangents with `add`.
+- `stop_gradient` yields a zero gradient in both directions.
+- Ops that produce booleans or integers (`equal`, `less`, `argmax`, …) yield a **zero** tangent, documented, not an error.
+- An op with no rule — `runtime_call`, a collective, an `external_call` with no rule and no portable decomposition — raises `TransformError` naming the op (and its rule key), never a silent fallback.
+
+## `jvp` — forward mode
+
+```python
+evoxc.jvp(fn_or_graph, tangents) -> Graph | TransformCallable
+```
+
+`tangents` mirrors the **input** structure — same containers, with a `TensorSpec` at every position you want a tangent for and `None` where the tangent is zero. The result graph's inputs are the primal inputs followed by the tangent inputs, and its outputs are `(primal outputs, tangent outputs)`.
+
+```python
+tangents = ({"w": None, "b": None},                     # zero for both params
+            evoxc.TensorSpec((8, 4), evoxc.float32),    # tangent for x
+            None)                                       # zero for y
+jac = evoxc.jvp(graph, tangents)
+# inputs: params, x, y, dx      outputs: (loss, dloss)
+```
+
+When a VJP rule exists but no JVP rule does, the tangent is derived through the adjoint trick rather than raising — all-zero tangents short-circuit to zero without calling the rule.
+
+## `vjp` — reverse mode with explicit cotangents
+
+```python
+evoxc.vjp(fn_or_graph, cotangents=None) -> Graph | TransformCallable
+```
+
+`cotangents` mirrors the **output** structure; the result graph's outputs are `(primal outputs, input cotangents)`.
+The default `None` becomes an *explicit* scalar-one cotangent input, so `vjp(graph)` still requires a single scalar output — pass a `TensorSpec` per output when the function returns more than one value.
+
+```python
+back = evoxc.vjp(graph)                       # inputs: params, x, y, seed
+# outputs: (loss, d(params["b"]), d(params["w"]), d(x), d(y))
+# — one cotangent per flat tensor input, in that order
+```
+
+## `batch_functions` — one graph for a whole population
+
+```python
+evoxc.batch_functions(fns, axes=0, out_axes=0, *,
+                      switch_ops=None, bands=None, alignment="variant")
+```
+
+`fns` is a non-empty sequence of same-signature programs — traced `Graph`s, or callables/`Defn`s (never mixed).
+The result is **one** `Graph` whose leading axis is a static, length-N function axis: row `i` evaluates program `i`, bit for bit. A mapped input (`axes=0`) supplies its own row; an unmapped one (`axes=None`) is shared by every program.
+
+Identical positions collapse into one batched op (the same per-op batching rules `vmap` uses), so identical programs emit zero `select`s; per-program constants stack into one `(N, …)` constant; every remaining divergence is `select`-muxed at its consumers and at the outputs, which is why *any* same-signature list merges correctly.
+
+```python
+@evoxc.defn
+def prog_mul(x, c):
+    return evoxc.tanh(evoxc.multiply(x, c))
+
+@evoxc.defn
+def prog_add(x, c):
+    return evoxc.tanh(evoxc.add(x, c))
+
+programs = [prog_mul, prog_add, prog_mul, prog_add]     # one program per row
+
+specs = (evoxc.TensorSpec((4, 32), evoxc.float32),      # row i = program i's input
+         evoxc.TensorSpec((1,), evoxc.float32))         # shared by every program
+
+merged = evoxc.batch_functions(programs, axes=(0, None))(*specs)
+report = merged.batch_report
+print(report.n_functions, report.value_classes, report.emitted_ops)
+
+exe = evoxc.load(evoxc.compile(evoxc.lower(merged)))
+y   = evoxc.run(exe, X, c)          # y[i] is program i's own output
+```
+
+Two keyword-only knobs tune the merge, and neither can change a row's value:
+
+- **`bands`** — `None` merges all N programs on one flat function axis; an `int K` merges K contiguous bands independently and concatenates their outputs; `"auto"` groups programs by structural fingerprint and lets a static cost model pick a partition. On divergent genetic-programming populations a NumPy evaluation with `bands="auto"` measured 2.6–10.7× faster than a flat merge, and it picks flat for identical programs. CPU guidance is `bands="auto"`; on an accelerator, dispatch is cheap, so `bands=16` (or `None`) is the data-supported choice.
+- **`alignment`** — `"variant"` (default) sends a program's switched op into an existing class that already holds that variant; `"occurrence"` is the byte-stable legacy merge; `"auto"` is variant-first with an occurrence fallback.
+
+`graph.batch_report` is documented transform metadata — value classes, shared and switched ops, output muxes, emitted ops, band sizes, cost estimates (12 keys, plus `as_dict()`); it is ignored by persistence and absent from a graph loaded from disk.
+`switch_ops=True` opts into collapsing same-skeleton positions whose op differs; `switch_ops` should not be combined with banding.
+
+## Composition
+
+`vmap(vmap(f))` (nested batching) and `vmap(grad(f))` (per-sample gradients) compose, because a `TransformCallable` input is invoked at one deeper batch depth.
+`vmap(vjp(f))` and `vmap(jvp(f))` are v1 deferrals: those callables produce extended input trees the outer axes normalization cannot address, so they raise `TransformError` instead of guessing.
+
+## What refuses, and how
+
+| Situation | Error |
+|---|---|
+| Vectorizing a graph containing `cond`/`while_loop`/`scan` | `TransformError` "cannot batch op 'if' … not vectorizable in v1" |
+| An op with no batching rule (collectives, `random_*`, `sort`, `argsort`, `tile`, `flip`, `roll`, `diag`, `cumprod`, `nan_to_num`, the linalg factorizations…) | `TransformError` `no batching rule for op '<name>'` |
+| An op with no VJP/JVP rule | `TransformError` `no VJP rule for op '<name>'` (extension keys add `(key 'external:<name>')` and a registration hint) |
+| `conv` differentiated in reverse mode | `TransformError` — the IR has no transposed-convolution op (v1 deferral) |
+| `mean`/`concatenate`/`pad` VJP over a symbolic dim | `TransformError`; static dims work |
+| A non-leading `in_axes`/`out_axes` entry | `TransformError` "must be 0 (the leading axis) in v1" |
+| `out_axes=None` on a mapped output | `TransformError` — a batch axis is never dropped |
+| `grad` of a non-scalar output | `ShapeError` "requires a scalar output" |
+| A `TransformCallable` given a concrete `Tensor` | `TraceError` — transforms never execute |
+| Vectorizing a graph with no Python rule and no native rule | `TransformError` naming the op — no Python-loop fallback |
+
+Region-bearing control flow is refused as a whole by the vectorizer and by the AD sweep: a `while` op is never walked, so a body that needs batching has to be restructured before it enters the graph.
+For a custom op the fix is a rule, not a workaround: register a batching/derivative rule on the `block`, register an `external_call` rule or a portable decomposition, or register the rule directly in `evoxc.transforms`' public registries (`batching_rules`, `jvp_rules`, `vjp_rules`). See [Custom ops and kernels](/guides/custom-blocks/).
+
+<Aside type="note" title="The result is an ordinary graph">
+A transformed graph has no transform metadata in its ops — only `graph.batch_report` (in memory) records that a merge happened.
+That is why a transformed graph can be saved, lowered to StableHLO, and compiled by IREE, XLA or TVM without any adapter support for `vmap` or autodiff; see [Backends and options](/guides/backends/) for the stage that consumes it.
+</Aside>

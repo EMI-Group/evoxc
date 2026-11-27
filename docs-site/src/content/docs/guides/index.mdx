@@ -7,4 +7,146 @@ sidebar:
     label: Guides
 ---
 
-<!-- TODO(content): write the Guides page. -->
+The guides are task-shaped: each page takes one job — trace a graph, differentiate it, put a loop inside it, move it to a device — and shows the exact calls that do it.
+They spend most of their words on *why* the API is shaped the way it is, because every design decision here is load-bearing: the graph is the program, staging is explicit, and nothing happens behind your back.
+The [reference](/reference/) pages carry the catalogue data instead: [pipeline objects](/reference/pipeline-objects/), the [op catalogue](/reference/ops/), the [option surface](/reference/options/) and the [v1 deferrals](/reference/deferrals/), with generated signatures indexed from [Python API at a glance](/reference/api-overview/).
+When a guide and the reference appear to disagree, the reference and the generated API pages win — a guide never introduces a name the API does not have.
+
+## The pipeline every guide returns to
+
+Every page here is a variation on one loop: build a graph, transform it if you need to, hand it to a backend, run it.
+
+```python
+import evoxc
+
+graph    = evoxc.trace(fn, *specs)   # Defn/function + TensorSpec tree → Graph
+lowered  = evoxc.lower(graph)        # Graph → LoweredProgram
+artifact = evoxc.compile(lowered)    # LoweredProgram → CompiledArtifact
+exe      = evoxc.load(artifact)      # CompiledArtifact → Executable
+out      = evoxc.run(exe, *args)     # Executable + tensors → Tensor tree
+```
+
+Each arrow is a public function with its own object type, and no stage silently performs the next one.
+`evoxc.build` and `evoxc.evaluate` are documented shorthand for exactly those compositions, so you can switch between the explicit form and the shorthand without changing semantics.
+
+## Your first five minutes
+
+If evoxc is not installed yet, [Install](/getting-started/install/) covers PyPI, the source build and the extras. Then:
+
+<Steps>
+
+1. **Trace one graph.** Copy the snippet from [Quickstart](/getting-started/quickstart/) and print the module with `graph.print()`. You should see one `func @main` with one op per line and a `loc("…":line:col)` on the ops that were built from your source.
+
+2. **Read the summary.** `graph.summary()` gives you the op count, the ops by category, and the tensor inputs and outputs as `{"path", "shape", "dtype"}` records — a compact description of the program you just wrote.
+
+3. **Run it.** `evoxc.build(fn, *specs)` composes trace → lower → compile → load, and `evoxc.run(exe, *args)` executes. Both are shorthand for stages you can also call one at a time.
+
+4. **Change one thing.** Add a `vmap`, a `grad`, or a `cond`, and trace again. Transforms return a `Graph`, so the rest of the pipeline is unchanged.
+
+</Steps>
+
+Nothing above caches, specializes or re-traces behind your back: two `evoxc.trace` calls are two graphs, even for the same function.
+
+## The four value kinds, in one table
+
+The guides assume this vocabulary throughout; [Core concepts](/getting-started/core-concepts/) is the long version.
+
+| Kind | What it is | Has storage? | Where you meet it |
+|---|---|---|---|
+| Python/static value | `None`, bool, int, float, str, Enum, dtype, slice, `Dim`, `Device`, config objects | n/a | Evaluated at trace time, specializes the graph |
+| `TensorSpec` | Describes a future runtime tensor | No | The arguments of `evoxc.trace` |
+| `SymbolicTensor` | An SSA value inside a graph | No | `x` inside a `@evoxc.defn` body |
+| `Tensor` | A materialized runtime tensor | Yes | `evoxc.constant`, `evoxc.run` outputs, creators |
+
+The distinction that matters most: a static value is *Python*, so Python `if`/`for` over it runs once, at trace time, and bakes its outcome into the graph — while a `SymbolicTensor` is a *graph* value, so any decision on it must be `evoxc.cond`/`evoxc.while_loop`/`evoxc.scan`.
+
+## Frontend: writing and reshaping a graph
+
+<CardGrid>
+  <Card title="Graphs and tracing" href="/guides/graphs-and-tracing/">
+    `@evoxc.defn`, `evoxc.trace`, and the `Graph` you get back — specs, static values, pytrees, `summary()`, `digest()`.
+  </Card>
+  <Card title="Graph transforms" href="/guides/graph-transforms/">
+    `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` as ordinary graph-to-graph functions.
+  </Card>
+  <Card title="In-graph control flow" href="/guides/control-flow/">
+    `cond`, `while_loop` and `scan` — runtime branches and loops that stay inside the persisted program.
+  </Card>
+</CardGrid>
+
+Start here if you have not traced anything yet: [Graphs and tracing](/guides/graphs-and-tracing/) defines the vocabulary (spec, symbolic value, static value) the other eleven pages assume.
+
+## Execution: backends, devices, communication
+
+<CardGrid>
+  <Card title="Backends and options" href="/guides/backends/">
+    The numpy interpreter, the native Rust engine, and the options every stage forwards.
+  </Card>
+  <Card title="Compiler adapters" href="/guides/compiler-adapters/">
+    IREE, XLA through a PJRT plugin, and TVM: device kinds, target flags, validation state.
+  </Card>
+  <Card title="Tensors and devices" href="/guides/tensors-and-devices/">
+    Physical devices, `Tensor.to`, DLPack interop, and the `DeviceError` that keeps placement honest.
+  </Card>
+  <Card title="Collectives" href="/guides/collectives/">
+    Explicit `all_reduce`/`all_gather`/`reduce_scatter` in the graph, with `rank`/`world_size` scalars.
+  </Card>
+</CardGrid>
+
+These pages all rest on one rule: a tensor's `device` says where its data actually lives, and the only device-to-host movement primitive is `Tensor.to(device)`.
+
+## Utilities: the edges of the graph
+
+<CardGrid>
+  <Card title="Custom ops and kernels" href="/guides/custom-blocks/">
+    `evoxc.block` for portable custom ops, `external_call` for real kernels, and the compiler escape hatches.
+  </Card>
+  <Card title="Persistence and caching" href="/guides/persistence-and-caching/">
+    The versioned save/load container, explicit `Cache`, and memoized builds with `build_cached`.
+  </Card>
+  <Card title="Tensor formats" href="/guides/tensor-formats/">
+    safetensors and GGUF reading/writing, `TensorInfo`, and where the model semantics stop.
+  </Card>
+  <Card title="Sparse tensors" href="/guides/sparse-tensors/">
+    The sparse value model, its sixteen graph ops, transform rules, and the v1 limits.
+  </Card>
+  <Card title="Inspection and errors" href="/guides/inspection-and-errors/">
+    Inspecting each stage without side effects, and the error taxonomy that names what went wrong.
+  </Card>
+</CardGrid>
+
+## Conventions in these pages
+
+- **Backend.** Code examples run on the default numpy interpreter unless the snippet names a backend. `backend="native"` selects the in-process Rust CPU engine; the compiler adapters need their own extra (see [Compiler adapters](/guides/compiler-adapters/)).
+- **Specs.** `TensorSpec(shape, dtype)` describes a future runtime tensor and holds no data. `evoxc.dim("B")` is a named symbolic extent; a plain `int` is a static one.
+- **Values.** Inside a traced function every graph value is a `SymbolicTensor`: it has a dtype and a shape, and no data. Concrete `Tensor`s only exist outside a trace.
+- **Errors.** Every failure is a subclass of `evoxc.EVOXCError` — `TraceError`, `ShapeError`, `DTypeError`, `TransformError`, `BackendError`, `DeviceError`, `PersistenceError`, `VerificationError`. Messages quote the source location of the op when a graph location exists.
+- **Deferrals.** A feature that v1 refuses raises an explicit error naming the op or option. There is no silent fallback, so "it raised" is documentation too — see [Limitations and deferrals](/reference/deferrals/).
+
+## Reading paths
+
+| If you want to… | Read |
+|---|---|
+| understand what a `Graph` actually is | [Graphs and tracing](/guides/graphs-and-tracing/) → [Pipeline objects](/reference/pipeline-objects/) |
+| batch a per-sample function | [Graph transforms](/guides/graph-transforms/) → [Core concepts](/getting-started/core-concepts/) |
+| differentiate a loss | [Graph transforms](/guides/graph-transforms/) |
+| write a loop or a branch | [In-graph control flow](/guides/control-flow/) |
+| run on a GPU | [Compiler adapters](/guides/compiler-adapters/) → [Tensors and devices](/guides/tensors-and-devices/) |
+| ship one graph for a whole population | [Graph transforms](/guides/graph-transforms/) (`batch_functions`) |
+| plug in your own kernel | [Custom ops and kernels](/guides/custom-blocks/) |
+| save a compiled artifact and reload it | [Persistence and caching](/guides/persistence-and-caching/) |
+
+## Where the reference takes over
+
+Once a guide has shown you the shape of a workflow, the reference pages answer the mechanical questions:
+
+- [Pipeline objects](/reference/pipeline-objects/) — what each stage's object exposes, and what it deliberately does not.
+- [Op catalogue](/reference/ops/) — every frontend op by area, with dtype and shape notes.
+- [Options](/reference/options/) — compile and lower options, their environment defaults, and per-backend support.
+- [Architecture](/reference/architecture/) — EvoXIR, the native Rust core, and the lowering boundary.
+- [Limitations and deferrals](/reference/deferrals/) — what v1 refuses, and the error it raises.
+
+<Aside type="tip" title="Everything is inspectable">
+No inspection call in evoxc traces, compiles, executes, transfers or mutates anything — `Graph.summary()`, `LoweredProgram.source_text()`, `Executable.summary()` and `Tensor.__repr__` are pure reads.
+Reach for them first when a graph does not do what you expected; [Inspection and errors](/guides/inspection-and-errors/) walks through each stage.
+</Aside>

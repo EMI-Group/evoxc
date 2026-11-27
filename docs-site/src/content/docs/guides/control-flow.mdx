@@ -1,8 +1,185 @@
 ---
 title: In-graph control flow
-description: cond, while_loop and scan: runtime control flow that stays inside the graph.
+description: "cond, while_loop and scan: runtime control flow that stays inside the graph."
 sidebar:
   order: 3
 ---
 
-<!-- TODO(content): write the In-graph control flow page. -->
+A branch on tensor data cannot be a Python `if`, because at trace time the data does not exist.
+evoxc answers with three explicit constructs — `evoxc.cond`, `evoxc.while_loop` and `evoxc.scan` — that trace their branch and body callables into IR regions.
+The regions are part of the program: they are printed by `graph.print()`, saved by `graph.save()`, lowered to StableHLO and executed by every backend, with no Python callback anywhere at run time.
+
+## The callables run once, at trace time
+
+The functions you hand to a control-flow construct are **not** callbacks.
+Each is invoked exactly once while tracing, under the active builder, to construct its region; the ops it emits become the region body.
+At run time the interpreter (or the compiled program) re-executes those ops as many times as the loop demands — `body_fn` may run a million times while the Python object that built it ran once.
+
+Two consequences to internalize:
+
+- A `print()` or counter inside a body runs once, at trace time — it tells you nothing about run-time iterations.
+- Any value the body needs from outside must be passed in as an operand (for `cond`) or as part of the carried state (for `while_loop`), because the body's ops are built inside a region whose block arguments are exactly what you passed.
+
+## Why a Python `if` cannot decide
+
+<Aside type="caution" title="Warning: a Python control flow statement on a graph value raises">
+`if evoxc.sum(x) > 0:` fails at trace time, because `SymbolicTensor` refuses to be used as a Python boolean.
+The correct runtime alternative is `evoxc.cond` for a branch, `evoxc.while_loop` (or `evoxc.scan`) for a loop — and plain Python `if`/`for` when the value is a static Python value, where specialization is the intended behaviour.
+</Aside>
+
+```python
+@evoxc.defn
+def f(x):
+    if evoxc.sum(x) > 0:
+        return x
+    return evoxc.negate(x)
+
+evoxc.trace(f, evoxc.TensorSpec((3,), evoxc.float32))
+```
+
+```text
+TraceError: SymbolicTensor cannot be used as a Python boolean (at model.py:3:7).
+Runtime tensor control flow must use evoxc.cond / evoxc.while_loop / evoxc.scan;
+static Python control flow is only valid over Python values.
+```
+
+Nothing is silently specialized on tensor data: if the decision depends on a tensor, it belongs in the graph.
+
+## `cond` — a runtime branch
+
+```python
+evoxc.cond(pred, true_fn, false_fn, *operands) -> outputs
+```
+
+| Requirement | What fails if you break it |
+|---|---|
+| `pred` is a 0-d **bool** `SymbolicTensor` | `TraceError` naming the construct |
+| `*operands` are `SymbolicTensor`s, static values, or pytrees of those | `TraceError` naming the leaf |
+| Both branches are callables taking the operands positionally | Python `TypeError` |
+| Both branches return the **same tree** | `TraceError` |
+| Matching leaves have the same dtype and shape | `DTypeError` / `ShapeError` |
+| Branch outputs are tensors (static leaves only inside registered pytree nodes) | `TraceError` |
+
+```python
+@evoxc.defn
+def abs_difference(x, y):
+    def positive(a, b):
+        return evoxc.subtract(a, b)
+
+    def negative(a, b):
+        return evoxc.subtract(b, a)
+
+    bigger = evoxc.greater(evoxc.sum(x), evoxc.sum(y))   # 0-d bool
+    return evoxc.cond(bigger, positive, negative, x, y)
+```
+
+The branches receive the **region's block arguments** — the operands you passed — not the enclosing values, so a branch can only read what you hand it.
+Static operands and `static_kwargs` specialize both regions at trace time (they are not loop- or branch-carried); anything not static raises `TraceError`.
+
+`cond` also composes: a branch may itself contain `cond`, `while_loop` or `scan`, and a `while_loop` body may contain a `cond`.
+
+## `while_loop` — a runtime loop with a carry
+
+```python
+evoxc.while_loop(cond_fn, body_fn, init) -> outputs
+```
+
+`init` is the carried state: a `SymbolicTensor`, or a pytree of symbolic values and static values.
+Static leaves specialize the regions and are **not** carried; at least one symbolic leaf is required, because a loop over static values only is plain Python control flow.
+
+| Part | Contract |
+|---|---|
+| `cond_fn(carried)` | Returns a 0-d bool `SymbolicTensor`; anything else is a `TraceError` |
+| `body_fn(carried)` | Returns the same tree as `init`, with the same dtypes and shapes (`DTypeError`/`ShapeError` otherwise) |
+| static leaves in `init` | Must be returned unchanged by `body_fn` — they are not loop-carried |
+| result | The final carried values, unflattened per `init`'s tree |
+
+```python
+@evoxc.defn
+def power_iteration(a, v0, steps):        # steps: static int → specializes the loop
+    def cond_fn(state):
+        i, _v = state
+        return evoxc.less(i, steps)
+
+    def body_fn(state):
+        i, v = state
+        av = evoxc.dot(a, v)
+        norm = evoxc.sqrt(evoxc.sum(evoxc.multiply(av, av)))
+        return evoxc.add(i, 1), evoxc.divide(av, norm)
+
+    _i, v = evoxc.while_loop(
+        cond_fn,
+        body_fn,
+        (evoxc.constant(evoxc.zeros((), evoxc.int32)), v0),   # carried pytree
+    )
+    return v
+```
+
+Note what is *not* in the carry: `steps` is a static Python value, so the comparison bound is baked into the traced condition region and no tensor for it exists.
+Loop-carried types must stay constant across iterations, which the tracer enforces at trace time — a body that returns a differently shaped value is a `ShapeError`, not a run-time surprise.
+
+Each symbolic leaf of `init` becomes one loop-carried operand and one region block argument. That is a 1:1 mapping with no packing, deduplication or region rewriting, so keeping the carry small (two or three values, with derived quantities recomputed in the body) keeps the emitted `while` small too.
+
+## `scan` — a loop that stacks its outputs
+
+```python
+evoxc.scan(f, init, xs, length=None) -> (carry, stacked_outputs)
+```
+
+`f(carry, x_step)` returns `(new_carry, y_step)`; `xs` is a symbolic value (or pytree of them) whose **leading axis is the scan axis**; the result is the final carry plus every `y_step` stacked along a new leading axis.
+
+```python
+@evoxc.defn
+def running_totals(xs):                   # xs: (6,) float32
+    zero = evoxc.constant(evoxc.zeros((), evoxc.float32))
+
+    def step(carry, x):
+        total = evoxc.add(carry, x)
+        return total, total               # (new_carry, y_step)
+
+    final, running = evoxc.scan(step, zero, xs)
+    return final, running                 # scalar, (6,)
+```
+
+`length` is a **static** `int` or `None`, in which case it is derived from `xs`'s static leading dim.
+An explicit `length` shorter than `xs` is a legal prefix scan (the stacked outputs get shape `(length, ...)`); a `length` larger than a statically known leading dim, a length of `0`, and any symbolic or dynamic length are `TraceError`s — dynamic-length scans are reserved in v1, and there is no fallback.
+
+Internally `scan` desugars to a `while_loop`: because the carried types must stay constant, the output accumulators are carried at their full static size `(length, ...)` and each step writes its row in place rather than growing a list.
+That is a detail you should not have to think about — except that it explains why the length must be static, and why `f` is traced twice (once for step 0 at the enclosing level, once inside the loop body).
+
+## Control flow and transforms
+
+The three constructs build region-bearing ops (`if`, `while`).
+`vectorize`/`vmap` refuse them outright — "cannot batch op 'while' … not vectorizable in v1" — and `grad`/`jvp`/`vjp` have no derivative rules for regions.
+This is a documented v1 deferral, not a limitation to work around with a Python loop: a Python loop over graph values is exactly the "silent fallback" the design forbids.
+
+The supported shapes are the other way round: transform a loop-free per-sample function with `vmap`, and let the *batched* body be the thing you trace; or put the loop in the program and differentiate the arithmetic inside its regions by hand.
+See [Graph transforms](/guides/graph-transforms/) for what the vectorizer does accept.
+
+## Control flow under a compiler backend
+
+Regions lower like any other op: the StableHLO exporter emits `stablehlo.if` and `stablehlo.while`, and the numpy interpreter selects regions natively, so both backends agree without transform support.
+IREE has been validated on `while_loop`, `scan`, a `while` nested inside a `cond`, and the multi-objective/NSGA2-class loops, with numpy parity — see [Compiler adapters](/guides/compiler-adapters/) for the current validation state and the known traps.
+
+Symbolic shapes and control flow interact per op: a carry whose shape contains a `Dim` is fine as long as every op inside the regions supports symbolic dims.
+When one does not (a `reshape`, a `pad`, a reduction over a dynamic reduced dim, …), `lower()` raises an explicit `BackendError` naming the op — the graph is never silently specialized to one extent, and you never get a wrong answer from a dim the exporter guessed.
+
+<Aside type="caution" title="A fully input-independent loop is still a graph">
+Both the predicate and the carry must involve at least one symbolic value; a loop whose condition and state are all static is Python control flow, and `while_loop` rejects it with a message saying so.
+Keep bounds as static Python values (they specialize, which is free) and decisions over tensor data in the graph.
+</Aside>
+
+## Choosing between them
+
+| You have | Use |
+|---|---|
+| A decision on a tensor value | `evoxc.cond` |
+| An unknown iteration count that depends on the data | `evoxc.while_loop` |
+| A fixed-length sequence to walk along its leading axis | `evoxc.scan` |
+| A decision or loop over a Python value | plain Python `if` / `for` — it specializes the graph |
+| A per-element computation with no cross-element state | `evoxc.vmap` instead; see [Graph transforms](/guides/graph-transforms/) |
+
+<Aside type="tip" title="Inspect the regions">
+`graph.print()` shows `if`/`while` as ops with nested regions, and `graph.summary()["op_count"]` counts ops at every nesting level.
+If a loop looks larger than you expect, check how many values you are carrying — each symbolic leaf of `init` is one carried operand.
+</Aside>

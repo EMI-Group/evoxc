@@ -5,4 +5,295 @@ sidebar:
   order: 1
 ---
 
-<!-- TODO(content): write the Graphs and tracing page. -->
+A graph in evoxc is not recorded by watching your function run on real data — it is built by running the function once, on symbolic values, under an active builder.
+This page covers that moment (`evoxc.trace`), what it accepts, what it refuses, and the `Graph` it hands back.
+
+## `@evoxc.defn` is a marker, not a JIT
+
+`@evoxc.defn` wraps a plain Python function in a `Defn` and stamps it with an `__evoxc_defn__` marker.
+It adds no execution mode: calling a `Defn` always raises, even with `TensorSpec`s, even from inside another trace.
+
+```python
+import evoxc
+
+@evoxc.defn
+def f(x):
+    return evoxc.add(x, 1.0)
+
+f(evoxc.tensor([1.0, 2.0]))
+```
+
+```text
+evoxc.core.errors.TraceError: `@evoxc.defn`-marked functions are graph definitions,
+not callables: they cannot be executed eagerly. Trace a graph with
+`evoxc.trace(defn, *specs)` (one `TensorSpec` per tensor input, static Python values
+for graph specialization) or build and run in one explicit step with
+`evoxc.evaluate(defn, *args)`.
+```
+
+There is no decorator that compiles on first call, no trace cache, and no eager/graph mode switch. `repr(f)` is metadata only: `<Defn f (<module>)>`.
+
+## Tracing against specs
+
+`evoxc.trace(fn_or_defn, *specs) -> Graph` treats all the positional `specs` as **one pytree**, flattens it, and calls the function exactly once with symbolic arguments in place of the tensor leaves.
+
+```python
+import evoxc
+
+@evoxc.defn
+def f(x, w):
+    """Project, squash, reduce — three ops, one graph."""
+    return evoxc.reduce_sum(evoxc.tanh(evoxc.dot(x, w)), axes=(1,))
+
+spec_x = evoxc.TensorSpec((4, 8), evoxc.float32)
+spec_w = evoxc.TensorSpec((8, 4), evoxc.float32)
+
+graph = evoxc.trace(f, spec_x, spec_w)   # a NEW Graph on every call
+graph.print()                            # the EvoXIR module, one op per line
+```
+
+```text
+module @"main" version 1 {
+  func @main(%arg0: tensor<4x8xf32>, %arg1: tensor<8x4xf32>) -> tensor<4xf32> {
+    %0 = evoxc.dot(%arg0, %arg1) : tensor<4x4xf32> loc("f.py":6:0)
+    %1 = evoxc.tanh(%0) : tensor<4x4xf32> loc("f.py":6:0)
+    %2 = evoxc.reduce_sum(%1) attributes {axes = [1], keepdims = False, reduce_op = "sum"} : tensor<4xf32>
+    evoxc.return(%2)
+  }
+}
+```
+
+Each `loc(...)` is the source position where that op was built, and it is exactly what error messages quote.
+Note what is *not* in the module: the specs, the pytrees, the Python function, and any data. A `Graph` is the program plus the structured I/O contract around it.
+
+`trace` does not verify and does not lower. `graph.verify()` is the explicit IR check, `graph.text()` is the string `print()` writes, and `graph.save(path)` / `evoxc.Graph.load(path)` are the explicit persistence round trip — none of them trace, compile or execute anything.
+
+## What `trace` accepts
+
+Each flattened leaf of `specs` must be one of two things:
+
+| Leaf kind | Meaning |
+|---|---|
+| `TensorSpec(shape, dtype, device=None, name=None)` | A tensor input: one block argument, one entry in `graph.tensor_specs` |
+| A static Python value — `None`, bool, int, float, complex, str, `Enum`, numpy `dtype`, `slice`, `ndarray`, `Dim`, `DimExpr`, `Device` | Graph specialization: recorded in `static_values`, never an input |
+
+Anything else raises. The message names the pytree path and repeats the sanctioned paths:
+
+```python
+evoxc.trace(f, evoxc.tensor([1.0, 2.0]))
+```
+
+```text
+TraceError: Invalid trace input at pytree path [0]: Tensor(...) (type Tensor) is
+neither a core.TensorSpec nor a static Python value. Tensor inputs must be declared
+as TensorSpec(shape, dtype); static values may be None/bool/int/...
+Concrete tensors are never silently captured — declare them as explicit inputs via
+TensorSpec, or embed their data explicitly with evoxc.constant inside the traced
+function.
+```
+
+Nesting is arbitrary — tuple, list, dict, namedtuple, dataclass, and registered pytree nodes — and **dict key order never matters**: keys are sorted when flattened, so a run-time dict may be built in any order and still match.
+
+### Symbolic dims
+
+A shape entry is a static `int`, a `Dim`, a `DimExpr`, or `None` (runtime-dynamic).
+
+```python
+B = evoxc.dim("B")                     # a named symbolic extent
+spec = evoxc.TensorSpec((B, 4), evoxc.float32)
+padded = evoxc.TensorSpec((B * 2, 4), evoxc.float32)   # DimExpr: + - * // % min max
+sized = evoxc.TensorSpec((evoxc.Dim("B", 32), 4), evoxc.float32)
+```
+
+`Dim` equality is structural on `(name, size)`, so two separately constructed `Dim("B")`s unify — you do not have to reuse one object.
+Inside a trace, symbolic values carry those dims through inference, and the numpy interpreter binds each named dim to one extent per run.
+
+<Aside type="caution" title="Run-time shape checks are per leaf">
+`flatten_inputs` validates each tensor leaf against its own spec: rank, static dims, dtype and device.
+There is no dim-binding environment at run time in v1, so the same `Dim("B")` appearing on two different inputs is **not** cross-checked, and a `Dim("B")` with no size (or a `None` dim) accepts any size.
+Tying dims together is enforced at trace time by shape inference only.
+</Aside>
+
+## The body runs once, at trace time
+
+Tracing calls your function once, as ordinary Python, with `SymbolicTensor`s where the tensor leaves were.
+Every op you call appends to the active builder, so a plain Python helper needs no decoration to take part:
+
+```python
+def block(h, w, b):                    # an ordinary Python function
+    return evoxc.relu(evoxc.dot(h, w) + b)
+
+@evoxc.defn
+def two_layers(x, w1, b1, w2, b2):
+    h = block(x, w1, b1)               # inlined: its ops land in the same graph
+    return block(h, w2, b2)
+```
+
+The consequence worth internalizing: **Python control flow over Python values specializes the graph.**
+A `for i in range(3)` is unrolled into three op groups; an `if scale > 0` chooses one branch and the other never exists.
+
+```python
+@evoxc.defn
+def scale_or_negate(x, scale):         # scale is static: a Python float
+    if scale > 0:
+        return evoxc.multiply(x, scale)
+    return evoxc.negate(x)
+
+g_pos = evoxc.trace(scale_or_negate, spec_x, 2.0)    # multiply baked in
+g_neg = evoxc.trace(scale_or_negate, spec_x, -1.0)   # negate baked in
+print(g_pos.digest() == g_neg.digest())              # False — two different programs
+```
+
+That is not a cache miss or a recompile you should try to avoid: changing a static value is *a different graph*, by design.
+Running `g_pos` with `3.0` instead of `2.0` raises rather than silently specializing at run time:
+
+```text
+TraceError: graph was specialized on 2.0 (a float); run-time argument 3.0
+(a float) at path [1] does not match
+```
+
+## Static values are snapshotted
+
+Closure values are read when the ops are built, so they are frozen into the graph the moment it is traced.
+At run time, each recorded static leaf is re-validated by type (`StaticValue.kind`, e.g. `float` vs `bool`) and value; `ndarray` leaves compare with array-equality semantics (`np.array_equal`, since `==` on arrays is elementwise).
+
+Only *tensor* data needs an explicit opt-in, because capturing it silently is exactly the mistake principle 6 forbids:
+
+```python
+w = evoxc.tensor([1.0, 2.0, 3.0])
+
+@evoxc.defn
+def bad(x):
+    return evoxc.add(x, w)             # closure-captured concrete tensor
+
+evoxc.trace(bad, evoxc.TensorSpec((3,), evoxc.float32))
+```
+
+```text
+TraceError: Concrete Tensor operands are not allowed in graph ops (evoxc has no
+eager mode): (1) pass the tensor as an explicit input (TensorSpec at trace time),
+(2) embed its data explicitly with evoxc.constant (snapshots the data and warns for
+large tensors), or (3) build and run a graph with evoxc.evaluate.
+```
+
+`evoxc.constant(w)` is the one sanctioned embedding: it copies the buffer at graph-construction time (mutating `w` afterwards does not change the graph) and warns above `EVOXC_LARGE_CONSTANT_BYTES` (default 1 MiB), because large tensors belong in the argument list, not in the program.
+
+## The `Graph` object
+
+A `Graph` is an `ir.Module` plus the structured I/O contract around it.
+
+| Member | What it gives you |
+|---|---|
+| `module` | The EvoXIR module: functions, blocks, ops, regions |
+| `tensor_specs` | One `TensorSpec` per tensor input, in block-argument order |
+| `input_specs` | The input `TreeSpec` (a historical name — it is the tree, not the specs) |
+| `output_tree` | The output `TreeSpec`, used to rebuild structured results |
+| `static_values` / `output_static_values` | `StaticValue` records (`index`, `path`, `value`, `kind`) for specialized leaves |
+| `source_locations` | Input value id → the `ir.Location` it was traced at |
+| `print()` / `text()` | The pretty-printed IR (`text()` returns the same string) |
+| `verify()` | Explicit IR verification → `VerificationError` |
+| `save(path)` / `Graph.load(path)` | The versioned persistence container |
+| `flatten_inputs(args)` / `validate_inputs(args)` | Flatten + validate a run-time argument tree |
+| `unflatten_outputs(flat)` | Rebuild the structured result from flat tensors |
+| `summary()` / `digest()` | JSON-safe structural summary and structural hash |
+
+### `summary()`, `digest()`, `text()`
+
+```python
+@evoxc.defn
+def mlp(params, batch):
+    h = evoxc.tanh(evoxc.dot(batch["x"], params["w1"]) + params["b1"])
+    h = evoxc.relu(evoxc.dot(h, params["w2"]) + params["b2"])
+    return evoxc.reduce_sum(h, axes=(1,))
+
+B = evoxc.dim("B")
+specs = (
+    {"w1": evoxc.TensorSpec((4, 8), evoxc.float32),
+     "b1": evoxc.TensorSpec((8,), evoxc.float32),
+     "w2": evoxc.TensorSpec((8, 3), evoxc.float32),
+     "b2": evoxc.TensorSpec((3,), evoxc.float32)},
+    {"x": evoxc.TensorSpec((B, 4), evoxc.float32)},
+)
+graph = evoxc.trace(mlp, *specs)
+print(graph.summary()["op_counts_by_category"])
+print(graph.digest())
+```
+
+```text
+{'elementwise': 4, 'linalg': 2, 'reduction': 1, 'terminator': 1}
+3f9c1e…     (a 64-character SHA-256 hex string)
+```
+
+The full `summary()` dict is JSON-safe and carries `functions`, `op_count` (all nesting levels, one line per op), `op_counts_by_category`, `tensor_inputs`/`tensor_outputs` as `{"path", "shape", "dtype"}` records, `static_values` as `{"path", "kind", "value_repr"}`, `source_location_count`, `has_batch_report`, and `digest`.
+For this graph the inputs are `[0, "b1"]`, `[0, "b2"]`, `[0, "w1"]`, `[0, "w2"]`, `[1, "x"]` (paths are positional indices, with dict keys where a dict was), and the single output is `{"path": [], "shape": ["B"], "dtype": "float32"}`.
+
+`digest()` is a SHA-256 over the module's **structure** plus the I/O signature: function and module names, block arguments, every op's name/attributes/operands/result types, nested regions, and the constant table.
+Op `location`s are stripped and `batch_report` is not part of it, so the same graph defined in a different file, re-traced in another process, or round-tripped through `save`/`load` digests identically.
+Anything that changes the program — an op, an attribute, a dtype, a shape, a static value, an I/O tree — changes the digest. That makes it the right key for build caches and for "did my refactor change the graph?" checks.
+
+## Source locations in errors
+
+Every op built by the frontend carries a call-site `Location`, and errors raised through a graph value include it, so a shape problem points at the line that caused it:
+
+```python
+@evoxc.defn
+def g(x):
+    if evoxc.sum(x) > 0:               # bool(SymbolicTensor) → TraceError
+        return x
+    return evoxc.negate(x)
+
+evoxc.trace(g, evoxc.TensorSpec((3,), evoxc.float32))
+```
+
+```text
+TraceError: SymbolicTensor cannot be used as a Python boolean (at model.py:4:7).
+Runtime tensor control flow must use evoxc.cond / evoxc.while_loop / evoxc.scan;
+static Python control flow is only valid over Python values.
+```
+
+## Trace-time failure modes
+
+| You did | You get |
+|---|---|
+| Captured a concrete `Tensor` from a closure | `TraceError` naming the explicit-input / `evoxc.constant` / `evoxc.evaluate` paths |
+| Passed a concrete `Tensor` as a `specs` leaf | `TraceError` "is neither a core.TensorSpec nor a static Python value" with the pytree path |
+| Called an op outside any trace | `TraceError` "No active trace: tensor ops can only be called while tracing a graph definition …" |
+| Used a graph value as a Python boolean | `TraceError` pointing at `evoxc.cond`/`while_loop`/`scan`, with the location |
+| Returned a concrete `Tensor` from the body | `TraceError` with the trace location |
+| Static value changed at run time | `TraceError` "graph was specialized on … does not match" |
+| dtype / shape / device mismatch at run time | `DTypeError` / `ShapeError` / `DeviceError` |
+
+## Pytree in, pytree out
+
+Structured inputs and outputs are first-class. Tensor leaves become block arguments; static leaves travel beside them and come back unchanged.
+
+```python
+@evoxc.defn
+def model(params, batch):
+    h = evoxc.tanh(evoxc.dot(batch["x"], params["w1"]) + params["b1"])
+    return {"logits": evoxc.dot(h, params["w2"]), "hidden": h, "scale": 0.5}
+
+spec = ({"w1": evoxc.TensorSpec((4, 8), evoxc.float32),
+         "b1": evoxc.TensorSpec((8,), evoxc.float32),
+         "w2": evoxc.TensorSpec((8, 3), evoxc.float32)},
+        {"x": evoxc.TensorSpec((B, 4), evoxc.float32)})
+
+exe = evoxc.build(model, *spec, device="cpu")          # one executable, any batch size
+out = evoxc.run(
+    exe,
+    {"w1": evoxc.ones((4, 8)), "b1": evoxc.zeros((8,)), "w2": evoxc.ones((8, 3))},
+    {"x": evoxc.ones((5, 4))},
+)
+# {'hidden': (5, 8), 'logits': (5, 3), 'scale': 0.5}
+```
+
+`"scale": 0.5` is a static output leaf: it never becomes a graph result (the module has one `return` operand for the tensor leaves) and `unflatten_outputs` re-inserts it verbatim.
+
+## What a trace does not do
+
+- It does not cache or verify. Two `trace` calls are two graphs even for the same function; call `graph.verify()` when you want the IR check (`evoxc.build` does it for you).
+- It does not lower, compile or execute — those are the next three explicit stages ([Backends and options](/guides/backends/)), and it does not pre-scan your closures: a captured tensor is caught when an op touches it.
+
+<Aside type="tip" title="Next">
+Graphs are the input to everything else: [Graph transforms](/guides/graph-transforms/) turns one graph into another (batching, differentiation, population merges), and [In-graph control flow](/guides/control-flow/) adds runtime branches and loops to a body you have traced.
+</Aside>
