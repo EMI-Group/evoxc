@@ -5,4 +5,196 @@ sidebar:
   order: 8
 ---
 
-<!-- TODO(content): write the Custom ops and kernels page. -->
+evoxc has no Python kernel-compilation path and no eager escape hatch: a graph is ordinary IR, and every operation in it is either a builtin or one of the three mechanisms below.
+Each mechanism makes a different promise, so the choice is a contract decision rather than a style preference.
+
+## Choosing a mechanism
+
+| Mechanism | You own | The graph carries | Executes on |
+|---|---|---|---|
+| `evoxc.block` | a decomposition written as a normal graph (optional per-backend impls) | a `block_call` op | numpy, `native`, and every compiler adapter |
+| `evoxc.external_call` + `evoxc.register_external_kernel` | the kernel body, outside evoxc | an `external_call` op | numpy (host dispatch), iree (host or device-resident) |
+| `evoxc.custom_call` / `evoxc.inline_stablehlo` / `evoxc.compile_text` | compiler-side IR | a compiler op, or verbatim MLIR | iree / xla / tvm only |
+
+The rule of thumb: if you can express the computation as a graph, write a **block**; if a real kernel has to run, declare an **external call**; if the answer only exists in the compiler's dialect, use an **escape hatch** and accept that the CPU backends refuse it.
+
+## Custom ops with `evoxc.block`
+
+`evoxc.block` declares an op with input/output specs, an attribute schema, an optional portable decomposition written as an `@evoxc.defn` graph, and optional per-backend implementations.
+The declaration is the registration — the returned `BlockOp` is callable inside any trace.
+
+```python
+import numpy as np
+import evoxc
+
+l2norm = evoxc.block(
+    "l2norm",
+    inputs=[evoxc.TensorSpec((4, 8), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4, 8), evoxc.float32)],
+)
+
+@l2norm.portable                         # the decomposition, as an ordinary graph
+@evoxc.defn
+def _l2norm(x):
+    return evoxc.divide(
+        x, evoxc.sqrt(evoxc.sum(evoxc.square(x), axes=-1, keepdims=True))
+    )
+
+@l2norm.impl("numpy")                    # optional fast path for one backend
+def _l2norm_numpy(x):
+    return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+
+@evoxc.defn
+def model(x):
+    return evoxc.sum(l2norm(x))
+
+exe = evoxc.build(model, evoxc.TensorSpec((4, 8), evoxc.float32), device="cpu")
+```
+
+Python values in a block call are always **static**: `attributes={"scale": float}` (bare type = required) or `attributes={"eps": 1e-6}` (a default instance = optional), and a call-site keyword must name a declared attribute.
+Positional statics bind to the next unfilled attribute in schema order, and there is no scalar→tensor auto-promotion inside a block — promote at the ops level instead.
+
+There is also a decorator form, `@evoxc.block(...)` over an `@evoxc.defn` function: the name defaults to the function name, input specs come from the `TensorSpec` annotations, and the return annotation (or `outputs=`/`result=`) declares the outputs.
+Portable implementations must be `@evoxc.defn` functions — a plain Python function is a `BlockError`, because a decomposition is traced, not called.
+
+<Aside type="warning" title="An impl receives encoded attributes">
+A per-backend implementation is invoked as `impl(*numpy_arrays, **static_args)` where each keyword is the JSON-safe payload dict `{"kind": ..., "value": ...}`, not the decoded Python value.
+An attribute is *specialization*, not data: changing it produces a different graph.
+
+```python
+gated = evoxc.block(
+    "gated_scale",
+    inputs=[evoxc.TensorSpec((4, 8), evoxc.float32)],
+    outputs=[evoxc.TensorSpec((4, 8), evoxc.float32)],
+    attributes={"scale": float},          # required; a default instance makes it optional
+)
+
+@gated.impl("numpy")
+def _gated_numpy(x, **kwargs):
+    return x * kwargs["scale"]["value"]   # the payload dict, not 2.5
+
+@evoxc.defn
+def apply(x):
+    return evoxc.sum(gated(x, 2.5))       # positional static, binds in schema order
+```
+</Aside>
+
+### The portable decomposition is the portability contract
+
+A `block_call` is a placeholder; how it computes is resolved per backend, first match wins:
+
+1. a compiler-native op (a backend that lists the block in `capabilities.custom_blocks`);
+2. a registered backend impl for that backend (`impl("numpy")`, `impl("native")`, …);
+3. the portable decomposition, traced and spliced into the graph as ordinary ops.
+
+So a portable is what makes **one** declaration run on numpy, on the `native` engine and on iree/xla/tvm: the compiler adapters declare `custom_blocks=False` and inline the decomposition at `lower()`, and the ops it expands into must be ones that adapter exports.
+A block with neither a portable nor an impl for the target backend is an explicit `BackendError` naming the block — never a silent fallback to numpy.
+
+### Batching: rules and policies
+
+`vmap`/`vectorize` need to know what your op does with batch dims. Declare a policy, a rule, or both:
+
+| `batching=` policy | Meaning without an explicit rule |
+|---|---|
+| `elementwise` | acts per element; batch dims pass through — safe as-is |
+| `map_over_batch` | maps over its leading batch dims internally; batch dims pass through — safe as-is |
+| `batching_rule` | the default when a portable exists: the decomposition is the rule |
+| `broadcast_batch` | batch dims broadcast among operands; needs a rule or a decomposition |
+| `opaque_batched` | consumes batch dims opaquely (flash-attention style) |
+| `unsupported` | no safe path — vectorizing raises `TransformError` |
+
+The two safe policies are pre-registered as a pass-through batching rule at declaration time, which is what makes them safe without any user code.
+An explicit `l2norm.batching_rule(fn)` always wins over the policy, and an explicit non-`batching_rule` policy suppresses the automatic decomposition fallback.
+Missing everything is a `TransformError` naming the block, never a Python loop over the batch dim.
+
+### Derivatives
+
+`BlockOp.jvp_rule(fn)` and `BlockOp.vjp_rule(fn)` publish into the transform rule registries under the `block:<name>` key.
+Without a rule, `grad`/`jvp`/`vjp` trace the portable decomposition and differentiate the inlined ops — which is why a portable is worth writing even when a fast impl exists.
+No rule and no portable is a `TransformError` ("not differentiable"), and `transforms` never imports `block`: it sees only registry entries.
+
+### Failures you will actually see
+
+- `BlockError` — duplicate name, malformed spec/schema/policy, undeclared or wrongly typed static value, non-`@evoxc.defn` portable.
+- `TraceError` — calling the op outside a trace, or passing a concrete `Tensor`.
+- `ShapeError` / `DTypeError` — an operand that does not match the declared `input_specs`.
+- `TransformError` — no batching or derivative rule for the op.
+
+## External kernels: `external_call`
+
+When the computation must stay opaque — a Triton launch, hand-written CUDA — declare the call in the graph and register the implementation out of band.
+The name is static and travels through save/load; **the registry does not**, so every process that runs the graph re-registers its kernels.
+
+```python
+@evoxc.defn
+def model(x, w):
+    h = evoxc.external_call("fused_scale", x,
+                            result=evoxc.TensorSpec((4, 8), evoxc.float32))
+    return evoxc.dot(h, w)                 # downstream ops consume it like any SSA value
+
+handle = evoxc.register_external_kernel("fused_scale", scale_kernel)   # default slot
+
+@handle.impl("iree")                       # per-backend slot, host mode: numpy in / out
+def scale_iree(x):
+    ...
+
+handle.batch_variant(scale_batched)        # optional batched kernel, derived name
+```
+
+`result=` is the declared output contract (`TensorSpec` or a non-empty tuple/list; symbolic dims are allowed) and the numpy backend validates the returned arrays' count, dtype and shape — `BackendError` or `ShapeError`, never a silent coercion.
+Registration is per backend: the exact slot wins, the default slot (`backend=None`) is the fallback for every backend.
+`batch_variant` registers a batched kernel under a derived `__evoxc_batched` name together with the pass-through batching rule (the suffix is reserved), so `vmap` over the call needs no rule of your own; `batch_invariant()` is the same rule without a second kernel.
+
+### Segmentation and device residency
+
+For the **iree** adapter, `external_call` boundaries are a *segment boundary*: at `lower()` the graph is split into compiled segments plus a kernel-call plan, and each boundary dispatches in its registered mode.
+
+- **Host mode** (the default) stages the operands to the host, runs `fn(*np_arrays)` and copies the result back — `Tensor.to(cpu)` is the only transfer, and this boundary is the only sanctioned host↔device staging point in the pipeline.
+- **Device-resident mode** (`register_external_kernel(..., backend="iree", device_resident=True)`) hands the kernel device `core.Tensor`s and accepts device payloads, duck-typed payloads or DLPack-capable objects, validated metadata only (count/dtype/shape, never a host copy). `device_resident=True` requires an explicit backend slot — a device kernel in the default slot would be handed host arrays by the numpy backend and is rejected with `TypeError`.
+
+Zero-copy interop is real: `Tensor.__dlpack__` delegates to the device payload, so a device kernel does `torch.from_dlpack(t)` and shares the HAL buffer.
+
+<Aside type="caution" title="The kernel owns synchronization">
+The adapter adds no fence around the import or the export. iree's HIP/CUDA HAL runs on its own stream, so a kernel that leaves work pending on a foreign stream must synchronize before returning — otherwise the next segment may read in-flight memory. The export direction is safe on its own because `run` blocks on the device queue.
+</Aside>
+
+On xla/tvm an `external_call` is not split: a registered portable decomposition is inlined with a `UserWarning`, and without one the adapter raises `BackendError`. The numpy interpreter dispatches the callable directly, and a `device_resident=True` registration there is an explicit `BackendError`.
+
+## Compiler escape hatches
+
+Two graph ops and one staging function that exist only for compiler backends.
+Both ops are gated on `Capabilities.custom_ops`, which is true only on iree/xla/tvm — numpy and native reject them by name in their capability pre-check.
+
+```python
+@evoxc.defn
+def with_target(x):
+    return evoxc.custom_call(
+        "my_kernel_target",
+        x,
+        result=evoxc.TensorSpec((4,), evoxc.float32),
+        backend_config="",
+        api_version=1,
+        has_side_effect=False,
+    )
+```
+
+`custom_call(call_target_name, *operands, result, backend_config="", api_version=1, has_side_effect=False)` emits a `stablehlo.custom_call` and forwards the target name and configuration verbatim.
+`inline_stablehlo(body, *operands, result, has_side_effect=False)` raises a raw MLIR snippet into the graph under a token contract evoxc does check: operand *i* is available as `%in<i>`, and every declared result *i* must be assigned to `%out<i>` at least once.
+Beyond that contract evoxc never parses MLIR — the declared result types are the compiler's to validate.
+
+`evoxc.compile_text(mlir_text, input_specs, output_specs, backend=..., device=..., entry_functions=("main",), **options)` is the same idea without a graph at all: authored or edited StableHLO goes straight to `compile` → `load`, which is also the round trip for `Executable.source_text()`.
+The full example lives on [backends](/guides/backends/).
+
+<Aside type="important" title="Forwarding is not validity">
+`custom_ops` claims the text is **forwarded**, not that it is legal. An unknown `stablehlo.custom_call @target` parses and then fails IREE legality (`failed to legalize operation 'stablehlo.custom_call' that was explicitly marked illegal`), and there is no custom-dispatch object-linking path and no PJRT custom-call registration.
+So a kernel that must actually execute is either a self-contained `inline_stablehlo`/`compile_text` body or an `external_call` segment — never a bare custom-call target name.
+</Aside>
+
+The design rules behind that: no Python kernel-compilation path belongs in evoxc, and the escape hatches never gain a numpy or native fallback — they keep raising the explicit `BackendError` on the CPU backends.
+
+## Related reading
+
+- [Graph transforms](/guides/graph-transforms/) — what your batching and derivative rules participate in.
+- [Backends](/guides/backends/) — capabilities, option forwarding, and the `compile_text` example.
+- [Compiler adapters](/guides/compiler-adapters/) — per-adapter device kinds and validation state.
+- [Limitations and deferrals](/reference/deferrals/) — what v1 refuses and the error it raises.

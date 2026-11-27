@@ -5,4 +5,154 @@ sidebar:
   order: 11
 ---
 
-<!-- TODO(content): write the Sparse tensors page. -->
+`evoxc.sparse` is an explicit sparse-tensor subsystem: a value model, a graph frontend, and numpy kernels that validate structure at run time.
+It follows the same **spec → symbolic → concrete** discipline as the dense core, and it has no eager mode for computation and no hidden densification — every conversion is an op you wrote.
+
+In v1 sparse execution is **numpy-backend-only**. Every compiler backend, and the `native` engine, defers with an explicit `BackendError` suggesting `evoxc.sparse.to_dense`; nothing falls back silently.
+
+## One value model, three phases
+
+All phases share one class hierarchy rooted at `SparseTensor`, so `is_sparse(x)` catches every phase and every storage format:
+
+| Class | Phase | Has data |
+|---|---|---|
+| `SparseTensorSpec` | trace-time description | no |
+| `SparseTensor` | symbolic value inside a graph **and** the concrete COO representation | symbolic: no; concrete: yes |
+| `CSRTensor` / `CSCTensor` | concrete compressed-row / compressed-column values | yes |
+
+A sparse value is an explicit `(structure, values)` pair with a known dense shape — never a dense tensor with a mask.
+
+## Structure, values, and canonical form
+
+The concrete constructors validate, loudly and once:
+
+- **COO** — `indices` are int64 `(nnz, ndim)`, lex-sorted row-major, strictly unique (duplicate *nonzero* rows are an error; a duplicate row carrying one stored zero is legal), and in range per column.
+- **CSR / CSC** — rank-2 only, `indptr[0] == 0`, monotone non-decreasing, `indptr[-1] == nnz`, per-row (per-column) indices sorted strictly increasing and in range.
+- Integer index dtypes normalize to int64; `dense_shape` is positive integers.
+
+Violations raise `ShapeError` or `DTypeError` from the constructor — canonical form is never repaired implicitly.
+Inside a graph, `nnz` is **runtime-dynamic** in every leaf spec (`(None, ndim)`), while `indptr` stays static (`(rows + 1,)` / `(cols + 1,)`, int64); that is what lets one traced graph serve any sparsity pattern.
+
+<Aside type="note" title="COO is the computation format">
+Any CSR/CSC symbolic input to a computation op — or to `to_dense` — is first converted by emitting `sparse_csr_to_coo` / `sparse_csc_to_coo` (rank-2 only; other ranks are a `ShapeError`). COO inputs pass through untouched. The conversion is visible in the graph, not a hidden kernel detail.
+</Aside>
+
+## Creators and converters
+
+Creators are **polymorphic**: concrete components (numpy arrays or `core.Tensor`) build a validated eager value, while symbolic components (`core.SymbolicTensor`) assemble the value in-graph with no validation — the numpy kernels validate canonical form at run time.
+
+| Name | Signature | Notes |
+|---|---|---|
+| `coo` | `(indices, values, shape)` | the computation format |
+| `csr` | `(indptr, indices, values, shape)` | compressed rows |
+| `csc` | `(indptr, indices, values, shape)` | compressed columns |
+| `from_dense` | `(dense, format="coo")` | concrete: exact `np.nonzero` extraction; symbolic: emits the `sparse_from_dense` op. Only `format="coo"` in v1 |
+| `to_dense` | `(x)` | polymorphic: eager method or graph op |
+| `to_csr` / `to_csc` / `to_coo` | `(x)` | polymorphic layout conversion |
+
+Mixing symbolic and concrete components is a `TypeError`, and a `core.TensorSpec` component is a `TypeError` pointing at `SparseTensorSpec`, which is what trace inputs take.
+`SparseTensorSpec.from_concrete(concrete_sparse)` derives the canonical spec — `evoxc.evaluate` uses it when you pass a concrete sparse argument.
+
+## The 16 graph ops
+
+| Area | Ops |
+|---|---|
+| Assembly / conversion | `sparse_from_dense`, `sparse_to_dense`, `sparse_coo_to_csr`, `sparse_coo_to_csc`, `sparse_csr_to_coo`, `sparse_csc_to_coo` |
+| Elementwise | `sparse_add` (union), `sparse_multiply` (intersection), `sparse_multiply_dense`, `sparse_negate` |
+| Structural | `sparse_transpose`, `sparse_reshape`, `sparse_concatenate` |
+| Reduction | `sparse_reduce_sum` — returns a **dense** result |
+| Matmul | `sparse_dot_dense`, `sparse_dense_dot_sparse` |
+
+The frontend names on `evoxc.sparse` are the natural ones: `add`, `subtract`, `multiply`, `multiply_dense`, `negate`, `sum` (alias `reduce_sum`), `transpose`, `reshape`, `concatenate`, `matmul`.
+`subtract` is the composition `add(a, negate(b))` — it does not add an IR op.
+`matmul` dispatches on the operand kinds: sparse@dense, dense@sparse, and dense@dense through the ordinary `evoxc.dot`; sparse@sparse is a v1 deferral.
+
+The other direction — go sparse inside the graph — is the symbolic `from_dense`:
+
+```python
+@evoxc.defn
+def roundtrip(dense):
+    return sparse.to_dense(sparse.from_dense(dense))   # sparse_from_dense + sparse_to_dense
+```
+
+A sparse value is also a legal loop carry: values flow through `cond`, `while_loop` and `scan` bodies as ordinary registered pytrees, while `scan` *sources* and `y` stacking over sparse values remain v1 deferrals.
+
+## What a sparse argument looks like at the I/O boundary
+
+A sparse value is a registered pytree whose children are its tensor leaves followed by static leaves:
+
+- COO: `[indices, values, *dense_shape, dtype, "coo"]`
+- CSR / CSC: `[indptr, indices, values, *dense_shape, dtype, "csr" | "csc"]`
+
+`dense_shape` contributes one leaf per dimension, then the `np.dtype` leaf, then the format string.
+Those static leaves are snapshotted at trace time and validated at the run boundary, which is why a **format mismatch** (a `coo` value handed to a graph traced for `csr`) fails loudly in `flatten_inputs` instead of producing wrong numbers.
+
+```python
+s = sparse.csr(indptr, indices, values, (3, 4))
+spec = sparse.SparseTensorSpec.from_concrete(s)
+# SparseTensorSpec(format='csr', dense_shape=(3, 4), dtype=float32, values_shape=(None,))
+```
+
+Batched sparse values put the batch dimension on the tensor leaves only; `dense_shape` gains the batch `Dim` at position 0 on **outputs**, via the batched-output remap — never by prepending a batch extent to the op's attributes.
+
+## How transforms treat sparse values
+
+`vmap`/`vectorize`, `grad`, `jvp` and `vjp` work on sparse values through per-op rules registered at `import evoxc.sparse` time; the ops participate in `cond`/`while_loop`/`scan` carries as ordinary registered pytrees.
+
+- **Batching** — one shared rule for all 16 ops rebuilds the op over the batched operands with the same attributes; result batch dims come from IR inference, and the output tree's `dense_shape` gains the batch `Dim` at position 0.
+- **VJP** — the structure is never differentiated: index operands get `ZeroTangent` and values get a flat values cotangent. `sparse_add` gathers the merged (union) cotangent, `sparse_multiply` weights it by the other operand's matched values (intersection), and the dot rules accumulate dense gradients by one-hot row selection plus a dense matmul. Cotangents are **flat tensors per leaf** — there is no sparse cotangent object, so a caller rebuilds the sparse value from the returned leaves.
+- **JVP** — explicit two-term product rules for the four bilinear ops (`sparse_multiply`, `sparse_multiply_dense`, `sparse_dot_dense`, `sparse_dense_dot_sparse`); every other sparse op derives its JVP from its VJP rule via the adjoint trick.
+
+Three vjps are v1 deferrals and raise `TransformError`: `sparse_concatenate` (it would need dynamic slicing of the merged cotangent per operand) and the two reordering conversions `sparse_coo_to_csc` / `sparse_csc_to_coo`.
+`evoxc.grad(f)` on a sparse argument needs `argnums=(1,)`, because the int64 indices leaf is not differentiable.
+
+## Backends
+
+The numpy interpreter runs all 16 ops with kernels that validate canonical form at run time; device handling is per leaf, and a non-CPU payload leaf raises `DeviceError` rather than being copied to the host.
+Every other backend refuses the graph at `lower()` with an explicit `BackendError` naming the sparse op and suggesting `evoxc.sparse.to_dense`, so a sparse experiment cannot silently become a dense one with different memory behaviour.
+
+## Worked example: sparse matmul on the numpy backend
+
+```python
+import numpy as np
+import evoxc
+from evoxc import sparse
+
+s = sparse.csr(
+    np.array([0, 1, 2, 4], dtype=np.int64),          # indptr
+    np.array([1, 2, 0, 3], dtype=np.int64),          # column indices
+    np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+    (3, 4),
+)
+
+@evoxc.defn
+def step(s, w):
+    return sparse.matmul(s, w)                       # sparse @ dense
+
+graph    = evoxc.trace(step, sparse.SparseTensorSpec.from_concrete(s),
+                       evoxc.TensorSpec((4, 2), evoxc.float32))
+lowered  = evoxc.lower(graph)                        # backend=None -> numpy
+artifact = evoxc.compile(lowered)
+exe      = evoxc.load(artifact)
+
+w = np.arange(8, dtype=np.float32).reshape(4, 2)
+out = evoxc.run(exe, s, w)
+print(out.numpy())
+# [[ 2.  3.]
+#  [ 8. 10.]
+#  [24. 31.]]
+```
+
+The same graph as a one-liner is `evoxc.evaluate(step, s, w, device="cpu")`, which derives the spec from the concrete CSR argument.
+The traced graph contains a `sparse_csr_to_coo` conversion (visible in `graph.text()`) followed by `sparse_dot_dense` — no densification of the operand.
+
+## v1 deferrals
+
+- **sparse @ sparse matmul** — `TraceError`; densify one operand with `evoxc.sparse.to_dense`.
+- **Sparse constants** — `evoxc.constant(concrete_sparse)` is a `TraceError`; large sparse data is an explicit input.
+- **Whole-sparse `bind`** — leaf-level bind works, binding a whole sparse value is a deferral.
+- **`scan` over sparse `xs`** and sparse `y` stacking — `TraceError`; sparse loop *carries* work.
+- **Three vjps** — `sparse_concatenate`, `sparse_coo_to_csc`, `sparse_csc_to_coo` raise `TransformError`.
+- **Compiler backends** — everything sparse, with an explicit `BackendError`.
+
+See [limitations and deferrals](/reference/deferrals/) for the dense-side list, and [graph transforms](/guides/graph-transforms/) for what the batching and derivative rules plug into.

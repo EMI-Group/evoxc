@@ -5,4 +5,268 @@ sidebar:
   order: 3
 ---
 
-<!-- TODO(content): write the Op catalogue page. -->
+Every numerical operation that can appear in an EvoXIR graph is a function in the frontend op namespace (`evoxc.ops`, re-exported at the top level of `evoxc`): `evoxc.ops.__all__` holds 104 names, plus `evoxc.arange` from `evoxc.numpy`, the eight `evoxc.random` functions, the `evoxc.dist` collectives and the `evoxc.sparse` surface.
+This page groups them by area; exact signatures, defaults and per-op docstrings are in the generated Python API reference published at `/api/` on this site, which is built from those docstrings.
+
+## How ops are called
+
+An op function is a *builder*, never an executor: it appends one IR op to the active builder (obtained from the trace context) and returns a `SymbolicTensor` wrapping the result value, with its dtype and shape already computed at trace time.
+
+| Call shape | What happens |
+|---|---|
+| `SymbolicTensor` operands | One IR op is created in the active builder; the result is a `SymbolicTensor` |
+| Python scalar alongside a `SymbolicTensor` | The scalar is auto-promoted to a 0-d constant operand — transparent sugar |
+| A concrete `Tensor` operand | `TraceError`: evoxc has no eager mode |
+| Called outside a trace | `TraceError` naming `evoxc.trace`, `@evoxc.defn` and `evoxc.evaluate` |
+
+```python
+import evoxc
+
+evoxc.add(evoxc.tensor([1.0, 2.0]), 1.0)   # no graph is active: TraceError
+```
+
+```text
+evoxc.core.errors.TraceError: No active trace: tensor ops can only be called while
+tracing a graph definition (inside an `@evoxc.defn` function traced via
+`evoxc.trace`, or inside the callables of `evoxc.cond` / `evoxc.while_loop` /
+`evoxc.scan`). Call `evoxc.trace(fn, *specs)` or `evoxc.evaluate(fn, *args)` …
+```
+
+Passing a concrete `Tensor` from inside a trace fails with the three sanctioned ways out: make it an explicit input, embed it with the warned `evoxc.constant`, or run the whole thing through `evoxc.evaluate`.
+
+Every non-tensor parameter — an axis, a shape, a padding table, `k`, a dtype, a callback — is a **static Python value**. It specializes the graph: a different value is a different op in a different program, with no hidden guard and no recompile. Nothing in the op layer computes a result, caches data, or inspects a runtime value.
+
+### Operator overloads
+
+`SymbolicTensor` supports the ordinary Python operators. Each one dispatches through a handler that the op layer registers at import time, so the dunder is pure sugar over the named function — including the reflected forms, which pass the tensor as the first argument:
+
+| Expression | Op |
+|---|---|
+| `x + y`, `x - y`, `x * y`, `x / y`, `x ** y`, `-x` | `add`, `subtract`, `multiply`, `divide`, `power`, `negate` |
+| `x @ y` | `dot` (rank ≥ 2; use `matmul` for 1-D operands) |
+| `x == y`, `x != y`, `x < y`, `x <= y`, `x > y`, `x >= y` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` |
+| `x[key]` | `slice` / `gather` for static keys |
+
+`__eq__` on two symbolic values builds a graph comparison, not a Python boolean — that is why `if x > 0:` on a symbolic value fails instead of silently picking a branch.
+
+## Dtype and shape rules that hold everywhere
+
+- **Tensor ⨯ tensor promotes by `numpy.result_type`**, including its subtleties: `int8`+`uint8` → `int16`, `float32`+`int64` → `float64`, `float16`+`float16` → `float16`.
+- **Python scalar ⨯ tensor follows NEP 50 weak promotion**, implemented explicitly so the behavior is identical on numpy 1.x and 2.x: `int` scalars promote down to a `float16`/`float32`/`float64` tensor when exactly representable, `float` scalars are weak toward every float/complex tensor, `complex` scalars toward `complex64`/`complex128` only.
+- **Unary math** (`sqrt`, `exp`, `log`, `log1p`, trig, `tanh`, `sigmoid`, `relu`, `gelu`, `erf`) turns integer/bool input into `float64` and keeps a float dtype; **unary preserving** (`abs`, `negate`, `square`, `sign`, `floor`, `ceil`, `round`) keeps the dtype.
+- **Broadcasting** aligns shapes right. Two concrete extents that disagree is a `ShapeError` at trace time — a statically known failure is never deferred; when a symbolic dim is involved the result dim is the `DimExpr.max` of the two, which is numpy's own result shape, and the runtime enforces exact compatibility.
+- **Reductions** take `axes=None` (all axes), negative axes, or a tuple; `keepdims=True` leaves the reduced axes as extent 1. A rank-0 result is the scalar shape `()`.
+- Shape arithmetic over symbolic dims uses `Dim`/`DimExpr`, so rank is always known at trace time even when extents are not.
+
+## Backend support
+
+| Backend | Coverage |
+||---|---|
+| `numpy` interpreter (default) | Every op — it is the reference implementation, and it supports symbolic shapes everywhere |
+| `native` Rust engine | The dense operation set, at parity with the numpy reference (exact bool/integer paths, measured float tolerances); sparse ops are off |
+| Compiler adapters (`iree`, `xla`, `tvm`) | The StableHLO-exportable subset; the rest raises an explicit `BackendError` at `lower()` |
+
+The compiler-relevant deferrals today: `tril`, `triu`, `cumsum`, `cumprod`, `flip`, `roll`, `nan_to_num`, `solve`, `erf` and `gelu` (there is no StableHLO error function, so GELU is deferred with it rather than approximated), `diagonal`, the factorizations `cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp`, `random_multinomial`, every `sparse_*` op (densify with `evoxc.sparse.to_dense` first), and the callback ops `runtime_call`/`external_call`/`dist.rank`/`dist.world_size`.
+The frontend compositions below work through their components, so `topk`, `stack`, `clamp`, `matmul`, `isnan`, `eye`, `linspace` and `diag` inherit the coverage of the ops they expand into.
+The two escape hatches `custom_call`/`inline_stablehlo` are gated on the backend's `Capabilities.custom_ops`: the numpy interpreter and the native engine reject them explicitly and the compiler decides their validity.
+
+## IR op or composition
+
+Some frontend names are one IR op; others are documented compositions of ordinary ops. The difference is observable — it changes the op count in `graph.summary()`, the derivative rules that apply, and the compiler coverage — so it is worth knowing which is which.
+
+| Kind | Names |
+|---|---|
+| One IR op each | the arithmetic, comparison, logical, bitwise and unary-math ops, `cast`, `broadcast`, `reshape`, `transpose`, `slice`, `gather`, `scatter`, `concatenate`, `pad`, the `reduce_*` ops, `argmax`/`argmin`, `dot`, `conv`, `tril`/`triu`, `diagonal`, `solve`, the factorizations, `sort`/`argsort`, `tile`/`flip`/`roll`/`diag`/`nan_to_num`, `stop_gradient`, `constant` |
+| Composition over IR ops | `sum`/`max`/`min`/`mean`/`prod` (shorthand for `reduce_*`), `cumsum`/`cumprod`, `matmul`, `topk`, `stack`, `clamp`, `isnan`, `eye`, `linspace`, `trace`, `norm`, `var`, `std`, `median`, `nansum`, `evoxc.arange` |
+
+A composition adds no new semantics: it is the same graph you would have written by hand, and its name in the catalogue is a convenience, not a backend feature.
+
+<Aside type="tip" title="Each op exists in three places">
+By contract a dense op lives in exactly three places: its schema and shape inference in the EvoXIR op registry (`evoxc/ir/op_defs/`), its reference kernel in the numpy interpreter (`evoxc/backends/numpy/`), and its fast kernel in the native CPU engine (`native/evoxc-cpu/`). A frontend op that works on one backend and not the other is a bug, not a tolerance.
+The documented exceptions are the compiler escape hatches `custom_call`/`inline_stablehlo` (a schema, inference, export and deliberately **no** kernel anywhere), the frontend compositions (no IR op at all), and the sparse ops (numpy-backend-only in v1).
+</Aside>
+
+## Creation and constants
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `evoxc.constant(t)` | Embed host tensor data in the graph as a `constant` op | Trace-time only; snapshots a copy of the data; warns above `EVOXC_LARGE_CONSTANT_BYTES` (1 MiB default); host data only — a non-cpu tensor raises `DeviceError` |
+| `evoxc.arange(start, stop, step, dtype)` | A 1-D index vector | A `constant` op, so bounds must be concrete Python numbers; symbolic bounds defer |
+| `evoxc.eye(n, m=None, dtype=evoxc.float32)` | Identity matrix | Composition over constants; `float32` default |
+| `evoxc.linspace(start, stop, num, dtype=None)` | Evenly spaced values | `float64` default (a deliberate deviation from the float32 creation convention); symbolic bounds raise |
+| `evoxc.numpy.zeros/ones/full/empty` | Graph-side array fillers | Graph ops; the **top-level** `evoxc.zeros/ones/full/empty` are concrete host creators, not graph ops |
+
+## Elementwise unary
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `abs`, `negate`, `square`, `sign` | Absolute value, sign flip, square, sign | Dtype preserved (complex `abs` gives the real magnitude dtype) |
+| `sqrt`, `exp`, `log`, `log1p` | Roots and logarithms | Integer/bool input → `float64` |
+| `sin`, `cos`, `tan`, `acos`, `tanh` | Trigonometric and hyperbolic | Integer/bool input → `float64` |
+| `sigmoid`, `relu` | Logistic sigmoid, rectifier (clamped at zero) | Integer/bool input → `float64` |
+| `gelu` | Gaussian error linear unit | The **exact** erf form `0.5·x·(1+erf(x/√2))`, not the tanh approximation some model code uses |
+| `erf` | Error function | No StableHLO emission exists; compiler backends defer |
+| `floor`, `ceil`, `round` | Rounding | Dtype preserving |
+| `cast(x, dtype)` | Exact dtype conversion | The target dtype is a static dtype object; a bad target is a `DTypeError` |
+| `isnan(x)` | NaN predicate | Composition returning `bool`; use it with `select` or a reduce for a guard |
+| `nan_to_num(x, nan=0.0, posinf=None, neginf=None)` | Replace non-finite values | Compiler backends defer |
+
+## Elementwise binary and comparisons
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `add`, `subtract`, `multiply` | Ring arithmetic | Operator sugar: `+`, `-`, `*` |
+| `divide` | True division | `int`/`int` → `float64`; `truediv` handler |
+| `power` | `x ** y` | Reproduces numpy's integer/fractional special table — exponents `0`, `1`, `2`, `3`, `0.5` and `-1`, with one libm `pow` for every other exponent |
+| `remainder` | Floored modulo | The result takes the **sign of the divisor** and satisfies `x == (x // y) * y + x % y`; bit-identical on numpy and on `iree` (the exporter emits `stablehlo.remainder` plus the inline sign correction) |
+| `maximum`, `minimum` | Elementwise max/min | Not the reductions `max`/`min` |
+| `bitwise_and`, `bitwise_or`, `bitwise_xor` | Bitwise logic | Integer/bool only; other dtypes are a `DTypeError` |
+| `bitwise_left_shift`, `bitwise_right_shift` | Shifts | Integer/bool only |
+| `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` | Comparisons | Result dtype is `bool`; `==`, `!=`, `<`, `<=`, `>`, `>=` route here |
+| `logical_and`, `logical_or`, `logical_not` | Boolean connective | `bool` operands only (`DTypeError`) |
+| `select(pred, on_true, on_false)` | Elementwise choice | Broadcasting applies; this is the frontend's `where` |
+
+## Reductions and statistics
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `reduce_sum`, `reduce_prod` | Sum, product | `bool` → `int64` |
+| `reduce_max`, `reduce_min` | Maximum, minimum | `bool` keeps `bool` |
+| `reduce_mean` | Mean | Integer/bool → `float64` |
+| `argmax`, `argmin` | Index of the extreme | `int64`; `axis=None` reduces over all elements |
+| `sum`, `max`, `min`, `mean`, `prod` | Documented shorthand for the `reduce_*` ops | Same keyword arguments, nothing else |
+| `var`, `std` | Variance, standard deviation | Compositions over ordinary ops (`ddof` static); no dedicated IR op |
+| `median` | Median along an axis | Composition: cast to `float64`, `sort`, `slice` the middle element(s), `reduce_mean` |
+| `nansum` | NaN-skipping sum | Composition |
+| `cumsum(x, axis=0, reverse=False)` | Running sum | Compiler backends defer |
+| `cumprod(x, axis=0, reverse=False)` | Running product | Compiler backends defer |
+
+## Shape manipulation
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `broadcast(x, shape)` | Materialize a broadcast | Target dims may be `int`, `Dim`/`DimExpr` or `None` |
+| `reshape(x, shape)` | Reinterpret the shape | At most one `-1`, inferred from the element count |
+| `transpose(x, axes=None)` | Permute axes | `None` reverses; a bad permutation is a `ShapeError` |
+| `concatenate(tensors, axis=0)` | Join along an existing axis | Variadic (one op, N operands); non-axis dims must match |
+| `tile(x, reps)` | Repeat whole blocks | Exports as a reshape + broadcast decomposition |
+| `stack(tensors, axis=0)` | Join along a new axis | Composition: reshape + `concatenate` |
+| `flip(x, axes)` | Reverse along axes | Compiler backends defer |
+| `roll(x, shift, axis=None)` | Cyclic shift | Compiler backends defer |
+| `diag(x)` | Vector → diagonal matrix, matrix → diagonal vector | Composition; exports as flatten + gather or an iota mask |
+| `evoxc.numpy.expand_dims` / `squeeze` | Insert/drop extent-1 axes | `evoxc.numpy` spellings only (reshape sugar) |
+
+## Indexing, gather, scatter, slice and pad
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `slice(x, start, lengths, strides=1)` | Static strided slice | Starts/strides must be static ints; lengths may be symbolic; shape is exactly `lengths` |
+| `gather(x, indices, axis=0)` | Take entries along an axis | `indices` must be `int32`/`int64` (else `DTypeError`); result shape is `x.shape[:axis] + indices.shape + x.shape[axis+1:]` |
+| `scatter(x, indices, updates, axis=0)` | Update along an axis | Functional: `x` is never mutated, a copy is updated; `updates` is cast to `x.dtype` |
+| `pad(x, config, value=0)` | Constant padding | One entry per axis, each an `int` (symmetric) or a `(before, after)` pair; negative padding is a `ShapeError`; the fill value is cast to `x.dtype` |
+| `x[key]` | `getitem` operator handler | Static ints and `slice` objects only → `slice`/`gather`; symbolic indices, masks, `None`/newaxis and ellipsis are `TraceError`s |
+
+## Linear algebra
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `dot(a, b)` | Batched matrix product | Both operands rank ≥ 2; batch dims broadcast; `k` dims must agree (a size-1 `k` broadcasts); `@` routes here |
+| `matmul(a, b)` | numpy `matmul` semantics | Composition over `dot` with rank-1 promote/squeeze |
+| `conv(x, w, strides=1, padding="VALID", input_dilation=1, kernel_dilation=1, feature_group_size=1, channels_last=False)` | N-dimensional convolution | NCHW by default; out dim `(d + 2·pad − kdil·(k−1) − 1) // stride + 1`; the only spatial op — pooling is written by the caller as `slice` + a reduction |
+| `tril`, `triu` | Lower/upper triangle mask | `k` is a static diagonal offset; compiler backends defer |
+| `solve(a, b)` | Linear solve | Integer input → `float64`; compiler backends defer |
+| `diagonal(x, offset=0, axis1=0, axis2=1)` | Extract a diagonal | Compiler backends defer (distinct from `diag`) |
+| `trace(x, offset=0)` | Sum of the main diagonal | Composition |
+| `norm(x, axis=None, keepdims=False, ord=2)` | Vector norm | `ord` accepts only 1, 2, `inf` and `-inf` — anything else is an explicit `NotImplementedError`; `axis=None` on rank > 1 is the flat-vector norm, not a matrix norm |
+| `eigh(x)` | Symmetric eigendecomposition | Multi-result (values, vectors); v1 exports via a while-loop cyclic-Jacobi composition |
+| `cholesky(x)` | Lower-triangular factorization | Non-positive-definite input raises at run time |
+| `qr`, `svd` | Factorizations | Multi-result tuple ops |
+| `matrix_rank`, `matrix_exp` | Rank, matrix exponential | v1 deferrals on compiler backends |
+
+## Sorting and search
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `sort(x, axis=-1, descending=False, stable=False)` | Sort values | Exports as v1 StableHLO (descending = reverse after the sort) |
+| `argsort(x, axis=-1, descending=False, stable=False)` | Sort indices | Exports as v1 StableHLO |
+| `topk(x, k, axis=-1, largest=True)` | Top-`k` values **and** indices | Composition returning a pair; `k` is a static int ≤ the extent (a symbolic extent defers to run time); `k=1` uses an argmax/reduce fast path |
+
+## Convolution and pooling
+
+`conv` is the only spatial op in the frontend; there is no pooling op, and no `conv` VJP.
+Windowed reductions are written out by the caller from `slice`, `reshape` and the `reduce_*` ops, exactly like softmax and layer norm, which are also explicit compositions rather than ops.
+
+## Random
+
+`evoxc.random` is key-based and functional: the algorithm is a static tag on the key, and the same key plus operands always produces bit-identical values.
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `key(seed, algorithm="splitmix64")` | Create a key | The only polymorphic creator; accepts a name or an `Algorithm` member (`SPLITMIX64`, `THREEFRY2X32`, `PHILOX4X32_10`) |
+| `split(key)`, `split_n(key, n)` | Derive independent keys | Keys are never mutated, so splitting is how you get more of them |
+| `uniform(key, shape, low=0.0, high=1.0, dtype=float32)` | Uniform sample | The key's form determines the algorithm; a mismatched key is a `ShapeError`/`DTypeError` |
+| `normal(key, shape, mean=0.0, std=1.0, dtype=float32)` | Normal sample | |
+| `randint(key, shape, low, high, dtype=int32)` | Integer sample | |
+| `permutation(key, n, dtype=int32)` | Random permutation | |
+| `multinomial(key, input, num_samples)` | Categorical sample | `int32`; the one random op that defers on compiler backends |
+
+## Control flow and graph annotations
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `evoxc.cond(pred, true_fn, false_fn, *operands)` | Runtime branch | The two callables are traced into IR regions; both must return the same structure |
+| `evoxc.while_loop(cond_fn, body_fn, init)` | Runtime loop | The predicate and the carry must involve at least one symbolic value |
+| `evoxc.scan(f, init, xs, length=None)` | Loop with stacked outputs | A symbolic-length `scan` is a v1 deferral |
+| `stop_gradient(x)` | Gradient barrier | Marks a value a derivative rule must not differentiate through |
+
+The most common control-flow hazard is deliberate: `if evoxc.sum(x) > 0:` raises, because a graph value cannot be a Python boolean — `cond` is the runtime alternative. See [in-graph control flow](/guides/control-flow/).
+
+## Collectives and callback ops
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `evoxc.dist.group(name, ranks)`, `dist.rank()`, `dist.world_size()` | Group handle and graph scalars | `rank`/`world_size` are graph values, effects `read` |
+| `dist.all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast`, `collective_permute` | Explicit communication | Effect `collective`; the shape contract is the local tensor shape (a 4-rank `all_gather` on axis 0: `[256,1024] → [1024,1024]`); not compiled in v1 — see [collectives](/guides/collectives/) |
+| `runtime_call(callback, *operands, result=...)` | Run a Python callback at that point in the graph | Effect `callback`; the callback is carried as an op attribute, never silently dropped or reordered; the numpy interpreter runs it, compiler adapters reject it |
+| `external_call(name, *operands, result=...)` | Call a registered external kernel by name | Effect `callback`; the kernel need not be registered at trace time; see [custom ops and kernels](/guides/custom-blocks/) |
+| `evoxc.block(...)` | A custom op with a portable decomposition and optional per-backend impls | Declares its own inputs/outputs/effects; see [custom ops and kernels](/guides/custom-blocks/) |
+
+## Sparse ops
+
+`evoxc.sparse` exposes 16 graph ops — `sparse_from_dense`, `sparse_to_dense`, the `coo`/`csr`/`csc` conversions, `negate`, `add`, `multiply`, `multiply_dense`, `reduce_sum`, `transpose`, `reshape`, `concatenate` and the two `dot` variants — and they are **numpy-backend-only in v1**: a compiler backend raises an explicit `BackendError` suggesting `evoxc.sparse.to_dense`. Sparse tensors are pytree composites over ordinary tensor values, not a new IR value kind. See [sparse tensors](/guides/sparse-tensors/).
+
+## Custom and escape-hatch ops
+
+| Op | Meaning | Notes |
+|---|---|---|
+| `custom_call(call_target_name, *operands, result=..., backend_config="", api_version=1, has_side_effect=False)` | Emit `stablehlo.custom_call @target` | The compiler validates the target and its configuration; numpy/native reject it |
+| `inline_stablehlo(body, *operands, result=..., has_side_effect=False)` | Splice a raw StableHLO snippet verbatim | Operand *i* is `%in<i>`, result *i* must be assigned as `%out<i>` exactly once; the snippet is static text |
+
+Both are effect-`callback` opaque ops with no kernel anywhere. A user *kernel* does not go through them: it plugs in as `external_call` or a `block` with a portable decomposition, which both numpy and the compiler adapters accept.
+
+## When an op fails
+
+Every op validates eagerly, at construction time, and the failure class tells you who owns the problem:
+
+| Failure | Raised as | Example |
+|---|---|---|
+| No active trace, a concrete `Tensor` operand, a symbolic index, two scalar operands | `TraceError` | calling `evoxc.add(x, 1.0)` outside a trace |
+| A statically known shape/rank/axis/broadcast/padding conflict | `ShapeError` | `broadcast: operand dim 2 cannot expand to target dim 3` |
+| A bad dtype for the op (non-bool logical, non-integer bitwise, non-integer gather indices, a bad `cast` target) | `DTypeError` | `cast: 'not-a-dtype' is not a valid dtype` |
+| A malformed static parameter (a list where a tensor belongs, a non-int axis) | `TypeError` | a Python programming error, not a graph error |
+
+A conflict that depends on a symbolic dim cannot be decided at trace time, so it is deferred: the numpy backend and the native engine enforce the exact compatibility check at run time and raise there.
+
+Every op also records a call-site `Location` (file and line) unless capture is disabled with `EVOXC_DISABLE_LOCATIONS=1`, which is what lets an error quote `model.py:83` instead of a stack trace.
+
+## Names that do not exist
+
+Composing is the intended style, so a few names callers reach for are deliberately absent — and there is no silent alias for them:
+
+- `rsqrt` — write `evoxc.divide(1.0, evoxc.sqrt(x))` or `evoxc.power(x, -0.5)`.
+- `softmax`, `logsumexp`, `layer_norm`/`rms_norm` — explicit `exp`/`sum`/`reduce_*` compositions.
+- `where` — the op is `evoxc.select`; `where` exists only as `evoxc.numpy.where`.
+- `any`, `all`, `count_nonzero`, `allclose` — explicit reduce compositions, e.g. `evoxc.max(evoxc.isnan(x))` as a NaN guard.
+- `einsum`, `tensordot`, `outer` — a batched `dot` plus `reshape`/`transpose`; an embedding lookup is `evoxc.gather(table, idx, axis=0)`.
+
+Calling one of these is an ordinary Python `AttributeError` naming the missing attribute — evoxc never resolves an unknown frontend name to a different op.

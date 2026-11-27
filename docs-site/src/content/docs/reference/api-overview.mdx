@@ -1,8 +1,191 @@
 ---
 title: Python API at a glance
-description: The top-level evoxc namespace, grouped by area, with links into the generated reference.
+description: The top-level evoxc namespace grouped by area, with links into the generated API reference.
 sidebar:
   order: 1
 ---
 
-<!-- TODO(content): write the Python API at a glance page. -->
+This page is the map of the `evoxc` namespace: which names exist, which area owns them, and which guide explains them.
+It exists because the generated API tree cannot cover the namespace itself — `evoxc.__all__` is computed at import time from the module globals, and a static analyser cannot evaluate that.
+
+Per-symbol signatures, module paths and docstrings are on the generated pages under `/api/`, grouped by module and addressed as `/api/<module-path>/<symbol>/`.
+Start at the [Python API reference](/api/) index, or follow the `evoxc.<module>` links below.
+
+## Staging and the pipeline
+
+Everything that moves a program from a Python function to a runnable object.
+
+| Name | What it gives you |
+|---|---|
+| `evoxc.defn` | decorator marking a function as a graph *definition* → `Defn` |
+| `evoxc.trace(fn_or_defn, *specs)` | `Graph` — EvoXIR, input/output trees, snapshotted static values |
+| `evoxc.lower(graph, backend=None, **options)` | `LoweredProgram` |
+| `evoxc.compile(lowered, backend=None, **options)` | `CompiledArtifact` |
+| `evoxc.load(artifact, backend=None, device=None, **options)` | `Executable` |
+| `evoxc.run(executable, *args, **options)` | the output tree, in the shape you passed in |
+| `evoxc.bind(executable, **bindings)` | `BoundExecutable` — argument-supply sugar, never a graph change |
+| `evoxc.build(fn, *specs, backend=None, device=None, **options)` | `Executable` — documented `trace → lower → compile → load` |
+| `evoxc.evaluate(fn, *args, backend=None, device=None, **options)` | documented `derive specs → build → run` |
+| `evoxc.build_cached(fn, *specs, backend=None, device=None, cache=None, **options)` | memoized `build`, keyed before tracing |
+| `evoxc.compile_text(mlir_text, input_specs, output_specs, *, backend=None, device=None, entry_functions=("main",), **options)` | `Executable` from StableHLO text, bypassing `lower` |
+| `evoxc.CompileCache` | the in-memory LRU backing `build_cached` (default `maxsize=128`) |
+| `evoxc.Executable`, `evoxc.BoundExecutable` | the pipeline wrapper types ([details](/reference/pipeline-objects/)) |
+
+Guides: [Graphs and tracing](/guides/graphs-and-tracing/), [Persistence and caching](/guides/persistence-and-caching/) for `build_cached`/`CompileCache`, [Custom ops and kernels](/guides/custom-blocks/) for `compile_text`.
+
+## The value model
+
+| Name | Meaning |
+|---|---|
+| `evoxc.Tensor` | materialized runtime tensor — has storage, a concrete shape, a *physical* device |
+| `evoxc.TensorSpec(shape, dtype, device=None, name=None)` | describes a future runtime tensor; holds no data |
+| `evoxc.SymbolicTensor` | an SSA value inside a graph; no data, no `.numpy()` |
+| `evoxc.Device(kind, index=0)` | a physical device; kinds `cpu`, `cuda`, `rocm` (alias `hip`), `vulkan` |
+| `evoxc.dim(name_or_int)` | `Dim` — a named symbolic extent; `DimExpr` arithmetic comes from it |
+| `evoxc.dtype(obj)` | normalize anything dtype-like to a numpy dtype |
+| `evoxc.float16` … `evoxc.complex128` | the 14 dtype constants: `float16/32/64`, `int8/16/32/64`, `uint8/16/32/64`, `bool_`, `complex64/128` |
+| `evoxc.tensor`, `evoxc.zeros`, `evoxc.ones`, `evoxc.full`, `evoxc.empty`, `evoxc.from_numpy`, `evoxc.from_dlpack` | concrete creators — host data only, always `Device("cpu", 0)` |
+| `evoxc.constant(tensor)` | the only way to embed data in a graph; graph-time only, warns above `EVOXC_LARGE_CONSTANT_BYTES` |
+| `evoxc.devices(kind=None)` | enumerate devices; never raises, never invents one |
+| `evoxc.split_tensor(tensor, axis, devices)`, `evoxc.replicate_tensor(tensor, devices)` | v1 host-only data preparation, not a sharding transformation |
+
+Guides: [Core concepts](/getting-started/core-concepts/) for the four value kinds, [Tensors and devices](/guides/tensors-and-devices/) for placement, `Tensor.to` and DLPack.
+
+## Pytree helpers
+
+Structured I/O is a first-class part of the contract: tuple, list, dict, namedtuple and dataclass work everywhere (trace inputs, run outputs, bind).
+
+| Name | Purpose |
+|---|---|
+| `evoxc.flatten(tree)`, `evoxc.unflatten(leaves, treespec)` | the primitive pair |
+| `evoxc.tree_flatten(tree)`, `evoxc.tree_unflatten(leaves, spec)` | aliases of the same pair |
+| `evoxc.tree_map(fn, *trees)` | map over leaves with structure validation |
+| `evoxc.tree_leaves(tree)` | leaves in pre-order |
+| `evoxc.tree_structure(tree)` | the `TreeSpec` of a tree |
+| `evoxc.register_pytree_node(node_type, flatten_fn, unflatten_fn)` | register a custom container |
+| `evoxc.TreeSpec` | the recorded structure itself |
+
+Structural mismatches report the first divergent path with expected and got descriptions; the diagnostics are shared by `tree_map`, `run`, `bind` and the transforms' axes/tangent trees.
+
+## Ops and the numpy namespace
+
+| Name | What it is |
+|---|---|
+| the frontend ops | `add`, `dot`, `sum`, `reshape`, `conv`, `sort`, `eigh`, `matmul`, … — the complete list is on the [Op catalogue](/reference/ops/) |
+| `evoxc.runtime_call(callback, *operands, result=...)` | an explicit host callback at run time |
+| `evoxc.external_call(name, *operands, result=...)` | a named external kernel boundary |
+| `evoxc.custom_call(call_target_name, *operands, result, ...)`, `evoxc.inline_stablehlo(body, *operands, result, ...)` | compiler-only escape hatches, gated by `Capabilities.custom_ops` |
+| `evoxc.numpy` (alias `evoxc.enp`) and `evoxc.numpy.linalg` | numpy-style spelling of the same IR |
+| `evoxc.arange` | the one creation op exported at top level (a graph `Constant`; the concrete creators are `zeros`/`ones`/`full`/`empty`) |
+
+Op functions build into the active trace. Called with a `SymbolicTensor` they build IR; called with a concrete `Tensor`, or outside a trace, they raise `TraceError` — there is no eager mode.
+
+## Transforms
+
+| Name | Signature shape |
+|---|---|
+| `evoxc.vectorize(graph, axes)` | traced `Graph` in, `Graph` out |
+| `evoxc.vmap(fn_or_graph, in_axes=0, out_axes=0)` | sugar over `vectorize` |
+| `evoxc.grad(fn_or_graph, argnums=None)` | reverse-mode gradient as an ordinary graph |
+| `evoxc.jvp(fn_or_graph, tangents)` | forward-mode |
+| `evoxc.vjp(fn_or_graph, cotangents=None)` | reverse-mode with explicit cotangents |
+| `evoxc.batch_functions(fns, axes=0, out_axes=0, *, switch_ops=None, bands=None, alignment="variant")` | merges same-signature programs into one graph |
+| `evoxc.BatchReport`, `evoxc.SwitchRecord` | the merge metadata reported on `graph.batch_report` |
+
+With a function or `Defn` the result is a `TransformCallable` (`*specs → Graph`); with a `Graph` it is a `Graph`. Transforms never execute anything. Guide: [Graph transforms](/guides/graph-transforms/).
+
+## In-graph control flow
+
+| Name | Purpose |
+|---|---|
+| `evoxc.cond(pred, true_fn, false_fn, *operands)` | runtime branch |
+| `evoxc.while_loop(cond_fn, body_fn, init)` | runtime loop |
+| `evoxc.scan(f, init, xs, length=None)` | a stacked loop with carried state |
+
+Branch and body functions are traced into IR regions, so a Python `if` on a symbolic value is never what you get. Guide: [In-graph control flow](/guides/control-flow/).
+
+## Custom ops, kernels and compiler escape hatches
+
+| Name | Purpose |
+|---|---|
+| `evoxc.block(name, inputs=None, outputs=None, attributes=None, effects=None, batching=None, portable=None)` | declare a custom op; decorator or factory |
+| `evoxc.BlockOp`, `evoxc.get_block(name)` | the handle and the lookup |
+| `evoxc.block.AttributeField`, `evoxc.block.StaticValue`, `evoxc.block.BatchingPolicy`, `evoxc.block.BlockError` | the attribute declaration, static-argument declaration, batching policy enum, and the block error |
+| `evoxc.register_external_kernel`, `evoxc.unregister_external_kernel`, `evoxc.get_external_kernel`, `evoxc.ExternalKernel` | the process-global kernel registry and its handle |
+| `evoxc.register_portable`, `evoxc.get_portable` | an optional `@evoxc.defn` decomposition for a kernel |
+
+Guide: [Custom ops and kernels](/guides/custom-blocks/).
+
+## Distributed collectives
+
+`evoxc.dist` is a namespace — collectives are never top-level names, so no API can insert one silently.
+
+| Name | Purpose |
+|---|---|
+| `evoxc.dist.group(name, ranks, backend=None)` | a group of ranks, a static graph value |
+| `evoxc.dist.all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast`, `collective_permute` | the explicit collectives |
+| `evoxc.dist.rank()`, `evoxc.dist.world_size()` | graph scalars |
+
+Guide: [Collectives](/guides/collectives/).
+
+## Sparse tensors
+
+`evoxc.sparse` — numpy-backend-only in v1.
+
+| Name | Purpose |
+|---|---|
+| `SparseTensor`, `CSRTensor`, `CSCTensor`, `SparseTensorSpec`, `is_sparse` | the value model |
+| `coo(indices, values, shape)`, `csr(indptr, indices, values, shape)`, `csc(...)` | creators |
+| `from_dense(dense)`, `to_dense`, `to_csr`, `to_csc`, `to_coo` | converters, polymorphic over concrete and symbolic input |
+| `add`, `subtract`, `multiply`, `multiply_dense`, `negate`, `sum`, `transpose`, `reshape`, `concatenate`, `matmul` | the graph ops |
+
+Guide: [Sparse tensors](/guides/sparse-tensors/).
+
+## Containers, persistence, host IO and RNG
+
+| Namespace | Names |
+|---|---|
+| `evoxc.formats` | `load_safetensors`, `save_safetensors`, `SafetensorsFile`, `load_gguf`, `GGUFFile`, `TensorInfo` |
+| `evoxc.persist` | `Cache`, `FileCache(directory)`, `save_object`, `load_object`; `evoxc.Cache` and `evoxc.FileCache` are the top-level exports |
+| `evoxc.io` | `prefetch(host_tensor, device)`, `sink(device_tensor)`, `AsyncCopy`, `wait_all(timeout=None)` |
+| `evoxc.random` | `key(seed, algorithm="splitmix64")`, `split`, `split_n`, `uniform`, `normal`, `randint`, `permutation`, `multinomial`, plus `Algorithm` and `ALGORITHMS` |
+
+Guides: [Tensor formats](/guides/tensor-formats/), [Persistence and caching](/guides/persistence-and-caching/), [Tensors and devices](/guides/tensors-and-devices/) for the async copy sugar.
+
+## Backends and capabilities
+
+| Name | Purpose |
+|---|---|
+| `evoxc.Backend` | the backend interface: `name`, `capabilities`, `lower`, `compile`, `load` |
+| `evoxc.Capabilities` | the frozen capability record a backend declares |
+| `evoxc.numpy_backend`, `evoxc.LoweredProgram`, `evoxc.CompiledArtifact` | the default backend and the two middle-stage payload types |
+| `evoxc.backends.get(name)`, `evoxc.backends.register(backend, replace=False)`, `evoxc.backends.unregister(name)` | the registry, extensible out of tree (plus the `evoxc.backends` entry-point group) |
+| `evoxc.backends.stablehlo.export(graph_or_module)` | MLIR text from a graph, without compiling |
+| `evoxc.__version__` | the installed distribution's version |
+
+Guide: [Backends and options](/guides/backends/).
+
+## Error taxonomy
+
+Every public error derives from `evoxc.EVOXCError`, and messages include the source location (`model.py:83`) whenever a graph location exists.
+
+| Class | Raised when |
+|---|---|
+| `TraceError` | tracing misuse: no active trace, a concrete `Tensor` operand, a closure-captured tensor, a bad static value, a symbolic-length `scan` |
+| `ShapeError` | a shape or axis contract is violated (at trace time or run time) |
+| `DTypeError` | a dtype contract is violated |
+| `TransformError` | a transform cannot answer: missing batching/derivative rule, unsupported axis or op — never a silent fallback |
+| `BackendError` | a backend refuses: unknown option key, unsupported op, unavailable adapter, invalid option value |
+| `DeviceError` | placement is wrong: an implicit transfer would be needed, `.numpy()` on a device payload, a creator asked for a non-host device |
+| `PersistenceError` | a save/load container mismatch, wrong payload type, or an artifact/backend disagreement |
+| `VerificationError` | the IR fails `verify()` |
+| `evoxc.block.BlockError` | a block declaration or implementation problem |
+
+Plain `TypeError` / `ValueError` / `NotImplementedError` are reserved for Python-level argument misuse (a wrong stage object, a non-`TensorSpec` in a spec sequence, an unsupported `norm` order) and are listed per symbol on the generated pages.
+
+## Where to go next
+
+- A worked program through every stage: [Quickstart](/getting-started/quickstart/).
+- What each stage result *is*: [Pipeline objects](/reference/pipeline-objects/).
+- What changes when you pass options: [Options](/reference/options/).
+- What v1 declines to do: [Limitations and deferrals](/reference/deferrals/).

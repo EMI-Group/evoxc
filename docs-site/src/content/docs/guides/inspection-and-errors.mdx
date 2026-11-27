@@ -5,4 +5,175 @@ sidebar:
   order: 12
 ---
 
-<!-- TODO(content): write the Inspection and errors page. -->
+evoxc's stages are explicit, so each stage object is also an *inspection* surface: you can read what a graph is, what a program lowered to, and what an executable will do — without tracing, compiling, executing, transferring or mutating anything.
+This page is the map of those reads, a worked debugging session, and the error taxonomy you will meet when something is wrong.
+
+## Inspection by stage
+
+| Object | Reads | Never |
+|---|---|---|
+| `Defn` | `repr` — the wrapped function's qualname and module | Executes anything |
+| `Graph` | `repr`, `summary()`, `digest()`, `text()`, `print()`, `verify()` | Traces, compiles or mutates the graph |
+| `LoweredProgram` | `repr`, `summary()`, `source_text()`, `text()` | Compiles or reads a backend handle |
+| `CompiledArtifact` | `repr`, `summary()`, `source_text()`, `text()` | Loads, or reconstructs a device |
+| `Executable` / `BoundExecutable` | `repr`, `summary()`, `plan_text()` | Runs, transfers, or materialises data |
+| `Tensor` | `repr` — shape/dtype/device plus a ≤8-element host preview | Calls `.numpy()`, forces a copy or raises |
+
+Every dict-returning helper is JSON-safe, and every one of these methods is a thin delegation to a renderer: none of them traces, compiles, executes, transfers, mutates the object or populates a cache.
+
+## The graph
+
+```python
+import evoxc
+
+@evoxc.defn
+def f(x, w):
+    return evoxc.reduce_sum(evoxc.tanh(evoxc.dot(x, w)), axes=(1,))
+
+spec_x, spec_w = evoxc.TensorSpec((4, 8), evoxc.float32), evoxc.TensorSpec((8, 4), evoxc.float32)
+graph = evoxc.trace(f, spec_x, spec_w)
+
+print(graph)
+```
+
+```text
+<Graph 4 ops, 1 function, 2 tensor inputs, 0 static values, 1 output>
+```
+
+The `repr` is the shape of the program at a glance. `summary()` is the same information as data:
+
+```python
+graph.summary()
+```
+
+```text
+{
+  "functions": ["main"],
+  "op_count": 4,
+  "op_counts_by_category": {"elementwise": 1, "linalg": 1, "reduction": 1, "terminator": 1},
+  "tensor_inputs": [{"path": [0], "shape": ["4", "8"], "dtype": "float32"},
+                    {"path": [1], "shape": ["8", "4"], "dtype": "float32"}],
+  "tensor_outputs": [{"path": [], "shape": ["4"], "dtype": "float32"}],
+  "static_values": [],
+  "source_location_count": 2,
+  "has_batch_report": False,
+  "digest": "5cd00c54d32f4c2b0c7a77a6811a056eb87fc94d524c3bcd9ce39cab7094c0a9"
+}
+```
+
+`op_count` counts ops at **every** nesting level, so a `cond` or `while_loop` body is included. `static_values` lists the Python values that specialised the graph (path, kind and a `value_repr`), which is also the list `run` validates against. `source_location_count` is how many ops carry a real call-site location. Shapes print as strings because a symbolic dim is a `Dim`/`DimExpr`, not an integer.
+
+`graph.text()` is the pretty-printed EvoXIR, one op per line with its type and `loc(...)`; `graph.print()` writes the same text to stdout. `graph.verify()` is the explicit IR check — `trace` does not run it for you.
+
+### `digest()`
+
+`digest()` is a SHA-256 over the **structural** payload: names, attributes, operand/result SSA ids and types, constant data, plus the signature and spec trees. Source locations are stripped, so the digest is stable across processes, across files, and across `save`/`load`:
+
+```python
+graph.digest()               # '5cd00c54…c0a9'
+evoxc.Graph.load(path).digest() == graph.digest()   # True — location-independent
+```
+
+That makes it the natural key for your own build cache: `evoxc.persist.FileCache(directory).get([graph.digest()], compute_fn)` recomputes only when the program actually changes, not when a line moves. It is not the key `build_cached` uses — that one is computed *before* tracing (from the function identity, the specs tree, the resolved backend/device and the canonicalised options) precisely so a hit can skip the trace; see [persistence and caching](/guides/persistence-and-caching/).
+
+## The program and the artifact
+
+```python
+lowered = evoxc.lower(graph)
+print(lowered)                # LoweredProgram(backend='numpy', payload=serialized-ir 1430 B, inputs=2, outputs=1)
+lowered.summary()             # backend, target, payload_kind/bytes, input/output shapes+dtypes, …
+lowered.source_text()         # the human-readable program, or None when the payload has no text form
+```
+
+`source_text()` returns MLIR/StableHLO for a compiler payload and the serialized-IR pretty print for the numpy payload; `None` means "this payload has no text form", while `text()` raises in that case. `summary()` adds `required_custom_ops` and `runtime_dependencies`, which is the honest answer to "will this artifact need something at load time?".
+
+The same two helpers exist on `CompiledArtifact`, whose `repr` also names the target:
+
+```text
+CompiledArtifact(backend='numpy', target='cpu', payload=serialized-ir 1430 B, inputs=2, outputs=1)
+```
+
+Neither object compiles, loads or reconstructs anything when you inspect it — and `save`/`load` on them are the explicit [persistence](/guides/persistence-and-caching/) round trip, never an implicit recompile.
+
+## The executable
+
+```python
+exe = evoxc.load(artifact, device="cpu")
+print(exe)                    # <Executable backend=numpy device=cpu:0 inputs=2 outputs=1>
+print(exe.plan_text())
+```
+
+```text
+function @main
+  block(%0, %1)
+    %0 dot in=(%0, %1) out=(%2) free=() kernel=_dot fast
+    %1 tanh in=(%2) out=(%3) free=(%2) kernel=kernel fast
+    %2 reduce_sum [axes=<tuple len=1>, keepdims=False, reduce_op='sum'] in=(%3) out=(%4) free=(%3) kernel=_reduce fast
+    <return> (%4)
+```
+
+`plan_text()` is the backend's *actual* plan, not a restatement of the graph: the numpy interpreter prints its per-op kernel choice and buffer reuse (`free=` is which buffers are released after the op), and the `native` backend prints the plan its Rust engine compiled — the immutable plan it will execute. A backend with no textual plan returns `None`. This is the fastest way to answer "is the op I think is happening the op that is happening?", and it costs nothing: rendering the plan executes nothing.
+
+`summary()` gives the structured view — `backend`, `device`, `functions`, leaf counts, the input/output specs and the two tree descriptions (`input_tree`/`output_tree`), the static-value count, `required_ops` and the backend's `capabilities` flags. On a `BoundExecutable` it adds `bound_count` and the reduced set of unbound inputs, so a partially applied executable still tells you what it is still waiting for. `exe.synchronize()` is the only *other* method here that touches the device at all, and it is explicit: inspection never calls it.
+
+## Tensors and definitions
+
+```python
+y = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))
+print(y)                      # Tensor(shape=(4,), dtype=float32, device=cpu:0, data=[4. 4. 4. 4.])
+print(f)                      # <Defn f (__main__)>
+```
+
+`Tensor.__repr__` shows a compact value preview **only** for an ndarray-backed tensor of at most 8 bool/integer/float/complex elements, and the payload class name for a device payload. It never calls `.numpy()`, never materialises a host copy, never forces a transfer and never raises — so printing a GPU tensor from a debugger is safe, and it tells you it is a GPU tensor instead of silently pulling 2 GB across the bus.
+
+## A worked debugging session
+
+Say a model forward gives wrong numbers. Walk down the pipeline instead of guessing:
+
+1. **`print(graph)`** — is the op count what you expect? If `op_counts_by_category` shows no `linalg` op, the matmul you meant is missing.
+2. **`graph.print()`** — read the ops. A `dot` with the wrong result type, or a `broadcast` you never wrote, points at the shape rule rather than the arithmetic.
+3. **`graph.summary()["static_values"]`** — every value here specialised the graph. If an axis or a `k` appears with the wrong value, you have the wrong *program*, not a wrong result.
+4. **`lowered.source_text()`** — did the lowering turn your op into what you expected? A deferred op fails here with `BackendError` naming it.
+5. **`exe.plan_text()`** — is the executed plan the one you read above?
+6. **`graph.digest()`** — record it. If the digest of the failing build equals the digest of the build that worked, the program is identical and the difference is data, device or option, not code.
+
+Errors raised while lowering, compiling, loading, running or verifying quote the graph location of the offending op, so step 2 through 5 usually tell you the file and line to open. A pure Python-side mistake (a malformed static argument) is a plain `TypeError` from your own call site instead — the traceback is already the answer.
+
+## Error taxonomy
+
+All public errors derive from `evoxc.EVOXCError`, so one `except` catches everything evoxc raises; each subclass is a distinct failure domain.
+
+| Error | What it means | What to do |
+|---|---|---|
+| `EVOXCError` | The base class — catch it when you do not care which stage failed | Log it; the message names the stage |
+| `TraceError` | Graph construction misuse: an op call outside a trace, a concrete `Tensor` operand, a `Defn` called directly, a symbolic index, a graph value used as a Python boolean | Pass a `TensorSpec`, make the tensor an explicit input, use `evoxc.constant`, or use `cond`/`while_loop` instead of Python `if`/`for` |
+| `ShapeError` | A shape/rank/axis/broadcast/padding conflict, or a statically knowable shape mismatch | Fix the shapes at trace time; a symbolic mismatch is caught by the backend at run time |
+| `TransformError` | A graph→graph transform could not answer: axis mismatch, no batching rule, no derivative rule | Only the documented deferrals raise this — a transform never falls back silently |
+| `BackendError` | The backend cannot lower/compile/load/run this: a capability gap, an unsupported op, an unknown option key, a missing compiler | Read the message — it names the op/option and the alternative; switching backend or densifying is usually the fix |
+| `PersistenceError` | A save/load failure: format or version mismatch, integrity hash failure, backend/device/ABI incompatibility | Rebuild rather than hand-edit a container; loading never re-traces or recompiles |
+| `DeviceError` | A device problem: unknown kind/index, a device mismatch at the run boundary, a DLPack failure, an implicit transfer that does not exist | Place data explicitly with `Tensor.to(device)`; read back with `.to(evoxc.Device("cpu", 0)).numpy()` |
+| `DTypeError` | An object cannot be normalised to a supported dtype, or the op/backend does not accept that dtype | Cast explicitly with `evoxc.cast` |
+| `VerificationError` | IR verification failed — a malformed module, an operand/result mismatch, a violated invariant | Usually a bug in a custom op declaration or a hand-edited artifact; `graph.verify()` reproduces it |
+
+Three of them, verbatim:
+
+```text
+evoxc.core.errors.TraceError: Concrete Tensor operands are not allowed in graph ops
+(evoxc has no eager mode): (1) pass the tensor as an explicit input (TensorSpec at
+trace time), (2) embed its data explicitly with evoxc.constant …, or (3) build and
+run a graph with evoxc.evaluate.
+
+evoxc.core.errors.ShapeError: broadcast: operand dim 2 cannot expand to target dim 3
+
+evoxc.core.errors.BackendError: capability drift: the numpy backend cannot execute
+'custom_call' — a local CPU interpreter cannot run a compiler custom call / raw
+StableHLO snippet. …
+```
+
+## Two rules about errors
+
+**Messages carry a source location whenever a graph location exists** — `model.py:83` — because every op records where it was built. That is why an error about op *n* can point straight at the line that wrote it, and why `EVOXC_DISABLE_LOCATIONS=1` (a tracing-speed knob) also makes those messages less specific.
+
+**No API silently swallows an error, works around it, or falls back to another implementation.** A missing batching rule is a `TransformError`, not a Python loop; an unsupported op is a `BackendError`, not a numpy evaluation on the host; a device mismatch is a `DeviceError`, not a hidden copy. When evoxc cannot do what you asked, it says so — and the message names the workaround you are meant to choose instead.
+
+For what is deferred by design, see [limitations and deferrals](/reference/deferrals/); for the options that change a failure into a success, see [backends and options](/guides/backends/).

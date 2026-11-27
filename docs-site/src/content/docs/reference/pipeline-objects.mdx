@@ -1,8 +1,149 @@
 ---
 title: Pipeline objects
-description: Defn, Graph, LoweredProgram, CompiledArtifact, Executable and Tensor: what each stage hands you.
+description: What each public pipeline type is produced by, what it exposes, and what it refuses to do.
 sidebar:
   order: 2
 ---
 
-<!-- TODO(content): write the Pipeline objects page. -->
+Each stage of an evoxc program returns a distinct public type.
+There is no "any stage" object and no function that inspects what it was handed and performs whatever steps are missing — a mismatched stage is a `TypeError` naming both the expected type and the function that produces it.
+
+```text
+@evoxc.defn ───────────────────────────────▶ Defn
+Defn + specs ──evoxc.trace────────────────▶ Graph              (EvoXIR module + trees + static values)
+Graph ────────evoxc.vectorize / vmap / grad / jvp / vjp / batch_functions
+                                            ──▶ Graph            (an ordinary graph of ordinary ops)
+Graph ────────evoxc.lower─────────────────▶ LoweredProgram     (StableHLO text or backend payload)
+LoweredProgram ──evoxc.compile────────────▶ CompiledArtifact   (vmfb / PJRT executable / serialized program)
+CompiledArtifact ──evoxc.load─────────────▶ Executable         (device-bound)
+Executable + tensors ──evoxc.run──────────▶ Tensor (tree)
+Executable + named tensors ──evoxc.bind───▶ BoundExecutable
+```
+
+`evoxc.build` is that whole chain in one documented call, `evoxc.evaluate` adds the run, and `evoxc.build_cached` memoizes the chain. `evoxc.compile_text` enters at `compile` with StableHLO text of your own and never traces or lowers.
+
+## Which stage is inspectable how
+
+Every helper below is a pure read: none traces, compiles, executes, transfers or mutates anything, and every dict-returning helper is JSON-safe.
+
+| Object | `repr` | `summary()` | `text()` | `source_text()` | `plan_text()` | save / load |
+|---|---|---|---|---|---|---|
+| `Defn` | function qualname + module | — | — | — | — | — |
+| `Graph` | op / function / input / static / output counts, batch marker | counts, specs, static values, digest | pretty-printed IR | — | — | `.evoxcgraph` |
+| `LoweredProgram` | backend, target, payload kind + size, leaf counts | payload and signature summary | raises when the payload has no text form | program text or `None` | — | yes |
+| `CompiledArtifact` | backend, target, payload kind + size, leaf counts | payload and signature summary | raises when the payload has no text form | program text or `None` | — | `.evoxcartifact` |
+| `Executable` | backend, device, input/output leaf counts | specs, trees, required ops, capabilities | — | — | backend plan text or `None` | backend-dependent |
+| `BoundExecutable` | as `Executable`, plus `bound=N` and reduced inputs | `bound_count` plus the reduced unbound inputs | — | — | delegates | — |
+| `Tensor` | shape, dtype, device, ≤8-element host preview | — | — | — | — | — |
+
+The `text()` versus `source_text()` split matters: `text()` is the historical accessor that *raises* when a payload has no textual form, while `source_text()` returns `None` in exactly that case. Neither compiles anything.
+
+## `Defn`
+
+**Produced by** `@evoxc.defn`. A `Defn` wraps a Python function and marks it as a graph *definition* — it is not a compiled function and not an eager one.
+
+- **Exposed:** `repr` (the wrapped function's qualname and `__module__`), the `__evoxc_defn__` marker, and the wrapped callable.
+- **Never does:** trace, compile or run on its own. Calling a `Defn` is what starts a trace, through `evoxc.trace` / `evoxc.build` / `evoxc.evaluate`.
+- **Refuses:** calling it with concrete tensors raises `TraceError` directing you to `trace`/`evaluate`.
+
+```python
+@evoxc.defn
+def f(x, w):
+    return evoxc.sum(evoxc.tanh(evoxc.dot(x, w)), axes=1)
+
+f                 # <Defn f …>
+f(evoxc.ones((4, 8)), evoxc.ones((8, 4)))   # TraceError, not a result
+```
+
+## `Graph`
+
+**Produced by** `evoxc.trace(fn_or_defn, *specs)` or by any graph transform (`vectorize`, `vmap`, `grad`, `jvp`, `vjp`, `batch_functions`).
+
+A `Graph` is EvoXIR: a region-based SSA module, the input/output trees, and the static Python values the trace specialized on. Its attributes are `module`, `input_specs`, `output_tree`, `static_values` and `source_locations`.
+
+- **Exposed:** `summary()`, `digest()`, `text()`, `print()`, `verify()`, `save(path)` / `Graph.load(path)`, and the I/O helpers `flatten_inputs(args)`, `unflatten_outputs(flat)`, `validate_inputs(args)`.
+- **`digest()`** is a sha256 over the canonical *structural* payload — names, attributes, operand/result SSA ids and types, constants, plus the signature and spec trees — with op source locations and the location-derived payload hash stripped. It is therefore stable across processes, across files, and across `save`/`load`, which is what makes it usable as a cache or comparison key.
+- **Never does:** compile, execute, or re-specialize. A transform returns a new `Graph`; the original is untouched.
+- **Refuses:** passing anything else to `evoxc.lower` raises `TypeError` — `lower expects an evoxc.Graph (from evoxc.trace), got …`.
+
+`evoxc.vectorize` requires a traced `Graph`: given a bare function it raises `TypeError` pointing at `evoxc.vmap`, because only `vmap` knows how to trace first.
+
+## `LoweredProgram`
+
+**Produced by** `evoxc.lower(graph, backend=None, **options)`. The backend verifies the graph, records its signature (input/output tree, specs, static values) and produces its own payload — StableHLO MLIR text for a compiler backend, a serialized program for the numpy interpreter, a serialized EvoXIR module for `native`.
+
+- **Exposed:** `backend`, `signature`, `summary()`, `source_text()`, `text()`, `save(path)` / `LoweredProgram.load(path)`.
+- **Never does:** compile. `save`/`load` are the persistence round trip and nothing else.
+- **Refuses:** `evoxc.compile` of a non-`LoweredProgram` raises `TypeError`; compiling a program produced by one backend with another backend raises `BackendError` — never a silent re-lower.
+
+## `CompiledArtifact`
+
+**Produced by** `evoxc.compile(lowered, backend=None, **options)` — or by `evoxc.compile_text`, which builds the lowered program itself from text you supply.
+
+- **Exposed:** `backend`, `signature`, `target`, `summary()`, `source_text()`, `save(path)` / `CompiledArtifact.load(path)`.
+- **Never does:** load onto a device; that is `load`'s job. It carries no live device handle, which is why it is the object you persist.
+- **Refuses:** `evoxc.load(artifact, backend=...)` with a backend that differs from the producing one raises `PersistenceError` — never a silent recompile. Passing a non-`CompiledArtifact` to `load` raises `TypeError`.
+
+## `Executable`
+
+**Produced by** `evoxc.load(artifact, backend=None, device=None, **options)`, or directly by `evoxc.build`, `evoxc.build_cached` or `evoxc.compile_text`.
+
+An `Executable` is a device-bound wrapper: the backend executable plus the decoded signature used to validate every call.
+
+- **Exposed:** `functions`, `device`, `backend`, `summary()`, `plan_text()`, `synchronize()`, `save(path)` / `Executable.load(path, backend=None, device=None)`.
+- **`plan_text()`** delegates to the backend's textual plan (the numpy interpreter's per-block plan, the `native` engine's plan render) or returns `None` when the backend has none.
+- **Never does:** re-trace, re-compile, or move a tensor between devices.
+- **Refuses:** `evoxc.run(exe, …)` with a structurally wrong input tree, a wrong dtype/shape or a tensor on the wrong device raises `TraceError` / `DTypeError` / `ShapeError` / `DeviceError` before backend dispatch; `bind` accepts only a plain `Executable` and raises `TypeError` on a `BoundExecutable`; `save` raises `PersistenceError` when the backend executable cannot serialize itself, directing you to `artifact.save(path)` plus `evoxc.load`.
+
+### `Executable.synchronize()`
+
+Device-resident execution may enqueue instead of blocking, so a wall-clock measurement needs an explicit join.
+
+- Output `Tensor`s' **values** are valid before the call — any read awaits.
+- `synchronize()` waits for device work submitted by earlier `run()` calls; it exists for **timing** and for reusing buffers, not for correctness of reads.
+- Nothing calls it implicitly, and `evoxc.run` performs no per-call sync — dispatch overlap stays a feature.
+- Backends whose `run()` already blocks (numpy, iree) document it as a no-op; a backend with an asynchronous `run` (xla) awaits and destroys the pending events.
+- `BoundExecutable.synchronize()` delegates, so a bound executable exposes the same call shape.
+
+## `BoundExecutable`
+
+**Produced by** `evoxc.bind(executable, **bindings)`. Pure argument-supply sugar: names, dtypes, shapes and devices are validated, and the graph is never altered or recompiled.
+
+- **Exposed:** `summary()` (the wrapped summary plus `bound_count`, with `input_count`/`input_specs` reduced to the inputs a caller still supplies), `plan_text()` and `synchronize()` delegating to the wrapped executable, `functions`, `device`.
+- **Never does:** change the graph, re-compile, or transfer a bound tensor. A binding on another device fails fast with the run-boundary `DeviceError`.
+- **Refuses:** binding a name the graph does not declare raises `TraceError` listing the available names; binding a `BoundExecutable` raises `TypeError` (call `evoxc.bind` once, on the executable).
+
+```python
+spec = evoxc.TensorSpec((8, 4), evoxc.float32, name="w")
+graph = evoxc.trace(f, evoxc.TensorSpec((4, 8), evoxc.float32), spec)
+exe = evoxc.load(evoxc.compile(evoxc.lower(graph)))
+bound = evoxc.bind(exe, w=w)
+evoxc.run(bound, x)      # `w` is supplied; `x` is still an argument
+```
+
+## `Tensor`
+
+**Produced by** `evoxc.run` and by the concrete creators (`evoxc.tensor`, `evoxc.zeros`, `evoxc.from_numpy`, …). A `Tensor` is a materialized runtime tensor whose `device` is always physically true.
+
+- **Exposed:** `shape`, `dtype`, `device`, `.numpy()`, `.to(device)`, `__dlpack__` / `__dlpack_device__`, and a `repr`.
+- **`repr`** shows shape, dtype and device plus a compact value preview **only** for an ndarray-backed tensor of at most 8 bool/integer/float/complex elements, and the payload class name for a device payload. It never calls `.numpy()`, never materializes a host copy, never forces a transfer and never raises.
+- **Never does:** exist inside a graph. In a trace, values are `SymbolicTensor`s, which have no `.numpy()`, no `__dlpack__` and no data pointer at all.
+- **Refuses:** `.numpy()` on a non-cpu payload raises `DeviceError` (use `.to(evoxc.Device("cpu", 0)).numpy()`); `evoxc.run` rejects a tensor leaf whose device differs from the executable's with a `DeviceError` naming the pytree path and both devices.
+
+`Tensor.to(device)` is the only transfer primitive in the library: equal device returns `self`, `to(cpu)` is the explicit device-to-host readback, and `to(non-cpu)` resolves the owning backend's transfer provider (a missing provider is a `DeviceError`).
+
+## Stage mismatches, in one table
+
+| Call | Wrong argument | What happens |
+|---|---|---|
+| `evoxc.lower` | anything but a `Graph` | `TypeError` naming `evoxc.Graph` and `evoxc.trace` |
+| `evoxc.compile` | anything but a `LoweredProgram` | `TypeError` naming `evoxc.backends.LoweredProgram` |
+| `evoxc.compile` | a program from a different backend | `BackendError` — never silently re-lower |
+| `evoxc.load` | anything but a `CompiledArtifact` | `TypeError` naming `evoxc.backends.CompiledArtifact` |
+| `evoxc.load` | an artifact from a different backend | `PersistenceError` — never silently recompile |
+| `evoxc.run` | anything but `Executable` / `BoundExecutable` | `TypeError` naming both |
+| `evoxc.bind` | a `BoundExecutable` or a non-executable | `TypeError` directing you to bind the executable |
+| a `Defn` | called with concrete tensors | `TraceError` directing to `trace`/`evaluate` |
+| an op function | called with a concrete `Tensor`, or outside a trace | `TraceError` (no eager mode) |
+
+Related: [Options](/reference/options/) for what each stage accepts, [Inspection and errors](/guides/inspection-and-errors/) for the helper-by-helper walkthrough, [Limitations and deferrals](/reference/deferrals/) for what v1 refuses outright.

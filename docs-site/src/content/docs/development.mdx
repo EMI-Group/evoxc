@@ -5,4 +5,170 @@ sidebar:
   order: 5
 ---
 
-<!-- TODO(content): write the Development page. -->
+This page covers working on the repository itself: the workspace, the dev environment, the gates CI runs, how releases are cut, and the few rules that shape new code.
+Every number here is quoted from the repository's contracts and is marked as a recorded baseline, not a target — re-run the command to get today's number.
+
+## The workspace
+
+One repository, **two distributions**, one root `uv.lock`:
+
+| Path | What it is |
+|---|---|
+| `evoxc/` | the `evoxc` package — the flat-layout Python frontend, interpreter and adapter layer |
+| `native/` | the Rust workspace: numerical core, transform engines, CPU engine and the PyO3 extension |
+| `evoxc_hf/` | the `evoxc-hf` distribution — a workspace member in src layout (`evoxc_hf/src/evoxc_hf/`) |
+| `tests/` | pytest suite mirroring `evoxc/`, plus the spec-compliance and packaging pins |
+| `evoxc_hf/tests/` | the member's own suite, colocated with the member |
+| `scripts/` | `dev-env.sh`, `build-native.sh`, `bump_version.py` (+ its tests) |
+| `docs-site/` | this site; `docs-infra.yml` at the root configures its generation |
+| `CONTEXT.md` files | the binding contracts — root architecture, then one per package directory |
+
+The root project is a **mixed maturin project**: `[tool.maturin]` compiles the Rust/PyO3 `abi3-py311` extension from `native/evoxc-python/` into the wheel as `evoxc/_evoxc_native.abi3.so`.
+The member is a pure-Python `uv_build` project declared by `[tool.uv.workspace] members = ["evoxc_hf"]`, and its `evoxc>=0.1.0` dependency resolves through `[tool.uv.sources] evoxc = { workspace = true }` rather than PyPI.
+Each distribution ships exactly one module and never the other; `tests/test_packaging.py` pins that boundary on the built archives.
+
+## Set up the environment
+
+Requires `uv`, a Rust toolchain and a C compiler. From the repository root:
+
+```sh
+uv sync --locked --all-packages --extra dev
+uv run pytest -q
+```
+
+- **`--all-packages` is mandatory.** A plain `uv sync` installs only the root `evoxc` project and **uninstalls** the `evoxc_hf` member, leaving an importable-looking but incomplete namespace directory behind, so imports silently resolve to the wrong thing.
+- **`--extra dev`** adds pytest; without it the test runner is not in the environment.
+- **`--extra interop` / `--extra bench`** add torch for the DLPack interop tests and the PyTorch comparison column; **`--extra compilers`** adds IREE + TVM so the adapter legs stop skipping; `--all-extras` adds everything.
+- `.python-version` pins the uv-managed interpreter to **3.14**, while `requires-python = ">=3.11"` is the supported floor (the `compilers` extra's `jaxlib` pin needs 3.11+).
+  Installing a wheel never needs the toolchain; a source install always does.
+
+### On NixOS, or with a read-only `~/.cargo`
+
+`scripts/dev-env.sh` exports the two things every Rust/Python command on such a host needs: the dynamic-loader path for the uv-managed interpreter's extension modules, and a writable `CARGO_HOME`.
+It is a **source** script — variables must survive into your shell — and it caches discovered Nix store paths in a gitignored `.dev-env.cache`:
+
+```sh
+source scripts/dev-env.sh
+uv sync --locked --all-packages --extra dev
+.venv/bin/python -m pytest tests/ir -q
+```
+
+### Rebuilding the extension without reinstalling
+
+`uv sync` already builds the extension through maturin. When you are iterating on Rust, build and copy it in place instead:
+
+```sh
+scripts/build-native.sh            # release build (default)
+scripts/build-native.sh --debug    # faster, for iteration
+```
+
+It runs `cargo build -p evoxc-python` and copies the cdylib to `evoxc/_evoxc_native.abi3.so`, which `evoxc/_native.py` loads — a gitignored build product.
+`import evoxc` never requires it unless a code path delegates to the native core; a missing extension raises an actionable `ImportError` naming how to produce it.
+
+## The gates
+
+| Gate | Command | Baseline (as of the last recorded run) |
+|---|---|---|
+| Python suite | `uv run --locked --all-packages --extra dev pytest -q` | `8018 passed, 88 skipped, 1 xfailed` |
+| `evoxc_hf` suite | `uv run --locked --all-packages --extra dev pytest evoxc_hf/tests -q` | `706 passed, 22 skipped` |
+| Rust workspace | `cargo test --workspace` in `native/` | `925 passed, 28 ignored` |
+| Rust lints | `cargo clippy --workspace --all-targets --no-deps -- -D warnings` | clean |
+| numpy ↔ native parity | `native/tools/parity_cpu.py` | `73/73` |
+| Packaging | `uv build --all-packages --out-dir dist`, `uvx twine check dist/*`, `python3 .github/workflows/release_checks.py dist` | both distributions, no cross-shipping |
+| This site | `npx @cloudflare/nimbus-docs check` then `npm run build` | builds clean |
+
+Two things that keep that table honest:
+
+- **Every skip is a host or dependency guard**, never a quietly disabled test — a missing `iree`/`tvm`/`torch` package, no CUDA/ROCm device, or an opt-in real-size checkpoint.
+  Install the extras and the same modules run instead of skipping.
+- The recorded Python baseline is one environment: Python 3.14, numpy 2.5, `iree-base` 3.13, one built extension, no CUDA, no usable ROCm, no tvm/torch/PJRT.
+  Numbers from a different host are not comparable, and the counts move as tests are added.
+
+The parity harness is a gate in its own right: the numpy interpreter is the *reference behaviour* and `native/evoxc-cpu` is the fast engine, so exact bool/integer paths must match bit for bit and float paths must agree under case-declared tolerances.
+Its documented residuals are three f32 `normal` 1-ulp cells and f32 `dot`, where `faer`'s blocking differs from OpenBLAS `sgemm`; a tolerance may only be declared by the case, never relaxed to make a run green.
+
+## CI
+
+`ci.yml` runs on pull requests and pushes to `main` only, and it is the full gate: the pytest matrix on Python 3.11–3.14, the Python 3.12 compiler leg (IREE/TVM installed), the two-distribution packaging job, and locked `cargo test --workspace` plus Clippy in `native/`.
+The packaging job also runs the release-helper and version-bump helper unit tests, and the 3.11 floor leg is there because those helpers are stdlib-only tools whose newer-stdlib usage would otherwise surface only at release time.
+
+The docs site is deliberately independent: [below](#building-this-site) is its own workflow, and a docs change never blocks a release while a release never publishes docs.
+
+## The release model
+
+The two distributions are **independently versioned** and released from this one repository:
+
+| Distribution | Version source | Trigger |
+|---|---|---|
+| `evoxc` | root `pyproject.toml`, `[project].version` | push a `v<version>` tag on a commit already in `origin/main` history |
+| `evoxc-hf` | `evoxc_hf/pyproject.toml`, `[project].version` | publish a GitHub Release for an existing `evoxc-hf-v<version>` tag |
+
+The workflows **never** bump a version, create a tag or move one — the `pyproject.toml` files are authoritative, and the tag must be exactly `v` plus the version declared at that commit.
+`RELEASING.md` owns the procedure (the `pypi` environment, trusted publishers, the rehearsal, recovery from a partial upload), and a tag never runs the full suite: it runs the quick release gate plus the authoritative seven-wheel-and-sdist matrix.
+
+Bumps are one operation so that the version, the Rust workspace and the locks cannot drift:
+
+```sh
+python scripts/bump_version.py 0.2.0 --dry-run   # preview
+python scripts/bump_version.py 0.2.0 --yes       # edit, commit, tag, push
+```
+
+It accepts `vX.Y.Z` or `X.Y.Z`, rewrites exactly the version declarations — root `pyproject.toml`, the `native/` workspace version and its internal requirements, `native/Cargo.lock`, `uv.lock` and `CHANGELOG.md` — commits only those files, creates the annotated tag and makes one non-forced atomic push.
+It never moves an existing tag and fails closed on a non-interactive stdin without `--yes`.
+
+To rehearse everything short of publishing:
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+A rehearsal pins the selected `main` commit, runs the same `verify → gate → wheels` checks, and re-checks the flat `dist/` names and digests — with no release-write job, no OIDC and no upload.
+
+## Rules that shape new code
+
+- **A new op lands in three places, in this order:** the op schema and shape inference, the numpy reference kernel, then the native kernel.
+  A native-only op or a numpy-only op is a bug.
+- **Transforms are Rust.** `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` are one implementation in `native/`, reached through the PyO3 extension; Python keeps validation (with pinned wording), pytree/spec adaptation, `Graph` reconstruction and the extension-rule bridge.
+  Do not add a second, Python batching or AD implementation — and there is no Python fallback: a missing extension is an `ImportError`, not a slow path.
+- **Do not add a second CPU kernel implementation.** If the two disagree, decide which behaviour the contract specifies and fix that side.
+- **NumPy stays a hard dependency**, by design: `evoxc.float32` *is* an `np.dtype`, a host tensor payload is an `ndarray`, the IR constant payload is serialized `.npy`, and the Rust dtype/promotion table is generated from numpy.
+- **Errors are explicit.** Unsupported paths raise a subclass of `EVOXCError` naming the operation and a remedy; nothing silently falls back to another backend, another dtype or a Python loop.
+- **The compiler escape hatches stay kernel-less.** `custom_call`/`inline_stablehlo` have a schema, inference and an emitter but deliberately no numpy or native kernel; user kernels go through `external_call` segmentation or a `block` with a portable decomposition.
+- **`README.md` is derived.** Every claim and number in it must trace to a `CONTEXT.md` or a committed bench record, so update it in the same change that moves the number.
+- **The distribution boundary is a test.** Model-level code belongs in `evoxc_hf/`, `evoxc` never imports it, and `tests/test_packaging.py` is what turns that rule into a build failure.
+
+The per-directory `CONTEXT.md` files are the binding contracts: the root one for architecture and status, `evoxc/CONTEXT.md` for the public API, `native/CONTEXT.md` for the Rust workspace and FFI, and `evoxc_hf/CONTEXT.md` for the model layer.
+
+## Building this site
+
+The site in `docs-site/` is a Nimbus/Astro static site deployed as the Cloudflare Worker `evoxc-docs` at **https://compiler.evox.group**.
+
+Its Python API reference is **generated, never hand-written**: `docs-infra python-api` walks the package's public namespaces with Griffe (static analysis, no imports) and writes Nimbus pages into the git-ignored `docs-site/src/content/docs/api/`.
+The module list, the `evoxc.ir.opdef` exclusion (its page URL would collide with `OpDef`) and the output directory all live in the repository-root `docs-infra.yml`, so a new public module is a config change plus a build, not a page edit.
+
+```sh
+cd docs-site
+npm ci                                            # once
+npx @cloudflare/nimbus-docs check                 # build-free preflight
+npm run build                                     # astro build -> dist/
+```
+
+<Aside type="note" title="Generate the API tree first">
+  A local build wants `src/content/docs/api/` to exist, otherwise the sidebar's `Python API` group is empty and `/api/` links go nowhere.
+  Run the toolkit's `docs-infra` `python-api` command against the repository root first; the build workflow regenerates it before every build, so never hand-edit a generated page — fix the docstring instead.
+</Aside>
+
+The `Documentation` workflow (`.github/workflows/docs-site.yml`) calls the shared reusable `build.yml` and `deploy.yml` from `EMI-Group/evox-docs-infra`, pinned to a published tag: it builds on every pull request and deploys to the Worker on pushes to `main`.
+Deployment needs the `docs-production` environment's Cloudflare token and account ID, and the Worker's custom domain is attached in the Cloudflare dashboard rather than in `wrangler.jsonc`.
+
+Translations are **off** by default: `docs-infra.yml` declares an empty `locales: []` with English as the source locale.
+Enabling another language means adding its locale ID there, registering the matching Nimbus `docs-<locale>` collection and route in `docs-site/`, and adding the toolkit's translate-workflow caller.
+
+Page-authoring rules — frontmatter, no repeated H1, absolute trailing-slash internal links, components available without import, and the "code examples call the real public API" rule — live in the site's own contract, `docs-site/CONTEXT.md` ([browse it on GitHub](https://github.com/EMI-Group/evoxc/blob/main/docs-site/CONTEXT.md)), together with the deployment details summarised above.
+
+## Where to go next
+
+- [Architecture](/reference/architecture/) — EvoXIR, the native core and the lowering boundary these rules protect.
+- [Options](/reference/options/) — the compile and lowering options, and their environment defaults.
+- [HuggingFace models](/huggingface/) — the second distribution, built only on the public API.
+- [Python API reference](/api/) — the generated reference for every public module.
