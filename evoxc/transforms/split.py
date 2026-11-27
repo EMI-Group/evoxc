@@ -83,10 +83,9 @@ tensor leaves, statics preserved), while `apply` takes the synthetic 2-child
 root ``(varying inputs, prepared tuple)`` — so a re-run of `prepare` is what a
 changed fixed input requires, and the backend/device in `lower`/`compile`/
 `load` is the caller's choice (the example pins ``"numpy"`` only for
-concreteness). The example's ``evoxc.split_by_inputs`` / ``evoxc.analyze_inputs``
-names are the intended TOP-LEVEL surface (the parent package re-exports them);
-until that re-export lands they are reachable as
-``evoxc.transforms.split_by_inputs`` / ``evoxc.transforms.analyze_inputs``.
+concreteness). ``evoxc.split_by_inputs`` / ``evoxc.analyze_inputs`` are the
+TOP-LEVEL names (``evoxc/__init__.py`` re-exports them; the
+``evoxc.transforms`` paths reach the same objects).
 
 v1 limits (one line): region-bearing control flow and effectful ops are
 blocked, there is no per-turn state tracking (a changed fixed input needs a

@@ -247,7 +247,7 @@ Sibling: `../../tests/transforms/` → test suite for this module (read-only fro
 The native-vs-reference numeric gate lives in the native workspace: `native/evoxc-compiler/tests/parity_transform/run_parity.py` (61 cases, 122 mode-runs, 0 mismatches) and `run_batch_parity.py` (25 populations, 87 checks, 0 mismatches), plus the `cargo test` gates `--test transform_parity` / `--test batch_functions_parity`.
 Both need `scripts/build-native.sh` first; run them with `source scripts/dev-env.sh && .venv/bin/python <harness>`.
 Spec-compliance additions live in `../../tests/test_spec_compliance.py`; the per-suite inventory is owned by `../../tests/CONTEXT.md`. CPU only, pytest.
-The split gets its own file there, pinning: the numerical law `apply(prepare(f), v) == f(f, v)` on the numpy backend, the digest stability of both halves and that `source.digest()` is unchanged, the blocked cases (control flow, each blocked effect, multi-function modules, `inline_stablehlo`) with the message naming the op, the mask/index error cases (both/neither argument, out of range, duplicate, `bool` on a static leaf, mismatched tree, all-fixed, none-fixed), the pruned-container `TransformError`, and the `analyze_inputs` facts against a hand-computed example (including `splittable=False` + a working `text()`, and `.split()` agreeing digest-for-digest with `split_by_inputs`).
+**Gap:** the split has no test file under `../../tests/transforms/`; a new suite must pin the numerical law `apply(prepare(f), v) == f(f, v)` on the numpy backend, the digest stability of both halves and that `source.digest()` is unchanged, the blocked cases (control flow, each blocked effect, multi-function modules, `inline_stablehlo`) with the message naming the op, the mask/index error cases (both/neither argument, out of range, duplicate, `bool` on a static leaf, mismatched tree, all-fixed, none-fixed), the pruned-container `TransformError`, and the `analyze_inputs` facts against a hand-computed example (including `splittable=False` + a working `text()`, and `.split()` agreeing digest-for-digest with `split_by_inputs`).
 
 ## Known Issues
 
@@ -263,6 +263,7 @@ The split gets its own file there, pinning: the numerical law `apply(prepare(f),
 - **The split keeps no per-turn state**: a boundary is a snapshot, so a STATEFUL fixed input would silently go stale — which is exactly why effectful ops are blocked rather than hoisted.
 - **A fixed-arity container that loses only SOME of its children is a `TransformError`**: a namedtuple / dataclass / registered pytree node cannot be rebuilt from a partial leaf set at run time (plain tuple/list/dict prune freely).
 - **`apply`'s signature is the synthetic 2-child root tuple** (never the source's input tree), and neither the pass nor `analyze_inputs` caches or executes anything.
+- **`split_by_inputs`/`analyze_inputs` are exported but unpinned**: no `../../tests/transforms/` suite covers the split, its gates or the analysis report, so a regression is currently caught only by downstream callers; the intended pins are listed under "Test strategy".
 
 ## Notes for agents
 
@@ -278,7 +279,7 @@ The split gets its own file there, pinning: the numerical law `apply(prepare(f),
 - `batch_functions` has NO Python merge implementation: the merge, its strategies and its report are native only, so a historical Python emitter/analyzer exists solely in git history.
 - `split.py` reuses `vectorize._broadcast_registered_axes` / `vectorize._is_int` for its `fixed` mask normalization and `_split_core._registered_base` for the registered-node test — the ONE intra-package coupling of the structural pass to the batching frontend, so a change to the mask broadcast rules lands in both.
 - `split_by_inputs`' `prepare` half is fed ONLY the pruned fixed-input tree (a graph with one fixed input takes exactly that one argument), and its halves are staged with the explicit `lower` → `compile` → `load` pipeline — `evoxc.build` deliberately rejects an already-traced `Graph`.
-- **When adding a public name here, update `__init__.py`, this CONTEXT.md, and the parent contract `../CONTEXT.md` together.** `evoxc/__init__.py` (parent-owned) re-exports `vectorize`, `vmap`, `batch_functions`, `BatchReport`, `SwitchRecord`, `grad`, `jvp`, `vjp`, the three registries + register functions, and `TransformCallable`; the structural split's names (`split_by_inputs`, `analyze_inputs`, `SplitPlan`, `BoundaryValue`, `InputAnalysis`, `InputInfo`, `SplitCallable`) currently live on `evoxc.transforms` only, awaiting that parent re-export.
+- **When adding a public name here, update `__init__.py`, this CONTEXT.md, and the parent contract `../CONTEXT.md` together.** `evoxc/__init__.py` (parent-owned) re-exports `vectorize`, `vmap`, `batch_functions`, `BatchReport`, `SwitchRecord`, `grad`, `jvp`, `vjp` and the structural split's `split_by_inputs`, `analyze_inputs`, `SplitPlan`, `BoundaryValue`, `InputAnalysis`, `InputInfo`, `SplitCallable`; `TransformCallable` and the rule registries are exported from `evoxc.transforms` only.
 
 ## Representation and extension boundaries
 
