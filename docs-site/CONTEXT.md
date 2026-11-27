@@ -63,7 +63,7 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 | `/getting-started/core-concepts/` | Core concepts | Explicit staging, the four value kinds, no hidden magic |
 | `/guides/` | Guides | Group landing page |
 | `/guides/graphs-and-tracing/` | Graphs and tracing | `defn`, `trace`, `Graph`, locations, digest |
-| `/guides/graph-transforms/` | Graph transforms | `vectorize`, `vmap`, `grad`, `jvp`, `vjp`, `batch_functions` |
+| `/guides/graph-transforms/` | Graph transforms | `vectorize`, `vmap`, `grad`, `jvp`, `vjp`, `batch_functions`, plus the structural `split_by_inputs`/`analyze_inputs` |
 | `/guides/control-flow/` | In-graph control flow | `cond`, `while_loop`, `scan` |
 | `/guides/tensors-and-devices/` | Tensors and devices | Physical devices, `Tensor.to`, DLPack, `DeviceError` |
 | `/guides/backends/` | Backends and options | numpy/native/compiler backends, the option surface |
@@ -95,8 +95,17 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 - Nimbus discovers `public/favicon.svg` before `public/favicon.ico`, so the head links the SVG and the `.ico` only answers a bare `/favicon.ico` request; both are the evoxc mark — regenerate the `.ico` from the SVG if the mark changes.
 - The toolkit derives page URLs by lowercasing symbol names, so `evoxc.ir.OpDef` and `evoxc.ir.opdef` collide on one URL; `../docs-infra.yml` excludes the function and keeps the class page.
 - The top-level `evoxc` namespace is not generated: its `__all__` is computed at import time, which Griffe's static analysis cannot evaluate, so `reference/api-overview.mdx` is hand-written and links into the definition pages.
-- A new public top-level name therefore never appears without hand edits, and the transform inventory (`vectorize`/`vmap`/`grad`/`jvp`/`vjp`/`batch_functions`) is duplicated in `reference/api-overview.mdx` (Transforms table), `reference/index.mdx` (pipeline chain), `reference/pipeline-objects.mdx` (the `Graph` producer diagram and "Produced by"), `reference/architecture.mdx` (layer diagram, crate table, the "six builtin transforms" sentence), `guides/graph-transforms.mdx`, `guides/index.mdx`, `index.mdx`, `getting-started/quickstart.mdx`, `getting-started/install.mdx` and `development.mdx`; the sidebar needs no edit because `astro.config.ts` autogenerates every group by directory.
+- A new public top-level name therefore never appears without hand edits, and the transform inventory (`vectorize`/`vmap`/`grad`/`jvp`/`vjp`/`batch_functions` and the structural `split_by_inputs`/`analyze_inputs`) is duplicated in `reference/api-overview.mdx` (Transforms table), `reference/index.mdx` (pipeline chain), `reference/pipeline-objects.mdx` (the `Graph` producer diagram and "Produced by"), `reference/architecture.mdx` (layer diagram, crate table, the numeric-transform sentence and the "What stays Python" table), `guides/graph-transforms.mdx`, `guides/index.mdx`, `index.mdx`, `getting-started/quickstart.mdx`, `getting-started/install.mdx` and `development.mdx`; the sidebar needs no edit because `astro.config.ts` autogenerates every group by directory.
+- The split's guide example must not show partially fixing the members of a dict/list input: only whole-container masks (or per-leaf masks over a plain tuple) are documented, because `split_by_inputs` raises a `VerificationError` on a partial container prune while `evoxc/transforms/CONTEXT.md` describes plain tuple/list/dict pruning as supported.
 - The generated pages carry the toolkit's back-link and signature text verbatim; when a docstring changes the page changes too, so never patch a generated page — fix the docstring.
+
+## Notes for Agents
+
+- Adding a public name is two jobs: a symbol listed in `__all__` of a module named in `../docs-infra.yml` reaches `/api/` automatically on the next generation run (`evoxc/transforms/__init__.py.__all__` is what gave `split_by_inputs`/`analyze_inputs`/`SplitPlan`/`BoundaryValue`/`InputAnalysis`/`InputInfo`/`SplitCallable` their pages, and `evoxc/__init__.py` re-exports them at top level), but the top-level `evoxc.*` spelling is hand-maintained in `reference/api-overview.mdx` plus the transform enumerations listed under Known issues — no generator writes those.
+- A split example in a guide or reference page must show the verified runtime call shapes: `evoxc.run(prepare, *fixed_args)` (the fixed arguments as separate arguments — `run(prepare, (params,))` raises `TraceError`) and `evoxc.run(apply, varying_tree, prepared_tuple)` (two arguments; nesting them as one raises `TraceError`), because `evoxc.run`'s root argument *is* the args tuple.
+- `evoxc.build` refuses an already-traced `Graph`, so every split example stages with the explicit `lower` → `compile` → `load` chain.
+- The split section's figures (prepare 2 ops, apply 5 ops, one boundary value of 128 B for the `fitness(dataset, params, candidate)` example) come from `evoxc/transforms/CONTEXT.md`; re-verify the snippet and those numbers together if the example ever changes.
+- Verify a Python sample against the tree before publishing it (`PYTHONPATH=. .venv/bin/python sample.py` after `scripts/dev-env.sh` — the generated pages and the site need no extension build).
 
 <!-- genesis:local -->
 
