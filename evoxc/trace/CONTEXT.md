@@ -63,6 +63,7 @@ by the 2025-08 cleanup refactor):
   The structural part is `ir.serialize_module(self.module)` with each op entry's `location` removed and the payload's own `sha256` field dropped, so it covers only module/function names + metadata, block arguments (SSA ids + types), every op's name, attributes, operand ids and result ids/types, the nested regions, and the constant table.
   Process-stable and identifying graph STRUCTURE + I/O signature only: `source_locations` (the `file:line` a graph was DEFINED at), the location-derived payload hash and `batch_report` are excluded, and the module carries no path- or memory-address-dependent data, so the same graph defined in a DIFFERENT FILE, re-traced in a different PROCESS, or deserialized from disk digests identically.
   Structural changes — an op name, an attribute value, a dtype/shape, a static value, the I/O trees — change the digest; `summary()["digest"]` is this same string.
+  `digest()` is the ONE inspection helper with a validation side effect: `ir.serialize_module` runs `ir.verify(module)` first, so digesting an invalid/unverified module raises `core.VerificationError` (e.g. a Graph a new transform built but has not verified).
 - `graph.text() -> str` — `ir.pretty_print(self.module)`; the same string `print()` writes to stdout (`print()` itself is unchanged).
 - `repr(defn)` — `<Defn <qualname> (<__module__>)>` (module dropped when absent), metadata-only; keeps the qualname substring.
 
@@ -398,6 +399,7 @@ editing messages, keep the wording of existing paths intact.
   recompute a derived carry such as `dominates = (count == 0)` locally in
   the cond/body instead of carrying it) — there is no CSE/DCE/region
   simplification anywhere in evoxc that would do it for you.
+- **`source_locations` has no error-message consumer.** Despite the docstrings ("so error messages can name the user's trace line"), nothing in `evoxc` reads it to build an error; its real consumers are `Graph.save`/`load`, `summary()["source_location_count"]`, and the transforms that remap it positionally through the native `input_ids` (`transforms/_native_bridge.py:182–189`, `transforms/_native_ad.py:182`, `transforms/batch_functions.py:953–958`). Keys are `ir.Value.id` (module-unique ints), one per TENSOR input block arg — static input leaves and op results/locations are NOT in it (per-op `op.location` is a separate, ops-owned mechanism).
 
 ## How to extend (hack-ability)
 
