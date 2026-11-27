@@ -152,18 +152,19 @@ Per backend capabilities, in order — first available wins, none → explicit
    — no `stablehlo.custom_call` emission exists anywhere in `../backends/`.)
 
 **Shipped-engine reality (binding):** all three compiler adapters declare
-`capabilities.custom_blocks = False`, and `CompilerBackend.lower` rejects a
-surviving `block_call` BEFORE portable inlining with
-`BackendError("capability drift: the <backend> backend cannot execute custom
-block ops (block_call)")` — so tier 3 does NOT make a block run on
-iree/xla/tvm today, even with a registered portable; `README.md` says the
-same ("Compiler adapters declare `custom_blocks=False` in v1 and reject a
-block graph with an explicit `BackendError`"). The `inline.py` message
-"compiler backends require BlockOp.portable(...)" is reachable only by a
-hypothetical `custom_blocks=True` compiler backend (the stub in
-`tests/backends/test_compiler_framework.py`). A kernel that must run on a
-compiler backend goes through `evoxc.external_call` (iree host/device
-dispatch), not a block.
+`capabilities.custom_blocks = False`, so their capability pre-check SKIPS a
+`block_call` whose block has a registered portable decomposition and
+`CompilerBackend.lower` then inlines it through
+`inline_portables(..., keep_backend_impls=None)` — a block with
+`BlockOp.portable(...)` therefore runs on iree/xla/tvm today (its inlined
+decomposition must use ops the adapter exports), while a `block_call` with no
+portable is an explicit `BackendError` at lower time ("... has no portable
+decomposition — compiler backends require BlockOp.portable(...)"). The numpy
+and native backends run the impl registered for their own backend
+(`keep_backend_impls="numpy"` / `"native"`) and splice the portable only when
+no such impl exists; a block with neither is an explicit `BackendError` naming
+the block. A kernel that must run AS a kernel on a compiler backend goes
+through `evoxc.external_call` (iree host/device dispatch), not a block.
 
 Derivatives (grad/jvp/vjp): explicit rule → use it; else portable
 decomposition (inline → differentiate) → else TransformError ("not

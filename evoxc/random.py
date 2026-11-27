@@ -14,8 +14,10 @@ Threefry2x32, Philox4x32_10 — selectable via :func:`key`'s ``algorithm``
 argument as canonical strings or ``Algorithm`` members), per-op salts,
 key-consumption semantics (ops never consume/mutate a key — split for
 independence), dtype rules, symbolic-shape and symbolic-``high`` handling,
-and the numpy-backend-only v1 coverage (compiler backends reject every
-random op with an explicit ``BackendError``). ``evoxc.random.key`` is a
+and the v1 backend coverage (numpy is the reference for all three
+algorithms; five of the six ``random_*`` ops export to StableHLO with
+algorithm-aware lowering, and only ``random_multinomial`` defers on compiler
+backends with an explicit ``BackendError``). ``evoxc.random.key`` is a
 polymorphic creator (concrete tensor outside a trace, Constant op inside);
 every other function is a graph op (``TraceError`` outside a trace).
 

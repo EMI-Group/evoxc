@@ -45,7 +45,7 @@ Reader validation (all raise `core.PersistenceError` naming the file, tensor and
 - GGUF: magic, version ∈ {2, 3}, bounds-checked string lengths (UTF-8), metadata value type ids, array element types (nested arrays rejected), power-of-two `general.alignment`, `n_dims <= 4`, known ggml type ids, `numel` divisible by the quantized block size, every payload inside the data section, no overlapping payloads, and a header count that cannot fit in the remaining bytes.
 - Writer: dtypes the format cannot represent (complex, float128, object, strings, ...) and non-string metadata are rejected; accepted inputs are `core.Tensor` (a non-cpu tensor raises `core.DeviceError` from `.numpy()` — no implicit D2H), numpy arrays and memmaps.
 
-Supported safetensors tags: `F64`, `F32`, `F16`, `BF16`, `I64`, `I32`, `I16`, `I8`, `U64`, `U32`, `U16`, `U8`, `BOOL`, `F8_E4M3`, `F8_E5M2` (the last three read-only in v1).
+Supported safetensors tags: 15 accepted, 12 writable — `F64`, `F32`, `F16`, `I64`, `I32`, `I16`, `I8`, `U64`, `U32`, `U16`, `U8`, `BOOL` read and write, while `BF16`, `F8_E4M3` and `F8_E5M2` are read-only in v1 (they surface as raw `uint16`/`uint8` views, so writing them back would need a tag override the API does not take).
 Supported GGML type ids: F32 (0), F16 (1), Q4_0 (2), Q4_1 (3), Q5_0 (6), Q5_1 (7), Q8_0 (8), Q8_1 (9), Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), BF16 (30).
 Explicit v1 deferrals (loud errors, never wrong values): every other ggml type id (Q8_K, the IQ family, TQ, MXFP4/NVFP4, Q1_0/Q2_0, I8..I64, F64, F8_E4M3), writing BF16/F8 safetensors (their raw storage words are indistinguishable from U16/U8 without a tag override the API does not take), GGUF v1 (32-bit string lengths), and big-endian GGUF files.
 
