@@ -146,7 +146,7 @@ Recorded hardware Vulkan coverage is a short Intel Panther Lake (`8086:b0a0`) co
 
 ## Serialization contract (binding)
 
-Formats are versioned via constants (`EVOXC_FORMAT_VERSION`). Artifacts are self-describing: backend name/version, target, input/output signature (TreeSpec + specs), static values, required custom ops, IR format version. `Graph.save` → `.evoxcgraph` (portable JSON container); `LoweredProgram` numpy → serialized program; stablehlo → `.mlir` text; `CompiledArtifact` → `.evoxcartifact`; `Executable.save` → backend-dependent (numpy saves the artifact plus an explicit note that it is reconstructed at load). Loading with a mismatched backend/device/ABI → `PersistenceError`, never a silent recompile.
+Formats are versioned via constants (`EVOXC_FORMAT_VERSION`). Artifacts are self-describing: backend name/version, target, input/output signature (TreeSpec + specs), static values, required custom ops, IR format version. `Graph.save` → `.evoxcgraph` (portable JSON container); `LoweredProgram.save` → the `evoxc.persist` container for EVERY backend, with the serialized program (numpy) or the MLIR text (stablehlo, inside the payload — never a bare `.mlir` file); `CompiledArtifact` → `.evoxcartifact`; `Executable.save` → backend-dependent (numpy saves the artifact plus an explicit note that it is reconstructed at load). Loading with a mismatched backend/device/ABI → `PersistenceError`, never a silent recompile.
 
 ## Routing table
 
