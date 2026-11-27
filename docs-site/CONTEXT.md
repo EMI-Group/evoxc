@@ -14,12 +14,12 @@ The site documents the public API; it never documents private modules (`evoxc._n
 - The page H1 comes from `title`: never repeat it as a `#` heading in the body — start at `##`.
 - Markdown-first: `##`/`###` headings, fenced code blocks with a language (`python`, `sh`, `text`, `toml`, `yaml`, `json`), tables for reference data, `<Aside>` for caveats.
 - Components usable in `.mdx` without any import (registered in `src/components.ts`): `Aside`, `Card`, `CardGrid`, `PackageManagers`, `Step`/`Steps`, `Tabs`/`TabItem`, `Render`.
-  `<Aside type="note|tip|important|warning|caution" title="…">` is the callout form.
+  `<Aside type="note|tip|caution|danger" title="…">` is the callout form — those are the only types `ui/aside/Aside.astro` styles, so any other value renders as a Note.
 - Internal links are absolute site paths with a trailing slash, e.g. `/guides/graph-transforms/`.
   The `nimbus/internal-link` rule is an error, so a link to a page that does not exist breaks the build.
 - Code examples must call the real public API exactly as `../evoxc/CONTEXT.md` defines it — real names, real keyword arguments, no invented parameters or return shapes.
-- A page is finished when its `<!-- TODO(content): … -->` marker is gone and `npm run build` passes.
-- Prefer explaining *why* a design is the way it is (explicitness, no hidden tracing, physical devices) over restating an API signature that the generated reference already shows; link to `/api/…` for signatures.
+- A page is finished when no `TODO`, placeholder or authoring note remains and both `npx @cloudflare/nimbus-docs check` and `npm run build` pass.
+- Prefer explaining *why* a design is the way it is (explicitness, no hidden tracing, physical devices) over restating an API signature that the generated reference already shows; for signatures point readers at [`/reference/api-overview/`](/reference/api-overview/) rather than guessing a `/api/…` path.
 
 ## Build and verification
 
@@ -87,7 +87,10 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 
 ## Known issues
 
-- A local build needs the generated API tree (`src/content/docs/api/`) to exist first; without it the site builds (the sidebar's `Python API` group is then empty) but `/api/…` links in `reference/api-overview.mdx` are dead.
+- Pages avoid `/api/…` deep links: that tree is generated and git-ignored, so a deep link can point at nothing; `/api/` itself is safe and the site builds green with the `api/` collection absent (28 pages).
+- A fresh clone therefore builds with no generation step (`npm ci` then `npm run build`); a full build regenerates the API pages first, which is what makes the `Python API` sidebar group non-empty.
+- While the `api/` tree is absent, `npx @cloudflare/nimbus-docs check` still reports every `/api/` link (`development.mdx`, `reference/api-overview.mdx`, `reference/index.mdx`) as `nimbus/internal-link` broken; the build itself passes.
+- A group index page must carry a `sidebar.order` strictly lower than every other page in its group — equal orders are not reliably broken — so `guides/index.mdx` uses `order: 0` and leads its group; `reference/index.mdx` sits at `order: 3` and its Overview link renders mid-group, after Op catalogue.
 - The generated API pages join the plain `docs` collection, so they are mounted as a labelled directory group (`{ label: "Python API", autogenerate: { directory: "api" } }`) rather than through a separate `api` collection; that is what keeps their position in the sidebar top level after Reference.
 - Nimbus discovers `public/favicon.svg` before `public/favicon.ico`, so the head links the SVG and the `.ico` only answers a bare `/favicon.ico` request; both are the evoxc mark — regenerate the `.ico` from the SVG if the mark changes.
 - The toolkit derives page URLs by lowercasing symbol names, so `evoxc.ir.OpDef` and `evoxc.ir.opdef` collide on one URL; `../docs-infra.yml` excludes the function and keeps the class page.
