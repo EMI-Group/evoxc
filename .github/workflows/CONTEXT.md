@@ -62,7 +62,7 @@ A release tag never runs the full CI suite: it runs the quick gate and then the 
 | Path | Area |
 |---|---|
 | `./ci.yml` | PR/main gate: Python pytest matrix, compiler leg, Rust tests + Clippy, and packaging. |
-| `./docs-site.yml` | Documentation site: calls the shared `EMI-Group/evox-docs-infra` `build.yml`/`deploy.yml@v0.1.0` for the Nimbus site in `../docs-site/` (config `../docs-infra.yml`, Worker `evoxc-docs`, Custom Domain `compiler.evox.group`). |
+| `./docs-site.yml` | Documentation site: calls the shared `EMI-Group/evox-docs-infra` `build.yml`/`deploy.yml@main` for the Nimbus site in `../docs-site/` (config `../docs-infra.yml`, Worker `evoxc-docs`, Custom Domain `compiler.evox.group`); pinned to the toolkit's `main` for the module-page/collision/stable-revision generator, move both pins to the next published tag once it is cut. |
 | `./release_gate.yml` | Reusable quick end-to-end release gate (build, boundary, abi3-floor/ceiling and combined-distribution smokes). |
 | `./wheels.yml` | Reusable gate for the supported evoxc wheel matrix, source archive and exact installs. |
 | `./smoke_evoxc.py` | Fresh-venv install and compiled-extension graph smoke for one exact archive. |
