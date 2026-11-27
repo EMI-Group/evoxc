@@ -398,6 +398,114 @@ def test_dead_ops_are_dropped_from_both_halves():
 
 
 # ---------------------------------------------------------------------------
+# 5b. op accounting is over DISTINCT SOURCE op ids (shared `constant`)
+# ---------------------------------------------------------------------------
+
+
+def test_shared_constant_never_makes_dropped_ops_negative():
+    """A `constant` feeding BOTH halves is one source op, not two.
+
+    `_prepare_ops`/`_apply_ops` each emit that one source `constant` op, so the
+    halves' counts sum to `source_ops + 1` here; `dropped_ops` is derived from
+    the UNION of the two source-op-id sets (`_split_types._op_accounting`), so
+    it stays at 0 instead of the old clone-count residual of -1.
+    """
+
+    def shared_constant(tref, x):
+        c = evoxc.constant(evoxc.tensor(np.float32(2.0)))
+        fx = tref * c  # fixed-only path: reaches the boundary
+        y = x * c  # varying path: `apply` recomputes it
+        return fx + y
+
+    graph = evoxc.trace(
+        shared_constant,
+        evoxc.TensorSpec((4,), evoxc.float32),
+        evoxc.TensorSpec((4,), evoxc.float32),
+    )
+    # Source: constant, multiply(tref, c), multiply(x, c), add.
+    assert [op.name for op in entry_ops(graph)] == [
+        "constant",
+        "multiply",
+        "multiply",
+        "add",
+    ]
+    plan = evoxc.split_by_inputs(graph, fixed_leaves=[0])
+
+    summary = plan.summary()
+    assert summary["source_ops"] == 4
+    assert summary["prepare_ops"] == 2  # constant + multiply(tref, c)
+    assert summary["apply_ops"] == 3  # constant + multiply(x, c) + add
+    assert summary["dropped_ops"] == 0  # never negative on this shape
+    assert summary["dropped_ops"] >= 0
+    # The shared `constant` is counted in EACH half's count and once in the
+    # union `dropped_ops` derives from: exactly one extra op under the rule.
+    assert summary["prepare_ops"] + summary["apply_ops"] == summary["source_ops"] + 1
+    assert (
+        summary["prepare_ops"] + summary["apply_ops"]
+        >= summary["source_ops"] - summary["dropped_ops"]
+    )
+    # The counts are still the halves' real non-terminator op counts.
+    assert summary["prepare_ops"] == len(entry_ops(plan.prepare))
+    assert summary["apply_ops"] == len(entry_ops(plan.apply))
+    assert [
+        op.name for op in entry_ops(plan.prepare)
+    ] == ["constant", "multiply"]
+    assert [
+        op.name for op in entry_ops(plan.apply)
+    ] == ["constant", "multiply", "add"]
+
+    # `text()` renders the same counts and no negative op count.
+    ops_line = next(line for line in plan.text().splitlines() if "ops:" in line)
+    counts = [int(token) for token in re.findall(r"-?\d+", ops_line)]
+    assert counts == [4, 2, 3, 0]
+    assert all(count >= 0 for count in counts)
+
+    plan.verify()
+
+    full, prepare, apply = stage(graph), stage(plan.prepare), stage(plan.apply)
+    rng = _rng(7)
+    tref = rng.normal(size=(4,)).astype(np.float32)
+    x = rng.normal(size=(4,)).astype(np.float32)
+    prepared = evoxc.run(prepare, tref)
+    assert len(prepared) == len(plan.boundary) == 1
+    assert np.array_equal(
+        evoxc.run(apply, (x,), prepared).numpy(),
+        evoxc.run(full, tref, x).numpy(),
+    )
+
+
+def test_op_accounting_invariants_hold_on_other_plans():
+    """`dropped_ops >= 0` and the union rule on the existing plan fixtures."""
+
+    def with_dead_branch(w, x):
+        live = evoxc.tanh(w)
+        _dead_fixed = evoxc.sin(w)  # feeds nothing
+        _dead_mixed = evoxc.multiply(x, 3.0)  # feeds nothing
+        return live * x
+
+    dead_graph = evoxc.trace(
+        with_dead_branch,
+        evoxc.TensorSpec((4,), evoxc.float32),
+        evoxc.TensorSpec((4,), evoxc.float32),
+    )
+    plans = [
+        evoxc.split_by_inputs(fitness_graph(), fixed_leaves=[0, 1]),
+        evoxc.split_by_inputs(fitness_graph(), fixed_leaves=[1]),
+        evoxc.split_by_inputs(fitness_graph(), fixed_leaves=[0, 2]),
+        evoxc.split_by_inputs(dead_graph, fixed_leaves=[0]),
+    ]
+    for plan in plans:
+        summary = plan.summary()
+        # Never negative, and the halves always cover every non-dropped source
+        # op (equality iff no op is shared; `>=` in general).
+        assert summary["dropped_ops"] >= 0
+        assert (
+            summary["prepare_ops"] + summary["apply_ops"]
+            >= summary["source_ops"] - summary["dropped_ops"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # 6. a varying input consumed only by dead ops
 # ---------------------------------------------------------------------------
 
