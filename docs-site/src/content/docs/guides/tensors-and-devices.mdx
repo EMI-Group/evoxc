@@ -5,4 +5,207 @@ sidebar:
   order: 4
 ---
 
-<!-- TODO(content): write the Tensors and devices page. -->
+A `Tensor` is the materialized end of the pipeline: it carries a dtype, a concrete shape, and a **device that says where its bytes actually live**.
+Everything else in this page follows from that one rule — evoxc never relabels a tensor, never copies it behind your back, and never pretends a buffer is somewhere it is not.
+
+Placement is a property of the value, not a hint you attach to it:
+
+```python
+import evoxc
+
+x = evoxc.tensor([1.0, 2.0, 3.0])
+x.device          # Device(kind='cpu', index=0)
+x.dtype           # dtype('float32')
+x.shape           # (3,)
+```
+
+Two details worth knowing early: `evoxc.tensor` keeps an existing `ndarray`'s dtype exactly, while a plain Python list that infers `float64` becomes `float32` (the library default), and `evoxc.from_numpy(array)` wraps an array zero-copy instead of converting it.
+
+## Host data is always `cpu:0`
+
+An `ndarray` payload *is* host memory, so a tensor wrapping one lives on `Device("cpu", 0)` — always, and the payload's own attributes are never consulted to decide otherwise.
+Passing any other device to a concrete creator is an error rather than an implicit upload:
+
+```python
+evoxc.zeros((4, 4), evoxc.float32, device=evoxc.Device("cpu", 0))  # fine
+evoxc.zeros((4, 4), evoxc.float32, device=evoxc.Device("cuda", 0))  # DeviceError
+```
+
+The message names the creator, says the memory is host (numpy) memory, and points at `t.to(...)` — placing data on a device is a separate, explicit step.
+The same rule governs `evoxc.tensor`, `evoxc.ones`, `evoxc.full`, `evoxc.empty`, `evoxc.from_numpy` and `evoxc.from_dlpack`.
+
+## Device payloads carry their real device
+
+A tensor may instead wrap an opaque **device payload** produced by a backend (the IREE adapter's `IreeDevicePayload` is the reference example, and XLA has its own).
+Such a payload declares its own shape, dtype and device; the tensor adopts them, and an explicit `device=` argument must *agree* with the payload's device (kind and index) — a payload cannot be relabelled onto a device it does not live on:
+
+```python
+exe = evoxc.build(forward, evoxc.TensorSpec((8, 8), evoxc.float32),
+                  backend="iree", device="cuda")
+out = evoxc.run(exe, host_x.to(evoxc.Device("cuda", 0)))
+out.device        # Device(kind='cuda', index=0) — where the data really is
+```
+
+Every backend that can allocate device memory hands back tensors on the device the work ran on.
+There are no "virtual" devices, no label-only placement, and no cpu-labelled tensor whose bytes sit in device memory.
+
+## `Tensor.to` is the only transfer
+
+`Tensor.to(device)` is the sole host ↔ device movement primitive in the whole frontend:
+
+```python
+gpu_x = host_x.to(evoxc.Device("cuda", 0))     # explicit host -> device upload
+host_x2 = gpu_x.to(evoxc.Device("cpu", 0))     # explicit device -> host readback
+```
+
+- `t.to(t.device)` returns `t` itself — no copy, no work.
+- `to(Device("cpu", 0))` on a device payload performs the explicit download (a fresh host copy).
+- `to(Device("cpu", N))` with `N != 0` raises `DeviceError`: only `cpu:0` exists.
+- A payload-backed tensor going straight to another accelerator kind raises `DeviceError` suggesting the two explicit hops, `t.to(cpu).to(target)`.
+- Otherwise the registered **device-transfer provider** for that kind performs the upload. The owning backend's slot is tried first, then the flat default slot; with nothing registered the error names the kind and the target device (for `cuda`, the fix is `pip install evoxc[iree]`).
+
+Providers are registered by adapters, not by you, and each adapter fills its own slot — activating a second compiler backend never clobbers the first one's upload path.
+
+## Reading data back
+
+`.numpy()` is explicit host access, and what it does depends on where the tensor lives:
+
+| Tensor | `.numpy()` behaviour |
+|---|---|
+| ndarray-backed (`cpu:0`) | zero-copy reference to the underlying array |
+| cpu-kind device payload (e.g. `llvm-cpu` output) | a fresh host copy on every call, never cached |
+| non-cpu device payload (`cuda`, `rocm`, `vulkan`) | `DeviceError` telling you to call `t.to(Device("cpu", 0))` first |
+
+Run outputs are never auto-copied to the host: a `cuda` executable returns `cuda` tensors, and reading one back is the explicit `out.to(evoxc.Device("cpu", 0)).numpy()`.
+`Tensor.__repr__` obeys the same discipline — it previews up to eight elements of *host* data and never materializes device memory.
+
+## DLPack interop
+
+`evoxc.from_dlpack(obj)` imports any object exposing `__dlpack__` (a numpy array, a torch tensor, another framework's tensor) without copying: the new tensor shares the exporter's buffer.
+In v1 the import path is host-only — the capsule is consumed with `np.from_dlpack`, so the result is an ndarray-backed `cpu:0` tensor, and a capsule that cannot be consumed that way raises `DeviceError`.
+
+`Tensor.__dlpack__` / `__dlpack_device__` are the export side, and they are zero-copy for host data.
+For device memory they **delegate to the payload's own optional DLPack protocol** when it implements one: the IREE `IreeDevicePayload` exports its HAL buffer directly, so
+
+```python
+torch_tensor = torch.from_dlpack(out)   # out: a cuda/rocm evoxc Tensor — shares device memory
+```
+
+gives you a torch tensor aliasing the same device allocation, with the 0-based `Device.index` as the DLPack device id.
+A cpu-kind payload is told to call `.numpy()` first, and a non-cpu payload without the protocol is told to transfer explicitly via `t.to(...)` — never silently wrong data.
+
+<Aside type="caution" title="Who owns the buffer">
+DLPack export aliases memory. `copy=True` and a different `dl_device` are refused with `DeviceError`, and synchronization stays the consumer's problem: a backend whose `run` only enqueues (XLA) needs the explicit `Executable.synchronize()` completion boundary described below.
+</Aside>
+
+## Enumerating devices
+
+`evoxc.devices()` reports what this host actually has, and it never invents anything:
+
+```python
+evoxc.devices()            # [Device(kind='cpu', index=0)] plus any cuda/rocm devices
+evoxc.devices("cuda")      # [] when no CUDA runtime is detectable
+evoxc.devices("rocm")      # canonical AMD spelling; evoxc.devices("hip") == evoxc.devices("rocm")
+evoxc.devices("vulkan")    # queried only when asked for explicitly
+```
+
+- `cpu` is always present; the CPU device is the only backend-independent one.
+- Detecting `rocm` probes the IREE HIP HAL driver first and falls back to a ROCm-capable torch build; the two sources are never combined, so nothing is double counted.
+- `devices("vulkan")` is deliberately excluded from the bare `devices()` list: the probe instantiates the IREE Vulkan runtime and the system Vulkan loader, which on a software host would advertise a CPU rasterizer as an accelerator.
+- An unrecognized kind raises `DeviceError`; a *recognized* kind with nothing present returns `[]`.
+- Indices are per-kind enumeration indices, not backend-specific handles. The IREE adapter maps them onto its own device ids — see [compiler adapters](/guides/compiler-adapters/).
+
+## Preparing data: split and replicate
+
+`evoxc.split_tensor(tensor, axis, devices)` and `evoxc.replicate_tensor(tensor, devices)` are **explicit data preparation**, not sharding transformations.
+They cut (or share) host data into one local tensor per device and touch no graph, no collective and no transfer:
+
+```python
+import numpy as np
+import evoxc
+
+host_x = evoxc.from_numpy(np.arange(32, dtype=np.float32).reshape(8, 4))
+shards = evoxc.split_tensor(host_x, 0, [evoxc.Device("cpu", 0)] * 4)
+len(shards), shards[0].shape      # 4, (2, 4)
+copies = evoxc.replicate_tensor(host_x, [evoxc.Device("cpu", 0)] * 4)
+```
+
+In v1 both are **host-memory utilities**: the source must be ndarray-backed on `Device("cpu", 0)` and every target device must be `Device("cpu", 0)`.
+Anything else raises `DeviceError` explaining that these helpers never move data across devices and pointing at `Tensor.to`.
+A non-divisible `axis` extent raises `ShapeError`.
+
+There is no `split`/`replicate` op in the graph language either — multi-device work is per-device executables plus explicit collectives, as [collectives](/guides/collectives/) shows.
+
+## Embedding data in a graph
+
+Capturing a concrete tensor from a closure into a `defn` is an error; large data enters a graph through `evoxc.constant(tensor)` — the one (explicit, warned) embedding path — or as an ordinary input spec.
+`evoxc.constant` snapshots **host data only**:
+
+```python
+@evoxc.defn
+def affine(x):
+    w = evoxc.constant(host_w)      # host tensor; warns above EVOXC_LARGE_CONSTANT_BYTES
+    return evoxc.dot(x, w)
+```
+
+A non-cpu tensor raises `DeviceError` with the `t.to(Device("cpu", 0))` remedy: no implicit device-to-host copy, not even for a constant.
+The warning threshold is `EVOXC_LARGE_CONSTANT_BYTES`, 1 MiB by default.
+
+## Async copies with `evoxc.io`
+
+`evoxc.io` is thin, explicit async sugar *over `Tensor.to`*: it schedules the same transfers on one process-global FIFO worker thread (lazily started) and hands you a handle.
+
+```python
+copy = evoxc.io.prefetch(host_x, evoxc.Device("cuda", 0))   # -> AsyncCopy
+copy.direction                                              # "host_to_device"
+copy.device                                                 # the target device
+copy.done                                                   # non-blocking boolean
+gpu_x = copy.result()                                       # wait, then the device Tensor
+
+down = evoxc.io.sink(gpu_x)                                 # -> AsyncCopy, "device_to_host"
+host_x2 = down.result()                                     # wait, then the host Tensor
+evoxc.io.wait_all()                                         # drain everything outstanding at call time
+```
+
+Contract details that matter in practice:
+
+- **Validation is synchronous, transfer is not.** A raw `ndarray` (not a `core.Tensor`) for `prefetch`, a non-`Device` target, an already-hosted source for `sink` — all raise on the calling thread. A missing transfer provider surfaces later, from the worker.
+- **Errors surface verbatim at `wait()`/`result()`/`wait_all()`.** The worker never raises and never dies; failures are stored on the handle and re-raised on every call.
+- **A timeout never cancels.** `wait(timeout=...)` / `result(timeout=...)` raise `TimeoutError` and leave the copy pending; the copy completes when it completes.
+- **Ordering, not overlap.** Copies run strictly in issue order on that one worker, so there is no guarantee of overlap beyond caller-relative asynchrony — a v1 limitation, and the reason `evoxc.io` is convenience sugar rather than a staging engine.
+- Scheduling or waiting *from* the worker thread raises `RuntimeError`; garbage collection never auto-waits for a copy.
+
+`prefetch` needs a device-transfer provider, so on a cuda/rocm target it needs `pip install evoxc[iree]` (or another backend that registers one).
+
+## Waiting for device work
+
+Inputs must match the executable's device. `evoxc.run` and `evoxc.bind` reject any tensor leaf whose `device` differs from the executable's device with a `DeviceError` naming the **input tree path** and both devices — before the backend is even dispatched — and a non-cpu executable also rejects raw numpy arrays and host tensors, because placing them is your job:
+
+```python
+exe = evoxc.build(step, spec, backend="xla", device="rocm")
+out = evoxc.run(exe, rocm_x)             # rocm_x = host_x.to(evoxc.Device("rocm", 0))
+exe.synchronize()                        # explicit completion boundary
+```
+
+`Executable.synchronize()` waits for all device work submitted by earlier `run()` calls.
+It is not a read barrier — output values are already valid, any read awaits — it is a **timing** primitive, and you must call it yourself when you measure wall clocks:
+
+- `numpy` and `iree` block inside `run`, so their `synchronize()` is a documented no-op.
+- The XLA device-resident `run` only *enqueues*, so a wall-clock number is `run` + `synchronize()`.
+- `BoundExecutable.synchronize()` delegates, so a `evoxc.bind(...)` result has the same shape.
+- Nothing calls it implicitly; per-call dispatch overlap stays a feature of `evoxc.run`.
+
+## Errors you will see
+
+| Situation | Error |
+|---|---|
+| Concrete creator with a non-`cpu:0` device | `DeviceError` naming the creator |
+| Explicit `device=` that disagrees with a payload's device | `DeviceError` (a payload cannot be relabelled) |
+| `.numpy()` on a non-cpu tensor | `DeviceError` with the `.to(cpu)` remedy |
+| `Tensor.to` with no provider for the kind | `DeviceError` naming kind and target device |
+| Run input on the wrong device | `DeviceError` naming the input tree path |
+| `split_tensor`/`replicate_tensor` off host memory | `DeviceError`; non-divisible axis → `ShapeError` |
+| `evoxc.constant` of a non-cpu tensor | `DeviceError` (no implicit D2H) |
+| Timeout on an async copy | builtin `TimeoutError` (the copy is not cancelled) |
+
+Continue with [backends and options](/guides/backends/) to choose where a graph runs, or [pipeline objects](/reference/pipeline-objects/) for the stage-by-stage types.

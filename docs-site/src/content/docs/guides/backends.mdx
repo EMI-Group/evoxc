@@ -5,4 +5,235 @@ sidebar:
   order: 5
 ---
 
-<!-- TODO(content): write the Backends and options page. -->
+A backend owns exactly the three stages below `lower`: turning a verified `Graph` into a `LoweredProgram`, compiling that into a `CompiledArtifact`, and loading the artifact into an `Executable` you can `run`.
+The frontend never picks one for you silently — the default is the numpy interpreter, and everything else is named explicitly.
+
+## The backend interface
+
+```python
+class Backend:
+    name: str
+    capabilities: Capabilities
+    def lower(self, graph, options=None) -> evoxc.LoweredProgram: ...
+    def compile(self, lowered, options=None) -> evoxc.CompiledArtifact: ...
+    def load(self, artifact, device=None, options=None): ...   # an executable
+```
+
+The executable side is a runtime-checkable protocol: `run(flat_input_tensors, options=None)` returning flat output tensors, plus `.functions` and `.device` attributes, and *optional* `save(path)` / `load(path, device=None)` / `synchronize()`.
+`save` must persist the underlying artifact — device handles are never serialized — and `synchronize()` must not become a required protocol member (executables without it stay structurally valid).
+
+`evoxc.backends.get(name)` resolves a backend and raises `BackendError` for an unknown name.
+Optional adapters are **activated on first use**: `get("iree")` imports the adapter module and calls its `register()`, so `import evoxc` never imports a compiler.
+`lower`, `compile` and `load` accept either a name or a `Backend` instance; `build`, `evaluate` and `build_cached` forward the instance they were given through both hops.
+
+## The three kinds of backend
+
+| Backend | How to enable | What it owns | Validated on |
+|---|---|---|---|
+| **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
+| **`native`** | `backend="native"` (shipped in the wheel) | the in-process Rust CPU engine: immutable plans over typed host buffers | CPU |
+| **compiler adapters** | `lower(..., backend="iree"\|"xla"\|"tvm")` | StableHLO → an external compiler and its runtime | see [compiler adapters](/guides/compiler-adapters/) |
+
+### The numpy interpreter
+
+The default backend is the **reference behaviour**, not a fallback: a pure-Python numpy interpreter that executes the IR op by op and supports every symbolic shape the frontend can express.
+It is CPU only, documents-ignores unknown options, and exposes `Executable.plan_text()` with its per-block execution plan.
+When two backends disagree, the numpy interpreter is the definition of what the graph means.
+
+### The `native` Rust CPU engine
+
+`backend="native"` runs the same graph on the in-process Rust CPU engine reached through the compiled extension.
+It is optional in the sense that nothing forces you to use it, and it is shipped in the wheel:
+
+```python
+exe = evoxc.build(step, evoxc.TensorSpec((64,), evoxc.float32), backend="native")
+evoxc.run(exe, x)
+```
+
+- **Host data only.** `cpu:0` in, `cpu:0` out; a non-CPU device or non-CPU input tensor is an explicit `DeviceError`, never an implicit copy.
+- **numpy-mirroring staging.** Same verify → capability pre-check → portable inlining order, and the payload is the serialized EvoXIR module (portable and savable), not machine code.
+- **Engine gate at `lower()`.** Any op the engine does not implement is reported there as a `BackendError` naming the ops and pointing at `backend="numpy"`.
+- **Capabilities.** Symbolic shapes, all 14 evoxc dtypes, single-rank collectives, `runtime_call`, host-mode external kernels and custom blocks — but `sparse_ops=False` (sparse is numpy-only in v1) and `async_collectives=False`.
+- **No pipeline options in v1.** All four stage option sets are empty, so passing a compiler option here fails loudly instead of being ignored.
+- **Diagnostics.** `Executable.summary()` reports through the engine, and the executable adds `plan_text()`, `stats()` and `required_ops()`.
+
+Numerically it matches numpy exactly on bool/integer paths and on every float op built from one-rounding primitives; the only documented windows are the platform libm transcendentals and f32 `dot` reassociation — see [reference architecture](/reference/architecture/).
+
+### Compiler adapters
+
+`iree`, `xla` and `tvm` consume the same exported StableHLO text and hand it to a real compiler.
+They are activated by use, fail explicitly when absent, and own device kinds, target flags and device-resident execution — the whole story lives on [compiler adapters](/guides/compiler-adapters/).
+
+## Capabilities: what a backend may refuse
+
+Every backend declares a frozen `Capabilities` record:
+
+```python
+caps = evoxc.backends.get("numpy").capabilities
+caps.dynamic_shapes, caps.collectives, caps.custom_ops, caps.sparse_ops
+caps.dtypes            # frozenset of supported dtypes
+caps.supports_dtype(evoxc.float32)
+```
+
+The flags are `dynamic_shapes`, `dtypes`, `collectives`, `runtime_calls`, `external_calls`, `custom_blocks`, `async_collectives`, `sparse_ops`, `rng_bit_generator` and `custom_ops`.
+A `False` flag is a **promise to reject explicitly** — never to emulate silently: a sparse op on a compiler backend raises `BackendError` suggesting `evoxc.sparse.to_dense`, a `runtime_call` there raises at `lower()`, and a block without a portable decomposition is refused with the remedies listed.
+
+`custom_ops` deserves its own line: it is true only on the three compiler adapters, and it claims the ops are **forwarded**, not that they are valid.
+`numpy` and `native` leave it false and reject `custom_call`/`inline_stablehlo` by name in their own capability pre-check, pointing at `external_call`, `runtime_call`, `evoxc.block` or `backend="iree"`.
+`rng_bit_generator` is the per-algorithm set for which a backend can emit native `stablehlo.rng_bit_generator`; every algorithm outside it is an inline expansion.
+
+## Options
+
+Every stage takes `**options`: `lower(graph, backend=..., **options)`, `compile(lowered, backend=..., **options)`, `load(artifact, backend=..., device=..., **options)`, and `run(executable, *args, **options)`.
+Option **keys are validated by the framework, values never are** — with two deliberate exceptions, `opt_level` and the bool-valued exporter options.
+
+```python
+graph    = evoxc.trace(fn, evoxc.TensorSpec((128, 128), evoxc.float32))
+lowered  = evoxc.lower(graph, backend="iree", opt_level="O2")
+artifact = evoxc.compile(lowered, backend="iree", iree_compile_args=["--iree-opt-data-tiling"])
+exe      = evoxc.load(artifact, backend="iree", device="cpu", iree_runtime_args=["--cuda_async_allocations=true"])
+```
+
+Each backend declares `KNOWN_OPTIONS` per stage (`lower`/`compile`/`load`/`run`) and a caller's dict is validated against the **union** of those sets — a key valid for any stage passes and is accepted-and-ignored at the others, so one dict can be forwarded to every stage.
+A key valid for no stage raises a `BackendError` listing the per-stage known sets.
+Flag values themselves pass straight through: evoxc never parses compiler flags.
+
+### `opt_level`
+
+The first evoxc-defined option, and the one evoxc validates itself: `"O0"`–`"O3"` (case-insensitive), `"0"`–`"3"`, or the integers `0`–`3`; anything else is a loud `BackendError` naming the accepted forms.
+
+```python
+exe = evoxc.build(fn, spec, backend="iree", opt_level="O3")
+```
+
+Per backend it becomes: iree's derived `--iree-opt-level=O{N}` flag (the `O` form is required — the compiler rejects numeric levels), XLA's `executable_build_options` field 24 in its compile-options proto, TVM's build `opt_level=` kwarg (which raises rather than dropping it on an installed TVM without the kwarg), and numpy documents it as ignored.
+Unset means byte-identical behaviour everywhere.
+
+### `dispatch_formation`
+
+The iree compile-stage knob for merged `batch_functions` population graphs, and the clearest example of an opt-in option:
+
+```python
+exe = evoxc.build(population_step, spec, backend="iree", device="rocm",
+                  dispatch_formation="aggressive")
+```
+
+- `"default"` or unset emits **no flag at all** — byte-identical compile args to a build without the option.
+- `"aggressive"` emits `--iree-dispatch-creation-enable-aggressive-fusion`.
+- Any other value is a loud `BackendError`.
+- Case and surrounding whitespace are normalized; a user flag with the same name wins over the derived one.
+
+It ships **opt-in** because the measurement is mixed: measured on iree 3.11 over a merged GP-population graph it takes 596 → 548 dispatches (2191 → 2021 ops), i.e. −5 % compile at population 4000 and −7…−9 % warm on rocm, while llvm-cpu is flat-to-worse.
+That is why it is enabled for rocm merged plans and left off elsewhere — evidence, probe and raw records: `evoxc/bench/dispatch_formation_findings.md`.
+On iree-base 3.13 the flag's own default is opt-level-dependent (off at `O0`, on at `O2` and above), so at `O2`/`O3` it yields a byte-identical vmfb.
+
+### Precedence: explicit > env > default
+
+Environment variables are read lazily per call; empty or whitespace counts as unset, and a malformed value raises a `BackendError` naming the variable and the value.
+The env vars are stage-scoped, and the compiler-option ones follow one naming scheme:
+
+```sh
+export EVOXC_BACKEND=iree            # default backend for build/evaluate/build_cached
+export EVOXC_DEVICE=rocm:0           # "kind[:index]"
+export EVOXC_OPT_LEVEL=O2            # opt_level default
+export EVOXC_DISPATCH_FORMATION=aggressive
+export EVOXC_IREE_COMPILE_ARGS="--iree-opt-data-tiling --mlir-print-ir-after-all"
+```
+
+An explicit keyword argument always wins over the env var, which wins over the evoxc default.
+Two further rules keep this honest:
+
+- **A raw same-name flag wins, never both.** Passing `iree_compile_args=["--iree-opt-level=O1"]` drops the derived `opt_level` flag; the same holds for `vulkan_target` and `--iree-vulkan-target`.
+- **Some flags are refused outright.** iree's `--iree-hal-target-backends` (use the `target_backends` option), `--iree-input-type` (StableHLO is always the input) and `--iree-vm-bytecode-module-output-format` raise with the reason; every other flag passes through.
+
+Bool-valued options (`split_reduction`, `split_reduction_non_exact`, `while_init_rewrite`) are type-coerced, so an env-style `"0"` can never hit the `bool("0") is True` trap.
+
+### One resolved dict, three stages
+
+`build`, `evaluate` and `build_cached` resolve the backend, the device and one options dict, then forward **that same dict** to `lower`, `compile` *and* `load`.
+That is what makes a load-stage option usable through the sugar: the XLA `plugin_path` is a compile *and* load option, so
+
+```python
+exe = evoxc.build(fn, spec, backend="xla", device="rocm",
+                  plugin_path="/opt/pjrt/xla_plugin.so")
+```
+
+reaches `load` without repeating it — and a persisted artifact loads without re-passing it either.
+
+<Aside type="note" title="Where the option tables live">
+Per-adapter keys, defaults and conflict rules are listed in [options](/reference/options/) and in the adapter contract (`evoxc/backends/adapters/CONTEXT.md`). This page covers the mechanism, not the full inventory.
+</Aside>
+
+## Registering a backend out of tree
+
+The registry is extensible without touching evoxc:
+
+```python
+import evoxc.backends as backends
+
+my_backend = MyStableHloBackend()        # a CompilerBackend subclass
+backends.register(my_backend)            # different instance, same name -> BackendError
+backends.register(my_backend, replace=True)   # the supported way to swap an adapter instance
+backends.unregister("my-compiler")       # removes and returns the instance
+```
+
+Re-registering the *same* instance is idempotent; a *different* instance under an existing name needs `replace=True`.
+For a reusable integration, publish an entry point instead and the registry will find it:
+
+```toml
+[project.entry-points."evoxc.backends"]
+my-compiler = "my_pkg.backend:my_backend"
+```
+
+A `get(name)` miss probes the optional in-tree adapters first, then scans the `evoxc.backends` entry-point group **once per process** (sorted by name) and retries.
+A loaded `Backend` instance is registered as-is, a module with `register()` has it called, any other callable is called; a failing entry point raises a `BackendError` naming it and chaining the cause.
+
+To write one, subclass `evoxc.backends.CompilerBackend`, declare `name` and `capabilities` (including `dtypes`), and implement only the compiler half — `compile` and `load`:
+
+```python
+class MyStableHloBackend(evoxc.backends.CompilerBackend):
+    name = "my-compiler"
+    capabilities = evoxc.backends.Capabilities(dtypes=frozenset({evoxc.float32}),
+                                              dynamic_shapes=True)
+
+    @classmethod
+    def check_available(cls):        # optional dependency probe, raise BackendError with a hint
+        ...
+
+    def compile(self, lowered, options=None): ...
+    def load(self, artifact, device=None, options=None): ...
+```
+
+The shared `lower()` already verifies the graph, checks capabilities, inlines portable decompositions and exports StableHLO, so an adapter must never re-lower.
+
+## Raw StableHLO with `compile_text`
+
+`evoxc.compile_text` is the explicit-staging escape hatch that skips tracing and `lower` entirely: hand-written or hand-edited StableHLO goes through the normal `compile` → `load`.
+
+```python
+MLIR = """
+module {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %c = stablehlo.constant dense<1.0> : tensor<4xf32>
+    %r = stablehlo.sqrt %x : tensor<4xf32>
+    %s = stablehlo.add %r, %c : tensor<4xf32>
+    return %s : tensor<4xf32>
+  }
+}
+"""
+
+exe = evoxc.compile_text(
+    MLIR,
+    [evoxc.TensorSpec((4,), evoxc.float32)],      # the OUTER input tuple
+    [evoxc.TensorSpec((4,), evoxc.float32)],
+    backend="iree",
+    device="cpu",
+)
+out = evoxc.run(exe, evoxc.tensor([1.0, 4.0, 9.0, 16.0]))[0]
+```
+
+Specs describe the outer tuple, so `evoxc.run(exe, a, b)` matches `tuple(input_specs)` and the outputs come back as a tuple; `output_specs` needs at least one spec.
+`backend` must be a compiler backend — numpy and native raise a `BackendError` naming themselves and suggesting `"iree"` — and the external compiler is the authority on whether the module is legal.
+This is also the round trip for `Executable.source_text()`: read the emitted text, edit it, compile it back.
+
+Next: [compiler adapters](/guides/compiler-adapters/) for the per-adapter semantics, or [tensors and devices](/guides/tensors-and-devices/) for the placement rules the options above assume.

@@ -5,4 +5,156 @@ sidebar:
   order: 6
 ---
 
-<!-- TODO(content): write the Compiler adapters page. -->
+The compiler adapters are how a traced graph reaches real hardware.
+They share everything above the compiler: verification, the capability pre-check, portable-decomposition inlining and the StableHLO export are done once by the shared `CompilerBackend.lower()`, so each adapter owns only its compiler half — `compile` (drive the external compiler on the MLIR text) and `load` (rebuild the executable, never recompiling).
+Two adapters fed the same graph therefore compile byte-identical MLIR, which is a useful property when you compare them.
+
+<img src="/evoxc-hardware.svg" alt="Hardware support in evoxc (EvoX Compiler): one traced graph runs on the numpy interpreter (cpu only, the default backend) or through a compiler adapter — IREE reaching llvm-cpu, NVIDIA CUDA, AMD ROCm and Vulkan-SPIRV; XLA reaching CUDA and ROCm through a PJRT plugin it discovers (a pip-installed jax_plugins plugin, or an explicit plugin path) and CPU only through a compiled test plugin (dashed); TVM reaching CPU end-to-end with ROCm compile-only (dashed). Placement is physical: Tensor.to(device) is the only transfer primitive and run outputs stay on the device they ran on." width="100%" />
+
+## Activation and explicit failure
+
+An adapter is never imported by `import evoxc`; it appears when you name it, and it either works or fails with a message telling you what to install:
+
+```python
+lowered = evoxc.lower(graph, backend="iree")     # activates the iree adapter
+```
+
+| Adapter | Dependency probe | Failure point |
+|---|---|---|
+| `iree` | `iree.compiler` / `iree.runtime` (pin `iree-base` 3.13.0) | `register()`, with a pip hint |
+| `xla` | none — registers **unconditionally** | `compile` / `load`, with the four-step discovery message |
+| `tvm` | `apache-tvm` (+ `jaxlib` for its MLIR bindings) | `register()`, with a pip hint |
+
+`iree` is `pip install evoxc[iree]`, `tvm` is `pip install evoxc[tvm]`, and `xla` has no extra because its dependency is a plugin `.so` rather than a package.
+XLA deliberately registers before any plugin exists — `plugin_path` is a per-call option — so its "missing dependency" error comes from the stage that needed it, and `check_available()` is the explicit, option-less preflight when you want to fail early:
+
+```python
+evoxc.backends.get("xla").check_available()   # raises BackendError with the same diagnostic, or returns None
+```
+
+XLA's plugin discovery is four steps, and the error message spells them out: `plugin_path` (a compile *and* load option) → `EVOXC_PJRT_PLUGIN` → the fixed well-known paths → an installed JAX PJRT plugin under `jax_plugins/<platform>/<name>_plugin.so`.
+That last step is why `pip install jax-rocm7-pjrt` (or `jax-cuda12-pjrt`) is enough to run on an accelerator with no path and no env var; `EVOXC_PJRT_PLUGIN_DISCOVERY=0` opts out of it.
+
+## What each adapter really is
+
+### IREE — the compiler and runtime, end to end
+
+`iree` drives `iree.compiler.compile_str` on the exported StableHLO text and runs the resulting VM flatbuffer on IREE's own HAL through `iree.runtime`.
+It is the only adapter that also carries host↔device staging, external-kernel segmentation and device-resident payloads.
+Its defaults are minimal and always overridable: `--iree-input-demote-f64-to-f32=false` always, `--iree-llvmcpu-target-cpu=generic` and `--iree-llvmcpu-link-embedded=false` on llvm-cpu only, plus a detected `--iree-rocm-target` on rocm.
+
+### XLA — the PJRT C API over a plugin, with no `jax`
+
+`xla` calls the PJRT C API through `ctypes` against a discovered plugin `.so`; MLIR text goes to `PJRT_Client_Compile` directly, so neither `jax` nor `jaxlib` is imported (nor needed).
+It is also the adapter whose device-resident `run` only enqueues work — see [tensors and devices](/guides/tensors-and-devices/) for the explicit `synchronize()` boundary.
+
+### TVM — StableHLO into Relax, jaxlib only for its bindings
+
+`tvm` translates the same MLIR with `tvm.relax.frontend.stablehlo.from_stablehlo`, builds a Relax VM executable and runs it on TVM's CPU runtime.
+`jaxlib` appears only because the vendored translator uses its bundled MLIR bindings; the `jax` package is never imported, and a compatibility shim covers the bindings version gap.
+
+## Device kinds and indices
+
+`backend=` picks the compiler; `device=` picks where it runs.
+A device is a `Device(kind, index)` and the indices are **per-kind enumeration indices**, not backend handles:
+
+| Kind | iree target | Notes |
+|---|---|---|
+| `cpu` | `llvm-cpu` | host data in, host data out — the tensors really are `cpu:0` |
+| `cuda` | `cuda` | NVIDIA; device-resident, HAL id `index + 1` |
+| `rocm` (alias `hip`) | `rocm` | AMD; device-resident, HAL id `index + 1` |
+| `vulkan` | `vulkan-spirv` | device-resident, HAL id is a queried UUID hash |
+
+- **ROCm device ids are 1-based** in IREE's HAL, and the adapter maps `Device("rocm", N)` onto `device_id = N + 1` (id 0 raises).
+  IREE has no ROCm target auto-detection, so the adapter injects a detected `--iree-rocm-target=gfxNNN` (`amdgpu-arch`, then `rocm_agent_enumerator`) unless you pass one.
+- **Vulkan device ids are per-process UUID hashes**, not ordinals: the adapter maps `Device("vulkan", N)` onto `query_available_devices()[N]` and creates the device from that info dict.
+  An out-of-range index raises an explicit error naming the requested index and the enumerated count, and zero devices names the cause.
+- `xla` serves `cpu`, `cuda` and `rocm`/`hip` only — it does **not** serve `vulkan`, and an accelerator plugin is refused for `Device("cpu", 0)` rather than mislabelled. A kind its plugin platform does not physically serve is an explicit `BackendError`.
+- `tvm` is CPU only: the `apache-tvm` wheel is built with ROCm support off.
+- A device kind an adapter does not accept is an explicit `BackendError`; a non-`Device` object is a `DeviceError`.
+
+`target_backends` is the iree compile option behind all of this: it defaults to `["llvm-cpu"]`, accepts `{"llvm-cpu", "cuda", "rocm", "vulkan-spirv"}`, and drives `--iree-hal-target-backends` (passing that flag yourself is refused).
+Through the `build`/`evaluate` sugar it is inferred from the resolved device when neither the option nor `EVOXC_TARGET_BACKENDS` is set; explicit-stage users pass it to `compile()` themselves.
+
+## `vulkan_target`
+
+IREE's Vulkan backend compiles against a SPIR-V target profile, and its default is `vp_android_baseline_2022` — 16384 bytes of workgroup shared memory, 128 threads — which is not enough for a large graph.
+The `vulkan_target` compile option derives `--iree-vulkan-target=<profile>` (env `EVOXC_IREE_VULKAN_TARGET`; a raw flag of the same name wins):
+
+```python
+exe = evoxc.build(fn, spec, backend="iree", device="vulkan", vulkan_target="rdna3")
+```
+
+Three facts worth internalizing:
+
+- **Unset derives no flag.** Compile args stay byte-identical, and a value supplied without `vulkan-spirv` in `target_backends` is a loud `BackendError`.
+- **The value is the compiler's to validate.** evoxc forwards it verbatim and never parses it; a rejected value is an actionable compile error that names the option and the installed compiler's rejection.
+- **An accepted profile is not a correctness contract.** On the reference host `llvmpipe` and `adreno` both compiled a correct matmul yet were exactly 2× and 0.5× on a rank-0 reduce, and `gfx942` compiles then fails at load. Naming a real-GPU profile is worth roughly 3× on a compute-bound matmul and 6× on a large rank-0 reduction, so check the actual device.
+
+**No Intel Xe / Panther-Lake profile exists**: `iree-base` 3.13.0 accepts 68 profiles and none is Intel Xe/PTL, so an Intel GPU runs the default profile. Intel GPUs use the same vendor-neutral `vulkan-spirv` path — `Device("vulkan", index)` — and an Intel claim should check the enumerated device name and ICD provenance, because a software rasterizer can occupy an index too.
+
+## Device-resident execution
+
+On `cuda`, `rocm` and `vulkan` the adapter runs **device-resident**, and the placement rules from [tensors and devices](/guides/tensors-and-devices/) are enforced at the run boundary:
+
+- outputs wrap the adapter's device payload on the device the work ran on, and are never auto-copied to the host;
+- same-device inputs pass through with **zero** host round-trips;
+- a host tensor or raw ndarray handed to a non-cpu executable raises `DeviceError` before dispatch;
+- `.numpy()` on a non-cpu output raises; `t.to(Device("cpu", 0))` is the only readback;
+- `Tensor.to(Device(kind, N))` goes through the provider each adapter registered, so uploads use that adapter's staging path.
+
+`llvm-cpu` runs keep feeding and reading host data — their tensors are `cpu:0` — and are the one case where the compiler's "device" is the host itself.
+
+## Validation state
+
+Exactly as recorded in this repository's contracts:
+
+| Adapter | Validated |
+|---|---|
+| `iree` | llvm-cpu, CUDA, ROCm/HIP and Vulkan/SPIR-V end to end |
+| `xla` | CUDA and ROCm against real plugins; CPU plumbing with a compiled test plugin |
+| `tvm` | CPU end to end; ROCm **compile-only** |
+
+Details that keep that table honest:
+
+- **IREE on llvm-cpu and ROCm/HIP** was re-validated device-resident on the `iree-base` 3.13.0 pin — `while_loop`, `scan`, `while` nested in `cond` and the MO/NSGA2-class non-domination loop compile and run with numpy parity, with 0 crashes in 30 compiles (records: `evoxc/bench/iree313_rocm_findings.md`). A fully input-independent counted `while` still fails to *compile* on that pin, with a clean compiler error.
+- **IREE on CUDA** was validated on the 3.11 release and is not re-exercised on 3.13 here (no NVIDIA GPU on the validating host).
+- **IREE on Vulkan** was validated on Mesa lavapipe, a software device, and on real Intel Panther Lake hardware through Mesa ANV with the pinned 3.13.0: five same-device resident iterations with zero `asdevicearray` calls against numpy, and the Vulkan suites 101/101 with no skips (`evoxc/bench/intel_vulkan_findings.md`). That is correctness and residency only — not general Intel coverage, performance or model readiness.
+- **TVM on ROCm** lowers fine and then fails explicitly at execution, because the wheel is built with ROCm off; never put TVM in a ROCm run matrix.
+
+## Symbolic shapes
+
+Symbolic dimensions are supported **per op**, not per backend: the exporter decides.
+Elementwise ops, casts, selects, reductions over static dims, transpose, concat and `dot` work; reshape, conv, slice, pad and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` with a clear `BackendError`.
+This is why vectorizing a softmax/layernorm/attention-style per-sample function defers on compiler backends while the numpy interpreter and the `native` engine handle every symbolic shape.
+XLA additionally compiles static shapes only, and enforces the recorded shapes exactly at `run()`.
+
+## Rank-0 float reductions on Vulkan
+
+A reduce whose result is rank-0 is lowered by IREE to a single workgroup of a single thread, so a full reduction is dramatically slower than an axis reduction.
+On the reference Intel iGPU a full `sum` of 16.8M f32 measured **648.5 ms**, versus **10.9 ms** with `split_reduction_non_exact=True` — about 59× — on the same graph.
+
+```python
+exe = evoxc.build(fn, spec, backend="iree", device="vulkan",
+                  split_reduction_non_exact=True)
+```
+
+The two knobs are different and both are lower-stage exporter options:
+
+- `split_reduction` (default **on**) splits rank-0-result reductions into two stages for the numerically **exact** classes; `False` restores the byte-identical single-stage text.
+- `split_reduction_non_exact` (default **off**) additionally splits float `sum`/`prod` — and therefore `reduce_mean`/`var` — which **reassociates** the floating-point accumulation. That is why it is opt-in, and why it is the documented fix for this cliff rather than the default.
+- `split_reduction_threshold` (default `1024`) is the minimum reduced extent that gets split.
+
+## v1 limits
+
+These are explicit errors, never silent fallbacks:
+
+- **Collectives are not compiled** by any adapter: multi-rank runtime channels are not wired, so a graph containing `evoxc.dist.*` collectives fails. See [collectives](/guides/collectives/).
+- **`runtime_call` is not compiled** — a Python callback cannot run inside a compiled module.
+- **`custom_call` and `inline_stablehlo` are forwarded verbatim** and the target compiler decides: evoxc keeps no target registry and pre-validates nothing, so an unknown `stablehlo.custom_call` target parses and then fails the compiler's legality check. There is no IREE custom-dispatch object-linking path and no PJRT custom-call registration, so **a kernel cannot be fused into a compiled module**.
+- **The supported kernel path is segmentation**: `evoxc.external_call` splits the graph into segments with the kernel at the boundary (host-mode, or device-resident and zero-copy through DLPack, with the kernel owning synchronization), or a `block` with a portable decomposition that the adapter inlines at `lower()`.
+- **Sparse ops defer**: the 16 `sparse_*` ops are numpy-backend-only and raise a `BackendError` suggesting `evoxc.sparse.to_dense`.
+- **Unsigned and complex dtypes vary per adapter**: iree supports no unsigned and no complex (nondeterministic upstream unsigned reduce legalization; the exporter defers complex), xla supports all 14, tvm supports unsigned but no complex.
+- **Function shape gates the compile**: iree needs a `main` function or exactly one entry function, TVM needs exactly one `func.func` with a single-operand return, and external-call splitting needs a single-function graph.
+
+For recipes and every measured trap, see the adapter contract in the repository (`evoxc/backends/adapters/CONTEXT.md`) and [options](/reference/options/) for the per-adapter option keys.
