@@ -13,10 +13,10 @@ This page is the map of those reads, a worked debugging session, and the error t
 | Object | Reads | Never |
 |---|---|---|
 | `Defn` | `repr` — the wrapped function's qualname and module | Executes anything |
-| `Graph` | `repr`, `summary()`, `digest()`, `text()`, `print()`, `verify()` | Traces, compiles or mutates the graph |
-| `LoweredProgram` | `repr`, `summary()`, `source_text()`, `text()` | Compiles or reads a backend handle |
-| `CompiledArtifact` | `repr`, `summary()`, `source_text()`, `text()` | Loads, or reconstructs a device |
-| `Executable` / `BoundExecutable` | `repr`, `summary()`, `plan_text()` | Runs, transfers, or materialises data |
+| [`Graph`](/api/evoxc/trace/graph/) | `repr`, `summary()`, `digest()`, `text()`, `print()`, `verify()` | Traces, compiles or mutates the graph |
+| [`LoweredProgram`](/api/evoxc/backends/loweredprogram/) | `repr`, `summary()`, `source_text()`, `text()` | Compiles or reads a backend handle |
+| [`CompiledArtifact`](/api/evoxc/backends/compiledartifact/) | `repr`, `summary()`, `source_text()`, `text()` | Loads, or reconstructs a device |
+| [`Executable`](/api/evoxc/backends/executable/) / `BoundExecutable` | `repr`, `summary()`, `plan_text()` | Runs, transfers, or materialises data |
 | `Tensor` | `repr` — shape/dtype/device plus a ≤8-element host preview | Calls `.numpy()`, forces a copy or raises |
 
 Every dict-returning helper is JSON-safe, and every one of these methods is a thin delegation to a renderer: none of them traces, compiles, executes, transfers, mutates the object or populates a cache.
@@ -145,15 +145,15 @@ All public errors derive from `evoxc.EVOXCError`, so one `except` catches everyt
 
 | Error | What it means | What to do |
 |---|---|---|
-| `EVOXCError` | The base class — catch it when you do not care which stage failed | Log it; the message names the stage |
-| `TraceError` | Graph construction misuse: an op call outside a trace, a concrete `Tensor` operand, a `Defn` called directly, a symbolic index, a graph value used as a Python boolean | Pass a `TensorSpec`, make the tensor an explicit input, use `evoxc.constant`, or use `cond`/`while_loop` instead of Python `if`/`for` |
-| `ShapeError` | A shape/rank/axis/broadcast/padding conflict, or a statically knowable shape mismatch | Fix the shapes at trace time; a symbolic mismatch is caught by the backend at run time |
-| `TransformError` | A graph→graph transform could not answer: axis mismatch, no batching rule, no derivative rule | Only the documented deferrals raise this — a transform never falls back silently |
-| `BackendError` | The backend cannot lower/compile/load/run this: a capability gap, an unsupported op, an unknown option key, a missing compiler | Read the message — it names the op/option and the alternative; switching backend or densifying is usually the fix |
-| `PersistenceError` | A save/load failure: format or version mismatch, integrity hash failure, backend/device/ABI incompatibility | Rebuild rather than hand-edit a container; loading never re-traces or recompiles |
-| `DeviceError` | A device problem: unknown kind/index, a device mismatch at the run boundary, a DLPack failure, an implicit transfer that does not exist | Place data explicitly with `Tensor.to(device)`; read back with `.to(evoxc.Device("cpu", 0)).numpy()` |
-| `DTypeError` | An object cannot be normalised to a supported dtype, or the op/backend does not accept that dtype | Cast explicitly with `evoxc.cast` |
-| `VerificationError` | IR verification failed — a malformed module, an operand/result mismatch, a violated invariant | Usually a bug in a custom op declaration or a hand-edited artifact; `graph.verify()` reproduces it |
+| [`EVOXCError`](/api/evoxc/core/evoxcerror/) | The base class — catch it when you do not care which stage failed | Log it; the message names the stage |
+| [`TraceError`](/api/evoxc/core/traceerror/) | Graph construction misuse: an op call outside a trace, a concrete `Tensor` operand, a `Defn` called directly, a symbolic index, a graph value used as a Python boolean | Pass a `TensorSpec`, make the tensor an explicit input, use `evoxc.constant`, or use `cond`/`while_loop` instead of Python `if`/`for` |
+| [`ShapeError`](/api/evoxc/core/shapeerror/) | A shape/rank/axis/broadcast/padding conflict, or a statically knowable shape mismatch | Fix the shapes at trace time; a symbolic mismatch is caught by the backend at run time |
+| [`TransformError`](/api/evoxc/core/transformerror/) | A graph→graph transform could not answer: axis mismatch, no batching rule, no derivative rule | Only the documented deferrals raise this — a transform never falls back silently |
+| [`BackendError`](/api/evoxc/core/backenderror/) | The backend cannot lower/compile/load/run this: a capability gap, an unsupported op, an unknown option key, a missing compiler | Read the message — it names the op/option and the alternative; switching backend or densifying is usually the fix |
+| [`PersistenceError`](/api/evoxc/core/persistenceerror/) | A save/load failure: format or version mismatch, integrity hash failure, backend/device/ABI incompatibility | Rebuild rather than hand-edit a container; loading never re-traces or recompiles |
+| [`DeviceError`](/api/evoxc/core/deviceerror/) | A device problem: unknown kind/index, a device mismatch at the run boundary, a DLPack failure, an implicit transfer that does not exist | Place data explicitly with `Tensor.to(device)`; read back with `.to(evoxc.Device("cpu", 0)).numpy()` |
+| [`DTypeError`](/api/evoxc/core/dtypeerror/) | An object cannot be normalised to a supported dtype, or the op/backend does not accept that dtype | Cast explicitly with `evoxc.cast` |
+| [`VerificationError`](/api/evoxc/core/verificationerror/) | IR verification failed — a malformed module, an operand/result mismatch, a violated invariant | Usually a bug in a custom op declaration or a hand-edited artifact; `graph.verify()` reproduces it |
 
 Three of them, verbatim:
 

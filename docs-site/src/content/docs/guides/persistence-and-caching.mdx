@@ -14,10 +14,10 @@ Every stage object writes the same self-describing container (`evoxc.persist`), 
 
 | Object | Method | Payload | Suffix named by the contract |
 |---|---|---|---|
-| `Graph` | `graph.save(path)` / `evoxc.Graph.load(path)` | the serialized IR module, input/output trees, specs, static values, source locations | `.evoxcgraph` |
-| `LoweredProgram` | `.save(path)` / `evoxc.LoweredProgram.load(path)` | the backend's program (for a StableHLO lowering, the MLIR text inside the compiler payload) | any path — a persist container |
-| `CompiledArtifact` | `.save(path)` / `evoxc.CompiledArtifact.load(path)` | the compiled form plus required custom ops and runtime dependencies | `.evoxcartifact` |
-| `Executable` | `.save(path)` / `evoxc.Executable.load(path, backend=None, device=None)` | delegates to the backend executable, which saves the artifact and reconstructs explicitly | backend-defined |
+| [`Graph`](/api/evoxc/trace/graph/) | `graph.save(path)` / `evoxc.Graph.load(path)` | the serialized IR module, input/output trees, specs, static values, source locations | `.evoxcgraph` |
+| [`LoweredProgram`](/api/evoxc/backends/loweredprogram/) | `.save(path)` / `evoxc.LoweredProgram.load(path)` | the backend's program (for a StableHLO lowering, the MLIR text inside the compiler payload) | any path — a persist container |
+| [`CompiledArtifact`](/api/evoxc/backends/compiledartifact/) | `.save(path)` / `evoxc.CompiledArtifact.load(path)` | the compiled form plus required custom ops and runtime dependencies | `.evoxcartifact` |
+| [`Executable`](/api/evoxc/backends/executable/) | `.save(path)` / `evoxc.Executable.load(path, backend=None, device=None)` | delegates to the backend executable, which saves the artifact and reconstructs explicitly | backend-defined |
 
 Each save records the backend name (and, for a compiled artifact, the target), the signature (TreeSpecs plus per-leaf specs and static values) and the format version, so a load can validate what it is about to hand back.
 
@@ -91,7 +91,7 @@ evoxc.Graph.load("step.evoxcgraph").digest() == graph.digest()   # True
 
 ## Caching is explicit: `Cache` and `FileCache`
 
-There is no global cache in evoxc. `evoxc.Cache` is an interface — `get`, `put`, `contains`, `clear`, and a `get_or_compute` alias — and `evoxc.FileCache(directory)` is the on-disk implementation, one container file per key.
+There is no global cache in evoxc. [`evoxc.Cache`](/api/evoxc/persist/cache/) is an interface — `get`, `put`, `contains`, `clear`, and a `get_or_compute` alias — and [`evoxc.FileCache(directory)`](/api/evoxc/persist/filecache/) is the on-disk implementation, one container file per key.
 
 ```python
 cache = evoxc.FileCache("/var/cache/evoxc")
@@ -102,7 +102,7 @@ cache.get_or_compute(key, compute)   # compute(), store, return
 ```
 
 Keying is a **caller** contract: the components must include everything that affects the value — graph bytes or digest, format/IR version, static values, signatures, backend name and version, compiler options and target, custom ops, runtime ABI.
-`evoxc.persist.compute_key(key_components)` derives the SHA-256 hex key and tags the container type, so a bare string and a one-element list do not collide.
+[`evoxc.persist.compute_key(key_components)`](/api/evoxc/persist/compute-key/) derives the SHA-256 hex key and tags the container type, so a bare string and a one-element list do not collide.
 One sharp edge: a top-level `dict` passed as the key contributes its *keys* only — pass `[options_dict]` when the values must affect the key.
 Corrupt entries are treated as a miss (recompute and overwrite atomically when a compute function was given, otherwise `None`); that is the one documented place evoxc swallows an error.
 
@@ -112,7 +112,7 @@ A cache entry is only as correct as the key you assembled. Persistence does not 
 
 ## Memoised builds: `build_cached`
 
-`evoxc.build_cached(fn, *specs, backend=None, device=None, cache=None, **options)` is documented shorthand for a **memoised** `build`: the exact `trace → lower → compile → load` composition runs at most once per distinct key, and a hit returns the same fully loaded `Executable` with zero pipeline work.
+[`evoxc.build_cached(fn, *specs, backend=None, device=None, cache=None, **options)`](/api/evoxc/build-cache/build-cached/) is documented shorthand for a **memoised** `build`: the exact `trace → lower → compile → load` composition runs at most once per distinct key, and a hit returns the same fully loaded `Executable` with zero pipeline work.
 
 ```python
 cache = evoxc.CompileCache(maxsize=64)          # in-memory LRU, maxsize=128 by default
@@ -134,7 +134,7 @@ The static-content rule is what makes it fit meta-level loops: each distinct sta
 An unencodable static leaf raises a `TypeError` naming the key component path (`specs[2]`, `specs[3]['w']`) before any cache access.
 
 Bookkeeping is strict: `fn` validation, backend/device resolution, cache-type checks and encodability all fire first; post-key stage failures count a miss, insert nothing and re-raise untouched, so a cached failure never exists.
-Only a fully loaded `Executable` is ever inserted, `CompileCache` is in-memory only (executables hold device handles, vmfb or compiled code — never persisted), and there is deliberately no `cache=False` escape: plain `evoxc.build` is the no-cache path.
+Only a fully loaded `Executable` is ever inserted, [`CompileCache`](/api/evoxc/build-cache/compilecache/) is in-memory only (executables hold device handles, vmfb or compiled code — never persisted), and there is deliberately no `cache=False` escape: plain `evoxc.build` is the no-cache path.
 `cache=None` selects the module-level default `CompileCache`; pass your own for isolation.
 
 ### Why the loop cares
