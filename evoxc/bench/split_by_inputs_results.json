@@ -1,0 +1,2200 @@
+{
+  "_meta": {
+    "accounting": {
+      "amortized_from_min": "the same table recomputed from each call shape's min sample, as a cross-check on the medians",
+      "amortized_per_repetition_ratio": "THE PRIMARY TABLE: for every repetition the ratio unsplit_per_generation / split_per_generation (and / hand_written_per_generation) is computed from that repetition's own samples and the reported number is the median of those --reps ratios; one repetition times every call shape, so a host mode shared by the whole repetition cancels, while two formulations' separate medians can land in different modes (see _meta.shared_host_caveat)",
+      "crossover_reuse_analytic": "ceil((split_total_ms + prepare_run - unsplit_total_ms) / (unsplit_run - apply_run)), i.e. the k above which (split_total + prepare_run)/k + apply_run drops below unsplit_total/k + unsplit_run",
+      "crossover_reuse_from_per_repetition_ratio": "the first N_apply in --reuse whose median per-repetition speedup >= 1.00",
+      "crossover_reuse_measured": "the first N_apply in --reuse whose measured speedup >= 1.00",
+      "hand_written_per_generation_ms": "(hand_written_total_ms + hand prepare run median) / N_apply + hand apply run median",
+      "hand_written_total_ms": "trace(hand prepare) + trace(hand apply) + lower+compile+load(both)",
+      "run_samples": "every raw per-repetition sample of every call shape, in issue order, so the mode mixture behind each table is auditable rather than hidden behind min/median/max",
+      "split_per_generation_ms": "(split_total_ms + prepare run median) / N_apply + apply run (median)",
+      "split_total_ms": "trace(source) + split_by_inputs + lower+compile+load(prepare) + lower+compile+load(apply)",
+      "unsplit_per_generation_ms": "unsplit_total_ms / N_apply + unsplit run (median)",
+      "unsplit_total_ms": "trace(source) + lower+compile+load(source)"
+    },
+    "available_backends": [
+      "numpy"
+    ],
+    "backends": [
+      "numpy"
+    ],
+    "batch_candidates": 64,
+    "boundary_size": 16384,
+    "cpu_count": 16,
+    "cpu_model": "13th Gen Intel(R) Core(TM) i5-13400F",
+    "date_utc": "2026-11-27T18:53:28+00:00",
+    "env": {
+      "EVOXC_DISABLE_LOCATIONS": "1"
+    },
+    "evoxc": "0.0.0+unknown",
+    "labels": [
+      "seed0"
+    ],
+    "last_label": "seed0",
+    "limits": "numpy interpreter backend only (host memory on Device('cpu', 0)); no device transfers, no compiled backend and no multi-process measurement are part of this record; the boundary is re-read from host memory, so a device-resident boundary would pay an explicit upload the numpy backend does not model",
+    "loadavg_end": [
+      1.66,
+      3.15,
+      2.78
+    ],
+    "loadavg_start": [
+      1.66,
+      3.15,
+      2.78
+    ],
+    "machine": "x86_64",
+    "native_extension": null,
+    "note": "the top-level _meta describes the most recent run; every runs.<label> entry carries its own date_utc/command/versions/loadavg snapshot so older labels stay self-describing",
+    "numpy": "2.5.5",
+    "platform": "Linux-6.18.63-x86_64-with-glibc2.44",
+    "probe": "evoxc/bench/probe_split_by_inputs.py",
+    "protocol": "every timed stage is interleaved per repetition (trace, build and run each measure all formulations once per repetition, in the same order) so a contention episode on this shared host is spread across formulations; each call shape gets one untimed warmup",
+    "python": "3.14.10",
+    "reps": 21,
+    "reuse_counts": [
+      1,
+      4,
+      16,
+      64
+    ],
+    "seed": 0,
+    "shared_host_caveat": "the host is shared and runs in slow-moving fast/slow modes \u2014 the SAME call samples anywhere from ~1.4 to ~59 ms in one 21-repetition cell \u2014 so a formulation's min and median are mode statistics, not its cost: all timed stages are interleaved per repetition, the amortized table is reported THREE ways (medians, mins, and the median of per-repetition ratios with the mode cancelled), the load average is recorded at both ends, one timing process runs at a time, and the ratios are the claim while the absolute milliseconds are indicative rather than isolated-hardware measurements",
+    "sizes": [
+      512,
+      4096
+    ],
+    "threading": {
+      "cpu_affinity": 16,
+      "cpu_count_reported": 16,
+      "effective_env": {
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1"
+      },
+      "nproc_reported": 4,
+      "pinned": true,
+      "requested": 1,
+      "why": "this host reports more CPUs to Python than the cgroup actually grants (os.cpu_count vs nproc), so the ambient BLAS/OpenMP pools oversubscribe it and a BLAS-bound cell comes out bimodal, the same work sampling anywhere from a few to tens of milliseconds; the pools are pinned so two formulations are compared on the same footing, and the effective values are recorded here"
+    },
+    "unavailable_backends": {},
+    "vmap": {
+      "reason": "the Rust extension evoxc._evoxc_native is not built in this worktree and every builtin transform (vmap included) delegates to it with no Python fallback; the batched comparison is a hand-written graph validated against 64 separate applies",
+      "status": "unavailable"
+    }
+  },
+  "runs": {
+    "seed0": {
+      "accounting": {
+        "amortized_from_min": "the same table recomputed from each call shape's min sample, as a cross-check on the medians",
+        "amortized_per_repetition_ratio": "THE PRIMARY TABLE: for every repetition the ratio unsplit_per_generation / split_per_generation (and / hand_written_per_generation) is computed from that repetition's own samples and the reported number is the median of those --reps ratios; one repetition times every call shape, so a host mode shared by the whole repetition cancels, while two formulations' separate medians can land in different modes (see _meta.shared_host_caveat)",
+        "crossover_reuse_analytic": "ceil((split_total_ms + prepare_run - unsplit_total_ms) / (unsplit_run - apply_run)), i.e. the k above which (split_total + prepare_run)/k + apply_run drops below unsplit_total/k + unsplit_run",
+        "crossover_reuse_from_per_repetition_ratio": "the first N_apply in --reuse whose median per-repetition speedup >= 1.00",
+        "crossover_reuse_measured": "the first N_apply in --reuse whose measured speedup >= 1.00",
+        "hand_written_per_generation_ms": "(hand_written_total_ms + hand prepare run median) / N_apply + hand apply run median",
+        "hand_written_total_ms": "trace(hand prepare) + trace(hand apply) + lower+compile+load(both)",
+        "run_samples": "every raw per-repetition sample of every call shape, in issue order, so the mode mixture behind each table is auditable rather than hidden behind min/median/max",
+        "split_per_generation_ms": "(split_total_ms + prepare run median) / N_apply + apply run (median)",
+        "split_total_ms": "trace(source) + split_by_inputs + lower+compile+load(prepare) + lower+compile+load(apply)",
+        "unsplit_per_generation_ms": "unsplit_total_ms / N_apply + unsplit run (median)",
+        "unsplit_total_ms": "trace(source) + lower+compile+load(source)"
+      },
+      "available_backends": [
+        "numpy"
+      ],
+      "backends": [
+        "numpy"
+      ],
+      "batch_candidates": 64,
+      "boundary_size": 16384,
+      "cells": {
+        "A_fixed_precompute|4096": {
+          "amortized": {
+            "1": {
+              "hand_written_ms": 2.318,
+              "speedup_hand_written_over_split": 0.91,
+              "speedup_unsplit_over_hand_written": 0.93,
+              "speedup_unsplit_over_split": 0.85,
+              "split_ms": 2.55,
+              "unsplit_ms": 2.161
+            },
+            "16": {
+              "hand_written_ms": 0.226,
+              "speedup_hand_written_over_split": 0.92,
+              "speedup_unsplit_over_hand_written": 6.36,
+              "speedup_unsplit_over_split": 5.84,
+              "split_ms": 0.247,
+              "unsplit_ms": 1.441
+            },
+            "4": {
+              "hand_written_ms": 0.645,
+              "speedup_hand_written_over_split": 0.91,
+              "speedup_unsplit_over_hand_written": 2.46,
+              "speedup_unsplit_over_split": 2.24,
+              "split_ms": 0.707,
+              "unsplit_ms": 1.585
+            },
+            "64": {
+              "hand_written_ms": 0.122,
+              "speedup_hand_written_over_split": 0.93,
+              "speedup_unsplit_over_hand_written": 11.53,
+              "speedup_unsplit_over_split": 10.69,
+              "split_ms": 0.131,
+              "unsplit_ms": 1.405
+            }
+          },
+          "amortized_from_min": {
+            "1": {
+              "hand_written_ms": 2.16,
+              "speedup_hand_written_over_split": 0.89,
+              "speedup_unsplit_over_hand_written": 0.94,
+              "speedup_unsplit_over_split": 0.84,
+              "split_ms": 2.415,
+              "unsplit_ms": 2.039
+            },
+            "16": {
+              "hand_written_ms": 0.208,
+              "speedup_hand_written_over_split": 0.94,
+              "speedup_unsplit_over_hand_written": 6.34,
+              "speedup_unsplit_over_split": 5.94,
+              "split_ms": 0.222,
+              "unsplit_ms": 1.319
+            },
+            "4": {
+              "hand_written_ms": 0.598,
+              "speedup_hand_written_over_split": 0.91,
+              "speedup_unsplit_over_hand_written": 2.44,
+              "speedup_unsplit_over_split": 2.21,
+              "split_ms": 0.661,
+              "unsplit_ms": 1.463
+            },
+            "64": {
+              "hand_written_ms": 0.111,
+              "speedup_hand_written_over_split": 0.98,
+              "speedup_unsplit_over_hand_written": 11.61,
+              "speedup_unsplit_over_split": 11.4,
+              "split_ms": 0.113,
+              "unsplit_ms": 1.283
+            }
+          },
+          "amortized_per_repetition_ratio": {
+            "1": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 0.93,
+              "speedup_unsplit_over_split": 0.85
+            },
+            "16": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 6.35,
+              "speedup_unsplit_over_split": 5.95
+            },
+            "4": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 2.45,
+              "speedup_unsplit_over_split": 2.25
+            },
+            "64": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 11.54,
+              "speedup_unsplit_over_split": 11.05
+            }
+          },
+          "apply_digest": "f7b80fda7e892a65775a4ce07c7fabf048a9e9ec5069d6a635faacab61c7104b",
+          "apply_ops": 4,
+          "backend": "numpy",
+          "batched_vmap_stand_in": {
+            "batched_ops": 15,
+            "build": {
+              "staging": {
+                "max_ms": 2.343,
+                "median_ms": 0.443,
+                "min_ms": 0.426
+              },
+              "total_ms": 0.729,
+              "trace_ms": 0.286
+            },
+            "candidates": 64,
+            "note": "the graph vmap(fitness, in_axes=(None, None, 0)) expands to; vmap itself is unavailable in this worktree (see _meta.vmap), so this stand-in is validated against 64 separate applies",
+            "parity_max_abs_err_vs_64_applies": 1.8533319234848022e-07,
+            "per_candidate_ms": {
+              "batched_one_run": 0.039,
+              "split_64_applies": 0.131,
+              "unsplit_64_runs": 1.405
+            },
+            "run": {
+              "max_ms": 3.501,
+              "median_ms": 1.737,
+              "min_ms": 1.559
+            },
+            "status": "measured as a hand-written batched graph",
+            "totals_for_candidates": {
+              "batched_one_run_ms": 2.466,
+              "speedup_batched_over_split_64": 3.41,
+              "speedup_batched_over_unsplit_64": 36.46,
+              "split_64_applies_ms": 8.409,
+              "unsplit_64_runs_ms": 89.92
+            }
+          },
+          "boundary": [
+            {
+              "defining_op": "tanh",
+              "dtype": "float32",
+              "is_input": false,
+              "nbytes": 1048576,
+              "shape": [
+                4096,
+                64
+              ]
+            }
+          ],
+          "boundary_bytes": 1048576,
+          "boundary_overhead_ms_one_turn": 0.039,
+          "boundary_values": 1,
+          "build": {
+            "apply_ms": 0.196,
+            "hand_apply_ms": 0.193,
+            "hand_apply_trace_ms": 0.112,
+            "hand_prepare_ms": 0.366,
+            "hand_prepare_trace_ms": 0.233,
+            "hand_written_total_ms": 0.904,
+            "prepare_ms": 0.362,
+            "split_total_ms": 1.118,
+            "split_transform_ms": 0.263,
+            "trace_ms": 0.297,
+            "unsplit_staging_ms": 0.471,
+            "unsplit_total_ms": 0.768
+          },
+          "build_spread": {
+            "apply": {
+              "max_ms": 1.02,
+              "median_ms": 0.196,
+              "min_ms": 0.187
+            },
+            "hand_apply": {
+              "max_ms": 1.073,
+              "median_ms": 0.193,
+              "min_ms": 0.188
+            },
+            "hand_prepare": {
+              "max_ms": 1.975,
+              "median_ms": 0.366,
+              "min_ms": 0.357
+            },
+            "prepare": {
+              "max_ms": 22.199,
+              "median_ms": 0.362,
+              "min_ms": 0.354
+            },
+            "unsplit": {
+              "max_ms": 2.592,
+              "median_ms": 0.471,
+              "min_ms": 0.457
+            }
+          },
+          "crossover_reuse_analytic": 2,
+          "crossover_reuse_from_per_repetition_ratio": 4,
+          "crossover_reuse_measured": 4,
+          "dropped_ops": 0,
+          "expectation": "win",
+          "fixed_leaves": [
+            0,
+            1
+          ],
+          "hand_written": {
+            "apply_digest": "d15e44867bd0ffdb492e2214ddfd7079cecebc97f4c25d9b94ca57aa4911d5bf",
+            "apply_ops": 4,
+            "ops_match_split": true,
+            "prepare_digest": "fe6224d517e05f7627099f3e1528867581d136f56c230329f83aaf0efbfac4e8",
+            "prepare_ops": 12
+          },
+          "label": "fixed precompute (GP/NEAT fitness)",
+          "output_device": "Device(kind='cpu', index=0)",
+          "parity_max_abs_err": {
+            "hand_written": 0.0,
+            "split": 0.0,
+            "unsplit": 0.0
+          },
+          "prepare_digest": "49dcbded9db47b0b55b3626b34ccdbca4a4f4302e5a7396099e6f97095fd2c26",
+          "prepare_ops": 12,
+          "prepared_device": "Device(kind='cpu', index=0)",
+          "reps": 21,
+          "reuse_counts": [
+            1,
+            4,
+            16,
+            64
+          ],
+          "rows": 4096,
+          "run": {
+            "apply": {
+              "max_ms": 0.288,
+              "median_ms": 0.093,
+              "min_ms": 0.076
+            },
+            "batched": {
+              "max_ms": 3.501,
+              "median_ms": 1.737,
+              "min_ms": 1.559
+            },
+            "hand_apply": {
+              "max_ms": 0.175,
+              "median_ms": 0.087,
+              "min_ms": 0.078
+            },
+            "hand_prepare": {
+              "max_ms": 3.838,
+              "median_ms": 1.327,
+              "min_ms": 1.178
+            },
+            "prepare": {
+              "max_ms": 5.618,
+              "median_ms": 1.339,
+              "min_ms": 1.221
+            },
+            "unsplit": {
+              "max_ms": 35.856,
+              "median_ms": 1.393,
+              "min_ms": 1.271
+            }
+          },
+          "run_samples": {
+            "apply": [
+              0.143,
+              0.288,
+              0.105,
+              0.1,
+              0.107,
+              0.09,
+              0.103,
+              0.093,
+              0.093,
+              0.114,
+              0.098,
+              0.092,
+              0.076,
+              0.11,
+              0.084,
+              0.08,
+              0.082,
+              0.083,
+              0.089,
+              0.089,
+              0.089
+            ],
+            "batched": [
+              1.814,
+              3.501,
+              1.734,
+              1.745,
+              1.765,
+              1.737,
+              1.738,
+              1.75,
+              1.729,
+              1.793,
+              1.727,
+              1.722,
+              1.559,
+              1.742,
+              1.734,
+              1.714,
+              1.707,
+              1.716,
+              1.764,
+              1.746,
+              1.72
+            ],
+            "hand_apply": [
+              0.141,
+              0.175,
+              0.089,
+              0.101,
+              0.101,
+              0.087,
+              0.092,
+              0.091,
+              0.085,
+              0.139,
+              0.097,
+              0.082,
+              0.081,
+              0.086,
+              0.08,
+              0.078,
+              0.078,
+              0.083,
+              0.087,
+              0.113,
+              0.087
+            ],
+            "hand_prepare": [
+              1.969,
+              3.838,
+              1.34,
+              1.32,
+              1.333,
+              1.34,
+              1.324,
+              1.319,
+              1.321,
+              1.36,
+              1.317,
+              1.322,
+              1.178,
+              1.358,
+              1.345,
+              1.303,
+              1.309,
+              1.313,
+              1.355,
+              1.327,
+              1.341
+            ],
+            "prepare": [
+              2.138,
+              5.618,
+              1.619,
+              1.35,
+              1.338,
+              1.339,
+              1.337,
+              1.338,
+              1.334,
+              1.354,
+              1.332,
+              1.325,
+              1.221,
+              1.699,
+              1.336,
+              1.325,
+              1.341,
+              1.34,
+              1.366,
+              1.356,
+              1.338
+            ],
+            "unsplit": [
+              2.459,
+              35.856,
+              2.121,
+              1.462,
+              1.391,
+              1.394,
+              1.378,
+              1.395,
+              1.372,
+              1.363,
+              1.393,
+              1.353,
+              1.271,
+              17.028,
+              1.467,
+              1.343,
+              1.373,
+              1.375,
+              1.365,
+              1.426,
+              1.394
+            ]
+          },
+          "shape": "dataset (4096, 64) float32 fixed + W1 (64, 64) float32 fixed; candidate W2 (64,) float32 varying",
+          "source_digest": "e748b740667fa40a92c6cc37e3dab3aeffd18b7952c6cc76f8e5b7843e677569",
+          "source_digest_unchanged_by_split": true,
+          "source_ops": 16,
+          "split_summary": {
+            "apply_digest": "f7b80fda7e892a65775a4ce07c7fabf048a9e9ec5069d6a635faacab61c7104b",
+            "apply_ops": 4,
+            "boundary_bytes": 1048576,
+            "boundary_values": 1,
+            "dropped_ops": 0,
+            "fixed_leaves": [
+              0,
+              1
+            ],
+            "prepare_digest": "49dcbded9db47b0b55b3626b34ccdbca4a4f4302e5a7396099e6f97095fd2c26",
+            "prepare_ops": 12,
+            "source_ops": 16,
+            "unused_varying_leaves": [],
+            "varying_leaves": [
+              2
+            ]
+          },
+          "trace_spread": {
+            "batched": {
+              "max_ms": 0.722,
+              "median_ms": 0.286,
+              "min_ms": 0.274
+            },
+            "hand_apply": {
+              "max_ms": 0.133,
+              "median_ms": 0.112,
+              "min_ms": 0.109
+            },
+            "hand_prepare": {
+              "max_ms": 0.488,
+              "median_ms": 0.233,
+              "min_ms": 0.222
+            },
+            "source": {
+              "max_ms": 0.528,
+              "median_ms": 0.297,
+              "min_ms": 0.282
+            }
+          },
+          "unused_varying_leaves": [],
+          "varying_leaves": [
+            2
+          ],
+          "workload": "A_fixed_precompute"
+        },
+        "A_fixed_precompute|512": {
+          "amortized": {
+            "1": {
+              "hand_written_ms": 1.163,
+              "speedup_hand_written_over_split": 0.84,
+              "speedup_unsplit_over_hand_written": 0.87,
+              "speedup_unsplit_over_split": 0.73,
+              "split_ms": 1.388,
+              "unsplit_ms": 1.009
+            },
+            "16": {
+              "hand_written_ms": 0.103,
+              "speedup_hand_written_over_split": 0.85,
+              "speedup_unsplit_over_hand_written": 2.55,
+              "speedup_unsplit_over_split": 2.17,
+              "split_ms": 0.12,
+              "unsplit_ms": 0.262
+            },
+            "4": {
+              "hand_written_ms": 0.315,
+              "speedup_hand_written_over_split": 0.84,
+              "speedup_unsplit_over_hand_written": 1.31,
+              "speedup_unsplit_over_split": 1.1,
+              "split_ms": 0.374,
+              "unsplit_ms": 0.411
+            },
+            "64": {
+              "hand_written_ms": 0.05,
+              "speedup_hand_written_over_split": 0.87,
+              "speedup_unsplit_over_hand_written": 4.52,
+              "speedup_unsplit_over_split": 3.93,
+              "split_ms": 0.057,
+              "unsplit_ms": 0.224
+            }
+          },
+          "amortized_from_min": {
+            "1": {
+              "hand_written_ms": 1.138,
+              "speedup_hand_written_over_split": 0.84,
+              "speedup_unsplit_over_hand_written": 0.87,
+              "speedup_unsplit_over_split": 0.73,
+              "split_ms": 1.359,
+              "unsplit_ms": 0.987
+            },
+            "16": {
+              "hand_written_ms": 0.096,
+              "speedup_hand_written_over_split": 0.86,
+              "speedup_unsplit_over_hand_written": 2.49,
+              "speedup_unsplit_over_split": 2.14,
+              "split_ms": 0.112,
+              "unsplit_ms": 0.24
+            },
+            "4": {
+              "hand_written_ms": 0.305,
+              "speedup_hand_written_over_split": 0.84,
+              "speedup_unsplit_over_hand_written": 1.28,
+              "speedup_unsplit_over_split": 1.08,
+              "split_ms": 0.361,
+              "unsplit_ms": 0.389
+            },
+            "64": {
+              "hand_written_ms": 0.044,
+              "speedup_hand_written_over_split": 0.89,
+              "speedup_unsplit_over_hand_written": 4.56,
+              "speedup_unsplit_over_split": 4.07,
+              "split_ms": 0.05,
+              "unsplit_ms": 0.202
+            }
+          },
+          "amortized_per_repetition_ratio": {
+            "1": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 0.87,
+              "speedup_unsplit_over_split": 0.73
+            },
+            "16": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 2.54,
+              "speedup_unsplit_over_split": 2.17
+            },
+            "4": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.31,
+              "speedup_unsplit_over_split": 1.1
+            },
+            "64": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 4.53,
+              "speedup_unsplit_over_split": 3.98
+            }
+          },
+          "apply_digest": "382590f150b87c91e54a7489e75f2b3bf68ee98c77ac1fdff161a8bef3d24552",
+          "apply_ops": 4,
+          "backend": "numpy",
+          "batched_vmap_stand_in": {
+            "batched_ops": 15,
+            "build": {
+              "staging": {
+                "max_ms": 0.666,
+                "median_ms": 0.447,
+                "min_ms": 0.428
+              },
+              "total_ms": 0.738,
+              "trace_ms": 0.291
+            },
+            "candidates": 64,
+            "note": "the graph vmap(fitness, in_axes=(None, None, 0)) expands to; vmap itself is unavailable in this worktree (see _meta.vmap), so this stand-in is validated against 64 separate applies",
+            "parity_max_abs_err_vs_64_applies": 1.1920928955078125e-07,
+            "per_candidate_ms": {
+              "batched_one_run": 0.016,
+              "split_64_applies": 0.057,
+              "unsplit_64_runs": 0.224
+            },
+            "run": {
+              "max_ms": 0.361,
+              "median_ms": 0.259,
+              "min_ms": 0.231
+            },
+            "status": "measured as a hand-written batched graph",
+            "totals_for_candidates": {
+              "batched_one_run_ms": 0.997,
+              "speedup_batched_over_split_64": 3.67,
+              "speedup_batched_over_unsplit_64": 14.41,
+              "split_64_applies_ms": 3.656,
+              "unsplit_64_runs_ms": 14.365
+            }
+          },
+          "boundary": [
+            {
+              "defining_op": "tanh",
+              "dtype": "float32",
+              "is_input": false,
+              "nbytes": 131072,
+              "shape": [
+                512,
+                64
+              ]
+            }
+          ],
+          "boundary_bytes": 131072,
+          "boundary_overhead_ms_one_turn": 0.026,
+          "boundary_values": 1,
+          "build": {
+            "apply_ms": 0.199,
+            "hand_apply_ms": 0.199,
+            "hand_apply_trace_ms": 0.119,
+            "hand_prepare_ms": 0.374,
+            "hand_prepare_trace_ms": 0.241,
+            "hand_written_total_ms": 0.933,
+            "prepare_ms": 0.37,
+            "split_total_ms": 1.15,
+            "split_transform_ms": 0.263,
+            "trace_ms": 0.318,
+            "unsplit_staging_ms": 0.479,
+            "unsplit_total_ms": 0.797
+          },
+          "build_spread": {
+            "apply": {
+              "max_ms": 0.497,
+              "median_ms": 0.199,
+              "min_ms": 0.191
+            },
+            "hand_apply": {
+              "max_ms": 0.213,
+              "median_ms": 0.199,
+              "min_ms": 0.191
+            },
+            "hand_prepare": {
+              "max_ms": 0.385,
+              "median_ms": 0.374,
+              "min_ms": 0.361
+            },
+            "prepare": {
+              "max_ms": 0.409,
+              "median_ms": 0.37,
+              "min_ms": 0.362
+            },
+            "unsplit": {
+              "max_ms": 0.802,
+              "median_ms": 0.479,
+              "min_ms": 0.459
+            }
+          },
+          "crossover_reuse_analytic": 4,
+          "crossover_reuse_from_per_repetition_ratio": 4,
+          "crossover_reuse_measured": 4,
+          "dropped_ops": 0,
+          "expectation": "win",
+          "fixed_leaves": [
+            0,
+            1
+          ],
+          "hand_written": {
+            "apply_digest": "d7e857a5b20d86ca04483011a3d754e4303b6eaff125999699dd6b1d5945beb8",
+            "apply_ops": 4,
+            "ops_match_split": true,
+            "prepare_digest": "aa3644c334c507a94942943a7a077c57338f99763bd8eae71d6a5e7d74b5ed24",
+            "prepare_ops": 12
+          },
+          "label": "fixed precompute (GP/NEAT fitness)",
+          "output_device": "Device(kind='cpu', index=0)",
+          "parity_max_abs_err": {
+            "hand_written": 0.0,
+            "split": 0.0,
+            "unsplit": 0.0
+          },
+          "prepare_digest": "9d35d36a00586cbe04116471ff2aa50f4218f1a5f5258e1cdefcfe31316366ef",
+          "prepare_ops": 12,
+          "prepared_device": "Device(kind='cpu', index=0)",
+          "reps": 21,
+          "reuse_counts": [
+            1,
+            4,
+            16,
+            64
+          ],
+          "rows": 512,
+          "run": {
+            "apply": {
+              "max_ms": 0.073,
+              "median_ms": 0.036,
+              "min_ms": 0.029
+            },
+            "batched": {
+              "max_ms": 0.361,
+              "median_ms": 0.259,
+              "min_ms": 0.231
+            },
+            "hand_apply": {
+              "max_ms": 0.049,
+              "median_ms": 0.032,
+              "min_ms": 0.027
+            },
+            "hand_prepare": {
+              "max_ms": 0.24,
+              "median_ms": 0.198,
+              "min_ms": 0.178
+            },
+            "prepare": {
+              "max_ms": 18.755,
+              "median_ms": 0.202,
+              "min_ms": 0.18
+            },
+            "unsplit": {
+              "max_ms": 0.25,
+              "median_ms": 0.212,
+              "min_ms": 0.19
+            }
+          },
+          "run_samples": {
+            "apply": [
+              0.036,
+              0.035,
+              0.035,
+              0.036,
+              0.036,
+              0.035,
+              0.039,
+              0.037,
+              0.041,
+              0.035,
+              0.035,
+              0.034,
+              0.036,
+              0.037,
+              0.035,
+              0.037,
+              0.034,
+              0.03,
+              0.029,
+              0.073,
+              0.04
+            ],
+            "batched": [
+              0.262,
+              0.259,
+              0.261,
+              0.257,
+              0.258,
+              0.259,
+              0.256,
+              0.257,
+              0.258,
+              0.255,
+              0.267,
+              0.258,
+              0.259,
+              0.257,
+              0.263,
+              0.261,
+              0.26,
+              0.231,
+              0.232,
+              0.346,
+              0.361
+            ],
+            "hand_apply": [
+              0.034,
+              0.033,
+              0.031,
+              0.032,
+              0.032,
+              0.032,
+              0.032,
+              0.032,
+              0.034,
+              0.033,
+              0.033,
+              0.033,
+              0.033,
+              0.036,
+              0.032,
+              0.032,
+              0.031,
+              0.028,
+              0.027,
+              0.04,
+              0.049
+            ],
+            "hand_prepare": [
+              0.199,
+              0.198,
+              0.195,
+              0.199,
+              0.198,
+              0.198,
+              0.195,
+              0.196,
+              0.199,
+              0.2,
+              0.207,
+              0.202,
+              0.202,
+              0.196,
+              0.196,
+              0.197,
+              0.196,
+              0.179,
+              0.178,
+              0.237,
+              0.24
+            ],
+            "prepare": [
+              0.208,
+              0.201,
+              0.199,
+              0.204,
+              0.203,
+              0.21,
+              0.214,
+              0.206,
+              0.203,
+              0.202,
+              0.202,
+              0.202,
+              0.198,
+              0.202,
+              0.2,
+              0.206,
+              0.2,
+              0.182,
+              0.18,
+              18.755,
+              0.229
+            ],
+            "unsplit": [
+              0.227,
+              0.22,
+              0.218,
+              0.218,
+              0.217,
+              0.21,
+              0.212,
+              0.213,
+              0.211,
+              0.212,
+              0.21,
+              0.215,
+              0.212,
+              0.21,
+              0.21,
+              0.214,
+              0.214,
+              0.192,
+              0.194,
+              0.19,
+              0.25
+            ]
+          },
+          "shape": "dataset (512, 64) float32 fixed + W1 (64, 64) float32 fixed; candidate W2 (64,) float32 varying",
+          "source_digest": "df8910d6115f4f78d7aca724c49add4acf689348baf530e5d1921558a1d0aaf3",
+          "source_digest_unchanged_by_split": true,
+          "source_ops": 16,
+          "split_summary": {
+            "apply_digest": "382590f150b87c91e54a7489e75f2b3bf68ee98c77ac1fdff161a8bef3d24552",
+            "apply_ops": 4,
+            "boundary_bytes": 131072,
+            "boundary_values": 1,
+            "dropped_ops": 0,
+            "fixed_leaves": [
+              0,
+              1
+            ],
+            "prepare_digest": "9d35d36a00586cbe04116471ff2aa50f4218f1a5f5258e1cdefcfe31316366ef",
+            "prepare_ops": 12,
+            "source_ops": 16,
+            "unused_varying_leaves": [],
+            "varying_leaves": [
+              2
+            ]
+          },
+          "trace_spread": {
+            "batched": {
+              "max_ms": 0.539,
+              "median_ms": 0.291,
+              "min_ms": 0.265
+            },
+            "hand_apply": {
+              "max_ms": 0.314,
+              "median_ms": 0.119,
+              "min_ms": 0.11
+            },
+            "hand_prepare": {
+              "max_ms": 0.5,
+              "median_ms": 0.241,
+              "min_ms": 0.225
+            },
+            "source": {
+              "max_ms": 2.206,
+              "median_ms": 0.318,
+              "min_ms": 0.288
+            }
+          },
+          "unused_varying_leaves": [],
+          "varying_leaves": [
+            2
+          ],
+          "workload": "A_fixed_precompute"
+        },
+        "B_boundary_dominated|16384": {
+          "amortized": {
+            "1": {
+              "hand_written_ms": 1.211,
+              "speedup_hand_written_over_split": 0.91,
+              "speedup_unsplit_over_hand_written": 0.92,
+              "speedup_unsplit_over_split": 0.85,
+              "split_ms": 1.324,
+              "unsplit_ms": 1.12
+            },
+            "16": {
+              "hand_written_ms": 0.633,
+              "speedup_hand_written_over_split": 0.98,
+              "speedup_unsplit_over_hand_written": 1.34,
+              "speedup_unsplit_over_split": 1.31,
+              "split_ms": 0.644,
+              "unsplit_ms": 0.845
+            },
+            "4": {
+              "hand_written_ms": 0.748,
+              "speedup_hand_written_over_split": 0.96,
+              "speedup_unsplit_over_hand_written": 1.2,
+              "speedup_unsplit_over_split": 1.15,
+              "split_ms": 0.78,
+              "unsplit_ms": 0.9
+            },
+            "64": {
+              "hand_written_ms": 0.604,
+              "speedup_hand_written_over_split": 0.99,
+              "speedup_unsplit_over_hand_written": 1.38,
+              "speedup_unsplit_over_split": 1.36,
+              "split_ms": 0.61,
+              "unsplit_ms": 0.832
+            }
+          },
+          "amortized_from_min": {
+            "1": {
+              "hand_written_ms": 1.187,
+              "speedup_hand_written_over_split": 0.92,
+              "speedup_unsplit_over_hand_written": 0.9,
+              "speedup_unsplit_over_split": 0.83,
+              "split_ms": 1.293,
+              "unsplit_ms": 1.071
+            },
+            "16": {
+              "hand_written_ms": 0.614,
+              "speedup_hand_written_over_split": 0.98,
+              "speedup_unsplit_over_hand_written": 1.3,
+              "speedup_unsplit_over_split": 1.28,
+              "split_ms": 0.624,
+              "unsplit_ms": 0.796
+            },
+            "4": {
+              "hand_written_ms": 0.729,
+              "speedup_hand_written_over_split": 0.96,
+              "speedup_unsplit_over_hand_written": 1.17,
+              "speedup_unsplit_over_split": 1.12,
+              "split_ms": 0.758,
+              "unsplit_ms": 0.851
+            },
+            "64": {
+              "hand_written_ms": 0.586,
+              "speedup_hand_written_over_split": 0.99,
+              "speedup_unsplit_over_hand_written": 1.34,
+              "speedup_unsplit_over_split": 1.33,
+              "split_ms": 0.59,
+              "unsplit_ms": 0.783
+            }
+          },
+          "amortized_per_repetition_ratio": {
+            "1": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 0.93,
+              "speedup_unsplit_over_split": 0.85
+            },
+            "16": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.33,
+              "speedup_unsplit_over_split": 1.32
+            },
+            "4": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.2,
+              "speedup_unsplit_over_split": 1.16
+            },
+            "64": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.38,
+              "speedup_unsplit_over_split": 1.37
+            }
+          },
+          "apply_digest": "f2ad28ccfa59847e780d1bda9fe069111c467bd8d9e8a1affb2ca245bbbf4ca7",
+          "apply_ops": 2,
+          "backend": "numpy",
+          "batched_vmap_stand_in": null,
+          "boundary": [
+            {
+              "defining_op": "multiply",
+              "dtype": "float32",
+              "is_input": false,
+              "nbytes": 4194304,
+              "shape": [
+                16384,
+                64
+              ]
+            }
+          ],
+          "boundary_bytes": 4194304,
+          "boundary_overhead_ms_one_turn": -0.007,
+          "boundary_values": 1,
+          "build": {
+            "apply_ms": 0.142,
+            "hand_apply_ms": 0.141,
+            "hand_apply_trace_ms": 0.084,
+            "hand_prepare_ms": 0.115,
+            "hand_prepare_trace_ms": 0.066,
+            "hand_written_total_ms": 0.406,
+            "prepare_ms": 0.114,
+            "split_total_ms": 0.504,
+            "split_transform_ms": 0.138,
+            "trace_ms": 0.11,
+            "unsplit_staging_ms": 0.183,
+            "unsplit_total_ms": 0.293
+          },
+          "build_spread": {
+            "apply": {
+              "max_ms": 0.173,
+              "median_ms": 0.142,
+              "min_ms": 0.137
+            },
+            "hand_apply": {
+              "max_ms": 0.153,
+              "median_ms": 0.141,
+              "min_ms": 0.138
+            },
+            "hand_prepare": {
+              "max_ms": 0.145,
+              "median_ms": 0.115,
+              "min_ms": 0.11
+            },
+            "prepare": {
+              "max_ms": 0.145,
+              "median_ms": 0.114,
+              "min_ms": 0.11
+            },
+            "unsplit": {
+              "max_ms": 0.461,
+              "median_ms": 0.183,
+              "min_ms": 0.177
+            }
+          },
+          "crossover_reuse_analytic": 2,
+          "crossover_reuse_from_per_repetition_ratio": 4,
+          "crossover_reuse_measured": 4,
+          "dropped_ops": 0,
+          "expectation": "loss",
+          "fixed_leaves": [
+            0
+          ],
+          "hand_written": {
+            "apply_digest": "dcc38f56abb2ab47b42c15f4625160509999fff68e0a4433f09224a98acdd2f9",
+            "apply_ops": 2,
+            "ops_match_split": true,
+            "prepare_digest": "7fc808184be39ab7dffcb18829b04274828c94d5a9bb9b4ee9f32876ea4b5c2a",
+            "prepare_ops": 2
+          },
+          "label": "boundary-dominated (cheap fixed op, large boundary)",
+          "output_device": "Device(kind='cpu', index=0)",
+          "parity_max_abs_err": {
+            "hand_written": 0.0,
+            "split": 0.0,
+            "unsplit": 0.0
+          },
+          "prepare_digest": "cbada49f0f48ebe676b8b7fb74e1caffdfc3a409381d383704632531c67625a6",
+          "prepare_ops": 2,
+          "prepared_device": "Device(kind='cpu', index=0)",
+          "reps": 21,
+          "reuse_counts": [
+            1,
+            4,
+            16,
+            64
+          ],
+          "rows": 16384,
+          "run": {
+            "apply": {
+              "max_ms": 22.194,
+              "median_ms": 0.599,
+              "min_ms": 0.579
+            },
+            "hand_apply": {
+              "max_ms": 0.814,
+              "median_ms": 0.594,
+              "min_ms": 0.576
+            },
+            "hand_prepare": {
+              "max_ms": 0.341,
+              "median_ms": 0.211,
+              "min_ms": 0.205
+            },
+            "prepare": {
+              "max_ms": 0.235,
+              "median_ms": 0.221,
+              "min_ms": 0.21
+            },
+            "unsplit": {
+              "max_ms": 1.032,
+              "median_ms": 0.827,
+              "min_ms": 0.778
+            }
+          },
+          "run_samples": {
+            "apply": [
+              0.629,
+              0.585,
+              0.591,
+              0.581,
+              0.619,
+              0.579,
+              0.591,
+              0.6,
+              0.623,
+              0.584,
+              0.599,
+              0.612,
+              0.614,
+              0.62,
+              22.194,
+              0.606,
+              0.598,
+              0.588,
+              0.614,
+              0.597,
+              0.586
+            ],
+            "hand_apply": [
+              0.623,
+              0.597,
+              0.59,
+              0.619,
+              0.612,
+              0.666,
+              0.589,
+              0.585,
+              0.594,
+              0.592,
+              0.613,
+              0.597,
+              0.609,
+              0.587,
+              0.814,
+              0.594,
+              0.594,
+              0.576,
+              0.589,
+              0.591,
+              0.586
+            ],
+            "hand_prepare": [
+              0.21,
+              0.208,
+              0.209,
+              0.242,
+              0.212,
+              0.211,
+              0.209,
+              0.216,
+              0.21,
+              0.248,
+              0.205,
+              0.215,
+              0.209,
+              0.222,
+              0.341,
+              0.225,
+              0.213,
+              0.207,
+              0.206,
+              0.211,
+              0.205
+            ],
+            "prepare": [
+              0.224,
+              0.22,
+              0.218,
+              0.217,
+              0.228,
+              0.218,
+              0.222,
+              0.223,
+              0.221,
+              0.23,
+              0.222,
+              0.222,
+              0.219,
+              0.227,
+              0.217,
+              0.235,
+              0.226,
+              0.221,
+              0.21,
+              0.219,
+              0.219
+            ],
+            "unsplit": [
+              0.81,
+              0.827,
+              0.819,
+              0.807,
+              0.872,
+              0.817,
+              0.849,
+              0.829,
+              0.814,
+              0.88,
+              0.871,
+              0.85,
+              0.836,
+              0.844,
+              0.82,
+              1.032,
+              0.839,
+              0.815,
+              0.782,
+              0.778,
+              0.815
+            ]
+          },
+          "shape": "X (16384, 64) float32 fixed taken with one elementwise scale; W2 (64,) float32 varying",
+          "source_digest": "8b46ebfb82e4c19781eed222544e416ddb5c65b56755d5a3465cbb84d52cb326",
+          "source_digest_unchanged_by_split": true,
+          "source_ops": 4,
+          "split_summary": {
+            "apply_digest": "f2ad28ccfa59847e780d1bda9fe069111c467bd8d9e8a1affb2ca245bbbf4ca7",
+            "apply_ops": 2,
+            "boundary_bytes": 4194304,
+            "boundary_values": 1,
+            "dropped_ops": 0,
+            "fixed_leaves": [
+              0
+            ],
+            "prepare_digest": "cbada49f0f48ebe676b8b7fb74e1caffdfc3a409381d383704632531c67625a6",
+            "prepare_ops": 2,
+            "source_ops": 4,
+            "unused_varying_leaves": [],
+            "varying_leaves": [
+              1
+            ]
+          },
+          "trace_spread": {
+            "hand_apply": {
+              "max_ms": 0.432,
+              "median_ms": 0.084,
+              "min_ms": 0.081
+            },
+            "hand_prepare": {
+              "max_ms": 0.112,
+              "median_ms": 0.066,
+              "min_ms": 0.064
+            },
+            "source": {
+              "max_ms": 0.224,
+              "median_ms": 0.11,
+              "min_ms": 0.107
+            }
+          },
+          "unused_varying_leaves": [],
+          "varying_leaves": [
+            1
+          ],
+          "workload": "B_boundary_dominated"
+        },
+        "C_state_variable|4096": {
+          "amortized": {
+            "1": {
+              "hand_written_ms": 1.873,
+              "speedup_hand_written_over_split": 0.92,
+              "speedup_unsplit_over_hand_written": 0.92,
+              "speedup_unsplit_over_split": 0.85,
+              "split_ms": 2.026,
+              "unsplit_ms": 1.716
+            },
+            "16": {
+              "hand_written_ms": 1.083,
+              "speedup_hand_written_over_split": 0.99,
+              "speedup_unsplit_over_hand_written": 1.27,
+              "speedup_unsplit_over_split": 1.26,
+              "split_ms": 1.096,
+              "unsplit_ms": 1.379
+            },
+            "4": {
+              "hand_written_ms": 1.241,
+              "speedup_hand_written_over_split": 0.97,
+              "speedup_unsplit_over_hand_written": 1.17,
+              "speedup_unsplit_over_split": 1.13,
+              "split_ms": 1.282,
+              "unsplit_ms": 1.446
+            },
+            "64": {
+              "hand_written_ms": 1.043,
+              "speedup_hand_written_over_split": 0.99,
+              "speedup_unsplit_over_hand_written": 1.31,
+              "speedup_unsplit_over_split": 1.3,
+              "split_ms": 1.049,
+              "unsplit_ms": 1.362
+            }
+          },
+          "amortized_from_min": {
+            "1": {
+              "hand_written_ms": 1.854,
+              "speedup_hand_written_over_split": 0.93,
+              "speedup_unsplit_over_hand_written": 0.91,
+              "speedup_unsplit_over_split": 0.84,
+              "split_ms": 2.003,
+              "unsplit_ms": 1.684
+            },
+            "16": {
+              "hand_written_ms": 1.07,
+              "speedup_hand_written_over_split": 0.99,
+              "speedup_unsplit_over_hand_written": 1.26,
+              "speedup_unsplit_over_split": 1.25,
+              "split_ms": 1.078,
+              "unsplit_ms": 1.347
+            },
+            "4": {
+              "hand_written_ms": 1.227,
+              "speedup_hand_written_over_split": 0.97,
+              "speedup_unsplit_over_hand_written": 1.15,
+              "speedup_unsplit_over_split": 1.12,
+              "split_ms": 1.263,
+              "unsplit_ms": 1.414
+            },
+            "64": {
+              "hand_written_ms": 1.031,
+              "speedup_hand_written_over_split": 1.0,
+              "speedup_unsplit_over_hand_written": 1.29,
+              "speedup_unsplit_over_split": 1.29,
+              "split_ms": 1.031,
+              "unsplit_ms": 1.33
+            }
+          },
+          "amortized_per_repetition_ratio": {
+            "1": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 0.92,
+              "speedup_unsplit_over_split": 0.84
+            },
+            "16": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.28,
+              "speedup_unsplit_over_split": 1.26
+            },
+            "4": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.17,
+              "speedup_unsplit_over_split": 1.13
+            },
+            "64": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.31,
+              "speedup_unsplit_over_split": 1.3
+            }
+          },
+          "apply_digest": "6de4e1dfac7ca0f19d5a547a22128dded088c0e574c1f6d6aad4b3db1f333135",
+          "apply_ops": 5,
+          "backend": "numpy",
+          "batched_vmap_stand_in": null,
+          "boundary": [
+            {
+              "defining_op": null,
+              "dtype": "float32",
+              "is_input": true,
+              "nbytes": 16384,
+              "shape": [
+                64,
+                64
+              ]
+            },
+            {
+              "defining_op": "dot",
+              "dtype": "float32",
+              "is_input": false,
+              "nbytes": 1048576,
+              "shape": [
+                4096,
+                64
+              ]
+            }
+          ],
+          "boundary_bytes": 1064960,
+          "boundary_overhead_ms_one_turn": 0.028,
+          "boundary_values": 2,
+          "build": {
+            "apply_ms": 0.204,
+            "hand_apply_ms": 0.207,
+            "hand_apply_trace_ms": 0.127,
+            "hand_prepare_ms": 0.099,
+            "hand_prepare_trace_ms": 0.06,
+            "hand_written_total_ms": 0.493,
+            "prepare_ms": 0.103,
+            "split_total_ms": 0.642,
+            "split_transform_ms": 0.193,
+            "trace_ms": 0.142,
+            "unsplit_staging_ms": 0.218,
+            "unsplit_total_ms": 0.36
+          },
+          "build_spread": {
+            "apply": {
+              "max_ms": 0.443,
+              "median_ms": 0.204,
+              "min_ms": 0.2
+            },
+            "hand_apply": {
+              "max_ms": 0.235,
+              "median_ms": 0.207,
+              "min_ms": 0.199
+            },
+            "hand_prepare": {
+              "max_ms": 0.112,
+              "median_ms": 0.099,
+              "min_ms": 0.096
+            },
+            "prepare": {
+              "max_ms": 0.115,
+              "median_ms": 0.103,
+              "min_ms": 0.099
+            },
+            "unsplit": {
+              "max_ms": 0.266,
+              "median_ms": 0.218,
+              "min_ms": 0.214
+            }
+          },
+          "crossover_reuse_analytic": 2,
+          "crossover_reuse_from_per_repetition_ratio": 4,
+          "crossover_reuse_measured": 4,
+          "dropped_ops": 0,
+          "expectation": "win",
+          "fixed_leaves": [
+            0,
+            1
+          ],
+          "hand_written": {
+            "apply_digest": "8096cbb0ea1142398249f66f7dff5eeb1dd30a37d3c7ccf333bfd9c02b43cfb4",
+            "apply_ops": 5,
+            "ops_match_split": true,
+            "prepare_digest": "3fff768e46bd7f52bc0905d898a0b0de95980f0afc3cf6b566da1e0b3d0e1db9",
+            "prepare_ops": 1
+          },
+          "label": "state-variable recurrence step",
+          "output_device": "Device(kind='cpu', index=0)",
+          "parity_max_abs_err": {
+            "hand_written": 0.0,
+            "split": 0.0,
+            "unsplit": 0.0
+          },
+          "prepare_digest": "52d68973dea7f6ce4692c0f7f44b67125fe3296b4d0db99f4db1551eea3bfb95",
+          "prepare_ops": 1,
+          "prepared_device": "Device(kind='cpu', index=0)",
+          "reps": 21,
+          "reuse_counts": [
+            1,
+            4,
+            16,
+            64
+          ],
+          "rows": 4096,
+          "run": {
+            "apply": {
+              "max_ms": 3.138,
+              "median_ms": 1.034,
+              "min_ms": 1.016
+            },
+            "hand_apply": {
+              "max_ms": 23.053,
+              "median_ms": 1.03,
+              "min_ms": 1.018
+            },
+            "hand_prepare": {
+              "max_ms": 0.948,
+              "median_ms": 0.35,
+              "min_ms": 0.343
+            },
+            "prepare": {
+              "max_ms": 0.966,
+              "median_ms": 0.35,
+              "min_ms": 0.345
+            },
+            "unsplit": {
+              "max_ms": 4.003,
+              "median_ms": 1.356,
+              "min_ms": 1.324
+            }
+          },
+          "run_samples": {
+            "apply": [
+              1.025,
+              1.033,
+              1.045,
+              1.028,
+              1.025,
+              1.034,
+              1.027,
+              1.056,
+              1.06,
+              1.029,
+              1.061,
+              1.042,
+              1.031,
+              1.02,
+              1.019,
+              1.016,
+              1.051,
+              3.138,
+              1.13,
+              1.053,
+              1.062
+            ],
+            "hand_apply": [
+              1.039,
+              1.056,
+              1.038,
+              1.021,
+              1.019,
+              1.019,
+              1.021,
+              1.018,
+              1.029,
+              1.02,
+              23.053,
+              1.043,
+              1.043,
+              1.031,
+              1.018,
+              1.028,
+              1.03,
+              3.132,
+              1.07,
+              1.036,
+              1.025
+            ],
+            "hand_prepare": [
+              0.35,
+              0.351,
+              0.348,
+              0.348,
+              0.345,
+              0.353,
+              0.352,
+              0.35,
+              0.349,
+              0.348,
+              0.35,
+              0.356,
+              0.349,
+              0.344,
+              0.344,
+              0.343,
+              0.363,
+              0.948,
+              0.377,
+              0.375,
+              0.372
+            ],
+            "prepare": [
+              0.363,
+              0.354,
+              0.353,
+              0.349,
+              0.347,
+              0.362,
+              0.348,
+              0.347,
+              0.349,
+              0.354,
+              0.375,
+              0.384,
+              0.348,
+              0.348,
+              0.35,
+              0.349,
+              0.348,
+              0.966,
+              0.675,
+              0.356,
+              0.345
+            ],
+            "unsplit": [
+              1.378,
+              1.386,
+              1.345,
+              1.351,
+              1.349,
+              1.349,
+              1.342,
+              1.343,
+              1.345,
+              1.365,
+              1.363,
+              1.61,
+              1.418,
+              1.335,
+              1.337,
+              1.356,
+              1.324,
+              1.68,
+              4.003,
+              1.413,
+              1.36
+            ]
+          },
+          "shape": "dataset (4096, 64) float32 + W1 (64, 64) float32 fixed; state (4096, 64) float32 + W2 (64,) float32 varying",
+          "source_digest": "a4faf9395a2dd728e89d86c6720c2c265e7f4a975814ee9be5d21ffe1b3ad65d",
+          "source_digest_unchanged_by_split": true,
+          "source_ops": 6,
+          "split_summary": {
+            "apply_digest": "6de4e1dfac7ca0f19d5a547a22128dded088c0e574c1f6d6aad4b3db1f333135",
+            "apply_ops": 5,
+            "boundary_bytes": 1064960,
+            "boundary_values": 2,
+            "dropped_ops": 0,
+            "fixed_leaves": [
+              0,
+              1
+            ],
+            "prepare_digest": "52d68973dea7f6ce4692c0f7f44b67125fe3296b4d0db99f4db1551eea3bfb95",
+            "prepare_ops": 1,
+            "source_ops": 6,
+            "unused_varying_leaves": [],
+            "varying_leaves": [
+              2,
+              3
+            ]
+          },
+          "trace_spread": {
+            "hand_apply": {
+              "max_ms": 0.696,
+              "median_ms": 0.127,
+              "min_ms": 0.111
+            },
+            "hand_prepare": {
+              "max_ms": 0.064,
+              "median_ms": 0.06,
+              "min_ms": 0.053
+            },
+            "source": {
+              "max_ms": 0.149,
+              "median_ms": 0.142,
+              "min_ms": 0.123
+            }
+          },
+          "unused_varying_leaves": [],
+          "varying_leaves": [
+            2,
+            3
+          ],
+          "workload": "C_state_variable"
+        },
+        "C_state_variable|512": {
+          "amortized": {
+            "1": {
+              "hand_written_ms": 0.695,
+              "speedup_hand_written_over_split": 0.83,
+              "speedup_unsplit_over_hand_written": 0.8,
+              "speedup_unsplit_over_split": 0.66,
+              "split_ms": 0.838,
+              "unsplit_ms": 0.554
+            },
+            "16": {
+              "hand_written_ms": 0.181,
+              "speedup_hand_written_over_split": 0.94,
+              "speedup_unsplit_over_hand_written": 1.16,
+              "speedup_unsplit_over_split": 1.1,
+              "split_ms": 0.192,
+              "unsplit_ms": 0.211
+            },
+            "4": {
+              "hand_written_ms": 0.284,
+              "speedup_hand_written_over_split": 0.88,
+              "speedup_unsplit_over_hand_written": 0.98,
+              "speedup_unsplit_over_split": 0.87,
+              "split_ms": 0.321,
+              "unsplit_ms": 0.279
+            },
+            "64": {
+              "hand_written_ms": 0.156,
+              "speedup_hand_written_over_split": 0.97,
+              "speedup_unsplit_over_hand_written": 1.25,
+              "speedup_unsplit_over_split": 1.21,
+              "split_ms": 0.16,
+              "unsplit_ms": 0.194
+            }
+          },
+          "amortized_from_min": {
+            "1": {
+              "hand_written_ms": 0.692,
+              "speedup_hand_written_over_split": 0.83,
+              "speedup_unsplit_over_hand_written": 0.8,
+              "speedup_unsplit_over_split": 0.66,
+              "split_ms": 0.835,
+              "unsplit_ms": 0.553
+            },
+            "16": {
+              "hand_written_ms": 0.179,
+              "speedup_hand_written_over_split": 0.94,
+              "speedup_unsplit_over_hand_written": 1.17,
+              "speedup_unsplit_over_split": 1.1,
+              "split_ms": 0.19,
+              "unsplit_ms": 0.21
+            },
+            "4": {
+              "hand_written_ms": 0.282,
+              "speedup_hand_written_over_split": 0.88,
+              "speedup_unsplit_over_hand_written": 0.99,
+              "speedup_unsplit_over_split": 0.87,
+              "split_ms": 0.319,
+              "unsplit_ms": 0.278
+            },
+            "64": {
+              "hand_written_ms": 0.154,
+              "speedup_hand_written_over_split": 0.97,
+              "speedup_unsplit_over_hand_written": 1.26,
+              "speedup_unsplit_over_split": 1.22,
+              "split_ms": 0.158,
+              "unsplit_ms": 0.193
+            }
+          },
+          "amortized_per_repetition_ratio": {
+            "1": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 0.8,
+              "speedup_unsplit_over_split": 0.66
+            },
+            "16": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.17,
+              "speedup_unsplit_over_split": 1.1
+            },
+            "4": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 0.99,
+              "speedup_unsplit_over_split": 0.87
+            },
+            "64": {
+              "pairs": 21,
+              "speedup_unsplit_over_hand_written": 1.25,
+              "speedup_unsplit_over_split": 1.22
+            }
+          },
+          "apply_digest": "4c0f899cfd3f6eb1f6e9a37e6ccdddf9a428ffa18522f19587b3b46c6cc1cb91",
+          "apply_ops": 5,
+          "backend": "numpy",
+          "batched_vmap_stand_in": null,
+          "boundary": [
+            {
+              "defining_op": null,
+              "dtype": "float32",
+              "is_input": true,
+              "nbytes": 16384,
+              "shape": [
+                64,
+                64
+              ]
+            },
+            {
+              "defining_op": "dot",
+              "dtype": "float32",
+              "is_input": false,
+              "nbytes": 131072,
+              "shape": [
+                512,
+                64
+              ]
+            }
+          ],
+          "boundary_bytes": 147456,
+          "boundary_overhead_ms_one_turn": 0.02,
+          "boundary_values": 2,
+          "build": {
+            "apply_ms": 0.207,
+            "hand_apply_ms": 0.204,
+            "hand_apply_trace_ms": 0.128,
+            "hand_prepare_ms": 0.098,
+            "hand_prepare_trace_ms": 0.062,
+            "hand_written_total_ms": 0.492,
+            "prepare_ms": 0.103,
+            "split_total_ms": 0.63,
+            "split_transform_ms": 0.175,
+            "trace_ms": 0.145,
+            "unsplit_staging_ms": 0.221,
+            "unsplit_total_ms": 0.366
+          },
+          "build_spread": {
+            "apply": {
+              "max_ms": 0.267,
+              "median_ms": 0.207,
+              "min_ms": 0.201
+            },
+            "hand_apply": {
+              "max_ms": 0.241,
+              "median_ms": 0.204,
+              "min_ms": 0.196
+            },
+            "hand_prepare": {
+              "max_ms": 0.108,
+              "median_ms": 0.098,
+              "min_ms": 0.095
+            },
+            "prepare": {
+              "max_ms": 0.137,
+              "median_ms": 0.103,
+              "min_ms": 0.1
+            },
+            "unsplit": {
+              "max_ms": 0.514,
+              "median_ms": 0.221,
+              "min_ms": 0.215
+            }
+          },
+          "crossover_reuse_analytic": 9,
+          "crossover_reuse_from_per_repetition_ratio": 16,
+          "crossover_reuse_measured": 16,
+          "dropped_ops": 0,
+          "expectation": "win",
+          "fixed_leaves": [
+            0,
+            1
+          ],
+          "hand_written": {
+            "apply_digest": "144229427e848e5216ea5c3e2d9521fa149e1424b11eae885f873717d20c5580",
+            "apply_ops": 5,
+            "ops_match_split": true,
+            "prepare_digest": "39828439cf776658e85e517da6ab093470910c68005e88d03df4557f3adbaf14",
+            "prepare_ops": 1
+          },
+          "label": "state-variable recurrence step",
+          "output_device": "Device(kind='cpu', index=0)",
+          "parity_max_abs_err": {
+            "hand_written": 0.0,
+            "split": 0.0,
+            "unsplit": 0.0
+          },
+          "prepare_digest": "eded1060ba1b37aebe670c24d025b5e86d34bfa3f1cfac827b92def4e5dc1df9",
+          "prepare_ops": 1,
+          "prepared_device": "Device(kind='cpu', index=0)",
+          "reps": 21,
+          "reuse_counts": [
+            1,
+            4,
+            16,
+            64
+          ],
+          "rows": 512,
+          "run": {
+            "apply": {
+              "max_ms": 0.16,
+              "median_ms": 0.149,
+              "min_ms": 0.147
+            },
+            "hand_apply": {
+              "max_ms": 0.151,
+              "median_ms": 0.147,
+              "min_ms": 0.145
+            },
+            "hand_prepare": {
+              "max_ms": 0.06,
+              "median_ms": 0.056,
+              "min_ms": 0.055
+            },
+            "prepare": {
+              "max_ms": 0.062,
+              "median_ms": 0.059,
+              "min_ms": 0.058
+            },
+            "unsplit": {
+              "max_ms": 0.195,
+              "median_ms": 0.188,
+              "min_ms": 0.187
+            }
+          },
+          "run_samples": {
+            "apply": [
+              0.151,
+              0.149,
+              0.151,
+              0.148,
+              0.148,
+              0.149,
+              0.153,
+              0.149,
+              0.151,
+              0.15,
+              0.148,
+              0.153,
+              0.148,
+              0.15,
+              0.15,
+              0.149,
+              0.15,
+              0.147,
+              0.16,
+              0.148,
+              0.149
+            ],
+            "hand_apply": [
+              0.149,
+              0.148,
+              0.146,
+              0.146,
+              0.151,
+              0.146,
+              0.146,
+              0.147,
+              0.148,
+              0.148,
+              0.145,
+              0.146,
+              0.147,
+              0.146,
+              0.151,
+              0.145,
+              0.145,
+              0.146,
+              0.147,
+              0.15,
+              0.147
+            ],
+            "hand_prepare": [
+              0.057,
+              0.06,
+              0.056,
+              0.056,
+              0.056,
+              0.056,
+              0.056,
+              0.056,
+              0.056,
+              0.056,
+              0.055,
+              0.056,
+              0.055,
+              0.056,
+              0.056,
+              0.055,
+              0.056,
+              0.056,
+              0.056,
+              0.056,
+              0.055
+            ],
+            "prepare": [
+              0.06,
+              0.059,
+              0.059,
+              0.062,
+              0.059,
+              0.059,
+              0.059,
+              0.059,
+              0.059,
+              0.059,
+              0.058,
+              0.06,
+              0.059,
+              0.059,
+              0.059,
+              0.059,
+              0.058,
+              0.059,
+              0.06,
+              0.058,
+              0.059
+            ],
+            "unsplit": [
+              0.195,
+              0.189,
+              0.189,
+              0.189,
+              0.188,
+              0.189,
+              0.188,
+              0.188,
+              0.19,
+              0.188,
+              0.187,
+              0.188,
+              0.188,
+              0.19,
+              0.188,
+              0.188,
+              0.188,
+              0.188,
+              0.19,
+              0.187,
+              0.189
+            ]
+          },
+          "shape": "dataset (512, 64) float32 + W1 (64, 64) float32 fixed; state (512, 64) float32 + W2 (64,) float32 varying",
+          "source_digest": "e86d9add6d05d53d76b1eb1c37474702e75324fcb7ffa97c7ca728377f847761",
+          "source_digest_unchanged_by_split": true,
+          "source_ops": 6,
+          "split_summary": {
+            "apply_digest": "4c0f899cfd3f6eb1f6e9a37e6ccdddf9a428ffa18522f19587b3b46c6cc1cb91",
+            "apply_ops": 5,
+            "boundary_bytes": 147456,
+            "boundary_values": 2,
+            "dropped_ops": 0,
+            "fixed_leaves": [
+              0,
+              1
+            ],
+            "prepare_digest": "eded1060ba1b37aebe670c24d025b5e86d34bfa3f1cfac827b92def4e5dc1df9",
+            "prepare_ops": 1,
+            "source_ops": 6,
+            "unused_varying_leaves": [],
+            "varying_leaves": [
+              2,
+              3
+            ]
+          },
+          "trace_spread": {
+            "hand_apply": {
+              "max_ms": 0.156,
+              "median_ms": 0.128,
+              "min_ms": 0.125
+            },
+            "hand_prepare": {
+              "max_ms": 0.392,
+              "median_ms": 0.062,
+              "min_ms": 0.059
+            },
+            "source": {
+              "max_ms": 0.162,
+              "median_ms": 0.145,
+              "min_ms": 0.139
+            }
+          },
+          "unused_varying_leaves": [],
+          "varying_leaves": [
+            2,
+            3
+          ],
+          "workload": "C_state_variable"
+        }
+      },
+      "command": "python evoxc/bench/probe_split_by_inputs.py --seed 0 --reps 21 --reuse 1,4,16,64 --sizes 512,4096 --boundary-size 16384 --workloads a,b,c --threads 1 --backends numpy --out evoxc/bench/split_by_inputs_results.json",
+      "date_utc": "2026-11-27T18:53:28+00:00",
+      "env": {
+        "EVOXC_DISABLE_LOCATIONS": "1"
+      },
+      "failures": [],
+      "label": "seed0",
+      "loadavg_end": [
+        1.66,
+        3.15,
+        2.78
+      ],
+      "loadavg_start": [
+        1.66,
+        3.15,
+        2.78
+      ],
+      "protocol": "every timed stage is interleaved per repetition (trace, build and run each measure all formulations once per repetition, in the same order) so a contention episode on this shared host is spread across formulations; each call shape gets one untimed warmup",
+      "reps": 21,
+      "reuse_counts": [
+        1,
+        4,
+        16,
+        64
+      ],
+      "seed": 0,
+      "sizes": [
+        512,
+        4096
+      ],
+      "status": "PASS",
+      "threading": {
+        "cpu_affinity": 16,
+        "cpu_count_reported": 16,
+        "effective_env": {
+          "MKL_NUM_THREADS": "1",
+          "NUMEXPR_NUM_THREADS": "1",
+          "OMP_NUM_THREADS": "1",
+          "OPENBLAS_NUM_THREADS": "1",
+          "VECLIB_MAXIMUM_THREADS": "1"
+        },
+        "nproc_reported": 4,
+        "pinned": true,
+        "requested": 1,
+        "why": "this host reports more CPUs to Python than the cgroup actually grants (os.cpu_count vs nproc), so the ambient BLAS/OpenMP pools oversubscribe it and a BLAS-bound cell comes out bimodal, the same work sampling anywhere from a few to tens of milliseconds; the pools are pinned so two formulations are compared on the same footing, and the effective values are recorded here"
+      },
+      "unavailable_backends": {},
+      "versions": {
+        "cpu_count": 16,
+        "cpu_model": "13th Gen Intel(R) Core(TM) i5-13400F",
+        "evoxc": "0.0.0+unknown",
+        "machine": "x86_64",
+        "native_extension": null,
+        "numpy": "2.5.5",
+        "platform": "Linux-6.18.63-x86_64-with-glibc2.44",
+        "python": "3.14.10"
+      },
+      "vmap": {
+        "reason": "the Rust extension evoxc._evoxc_native is not built in this worktree and every builtin transform (vmap included) delegates to it with no Python fallback; the batched comparison is a hand-written graph validated against 64 separate applies",
+        "status": "unavailable"
+      }
+    }
+  }
+}
