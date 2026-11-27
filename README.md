@@ -24,6 +24,10 @@ evoxc owns graph construction, transformations, and the explicit trace → lower
 
 ---
 
+## Documentation
+The reference documentation lives at **[compiler.evox.group](https://compiler.evox.group)** — installation, the explicit pipeline, graph transforms, control flow, backends and compiler adapters, collectives, persistence, tensor formats, sparse tensors, the op catalogue, the option tables and the generated Python API reference.
+The site is built from this repository's `./docs-site/` directory through the shared [EMI-Group/evox-docs-infra](https://github.com/EMI-Group/evox-docs-infra) workflows; its authoring contract is `./docs-site/CONTEXT.md`.
+
 ## Why evoxc exists
 
 Evolutionary computation repeatedly evaluates populations of candidates and updates their state. These workloads benefit from batching evaluations and reusing an executable across iterations, with state kept on the execution device. When the candidates are programs, as in genetic programming and algorithm synthesis, evaluating them separately can also repeat compilation and dispatch work.
@@ -344,7 +348,7 @@ The NumPy backend dispatches a registered NumPy implementation when available an
 
 - `evoxc.custom_call(call_target_name, *operands, result=..., backend_config="", api_version=1, has_side_effect=False)` emits a `stablehlo.custom_call`. The selected compiler validates the target and its configuration.
 - `evoxc.inline_stablehlo(body, *operands, result=..., has_side_effect=False)` inserts an MLIR snippet. Reference operand *i* as `%in<i>` and assign result *i* to `%out<i>`.
-- `evoxc.compile_text(mlir_text, input_specs, output_specs, backend="iree")` compiles and loads an authored or edited StableHLO module with a compiler backend. Pass the inputs as positional arguments to `evoxc.run(exe, *args)` and read the results as a tuple. Use `Executable.source_text()` to retrieve the text from a compiled executable.
+- `evoxc.compile_text(mlir_text, input_specs, output_specs, backend="iree")` compiles and loads an authored or edited StableHLO module with a compiler backend. Pass the inputs as positional arguments to `evoxc.run(exe, *args)` and read the results as a tuple. The `CompiledArtifact` returned by `evoxc.compile` keeps that text: `artifact.source_text()` returns it (and `None` for a payload with no textual form).
 
 The in-graph operations require `Capabilities.custom_ops`. IREE, XLA, and TVM accept them for lowering, subject to the selected compiler's support. For Python or Triton kernels, see [Custom kernels](#custom-kernels).
 

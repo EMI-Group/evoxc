@@ -127,7 +127,7 @@ Development and CI install both with `uv sync --all-packages` (a plain `uv sync`
 
 ## Error strategy (binding)
 
-All public errors derive from `EVOXCError` (in `core`): `TraceError`, `ShapeError`, `TransformError` (axis mismatch, unsupported batching/diff — never silent fallback), `BackendError`, `PersistenceError`, `DeviceError`, `DTypeError`, `VerificationError`. No API silently swallows or works around errors. Error messages include source location (e.g. `model.py:83`) whenever a graph location exists.
+All public errors derive from `EVOXCError` (in `core`): `TraceError`, `ShapeError`, `TransformError` (axis mismatch, unsupported batching/diff — never silent fallback), `BackendError`, `PersistenceError`, `DeviceError`, `DTypeError`, `VerificationError`, plus `BlockError` (block declaration/implementation misuse; in `block`, a `core`-subclass of `EVOXCError`). No API silently swallows or works around errors. Error messages include source location (e.g. `model.py:83`) whenever a graph location exists.
 
 ## Dependencies, testing, and hardware policy
 
