@@ -66,10 +66,21 @@ Worked example — a fitness graph ``f(dataset, params, candidate)`` where
     )
     plan = evoxc.split_by_inputs(graph, fixed_leaves=[1])   # params fixed
 
-    prepare = evoxc.build(plan.prepare)              # once per parameters
-    apply = evoxc.build(plan.apply)                  # once per shape set
-    prepared = evoxc.run(prepare, dataset, params)   # a 1-tuple (the product)
+    def stage(half):
+        return evoxc.load(evoxc.compile(evoxc.lower(half, backend="numpy"),
+                                       backend="numpy"),
+                          backend="numpy")
+
+    prepare, apply = stage(plan.prepare), stage(plan.apply)   # once per shape set
+    prepared = evoxc.run(prepare, params)          # 1-tuple: the boundary tensors
     score = evoxc.run(apply, (dataset, candidate), prepared)
+
+`prepare` is fed ONLY the fixed inputs (the input tree pruned to the fixed
+tensor leaves, statics preserved), while `apply` takes the synthetic 2-child
+root ``(varying inputs, prepared tuple)`` — so a re-run of `prepare` is what a
+changed fixed input requires, and the backend/device in `lower`/`compile`/
+`load` is the caller's choice (the example pins ``"numpy"`` only for
+concreteness).
 
 v1 limits (one line): region-bearing control flow and effectful ops are
 blocked, there is no per-turn state tracking (a changed fixed input needs a
