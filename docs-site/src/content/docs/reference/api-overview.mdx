@@ -89,9 +89,14 @@ Op functions build into the active trace. Called with a `SymbolicTensor` they bu
 | `evoxc.jvp(fn_or_graph, tangents)` | forward-mode |
 | `evoxc.vjp(fn_or_graph, cotangents=None)` | reverse-mode with explicit cotangents |
 | `evoxc.batch_functions(fns, axes=0, out_axes=0, *, switch_ops=None, bands=None, alignment="variant")` | merges same-signature programs into one graph |
+| `evoxc.split_by_inputs(graph_or_fn, fixed=None, *, fixed_leaves=None)` | one graph sliced into a `prepare` half (its fixed inputs) and an `apply` half (its varying inputs); a `Graph` in, a `SplitPlan` out |
+| `evoxc.analyze_inputs(graph)` | `InputAnalysis`: per tensor input, its consumers, the ops that depend on it, the outputs it influences, and what fixing it alone would cost |
+| `evoxc.SplitPlan`, `evoxc.BoundaryValue`, `evoxc.InputAnalysis`, `evoxc.InputInfo`, `evoxc.SplitCallable` | the split's plan, boundary and report types ([details](/reference/pipeline-objects/)) |
 | `evoxc.BatchReport`, `evoxc.SwitchRecord` | the merge metadata reported on `graph.batch_report` |
 
-With a function or `Defn` the result is a `TransformCallable` (`*specs → Graph`); with a `Graph` it is a `Graph`. Transforms never execute anything. Guide: [Graph transforms](/guides/graph-transforms/).
+With a function or `Defn` the numeric transforms give a `TransformCallable` (`*specs → Graph`) and the split gives a `SplitCallable` (`*specs → SplitPlan`); with a `Graph` the result is a `Graph` — except the split, which returns a `SplitPlan` holding two of them. Transforms never execute anything. Guide: [Graph transforms](/guides/graph-transforms/).
+
+The five numeric transforms and the `batch_functions` merge are the Rust engine; `split_by_inputs` and `analyze_inputs` are the one structural (non-numeric) pass and live in Python because they only slice the graph data structure.
 
 ## In-graph control flow
 

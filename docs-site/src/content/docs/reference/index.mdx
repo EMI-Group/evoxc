@@ -70,12 +70,14 @@ Every reference page is consistent with this one chain, and each arrow is a publ
 | define | `evoxc.defn` | `Defn` |
 | trace | `evoxc.trace` | `Graph` (EvoXIR) |
 | transform (optional) | `evoxc.vectorize` / `vmap` / `grad` / `jvp` / `vjp` / `batch_functions` | `Graph` |
+| transform (structural, optional) | `evoxc.split_by_inputs` | `SplitPlan` — a `prepare` / `apply` pair of `Graph`s |
 | lower | `evoxc.lower` | `LoweredProgram` |
 | compile | `evoxc.compile` | `CompiledArtifact` |
 | load | `evoxc.load` | `Executable` |
 | run | `evoxc.run` | `Tensor` tree |
 
 `evoxc.build` composes trace → lower → compile → load, `evoxc.evaluate` adds a run, and `evoxc.build_cached` memoizes the build. Those three are documented shorthand and nothing more; every other reference claim is about one of the explicit hops.
+`evoxc.split_by_inputs` is the structural exception in the transform row: it returns a `SplitPlan` holding two ordinary `Graph`s rather than one `Graph`, and each half then stages through the same explicit hops.
 
 ## How the reference relates to the generated Python API
 
