@@ -13,8 +13,8 @@ Each case pins the error TYPE plus a distinguishing substring of the message
 wording polish does not break the suite while a lost diagnostic does.
 Authority: `evoxc/transforms/CONTEXT.md` ("split_by_inputs (structural pass,
 binding)" + "v1 scope vs deferred"), `evoxc/transforms/split.py` (the mask /
-`fixed_leaves` validation) and `evoxc/transforms/_split_core.py` (`gates` /
-`_gate_op` / `split_graph`).
+`fixed_leaves` validation) and `evoxc/transforms/_split_deps.py` (`gates` /
+`_gate_op`) plus `evoxc/transforms/_split_build.py` (`split_graph`).
 """
 import numpy as np
 import pytest

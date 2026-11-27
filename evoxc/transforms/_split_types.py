@@ -19,8 +19,8 @@ Contents:
   `analyze_inputs` (see `analyze.py`).
 
 This module is deliberately free of machinery: the analysis/clone/build code
-lives in `_split_core.py`, the public entry points in `split.py` (the pass)
-and `analyze.py` (the report).
+lives in `_split_deps.py` / `_split_build.py` (re-exported by `_split_core.py`),
+the public entry points in `split.py` (the pass) and `analyze.py` (the report).
 """
 
 from __future__ import annotations
