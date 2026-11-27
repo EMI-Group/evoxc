@@ -67,7 +67,7 @@ The distinction that matters most: a static value is *Python*, so Python `if`/`f
     `@evoxc.defn`, `evoxc.trace`, and the `Graph` you get back — specs, static values, pytrees, `summary()`, `digest()`.
   </Card>
   <Card title="Graph transforms" href="/guides/graph-transforms/">
-    `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` as ordinary graph-to-graph functions.
+    `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` as ordinary graph-to-graph functions, plus `split_by_inputs` (one graph into a fixed/varying `prepare`/`apply` pair) and `analyze_inputs`.
   </Card>
   <Card title="In-graph control flow" href="/guides/control-flow/">
     `cond`, `while_loop` and `scan` — runtime branches and loops that stay inside the persisted program.
@@ -133,6 +133,7 @@ These pages all rest on one rule: a tensor's `device` says where its data actual
 | write a loop or a branch | [In-graph control flow](/guides/control-flow/) |
 | run on a GPU | [Compiler adapters](/guides/compiler-adapters/) → [Tensors and devices](/guides/tensors-and-devices/) |
 | ship one graph for a whole population | [Graph transforms](/guides/graph-transforms/) (`batch_functions`) |
+| split a graph into a fixed part and a per-call part | [Graph transforms](/guides/graph-transforms/) (`split_by_inputs`) |
 | plug in your own kernel | [Custom ops and kernels](/guides/custom-blocks/) |
 | save a compiled artifact and reload it | [Persistence and caching](/guides/persistence-and-caching/) |
 
