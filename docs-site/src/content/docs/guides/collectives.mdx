@@ -25,7 +25,7 @@ The value model underneath is the same as everywhere else: a tensor is a **local
 
 ## Groups
 
-A group is a static Python value — a named set of ranks that specializes the graph at trace time:
+A [`group`](/api/evoxc/dist/group/) is a static Python value — a named set of ranks that specializes the graph at trace time:
 
 ```python
 dp = evoxc.dist.group("dp", (0, 1, 2, 3))
@@ -46,12 +46,12 @@ Every collective takes one `SymbolicTensor` and returns one `SymbolicTensor`; ca
 
 | Collective | Signature | Local effect |
 |---|---|---|
-| `all_reduce` | `all_reduce(x, op="sum", group=None)` | same shape; elementwise reduction across ranks |
-| `all_gather` | `all_gather(x, axis=0, group=None)` | `out[axis] = in[axis] × group_size` |
-| `reduce_scatter` | `reduce_scatter(x, op="sum", axis=0, group=None)` | `out[axis] = in[axis] ÷ group_size` |
-| `all_to_all` | `all_to_all(x, split_axis, concat_axis, group=None)` | split dim ÷ g, concat dim × g |
-| `broadcast` | `broadcast(x, src_rank=0, group=None)` | same shape; `src_rank`'s copy on every rank |
-| `collective_permute` | `collective_permute(x, source_target_pairs, group=None)` | same shape; routed by the pair list |
+| [`all_reduce`](/api/evoxc/dist/all-reduce/) | `all_reduce(x, op="sum", group=None)` | same shape; elementwise reduction across ranks |
+| [`all_gather`](/api/evoxc/dist/all-gather/) | `all_gather(x, axis=0, group=None)` | `out[axis] = in[axis] × group_size` |
+| [`reduce_scatter`](/api/evoxc/dist/reduce-scatter/) | `reduce_scatter(x, op="sum", axis=0, group=None)` | `out[axis] = in[axis] ÷ group_size` |
+| [`all_to_all`](/api/evoxc/dist/all-to-all/) | `all_to_all(x, split_axis, concat_axis, group=None)` | split dim ÷ g, concat dim × g |
+| [`broadcast`](/api/evoxc/dist/broadcast/) | `broadcast(x, src_rank=0, group=None)` | same shape; `src_rank`'s copy on every rank |
+| [`collective_permute`](/api/evoxc/dist/collective-permute/) | `collective_permute(x, source_target_pairs, group=None)` | same shape; routed by the pair list |
 
 `op` is one of `"sum"`, `"max"`, `"min"`, `"prod"`; anything else is a `ValueError`.
 Axes normalize Python-style (negative wraps), and an out-of-range axis is a `ShapeError`.
@@ -71,7 +71,7 @@ Worked local shapes for `g = evoxc.dist.group("data", (0, 1, 2, 3))`:
 
 ## `rank()` and `world_size()`
 
-These are **graph scalars**, not Python ints: `evoxc.dist.rank()` and `evoxc.dist.world_size()` each build a scalar `int64` op of shape `()` whose value comes from the execution context at run time.
+These are **graph scalars**, not Python ints: [`evoxc.dist.rank()`](/api/evoxc/dist/rank/) and [`evoxc.dist.world_size()`](/api/evoxc/dist/world-size/) each build a scalar `int64` op of shape `()` whose value comes from the execution context at run time.
 
 ```python
 @evoxc.defn
