@@ -152,7 +152,7 @@ NN modules, layers, optimizers, datasets, loaders, training loops, model zoo; au
 ## Status
 
 Implemented and tested. The explicit pipeline, all graph transforms, explicit collectives, custom blocks, the `evoxc.numpy` namespace, the numpy interpreter (default, CPU), the native Rust CPU engine (`backend="native"`), the StableHLO exporter, the pluggable compiler adapters, the tensor-container formats and persistence/caching are in place, together with the compiler escape hatches (`custom_call`, `inline_stablehlo`, `compile_text`) and the out-of-tree backend registry.
-Binding contracts: `./evoxc/CONTEXT.md` (package API), `./native/CONTEXT.md` (Rust workspace + FFI), `./evoxc/backends/adapters/CONTEXT.md` (adapter semantics, per-option tables, Known Issues), `./evoxc/backends/native/CONTEXT.md` (native backend), `./evoxc/backends/CONTEXT.md` (interpreter/staging cost models), `./evoxc/transforms/CONTEXT.md` (transform semantics + measurements), `./evoxc/formats/CONTEXT.md` (container formats), `./evoxc_hf/CONTEXT.md` (HF models), `./tests/CONTEXT.md` (test baseline and inventories).
+Binding contracts: `./docs-site/CONTEXT.md` (documentation site), `./evoxc/CONTEXT.md` (package API), `./native/CONTEXT.md` (Rust workspace + FFI), `./evoxc/backends/adapters/CONTEXT.md` (adapter semantics, per-option tables, Known Issues), `./evoxc/backends/native/CONTEXT.md` (native backend), `./evoxc/backends/CONTEXT.md` (interpreter/staging cost models), `./evoxc/transforms/CONTEXT.md` (transform semantics + measurements), `./evoxc/formats/CONTEXT.md` (container formats), `./evoxc_hf/CONTEXT.md` (HF models), `./tests/CONTEXT.md` (test baseline and inventories).
 
 ### Native core (Rust + PyO3)
 

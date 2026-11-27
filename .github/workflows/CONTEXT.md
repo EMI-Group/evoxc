@@ -2,6 +2,7 @@
 
 ## Intent
 
+`docs-site.yml` is the independent documentation-site workflow (build on every pull request, deploy to the `evoxc-docs` Cloudflare Worker on pushes to `main`; it never touches the Python distributions or the release pipelines).
 These workflows test and package the two distributions from one workspace: `ci.yml` gates pull requests and pushes to `main`, `release_gate.yml` is the quick end-to-end release gate, and `release.yml` releases `evoxc` from a verified tag push while retaining the independent, manually initiated GitHub Release for `evoxc-hf`.
 A release tag never runs the full CI suite: it runs the quick gate and then the authoritative wheel matrix.
 
@@ -61,6 +62,7 @@ A release tag never runs the full CI suite: it runs the quick gate and then the 
 | Path | Area |
 |---|---|
 | `./ci.yml` | PR/main gate: Python pytest matrix, compiler leg, Rust tests + Clippy, and packaging. |
+| `./docs-site.yml` | Documentation site: calls the shared `EMI-Group/evox-docs-infra` `build.yml`/`deploy.yml@v0.1.0` for the Nimbus site in `../docs-site/` (config `../docs-infra.yml`, Worker `evoxc-docs`, Custom Domain `compiler.evox.group`). |
 | `./release_gate.yml` | Reusable quick end-to-end release gate (build, boundary, abi3-floor/ceiling and combined-distribution smokes). |
 | `./wheels.yml` | Reusable gate for the supported evoxc wheel matrix, source archive and exact installs. |
 | `./smoke_evoxc.py` | Fresh-venv install and compiled-extension graph smoke for one exact archive. |
