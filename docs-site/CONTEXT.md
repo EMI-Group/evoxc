@@ -16,7 +16,7 @@ The site documents the public API; it never documents private modules (`evoxc._n
 - Components usable in `.mdx` without any import (registered in `src/components.ts`): `Aside`, `Card`, `CardGrid`, `PackageManagers`, `Step`/`Steps`, `Tabs`/`TabItem`, `Render`.
   `<Aside type="note|tip|caution|danger" title="…">` is the callout form — those are the only types `ui/aside/Aside.astro` styles, so any other value renders as a Note.
 - Internal links are absolute site paths with a trailing slash, e.g. `/guides/graph-transforms/`.
-  The `nimbus/internal-link` rule is an error, so a link to a page that does not exist breaks the build.
+  The `nimbus/internal-link` rule is an error, so a link to a page that does not exist fails the `npx @cloudflare/nimbus-docs check` preflight (the Astro build itself still passes; see Known issues).
 - Code examples must call the real public API exactly as `../evoxc/CONTEXT.md` defines it — real names, real keyword arguments, no invented parameters or return shapes.
 - A page is finished when no `TODO`, placeholder or authoring note remains and both `npx @cloudflare/nimbus-docs check` and `npm run build` pass.
 - Prefer explaining *why* a design is the way it is (explicitness, no hidden tracing, physical devices) over restating an API signature that the generated reference already shows; for signatures point readers at [`/reference/api-overview/`](/reference/api-overview/) rather than guessing a `/api/…` path.
@@ -36,6 +36,16 @@ node <path-to>/evox-docs-infra/bin/docs-infra.mjs python-api --root .
 ```
 
 The config for that generation is the repository-root `../docs-infra.yml`; the doc-site build workflow regenerates it before every build, so never hand-edit files under `src/content/docs/api/`.
+
+## Generated API tree: shape, URLs, sidebar
+
+`docs-infra python-api` (toolkit v0.1.0) writes ONE page per unique public function/class target plus a single root `api/index.md` titled `Python API reference`; it emits no per-package `index.md` and no sidebar metadata — the only frontmatter key is `title`, so generated pages carry no `description` and therefore no meta description.
+A page's path is its public name split on dots, each segment lowercased with `_` → `-`: `evoxc.pipeline.compile` → `src/content/docs/api/evoxc/pipeline/compile.md` → `/api/evoxc/pipeline/compile/` (never a dotted single segment); the first module listed in `../docs-infra.yml` that exports a symbol owns its canonical page.
+Generated pages are `.md`, so they join the plain `docs` collection, whose `docsCollection()` loader globs `**/*.{md,mdx}` (nested subdirectories accepted, strict frontmatter — only `title` is required).
+Nested directories render as recursive sidebar groups (`src/components/ui/sidebar/SidebarGroup.astro` recurses); a group is open unless its `collapsed` is `true`, and a directory `index.md` collapses to the directory URL and becomes that group's landing page, whose link `overviewLabel: true` labels "Overview" — a directory without an `index.md` is a heading-only group with no overview link.
+A hand-authored `api/index.md` would collide with the generated one (a collision aborts generation); a nested `api/evoxc/<module>/index.md` has no generated counterpart and survives regeneration.
+The API tree is a directory of the primary `docs` collection, not a separate collection, so `sidebar.scope: "section"` / `isolate` cannot isolate it; the 300+-entry rail is tamed with `collapsed: true` on the `Python API` sidebar item, site-wide `defaultCollapsed: true`, or a `transform` passed to `getSidebar` in `src/pages/[...slug].astro`.
+A committed copy of the tree is overwritten by the CI regeneration step, so a generated page is never patched by hand — fix the docstring.
 
 ## Routing table
 
@@ -96,6 +106,8 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 - The toolkit derives page URLs by lowercasing symbol names, so `evoxc.ir.OpDef` and `evoxc.ir.opdef` collide on one URL; `../docs-infra.yml` excludes the function and keeps the class page.
 - The top-level `evoxc` namespace is not generated: its `__all__` is computed at import time, which Griffe's static analysis cannot evaluate, so `reference/api-overview.mdx` is hand-written and links into the definition pages.
 - The generated pages carry the toolkit's back-link and signature text verbatim; when a docstring changes the page changes too, so never patch a generated page — fix the docstring.
+- `reference/index.mdx` names the page for `evoxc.compile` as `/api/evoxc.pipeline/compile/`; the generator writes `/api/evoxc/pipeline/compile/` (the public name's dots become directories), so that sentence is wrong and every `/api/…` deep link must be read from the generated `api/index.md` rather than hand-derived (the canonical owner is the first module listed in `../docs-infra.yml` that exports the symbol).
+- Generated pages have no `description`, so the one-sentence-description authoring rule cannot be met by generation; only `title` reaches the page schema.
 
 <!-- genesis:local -->
 
