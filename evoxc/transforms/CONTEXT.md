@@ -89,6 +89,18 @@ A banded merge glues the per-band outputs with ONE variadic `concatenate`: IREE 
 
 The native merge owns rank-0 mapped outputs directly: a mapped `out_axes=0` on a rank-0 per-function output becomes rank 1 in the merged graph (the static function axis is prepended), so the façade is a single `_merge` call for every population.
 
+## Building a result Graph (the reconstruction recipe)
+
+Every transform that wraps a modified module back into a `Graph` follows the same steps, in this order:
+1. Frontend validation with the pinned wording: exactly ONE function with ONE block (`batching._entry_function`), a `return` terminator, and `len(block.arguments) == len(graph.tensor_specs)`.
+2. Produce the new `ir.Module` (native `call_native`, or `ir.Builder` driven by `ir.opdef`); the rebuild helpers read `module.main`, so a multi-function module is never a valid result.
+3. Re-derive input specs from the SOURCE `graph.tensor_specs`, never from the decoded block-argument types, so symbolic row `Dim` objects survive by identity; a mapped leaf gains the shared batch `Dim` object, an unmapped leaf reuses the source spec object.
+4. Derive the output tree: the source `graph.output_tree` unchanged, `core.TreeSpec(type=None)` per NEW tensor output (`type=None` is the TENSOR-leaf marker), `core.TreeSpec(type=type(None))` per NEW static leaf — the two spellings are not interchangeable.
+5. Carry input source locations positionally: `source_locations[new_id] = graph.source_locations[old_argument.id]` zipped over `source_graph.module.main.entry_block.arguments` and the metadata's `input_ids`.
+6. Construct positionally — `type(graph)(module, input_specs, tuple(new_specs), output_tree, static_values, output_static_values, source_locations)`; `Graph.__init__` is bare attribute assignment with NO validation, so the pass owns consistency and only `verify()` checks IR invariants.
+7. `batch_report` is a plain attribute set AFTER construction (`batch_functions` does); nothing in the rebuild path populates it.
+Invariants every result graph must keep: `tensor_specs` order == block-argument order, `input_specs.num_leaves == len(tensor_specs) + len(static_values)`, and `output_tree` leaf order == `return`-operand order plus the output statics.
+
 ## API surface (public — re-exported from `__init__.py`)
 
 - `vectorize(graph, axes) -> Graph` — the primitive; a callable/`Defn` raises `TypeError` pointing at `evoxc.vmap`. `axes` is an `int`, `None`, or a pytree thereof over the input structure; `0` maps a tensor input's leading axis, `None` leaves it unmapped (mandatory for static inputs). Normalization lives in `vectorize._normalize_axes` (shared with `vmap` and `batch_functions`).

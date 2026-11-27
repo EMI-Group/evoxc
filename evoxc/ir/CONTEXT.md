@@ -46,7 +46,10 @@ arithmetic over symbolic dims uses core's `DimExpr`.
 
 ### 2. Nested regions (if/while)
 Control-flow ops own their bodies as `Op.regions`: `if` holds `(true, false)`,
-`while` holds `(cond, body)`. Operand values are passed by binding them to the
+`while` holds `(cond, body)`. Those are the ONLY two region-bearing op names —
+`evoxc.cond`/`evoxc.while_loop` emit them directly and `evoxc.scan` desugars to a
+`while` plus structural ops (`../trace/control_flow.py:730`), so "has nested
+regions" is exactly `bool(op.regions)` (== `op.opdef.regions`). Operand values are passed by binding them to the
 entry-block arguments of each region (MLIR style): block-arg count/type must
 match operand count/type. v1: FUNCTION regions must be single-block
 (`verify.py:197-204`); nested regions must be non-empty (`verify.py:369`) but
@@ -372,6 +375,12 @@ in `printer.py`.
   `reduce_*` OpDefs carry a `reduce_op` attribute: 'sum'|'max'|'min'|'mean'|
   'prod').
 - Files < ~1000 lines; op_defs split by category (done).
+- **Hand-building / slicing a function (mechanics for a new structural transform):** `Block.arguments` is a TUPLE with no append/`add_arg` helper, so block arguments are constructed as `Value(id=module.new_value_id(), type=ValueType(...), owner=block, index=i)` and assigned wholesale (`block.arguments = tuple(...)` — exactly `builder.py:234-242`); a block-argument `Value`'s `.owner` is the BLOCK (`value.is_block_arg` True, `value.defining_op` None).
+- `Builder` needs no trace and has no context-manager API: `Builder(module)`, `build_module`/`build_function`/`build_region`/`insert_block`, `set_insertion_point`/`push_region`/`pop_region`, then `create(op_name, operands=..., attributes=..., result_types=..., location=..., regions=...)` / `emit(...)` / `set_terminator(block, "return", operands)`; only `evoxc.ops` op functions need the trace-owned `current_builder()`/`with_builder` (`../trace/builder.py`), whose `_return_terminator` is just `Builder.set_terminator(current_block, "return", values)`.
+- `Module._op_ids`/`_value_ids` are `itertools.count()` from 0 and fresh ids come from `module.new_op_id()`/`new_value_id()` (non-negative, module-unique); a rebuild that REUSES source ids must fast-forward both counters (`serialize._fast_forward_counters`, `serialize.py:783`).
+- `serialize._build_module` and `_native_decode.build_module_fast` are the in-tree templates for wiring `Op`/`Value` objects by hand (`block.append(op)` wires `op.parent`, `operand.add_use(Use(op, i))` per operand) instead of going through `Builder`; attributes/locations may be shared by reference (both are immutable-in-practice value dicts/frozen `Location`).
+- There is NO clone/slice/DCE/topological utility in this package (no `clone`/`deepcopy`/`remap`/`value_map`/reachability walk): the only traversal primitives are `Value.owner`/`defining_op`/`is_block_arg`/`uses`, `Op.operands`/`results`, `Block.ops`, `Op.regions`, plus the private `../trace/graph.py` `_iter_nested_ops(region)` and `serialize._collect_ops`.
+- What `verify` then demands of a hand-built subgraph: recorded result types must equal a FRESH `shape_fn` re-derivation from the remapped operand types (`verify.py:684-742`), so remapped operands must keep their original `ValueType`s; operands must dominate (enclosing block args or earlier ops, `verify.py:336-352`); nested-region entry args must equal the op's operand types one-for-one (`verify.py:388-409`); `result_specs` of `block_call`/`external_call`/`runtime_call`/`custom_call`/`inline_stablehlo` must be a sequence of `ValueType`s EQUAL to the op's results (`verify.py:846-868`); entry-block arg count/types must equal `Function.input_types`; and a function's outputs are nothing but its `return` operands' types (no declared output field — `Function.output_types` is derived, `function.py:49-59`), terminated by exactly one last `return` op.
 - `_native_decode.build_module_fast` must stay structurally in lockstep with
   `serialize._build_module`: a change to the envelope layout, the phase order or
   the `Use` wiring lands in BOTH, and an `EVOXC_NATIVE_DECODE_CHECK=1` run is
