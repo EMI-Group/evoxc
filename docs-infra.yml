@@ -62,12 +62,11 @@ python_api:
       - evoxc.random
       - evoxc.build_cache
       - evoxc.io
-    # `evoxc.ir.OpDef` (the class) and `evoxc.ir.opdef` (the lookup function)
-    # differ only in case, and the toolkit lowercases page paths, so both map to
-    # `api/evoxc/ir/opdef/`. Keep the class page (richer: attributes and
-    # docstring, cited from reference/architecture) and drop the function's; the
-    # lookup is described in the architecture page.
-    exclude: [evoxc.ir.opdef]
+    # No exclusions: page paths are lowercased, so a class/function pair that
+    # differs only in case (``evoxc.ir.OpDef`` / ``evoxc.ir.opdef``,
+    # ``evoxc.dist.Group`` / ``evoxc.dist.group``) is disambiguated by the
+    # generator — the first sorted name keeps the plain path and the later one
+    # gets a ``-class``/``-function`` suffix.
     docstring_style: auto
     output: docs-site/src/content/docs/api
     url_prefix: /api
