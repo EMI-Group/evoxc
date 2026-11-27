@@ -5,4 +5,157 @@ sidebar:
   order: 9
 ---
 
-<!-- TODO(content): write the Persistence and caching page. -->
+Persistence in evoxc is an explicit operation on a specific stage object, and caching is an object you own.
+Nothing is saved behind your back, nothing is cached implicitly, and loading never fills in a missing pipeline step: a saved `LoweredProgram` is not an executable, and a saved artifact never silently re-compiles.
+
+## One container, four stages
+
+Every stage object writes the same self-describing container (`evoxc.persist`), with a payload type that identifies the stage:
+
+| Object | Method | Payload | Typical suffix |
+|---|---|---|---|
+| `Graph` | `graph.save(path)` / `evoxc.Graph.load(path)` | the serialized IR module, input/output trees, specs, static values, source locations | `.evoxcgraph` |
+| `LoweredProgram` | `.save(path)` / `evoxc.LoweredProgram.load(path)` | the backend's program (for a StableHLO lowering, the MLIR text inside the compiler payload) | `.evoxc` |
+| `CompiledArtifact` | `.save(path)` / `evoxc.CompiledArtifact.load(path)` | the compiled form plus required custom ops and runtime dependencies | `.evoxcartifact` |
+| `Executable` | `.save(path)` / `evoxc.Executable.load(path, backend=None, device=None)` | delegates to the backend executable, which saves the artifact and reconstructs explicitly | `.evoxcexe` |
+
+Each save records the backend name, the target, the signature (TreeSpecs plus per-leaf specs and static values) and the format version, so a load can validate what it is about to hand back.
+
+```python
+import evoxc
+
+graph    = evoxc.trace(step, evoxc.TensorSpec((2, 3), evoxc.float32))
+lowered  = evoxc.lower(graph)
+artifact = evoxc.compile(lowered)
+exe      = evoxc.load(artifact)
+
+graph.save("step.evoxcgraph")
+artifact.save("step.evoxcartifact")
+
+# ... another process, without the original function:
+exe2 = evoxc.Executable.load("step.evoxcartifact")
+out = evoxc.run(exe2, evoxc.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+```
+
+`Executable.save` needs a backend executable that can serialize itself; a backend holding live device handles raises `PersistenceError` telling you to save the `CompiledArtifact` and reload it with `evoxc.load` instead of pretending a handle was serialized.
+
+### What loading refuses
+
+- A mismatched backend, device or ABI: `PersistenceError`, never a silent re-compile.
+- The wrong stage: loading a saved `LoweredProgram` as an executable raises "compile the lowered program first".
+- A truncated or tampered file: the payload checksum is verified, and the message says corrupt.
+- A newer container version: rejected explicitly — there is no migration path.
+
+## The container layout
+
+| Field | Size | Notes |
+|---|---|---|
+| magic | 9 B | `EVOXCPERS` |
+| format version | 4 B | `EVOXC_FORMAT_VERSION` (currently `1`) |
+| header length + header JSON | 4 B + H | `payload_type`, `backend_info`, `signature_info`, `format_version`, `hash_algorithm` |
+| payload length + payload | 8 B + P | the JSON of the encoded payload fields |
+| SHA-256 | 64 B | hex digest of the payload bytes |
+
+Multi-byte integers are big-endian and writes are atomic (temp file → fsync → `os.replace`), so a reader never sees a half-written file.
+The hash covers the payload only — it is corruption detection, not authentication.
+
+The same functions are directly usable for your own data:
+
+```python
+import evoxc.persist as persist
+
+persist.save_object("weights.evoxc", "weights", {"arrays": {"w": w, "b": b}})
+loaded = persist.load_object("weights.evoxc", expected_payload_type="weights")
+loaded.payload["arrays"]["w"]        # a READ-ONLY numpy array
+```
+
+<Aside type="note" title="A container, not a checkpoint reader">
+The payload is encoded by the `evoxc.persist` codec: `None`, bool, int, float, complex, str, list, tuple, dict, numpy arrays/scalars/dtypes, `slice`, `Dim`, `DimExpr`, `Device`, `TensorSpec` and `TreeSpec`. Unknown types and cycles raise `PersistenceError`, and the codec is extensible via `register_codec`.
+There is no `.npy`/`.npz`/safetensors/torch loader here — for checkpoint files use [tensor formats](/guides/tensor-formats/) and store the decoded arrays afterwards. A `TreeSpec` whose node type is a function-local class encodes but fails to decode, so keep pytree node types module-level if artifacts must round-trip.
+</Aside>
+
+## `Graph.digest()` — a structural key
+
+`graph.digest()` is a SHA-256 over the canonical structural payload (the serialized module with source locations stripped, plus the signature and spec trees).
+It ignores source locations, so it is stable across processes, across files, and across `save`/`load` — which makes it the right key for "is this the same program?", and the wrong key for "is this the same file?".
+
+```python
+graph = evoxc.trace(step, spec)
+graph.digest()                       # 64 hex characters: sha256 of the structural payload
+
+graph.save("step.evoxcgraph")
+evoxc.Graph.load("step.evoxcgraph").digest() == graph.digest()   # True
+```
+
+`summary()` carries the digest next to the counts, so one inspection call answers both "what is in this graph" and "which graph is it" — see [inspection and errors](/guides/inspection-and-errors/).
+
+## Caching is explicit: `Cache` and `FileCache`
+
+There is no global cache in evoxc. `evoxc.Cache` is an interface — `get`, `put`, `contains`, `clear`, and a `get_or_compute` alias — and `evoxc.FileCache(directory)` is the on-disk implementation, one container file per key.
+
+```python
+cache = evoxc.FileCache("/var/cache/evoxc")
+key = ["my-step", evoxc.persist.EVOXC_FORMAT_VERSION, graph.digest(), ["opt_level", "O2"]]
+
+cache.get(key)                       # None on a miss
+cache.get_or_compute(key, compute)   # compute(), store, return
+```
+
+Keying is a **caller** contract: the components must include everything that affects the value — graph bytes or digest, format/IR version, static values, signatures, backend name and version, compiler options and target, custom ops, runtime ABI.
+`evoxc.persist.compute_key(key_components)` derives the SHA-256 hex key and tags the container type, so a bare string and a one-element list do not collide.
+One sharp edge: a top-level `dict` passed as the key contributes its *keys* only — pass `[options_dict]` when the values must affect the key.
+Corrupt entries are treated as a miss (recompute and overwrite atomically when a compute function was given, otherwise `None`); that is the one documented place evoxc swallows an error.
+
+<Aside type="warning" title="Invalidate by key, never by luck">
+A cache entry is only as correct as the key you assembled. Persistence does not expire, version-bump or re-validate your entries, and no API will notice that a compiler flag changed. If a key component can change the bytes, put it in the key — otherwise pass a fresh cache.
+</Aside>
+
+## Memoised builds: `build_cached`
+
+`evoxc.build_cached(fn, *specs, backend=None, device=None, cache=None, **options)` is documented shorthand for a **memoised** `build`: the exact `trace → lower → compile → load` composition runs at most once per distinct key, and a hit returns the same fully loaded `Executable` with zero pipeline work.
+
+```python
+cache = evoxc.CompileCache(maxsize=64)          # in-memory LRU, maxsize=128 by default
+exe_a = evoxc.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
+exe_b = evoxc.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
+
+exe_a is exe_b            # True  — no re-tracing, no re-compile
+cache.hits, cache.misses  # 1 1
+```
+
+The key is computed **before any tracing** from:
+
+- function identity (`id(fn)`, with the entry pinning `fn` as a keepalive so the id can never alias a later object),
+- the full `*specs` tree — structure *and* static-leaf content, encoded through the persistence codec,
+- the resolved backend name and the resolved device (`EVOXC_BACKEND` / `EVOXC_DEVICE` are read at call time and participate),
+- the resolved options, canonicalised so semantically equal option sets key identically.
+
+The static-content rule is what makes it fit meta-level loops: each distinct static "program" value is a distinct graph and therefore a distinct entry, while a runtime tensor in a program slot is an ordinary graph input keyed once on its `TensorSpec` — never specialised per value.
+An unencodable static leaf raises a `TypeError` naming the key component path (`specs[2]`, `specs[3]['w']`) before any cache access.
+
+Bookkeeping is strict: `fn` validation, backend/device resolution, cache-type checks and encodability all fire first; post-key stage failures count a miss, insert nothing and re-raise untouched, so a cached failure never exists.
+Only a fully loaded `Executable` is ever inserted, `CompileCache` is in-memory only (executables hold device handles, vmfb or compiled code — never persisted), and there is deliberately no `cache=False` escape: plain `evoxc.build` is the no-cache path.
+`cache=None` selects the module-level default `CompileCache`; pass your own for isolation.
+
+### Why the loop cares
+
+A meta-level outer loop — NAS, genetic programming, algorithm synthesis — emits a **different static program each generation**, and the inner step re-traces and re-stages per program.
+Measured on the numpy backend (`--seed 0 --reps 7`, records in `evoxc/bench/compile_perf_findings.md`): staging a 200-op graph went from 6.29 ms to 1.99 ms (3.16×) and `build` from 8.65 ms to 3.68 ms (2.35×) once staging decoded the module at most once; the 1700-op graph went 52.0 → 16.7 ms staging and 66.2 → 30.8 ms for `build`; a 5000-op trace dropped 65.6 → 36.4 ms.
+`build_cached` hits stay at roughly 0.04 ms, because a hit does no pipeline work at all.
+
+```python
+cache = evoxc.CompileCache(maxsize=256)
+
+for generation in range(generations):
+    program = population[generation]        # a STATIC structure: ints, floats, tuples
+    exe = evoxc.build_cached(step, spec_x, program, cache=cache, device="cpu")
+    result = evoxc.run(exe, x)              # same-device run loop, unchanged
+```
+
+The returned executable is a normal one: device-resident inner loops that feed outputs back as inputs work exactly as before.
+
+<Aside type="caution" title="Env knobs are not in the key">
+Process environment variables the compiler stages read themselves (`EVOXC_OPT_LEVEL`, `EVOXC_EIGH_ALGORITHM`, `EVOXC_SPLIT_REDUCTION`, `EVOXC_IREE_*`, `EVOXC_XLA_*`, `EVOXC_TVM_*`) are **not** key components. Change one and the cache still answers with the old executable — clear the `CompileCache` or pass a fresh one.
+</Aside>
+
+Next: [tensor formats](/guides/tensor-formats/) for getting weights into a graph, or [reference options](/reference/options/) for the options that belong in a cache key.

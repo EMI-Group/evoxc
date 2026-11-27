@@ -5,4 +5,156 @@ sidebar:
   order: 10
 ---
 
-<!-- TODO(content): write the Tensor formats page. -->
+`evoxc.formats` reads and writes the **tensor half** of the common checkpoint containers without a `torch`, `transformers`, `safetensors` or `gguf` dependency.
+It is imported explicitly — `import evoxc.formats` — and adds no flat `evoxc.*` names.
+
+Scope is deliberately narrow: tensor data, dtype, shape, names, and the container metadata needed to find them.
+Tokenizers, chat templates, generation config and model-family semantics are out of scope; a module that knows how to turn these tensors into a model is a separate distribution — see [HuggingFace models](/huggingface/).
+
+Nothing here traces, compiles or moves data: a loaded tensor is ordinary host data on `Device("cpu", 0)`, and turning it into a graph input (or an `evoxc.constant`) is your explicit choice.
+
+## safetensors
+
+| Name | Signature | What it does |
+|---|---|---|
+| `load_safetensors` | `(path, *, mmap=True) -> SafetensorsFile` | parse and validate; `mmap=True` maps the file and hands back zero-copy read-only views |
+| `save_safetensors` | `(path, tensors, *, metadata=None)` | canonical layout, atomic write |
+| `SafetensorsFile` | `metadata`, `tensor_names()`, `info(name)`, `tensor(name)`, `as_dict()`, `close()`, `in`, `len`, iteration, context manager | the open container |
+
+The layout is the format's own: a little-endian `u64` header length, a JSON header of tensor descriptors, then the data buffer.
+The writer pads the header to an 8-byte multiple and aligns each tensor start to 8 bytes inside the data buffer; the reader also accepts a header length that is not a multiple of 8, because the offsets are validated independently.
+
+```python
+from evoxc.formats import load_safetensors, save_safetensors
+
+save_safetensors("weights.safetensors", {"w": w, "b": b}, metadata={"format": "pt"})
+
+ckpt = load_safetensors("weights.safetensors")   # mmap: zero-copy
+ckpt.metadata                                     # {'format': 'pt'}
+ckpt.tensor_names()                               # ['b', 'w']
+ckpt.info("w")                                    # w: float32(2, 3) (24 bytes)
+ckpt.tensor("w")                                  # a core.Tensor on Device("cpu", 0)
+ckpt.close()
+```
+
+A memory-mapped tensor is a **read-only view** of the file; `.numpy()` exposes that read-only array, and copying (`np.array(a)`) is the caller's explicit choice.
+`mmap=False` is a performance choice, never a semantic one: it reads eagerly and every returned array is an independent writable copy.
+A zero-element tensor cannot alias file memory, so it is a fresh writable array in both modes.
+
+### Dtype support
+
+| safetensors tag | `TensorInfo.dtype` | numpy dtype you get | Write |
+|---|---|---|---|
+| `F64` | `float64` | `float64` | yes |
+| `F32` | `float32` | `float32` | yes |
+| `F16` | `float16` | `float16` | yes |
+| `BF16` | `BF16` | raw `uint16` view | no (v1) |
+| `I64` / `I32` / `I16` / `I8` | `int64` / … | `int64` / … | yes |
+| `U64` / `U32` / `U16` / `U8` | `uint64` / … | `uint64` / … | yes |
+| `BOOL` | `bool` | `bool` | yes |
+| `F8_E4M3` / `F8_E5M2` | `F8_E4M3` / `F8_E5M2` | raw `uint8` view | no (v1) |
+
+That is 15 accepted tags and 12 writable ones.
+evoxc has no bf16 or fp8 dtype, so those two families surface as their raw storage words with the canonical name preserved in `TensorInfo.dtype` — the bit pattern is what you get, and interpreting it stays explicit.
+
+## GGUF v2/v3
+
+| Name | Signature | What it does |
+|---|---|---|
+| `load_gguf` | `(path, *, mmap=True) -> GGUFFile` | parse the v2/v3 header, the metadata KV table and the tensor infos; data is mapped lazily |
+| `GGUFFile` | `metadata`, `version`, `alignment`, `tensor_names()`, `info(name)`, `tensor(name)`, `raw(name)`, `close()`, `in`, `len`, iteration, context manager | the open container |
+
+GGUF stores dimensions fastest-axis-first (`ne[0]` first); the reader reverses them, so every shape you see is the ordinary numpy row-major one: `tensor(name).numpy().shape == info.shape`.
+The data section starts at `align_up(end_of_tensor_infos, alignment)` with `alignment` defaulting to `32`; a metadata-only file (zero tensors, e.g. a tokenizer container) may end without that padding and is accepted.
+`tensor()` widens `BF16` to `float32`, returns a zero-copy view for `F32`/`F16`, and **dequantizes** every block-quantized type to a fresh dense `float32` array; `raw(name)` always returns the stored payload bytes as a 1-D `uint8` view.
+
+| ggml type | id | `tensor()` gives you |
+|---|---|---|
+| `F32` | 0 | zero-copy `float32` view |
+| `F16` | 1 | zero-copy `float16` view |
+| `BF16` | 30 | widened `float32` |
+| `Q4_0` / `Q4_1` | 2 / 3 | dequantized `float32` |
+| `Q5_0` / `Q5_1` | 6 / 7 | dequantized `float32` |
+| `Q8_0` / `Q8_1` | 8 / 9 | dequantized `float32` |
+| `Q2_K` / `Q3_K` | 10 / 11 | dequantized `float32` |
+| `Q4_K` / `Q5_K` / `Q6_K` | 12 / 13 / 14 | dequantized `float32` |
+
+Fourteen types in total.
+Every other ggml type id fails loudly rather than returning wrong numbers: `Q8_K`, the IQ family, TQ, MXFP4/NVFP4, `Q1_0`/`Q2_0`, `I8`…`I64`, `F64` and `F8_E4M3` are v1 deferrals, as are GGUF v1 (32-bit string lengths) and big-endian files.
+See [limitations and deferrals](/reference/deferrals/) for the whole list.
+
+```python
+from evoxc.formats import load_gguf
+
+gguf = load_gguf("model.gguf")                  # headers only; data mapped lazily
+gguf.version, gguf.alignment                    # 3, 32
+gguf.metadata["general.architecture"]            # typed metadata values
+q4 = gguf.tensor("blk.0.attn_q.weight")          # dequantized, float32, host
+raw = gguf.raw("blk.0.attn_q.weight")            # the stored quantized bytes
+```
+
+## `TensorInfo`
+
+Both readers describe tensors with the same dataclass:
+
+| Field | Meaning |
+|---|---|
+| `name` | the tensor name inside the container |
+| `dtype` | the canonical **stored** dtype name — the numpy dtype name when numpy has a native equivalent, otherwise the format's own (`"BF16"`, `"Q4_K"`, …) |
+| `shape` | the numpy row-major shape, always |
+| `nbytes` | the stored payload size (for block-quantized types `numel / block_size * type_size`) |
+| `source_dtype` | the source format's own identifier, verbatim: a safetensors tag (`"F32"`) or a ggml type name (`"Q4_0"`) |
+
+plus `numel` and `rank` properties.
+`dtype` answers "what will this look like in my graph"; `source_dtype` answers "what was in the file".
+
+## Read → dequantize → graph constant
+
+The typical path in: open the container, and either pass the tensors as **explicit graph inputs** (the preferred form for anything large) or embed one with the explicitly warned `evoxc.constant`.
+A GGUF `tensor()` has already dequantized the block-quantized payload, so what enters the graph is ordinary dense `float32` host data:
+
+```python
+from evoxc.formats import load_gguf
+
+gguf = load_gguf("model.gguf")
+w = gguf.tensor("blk.0.attn_q.weight")     # dequantized dense float32, on Device("cpu", 0)
+```
+
+From there, either feed it in the run signature or snapshot it into the graph:
+
+```python
+import numpy as np
+import evoxc
+from evoxc.formats import load_safetensors
+
+ckpt = load_safetensors("weights.safetensors")
+
+@evoxc.defn
+def step(x, bias):
+    w = evoxc.constant(ckpt.tensor("w"))     # host data only; warned above the size limit
+    return evoxc.dot(x, w) + bias
+
+exe = evoxc.build(
+    step,
+    evoxc.TensorSpec((4, 2), evoxc.float32),
+    evoxc.TensorSpec((3,), evoxc.float32),
+    device="cpu",
+)
+out = evoxc.run(exe, evoxc.ones((4, 2), dtype=evoxc.float32), ckpt.tensor("b"))
+```
+
+`evoxc.constant` snapshots **host** data only — a non-CPU tensor raises `DeviceError` and needs `t.to(evoxc.Device("cpu", 0))` first — and warns above `EVOXC_LARGE_CONSTANT_BYTES` (1 MiB by default), which is exactly why large weights belong in the run signature.
+
+## Errors and boundaries
+
+- Malformed input is a `PersistenceError` naming the file, the tensor and the offending offset or range: short files, header overflow, bad JSON, unknown dtype tag, byte-extent mismatch, out-of-bounds or reversed offsets, overlapping tensors, non-string metadata, bad magic, an unsupported version, absurd counts, payload outside the data section, `n_dims` above 4, a non-block-multiple element count, a non-power-of-two alignment.
+- Writer argument problems are plain `TypeError`/`ValueError`; dtypes the format cannot represent (complex, float128, object, strings) and non-string metadata are rejected rather than coerced.
+- Accepted writer inputs are `core.Tensor` (a non-CPU tensor raises `DeviceError` from `.numpy()` — no implicit device-to-host transfer), numpy arrays and memmaps.
+
+<Aside type="note" title="Dequantization order is load-bearing">
+Each ggml block layout — interleaved low/high nibbles, the `qh` bit positions, the K-quant 6-bit scale packing — was verified bit-exactly against `gguf-py`'s independent `dequantize` on random blocks and against real checkpoints. Treat the dequantization code as pinned, not as something to "simplify".
+</Aside>
+
+Measured on the reference host (records in `evoxc/formats/CONTEXT.md`): a 65.7 MB / 2000-tensor safetensors file parses in 5.5 ms with `mmap=True` (31 ms with `mmap=False`), a single-tensor lookup plus view costs 4.3 µs, and GGUF dequantization runs at 470 Melem/s for `Q4_0`, 404 Melem/s for `Q4_K` and 376 Melem/s for `Q6_K`.
+
+Next: [sparse tensors](/guides/sparse-tensors/) for the other value model in the package, or [persistence and caching](/guides/persistence-and-caching/) for evoxc's own container.
