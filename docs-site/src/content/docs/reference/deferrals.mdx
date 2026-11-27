@@ -1,8 +1,145 @@
 ---
 title: Limitations and deferrals
-description: What v1 deliberately does not do, and the explicit error each deferral raises.
+description: What v1 deliberately does not do, and the explicit error or behaviour that marks each deferral.
 sidebar:
   order: 6
 ---
 
-<!-- TODO(content): write the Limitations and deferrals page. -->
+evoxc refuses loudly.
+A deferred feature is never emulated by a slower path, never approximated, and never silently lowered to something else — so the honest way to read this page is: every row names a thing you cannot do *and the failure you will get if you try*.
+That failure is documentation too: it names the op or option, and where a workaround exists it names that as well.
+
+<Aside type="important" title="There is no silent fallback anywhere">
+Every entry below raises a typed error (`TransformError`, `BackendError`, `TraceError`, `ShapeError` …) or is a Python-level `TypeError`/`NotImplementedError`.
+evoxc never falls back to a second backend, a Python loop, a densified copy or an approximation to keep a program running.
+</Aside>
+
+## Graph transforms
+
+| Deferral | What happens |
+|---|---|
+| Vectorizing control-flow regions | `vectorize`/`vmap` over `cond`, `while_loop` or `scan` raises `TransformError` naming the control-flow op |
+| `conv` VJP | `grad`/`vjp` through a `conv` raises `TransformError` — there is no transposed-convolution op in the IR |
+| Batching a `conv` with a *mapped kernel* | `TransformError`: the batch-group count is a static integer attribute, so a symbolic batch axis cannot be represented |
+| `batch_functions` merge gaps | `TransformError` for programs the merge cannot make bit-identical; the merge is all-or-nothing |
+| `vmap`/`grad`/`jvp`/`vjp` over random ops | `TransformError` with category `"random"` — there is no batching or derivative rule for the RNG family |
+| `vmap`/`grad`/`jvp`/`vjp` over ops with no registered rule | `TransformError` naming the op; rules exist per op family, not universally |
+| Whole-graph transforms over external kernels without a rule or portable | `TransformError` naming the kernel; register rules or a portable decomposition |
+
+Transformed results are ordinary graphs of ordinary ops, so a transform either produces a correct graph or raises — never a graph with a hidden loop.
+
+## Numeric and linear-algebra scope
+
+| Deferral | What happens |
+|---|---|
+| `linalg.inv`, `det` | there is no such op in v1 — the name does not exist on the namespace |
+| Matrix and arbitrary p-norms | `evoxc.norm` covers *vector* norms only, with `ord` in `1`, `2`, `inf`, `-inf`; any other `ord` raises `NotImplementedError` naming the supported set |
+| Non-constant `pad` modes | `evoxc.pad(x, config, value=0)` fills with a constant only; there is no `mode` parameter |
+| Symbolic-bound `arange`/`linspace` | `TraceError`: bounds must be concrete Python numbers at trace time, because the op becomes a constant (dynamic-length constants are deferred) |
+| Symbolic-length `scan` | `TraceError`: a dynamic (`None`) or symbolic scan length is reserved — the length must be derivable as a static `int`, or passed explicitly |
+| `conv` batching with `batch_group_count` | `TransformError` — the attribute must stay a static integer |
+
+## StableHLO export
+
+These ops exist in the frontend and run on the numpy interpreter and the `native` engine, but have **no emission in v1**. Lowering a graph containing one on a compiler backend raises `BackendError` at `lower()` naming the op.
+
+| Family | Ops without a v1 emission |
+|---|---|
+| scans and structural | `cumsum`, `cumprod`, `diagonal`, `tril`, `triu`, `flip`, `roll`, `nan_to_num` |
+| numeric | `erf`, `gelu` (StableHLO has no `erf`; the binding decomposition needs it) |
+| linalg | `cholesky`, `qr`, `matrix_rank`, `svd`, `matrix_exp`, `solve` |
+| random | `random_multinomial` — the other five `random_*` ops do export, with algorithm-aware lowering |
+
+`eigh` **is** v1: it lowers through a while-loop cyclic-Jacobi composition, with the schedule chosen by the [`eigh_algorithm`](/reference/options/) option.
+
+Because there is no emission, an op in this table also cannot appear in a graph you hand to `evoxc.compile_text` as text you wrote yourself — but text you write is the compiler's to accept or reject, so that path fails in the compiler rather than in the exporter.
+
+## Sparse tensors
+
+`evoxc.sparse` is numpy-backend-only in v1.
+
+| Deferral | What happens |
+|---|---|
+| Every `sparse_*` op on a compiler backend | `BackendError` naming the op and suggesting `evoxc.sparse.to_dense` — densifying is your explicit choice, never an automatic one |
+| `sparse @ sparse` matmul | `TraceError`; sparse@dense and dense@sparse work |
+| Sparse constants | not supported — `evoxc.constant` takes dense host data |
+| Whole-sparse `bind` | not supported; bind individual tensor leaves |
+| `concatenate` and `csc` VJPs | `TransformError` |
+
+## Compiler adapters
+
+| Deferral | What happens |
+|---|---|
+| Collectives | no adapter compiles them in v1 (multi-rank runtime channels are not wired): a graph containing a collective raises `BackendError` at `lower()`. Single-rank collectives run on numpy and `native` |
+| `runtime_call` | rejected at `lower()` — a Python callback cannot be compiled |
+| Dynamic shapes | supported **per op**, not universally: elementwise, cast, select, reductions over static dims, transpose, concat and `dot` accept symbolic dims, while `reshape`, `conv`, `slice`, `pad` and `reduce_mean` over a dynamic reduced dim are rejected with a clear `BackendError` at `lower()` |
+| xla dynamic shapes | `xla` declares `dynamic_shapes = False` and rejects symbolic dims at compile, recording the static shapes and enforcing them at `run()` |
+| vmap of per-sample softmax / layernorm / attention | defers on compiler backends, because the batch transform produces exactly the symbolic `reshape`/`reduce_mean` shapes above — numpy and `native` handle every symbolic shape |
+| TVM op coverage | `tvm` checks its supported StableHLO op set at compile and raises `BackendError` naming the op; control flow, `gather`/`scatter`, `remainder`, conv/reduce-window, multi-function and multi-output modules are outside it |
+| TVM on ROCm | compile-only: the wheel is built with ROCm off, so execution raises explicitly |
+| External kernels inside `cond`/`while_loop`/`scan` bodies | `BackendError` on `iree`; numpy supports the composition |
+| A registered kernel's portable decomposition on `xla`/`tvm` | inlined with a `UserWarning` when registered, `BackendError` when absent |
+
+Capability flags are the machine-readable form of this table: a `False` in a backend's `Capabilities` is a promise to reject explicitly, never to emulate. See [Backends and options](/guides/backends/) and [Compiler adapters](/guides/compiler-adapters/).
+
+## Custom calls and custom kernels
+
+`custom_call` and `inline_stablehlo` are **forwarded verbatim**: evoxc validates that the ops exist, gates them on `Capabilities.custom_ops` (numpy and `native` reject them with an explicit `BackendError`), and then keeps no target registry and pre-validates nothing.
+
+| Deferral | What happens |
+|---|---|
+| A `stablehlo.custom_call` whose target the compiler does not know | the compiler's own diagnostic — for IREE, a failed legalization of an explicitly illegal op — surfaces as `BackendError` |
+| Fusing a custom kernel **into** a compiled module | no such path exists in v1: there is no IREE object-linking route and no PJRT custom-call registration |
+| A host callback inside a compiled program | `runtime_call` is rejected on compiler backends (above) |
+
+The supported kernel path is the other one: `external_call` with `register_external_kernel(..., backend="iree", device_resident=True)` — a device-resident segment boundary where the kernel owns synchronization — or an `evoxc.block` op with a portable decomposition. Both numpy and the compiler adapters accept them. See [Custom ops and kernels](/guides/custom-blocks/).
+
+## External kernels
+
+| Deferral | What happens |
+|---|---|
+| Device-resident mode on numpy or on the default slot | `BackendError`: `device_resident=True` requires an explicit `"iree"` slot |
+| Static kernel parameters | not supported in v1 — operands are tensors or Python scalars |
+| Kernels inside control-flow regions on `iree` | `BackendError` |
+| MULTI-function graphs with a kernel boundary on `iree` | `BackendError` |
+| Persistent registrations | the registry is never serialized: an artifact carries only the kernel *name*, so re-register after `Graph.load` |
+
+## `evoxc_hf`
+
+The separate `evoxc-hf` distribution has its own v1 deferrals, all explicit:
+
+- **Dynamic shapes** — model shapes are static `(config, seq_len, batch)`; a new length is a new build.
+- **KV cache and generation** — a single forward pass is the unit; there is no incremental decode loop.
+- **`erf`-GELU configs** — the `erf` emission gap above makes those activations unavailable on the compiled path.
+- **TVM** — unvalidated for `evoxc_hf`.
+
+See [HuggingFace models](/huggingface/).
+
+## Refusals by error class
+
+Reading the failure is usually faster than reading this page, so here is the mapping from error to cause.
+
+| Error | Typical deferral behind it |
+|---|---|
+| `TransformError` | a missing batching or derivative rule, control-flow vectorization, `conv` VJP, a batched mapped kernel, a sparse VJP, a random op inside `vmap`/`grad`/`jvp`/`vjp` |
+| `BackendError` | an op with no v1 emission at `lower()`, a sparse op on a compiler backend, an uncompiled collective or `runtime_call`, a symbolic shape the exporter cannot express, an unknown option key or invalid option value, an unavailable adapter, a rejected TVM op |
+| `TraceError` | symbolic-bound `arange`/`linspace`, a symbolic/dynamic `scan` length, `sparse @ sparse`, a concrete `Tensor` where a graph value was expected |
+| `ShapeError` / `DTypeError` | a shape or dtype outside the op's contract, detected at trace time or at the run boundary |
+| `NotImplementedError` | a documented Python-level scope limit in a frontend op — `evoxc.norm` with an `ord` outside `1`, `2`, `inf`, `-inf` |
+| `TypeError` | Python-level argument misuse, including a wrong stage object |
+
+If a failure is not in this table, it is a bug rather than a deferral: the contract allows no other silent behaviour.
+
+## What this means for you
+
+| If you want to… | Read |
+|---|---|
+| differentiate through a convolution | [Graph transforms](/guides/graph-transforms/) — decompose into `dot`/`reshape`/`pad` where it is expressible, otherwise this is a hard v1 limit |
+| batch a per-sample function with a softmax or a layernorm | [Compiler adapters](/guides/compiler-adapters/) — run it on numpy or `native`, or keep the reduced dims static |
+| use a scan whose length depends on a runtime value | [In-graph control flow](/guides/control-flow/) — use a static length, or `while_loop` with a dynamic condition |
+| run a sparse program on a GPU | [Sparse tensors](/guides/sparse-tensors/) — densify with `evoxc.sparse.to_dense` as an explicit step |
+| plug in a Triton or torch kernel | [Custom ops and kernels](/guides/custom-blocks/) — `external_call` on `iree`, or a `block` with a portable |
+| write your own StableHLO instead of tracing | [Custom ops and kernels](/guides/custom-blocks/) — `evoxc.compile_text`, and the compiler has the final say |
+| understand why an error named an op | [Inspection and errors](/guides/inspection-and-errors/) — the taxonomy and the source-location rule |
+
+Deferrals are not accidents: each one is a place where an alternative would have been a guess about what you meant. The explicit rejection is what makes the rest of the pipeline checkable.

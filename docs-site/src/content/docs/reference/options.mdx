@@ -1,8 +1,142 @@
 ---
 title: Options
-description: Compile and lower options, their environment defaults, and which backends honour them.
+description: The compile, lower and load option surface, with accepted values, environment variables, defaults and per-backend support.
 sidebar:
   order: 4
 ---
 
-<!-- TODO(content): write the Options page. -->
+evoxc never hardcodes a compiler flag you cannot override.
+Every stage takes `**options`, every option has a documented default, and most can also be supplied from an environment variable:
+
+```python
+lowered  = evoxc.lower(graph, backend="iree", opt_level="O3")
+artifact = evoxc.compile(lowered, backend="iree", iree_compile_args=["--iree-opt-data-tiling"])
+exe      = evoxc.load(artifact, backend="iree", device="cpu",
+                      iree_runtime_args=["--cuda_async_allocations=true"])
+```
+
+`evoxc.build`, `evoxc.evaluate` and `evoxc.build_cached` take ONE options dict and forward it, already resolved, to `lower`, `compile` **and** `load` — so a load-stage option such as the xla `plugin_path` reaches the load hop through the sugar too.
+
+## The three rules
+
+**Precedence: explicit kwarg > environment variable > evoxc default.**
+Environment variables are read lazily at call time (no import-time snapshot); an empty or whitespace value counts as unset; a malformed value raises `BackendError` naming the variable and the value. An explicit kwarg for the same option always wins, so an env var can never override code.
+
+**Keys are validated by the framework, values by the consumer.**
+Each backend declares `KNOWN_OPTIONS: dict[stage, frozenset[str]]`. A caller's dict is checked against the **union** of the stage sets: a key valid for any stage passes and is accepted-and-ignored at the others (that is what lets one dict be forwarded to three stages), while a key valid for no stage raises `BackendError` listing the per-stage known sets. Option *values* otherwise pass straight through to the compiler, which validates them — evoxc never parses compiler flags.
+
+**A raw flag with the same name as a derived option wins, never both.**
+When an option derives a compiler flag (for example `--iree-opt-level=O3`), passing the same flag yourself in `iree_compile_args` drops the derived one. The same rule applies to an already-set field inside `xla_compile_options`.
+
+The only values evoxc validates itself are `opt_level` and the bool-valued options: bools are coerced to a real `bool` (real bools, `0`/`1`, and `"1"`/`"0"`/`"true"`/`"false"`/`"yes"`/`"no"`/`"on"`/`"off"`, case-insensitive), so an env-style `"0"` can never fall into the `bool("0") is True` trap.
+
+## evoxc-defined options
+
+These mean the same thing on every backend; the per-backend translation is the adapter's job.
+
+| Option | Stage | Accepted values | Env var | Default |
+|---|---|---|---|---|
+| `opt_level` | compile | `"O0"`–`"O3"` (case-insensitive), `"0"`–`"3"`, or an `int` 0–3 (never a bool) | `EVOXC_OPT_LEVEL` | unset |
+| `dispatch_formation` | compile | `"default"` or unset, `"aggressive"` (case-insensitive, whitespace-stripped) | `EVOXC_DISPATCH_FORMATION` | unset |
+
+### `opt_level`, per backend
+
+| Backend | Translation | Notes |
+|---|---|---|
+| iree | derives the flag `--iree-opt-level=O{N}` | the `O` form is required — the pinned compiler rejects numeric levels; a user `--iree-opt-level=…` wins and the derived flag is dropped |
+| xla | sets the optimization-level field (wire-format field 24) inside `executable_build_options` | a level already present in `xla_compile_options` wins, unchanged |
+| tvm | passes `opt_level=N` as a build kwarg | the installed TVM lacks the kwarg, so asking for it raises a loud `BackendError` naming `opt_level` rather than silently dropping it |
+| numpy | documents-ignored | unset everywhere means byte-identical behaviour |
+
+Anything else — `"O4"`, `"4"`, `-1`, `3.5`, `None`, `True`, `"banana"` — raises `BackendError` naming the option and the accepted forms.
+
+### `dispatch_formation`
+
+The iree compile-stage knob for merged `batch_functions` population graphs, and the clearest example of an opt-in option.
+
+| Value | Effect |
+|---|---|
+| `"default"` or unset | derives no flag — compile args are byte-identical to a build without the option |
+| `"aggressive"` | derives `--iree-dispatch-creation-enable-aggressive-fusion`, which joins the adapter's compile-args defaults |
+| anything else | a loud `BackendError` from the iree adapter |
+
+Measured on a merged GP-population graph it forms 596 → 548 dispatches, about −5 % compile time at population 4000 and −7…−9 % warm run time on ROCm, while llvm-cpu is flat-to-worse — which is why it ships opt-in rather than as a default.
+On the pinned IREE 3.13 the flag's own default is opt-level dependent (off at O0, on at O2+), so at `O2`/`O3` naming it yields a byte-identical vmfb.
+
+## Exporter options (lower stage)
+
+These are forwarded by the shared compiler-frontend to the StableHLO exporter, so all three compiler adapters declare and honour them; numpy and `native` have no exporter and reject them as unknown keys.
+
+| Option | Accepted values | Env var | Default |
+|---|---|---|---|
+| `rng_bit_generator` | `bool`, or a collection of algorithm names | — | the adapter's native-RNG capability set |
+| `dot_precision` | `"DEFAULT"`, `"HIGH"`, `"HIGHEST"` (case-insensitive) | — | `"DEFAULT"` (emits no `precision_config`) |
+| `eigh_algorithm` | `"jacobi"`, `"jacobi_batched"` (case-insensitive, whitespace-stripped) | `EVOXC_EIGH_ALGORITHM` | `"jacobi_batched"` |
+| `split_reduction` | bool spellings (coerced) | `EVOXC_SPLIT_REDUCTION` | `True` |
+| `split_reduction_non_exact` | bool spellings (coerced) | — | `False` |
+| `split_reduction_threshold` | `int` ≥ 2 | — | `1024` |
+| `sort_emission` | `"pair"`, `"count"`, `"auto"` | — | `"auto"` on iree (`"count"` when the sorted axis is ≥ 32) |
+| `while_init_rewrite` | bool spellings (coerced) | — | on at export |
+
+What they do, in one line each:
+
+- **`rng_bit_generator`** overrides which random algorithms are emitted as a native `stablehlo.rng_bit_generator`; every algorithm outside the set is emitted as an inline expansion.
+- **`dot_precision`** attaches a precision hint to `dot`. Only `"HIGHEST"` disables XLA/ROCm's TF32-class fp32 `dot` on this XLA version; `"DEFAULT"` keeps the export byte-identical, and iree/llvm-cpu and tvm/llvm results are bit-identical to it.
+- **`eigh_algorithm`** chooses the cyclic-Jacobi schedule: `"jacobi_batched"` rotates one round-robin round of mutually disjoint pairs per loop iteration, `"jacobi"` one pair.
+- **`split_reduction`** emits two-stage reductions for rank-0-result reductions, which is numerically exact and keeps first-occurrence tie-breaks for min/argmin.
+- **`split_reduction_non_exact`** opts in to *also* splitting float `sum`/`prod` (and therefore `reduce_mean`/`var`). It reassociates the accumulation, so it is not bit-exact against the single-stage text — hence opt-in. It is the documented workaround for the rank-0 float-reduction cliff on some GPU targets.
+- **`split_reduction_threshold`** is the minimum total reduced extent for which a reduce is split, and also lets you force or suppress splitting on small shapes.
+- **`sort_emission`** picks the `stablehlo.sort` emission: the pair form, or the count composition that some GPU targets can bufferize when the axis is large.
+- **`while_init_rewrite`** is the computed-zeros init rewrite that keeps population-rank loops compilable; it is on at export and is not a per-call switch.
+
+An invalid value for any of them raises `BackendError` from the exporter, naming the option and the accepted values.
+`split_reduction_non_exact` and `split_reduction_threshold` are deliberately **not** in any adapter's `KNOWN_OPTIONS` and have no env rows: pass them to `evoxc.backends.stablehlo.export(graph, options=...)` directly, or `lower(..., backend="iree")` will reject the key.
+
+## Adapter options (compile and load)
+
+| Option | Stage | Accepted values | Env var | Default |
+|---|---|---|---|---|
+| `target_backends` | compile | list of `"llvm-cpu"`, `"cuda"`, `"rocm"`, `"vulkan-spirv"` | `EVOXC_TARGET_BACKENDS` | `["llvm-cpu"]` (an iree-family backend infers it from the resolved device) |
+| `iree_compile_args` | compile | list of flags (shlex parsed from env) | `EVOXC_IREE_COMPILE_ARGS` | none |
+| `iree_runtime_args` | load | list of loader/HAL flags | `EVOXC_IREE_RUNTIME_ARGS` | none |
+| `iree_compiler_module` | compile | module object, or non-empty dotted module path | `EVOXC_IREE_COMPILER_MODULE` | the published `iree.compiler` |
+| `iree_runtime_module` | load | module object, or non-empty dotted module path | `EVOXC_IREE_RUNTIME_MODULE` | the published `iree.runtime` |
+| `vulkan_target` | compile | non-empty SPIR-V profile string (`rdna3`, `sm_80`, `adreno`, …) | `EVOXC_IREE_VULKAN_TARGET` | unset (IREE's own default profile) |
+| `xla_compile_options` | compile | `bytes` of a serialized `CompileOptionsProto` | `EVOXC_XLA_COMPILE_OPTIONS` (base64) | a minimal proto with one replica and one partition |
+| `plugin_path` | compile **and** load | path to an existing PJRT plugin `.so` | `EVOXC_PJRT_PLUGIN` | discovery: env var, fixed paths, then an installed JAX plugin |
+| `tvm_target` | compile | TVM target string | `EVOXC_TVM_TARGET` | `"llvm"` |
+| `tvm_pass_configs` | compile | `dict` | `EVOXC_TVM_PASS_CONFIGS` (JSON object) | unset |
+
+Notes that change how you use them:
+
+- **`target_backends`** drives `--iree-hal-target-backends`, and that flag is on the adapter's DENY list — set the targets through this option, never as a raw flag. The artifact's `target` label is `"cpu"`/`"cuda"`/`"rocm"`/`"vulkan"`, or a `"+"`-joined label for a mixed list.
+- **`iree_compile_args`** is appended after the adapter's defaults; a user flag whose name collides with a default drops the default. Three flags are denied with actionable reasons: `--iree-hal-target-backends`, `--iree-input-type` and `--iree-vm-bytecode-module-output-format`.
+- **`iree_compiler_module` / `iree_runtime_module`** are the custom-IREE-build seam: a module object (explicit kwarg only) or a dotted path the adapter imports. The whole compiler or runtime half routes through it, and a supplied module replaces the default dependency probe. An empty, unimportable or non-module value is a `BackendError` naming the option.
+- **`vulkan_target`** only derives `--iree-vulkan-target=<profile>` when `vulkan-spirv` is among the targets; setting it without that target, or with a non-string/empty value, is a `BackendError`. The profile *value* is the compiler's to validate — evoxc forwards it verbatim.
+- **`plugin_path`** is honoured at load as well, so a persisted artifact reloads without re-passing it. `Tensor.to(...)` placement has no option channel: it resolves the env var, the fixed paths and the installed-plugin scan.
+- **`xla_compile_options`** is passed straight into the PJRT compile call; evoxc does not parse it. Non-bytes is a `BackendError`.
+
+Unknown keys at `compile` or `load` raise `BackendError` listing the per-stage known sets. The `run` stage has no options in v1 for the compiler adapters, so a non-empty run options dict is a `BackendError` by design; the numpy backend documents-ignoring run options.
+
+## Staging-level environment variables
+
+These are not stage options — `evoxc.build`, `evoxc.evaluate` and `evoxc.build_cached` resolve them when the corresponding kwarg is unset, and an explicit kwarg always wins.
+
+| Env var | Fills | Format |
+|---|---|---|
+| `EVOXC_BACKEND` | `backend` | a registered backend name (default `"numpy"`) |
+| `EVOXC_DEVICE` | `device` | `"kind[:index]"` — `cpu`, `cuda:0`, `rocm:0`, `vulkan:0`; malformed is a `DeviceError` naming the variable and value |
+| `EVOXC_TARGET_BACKENDS` | `target_backends` | comma-separated target list |
+
+The explicit stage functions (`lower`, `compile`, `load`) keep their documented defaults and do not read these three.
+
+## What is *not* in the key
+
+`build_cached` keys its cache on function identity, the full specs tree, the resolved backend and device, and a canonicalized copy of the options you passed.
+The process-environment options the compiler stages read themselves — `EVOXC_OPT_LEVEL`, `EVOXC_EIGH_ALGORITHM`, `EVOXC_SPLIT_REDUCTION` and the per-adapter `EVOXC_IREE_*` / `EVOXC_XLA_*` / `EVOXC_TVM_*` variables — are deliberately **not** part of the key: when you change them, clear the cache or pass a fresh `CompileCache`. See [Persistence and caching](/guides/persistence-and-caching/).
+
+## Related pages
+
+- [Backends and options](/guides/backends/) — the mechanism from a backend author's point of view, including the option-key/union validation.
+- [Compiler adapters](/guides/compiler-adapters/) — device kinds, target flags and what each adapter has been validated on.
+- [Limitations and deferrals](/reference/deferrals/) — the options and ops that v1 refuses.

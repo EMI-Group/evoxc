@@ -1,10 +1,141 @@
 ---
 title: Reference
-description: Contract-level reference: the public API, pipeline objects, the op catalogue, options and deferrals.
+description: Contract-level reference for the public API, pipeline objects, op catalogue, options and deferrals.
 sidebar:
   order: 3
   group:
     label: Reference
 ---
 
-<!-- TODO(content): write the Reference page. -->
+The reference section states what evoxc *is*, in the form you can check a program against: exact public names, the objects each pipeline stage hands you, the option surface every backend shares, and the things v1 refuses.
+Every claim here is derived from the package contract, not from a single implementation detail — so if a page here and a docstring disagree about a signature, the generated API page wins (see below), and if they disagree about meaning, this section is the one to trust.
+
+## What "reference" means here
+
+These pages are **contract-level, not tutorial**:
+
+- **Names are exact.** Every function, class and keyword argument shown exists with that spelling. There are no "approximately like this" snippets.
+- **Stages stay distinct.** A page never shows a convenience call doing a step the explicit pipeline does not do; the [pipeline objects](/reference/pipeline-objects/) page names the producing function for every type.
+- **Refusals are documented.** When v1 does not support something, the [deferrals](/reference/deferrals/) page states the behaviour that marks it — usually a typed error naming the op — because "it raised" is part of the contract, not an accident.
+- **No invented numbers.** The only figures quoted are ones recorded in the repository's contracts or in a committed bench record.
+
+Why a design is the way it is — why there is no eager mode, why devices are physical, why `vmap` is sugar over `vectorize` — belongs to the guides and to [Core concepts](/getting-started/core-concepts/).
+This section answers "what exactly can I call, and what exactly comes back".
+
+## The pages
+
+<CardGrid>
+  <Card title="Python API at a glance" href="/reference/api-overview/">
+    The top-level `evoxc` namespace grouped by area, the value model, the pytree helpers and the error taxonomy.
+  </Card>
+  <Card title="Pipeline objects" href="/reference/pipeline-objects/">
+    `Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `BoundExecutable` and `Tensor` — what produced each one, and what it refuses.
+  </Card>
+  <Card title="Op catalogue" href="/reference/ops/">
+    Every frontend op by area, with the dtype and shape notes the contract makes.
+  </Card>
+  <Card title="Options" href="/reference/options/">
+    The compile/lower/load option surface: accepted values, environment variables, defaults and per-backend support.
+  </Card>
+  <Card title="Architecture" href="/reference/architecture/">
+    EvoXIR, the native Rust core, the lowering boundary and the import layers between modules.
+  </Card>
+  <Card title="Limitations and deferrals" href="/reference/deferrals/">
+    What v1 deliberately does not do, and the explicit error or behaviour that marks each deferral.
+  </Card>
+</CardGrid>
+
+Reading order for most people: [Python API at a glance](/reference/api-overview/) to learn the shape of the namespace, [Pipeline objects](/reference/pipeline-objects/) because every stage result is one of those types, then [Options](/reference/options/) once a program runs and you want to change how it is compiled.
+
+## Five questions, five answers
+
+If you are looking something up under time pressure, this is the mapping.
+
+| Question | Page |
+|---|---|
+| Is `evoxc.<name>` a real public name, and which area owns it? | [Python API at a glance](/reference/api-overview/) |
+| What is this object I just got back, and what can I do with it without side effects? | [Pipeline objects](/reference/pipeline-objects/) |
+| Which op do I call for this operation, and what dtype or shape does it promise? | [Op catalogue](/reference/ops/) |
+| Which option changes this, what does it accept, and does my backend honour it? | [Options](/reference/options/) |
+| Why did this raise, and is there a supported way to do what I wanted? | [Limitations and deferrals](/reference/deferrals/) |
+
+The sixth question — *how is the whole thing put together* — is [Architecture](/reference/architecture/): EvoXIR, the native Rust core, where lowering hands off to a compiler, and which module may import which.
+
+## A pipeline you can hold in your head
+
+Every reference page is consistent with this one chain, and each arrow is a public function that returns a distinct public type:
+
+| Hop | Function | Result |
+|---|---|---|
+| define | `evoxc.defn` | `Defn` |
+| trace | `evoxc.trace` | `Graph` (EvoXIR) |
+| transform (optional) | `evoxc.vectorize` / `vmap` / `grad` / `jvp` / `vjp` / `batch_functions` | `Graph` |
+| lower | `evoxc.lower` | `LoweredProgram` |
+| compile | `evoxc.compile` | `CompiledArtifact` |
+| load | `evoxc.load` | `Executable` |
+| run | `evoxc.run` | `Tensor` tree |
+
+`evoxc.build` composes trace → lower → compile → load, `evoxc.evaluate` adds a run, and `evoxc.build_cached` memoizes the build. Those three are documented shorthand and nothing more; every other reference claim is about one of the explicit hops.
+
+## How the reference relates to the generated Python API
+
+The site ships two kinds of API material, and they answer different questions.
+
+| Material | Question it answers | Where it comes from |
+|---|---|---|
+| These reference pages | What does this name *mean*, which stage does it belong to, what does it refuse? | This repository's contracts, maintained by hand |
+| The generated tree under `/api/` | What is the exact signature, docstring and module path of this symbol? | Griffe reading the installed package's docstrings |
+
+The generated pages are grouped by module and their URL shape is `/api/<module-path>/<symbol>/` — `/api/evoxc.pipeline/compile/` is the page for `evoxc.compile`.
+Start at [Python API reference](/api/) when you need a signature.
+
+Two consequences worth knowing:
+
+- **The top-level `evoxc` namespace is not generated.** `evoxc.__all__` is computed at import time from the module globals, which static analysis cannot evaluate, so no generator page exists for the namespace itself. [Python API at a glance](/reference/api-overview/) is the hand-written replacement, and it links into the per-module pages.
+- **A generated page is never patched here.** If a docstring is wrong or unclear, the fix belongs in the docstring, and the page changes on the next build. That is also why signatures are linked to rather than restated: a hand-copied signature is a second source of truth, and it rots.
+
+The practical rule: read a reference page to decide *which* symbol you want and what it guarantees, then open the `/api/` page for the argument list.
+
+## Conventions used across these pages
+
+- **Shapes** are written as tuples. An `int` is a static extent, `evoxc.dim("B")` is a named symbolic extent, and `None` is a runtime-dynamic extent the tracer does not check. Rank is always known at trace time.
+- **Dtypes** are the numpy dtype objects exposed as `evoxc.float32`, `evoxc.int64`, … (see [Python API at a glance](/reference/api-overview/)). `bool_` keeps its underscore so it does not shadow the builtin.
+- **"Documents-ignored"** means an option is accepted at that stage and deliberately has no effect — it is not an error, so one options dict can be forwarded across backends.
+- **"Byte-identical"** means the option, left unset, derives no compiler flag or changes no emitted text: a program compiled without it is the same program as before the option existed.
+- **Errors** are subclasses of `evoxc.EVOXCError`, except where a page says a plain `TypeError`, `NotImplementedError` or `ValueError` is raised — those mark Python-level argument misuse rather than a graph or backend problem. The full taxonomy is on [Python API at a glance](/reference/api-overview/).
+- **Stage mismatch** is always loud: passing the wrong object type to a stage raises `TypeError` naming the expected type and the producing function.
+
+## What this section does not cover
+
+- **How to write a graph.** Start at [Graphs and tracing](/guides/graphs-and-tracing/).
+- **How to pick a backend or a device.** See [Backends and options](/guides/backends/), [Compiler adapters](/guides/compiler-adapters/) and [Tensors and devices](/guides/tensors-and-devices/).
+- **Per-op lowering and per-adapter limitation tables.** Those live with the adapter contract and are summarised in the guides; [Limitations and deferrals](/reference/deferrals/) collects the v1 list in one place.
+
+## Where these claims come from
+
+Nothing on these pages is invented, and each page can be traced back to an owning contract in the repository:
+
+| Claim kind | Owning contract |
+|---|---|
+| public names, value model, pipeline types, inspection, option mechanics | the package contract (`evoxc/CONTEXT.md`) |
+| architecture, error strategy, v1 deferrals, device-kinds summary | the root contract (`CONTEXT.md`) |
+| per-option defaults, conflict rules, adapter validation state | the compiler-adapter contract (`evoxc/backends/adapters/CONTEXT.md`) |
+| the native Rust engine's staging and numerics | the native backend contract (`evoxc/backends/native/CONTEXT.md`) |
+| transform semantics and measured cost | the transforms contract (`evoxc/transforms/CONTEXT.md`) |
+| container formats | the formats contract (`evoxc/formats/CONTEXT.md`) |
+| HuggingFace model support | the `evoxc-hf` contract (`evoxc_hf/CONTEXT.md`) |
+
+That is also the rule for changing a reference page: if the contract moves, the page moves in the same change; if the page is wrong, the contract wins.
+
+## What "stable" means for a reference page
+
+A name documented here is a name the project treats as public API — the kind of thing that needs a deprecation rather than a quiet rename.
+Two caveats are deliberate:
+
+- **A backend may refuse a public name.** `custom_call` is public and real, and the numpy interpreter rejects it with an explicit `BackendError`. Public does not mean "works on every backend"; [Options](/reference/options/) and the capability flags say which backend honours what.
+- **A deferral is not an oversight.** Where v1 has no answer, the error is the answer, so a program that raises has not half-worked. The list is on [Limitations and deferrals](/reference/deferrals/).
+
+If you are extending evoxc rather than using it, read [Architecture](/reference/architecture/) and the import-acyclicity rules there before adding a module: the layering is part of the contract, not a convention.
+
+One more habit worth forming: when an example here and a guide disagree, treat the disagreement as a bug report rather than a choice.
+Both are derived documents, so a contradiction means one of them has drifted from the contract — and the contract is the only thing that decides.
