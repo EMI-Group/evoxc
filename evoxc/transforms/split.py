@@ -56,7 +56,8 @@ Worked example — a fitness graph ``f(dataset, params, candidate)`` where
 ``params`` is fixed and a candidate changes every evaluation::
 
     def fitness(dataset, params, candidate):
-        return evoxc.sum(evoxc.tanh(evoxc.dot(dataset, candidate) * params))
+        return evoxc.sum(evoxc.tanh(evoxc.matmul(dataset * candidate,
+                                                evoxc.tanh(params))))
 
     graph = evoxc.trace(
         fitness,
@@ -65,10 +66,12 @@ Worked example — a fitness graph ``f(dataset, params, candidate)`` where
         evoxc.TensorSpec((32,), evoxc.float32),        # candidate(varies)
     )
     plan = evoxc.split_by_inputs(graph, fixed_leaves=[1])   # params fixed
+    # prepare: 2 ops (tanh(params) + the matmul rank promotion) -> 1 value, 128 B
+    # apply:   5 ops over (dataset, candidate) plus the prepared vector
 
     def stage(half):
         return evoxc.load(evoxc.compile(evoxc.lower(half, backend="numpy"),
-                                       backend="numpy"),
+                                        backend="numpy"),
                           backend="numpy")
 
     prepare, apply = stage(plan.prepare), stage(plan.apply)   # once per shape set
@@ -80,7 +83,10 @@ tensor leaves, statics preserved), while `apply` takes the synthetic 2-child
 root ``(varying inputs, prepared tuple)`` — so a re-run of `prepare` is what a
 changed fixed input requires, and the backend/device in `lower`/`compile`/
 `load` is the caller's choice (the example pins ``"numpy"`` only for
-concreteness).
+concreteness). The example's ``evoxc.split_by_inputs`` / ``evoxc.analyze_inputs``
+names are the intended TOP-LEVEL surface (the parent package re-exports them);
+until that re-export lands they are reachable as
+``evoxc.transforms.split_by_inputs`` / ``evoxc.transforms.analyze_inputs``.
 
 v1 limits (one line): region-bearing control flow and effectful ops are
 blocked, there is no per-turn state tracking (a changed fixed input needs a
