@@ -587,7 +587,7 @@ The separate `evoxc_hf` suite recorded **695 passed and 33 skipped** in the base
 - Collectives and `runtime_call` are not compiled by any adapter in v1 (multi-rank runtime channels are not wired).
 - Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
 - `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`.
-- `split_by_inputs` handles straight-line graphs only: control-flow regions and effectful ops (collectives, `runtime_call`/`external_call`/`custom_call`/`inline_stablehlo`) raise `TransformError`, a fixed-arity container cannot lose only some children, and nothing re-prepares a changed fixed input automatically.
+- `split_by_inputs` handles straight-line graphs only: control-flow regions and effectful ops (collectives, `runtime_call`/`external_call`/`custom_call`/`inline_stablehlo`) raise `TransformError`, plain tuple/list/dict containers prune per tensor leaf, and nothing re-prepares a changed fixed input automatically.
 
 Unsupported operations raise `BackendError` or `TransformError` with the operation name and a suggested remedy. Execution does not silently fall back to another backend or a Python loop.
 
