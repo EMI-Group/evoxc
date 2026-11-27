@@ -149,7 +149,7 @@ A hand-authored `src/content/docs/api/index.md` is overwritten by the generated 
 
 - Worker name `evoxc-docs`, `workers_dev: false`, static assets `./dist`; the Custom Domain `compiler.evox.group` (zone `evox.group`) is attached to that Worker in the Cloudflare dashboard, not in `wrangler.jsonc`.
 - The GitHub environment `docs-production` carries the `CLOUDFLARE_API_TOKEN` secret and the `CLOUDFLARE_ACCOUNT_ID` variable; the token needs Workers Scripts edit rights on this Worker.
-- `../.github/workflows/docs-site.yml` calls `EMI-Group/evox-docs-infra/.github/workflows/{build,deploy}.yml@v0.1.0` with `site_directory: docs-site`, `output_directory: docs-site/dist` and `wrangler_config: docs-site/wrangler.jsonc`: it builds on pull requests and deploys on pushes to `main`.
+- `../.github/workflows/docs-site.yml` calls `EMI-Group/evox-docs-infra/.github/workflows/{build,deploy}.yml@main` (pinned to the toolkit's `main` for the module-page, collision and stable-`revision` generator; move both pins to the next published tag) with `site_directory: docs-site`, `output_directory: docs-site/dist` and `wrangler_config: docs-site/wrangler.jsonc`: it builds on pull requests and deploys on pushes to `main`.
 - That workflow regenerates `src/content/docs/api/` before each build, so CI's copy is always the current docstrings; a committed page that differs is a docstring change that has not been regenerated locally — the CI build does not fail on the difference, it just publishes the fresh one.
 - The optional `DOCS_INFRA_READ_TOKEN` repository secret lets a private checkout of the toolkit be read; with the public toolkit the caller falls back to the job token.
 - Local deploy: `npm run build` then `npx wrangler deploy` with `CLOUDFLARE_API_TOKEN` exported.
