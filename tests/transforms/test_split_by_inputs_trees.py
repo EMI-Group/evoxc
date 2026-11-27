@@ -20,9 +20,15 @@ the same tree pruned to the varying tensor leaves.
 The pass is structural only — it never executes and never caches — and
 `evoxc.build` deliberately rejects an already-traced `Graph`, so every
 numerical check here stages the halves through the explicit
-`lower` → `compile` → `load` pipeline. Two nested-pytree pins are kept as
-strict `xfail`s against a documented prune bug (see their `BUG(evoxc)`
-markers and this suite's Known Issues entry).
+`lower` → `compile` → `load` pipeline.
+
+Pruning happens PER TENSOR LEAF under a plain tuple/list/dict: fixing one
+member of a container input rebuilds that container's `TreeSpec` (a pruned
+dict gets its `node_data` key list rebuilt) instead of reusing the ancestor
+verbatim, and a container whose whole subtree keeps no leaf is dropped.
+A fixed-arity node (namedtuple / dataclass / registered pytree node) that
+would lose only some of its children is an explicit `TransformError` instead;
+it is not exercised here.
 """
 
 import numpy as np
@@ -77,6 +83,27 @@ def _mixed_nested(inputs, scale):
     return evoxc.multiply(
         evoxc.multiply(inputs["y"], evoxc.tanh(inputs["x"])), float(scale)
     )
+
+
+def _nested_unused_static(inputs, scale, unused):
+    """`_mixed_nested` next to a static leaf the body never reads."""
+    return evoxc.multiply(
+        evoxc.multiply(inputs["y"], evoxc.tanh(inputs["x"])), float(scale)
+    )
+
+
+def _list_batch(inputs, scale):
+    """A plain LIST container whose elements split across the boundary."""
+    return evoxc.multiply(
+        evoxc.multiply(inputs[1], evoxc.tanh(inputs[0])), float(scale)
+    )
+
+
+def _deep_nested(inputs, scale):
+    """A dict holding a tuple: only the tuple's SECOND leaf is fixed."""
+    return evoxc.multiply(
+        evoxc.multiply(inputs["b"], evoxc.tanh(inputs["a"][0])), float(scale)
+    ) + evoxc.sum(inputs["a"][1])
 
 
 # ---------------------------------------------------------------------------
@@ -146,33 +173,14 @@ def test_nested_container_leaves_split_at_the_argument_boundary():
     assert by_leaves.apply.digest() == plan.apply.digest()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG(evoxc): prune_input_tree reuses an ancestor TreeSpec verbatim when "
-        "its child count is unchanged, so a per-leaf prune INSIDE a nested "
-        "container keeps the dropped leaf and rebuild_static_values raises "
-        "VerificationError"
-    ),
-)
 def test_nested_partial_prune_keeps_only_the_fixed_tensor_leaves():
-    """Splitting INSIDE a nested container: the pruned signature is minimal.
+    """Splitting INSIDE a nested container prunes per tensor leaf.
 
-    BUG(evoxc): `_split_core.prune_input_tree` returns an ancestor `TreeSpec`
-    VERBATIM whenever its direct child count is unchanged, even when a
-    DESCENDANT was pruned — so the "pruned" tree still carries the dropped
-    varying leaf and `rebuild_static_values` raises `VerificationError`
-    ("the pruned input tree has 3 leaves but 2 source leaf positions were
-    kept"). The documented contract (`evoxc/transforms/CONTEXT.md` Known
-    Issues: "plain tuple/list/dict prune freely") says a per-leaf prune inside
-    a plain dict/tuple container is exactly what this pass must support.
-
-    Repro::
-
-        graph = evoxc.trace(_mixed_nested, {"x": s, "y": s}, 2)
-        evoxc.split_by_inputs(graph, fixed=({"x": True, "y": False}, None))
-        # -> VerificationError: the pruned input tree has 3 leaves but 2
-        #    source leaf positions were kept (+0 appended leaves)
+    Contract: a plain dict input container prunes PER LEAF, so fixing only
+    `{"x": True, "y": False}` gives a `prepare` whose pruned dict names just
+    the surviving key `"x"` and an `apply` whose dict names just `"y"` — the
+    container `TreeSpec` is rebuilt (its `node_data` key list re-derived),
+    never reused verbatim because its direct child count is unchanged.
     """
     graph = evoxc.trace(_mixed_nested, {"x": _W, "y": _X}, _SCALE)
     plan = evoxc.split_by_inputs(graph, fixed=({"x": True, "y": False}, None))
@@ -184,46 +192,181 @@ def test_nested_partial_prune_keeps_only_the_fixed_tensor_leaves():
     # `prepare` keeps the fixed dict leaf only (the static leaf stays)
     assert len(plan.prepare.tensor_specs) == 1
     assert plan.prepare.tensor_specs[0] is graph.tensor_specs[0]
+    prepare_dict = plan.prepare.input_specs.children[0]
+    assert prepare_dict.type is dict
+    assert prepare_dict.node_data == ["x"]  # the dropped key is really gone
+    assert prepare_dict.num_leaves == 1
     assert _static_records(plan.prepare) == [(_SCALE, "int", 1, (1,))]
     assert plan.prepare.input_specs.num_leaves == 2
 
-    # `apply` takes the varying dict leaf only, then the prepared tuple
+    # `apply` takes the varying dict leaf only (its own dict key list is
+    # rebuilt too), then the prepared tuple
     assert plan.apply.tensor_specs[0] is graph.tensor_specs[1]
     assert len(plan.apply.tensor_specs) == 1 + len(plan.boundary)
+    apply_dict = plan.apply.input_specs.children[0].children[0]
+    assert apply_dict.type is dict
+    assert apply_dict.node_data == ["y"]
+    assert apply_dict.num_leaves == 1
     assert plan.apply.input_specs.num_leaves == (
         len(plan.apply.tensor_specs) + len(plan.apply.static_values)
     )
 
+    # a touched container is a NEW node, never the source's dict node
+    assert prepare_dict is not graph.input_specs.children[0]
+    assert apply_dict is not graph.input_specs.children[0]
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG(evoxc): the same prune_input_tree ancestor-reuse bug blocks the "
-        "plan for a per-leaf prune inside a nested container, so the split can "
-        "never be constructed and run"
-    ),
-)
+
 def test_nested_partial_prune_end_to_end_matches_the_unsplit_graph():
     """The same nested split, run: `apply(prepare(f), v) == f(f, v)`.
 
-    BUG(evoxc): blocked by the same `prune_input_tree` ancestor-reuse bug as
-    `test_nested_partial_prune_keeps_only_the_fixed_tensor_leaves` — the plan
-    cannot even be constructed (see that test's repro).
+    Contract: a per-leaf prune inside a plain dict is a real split — ONE
+    prepared result serves several varying members bit-exactly, and a changed
+    fixed member needs only `prepare` re-run (the staged `apply` is untouched).
     """
     graph = evoxc.trace(_mixed_nested, {"x": _W, "y": _X}, _SCALE)
     plan = evoxc.split_by_inputs(graph, fixed_leaves=[0])
     plan.verify()
 
+    prepare_executable = _stage(plan.prepare)
+    apply_executable = _stage(plan.apply)
+    unsplit_executable = _stage(graph)
+
     xv, yv = _rand((3, 4), 4), _rand((3, 4), 5)
-    reference = to_np(evoxc.run(_stage(graph), {"x": xv, "y": yv}, _SCALE))
-    prepared = evoxc.run(_stage(plan.prepare), {"x": xv}, _SCALE)
-    got = to_np(evoxc.run(_stage(plan.apply), ({"y": yv}, _SCALE), prepared))
+    reference = to_np(evoxc.run(unsplit_executable, {"x": xv, "y": yv}, _SCALE))
+    prepared = evoxc.run(prepare_executable, {"x": xv}, _SCALE)
+    assert isinstance(prepared, tuple) and len(prepared) == len(plan.boundary)
+    got = to_np(evoxc.run(apply_executable, ({"y": yv}, _SCALE), prepared))
     assert np.array_equal(got, reference)
+
+    # the SAME prepared boundary serves a different varying member bit-exactly
+    yv2 = _rand((3, 4), 15)
+    got2 = to_np(evoxc.run(apply_executable, ({"y": yv2}, _SCALE), prepared))
+    reference2 = to_np(evoxc.run(unsplit_executable, {"x": xv, "y": yv2}, _SCALE))
+    assert np.array_equal(got2, reference2)
+
+    # a CHANGED fixed member needs only `prepare` re-run
+    xv2 = _rand((3, 4), 25)
+    reprepared = evoxc.run(prepare_executable, {"x": xv2}, _SCALE)
+    assert not np.array_equal(to_np(reprepared[0]), to_np(prepared[0]))
+    got3 = to_np(evoxc.run(apply_executable, ({"y": yv}, _SCALE), reprepared))
+    reference3 = to_np(evoxc.run(unsplit_executable, {"x": xv2, "y": yv}, _SCALE))
+    assert np.array_equal(got3, reference3)
 
     # the mask form and the tensor-index form agree digest-for-digest
     by_mask = evoxc.split_by_inputs(graph, fixed=({"x": True, "y": False}, None))
     assert by_mask.prepare.digest() == plan.prepare.digest()
     assert by_mask.apply.digest() == plan.apply.digest()
+
+
+# ---------------------------------------------------------------------------
+# 1a. per-leaf pruning of plain containers: list, unused static leaf, deeper
+#     nesting
+# ---------------------------------------------------------------------------
+
+
+def test_partial_prune_keeps_a_plain_list_a_list():
+    """Fixing ONE list element leaves a one-leaf LIST, not a rebuilt tuple."""
+    graph = evoxc.trace(_list_batch, [_W, _X], _SCALE)
+    plan = evoxc.split_by_inputs(graph, fixed=([False, True], None))
+    plan.verify()
+
+    assert plan.fixed_leaves == (1,)
+    assert plan.varying_leaves == (0,)
+
+    assert len(plan.prepare.tensor_specs) == 1
+    assert plan.prepare.tensor_specs[0] is graph.tensor_specs[1]
+    prepare_list = plan.prepare.input_specs.children[0]
+    assert prepare_list.type is list
+    assert prepare_list.num_leaves == 1
+    assert _static_records(plan.prepare) == [(_SCALE, "int", 1, (1,))]
+
+    assert plan.apply.tensor_specs[0] is graph.tensor_specs[0]
+    apply_list = plan.apply.input_specs.children[0].children[0]
+    assert apply_list.type is list
+    assert apply_list.num_leaves == 1
+    assert plan.apply.input_specs.num_leaves == (
+        len(plan.apply.tensor_specs) + len(plan.apply.static_values)
+    )
+
+    # the correctness law, bit-exactly
+    xv, yv = _rand((3, 4), 4), _rand((3, 4), 5)
+    reference = to_np(evoxc.run(_stage(graph), [xv, yv], _SCALE))
+    prepared = evoxc.run(_stage(plan.prepare), [yv], _SCALE)
+    got = to_np(evoxc.run(_stage(plan.apply), ([xv], _SCALE), prepared))
+    assert np.array_equal(got, reference)
+
+
+def test_partial_prune_keeps_an_unused_static_leaf_in_both_halves():
+    """An UNUSED static leaf survives in both pruned signatures."""
+    graph = evoxc.trace(_nested_unused_static, {"x": _W, "y": _X}, _SCALE, 7)
+    assert _static_records(graph) == [
+        (_SCALE, "int", 2, (1,)),
+        (7, "int", 3, (2,)),
+    ]
+
+    plan = evoxc.split_by_inputs(graph, fixed=({"x": True, "y": False}, None, None))
+    plan.verify()
+
+    assert plan.fixed_leaves == (0,)
+    assert plan.varying_leaves == (1,)
+    # both statics stay in BOTH halves (a static specializes, it never crosses)
+    assert _static_records(plan.prepare) == [
+        (_SCALE, "int", 1, (1,)),
+        (7, "int", 2, (2,)),
+    ]
+    assert _static_records(plan.apply) == [
+        (_SCALE, "int", 1, (0, 1)),
+        (7, "int", 2, (0, 2)),
+    ]
+    assert plan.prepare.input_specs.children[0].node_data == ["x"]
+    assert plan.apply.input_specs.children[0].children[0].node_data == ["y"]
+    for half in (plan.prepare, plan.apply):
+        assert half.input_specs.num_leaves == (
+            len(half.tensor_specs) + len(half.static_values)
+        )
+
+    # both halves TAKE the unused static at run time and the law still holds
+    xv, yv = _rand((3, 4), 6), _rand((3, 4), 7)
+    reference = to_np(evoxc.run(_stage(graph), {"x": xv, "y": yv}, _SCALE, 7))
+    prepared = evoxc.run(_stage(plan.prepare), {"x": xv}, _SCALE, 7)
+    got = to_np(evoxc.run(_stage(plan.apply), ({"y": yv}, _SCALE, 7), prepared))
+    assert np.array_equal(got, reference)
+
+
+def test_partial_prune_inside_a_tuple_nested_in_a_dict():
+    """`{"a": (x, y), "b": z}` with only `y` fixed prunes at depth 2."""
+    graph = evoxc.trace(_deep_nested, {"a": (_W, _X), "b": _W}, _SCALE)
+    plan = evoxc.split_by_inputs(graph, fixed_leaves=[1])
+    plan.verify()
+
+    assert plan.fixed_leaves == (1,)
+    assert plan.varying_leaves == (0, 2)
+
+    # `prepare`: the dict keeps key "a", whose tuple keeps ONE leaf
+    prepare_dict = plan.prepare.input_specs.children[0]
+    assert prepare_dict.type is dict
+    assert prepare_dict.node_data == ["a"]
+    prepare_tuple = prepare_dict.children[0]
+    assert prepare_tuple.type is tuple
+    assert prepare_tuple.num_leaves == 1
+    assert plan.prepare.tensor_specs[0] is graph.tensor_specs[1]
+
+    # `apply`: the dict keeps both keys, and only "a"'s tuple lost a leaf
+    apply_dict = plan.apply.input_specs.children[0].children[0]
+    assert apply_dict.node_data == ["a", "b"]
+    assert apply_dict.children[0].type is tuple
+    assert apply_dict.children[0].num_leaves == 1
+    assert plan.apply.tensor_specs[0] is graph.tensor_specs[0]
+    assert plan.apply.tensor_specs[1] is graph.tensor_specs[2]
+
+    # the correctness law, bit-exactly
+    xv, yv, zv = _rand((3, 4), 8), _rand((3, 4), 9), _rand((3, 4), 10)
+    reference = to_np(evoxc.run(_stage(graph), {"a": (xv, yv), "b": zv}, _SCALE))
+    prepared = evoxc.run(_stage(plan.prepare), {"a": (yv,)}, _SCALE)
+    got = to_np(
+        evoxc.run(_stage(plan.apply), ({"a": (xv,), "b": zv}, _SCALE), prepared)
+    )
+    assert np.array_equal(got, reference)
 
 
 # ---------------------------------------------------------------------------
