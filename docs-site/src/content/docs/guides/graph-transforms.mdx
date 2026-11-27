@@ -252,6 +252,8 @@ There are two ways to name the fixed inputs, and they are mutually exclusive —
 - `fixed` is a pytree mask of bools and `None`s mirroring the graph's **input structure**: `True` keeps a tensor input in `prepare`, `False`/`None` moves it to `apply`. A bare bool broadcasts over every tensor leaf, and a non-`None` entry at a **static** leaf is a `TransformError`.
 - `fixed_leaves` is a sequence of flat tensor-input indices, in `graph.tensor_specs` order.
 
+The mask resolves **per tensor leaf**, including inside plain tuple/list/dict containers, so fixing only some members of a container is an ordinary split: `fixed=({"w": True, "b": False}, False)` fixes just `w`, `prepare`'s signature keeps `{"w": …}` and `apply`'s varying tree keeps `{"b": …}` alongside the prepared tuple. A partially pruned container keeps its own key/index structure with only the surviving members, and a container whose subtree keeps no leaf is dropped from that half's signature entirely.
+
 The two axes are not the same axis: mask positions count static leaves too, while `fixed_leaves` counts tensor leaves only.
 Both halves must be non-trivial — no fixed leaf, or every leaf fixed, is a `TransformError`.
 
@@ -287,7 +289,7 @@ The split result is numerically bit-identical to running the un-split graph on t
 
 The two runtime call shapes follow from `evoxc.run(exe, *args)` treating its **root** argument as the args tuple, and they are easy to get wrong:
 
-- `prepare` takes exactly the fixed arguments as separate arguments — `evoxc.run(prepare, params)`, not `evoxc.run(prepare, (params,))`, which raises `TraceError`. A fixed dict input keeps its container (`evoxc.run(prepare, {"w": w, "b": b})`) and still returns a **flat** tuple of tensors.
+- `prepare` takes exactly the fixed arguments as separate arguments — `evoxc.run(prepare, params)`, not `evoxc.run(prepare, (params,))`, which raises `TraceError`. A fixed dict input keeps its container (`evoxc.run(prepare, {"w": w, "b": b})`), or only its surviving members when the split fixed part of it (`evoxc.run(prepare, {"w": w})`), and still returns a **flat** tuple of tensors.
 - `apply` takes exactly two arguments: the varying input tree and the prepared tuple — `evoxc.run(apply, (dataset, candidate), prepared)`. Nesting them as one argument (`evoxc.run(apply, ((dataset, candidate), prepared))`) raises `TraceError`: "expected tuple of length 2, got tuple of length 1".
 
 `evoxc.build` is not usable here for the same reason it is not usable on any transformed graph: it accepts a function or `Defn`, not a `Graph`, and raises `TypeError` pointing at the explicit pipeline.
@@ -334,6 +336,7 @@ The split replaces neither: it is the structural option when the axis of variati
 | Both `fixed` and `fixed_leaves`, or neither | `TypeError` — exactly one argument form |
 | No fixed leaf, or every leaf fixed | `TransformError` — each half must be non-trivial |
 | A non-`None` mask entry at a static leaf | `TransformError` — a static leaf has no tensor to fix |
+| A namedtuple, dataclass or registered pytree node that would lose only some of its children | `TransformError` — the constructor's arity is fixed, so a partial child set cannot be rebuilt at run time; plain tuple/list/dict containers prune per tensor leaf instead |
 | A changed fixed input, expecting `apply` to notice | no error, and no protection: the boundary is a snapshot, so `prepare` must run again |
 
 `block_call`, `rank` and `world_size` carry the `read` effect and are allowed; the refused effects are exactly the ones whose *running once* could differ from running per turn.
