@@ -85,6 +85,64 @@ print(graph.summary()["tensor_inputs"])         # path / shape / dtype of each i
 
 That snippet is the entire idea: a Python function becomes data, and the data is what executes.
 
+## Four words
+
+The design is easiest to remember as four words — each one is a constraint on what the library is allowed to do.
+
+- **Minimal.** NumPy is the only runtime dependency. The package is a Python frontend, a NumPy interpreter and a compiled Rust extension; a prebuilt wheel runs graphs with no compiler toolchain installed.
+- **Explicit.** Every pipeline stage is a public function with its own result type. You can inspect, save or transfer the intermediate object at any stage, and no stage runs on your behalf.
+- **Compiler-neutral.** EvoXIR — a region-based SSA IR — represents the program. StableHLO connects it to IREE, XLA and TVM; which one you get is decided by `backend=`, not by the language you wrote.
+- **Simple.** Convenience APIs compose the pipeline and add no semantics: `vmap` uses `vectorize`, `bind` supplies arguments, `build` chains trace → lower → compile → load.
+
+The corollary is a short list of things evoxc deliberately does **not** do: it has no eager mode to fall back to, no implicit tracing, no hidden recompilation when a Python value changes, no automatic device movement, and no silent fallback from a compiler backend to NumPy.
+
+## What a first session looks like
+
+<Steps>
+  <Step title="Install">
+    ```sh
+    pip install evoxc
+    ```
+  </Step>
+  <Step title="Confirm it imports">
+    ```python
+    import evoxc
+    print(evoxc.__version__)
+    ```
+  </Step>
+  <Step title="Run the quickstart">
+    One graph through every stage, then the same pipeline in one call — see [Quickstart](/getting-started/quickstart/).
+  </Step>
+</Steps>
+
+## Backends in one paragraph
+
+Two backends ship inside the wheel: the **NumPy interpreter**, which is the default and interprets EvoXIR with NumPy kernels, and the **`native`** backend, which runs the same EvoXIR on the in-process Rust CPU engine. Neither is a mode — you select one with `backend=` and the graph's meaning is unchanged.
+
+Everything else is an optional adapter that receives StableHLO: **IREE** (llvm-cpu, CUDA, ROCm, Vulkan-SPIRV), **XLA** (through a PJRT C API plugin the adapter discovers) and **TVM**. Because the boundary is a compiler-neutral IR, choosing a backend is a deployment decision, not a rewrite — and an absent or incapable backend raises `BackendError` instead of quietly doing something else.
+
+## Reading this site
+
+| Section | What lives there |
+|---|---|
+| Getting started | this section: install, first graph, the vocabulary |
+| [Guides](/guides/) | task-focused walkthroughs — tracing, transforms, control flow, devices, backends, collectives, custom kernels, persistence, formats, sparse |
+| [Reference](/reference/) | the op catalogue, options, pipeline objects, architecture, deferrals |
+| [HuggingFace models](/huggingface/) | the separate `evoxc-hf` distribution |
+| [Development](/development/) | building the workspace, the gates, docs maintenance |
+
+## Vocabulary
+
+Five names recur in every page, so they are worth fixing now.
+
+| name | one-line meaning |
+|---|---|
+| `Defn` | a Python callable marked as a graph definition — the input to `trace` |
+| `Graph` | the traced program: EvoXIR plus input/output trees and snapshotted static values |
+| `SymbolicTensor` | an SSA value inside a `Graph` — shape and dtype only, never storage |
+| `Tensor` | materialized runtime data with a concrete shape and a physical device |
+| `Executable` | a compiled artifact bound to a device; the thing `run` calls |
+
 ## Where to go next
 
 - [Install](/getting-started/install/) — the extras table and the source-build path.
