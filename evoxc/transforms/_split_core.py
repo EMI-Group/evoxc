@@ -430,10 +430,13 @@ def prune_input_tree(
     Returns ``(new_spec, kept_tree_leaf_positions)``: `new_spec` is the pruned
     tree (`None` when nothing survives) and the positions are the ORIGINAL
     tree's flat leaf positions of the kept leaves, in the new tree's
-    pre-order. A container whose subtree keeps no leaf is dropped; a
-    fixed-arity node (namedtuple / dataclass / registered pytree node) that
-    would keep only SOME of its children raises `core.TransformError` naming
-    the pytree path — its arity is fixed, so suggest a plain tuple/dict.
+    pre-order. A container is rebuilt whenever ANY child was rebuilt — never
+    reused verbatim just because its direct child COUNT is unchanged, so a
+    per-leaf prune INSIDE a plain tuple/list/dict really drops the leaf. A
+    container whose subtree keeps no leaf is dropped; a fixed-arity node
+    (namedtuple / dataclass / registered pytree node) that would keep only
+    SOME of its children raises `core.TransformError` naming the pytree path
+    — its arity is fixed, so suggest a plain tuple/dict.
     """
     position = [0]
 
@@ -450,6 +453,7 @@ def prune_input_tree(
             return None, ()  # a container of empty containers
         kept: List[Tuple[Any, "core.TreeSpec"]] = []
         positions: Tuple[int, ...] = ()
+        rebuilt = False
         for index, child in enumerate(node.children):
             key = (
                 node.node_data[index]
@@ -460,9 +464,14 @@ def prune_input_tree(
             if new_child is not None:
                 kept.append((key, new_child))
                 positions += child_positions
+                # A DESCENDANT may have been pruned even when the direct child
+                # count is unchanged, so only an unchanged child OBJECT proves
+                # this subtree is untouched (see the docstring's contract).
+                if new_child is not child:
+                    rebuilt = True
         if not kept:
             return None, ()
-        if len(kept) == len(node.children):
+        if not rebuilt and len(kept) == len(node.children):
             return node, positions  # nothing pruned: reuse the node verbatim
         if _is_fixed_arity_node(node):
             raise core.TransformError(
