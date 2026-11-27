@@ -55,6 +55,8 @@ __all__ = [
     "clone_module",
     "build_prepare",
     "build_apply",
+    "partition",
+    "op_id_partition",
     "split_graph",
 ]
 
@@ -936,15 +938,32 @@ def _unused_varying_leaves(
 # 9. the composition
 # ---------------------------------------------------------------------------
 
+@dataclasses.dataclass(frozen=True)
+class _Partition:
+    """One validated split: the input partition plus the op partition.
 
-def split_graph(graph: Graph, fixed_positions: Sequence[int]) -> SplitPlan:
-    """Split a traced `Graph` into a `prepare` / `apply` pair.
+    The single derivation `split_graph` builds its two graphs from and
+    `op_id_partition` reports on, so a plan's recorded op provenance can never
+    drift from the halves it built.
+    """
+
+    fixed: Tuple[int, ...]
+    varying: Tuple[int, ...]
+    boundary: Tuple[BoundaryValue, ...]
+    prepare_ops: Tuple["ir.Op", ...]
+    apply_ops: Tuple["ir.Op", ...]
+    unused_varying_leaves: Tuple[int, ...]
+
+
+def partition(graph: Graph, fixed_positions: Sequence[int]) -> _Partition:
+    """Validate the input partition and run the whole op partition.
 
     `fixed_positions` are flat TENSOR-input indices (into `graph.tensor_specs`)
     that stay in `prepare`; every other tensor input moves to `apply`. Both
     halves must be non-trivial (`core.TransformError` otherwise). The source
     graph is never mutated.
     """
+
     if not isinstance(graph, Graph):
         raise TypeError(
             f"split_graph expects a traced evoxc.Graph, got "
@@ -980,17 +999,57 @@ def split_graph(graph: Graph, fixed_positions: Sequence[int]) -> SplitPlan:
     output_ids = tuple(
         value.id for value in entry_block.terminator.operands
     )
-    prepare_ops = _prepare_ops(needed_ops, masks, boundary)
-    apply_ops = _apply_ops(needed_ops, masks, boundary, output_ids)
+    return _Partition(
+        fixed=tuple(fixed),
+        varying=tuple(varying),
+        boundary=boundary,
+        prepare_ops=_prepare_ops(needed_ops, masks, boundary),
+        apply_ops=_apply_ops(needed_ops, masks, boundary, output_ids),
+        unused_varying_leaves=_unused_varying_leaves(needed_ops, masks, varying),
+    )
 
-    prepare = build_prepare(graph, prepare_ops, boundary, fixed)
-    apply = build_apply(graph, apply_ops, boundary, varying)
+
+def op_id_partition(
+    graph: Graph, fixed_positions: Sequence[int]
+) -> Tuple[frozenset, frozenset]:
+    """The SOURCE op-id sets each half of the split emits, ``(prepare, apply)``.
+
+    `clone_module` clones every emitted source op exactly once, so a set's size
+    IS that half's entry-block op count. A `constant` op whose result feeds
+    BOTH a fixed-only producer of the boundary and a mixed op is emitted by
+    both halves, so its id appears in both sets — and ONCE in their union,
+    which is what keeps `SplitPlan.summary()["dropped_ops"]` from going
+    negative. Both sets come from the SAME `partition` call, so their ids are
+    comparable.
+    """
+
+    part = partition(graph, fixed_positions)
+    return (
+        frozenset(id(op) for op in part.prepare_ops),
+        frozenset(id(op) for op in part.apply_ops),
+    )
+
+
+def split_graph(graph: Graph, fixed_positions: Sequence[int]) -> SplitPlan:
+    """Split a traced `Graph` into a `prepare` / `apply` pair.
+
+    `fixed_positions` are flat TENSOR-input indices (into `graph.tensor_specs`)
+    that stay in `prepare`; every other tensor input moves to `apply`. Both
+    halves must be non-trivial (`core.TransformError` otherwise). The source
+    graph is never mutated.
+    """
+
+    part = partition(graph, fixed_positions)
+    prepare = build_prepare(graph, part.prepare_ops, part.boundary, part.fixed)
+    apply = build_apply(graph, part.apply_ops, part.boundary, part.varying)
     return SplitPlan(
         graph,
         prepare,
         apply,
-        fixed,
-        varying,
-        boundary,
-        unused_varying_leaves=_unused_varying_leaves(needed_ops, masks, varying),
+        part.fixed,
+        part.varying,
+        part.boundary,
+        unused_varying_leaves=part.unused_varying_leaves,
+        prepare_op_ids=frozenset(id(op) for op in part.prepare_ops),
+        apply_op_ids=frozenset(id(op) for op in part.apply_ops),
     )

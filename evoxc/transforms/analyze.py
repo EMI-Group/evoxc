@@ -48,13 +48,20 @@ def analyze_inputs(graph) -> InputAnalysis:
         `evoxc.split_by_inputs` accepts the graph (`blocked_reason` carries the
         gate's message verbatim when it does not).
 
-    On a BLOCKED graph the per-op facts (`direct_consumers` / `op_count` /
-    `outputs`) are still reported — the gate blocks the SPLIT, not the
-    counting — while the boundary fields are ``None``. A boundary field is
-    also ``None`` when fixing that input ALONE is not a legal split (a graph
-    with a single tensor input, where "that one input fixed" means "all
-    fixed"). Fixing an input alone that crosses nothing is a LEGAL split and
-    reports ``0`` bytes over ``0`` values.
+    On a graph the split GATE blocks (region-bearing control flow, an
+    effectful op, a multi-block function, a missing ``return``) the per-op
+    facts (`direct_consumers` / `op_count` / `outputs`) are STILL reported —
+    the gate blocks the SPLIT, not the counting — and only the boundary
+    fields are ``None``. A DEFENSIVE shape gate is different: a module that
+    does not hold exactly one function, or whose function has no block,
+    leaves no entry block to walk, so the report is `splittable=False` with
+    ZEROED facts (`op_count=0` and every `InputInfo` count ``0`` / ``outputs``
+    empty). Real `Graph`s are single-function with a terminator (`ir` enforces
+    it), so that path only fires on a malformed module.
+    A boundary field is also ``None`` when fixing that input ALONE is not a
+    legal split (a graph with a single tensor input, where "that one input
+    fixed" means "all fixed"). Fixing an input alone that crosses nothing is a
+    LEGAL split and reports ``0`` bytes over ``0`` values.
     """
     if not isinstance(graph, Graph):
         raise TypeError(
@@ -70,8 +77,10 @@ def analyze_inputs(graph) -> InputAnalysis:
     block = _analysis_block(graph.module)
 
     if block is None:
-        # No single readable function: the gate already explains why and there
-        # is nothing to walk, so report the inputs with zeroed facts.
+        # DEFENSIVE shape gate: the module does not hold exactly one function,
+        # or that function has no block. There is nothing to walk, so every
+        # input is reported with zeroed facts; the gate's message still
+        # explains why the split is blocked.
         infos = tuple(
             InputInfo(index, _path_at(paths, index), specs[index])
             for index in range(n_inputs)
@@ -128,8 +137,15 @@ def analyze_inputs(graph) -> InputAnalysis:
 
 
 def _analysis_block(module) -> Optional[Any]:
-    """The entry block to walk, or ``None`` when the module has no single
-    readable function (the gate explains that case)."""
+    """The entry block to walk, or ``None`` on a DEFENSIVE shape gate.
+
+    ``None`` means the module does not hold exactly one function, or that
+    function's region has no block — a malformed module, since a real
+    `evoxc.Graph` is single-function with an entry block. A graph the split
+    gate blocks for a REASON (control flow, an effectful op, a multi-block
+    function, a missing ``return``) still yields its entry block, so its
+    per-op facts stay fully reported.
+    """
     if len(module.functions) != 1:
         return None
     blocks = module.functions[0].region.blocks
