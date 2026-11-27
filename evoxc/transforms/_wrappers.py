@@ -36,6 +36,9 @@ class TransformCallable:
     ) -> None:
         self._build = build
         #: One of "vmap" | "batch_functions" | "grad" | "jvp" | "vjp".
+        #: `SplitCallable` (`_split_types.py`) is the same spec→result
+        #: convention with ``kind="split_by_inputs"``, returning a `SplitPlan`
+        #: instead of a `Graph`.
         self.kind = kind
         if doc:
             self.__doc__ = doc

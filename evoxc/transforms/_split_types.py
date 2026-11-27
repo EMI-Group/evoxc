@@ -15,10 +15,12 @@ Contents:
   `verify()` that checks the wiring law.
 * `SplitCallable` — the spec→plan convention for a function/`Defn` input
   (mirrors `_wrappers.TransformCallable`, but returns a `SplitPlan`).
+* `InputAnalysis` / `InputInfo` — the per-input inspection report returned by
+  `analyze_inputs` (see `analyze.py`).
 
 This module is deliberately free of machinery: the analysis/clone/build code
-lives in `_split_core.py`, the public entry point in `split.py`. Later rounds
-append the per-input analysis types here.
+lives in `_split_core.py`, the public entry points in `split.py` (the pass)
+and `analyze.py` (the report).
 """
 
 from __future__ import annotations
@@ -31,7 +33,13 @@ from evoxc import core
 from evoxc.trace import Graph
 from evoxc.trace._tree import _iter_leaf_paths
 
-__all__ = ["BoundaryValue", "SplitPlan", "SplitCallable"]
+__all__ = [
+    "BoundaryValue",
+    "SplitPlan",
+    "SplitCallable",
+    "InputAnalysis",
+    "InputInfo",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -479,3 +487,225 @@ class SplitCallable:
 
     def __repr__(self) -> str:
         return f"<evoxc.transforms.SplitCallable kind={self.kind!r}>"
+
+
+# ---------------------------------------------------------------------------
+# InputInfo (analyze_inputs)
+# ---------------------------------------------------------------------------
+
+
+class InputInfo:
+    """Per-tensor-input facts of one traced graph (`analyze_inputs`).
+
+    Attributes:
+        index: The tensor-input index — into ``graph.tensor_specs``, i.e. the
+            entry-block argument order, which is the SAME axis
+            `split_by_inputs`'s ``fixed_leaves`` uses.
+        path: The input's pytree path, rendered by `core.format_path` over its
+            leaf position in ``graph.input_specs`` (that axis also counts the
+            static leaves, hence the distinction from `index`).
+        spec: The SOURCE `core.TensorSpec` OBJECT (its identity and symbolic
+            `Dim` objects survive).
+        nbytes: Static byte size (`static_nbytes`), or ``None`` when an extent
+            is unknown.
+        direct_consumers: Distinct non-terminator entry-block ops that take
+            this block argument as an operand.
+        op_count: Ops transitively depending on it (their dependence mask has
+            this input's bit set).
+        outputs: Indices into the graph's TENSOR output leaves whose `return`
+            operand depends on this input.
+        boundary_bytes: Summed static byte size of the boundary that fixing
+            this input ALONE would produce; ``None`` when the graph is not
+            splittable, fixing it alone is not a legal split, or any boundary
+            value's size is unknown.
+        boundary_count: How many boundary values fixing this input alone
+            produces (``None`` under exactly the conditions of
+            `boundary_bytes`).
+    """
+
+    def __init__(
+        self,
+        index: int,
+        path: str,
+        spec: "core.TensorSpec",
+        *,
+        direct_consumers: int = 0,
+        op_count: int = 0,
+        outputs: Sequence[int] = (),
+        boundary_bytes: Optional[int] = None,
+        boundary_count: Optional[int] = None,
+    ) -> None:
+        self.index = int(index)
+        self.path = path
+        self.spec = spec
+        self.nbytes = static_nbytes(tuple(spec.shape), spec.dtype)
+        self.direct_consumers = int(direct_consumers)
+        self.op_count = int(op_count)
+        self.outputs = tuple(int(output) for output in outputs)
+        self.boundary_bytes = (
+            None if boundary_bytes is None else int(boundary_bytes)
+        )
+        self.boundary_count = (
+            None if boundary_count is None else int(boundary_count)
+        )
+
+    def summary(self) -> dict:
+        """A JSON-safe dict of these facts (``outputs`` as a tuple)."""
+        return {
+            "index": self.index,
+            "path": self.path,
+            "shape": [str(dim) for dim in self.spec.shape],
+            "dtype": str(self.spec.dtype),
+            "nbytes": self.nbytes,
+            "direct_consumers": self.direct_consumers,
+            "op_count": self.op_count,
+            "outputs": self.outputs,
+            "boundary_bytes": self.boundary_bytes,
+            "boundary_count": self.boundary_count,
+        }
+
+    def as_dict(self) -> dict:
+        """`summary()` with ``outputs`` rendered as a list (JSON-safe)."""
+        data = self.summary()
+        data["outputs"] = list(data["outputs"])
+        return data
+
+    def __repr__(self) -> str:
+        if self.boundary_count is None:
+            boundary = "?"
+        else:
+            boundary = (
+                f"{format_bytes(self.boundary_bytes)} / {self.boundary_count}"
+            )
+        return (
+            f"<InputInfo {self.index} at {self.path} "
+            f"shape=({', '.join(str(dim) for dim in self.spec.shape)}) "
+            f"dtype={self.spec.dtype} {format_bytes(self.nbytes)}: "
+            f"consumers={self.direct_consumers} ops={self.op_count} "
+            f"outputs={list(self.outputs)} boundary={boundary}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# InputAnalysis (analyze_inputs)
+# ---------------------------------------------------------------------------
+
+
+class InputAnalysis:
+    """The result of `analyze_inputs`: the per-input facts of one graph.
+
+    Pure inspection — this object holds no graph transformation, executes
+    nothing and caches nothing; `split()` builds a FRESH `SplitPlan` each
+    call.
+
+    Attributes:
+        source: the graph analyzed (never mutated).
+        inputs: one `InputInfo` per TENSOR input, in ``graph.tensor_specs``
+            order (tensor-input index order).
+        op_count: NON-TERMINATOR entry-block ops (nested region bodies are the
+            gate's business, never counted here).
+        output_count: number of TENSOR leaves in the graph's output tree.
+        splittable: True iff `evoxc.split_by_inputs` accepts this graph.
+        blocked_reason: the gate's message verbatim (naming the offending op
+            and its source location) when `splittable` is False, else ``None``.
+    """
+
+    def __init__(
+        self,
+        source: Graph,
+        inputs: Sequence[InputInfo],
+        *,
+        op_count: int = 0,
+        output_count: int = 0,
+        splittable: bool = True,
+        blocked_reason: Optional[str] = None,
+    ) -> None:
+        self.source = source
+        self.inputs = tuple(inputs)
+        self.op_count = int(op_count)
+        self.output_count = int(output_count)
+        self.splittable = bool(splittable)
+        self.blocked_reason = blocked_reason
+
+    # --- the pass this report explains ----------------------------------
+
+    def split(self, fixed=None, *, fixed_leaves=None) -> SplitPlan:
+        """Split `self.source` — thin sugar over `evoxc.split_by_inputs`.
+
+        Arguments are forwarded verbatim (``fixed`` / ``fixed_leaves``); on a
+        blocked graph this raises exactly the gate's `core.TransformError`.
+        """
+        # Local import: `split.py` imports this module, so a module-level
+        # import here would be circular.
+        from evoxc.transforms.split import split_by_inputs
+
+        return split_by_inputs(self.source, fixed, fixed_leaves=fixed_leaves)
+
+    # --- inspection -----------------------------------------------------
+
+    def summary(self) -> dict:
+        """A JSON-safe summary of the analysis.
+
+        Keys (exactly): ``input_count``, ``output_count``, ``op_count``,
+        ``splittable``, ``blocked_reason``. `as_dict()` adds the per-input
+        detail.
+        """
+        return {
+            "input_count": len(self.inputs),
+            "output_count": self.output_count,
+            "op_count": self.op_count,
+            "splittable": self.splittable,
+            "blocked_reason": self.blocked_reason,
+        }
+
+    def as_dict(self) -> dict:
+        """`summary()` plus ``inputs`` — one dict per tensor input."""
+        data = self.summary()
+        data["inputs"] = [info.as_dict() for info in self.inputs]
+        return data
+
+    def text(self) -> str:
+        """Human-readable report: a header with the graph-level counts and
+        the blocked reason, then one row per tensor input."""
+        static_count = len(self.source.static_values)
+        lines = [
+            f"InputAnalysis over {self.source!r}",
+            f"  {len(self.inputs)} tensor inputs, {static_count} static values, "
+            f"{self.op_count} entry-block ops, {self.output_count} tensor outputs",
+        ]
+        if self.splittable:
+            lines.append("  splittable: yes")
+        else:
+            lines.append(f"  splittable: no — {self.blocked_reason}")
+        if self.inputs:
+            lines.append(
+                "   idx  path           shape             dtype    bytes    "
+                "consumers  ops  outputs    boundary(alone)"
+            )
+            for info in self.inputs:
+                shape = "(" + ", ".join(str(dim) for dim in info.spec.shape) + ")"
+                if info.boundary_count is None:
+                    boundary = "?"
+                else:
+                    boundary = (
+                        f"{format_bytes(info.boundary_bytes)} / "
+                        f"{info.boundary_count} values"
+                    )
+                lines.append(
+                    f"  {info.index:>4}  {info.path:<14} {shape:<17} "
+                    f"{str(info.spec.dtype):<8} {format_bytes(info.nbytes):>7}  "
+                    f"{info.direct_consumers:>9}  {info.op_count:>4}  "
+                    f"{str(list(info.outputs)):<9}  {boundary}"
+                )
+        return "\n".join(lines)
+
+    def print(self) -> None:
+        """Print `text()` to stdout."""
+        print(self.text())
+
+    def __repr__(self) -> str:
+        state = "splittable" if self.splittable else "blocked"
+        return (
+            f"<InputAnalysis {len(self.inputs)} inputs, {self.op_count} ops, "
+            f"{self.output_count} outputs, {state}>"
+        )

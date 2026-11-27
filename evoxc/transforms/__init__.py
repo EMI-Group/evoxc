@@ -8,8 +8,16 @@ an ordinary `Graph` of ordinary ops — backends need no transform-specific
 runtime support. No execution happens here: transforms never import
 backends/pipeline.
 
+One pass is STRUCTURAL rather than numeric: `split_by_inputs` slices a graph
+into a `prepare` / `apply` pair at its input structure (which inputs stay fixed
+across calls and which vary per call), and `analyze_inputs` reports the
+per-input facts that split is derived from. It slices the graph data structure
+and carries no numerical authority, so it is neither a native-engine transform
+nor a numerical one.
+
 Read `./CONTEXT.md` for the binding design: rule-call signatures, the
-vmap⇔vectorize equivalence contract, AD semantics, and v1 scope.
+vmap⇔vectorize equivalence contract, AD semantics, `split_by_inputs`'s
+correctness law, and v1 scope.
 """
 
 from evoxc.transforms.batching import (
@@ -33,6 +41,15 @@ from evoxc.transforms.batch_functions import (
 from evoxc.transforms.grad import grad
 from evoxc.transforms.jvp import jvp
 from evoxc.transforms.vjp import vjp
+from evoxc.transforms.split import split_by_inputs
+from evoxc.transforms.analyze import analyze_inputs
+from evoxc.transforms._split_types import (
+    BoundaryValue,
+    InputAnalysis,
+    InputInfo,
+    SplitCallable,
+    SplitPlan,
+)
 from evoxc.transforms._wrappers import TransformCallable
 
 # Registers the builtin batching/JVP/VJP rules for the standard op set.
@@ -47,6 +64,13 @@ __all__ = [
     "grad",
     "jvp",
     "vjp",
+    "split_by_inputs",
+    "analyze_inputs",
+    "SplitPlan",
+    "BoundaryValue",
+    "InputAnalysis",
+    "InputInfo",
+    "SplitCallable",
     "TransformCallable",
     "batching_rules",
     "register_batching_rule",
