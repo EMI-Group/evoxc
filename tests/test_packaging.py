@@ -80,6 +80,12 @@ MEMBER_INIT = MEMBER_DIR / "src" / MEMBER_MODULE / "__init__.py"
 # `evoxc`'s extras are EXACTLY these six; the HF oracle extra lives on the member.
 ROOT_EXTRAS = frozenset({"interop", "dev", "iree", "tvm", "compilers", "bench"})
 
+# Paths that belong to NEITHER artifact and must be excluded from wheel AND sdist:
+# the dev-built extension (maturin compiles it itself) and the `docs-site/`
+# documentation site (a Nimbus/Astro static site built by the docs workflow).
+MATURIN_EXCLUSIONS = frozenset({"evoxc/_evoxc_native*.so", "docs-site/**"})
+DOCS_SITE_DIR = "docs-site"
+
 # Directories that never contain distributable source packages.
 _SKIP_DIRS = frozenset({".git", ".genesis", ".eggs", ".venv", ".mypy_cache", ".pytest_cache"})
 _SKIP_DIRS |= frozenset({"__pycache__", "build", "dist", "node_modules", "venv"})
@@ -307,12 +313,23 @@ def test_root_maturin_ships_the_sdist_extras_only():
     for entry in ("conftest.py", "CHANGELOG.md"):
         assert (REPO_ROOT / entry).is_file(), entry
 
-    # The dev-built extension is a gitignored build product: never package it from source.
+    # The `exclude` list carries EXACTLY the two paths that belong to neither artifact —
+    # the dev-built extension (a gitignored build product maturin compiles itself) and
+    # the `docs-site/` documentation site — each kept out of the sdist AND the wheel.
     excludes = config["exclude"]
-    assert excludes, "the dev-built evoxc/_evoxc_native*.so must be excluded from wheel and sdist"
+    excluded = {}
     for entry in excludes:
-        path = entry["path"] if isinstance(entry, dict) else entry
-        assert "evoxc_native" in path, entry
+        assert isinstance(entry, dict), f"exclude entry {entry!r} is unconditional and carries no `format`"
+        formats = entry["format"]
+        formats = [formats] if isinstance(formats, str) else list(formats)
+        assert {"sdist", "wheel"} <= set(formats), (
+            f"exclude={excludes} does not keep `{entry['path']}` out of both artifacts (format={formats!r})"
+        )
+        excluded[entry["path"]] = formats
+    assert set(excluded) == set(MATURIN_EXCLUSIONS), (
+        f"exclude paths are {sorted(excluded)}, expected exactly {sorted(MATURIN_EXCLUSIONS)}: the "
+        "dev-built extension and the docs site belong to neither artifact"
+    )
 
 
 # ---- 2. identity and dependency metadata of the two distributions ------------
@@ -1110,6 +1127,11 @@ def test_evoxc_sdist_ships_the_module_and_tests_only(built_artifacts):
     assert "pyproject.toml" in entries, sorted(top)  # anti-vacuity: a real sdist root
     shipped = _entries_under(entries, MEMBER_MODULE)
     assert not shipped, f"the evoxc sdist ships member entries: {shipped[:5]}\n{_STALE_HINT}"
+    docs_site = _entries_under(entries, DOCS_SITE_DIR)
+    assert not docs_site, (
+        f"the evoxc sdist ships `{DOCS_SITE_DIR}/` entries: {docs_site[:5]} — the documentation site "
+        "is built by the docs workflow and must not bloat the release artifact"
+    )
 
 
 def test_evoxc_hf_sdist_ships_only_its_src_layout(built_artifacts):

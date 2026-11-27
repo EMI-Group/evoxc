@@ -190,15 +190,23 @@ strip = true
 # `test_evoxc_sdist_is_a_complete_buildable_source_tree` packaging test pins
 # that the manifest, the lock and the PyO3 crate are all present).
 # Deliberately NOT shipped: the workspace member `evoxc_hf/` (a SEPARATE
-# distribution built from its own project) and the dev-built extension (a
-# gitignored build product that maturin compiles itself).
+# distribution built from its own project), the dev-built extension (a
+# gitignored build product that maturin compiles itself) and the `docs-site/`
+# documentation site (a Nimbus/Astro static site built by the docs workflow —
+# not a Python package and not part of either artifact).
 include = [
     { path = "tests/**/*", format = "sdist" },
     { path = "assets/**/*", format = "sdist" },
     { path = "conftest.py", format = "sdist" },
     { path = "CHANGELOG.md", format = "sdist" },
 ]
-exclude = [{ path = "evoxc/_evoxc_native*.so", format = ["sdist", "wheel"] }]
+# `python-source = "."` makes maturin carry every git-tracked file into the
+# sdist, so an exclusion is explicit: the `docs-site/` site is built by the docs
+# workflow and belongs to neither artifact.
+exclude = [
+    { path = "evoxc/_evoxc_native*.so", format = ["sdist", "wheel"] },
+    { path = "docs-site/**", format = ["sdist", "wheel"] },
+]
 
 [tool.pytest.ini_options]
 # `tests/` mirrors the `evoxc` package; the workspace member distribution
