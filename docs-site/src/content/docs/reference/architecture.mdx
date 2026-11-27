@@ -5,4 +5,205 @@ sidebar:
   order: 5
 ---
 
-<!-- TODO(content): write the Architecture page. -->
+evoxc is a frontend and a runtime boundary around a compiler-neutral IR. It owns the tensor-graph language, the IR, the graph transformations, the explicit staging contract and the backend-adapter contract; it deliberately does not own optimisation, kernel scheduling, memory planning or code generation — those belong to IREE, XLA or TVM.
+
+## The layers
+
+```text
+                    evoxc  (the Python package)
+    ┌───────────────────────────────────────────────────────────┐
+    │  frontend      ops (tensor ops)  ·  evoxc.numpy (enp)     │
+    │                trace/defn  ·  block  ·  dist  ·  sparse   │
+    │                transforms: vectorize / vmap / grad /      │
+    │                            jvp / vjp / batch_functions    │
+    └───────────────────────────────┬───────────────────────────┘
+                                    ▼
+                        EvoXIR  (region-based SSA)
+                     Module › Function › Block › Op › Value
+                                    │
+              ┌─────────────────────┴──────────────────────┐
+              ▼                                            ▼
+   native Rust core (in-process)              trace-time inference (Python)
+   schemas · dtype promotion                  shape/dtype inference hooks
+   vectorize/vmap · AD · batch merge          backends (Python)
+   CPU engine (immutable plans)               StableHLO export · numpy interpreter
+        ▲                                      iree / xla / tvm adapters
+        │  PyO3: evoxc._evoxc_native          (+ the "native" backend)
+        └──────────────────────────────────────────────┘
+────────────────────────── runtime boundary ──────────────────────────
+                    Tensor  +  DLPack  (+ explicit Tensor.to)
+```
+
+Above the boundary everything is symbolic: no value has storage. Below it everything is physical: a `Tensor` knows its device, and nothing moves data on your behalf.
+
+## EvoXIR: a region-based SSA IR
+
+`evoxc.ir` owns the IR data model — `Module`, `Function`, `Region`, `Block`, `Op`, `Value`, `Use` — plus `ValueType` (a dtype and a shape of `int | DimExpr | None`), `Location(file, line, col)`, the `Builder`, verification and serialization.
+It is MLIR-inspired but not MLIR: a `Module` holds functions, a function holds a region of blocks, blocks hold ordered ops, and an op's operand references are SSA values. Control flow is *nested regions* — `if` owns its true/false regions and `while` its cond/body regions, with operands bound to the region's entry-block arguments exactly as in MLIR.
+`return` is the v1 terminator; a `trace.Graph` always builds exactly one function (conventionally `main`), though the IR itself supports several and a `call` op.
+
+**Effects** are declared per op and are one of five kinds: `pure`, `write`, `read`, `collective`, `callback`. Program order inside a block *is* the order for effectful ops: pure ops may be reordered or CSE'd but never moved across an effectful op or out of their region; effectful ops are never reordered, duplicated or eliminated; `collective` ops additionally impose device-synchronisation ordering. `write` is reserved for future stateful ops — v1 has none, so `scatter` is functional and every value is produced exactly once.
+
+**Verification** is the explicit `evoxc.ir.verify(module)`, raising `VerificationError` on the first violation: module and function invariants, block/region wiring, registered op names with arity/result-count/region-count and attribute schemas, result types agreeing with the op's inference hook, SSA dominance and use-bookkeeping. `graph.verify()` is the same check for a `Graph`.
+
+**Serialization** (`serialize_module`/`deserialize_module`, `IR_FORMAT_VERSION`) produces a self-describing payload — the module, its functions and a flat op table, values by id, constants as base64 `npy`, and a SHA-256 over the canonical JSON. Tampering or a structural violation raises `VerificationError`; an unknown format or version raises `PersistenceError`. This payload is the core of the `.evoxcgraph` container (`evoxc.persist` wraps it, it does not rewrite it). `pretty_print(module)` is the text `graph.print()` shows and `graph.text()` returns.
+
+### The op registry
+
+Ops are not an open namespace: every op a graph can contain is declared in `evoxc.ir`'s registry, and that table — not the frontend functions — is the canonical definition.
+
+| Name | Purpose |
+|---|---|
+| `opdef(name)` | The `OpDef` for a name (`KeyError` if unknown) |
+| `has_opdef(name)`, `op_names()`, `all_opdefs()` | Registry queries |
+| `register_opdef(...)` | Add or replace a definition — the extension point for custom ops |
+| `AttrSpec(name, tag, default=…)` | One attribute of an op: name, type tag, optional default |
+| `OpDef` | Name, category, arity, result count, regions, effect, terminator flag, attribute schema, optional shape-inference hook |
+
+The v1 canonical set is **121 ops in 12 categories**:
+
+| Category | Ops | Notes |
+|---|---|---|
+| elementwise | 38 | arithmetic, unary math, `cast`, logical, bitwise, `nan_to_num` — all `pure` |
+| comparison | 6 | results are `bool` |
+| structure | 13 | `select`, `broadcast`, `reshape`, `transpose`, `slice`, `gather`, `scatter`, `concatenate`, `pad`, `tile`, `flip`, `roll`, `diag` |
+| reduction | 9 | the `reduce_*` family, `argmax`/`argmin`, `cumsum`/`cumprod` |
+| sorting | 2 | `sort`, `argsort` |
+| linalg | 12 | `dot`, `conv`, `tril`/`triu`, `diagonal`, `solve`, `eigh`, `cholesky`, `qr`, `matrix_rank`, `svd`, `matrix_exp` |
+| control | 8 + terminator | `constant`, `stop_gradient`, `if`, `while`, `call`, `runtime_call`, `external_call`, `block_call`, plus `return` |
+| collective | 8 | the six collectives plus `rank`/`world_size`; effect `collective` (`rank`/`world_size` are `read`) |
+| sparse | 16 | numpy-backend-only in v1 |
+| random | 6 | algorithm-aware, deterministic per key |
+| custom | 2 | `custom_call`, `inline_stablehlo` — effect `callback` |
+
+Declaring an op here does not mean every backend implements it. Backends reject what they cannot do through their `Capabilities`, explicitly and never silently — and the frontend op names are deliberately *fewer* than 121, because some (like `topk` or `softmax`-style compositions) are frontend sugar over these ops. See the [op catalogue](/reference/ops/).
+
+## The native Rust core
+
+The numerical authority is the Rust workspace in `native/`, reached from Python through one PyO3 extension, `evoxc._evoxc_native`.
+
+```text
+evoxc-core      dtypes + promotion table, Dim/DimExpr, ValueType, attrs,
+   ↑            the 121-op schema table, graph IR, envelope codec, inference
+   ├── evoxc-compiler   builder, vectorize/vmap, jvp/vjp/grad, batch_functions
+   ├── evoxc-runtime    sessions, buffers, submissions, executables (no drivers)
+   └── evoxc-cpu        the CPU engine: plan compile + typed host buffers
+                 ↑
+        evoxc (published facade crate: cpu / runtime / full features)
+                 ↑
+        evoxc-python (the only PyO3 crate; publish = false)
+```
+
+| Crate | Owns |
+|---|---|
+| `evoxc-core` | dtypes and the promotion table, `Dim`/`DimExpr`, `ValueType`, attributes, the op schema table, the graph IR, the envelope codec, per-category inference |
+| `evoxc-compiler` | the builder, `vectorize`/`vmap`, `jvp`/`vjp`/`grad`, the `batch_functions` merge, extension-rule inlining |
+| `evoxc-cpu` | the CPU execution engine: compile to an immutable plan, run on typed host buffers |
+| `evoxc-runtime` | session/buffer/executable structure with real ownership invariants and no device drivers |
+| `evoxc` | the reusable, publishable facade: `core`/`compiler` always, `cpu` and `runtime` behind features |
+| `evoxc-python` | the PyO3 binding — `version`, `infer`, `transform`, `batch_functions`, `batching_rule_keys`, `native_compile` |
+
+Two generated tables are the authority rather than a by-product: the op schema table is emitted from the Python registry, and the dtype promotion table is `numpy.result_type` over **every subset** of the 14 dtypes (16384 entries) — because `result_type` is not associative under pairwise folding but depends only on the set of dtypes.
+
+**One implementation for the six builtin transforms.** `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` are Rust code, and Python has no fallback: a missing extension raises an actionable `ImportError`. What Python keeps is validation with pinned error wording, pytree/spec adaptation and the extension-rule bridge — the one thing only Python can answer, a `block:*`/`external:*`/`sparse_*` op whose derivative rule is a Python callable. A rule that cannot answer raises `TransformError` naming the op; nothing silently degrades to a Python loop.
+
+The cost of that hop is measured, not estimated: whole-graph `grad`/`vjp` costs 1.22× (752 ops) and 1.27× (2252 ops) the deleted pure-Python sweep end to end, and the residual gap is the Python-side envelope decode rather than the Rust work. Native `run` against the numpy interpreter on synthetic graphs is 2.0× (`ew_chain_1e6`), 9.3× (`ew_transcendental_1e6`), 11.4× (`tf_softmax_8x128x384`) and ≈11.7× (`chain_2000`), 1.33× on `gp_gather_4096` and 0.98× on `tn_step_pop500` — release build, on one host, so treat them as shape evidence rather than a promise.
+
+### Crossing the boundary: the envelope
+
+Python and Rust exchange **one JSON-able dict per call**, never a callback per node. `evoxc._native_codec` (`ENVELOPE_FORMAT = 1`) encodes an `ir.Module` into that envelope and decodes the result back into a `Module`:
+
+```text
+{
+  "format": "evoxc-native-ir",     # discriminator (the stored IR payload says "evoxc-ir")
+  "version": 1,
+  "module":    {"name": str, "metadata": {json}},
+  "functions": [{"name", "input_types", "output_types", "metadata", "block"}],
+  "ops":       [{"id", "name", "operands", "results", "attributes", "regions", "location"}]
+}
+```
+
+It mirrors the stored (`.evoxcgraph`) payload with three deliberate differences: a different discriminator, ndarray payloads inline as raw little-endian bytes instead of a `constants` table of `npy` bytes, and no `sha256` — the envelope is an in-process value, not a file. Two decoders exist: a *validated* one for anything of uncertain provenance (files, caches, tests), which checks structure and runs `ir.verify`, and a *trusted fast* one for output the native engine produced moments ago from a module this runtime had just validated.
+
+### Where the two implementations must agree
+
+The numpy interpreter is the **reference behaviour**; the Rust engine is the fast implementation. They are gated against each other, not against a third oracle: `native/tools/parity_cpu.py` runs 73 op cases (exact bool and integer results, `allclose` floats with case-declared tolerances, bit-exact only where a case opts in) and the transform harnesses compare batching and AD output against the Python-built graphs. The documented residual differences are narrow and typed: transcendentals follow the platform libm while numpy uses its own CPU-dispatched SIMD kernels (≤2 ulp in `float32`, 1 ulp in `float64`), and `float32` `dot` reassociates differently through `faer` than through OpenBLAS `sgemm`.
+
+New op work therefore lands in three places in this order — the schema and inference, the numpy reference kernel, and the native kernel. A native-only op, or a numpy-only op, is a bug rather than an optimisation.
+
+## What stays Python
+
+| Duty | Why Python |
+|---|---|
+| Executing a `defn` body | It is Python code; the frontend calls it once with symbolic arguments |
+| pytree and spec adaptation | The containers are Python objects |
+| Extension rules (`block:*`, `external:*`, `sparse_*`) | The rules are Python callables, served to the native rewrite through the bridge |
+| Trace-time shape inference | `ir/inference.py` is on the hot path today; the native hooks exist and are parity-tested |
+| Lowering and StableHLO export | The export is a writer over the IR, and it is where exporter options live |
+| Backend adapters, persistence, formats, I/O | These are host-OS and third-party-package concerns, not graph semantics |
+
+## Import layers
+
+The package is a strict layering: each layer imports only lower layers, so no cycle can form and the frontend can never reach into a backend by accident.
+
+| Layer | Imports |
+|---|---|
+| `core` | nothing from evoxc (numpy + stdlib only) |
+| `ir` | `core` |
+| `ops` | `core`, `ir`, `trace` (only for the active-builder hook) |
+| `trace`, `numpy` (enp) | `core`, `ir`, `ops` |
+| `block`, `transforms`, `backends`, `dist`, `sparse`, `pipeline`, `persist` | the layers above them |
+
+Two documented exceptions: the numpy interpreter reaches `dist` for single-process collective emulation (`backends → dist`), and `sparse` registers its rules one-way into `transforms`' public registries without `transforms` ever importing `sparse`. The `evoxc-hf` distribution is not a submodule — it imports only evoxc's *public* API, and `evoxc` never imports it.
+
+## The runtime boundary
+
+Below `load()` sits a backend executable with one structural obligation: `run(flat_input_tensors) -> flat_output_tensors`, plus optional `plan_text()`, `save`/`load` and `synchronize()`. Everything above that point is evoxc's; everything below it is the compiler's or interpreter's.
+
+`Tensor` is the only object that crosses the boundary, and it is always *physically* honest: numpy-backed data is host memory at `Device("cpu", 0)`, a device payload carries its real device, and `Tensor.to(device)` is the only transfer. DLPack is the zero-copy interop path in both directions. That is also why the frontend can offer a real guarantee: no API moves, copies or reshards a tensor behind your back — a mismatch is a `DeviceError` naming the path and both devices.
+
+### What a backend must declare
+
+A backend is `name`, `capabilities`, `lower`, `compile`, `load`; the executable it returns implements `run`. The interesting part is `Capabilities`, because it is how a limitation becomes an error at the right stage instead of a surprise at run time:
+
+| Field | Meaning |
+|---|---|
+| `dynamic_shapes` | Whether symbolic (non-concrete) dims are executable |
+| `dtypes` | The dtype set the backend accepts |
+| `collectives`, `async_collectives` | Whether `evoxc.dist.*` can be compiled |
+| `runtime_calls`, `external_calls` | Whether Python callbacks and named kernels can run |
+| `custom_blocks` | Whether `evoxc.block` ops are supported directly (compiler adapters inline their portable decompositions instead) |
+| `sparse_ops` | The numpy-only sparse surface |
+| `rng_bit_generator` | The RNG algorithms the backend accepts |
+| `custom_ops` | The `custom_call`/`inline_stablehlo` gate — `False` on numpy and native, so both reject them explicitly |
+
+The mechanism to read a capability is a failure, not a probe: an unsupported request surfaces as `BackendError` at `lower`, `compile` or `load` — the earliest stage that can know.
+
+### Why numpy is a hard dependency
+
+`numpy` is not just the default backend; it is the host ABI and the type system:
+
+- the public dtype constants (`evoxc.float32`, …) **are** `np.dtype` objects, and `evoxc.dtype()` returns one;
+- a host `Tensor` payload **is** an `np.ndarray`, so `.numpy()` is a zero-copy identity;
+- the IR constant payload is an ndarray, serialized as `.npy` bytes;
+- dtype promotion **is** `numpy.result_type`, and the Rust promotion table is generated from it;
+- the native FFI is numpy-in/numpy-out: typed numpy views in, owned Rust buffers moved out as fresh numpy arrays.
+
+Dropping it would be a separate native host-buffer ABI project — a Python-visible tensor/store layer plus a rewrite of every frontend kernel — not a packaging flip. So it stays hard, and the optional dependencies stay truly optional: compilers are never vendored, downloaded or linked, and every adapter module is pure Python behind lazy activation.
+
+## What evoxc does not own
+
+The boundary is as much of the design as the layers. evoxc contains no optimiser, no scheduler and no code generator, and it never grows one by accident:
+
+- **Not in evoxc:** NN modules, layers, optimisers, datasets, loaders, training loops or a model zoo; automatic global sharding, resharding or implicit collectives; a CUDA allocator, GPU runtime or kernel scheduler; compiler optimisation passes; a kernel compiler; a distributed job scheduler, checkpoint manager or serving layer.
+- **Not invented by evoxc:** communication (a collective appears in the graph because you wrote it), placement (a tensor is where its data is), transfers (only `Tensor.to`), or specialisation (a static value changing means a new graph, visible as a new `digest()`).
+
+Applications build those things *on top of* the public API — `evoxc-hf` is the in-repository example of a whole model forward expressed as one graph.
+
+## StableHLO is an export target, not the IR
+
+EvoXIR defines the program. StableHLO is how a compiler adapter receives it: `evoxc.backends.stablehlo.export(graph) -> str` walks the verified IR and emits MLIR text, which is exactly what `iree`, `xla` and `tvm` consume (and what `compile_text` accepts back). That ordering matters in practice — the IR is free to hold things StableHLO has no spelling for (custom ops, callbacks, sparse tensors), and a backend that cannot express one says so with an explicit `BackendError` instead of the frontend quietly narrowing its own language. Exporter coverage is therefore a *backend* property, listed per op in the [op catalogue](/reference/ops/) and in [limitations and deferrals](/reference/deferrals/).
+
+<Aside type="note" title="Proposal versus contract">
+`NATIVE_ARCHITECTURE_PROPOSAL.md` at the repository root is the target design and the rationale for a Rust numerical authority — it describes more than is built, including a separate `evoxc-format` crate and native inference on the hot path. This page describes what exists; where the two differ, the module contracts win.
+</Aside>
