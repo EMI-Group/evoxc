@@ -102,7 +102,7 @@ It is pure inspection over the same helpers the split uses, so the report cannot
 - **`InputInfo`** — one tensor input's facts: `index` (the tensor-input index that `fixed_leaves` uses), `path` (the pytree path, e.g. `[1]` or `[0]['w']`), `spec`, `nbytes`, `direct_consumers`, `op_count` (ops transitively depending on it), `outputs` (indices of the tensor output leaves it influences), `boundary_bytes` / `boundary_count` (what fixing that input alone would cost — `None` when the graph is not splittable or fixing it alone is not a legal split; a legal split that crosses nothing reports `0` / `0`), plus `summary()` / `as_dict()` / `repr`.
 - **Axis note:** `index` is the tensor-input axis `fixed_leaves` uses, while `path` is rendered over tree-leaf positions (which also count static leaves), so the two are not interchangeable.
 
-On a blocked graph the per-op facts are still reported — the gate blocks the split, not the counting — and only the boundary fields become `None`.
+A graph blocked by control-flow regions or effectful ops still reports full per-input facts — that gate blocks the split, not the counting — and only the `boundary_bytes` / `boundary_count` fields become `None`. A defensive module-shape gate (a module that is not exactly one function, a multi-block region, a missing `return` terminator) has no single entry block to walk, so it reports `splittable=False` with zeroed facts instead: `op_count` is `0` and each `InputInfo`'s `direct_consumers` / `op_count` / `outputs` are `0` / empty.
 
 ## `LoweredProgram`
 
