@@ -4,7 +4,10 @@
 # deploys it to the `evoxc-docs` Cloudflare Worker on pushes to `main`.
 #
 # The work happens in reusable workflows from the shared toolkit repository
-# `EMI-Group/evox-docs-infra` (pinned to its published `v0.1.0` tag):
+# `EMI-Group/evox-docs-infra`, pinned to the toolkit's `main` branch: the
+# site's Python API reference uses the module pages, grouped index and stable
+# `revision` source links added after the `v0.1.0` tag. Move both pins to the
+# next published tag (`v0.2.0`) once it is cut.
 #   build.yml  — installs the toolkit, regenerates the Python API reference
 #                (`docs-infra python-api`, configured by `docs-infra.yml`),
 #                runs `npm ci && npm run build` in `docs-site/` and uploads
@@ -36,7 +39,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    uses: EMI-Group/evox-docs-infra/.github/workflows/build.yml@v0.1.0
+    uses: EMI-Group/evox-docs-infra/.github/workflows/build.yml@main
     with:
       site_directory: docs-site
       output_directory: docs-site/dist
@@ -46,7 +49,7 @@ jobs:
   deploy:
     if: github.event_name != 'pull_request'
     needs: build
-    uses: EMI-Group/evox-docs-infra/.github/workflows/deploy.yml@v0.1.0
+    uses: EMI-Group/evox-docs-infra/.github/workflows/deploy.yml@main
     with:
       output_directory: docs-site/dist
       wrangler_config: docs-site/wrangler.jsonc
