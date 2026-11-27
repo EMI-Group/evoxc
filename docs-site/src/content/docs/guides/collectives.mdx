@@ -25,7 +25,7 @@ The value model underneath is the same as everywhere else: a tensor is a **local
 
 ## Groups
 
-A [`group`](/api/evoxc/dist/group/) is a static Python value — a named set of ranks that specializes the graph at trace time:
+A [`group`](/api/evoxc/dist/group-function/) is a static Python value — a named set of ranks that specializes the graph at trace time:
 
 ```python
 dp = evoxc.dist.group("dp", (0, 1, 2, 3))
@@ -37,7 +37,7 @@ everyone = evoxc.dist.WORLD_GROUP   # the default: group=None on every collectiv
 
 - `ranks` must be non-empty, unique and non-negative integers (bools are rejected) — otherwise `ValueError`.
 - `WORLD_GROUP` (name `"world"`) means *all ranks of the runtime execution context*: its membership is known only at run time, so its shapes stay runtime-dynamic where a shape depends on the group size.
-- Groups are immutable and hashable, compared over `(name, ranks, backend)`.
+- [`Group`](/api/evoxc/dist/group/) values are immutable and hashable, compared over `(name, ranks, backend)`.
 - Collectives record the group **by name and size** (`group`, `group_size`; `None` for the world group), so artifacts stay self-describing with no Python objects inside.
 
 ## The six collectives

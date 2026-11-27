@@ -30,6 +30,8 @@ object itself.
 - [`StaticValue`](/api/evoxc/trace/staticvalue/) — Record of one static (graph-specializing) input or output leaf.
 - [`cond`](/api/evoxc/trace/cond/) — Runtime `if` over a tensor predicate → traced `if` op.
 - [`current_builder`](/api/evoxc/trace/current-builder/) — Return the innermost active `ir.Builder`.
+- [`defn`](/api/evoxc/trace/defn-function/) — Mark `fn` as a graph definition.
 - [`scan`](/api/evoxc/trace/scan/) — Scan along a leading axis → `(carry, stacked_outputs)`.
+- [`trace`](/api/evoxc/trace/trace/) — Trace `fn_or_defn` with the given input specs → `Graph`.
 - [`while_loop`](/api/evoxc/trace/while-loop/) — Runtime `while` over a tensor condition → traced `while` op.
 - [`with_builder`](/api/evoxc/trace/with-builder/) — Context manager installing `builder` as the active builder for ops.

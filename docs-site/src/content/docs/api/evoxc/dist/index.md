@@ -30,6 +30,7 @@ Public surface (full semantics in this directory's CONTEXT.md):
 - [`broadcast`](/api/evoxc/dist/broadcast/) — Broadcast: every rank receives the local tensor of `src_rank`.
 - [`collective_permute`](/api/evoxc/dist/collective-permute/) — Collective permute: pairwise send/recv per `source_target_pairs`.
 - [`get_collective_executor`](/api/evoxc/dist/get-collective-executor/) — Return the installed collective executor.
+- [`group`](/api/evoxc/dist/group-function/) — Create an explicit communication `Group`.
 - [`rank`](/api/evoxc/dist/rank/) — Current rank of the runtime execution context, as a scalar int64 graph value.
 - [`reduce_scatter`](/api/evoxc/dist/reduce-scatter/) — Reduce-scatter: reduce across ranks with `op`, then scatter along `axis`.
 - [`set_collective_executor`](/api/evoxc/dist/set-collective-executor/) — Install (or clear, with `None`) the process-wide collective executor.

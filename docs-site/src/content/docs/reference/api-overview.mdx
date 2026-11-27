@@ -18,7 +18,7 @@ Everything that moves a program from a Python function to a runnable object.
 | Name | What it gives you |
 |---|---|
 | `evoxc.defn` | decorator marking a function as a graph *definition* → [`Defn`](/api/evoxc/trace/defn/) |
-| `evoxc.trace(fn_or_defn, *specs)` | [`Graph`](/api/evoxc/trace/graph/) — EvoXIR, input/output trees, snapshotted static values |
+| [`evoxc.trace(fn_or_defn, *specs)`](/api/evoxc/trace/trace/) | [`Graph`](/api/evoxc/trace/graph/) — EvoXIR, input/output trees, snapshotted static values |
 | [`evoxc.lower(graph, backend=None, **options)`](/api/evoxc/pipeline/lower/) | [`LoweredProgram`](/api/evoxc/backends/loweredprogram/) |
 | [`evoxc.compile(lowered, backend=None, **options)`](/api/evoxc/pipeline/compile/) | [`CompiledArtifact`](/api/evoxc/backends/compiledartifact/) |
 | [`evoxc.load(artifact, backend=None, device=None, **options)`](/api/evoxc/pipeline/load/) | [`Executable`](/api/evoxc/backends/executable/) |
@@ -41,10 +41,10 @@ Guides: [Graphs and tracing](/guides/graphs-and-tracing/), [Persistence and cach
 | [`evoxc.TensorSpec(shape, dtype, device=None, name=None)`](/api/evoxc/core/tensorspec/) | describes a future runtime tensor; holds no data |
 | [`evoxc.SymbolicTensor`](/api/evoxc/core/symbolictensor/) | an SSA value inside a graph; no data, no `.numpy()` |
 | [`evoxc.Device(kind, index=0)`](/api/evoxc/core/device/) | a physical device; kinds `cpu`, `cuda`, `rocm` (alias `hip`), `vulkan` |
-| `evoxc.dim(name_or_int)` | [`Dim`](/api/evoxc/core/dim/) — a named symbolic extent; [`DimExpr`](/api/evoxc/core/dimexpr/) arithmetic comes from it |
+| [`evoxc.dim(name_or_int)`](/api/evoxc/core/dim-function/) | [`Dim`](/api/evoxc/core/dim/) — a named symbolic extent; [`DimExpr`](/api/evoxc/core/dimexpr/) arithmetic comes from it |
 | [`evoxc.dtype(obj)`](/api/evoxc/core/dtype/) | normalize anything dtype-like to a numpy dtype |
 | `evoxc.float16` … `evoxc.complex128` | the 14 dtype constants: `float16/32/64`, `int8/16/32/64`, `uint8/16/32/64`, `bool_`, `complex64/128` |
-| [`evoxc.tensor`](/api/evoxc/core/tensor/), [`evoxc.zeros`](/api/evoxc/core/zeros/), [`evoxc.ones`](/api/evoxc/core/ones/), [`evoxc.full`](/api/evoxc/core/full/), [`evoxc.empty`](/api/evoxc/core/empty/), [`evoxc.from_numpy`](/api/evoxc/core/from-numpy/), [`evoxc.from_dlpack`](/api/evoxc/core/from-dlpack/) | concrete creators — host data only, always `Device("cpu", 0)` |
+| [`evoxc.tensor`](/api/evoxc/core/tensor-function/), [`evoxc.zeros`](/api/evoxc/core/zeros/), [`evoxc.ones`](/api/evoxc/core/ones/), [`evoxc.full`](/api/evoxc/core/full/), [`evoxc.empty`](/api/evoxc/core/empty/), [`evoxc.from_numpy`](/api/evoxc/core/from-numpy/), [`evoxc.from_dlpack`](/api/evoxc/core/from-dlpack/) | concrete creators — host data only, always `Device("cpu", 0)` |
 | [`evoxc.constant(tensor)`](/api/evoxc/core/constant/) | the only way to embed data in a graph; graph-time only, warns above `EVOXC_LARGE_CONSTANT_BYTES` |
 | [`evoxc.devices(kind=None)`](/api/evoxc/core/devices/) | enumerate devices; never raises, never invents one |
 | [`evoxc.split_tensor(tensor, axis, devices)`](/api/evoxc/core/split-tensor/), [`evoxc.replicate_tensor(tensor, devices)`](/api/evoxc/core/replicate-tensor/) | v1 host-only data preparation, not a sharding transformation |
@@ -84,12 +84,12 @@ Op functions build into the active trace. Called with a `SymbolicTensor` they bu
 
 | Name | Signature shape |
 |---|---|
-| `evoxc.vectorize(graph, axes)` | traced `Graph` in, `Graph` out |
-| `evoxc.vmap(fn_or_graph, in_axes=0, out_axes=0)` | sugar over `vectorize` |
-| `evoxc.grad(fn_or_graph, argnums=None)` | reverse-mode gradient as an ordinary graph |
-| `evoxc.jvp(fn_or_graph, tangents)` | forward-mode |
-| `evoxc.vjp(fn_or_graph, cotangents=None)` | reverse-mode with explicit cotangents |
-| `evoxc.batch_functions(fns, axes=0, out_axes=0, *, switch_ops=None, bands=None, alignment="variant")` | merges same-signature programs into one graph |
+| [`evoxc.vectorize(graph, axes)`](/api/evoxc/transforms/vectorize/) | traced `Graph` in, `Graph` out |
+| [`evoxc.vmap(fn_or_graph, in_axes=0, out_axes=0)`](/api/evoxc/transforms/vmap/) | sugar over `vectorize` |
+| [`evoxc.grad(fn_or_graph, argnums=None)`](/api/evoxc/transforms/grad/) | reverse-mode gradient as an ordinary graph |
+| [`evoxc.jvp(fn_or_graph, tangents)`](/api/evoxc/transforms/jvp/) | forward-mode |
+| [`evoxc.vjp(fn_or_graph, cotangents=None)`](/api/evoxc/transforms/vjp/) | reverse-mode with explicit cotangents |
+| [`evoxc.batch_functions(fns, axes=0, out_axes=0, *, switch_ops=None, bands=None, alignment="variant")`](/api/evoxc/transforms/batch-functions/) | merges same-signature programs into one graph |
 | [`evoxc.BatchReport`](/api/evoxc/transforms/batchreport/), [`evoxc.SwitchRecord`](/api/evoxc/transforms/switchrecord/) | the merge metadata reported on `graph.batch_report` |
 
 With a function or `Defn` the result is a [`TransformCallable`](/api/evoxc/transforms/transformcallable/) (`*specs → Graph`); with a `Graph` it is a `Graph`. Transforms never execute anything. Guide: [Graph transforms](/guides/graph-transforms/).
@@ -122,7 +122,7 @@ Guide: [Custom ops and kernels](/guides/custom-blocks/).
 
 | Name | Purpose |
 |---|---|
-| `evoxc.dist.group(name, ranks, backend=None)` | a group of ranks, a static graph value |
+| [`evoxc.dist.group(name, ranks, backend=None)`](/api/evoxc/dist/group-function/) | a [`Group`](/api/evoxc/dist/group/) of ranks, a static graph value |
 | [`evoxc.dist.all_reduce`](/api/evoxc/dist/all-reduce/), [`all_gather`](/api/evoxc/dist/all-gather/), [`reduce_scatter`](/api/evoxc/dist/reduce-scatter/), [`all_to_all`](/api/evoxc/dist/all-to-all/), [`broadcast`](/api/evoxc/dist/broadcast/), [`collective_permute`](/api/evoxc/dist/collective-permute/) | the explicit collectives |
 | [`evoxc.dist.rank()`](/api/evoxc/dist/rank/), [`evoxc.dist.world_size()`](/api/evoxc/dist/world-size/) | graph scalars |
 

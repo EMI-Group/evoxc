@@ -52,6 +52,7 @@ Unified semantics (binding, summarized — see CONTEXT.md for the full rules):
 - [`cholesky`](/api/evoxc/ops/cholesky/) — Lower-triangular Cholesky factor (numpy `linalg.cholesky`).
 - [`clamp`](/api/evoxc/ops/clamp/) — Clamp values into `[min, max]` (numpy `clip` semantics).
 - [`concatenate`](/api/evoxc/ops/concatenate/) — Concatenate tensors along an axis (numpy `concatenate` semantics).
+- [`constant`](/api/evoxc/ops/constant/) — Embed a concrete `Tensor` into the graph as a Constant op.
 - [`conv`](/api/evoxc/ops/conv/) — N-dimensional convolution (Nx `conv` semantics, NCHW default).
 - [`cos`](/api/evoxc/ops/cos/) — Elementwise cosine.
 - [`cumprod`](/api/evoxc/ops/cumprod/) — Cumulative product along an axis (numpy `cumprod` semantics plus an optional reverse scan direction, mirroring `cumsum`).

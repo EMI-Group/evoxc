@@ -10,7 +10,7 @@ That is design principle 7, and it is why `vmap`-ed or differentiated code can b
 
 ## One Rust implementation, no fallback
 
-`vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge are a single implementation in the Rust core, reached through the compiled `evoxc._evoxc_native` extension (`scripts/build-native.sh` builds it; `EVOXC_NATIVE_LIB` can point at a prebuilt library).
+[`vectorize`](/api/evoxc/transforms/vectorize/), [`vmap`](/api/evoxc/transforms/vmap/), [`grad`](/api/evoxc/transforms/grad/), [`jvp`](/api/evoxc/transforms/jvp/), [`vjp`](/api/evoxc/transforms/vjp/) and the [`batch_functions`](/api/evoxc/transforms/batch-functions/) merge are a single implementation in the Rust core, reached through the compiled `evoxc._evoxc_native` extension (`scripts/build-native.sh` builds it; `EVOXC_NATIVE_LIB` can point at a prebuilt library).
 There is no Python fallback: if the extension is missing, the first transform call raises `ImportError` with the build instructions instead of silently taking a slower, subtly different path.
 
 Python keeps only frontend duties — argument validation with fixed error wording, [`TensorSpec`](/api/evoxc/core/tensorspec/)/pytree adaptation, `Graph` reconstruction, and the rules bridge.

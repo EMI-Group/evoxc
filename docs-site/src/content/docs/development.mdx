@@ -144,10 +144,10 @@ The per-directory `CONTEXT.md` files are the binding contracts: the root one for
 The site in `docs-site/` is a Nimbus/Astro static site deployed as the Cloudflare Worker `evoxc-docs` at **https://compiler.evox.group**.
 
 Its Python API reference is **generated, never hand-written**: `docs-infra python-api` walks the package's public namespaces with Griffe (static analysis, no imports) and writes Nimbus pages into `docs-site/src/content/docs/api/`.
-That tree is **committed** — 418 pages: 389 symbol pages, 28 module `index.md` pages and one root `api/index.md` — so a fresh clone builds with the sidebar's `Python API` group populated and every `/api/` link resolving.
+That tree is **committed** — 432 pages: 403 symbol pages, 28 module `index.md` pages and one root `api/index.md` — so a fresh clone builds with the sidebar's `Python API` group populated and every `/api/` link resolving.
 It is still regenerated, never hand-edited: run `node <path-to>/evox-docs-infra/bin/docs-infra.mjs python-api --root .` from the repository root whenever a public docstring changes, and the build workflow runs the same command before every build. A regenerated page is overwritten, so a wrong page is fixed in the docstring, not in the page.
 Each generated page ends with a `View Python source` link at the stable `main` ref, so a line anchor in it can move ahead of the commit you are reading.
-The module list, the `evoxc.ir.opdef` exclusion (its page URL would collide with `OpDef`) and the output directory all live in the repository-root `docs-infra.yml`, so a new public module is a config change plus a regeneration, not a page edit.
+The module list, the output directory and the generated-page URL rules all live in the repository-root `docs-infra.yml` — there is no exclusion list, because a lowercased page-path collision is disambiguated with a `-class`/`-function` suffix instead (`evoxc.ir.OpDef` keeps `/api/evoxc/ir/opdef/`, `opdef()` is `/api/evoxc/ir/opdef-function/`) — so a new public module is a config change plus a regeneration, not a page edit.
 
 ```sh
 cd docs-site

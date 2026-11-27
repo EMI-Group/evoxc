@@ -35,7 +35,7 @@ There is no decorator that compiles on first call, no trace cache, and no eager/
 
 ## Tracing against specs
 
-`evoxc.trace(fn_or_defn, *specs) -> Graph` treats all the positional `specs` as **one pytree**, flattens it, and calls the function exactly once with symbolic arguments in place of the tensor leaves.
+[`evoxc.trace(fn_or_defn, *specs) -> Graph`](/api/evoxc/trace/trace/) treats all the positional `specs` as **one pytree**, flattens it, and calls the function exactly once with symbolic arguments in place of the tensor leaves.
 
 ```python
 import evoxc

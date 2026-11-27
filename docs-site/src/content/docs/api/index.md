@@ -26,6 +26,7 @@ title: "Python API reference"
 - [`VerificationError`](/api/evoxc/core/verificationerror/) — Raised when IR verification fails (malformed module, op operand/result mismatches, violated invariants).
 - [`constant`](/api/evoxc/core/constant/) — Embed a concrete tensor's data into the graph as a Constant op.
 - [`devices`](/api/evoxc/core/devices/) — Enumerate the devices actually available to this process.
+- [`dim`](/api/evoxc/core/dim-function/) — Create a `Dim` from a name, a known size, or a `Dim`.
 - [`dtype`](/api/evoxc/core/dtype/) — Normalize any dtype-like object to a `numpy.dtype`.
 - [`empty`](/api/evoxc/core/empty/) — Create an uninitialized concrete tensor.
 - [`flatten`](/api/evoxc/core/flatten/) — Flatten a pytree into `(leaves, treespec)`.
@@ -39,6 +40,7 @@ title: "Python API reference"
 - [`register_pytree_node`](/api/evoxc/core/register-pytree-node/) — Register a custom container type as a pytree node.
 - [`replicate_tensor`](/api/evoxc/core/replicate-tensor/) — Replicate a local tensor onto each device (one tensor per device).
 - [`split_tensor`](/api/evoxc/core/split-tensor/) — Split a local tensor along `axis` into one tensor per device.
+- [`tensor`](/api/evoxc/core/tensor-function/) — Create a concrete tensor from array-like data.
 - [`unflatten`](/api/evoxc/core/unflatten/) — Rebuild a pytree from leaves and a `TreeSpec`.
 - [`zeros`](/api/evoxc/core/zeros/) — Create a concrete tensor filled with zeros.
 
@@ -61,9 +63,11 @@ title: "Python API reference"
 - [`deserialize_module`](/api/evoxc/ir/deserialize-module/) — Rebuild a `Module` from a payload produced by `serialize_module`.
 - [`has_opdef`](/api/evoxc/ir/has-opdef/) — True if an op with this name is registered.
 - [`op_names`](/api/evoxc/ir/op-names/) — All registered op names (sorted).
+- [`opdef`](/api/evoxc/ir/opdef-function/) — Look up the `OpDef` for an op name.
 - [`pretty_print`](/api/evoxc/ir/pretty-print/) — Render `module` as readable SSA text (format above).
 - [`register_opdef`](/api/evoxc/ir/register-opdef/) — Register an `OpDef` (idempotent per name).
 - [`serialize_module`](/api/evoxc/ir/serialize-module/) — Serialize `module` into the self-describing payload dict above.
+- [`verify`](/api/evoxc/ir/verify/) — Validate `module` against all EvoXIR invariants.
 
 ### [evoxc.ops](/api/evoxc/ops/)
 
@@ -84,6 +88,7 @@ title: "Python API reference"
 - [`cholesky`](/api/evoxc/ops/cholesky/) — Lower-triangular Cholesky factor (numpy `linalg.cholesky`).
 - [`clamp`](/api/evoxc/ops/clamp/) — Clamp values into `[min, max]` (numpy `clip` semantics).
 - [`concatenate`](/api/evoxc/ops/concatenate/) — Concatenate tensors along an axis (numpy `concatenate` semantics).
+- [`constant`](/api/evoxc/ops/constant/) — Embed a concrete `Tensor` into the graph as a Constant op.
 - [`conv`](/api/evoxc/ops/conv/) — N-dimensional convolution (Nx `conv` semantics, NCHW default).
 - [`cos`](/api/evoxc/ops/cos/) — Elementwise cosine.
 - [`cumprod`](/api/evoxc/ops/cumprod/) — Cumulative product along an axis (numpy `cumprod` semantics plus an optional reverse scan direction, mirroring `cumsum`).
@@ -236,7 +241,9 @@ title: "Python API reference"
 - [`StaticValue`](/api/evoxc/trace/staticvalue/) — Record of one static (graph-specializing) input or output leaf.
 - [`cond`](/api/evoxc/trace/cond/) — Runtime `if` over a tensor predicate → traced `if` op.
 - [`current_builder`](/api/evoxc/trace/current-builder/) — Return the innermost active `ir.Builder`.
+- [`defn`](/api/evoxc/trace/defn-function/) — Mark `fn` as a graph definition.
 - [`scan`](/api/evoxc/trace/scan/) — Scan along a leading axis → `(carry, stacked_outputs)`.
+- [`trace`](/api/evoxc/trace/trace/) — Trace `fn_or_defn` with the given input specs → `Graph`.
 - [`while_loop`](/api/evoxc/trace/while-loop/) — Runtime `while` over a tensor condition → traced `while` op.
 - [`with_builder`](/api/evoxc/trace/with-builder/) — Context manager installing `builder` as the active builder for ops.
 
@@ -245,10 +252,16 @@ title: "Python API reference"
 - [`BatchReport`](/api/evoxc/transforms/batchreport/) — What one `batch_functions` merge actually did (the `batch_report`).
 - [`SwitchRecord`](/api/evoxc/transforms/switchrecord/) — One switch class emitted by `batch_functions`.
 - [`TransformCallable`](/api/evoxc/transforms/transformcallable/) — Returned by transforms applied to a callable/`Defn`.
+- [`batch_functions`](/api/evoxc/transforms/batch-functions/) — Merge N same-signature programs into one graph with a function axis.
+- [`grad`](/api/evoxc/transforms/grad/) — Reverse-mode gradients: inputs → gradients w.r.t.
+- [`jvp`](/api/evoxc/transforms/jvp/) — Forward-mode differentiation: push tangents through the computation.
 - [`register_batched_aux_remap`](/api/evoxc/transforms/register-batched-aux-remap/) — Register (or replace) the batched-output aux remap fn for `node_type`.
 - [`register_batching_rule`](/api/evoxc/transforms/register-batching-rule/) — Register (or replace) the batching rule for `op_name`.
 - [`register_jvp_rule`](/api/evoxc/transforms/register-jvp-rule/) — Register (or replace) the JVP rule for `op_name`.
 - [`register_vjp_rule`](/api/evoxc/transforms/register-vjp-rule/) — Register (or replace) the VJP rule for `op_name`.
+- [`vectorize`](/api/evoxc/transforms/vectorize/) — Vectorize a traced graph via per-op batching rules.
+- [`vjp`](/api/evoxc/transforms/vjp/) — Reverse-mode differentiation: pull cotangents back to the inputs.
+- [`vmap`](/api/evoxc/transforms/vmap/) — Vectorize a function or graph over a leading axis (function-side sugar).
 
 ### [evoxc.block](/api/evoxc/block/)
 
@@ -299,6 +312,7 @@ title: "Python API reference"
 - [`broadcast`](/api/evoxc/dist/broadcast/) — Broadcast: every rank receives the local tensor of `src_rank`.
 - [`collective_permute`](/api/evoxc/dist/collective-permute/) — Collective permute: pairwise send/recv per `source_target_pairs`.
 - [`get_collective_executor`](/api/evoxc/dist/get-collective-executor/) — Return the installed collective executor.
+- [`group`](/api/evoxc/dist/group-function/) — Create an explicit communication `Group`.
 - [`rank`](/api/evoxc/dist/rank/) — Current rank of the runtime execution context, as a scalar int64 graph value.
 - [`reduce_scatter`](/api/evoxc/dist/reduce-scatter/) — Reduce-scatter: reduce across ranks with `op`, then scatter along `axis`.
 - [`set_collective_executor`](/api/evoxc/dist/set-collective-executor/) — Install (or clear, with `None`) the process-wide collective executor.

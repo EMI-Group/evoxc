@@ -63,6 +63,7 @@ implemented (no stubs remain).
 - [`VerificationError`](/api/evoxc/core/verificationerror/) — Raised when IR verification fails (malformed module, op operand/result mismatches, violated invariants).
 - [`constant`](/api/evoxc/core/constant/) — Embed a concrete tensor's data into the graph as a Constant op.
 - [`devices`](/api/evoxc/core/devices/) — Enumerate the devices actually available to this process.
+- [`dim`](/api/evoxc/core/dim-function/) — Create a `Dim` from a name, a known size, or a `Dim`.
 - [`dtype`](/api/evoxc/core/dtype/) — Normalize any dtype-like object to a `numpy.dtype`.
 - [`empty`](/api/evoxc/core/empty/) — Create an uninitialized concrete tensor.
 - [`flatten`](/api/evoxc/core/flatten/) — Flatten a pytree into `(leaves, treespec)`.
@@ -76,5 +77,6 @@ implemented (no stubs remain).
 - [`register_pytree_node`](/api/evoxc/core/register-pytree-node/) — Register a custom container type as a pytree node.
 - [`replicate_tensor`](/api/evoxc/core/replicate-tensor/) — Replicate a local tensor onto each device (one tensor per device).
 - [`split_tensor`](/api/evoxc/core/split-tensor/) — Split a local tensor along `axis` into one tensor per device.
+- [`tensor`](/api/evoxc/core/tensor-function/) — Create a concrete tensor from array-like data.
 - [`unflatten`](/api/evoxc/core/unflatten/) — Rebuild a pytree from leaves and a `TreeSpec`.
 - [`zeros`](/api/evoxc/core/zeros/) — Create a concrete tensor filled with zeros.

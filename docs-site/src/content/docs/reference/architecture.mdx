@@ -44,7 +44,7 @@ It is MLIR-inspired but not MLIR: a `Module` holds functions, a function holds a
 
 **Effects** are declared per op and are one of five kinds: `pure`, `write`, `read`, `collective`, `callback`. Program order inside a block *is* the order for effectful ops: pure ops may be reordered or CSE'd but never moved across an effectful op or out of their region; effectful ops are never reordered, duplicated or eliminated; `collective` ops additionally impose device-synchronisation ordering. `write` is reserved for future stateful ops — v1 has none, so `scatter` is functional and every value is produced exactly once.
 
-**Verification** is the explicit `evoxc.ir.verify(module)`, raising `VerificationError` on the first violation: module and function invariants, block/region wiring, registered op names with arity/result-count/region-count and attribute schemas, result types agreeing with the op's inference hook, SSA dominance and use-bookkeeping. `graph.verify()` is the same check for a `Graph`.
+**Verification** is the explicit [`evoxc.ir.verify(module)`](/api/evoxc/ir/verify/), raising `VerificationError` on the first violation: module and function invariants, block/region wiring, registered op names with arity/result-count/region-count and attribute schemas, result types agreeing with the op's inference hook, SSA dominance and use-bookkeeping. `graph.verify()` is the same check for a `Graph`.
 
 **Serialization** (`serialize_module`/`deserialize_module`, `IR_FORMAT_VERSION`) produces a self-describing payload — the module, its functions and a flat op table, values by id, constants as base64 `npy`, and a SHA-256 over the canonical JSON. Tampering or a structural violation raises `VerificationError`; an unknown format or version raises `PersistenceError`. This payload is the core of the `.evoxcgraph` container (`evoxc.persist` wraps it, it does not rewrite it). `pretty_print(module)` is the text `graph.print()` shows and `graph.text()` returns.
 
@@ -54,7 +54,7 @@ Ops are not an open namespace: every op a graph can contain is declared in `evox
 
 | Name | Purpose |
 |---|---|
-| `opdef(name)` | The `OpDef` for a name (`KeyError` if unknown) |
+| [`opdef(name)`](/api/evoxc/ir/opdef-function/) | The [`OpDef`](/api/evoxc/ir/opdef/) for a name (`KeyError` if unknown) |
 | `has_opdef(name)`, `op_names()`, `all_opdefs()` | Registry queries |
 | `register_opdef(...)` | Add or replace a definition — the extension point for custom ops |
 | `AttrSpec(name, tag, default=…)` | One attribute of an op: name, type tag, optional default |

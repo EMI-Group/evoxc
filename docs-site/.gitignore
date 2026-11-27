@@ -1,5 +1,8 @@
 node_modules/
-dist/
+# Astro's build output is the top-level dist/ only — anchored, because an
+# unanchored `dist/` also matches the generated API group
+# src/content/docs/api/evoxc/dist/ and silently drops its pages.
+/dist/
 .astro/
 .wrangler/
 .nimbus/

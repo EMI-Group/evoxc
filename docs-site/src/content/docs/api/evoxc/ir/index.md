@@ -51,6 +51,8 @@ Note: the data structures, the registry, shape inference (`inference`),
 - [`deserialize_module`](/api/evoxc/ir/deserialize-module/) — Rebuild a `Module` from a payload produced by `serialize_module`.
 - [`has_opdef`](/api/evoxc/ir/has-opdef/) — True if an op with this name is registered.
 - [`op_names`](/api/evoxc/ir/op-names/) — All registered op names (sorted).
+- [`opdef`](/api/evoxc/ir/opdef-function/) — Look up the `OpDef` for an op name.
 - [`pretty_print`](/api/evoxc/ir/pretty-print/) — Render `module` as readable SSA text (format above).
 - [`register_opdef`](/api/evoxc/ir/register-opdef/) — Register an `OpDef` (idempotent per name).
 - [`serialize_module`](/api/evoxc/ir/serialize-module/) — Serialize `module` into the self-describing payload dict above.
+- [`verify`](/api/evoxc/ir/verify/) — Validate `module` against all EvoXIR invariants.
