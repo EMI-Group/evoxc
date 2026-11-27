@@ -13,6 +13,7 @@ There is no "any stage" object and no function that inspects what it was handed 
 Defn + specs ──evoxc.trace────────────────▶ Graph              (EvoXIR module + trees + static values)
 Graph ────────evoxc.vectorize / vmap / grad / jvp / vjp / batch_functions
                                             ──▶ Graph            (an ordinary graph of ordinary ops)
+Graph ────────evoxc.split_by_inputs──────────▶ SplitPlan          (prepare + apply Graphs, a boundary)
 Graph ────────evoxc.lower─────────────────▶ LoweredProgram     (StableHLO text or backend payload)
 LoweredProgram ──evoxc.compile────────────▶ CompiledArtifact   (vmfb / PJRT executable / serialized program)
 CompiledArtifact ──evoxc.load─────────────▶ Executable         (device-bound)
@@ -30,6 +31,8 @@ Every helper below is a pure read: none traces, compiles, executes, transfers or
 |---|---|---|---|---|---|---|
 | `Defn` | function qualname + module | — | — | — | — | — |
 | `Graph` | op / function / input / static / output counts, batch marker | counts, specs, static values, digest | pretty-printed IR | — | — | `.evoxcgraph` |
+| `SplitPlan` | fixed / varying / boundary counts and per-half op counts | the 11 keys | the plan render (leaves, boundary table, digests) | — | — | — |
+| `InputAnalysis` | input / op / output counts plus splittable / blocked | the 5 keys | one row per tensor input | — | — | — |
 | `LoweredProgram` | backend, target, payload kind + size, leaf counts | payload and signature summary | raises when the payload has no text form | program text or `None` | — | yes |
 | `CompiledArtifact` | backend, target, payload kind + size, leaf counts | payload and signature summary | raises when the payload has no text form | program text or `None` | — | `.evoxcartifact` |
 | `Executable` | backend, device, input/output leaf counts | specs, trees, required ops, capabilities | — | — | backend plan text or `None` | backend-dependent |
@@ -59,6 +62,8 @@ f(evoxc.ones((4, 8)), evoxc.ones((8, 4)))   # TraceError, not a result
 
 **Produced by** `evoxc.trace(fn_or_defn, *specs)` or by any graph transform (`vectorize`, `vmap`, `grad`, `jvp`, `vjp`, `batch_functions`).
 
+`evoxc.split_by_inputs` is the structural exception among the transforms: it does not hand back a `Graph` itself, but a `SplitPlan` whose `prepare` and `apply` halves are two `Graph`s produced exactly this way.
+
 A `Graph` is EvoXIR: a region-based SSA module, the input/output trees, and the static Python values the trace specialized on. Its attributes are `module`, `input_specs`, `output_tree`, `static_values` and `source_locations`.
 
 - **Exposed:** `summary()`, `digest()`, `text()`, `print()`, `verify()`, `save(path)` / `Graph.load(path)`, and the I/O helpers `flatten_inputs(args)`, `unflatten_outputs(flat)`, `validate_inputs(args)`.
@@ -67,6 +72,37 @@ A `Graph` is EvoXIR: a region-based SSA module, the input/output trees, and the 
 - **Refuses:** passing anything else to `evoxc.lower` raises `TypeError` — `lower expects an evoxc.Graph (from evoxc.trace), got …`.
 
 `evoxc.vectorize` requires a traced `Graph`: given a bare function it raises `TypeError` pointing at `evoxc.vmap`, because only `vmap` knows how to trace first.
+
+## `SplitPlan`
+
+**Produced by** `evoxc.split_by_inputs(graph_or_fn, fixed=None, *, fixed_leaves=None)`.
+
+A `SplitPlan` is one traced graph cut into two ordinary graphs plus the boundary between them: the `prepare` half evaluates the fixed inputs once, and the `apply` half runs the varying inputs against the prepared result.
+
+- **Holds:** `source` (the graph that was split), `prepare` and `apply` — ordinary `Graph`s, so each stages through `evoxc.lower` → `evoxc.compile` → `evoxc.load` like any graph, which is why `evoxc.build` is not usable here (it refuses an already-traced `Graph` and points at those three); `fixed_leaves` / `varying_leaves` (flat tensor-input indices into `source.tensor_specs`, ascending); `boundary` (a tuple of `BoundaryValue`s in `prepare`'s output order); `unused_varying_leaves` (varying inputs no needed op consumes, kept in `apply` for signature stability); and the properties `boundary_specs` (a `TensorSpec` per boundary value) and `boundary_bytes` (summed static size, `None` when any extent is unknown).
+- **Arguments:** `fixed` is a pytree bool / `None` mask mirroring the graph's input structure (`True` keeps a tensor input in `prepare`, `False` / `None` moves it to `apply`; a bare bool broadcasts across all tensor leaves; a non-`None` entry at a static leaf is a `TransformError`), while `fixed_leaves` names the same choice as flat tensor-input indices — the two are alternatives, never combined.
+- **Exposed:** `summary()` (11 keys — `fixed_leaves`, `varying_leaves`, `boundary_values`, `boundary_bytes`, `source_ops`, `prepare_ops`, `apply_ops`, `dropped_ops`, `unused_varying_leaves`, `prepare_digest`, `apply_digest` — where the op counts are non-terminator entry-block ops), `as_dict()` (tuples as lists plus a per-value `boundary` list), `text()`, `print()`, `verify()`, and a `repr`.
+- **`verify()`** verifies both graphs and the wiring law: `prepare`'s tensor-output count equals `len(boundary)` equals `apply`'s prepared-input count, each position agreeing on shape and dtype (device is compared only when both sides declare one), and `apply`'s tensor-output count equals the source's. A construction bug raises `VerificationError`.
+- **Runtime shapes:** `evoxc.run(prepare, *fixed_args)` returns a **flat tuple** of boundary tensors (a fixed dict input keeps its container on the way in — `evoxc.run(prepare, {"w": w, "b": b})` — but the boundary always comes back flat); `evoxc.run(apply, varying_tree, prepared_tuple)` returns the source output tree, because `apply`'s input root is the synthetic two-child tuple `(varying inputs, prepared tuple)` and `run`'s root argument *is* the args tuple.
+- **Never does:** mutate the source (its `digest()` is unchanged by a split), execute, trace, or import a backend.
+- **Refuses:** giving both or neither of `fixed` / `fixed_leaves` raises `TypeError`; no fixed tensor leaf, or every tensor leaf fixed, raises `TransformError`; a mask that does not mirror the input structure raises `TransformError` naming the first mismatch pytree path; region-bearing control flow (`cond` / `while_loop` / `scan`) and any op whose effect is not `pure` / `read` (collectives, `runtime_call`, `external_call`, `custom_call`, `inline_stablehlo`) raise `TransformError` naming the op and its source location — `block_call` / `rank` / `world_size` are `read` and allowed.
+- **`BoundaryValue`** — one tensor crossing the cut: `source_value_id` (the SSA id in the source graph), `spec`, `shape`, `dtype`, `nbytes` (`None` when an extent is unknown), `defining_op` (the op name, `None` for a pass-through input), `location`, `is_input`, the `producer` property (`"<input>"` or the op name), and `summary()` / `as_dict()`.
+
+The boundary is a snapshot of the fixed half's contribution, never re-derived per call: a changed fixed input means re-running `prepare`, and neither graph carries state or invalidation logic.
+
+Given a callable or `Defn` instead of a `Graph`, `evoxc.split_by_inputs` returns a `SplitCallable` whose `sc(*specs)` traces exactly once and returns a `SplitPlan`; concrete `Tensor` arguments raise `TraceError`, because a plan never executes.
+
+## `InputAnalysis`
+
+**Produced by** `evoxc.analyze_inputs(graph)`; anything that is not a traced `Graph` raises `TypeError`.
+
+It is pure inspection over the same helpers the split uses, so the report cannot drift from the transform — it never mutates, traces, executes or imports a backend.
+
+- **Exposed:** `source`, `inputs` (one `InputInfo` per tensor input in `tensor_specs` order), `op_count` (non-terminator entry-block ops), `output_count` (tensor output leaves), `splittable`, `blocked_reason` (the split gate's message verbatim, `None` when splittable), `split(fixed=None, *, fixed_leaves=None)` (sugar over `evoxc.split_by_inputs(self.source, …)` — a blocked graph re-raises exactly the gate's `TransformError`), `summary()` (5 keys — `input_count`, `output_count`, `op_count`, `splittable`, `blocked_reason`), `as_dict()`, `text()`, `print()`, and a `repr`.
+- **`InputInfo`** — one tensor input's facts: `index` (the tensor-input index that `fixed_leaves` uses), `path` (the pytree path, e.g. `[1]` or `[0]['w']`), `spec`, `nbytes`, `direct_consumers`, `op_count` (ops transitively depending on it), `outputs` (indices of the tensor output leaves it influences), `boundary_bytes` / `boundary_count` (what fixing that input alone would cost — `None` when the graph is not splittable or fixing it alone is not a legal split; a legal split that crosses nothing reports `0` / `0`), plus `summary()` / `as_dict()` / `repr`.
+- **Axis note:** `index` is the tensor-input axis `fixed_leaves` uses, while `path` is rendered over tree-leaf positions (which also count static leaves), so the two are not interchangeable.
+
+On a blocked graph the per-op facts are still reported — the gate blocks the split, not the counting — and only the boundary fields become `None`.
 
 ## `LoweredProgram`
 
@@ -137,6 +173,8 @@ evoxc.run(bound, x)      # `w` is supplied; `x` is still an argument
 | Call | Wrong argument | What happens |
 |---|---|---|
 | `evoxc.lower` | anything but a `Graph` | `TypeError` naming `evoxc.Graph` and `evoxc.trace` |
+| `evoxc.analyze_inputs` | anything but a `Graph` | `TypeError` naming `evoxc.Graph` and `evoxc.trace` |
+| `evoxc.split_by_inputs` | both or neither of `fixed` / `fixed_leaves` | `TypeError`; all-fixed or no-fixed is a `TransformError` |
 | `evoxc.compile` | anything but a `LoweredProgram` | `TypeError` naming `evoxc.backends.LoweredProgram` |
 | `evoxc.compile` | a program from a different backend | `BackendError` — never silently re-lower |
 | `evoxc.load` | anything but a `CompiledArtifact` | `TypeError` naming `evoxc.backends.CompiledArtifact` |

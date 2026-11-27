@@ -1,6 +1,6 @@
 ---
 title: Graph transforms
-description: vectorize, vmap, grad, jvp and vjp as ordinary graph-to-graph transformations.
+description: vectorize, vmap, grad, jvp, vjp, batch_functions and split_by_inputs as ordinary graph-to-graph transformations.
 sidebar:
   order: 2
 ---
@@ -206,6 +206,138 @@ Two keyword-only knobs tune the merge, and neither can change a row's value:
 
 `graph.batch_report` is documented transform metadata — value classes, shared and switched ops, output muxes, emitted ops, band sizes, cost estimates (12 keys, plus `as_dict()`); it is ignored by persistence and absent from a graph loaded from disk.
 `switch_ops=True` opts into collapsing same-skeleton positions whose op differs; `switch_ops` should not be combined with banding.
+
+## Splitting a program at its inputs
+
+An outer loop — a genetic-programming population, an evaluation sweep, a fine-tuning harness — repeats one program many times, and most of its input is identical on every turn: a dataset, a trained parameter tree.
+Only a small part changes per evaluation, such as one candidate.
+Re-running the fixed half's subprogram and re-sending its data every turn is waste, because that half's contribution is the same program every time.
+
+`split_by_inputs` turns that observation into an explicit structural boundary in the graph — one program for the fixed inputs, one for what varies — rather than a cache hidden behind a call.
+That is design principle 3 in practice: caching and staging are operations you perform, never something the frontend does for you.
+
+```python
+evoxc.split_by_inputs(graph_or_fn, fixed=None, *, fixed_leaves=None)
+# Graph → SplitPlan;  callable/Defn → SplitCallable
+```
+
+A callable or `Defn` input returns a `SplitCallable` for the same reason `vmap` does: the shapes must be known before the slice can be computed, and `evoxc.transforms` may not import the pipeline.
+Call it with specs and it traces exactly once and returns a `SplitPlan`; concrete `Tensor` arguments raise `TraceError`, because a plan never executes anything.
+
+This is the first structural — non-numeric — pass in `evoxc.transforms`: it only slices the graph data structure (no derivatives, no batching, no computation), so unlike `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge it is a Python pass rather than part of the Rust engine, under the same import constraints: no backend awareness, no lowering.
+
+### The two-graph contract
+
+- `plan.prepare` maps the **fixed** inputs to a flat tuple of boundary tensors.
+- `plan.apply` maps the **varying** inputs, plus that boundary tuple, to the source graph's output tree.
+
+Both halves are ordinary `Graph`s of cloned ordinary ops, so every backend runs them with no split-specific support — a split graph is not a new kind of program.
+The source graph is never mutated: its `digest()` is unchanged by a split, so you can keep using it directly alongside the plan.
+
+One rule decides what crosses the boundary: a fixed-only value crosses only where a `return` operand *is* it or a mixed op consumes it.
+A fixed-only value consumed only by fixed-only ops stays inside `prepare`, so the computed downstream value is what crosses, not its inputs; constants are re-cloned into `apply` instead of being shipped across the boundary.
+`plan.boundary` lists the `BoundaryValue`s in `prepare`-output order, and `plan.boundary_specs` / `plan.boundary_bytes` describe their types and size.
+A varying input the source never reads stays in `apply`'s signature for stability and is listed in `plan.unused_varying_leaves`.
+
+The boundary is a **snapshot**, not a cache: neither graph carries state or invalidation logic, so when a fixed input changes you run `prepare` again — running `apply` on a stale boundary silently computes a stale answer.
+
+`plan.verify()` checks the wiring law: that both halves are well formed and that the boundary tuple `apply` expects is exactly what `prepare` returns.
+Alongside it, `plan.fixed_leaves` / `plan.varying_leaves` are flat **tensor-input** indices in ascending order, and `plan.summary()` is an 11-key dict (`fixed_leaves`, `varying_leaves`, `boundary_values`, `boundary_bytes`, `source_ops`, `prepare_ops`, `apply_ops`, `dropped_ops`, `unused_varying_leaves`, `prepare_digest`, `apply_digest`), with `as_dict()`, `text()`, `print()` and a one-line `__repr__` next to it.
+
+### The mask, or the leaf index
+
+There are two ways to name the fixed inputs, and they are mutually exclusive — passing both, or neither, is a `TypeError`.
+
+- `fixed` is a pytree mask of bools and `None`s mirroring the graph's **input structure**: `True` keeps a tensor input in `prepare`, `False`/`None` moves it to `apply`. A bare bool broadcasts over every tensor leaf, and a non-`None` entry at a **static** leaf is a `TransformError`.
+- `fixed_leaves` is a sequence of flat tensor-input indices, in `graph.tensor_specs` order.
+
+The two axes are not the same axis: mask positions count static leaves too, while `fixed_leaves` counts tensor leaves only.
+Both halves must be non-trivial — no fixed leaf, or every leaf fixed, is a `TransformError`.
+
+### A worked example
+
+```python
+import evoxc
+
+def fitness(dataset, params, candidate):
+    return evoxc.sum(evoxc.tanh(evoxc.matmul(dataset * candidate, evoxc.tanh(params))))
+
+graph = evoxc.trace(
+    fitness,
+    evoxc.TensorSpec((768, 32), evoxc.float32),   # dataset   (varies)
+    evoxc.TensorSpec((32,), evoxc.float32),       # params    (FIXED)
+    evoxc.TensorSpec((32,), evoxc.float32),       # candidate (varies)
+)
+plan = evoxc.split_by_inputs(graph, fixed=(False, True, False))
+plan.verify()                                    # wiring law: check it once
+
+def stage(half):                                 # evoxc.build refuses a Graph
+    return evoxc.load(evoxc.compile(evoxc.lower(half, backend="numpy"), backend="numpy"),
+                      backend="numpy")
+
+prepare, apply = stage(plan.prepare), stage(plan.apply)
+prepared = evoxc.run(prepare, params)                 # flat tuple of boundary tensors
+score    = evoxc.run(apply, (dataset, candidate), prepared)
+```
+
+`prepare` holds 2 entry-block ops (`tanh`, `reshape`) and returns one boundary value of 128 B — `tanh(params)` reshaped to `(32, 1)` — while `apply` holds 5 (`multiply`, `dot`, `reshape`, `tanh`, `reduce_sum`).
+So `plan.fixed_leaves == (1,)`, `plan.varying_leaves == (0, 2)`, `plan.boundary_bytes == 128`, and `repr(plan)` is `<SplitPlan fixed=1 varying=2 boundary=1 values / 128 B, prepare 2 ops, apply 5 ops>`.
+The split result is numerically bit-identical to running the un-split graph on the NumPy backend.
+
+The two runtime call shapes follow from `evoxc.run(exe, *args)` treating its **root** argument as the args tuple, and they are easy to get wrong:
+
+- `prepare` takes exactly the fixed arguments as separate arguments — `evoxc.run(prepare, params)`, not `evoxc.run(prepare, (params,))`, which raises `TraceError`. A fixed dict input keeps its container (`evoxc.run(prepare, {"w": w, "b": b})`) and still returns a **flat** tuple of tensors.
+- `apply` takes exactly two arguments: the varying input tree and the prepared tuple — `evoxc.run(apply, (dataset, candidate), prepared)`. Nesting them as one argument (`evoxc.run(apply, ((dataset, candidate), prepared))`) raises `TraceError`: "expected tuple of length 2, got tuple of length 1".
+
+`evoxc.build` is not usable here for the same reason it is not usable on any transformed graph: it accepts a function or `Defn`, not a `Graph`, and raises `TypeError` pointing at the explicit pipeline.
+Stage both halves with `lower`/`compile`/`load` once per shape set (see [Pipeline objects](/reference/pipeline-objects/)) and reuse the two executables across turns.
+
+### `analyze_inputs` — choosing the boundary
+
+```python
+evoxc.analyze_inputs(graph) -> InputAnalysis
+```
+
+Which inputs are worth fixing is a structural question, and `analyze_inputs` answers it with the report the split itself would compute: it is derived from the same helpers the split uses, so the numbers cannot drift from what `split_by_inputs` actually does.
+Per input it reports `index` (the flat tensor-input index — the axis `fixed_leaves` uses), `path` (the pytree path, such as `[0]` or `[0]['w']`), `spec`, `nbytes`, `direct_consumers`, `op_count` (the ops that transitively depend on it), `outputs` (the output indices it influences), and `boundary_bytes` / `boundary_count` — the cost of fixing *that input alone*.
+
+```python
+analysis = evoxc.analyze_inputs(graph)
+analysis.print()                                 # or analysis.text()
+info = analysis.inputs[1]                        # params: flat tensor input 1
+info.op_count, info.outputs                      # dependent ops, influenced outputs
+info.boundary_bytes, info.boundary_count         # the cost of fixing params alone
+analysis.split(fixed_leaves=[1])                 # == split_by_inputs(graph, fixed_leaves=[1])
+```
+
+`.text()` prints a header line with the counts (tensor inputs, static values, entry-block ops, tensor outputs), a `splittable:` line, and one row per tensor input under the columns `idx`, `path`, `shape`, `dtype`, `bytes`, `consumers`, `ops`, `outputs`, `boundary(alone)`.
+`InputAnalysis` also carries `source`, `inputs`, `op_count` (non-terminator entry-block ops), `output_count`, `splittable`, `blocked_reason` (the gate's own message when the graph cannot be split), `summary()` (five keys), `as_dict()` and `text()`.
+`split(...)` is the sugar over `split_by_inputs` on the same graph and takes the identical `fixed` / `fixed_leaves` arguments.
+
+### When to prefer it over `vmap` or `batch_functions`
+
+| Transform | Axis it divides | What the work looks like |
+|---|---|---|
+| `split_by_inputs` | one program in **time** — fixed inputs vs per-call inputs | one call per turn at the same shapes; nothing is batched, and no op needs a batching rule |
+| `vmap` / `vectorize` | one sample-level program across a leading **batch** axis | many rows in ONE call; every op in the body needs a batching rule |
+| `batch_functions` | **different** same-signature programs | one graph with a static function axis — a merge, not a split |
+
+The split replaces neither: it is the structural option when the axis of variation is *which inputs change between calls*, not *many samples at once*.
+
+### v1 limits
+
+| Situation | Error |
+|---|---|
+| Fixed or varying side reaches `cond` / `while_loop` / `scan` | `TransformError` naming the IR op — `op 'if' carries 2 nested region(s)` |
+| An op whose effect is not `pure` or `read` — a `collective`, a `callback` or a `write` (collectives, `runtime_call`, `external_call`, `custom_call`, `inline_stablehlo`) | `TransformError` — "does not depend on the varying inputs" is not "safe to run once" |
+| Both `fixed` and `fixed_leaves`, or neither | `TypeError` — exactly one argument form |
+| No fixed leaf, or every leaf fixed | `TransformError` — each half must be non-trivial |
+| A non-`None` mask entry at a static leaf | `TransformError` — a static leaf has no tensor to fix |
+| A changed fixed input, expecting `apply` to notice | no error, and no protection: the boundary is a snapshot, so `prepare` must run again |
+
+`block_call`, `rank` and `world_size` carry the `read` effect and are allowed; the refused effects are exactly the ones whose *running once* could differ from running per turn.
+Region-bearing control flow is refused as a whole — a body that needs splitting has to be restructured before it enters the graph, as it does for the other transforms.
+There is no per-turn state and no invalidation logic anywhere in the plan, and `apply`'s synthetic two-child signature `(varying inputs, prepared tuple)` is fixed.
 
 ## Composition
 
