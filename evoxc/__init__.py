@@ -228,10 +228,17 @@ from .trace import Defn, Graph, cond, defn, scan, trace, while_loop  # noqa: F40
 from . import transforms  # noqa: F401
 from .transforms import (  # noqa: F401
     BatchReport,
+    BoundaryValue,
+    InputAnalysis,
+    InputInfo,
+    SplitCallable,
+    SplitPlan,
     SwitchRecord,
+    analyze_inputs,
     batch_functions,
     grad,
     jvp,
+    split_by_inputs,
     vectorize,
     vjp,
     vmap,
