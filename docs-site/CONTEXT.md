@@ -41,7 +41,7 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 
 | Path | Area |
 |---|---|
-| `./astro.config.ts` | Nimbus site configuration: canonical origin, title/description, GitHub link, sidebar items, lint rules, MDX features |
+| `./astro.config.ts` | Nimbus site configuration: canonical origin, title/description, GitHub link, sidebar items (one labelled group per docs directory, so the generated `api/` group keeps its place between Reference and the HuggingFace page), lint rules, MDX features |
 | `./wrangler.jsonc` | Cloudflare Worker name + static-assets config used by the deploy workflow |
 | `./src/content/docs/` | The English `docs` collection — `getting-started/`, `guides/`, `reference/`, `huggingface.mdx`, `development.mdx` |
 | `./src/content/docs/api/` | GENERATED Python API reference pages (git-ignored, regenerated before each build — never hand-edit) |
@@ -49,7 +49,7 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 | `./src/layouts/` | `BaseLayout` (head/OG/agent directives) and `DocsLayout` (sidebar, TOC, breadcrumbs) |
 | `./src/pages/` | Route generators: per-page Markdown alternates, `llms.txt`/`llms-full.txt`, `robots.txt`, OG images |
 | `./src/styles/` | Tailwind entry and prose styles |
-| `./public/` | Static files served as-is: favicon, `_headers`, the evoxc diagrams copied from `../assets/` |
+| `./public/` | Static files served as-is: `favicon.svg` (the evoxc mark on a rounded card) with `favicon.ico` as the raster fallback, `_headers`, and verbatim copies of the README diagrams — `evoxc-mark.svg`, `evoxc-stack.svg` (embeds on the landing page) and `evoxc-hardware.svg` (referenced from the compiler-adapters guide); copies of `../assets/`, never edited here |
 | `./AGENT.md` | Nimbus's own authoring/upgrade guidance for this starter (delegated to by `CLAUDE.md`) |
 
 ## Page inventory (cross-link targets)
@@ -87,7 +87,9 @@ The config for that generation is the repository-root `../docs-infra.yml`; the d
 
 ## Known issues
 
-- A local build needs the generated API tree (`src/content/docs/api/`) to exist first; without it the site builds but `/api/…` links in `reference/api-overview.mdx` are dead.
+- A local build needs the generated API tree (`src/content/docs/api/`) to exist first; without it the site builds (the sidebar's `Python API` group is then empty) but `/api/…` links in `reference/api-overview.mdx` are dead.
+- The generated API pages join the plain `docs` collection, so they are mounted as a labelled directory group (`{ label: "Python API", autogenerate: { directory: "api" } }`) rather than through a separate `api` collection; that is what keeps their position in the sidebar top level after Reference.
+- Nimbus discovers `public/favicon.svg` before `public/favicon.ico`, so the head links the SVG and the `.ico` only answers a bare `/favicon.ico` request; both are the evoxc mark — regenerate the `.ico` from the SVG if the mark changes.
 - The toolkit derives page URLs by lowercasing symbol names, so `evoxc.ir.OpDef` and `evoxc.ir.opdef` collide on one URL; `../docs-infra.yml` excludes the function and keeps the class page.
 - The top-level `evoxc` namespace is not generated: its `__all__` is computed at import time, which Griffe's static analysis cannot evaluate, so `reference/api-overview.mdx` is hand-written and links into the definition pages.
 - The generated pages carry the toolkit's back-link and signature text verbatim; when a docstring changes the page changes too, so never patch a generated page — fix the docstring.
