@@ -48,8 +48,8 @@ EvoXIR represents the program. StableHLO connects it to IREE, XLA and TVM, and S
 defn → trace → Graph → transform → Graph → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor
 ```
 
-- **defn** — `@evoxc.defn` marks a Python function as a graph *definition*. Calling it with concrete tensors is an error: it describes a computation, it does not execute one.
-- **trace** — `evoxc.trace(fn, *specs)` runs the definition against `TensorSpec` inputs and returns a `Graph`, EvoXIR's region-based SSA module plus the input/output trees.
+- **defn** — [`@evoxc.defn`](/api/evoxc/trace/defn/) marks a Python function as a graph *definition*. Calling it with concrete tensors is an error: it describes a computation, it does not execute one.
+- **trace** — `evoxc.trace(fn, *specs)` runs the definition against `TensorSpec` inputs and returns a [`Graph`](/api/evoxc/trace/graph/), EvoXIR's region-based SSA module plus the input/output trees.
 - **transform** — `evoxc.vectorize`, `vmap`, `batch_functions`, `grad`, `jvp` and `vjp` take a `Graph` and return an ordinary `Graph` of ordinary ops.
 - **lower** — `evoxc.lower(graph, backend=…)` returns a `LoweredProgram`: StableHLO MLIR text, or the backend's own payload.
 - **compile** — `evoxc.compile(lowered, **options)` returns a `CompiledArtifact` — the compiler's own artifact (a `vmfb`, a PJRT executable, serialized IR).

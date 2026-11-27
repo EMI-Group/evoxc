@@ -17,7 +17,7 @@ from evoxc import TensorSpec
 
 <Steps>
   <Step title="Mark the graph function">
-    `@evoxc.defn` marks a Python function as a graph *definition*. It does not compile it, trace it, or run it — a `Defn` is a callable that refuses concrete tensors and tells you to trace or evaluate instead.
+    [`@evoxc.defn`](/api/evoxc/trace/defn/) marks a Python function as a graph *definition*. It does not compile it, trace it, or run it — a `Defn` is a callable that refuses concrete tensors and tells you to trace or evaluate instead.
 
     ```python
     @evoxc.defn
@@ -26,7 +26,7 @@ from evoxc import TensorSpec
     ```
   </Step>
   <Step title="Describe the inputs with specs">
-    A `TensorSpec` describes a future runtime tensor: a shape (symbolic dims allowed), a dtype, and an optional device. It has no storage. Python values — `int`s, `bool`s, strings, dtypes, `None` — are *also* legal trace inputs, and they specialize the graph.
+    A [`TensorSpec`](/api/evoxc/core/tensorspec/) describes a future runtime tensor: a shape (symbolic dims allowed), a dtype, and an optional device. It has no storage. Python values — `int`s, `bool`s, strings, dtypes, `None` — are *also* legal trace inputs, and they specialize the graph.
 
     ```python
     spec_x = TensorSpec((4, 8), evoxc.float32)
@@ -34,7 +34,7 @@ from evoxc import TensorSpec
     ```
   </Step>
   <Step title="Trace it into a Graph">
-    `evoxc.trace` runs your function in graph-building mode and returns a `Graph`: EvoXIR, a region-based SSA module plus the input/output trees and the snapshotted static values. Nothing has executed.
+    `evoxc.trace` runs your function in graph-building mode and returns a [`Graph`](/api/evoxc/trace/graph/): EvoXIR, a region-based SSA module plus the input/output trees and the snapshotted static values. Nothing has executed.
 
     ```python
     graph = evoxc.trace(f, spec_x, spec_w)
@@ -53,7 +53,7 @@ from evoxc import TensorSpec
     `digest()` is deliberately structural: it hashes names, attributes, operands, results, types and constants, and excludes source locations. The same program therefore has the same digest across processes, files and a `save`/`load` round trip, which makes it usable as a cache key or as a regression check.
   </Step>
   <Step title="Lower it">
-    `evoxc.lower` turns a `Graph` into a `LoweredProgram` for one backend. For a compiler backend that means StableHLO MLIR text; for the NumPy interpreter it is the serialized IR it will interpret.
+    `evoxc.lower` turns a `Graph` into a [`LoweredProgram`](/api/evoxc/backends/loweredprogram/) for one backend. For a compiler backend that means StableHLO MLIR text; for the NumPy interpreter it is the serialized IR it will interpret.
 
     ```python
     lowered = evoxc.lower(graph)          # default backend: the NumPy interpreter
@@ -62,14 +62,14 @@ from evoxc import TensorSpec
     ```
   </Step>
   <Step title="Compile it">
-    `evoxc.compile` produces a `CompiledArtifact` — the thing the backend actually knows how to load. Both objects save and load through the persistence container, so a graph can be compiled on one machine and shipped.
+    `evoxc.compile` produces a [`CompiledArtifact`](/api/evoxc/backends/compiledartifact/) — the thing the backend actually knows how to load. Both objects save and load through the persistence container, so a graph can be compiled on one machine and shipped.
 
     ```python
     artifact = evoxc.compile(lowered)
     ```
   </Step>
   <Step title="Load it onto a device">
-    `evoxc.load` binds the artifact to a device and returns an `Executable`. `device="cpu"` normalizes to `Device("cpu", 0)`.
+    `evoxc.load` binds the artifact to a device and returns an [`Executable`](/api/evoxc/pipeline/executable/). `device="cpu"` normalizes to `Device("cpu", 0)`.
 
     ```python
     exe = evoxc.load(artifact, device="cpu")
@@ -109,7 +109,7 @@ Six lines to run a graph, and five objects you could have stopped at.
 
 ## The same pipeline in one call
 
-`evoxc.build` and `evoxc.evaluate` are documented shorthand for exactly the calls above — same stages, same options, no extra semantics:
+[`evoxc.build`](/api/evoxc/pipeline/build/) and [`evoxc.evaluate`](/api/evoxc/pipeline/evaluate/) are documented shorthand for exactly the calls above — same stages, same options, no extra semantics:
 
 ```python
 exe = evoxc.build(f, spec_x, spec_w, device="cpu")               # trace → lower → compile → load

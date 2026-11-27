@@ -26,9 +26,9 @@ Without it you get the numpy interpreter, which is a complete and correct execut
 
 Loading is format-only and honest about it:
 
-- **`load_config`** reads the checkpoint directory's `config.json` into a frozen `ModelConfig` — a static graph-specialisation record with a `digest` over every field that changes the graph.
-- **`load_params`** reads the checkpoint (safetensors through the public `evoxc.formats` reader, or torch's zip/legacy `.bin` format through a restricted unpickler), widens fp16/bfloat16 to float32, canonicalises the keys and orientations for the family, and validates the result against `param_specs` **before** anything is compiled.
-- **`load_hf`** is exactly `load_config` + `load_params`, returning a `LoadedModel` — a `typing.NamedTuple` with field access only, no methods, and no `seq_len` on it.
+- **[`load_config`](/api/evoxc-hf/load/load-config/)** reads the checkpoint directory's `config.json` into a frozen [`ModelConfig`](/api/evoxc-hf/config/modelconfig/) — a static graph-specialisation record with a `digest` over every field that changes the graph.
+- **[`load_params`](/api/evoxc-hf/load/load-params/)** reads the checkpoint (safetensors through the public `evoxc.formats` reader, or torch's zip/legacy `.bin` format through a restricted unpickler), widens fp16/bfloat16 to float32, canonicalises the keys and orientations for the family, and validates the result against `param_specs` **before** anything is compiled.
+- **[`load_hf`](/api/evoxc-hf/load/load-hf/)** is exactly `load_config` + `load_params`, returning a `LoadedModel` — a `typing.NamedTuple` with field access only, no methods, and no `seq_len` on it.
 
 The compute half is one `@evoxc.defn` function per family: `(params, input_ids) -> logits`. It captures **no parameters** and knows nothing about backends, devices or compilation, so one graph serves every checkpoint with the same config.
 
@@ -42,8 +42,8 @@ The compute half is one `@evoxc.defn` function per family: `(params, input_ids) 
 | Layer | Question it answers | Surface |
 |---|---|---|
 | loading | *what is this checkpoint?* | `load_config` → `ModelConfig`, `load_params` → `dict[str, np.ndarray]`, `load_hf` → `LoadedModel`, `validate_params` |
-| the compute function | *what does it compute?* | `forward_fn` (a memoised `@evoxc.defn`), `param_specs`, `reference_logits` |
-| staging | *where and how does it run?* | `build`, `run`, `predict`, `place_params`, `place_ids` |
+| the compute function | *what does it compute?* | [`forward_fn`](/api/evoxc-hf/program/forward-fn/) (a memoised `@evoxc.defn`), [`param_specs`](/api/evoxc-hf/program/param-specs/), [`reference_logits`](/api/evoxc-hf/program/reference-logits/) |
+| staging | *where and how does it run?* | [`build`](/api/evoxc-hf/pipeline/build/), `run`, [`predict`](/api/evoxc-hf/pipeline/predict/), `place_params`, `place_ids` |
 
 There is **no loaded-model class with behaviour** — no `HFModel`, no `build_model`/`run_model`.
 Every operation is a module-level function taking its inputs as arguments, which is why a call cannot silently reuse a stale length, backend or placed tree.

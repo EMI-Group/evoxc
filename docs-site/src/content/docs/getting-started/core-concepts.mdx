@@ -14,9 +14,9 @@ A single misreading of evoxc is thinking of it as an eager array library with a 
 | Concept | Meaning | Has storage? | Key capabilities |
 |---|---|---|---|
 | Python/static value | `None`, bool, int, float, complex, str, `Enum`, dtype, slice, config objects | n/a | Evaluated at trace time; specializes the graph. Changing it means tracing a new graph. No hidden guards, no implicit recompile. |
-| `TensorSpec` | Describes a future runtime tensor | No | `shape` (symbolic dims allowed), `dtype`, optional `device`. Lifecycle: spec → trace → `SymbolicTensor` → run → `Tensor`. |
-| `SymbolicTensor` | An SSA value inside a graph | **No** | dtype, symbolic shape, source location, SSA identity. `.numpy()`, `data_ptr()` and `__dlpack__` do not exist on it. |
-| `Tensor` | A materialized runtime tensor | Yes | Concrete shape and dtype, **physical** device, `.numpy()` (host data only), explicit `Tensor.to(device)`, DLPack interop. |
+| [`TensorSpec`](/api/evoxc/core/tensorspec/) | Describes a future runtime tensor | No | `shape` (symbolic dims allowed), `dtype`, optional `device`. Lifecycle: spec → trace → `SymbolicTensor` → run → `Tensor`. |
+| [`SymbolicTensor`](/api/evoxc/core/symbolictensor/) | An SSA value inside a graph | **No** | dtype, symbolic shape, source location, SSA identity. `.numpy()`, `data_ptr()` and `__dlpack__` do not exist on it. |
+| [`Tensor`](/api/evoxc/core/tensor/) | A materialized runtime tensor | Yes | Concrete shape and dtype, **physical** device, `.numpy()` (host data only), explicit `Tensor.to(device)`, DLPack interop. |
 
 What each kind lets you do:
 
@@ -41,11 +41,11 @@ defn → trace → Graph → transform → Graph
 
 | object | you get it from | what you can do with it |
 |---|---|---|
-| `Defn` | `@evoxc.defn` | call it with specs to build a graph (calling it with tensors raises) |
-| `Graph` | `evoxc.trace`, or any transform | `summary()`, `digest()`, `text()`, save/load, transform again |
-| `LoweredProgram` | `evoxc.lower` | `source_text()`, save/load, compile |
-| `CompiledArtifact` | `evoxc.compile` | save/load, load onto a device |
-| `Executable` | `evoxc.load` | `run`, `bind`, `summary()`, `plan_text()`, `synchronize()` |
+| [`Defn`](/api/evoxc/trace/defn/) | `@evoxc.defn` | call it with specs to build a graph (calling it with tensors raises) |
+| [`Graph`](/api/evoxc/trace/graph/) | `evoxc.trace`, or any transform | `summary()`, `digest()`, `text()`, save/load, transform again |
+| [`LoweredProgram`](/api/evoxc/backends/loweredprogram/) | `evoxc.lower` | `source_text()`, save/load, compile |
+| [`CompiledArtifact`](/api/evoxc/backends/compiledartifact/) | `evoxc.compile` | save/load, load onto a device |
+| [`Executable`](/api/evoxc/pipeline/executable/) | `evoxc.load` | `run`, `bind`, `summary()`, `plan_text()`, `synchronize()` |
 | `Tensor` | `evoxc.run`, concrete creators | `.numpy()`, `.to(device)`, DLPack, structured repr |
 
 Two consequences are worth stating explicitly:
