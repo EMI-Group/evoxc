@@ -67,7 +67,7 @@ const resolveSectionHref = (href: string): string =>
       <slot name="brand">
         {/* The mark alone; the site title stays as the link's accessible name. */}
         <a href={homeHref} class="flex shrink-0 items-center text-foreground transition-opacity hover:opacity-70">
-          <Logo class="h-5 w-8 shrink-0" />
+          <Logo class="h-5 w-7 shrink-0" />
           <span class="sr-only">{config.title}</span>
         </a>
       </slot>
@@ -111,6 +111,18 @@ const resolveSectionHref = (href: string): string =>
           <Icon name="ph:github-logo" class="w-4 h-4" />
         </LinkButton>
       )}
+      <LinkButton
+        href="https://pypi.org/project/evoxc/"
+        variant="minimal"
+        shape="square"
+        size="sm"
+        aria-label="PyPI package"
+        target="_blank"
+        rel="noopener"
+        class="text-muted-foreground"
+      >
+        <Icon name="ph:package" class="w-4 h-4" />
+      </LinkButton>
       <ThemeToggle />
       {showSidebar && (
         <Button

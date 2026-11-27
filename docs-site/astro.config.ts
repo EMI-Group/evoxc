@@ -18,9 +18,24 @@ const nimbusConfig = defineNimbusConfig({
   // The GitHub link in the site header.
   github: "https://github.com/EMI-Group/evoxc",
   socialImageAlt: "EvoX Compiler documentation preview",
-  // The home page leads the sidebar; every other page joins it automatically.
+  // The home page leads the sidebar; the groups and the two standalone pages
+  // follow in the order below. The generated Python API pages
+  // (`src/content/docs/api/`, written by docs-infra before each build and
+  // absent from a fresh checkout) are their own group, so they sit between
+  // Reference and the HuggingFace page instead of sorting to the end of the
+  // rail. `overviewLabel` names a group's index-page link "Overview"; that
+  // link still sorts by its own `sidebar.order` among the group's children.
   sidebar: {
-    items: ["index", { autogenerate: { collection: "docs" } }],
+    overviewLabel: true,
+    items: [
+      "index",
+      { label: "Getting started", autogenerate: { directory: "getting-started" } },
+      { label: "Guides", autogenerate: { directory: "guides" } },
+      { label: "Reference", autogenerate: { directory: "reference" } },
+      { label: "Python API", autogenerate: { directory: "api" } },
+      "huggingface",
+      "development",
+    ],
   },
 });
 

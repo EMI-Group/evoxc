@@ -1,50 +1,102 @@
 ---
-title: Introduction
-description: What your product does, who it's for, and where to start.
+title: EvoX Compiler
+description: A minimal, explicit, compiler-neutral tensor graph compiler and runtime for Python.
 sidebar:
   order: 0
 ---
 
-Describe your product in two sentences: what it does, and who it's for. A reader should know within ten seconds whether they're in the right place.
+**evoxc** (EvoX Compiler) is a Python tensor graph compiler and runtime: it builds computational graphs, transforms them, and hands them to a compiler that generates code. The graph is the program — there is no eager mode, no implicit tracing, and no hidden compilation.
 
-<Aside type="tip" title="This page is yours">
-  Edit `src/content/docs/index.mdx` and save. The page reloads with your changes.
-</Aside>
+It is for people who write numerical programs — optimisation loops, batched simulations, model forwards — and want to see, save, transform and reuse the graph instead of treating a framework call as opaque. A NumPy interpreter runs graphs on a CPU with no compiler toolchain installed; IREE, XLA via PJRT and TVM are optional backends that receive StableHLO.
 
-## What you can do
+<CardGrid>
+  <Card title="Getting started" href="/getting-started/" icon="ph:rocket-launch">
+    Install evoxc and run one traced graph through every explicit stage.
+  </Card>
+  <Card title="Guides" href="/guides/" icon="ph:compass">
+    Tracing, transforms, control flow, devices, backends, collectives and custom kernels.
+  </Card>
+  <Card title="Reference" href="/reference/" icon="ph:book-open">
+    The public API, pipeline objects, ops, options, architecture and v1 deferrals.
+  </Card>
+  <Card title="Python API" href="/api/" icon="ph:code">
+    The generated API reference for every public name in the package.
+  </Card>
+</CardGrid>
 
-List the three things people come here to do, in the words they would use.
+## The four defining properties
 
-- Something a reader can accomplish on day one.
-- Something they'll need once they're up and running.
-- Something that makes your product different.
+### Simple
 
-## Get started
+Convenience APIs are compositions, not a second semantics: `vmap` is sugar over `vectorize`, `bind` only passes arguments, and `build` runs `trace → lower → compile → load` in one call. When you need a stage on its own, you call the same function the shorthand calls.
 
-Show the shortest path to something working. Name the prerequisites first, then one command or one click at a time.
+### Minimal
 
-<Steps>
-  <Step title="Install">
-    ```sh
-    npm install your-package
-    ```
-  </Step>
-  <Step title="See it work">
-    Show the one result that proves the setup worked.
-  </Step>
-</Steps>
+`numpy` is the only hard runtime dependency. The package is a Python frontend, a NumPy interpreter, and a Rust extension for the graph transforms and the optional CPU engine; a prebuilt wheel runs graphs without a compiler toolchain. Optimisation, scheduling, memory planning and code generation belong to external compilers, never to evoxc.
 
-## Add your next page
+### Explicit
 
-Create a file beside this one. It joins the sidebar as soon as you save.
+Every stage of the pipeline is a public function with a distinct result object, and you can inspect, save or transfer the object at any point. Communication between devices is an explicit collective in the graph; moving data between host and device is the explicit `Tensor.to(device)`; a large tensor enters a graph as an input or through the warned `evoxc.constant`, never by silent capture.
 
-```mdx title="src/content/docs/quickstart.mdx"
----
-title: Quickstart
-description: From nothing to a working setup in five minutes.
----
+### Compiler-neutral
 
-Your first guide starts here.
+EvoXIR represents the program. StableHLO connects it to IREE, XLA and TVM, and StableHLO is an export target rather than the definition of the IR. A backend that cannot express something fails loudly, and the NumPy interpreter stays the reference behaviour.
+
+## The explicit pipeline
+
+```text
+defn → trace → Graph → transform → Graph → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor
 ```
 
-Before you publish, run `npx @cloudflare/nimbus-docs check` to catch mistakes before your readers do.
+- **defn** — `@evoxc.defn` marks a Python function as a graph *definition*. Calling it with concrete tensors is an error: it describes a computation, it does not execute one.
+- **trace** — `evoxc.trace(fn, *specs)` runs the definition against `TensorSpec` inputs and returns a `Graph`, EvoXIR's region-based SSA module plus the input/output trees.
+- **transform** — `evoxc.vectorize`, `vmap`, `batch_functions`, `grad`, `jvp` and `vjp` take a `Graph` and return an ordinary `Graph` of ordinary ops.
+- **lower** — `evoxc.lower(graph, backend=…)` returns a `LoweredProgram`: StableHLO MLIR text, or the backend's own payload.
+- **compile** — `evoxc.compile(lowered, **options)` returns a `CompiledArtifact` — the compiler's own artifact (a `vmfb`, a PJRT executable, serialized IR).
+- **load** — `evoxc.load(artifact, device=…)` returns an `Executable` bound to a device.
+- **run** — `evoxc.run(exe, *args)` executes it and returns a `Tensor`, or a tree of tensors matching the outputs you traced.
+
+Nothing happens implicitly between those calls: no stage consumes an earlier-stage object and performs the missing steps, and each object's `summary()` or `text()` shows what it holds.
+
+## Quickstart — sixty seconds
+
+```python
+import evoxc
+from evoxc import TensorSpec
+
+@evoxc.defn
+def f(x, w):
+    return evoxc.sum(evoxc.tanh(evoxc.dot(x, w)), axes=1)
+
+spec_x, spec_w = TensorSpec((4, 8), evoxc.float32), TensorSpec((8, 4), evoxc.float32)
+graph    = evoxc.trace(f, spec_x, spec_w)                       # Graph          (EvoXIR)
+lowered  = evoxc.lower(graph)                                   # LoweredProgram
+artifact = evoxc.compile(lowered)                               # CompiledArtifact
+exe      = evoxc.load(artifact, device="cpu")                   # Executable
+y        = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))   # Tensor
+print(y.shape, y.dtype)      # (4,) float32
+print(graph)                 # <Graph 4 ops, 1 function, 2 tensor inputs, 0 static values, 1 output>
+```
+
+The same graph runs on another backend by changing one argument — `backend="native"` uses the in-process Rust CPU engine, and the optional compiler adapters take `backend="iree"`, `"xla"` or `"tvm"`:
+
+```python
+exe = evoxc.build(f, spec_x, spec_w, backend="native", device="cpu")  # trace → lower → compile → load
+y   = evoxc.run(exe, evoxc.ones((4, 8)), evoxc.ones((8, 4)))
+```
+
+`build` and `evaluate` are documented shorthand for the same stages (`evaluate` derives the specs from concrete tensors, then builds and runs), never a separate execution mode. Install evoxc with `pip install evoxc` — NumPy only, with the compiled extension in the wheel — and add a compiler extra when you want one.
+
+<img src="/evoxc-stack.svg" alt="The explicit evoxc stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="1200" height="560" />
+
+## What evoxc leaves to other tools
+
+evoxc owns the frontend and the staging contract; it deliberately does not own optimisation, kernel scheduling, memory planning or code generation — those belong to the compilers it hands StableHLO to. It also contains no neural-network modules, layers, optimizers, datasets, training loops or model zoo, no automatic global sharding or implicit collectives, no CUDA allocator or kernel scheduler, and no serving or checkpoint manager. Those are separate libraries built on top of evoxc, such as the [evoxc-hf](/huggingface/) distribution for HuggingFace checkpoints.
+
+## Where to go next
+
+- Install evoxc from PyPI, or build it from source, in [Install](/getting-started/install/).
+- Learn the rules that make the pipeline explicit in [Core concepts](/getting-started/core-concepts/).
+- Batch, differentiate and combine graphs in [Graph transforms](/guides/graph-transforms/).
+- Keep state on the device across iterations in [Tensors and devices](/guides/tensors-and-devices/).
+- See which backends reach which hardware, and what is validated where, in [Compiler adapters](/guides/compiler-adapters/).
