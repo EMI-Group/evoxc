@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-A transform in evoxc takes a `Graph` and returns a `Graph`. It never runs anything, never asks a backend for help, and never leaves a marker op behind: the result is a program made of ordinary `evoxc.ops` ops with static shapes, so the NumPy interpreter, the native engine and every compiler adapter execute it without knowing a transform happened.
+A transform in evoxc takes a [`Graph`](/api/evoxc/trace/graph/) and returns a `Graph`. It never runs anything, never asks a backend for help, and never leaves a marker op behind: the result is a program made of ordinary `evoxc.ops` ops with static shapes, so the NumPy interpreter, the native engine and every compiler adapter execute it without knowing a transform happened.
 That is design principle 7, and it is why `vmap`-ed or differentiated code can be persisted, inspected and lowered exactly like the graph it came from.
 
 ## One Rust implementation, no fallback
@@ -13,8 +13,8 @@ That is design principle 7, and it is why `vmap`-ed or differentiated code can b
 `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge are a single implementation in the Rust core, reached through the compiled `evoxc._evoxc_native` extension (`scripts/build-native.sh` builds it; `EVOXC_NATIVE_LIB` can point at a prebuilt library).
 There is no Python fallback: if the extension is missing, the first transform call raises `ImportError` with the build instructions instead of silently taking a slower, subtly different path.
 
-Python keeps only frontend duties — argument validation with fixed error wording, `TensorSpec`/pytree adaptation, `Graph` reconstruction, and the rules bridge.
-That bridge is how custom `block` ops (`block:<name>`), external kernels (`external:<name>`) and sparse ops (`sparse_*`) contribute batching and derivative rules: their Python rules run inside the native rewrite and produce subgraphs that the engine splices in.
+Python keeps only frontend duties — argument validation with fixed error wording, [`TensorSpec`](/api/evoxc/core/tensorspec/)/pytree adaptation, `Graph` reconstruction, and the rules bridge.
+That bridge is how custom [`block`](/api/evoxc/block/block/) ops (`block:<name>`), external kernels (`external:<name>`) and sparse ops (`sparse_*`) contribute batching and derivative rules: their Python rules run inside the native rewrite and produce subgraphs that the engine splices in.
 A backend therefore only ever sees plain ops — there is no "vectorized" or "autodiff" runtime support to implement anywhere.
 
 ## Graph in, graph out — or a callable of specs
@@ -37,7 +37,7 @@ graph = tf(w_spec, x_spec)          # a fresh Graph per call; tf.kind == "vmap"
 
 Two rules follow from "transforms never execute":
 
-- A `TransformCallable` rejects concrete `Tensor` arguments with `TraceError` ("never execute") — pass `TensorSpec`s.
+- A `TransformCallable` rejects concrete `Tensor` arguments with [`TraceError`](/api/evoxc/core/traceerror/) ("never execute") — pass `TensorSpec`s.
 - `evoxc.build` accepts a function or `Defn`, not a `Graph`; it raises `TypeError` telling you to use the explicit `lower`/`compile`/`load` pipeline. Stage a transformed graph the long way:
 
 ```python
@@ -52,7 +52,7 @@ evoxc.vectorize(graph, axes) -> Graph
 ```
 
 `axes` is an `int`, `None`, or a pytree of those over the input structure: `0` maps a tensor input's leading axis into a fresh batch dimension, and `None` leaves it unmapped (mandatory for a static input, since a static leaf has no axis).
-Only leading axes are accepted in v1 — anything else is a `TransformError` naming the rule ("must be 0 (the leading axis) in v1").
+Only leading axes are accepted in v1 — anything else is a [`TransformError`](/api/evoxc/core/transformerror/) naming the rule ("must be 0 (the leading axis) in v1").
 
 `vectorize` is a graph→graph function and takes a traced `Graph` only; handing it a bare callable is a `TypeError` that points at `evoxc.vmap`.
 
@@ -90,7 +90,7 @@ scores = evoxc.run(exe, W, X)          # X: (5, 4) → scores: (5,)
 ### Axis levels and the batch dimension
 
 One batching pass creates **one** fresh batch `Dim` shared by all of its mapped inputs, named after the pass depth: `batch` at depth 0, `batch_1` at depth 1, and so on.
-The name must be level-distinct because the NumPy interpreter binds symbolic dims by name: a mismatch then raises a clear `ShapeError` ("dimension 'batch' is already bound to 4, got 1") instead of silently broadcasting.
+The name must be level-distinct because the NumPy interpreter binds symbolic dims by name: a mismatch then raises a clear [`ShapeError`](/api/evoxc/core/shapeerror/) ("dimension 'batch' is already bound to 4, got 1") instead of silently broadcasting.
 
 The depth counter follows `TransformCallable` composition, which is why `vmap(vmap(f))` and `vmap(grad(f))` nest cleanly.
 `vectorize(vectorize(g))` on the Graph path runs both passes at depth 0 and yields same-named dims — a documented v1 fail-explicit: unequal extents raise `ShapeError`.
@@ -130,7 +130,7 @@ Semantics worth knowing:
 - Multiply-used values accumulate cotangents with `add`.
 - `stop_gradient` yields a zero gradient in both directions.
 - Ops that produce booleans or integers (`equal`, `less`, `argmax`, …) yield a **zero** tangent, documented, not an error.
-- An op with no rule — `runtime_call`, a collective, an `external_call` with no rule and no portable decomposition — raises `TransformError` naming the op (and its rule key), never a silent fallback.
+- An op with no rule — [`runtime_call`](/api/evoxc/ops/runtime-call/), a collective, an [`external_call`](/api/evoxc/ops/external-call/) with no rule and no portable decomposition — raises `TransformError` naming the op (and its rule key), never a silent fallback.
 
 ## `jvp` — forward mode
 

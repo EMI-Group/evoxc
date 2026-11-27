@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-A `Tensor` is the materialized end of the pipeline: it carries a dtype, a concrete shape, and a **device that says where its bytes actually live**.
+A [`Tensor`](/api/evoxc/core/tensor/) is the materialized end of the pipeline: it carries a dtype, a concrete shape, and a **device that says where its bytes actually live**.
 Everything else in this page follows from that one rule — evoxc never relabels a tensor, never copies it behind your back, and never pretends a buffer is somewhere it is not.
 
 Placement is a property of the value, not a hint you attach to it:
@@ -23,7 +23,7 @@ Two details worth knowing early: `evoxc.tensor` keeps an existing `ndarray`'s dt
 
 ## Host data is always `cpu:0`
 
-An `ndarray` payload *is* host memory, so a tensor wrapping one lives on `Device("cpu", 0)` — always, and the payload's own attributes are never consulted to decide otherwise.
+An `ndarray` payload *is* host memory, so a tensor wrapping one lives on [`Device("cpu", 0)`](/api/evoxc/core/device/) — always, and the payload's own attributes are never consulted to decide otherwise.
 Passing any other device to a concrete creator is an error rather than an implicit upload:
 
 ```python
@@ -32,7 +32,7 @@ evoxc.zeros((4, 4), evoxc.float32, device=evoxc.Device("cuda", 0))  # DeviceErro
 ```
 
 The message names the creator, says the memory is host (numpy) memory, and points at `t.to(...)` — placing data on a device is a separate, explicit step.
-The same rule governs `evoxc.tensor`, `evoxc.ones`, `evoxc.full`, `evoxc.empty`, `evoxc.from_numpy` and `evoxc.from_dlpack`.
+The same rule governs `evoxc.tensor`, `evoxc.ones`, `evoxc.full`, `evoxc.empty`, `evoxc.from_numpy` and [`evoxc.from_dlpack`](/api/evoxc/core/from-dlpack/).
 
 ## Device payloads carry their real device
 
@@ -60,7 +60,7 @@ host_x2 = gpu_x.to(evoxc.Device("cpu", 0))     # explicit device -> host readbac
 
 - `t.to(t.device)` returns `t` itself — no copy, no work.
 - `to(Device("cpu", 0))` on a device payload performs the explicit download (a fresh host copy).
-- `to(Device("cpu", N))` with `N != 0` raises `DeviceError`: only `cpu:0` exists.
+- `to(Device("cpu", N))` with `N != 0` raises [`DeviceError`](/api/evoxc/core/deviceerror/): only `cpu:0` exists.
 - A payload-backed tensor going straight to another accelerator kind raises `DeviceError` suggesting the two explicit hops, `t.to(cpu).to(target)`.
 - Otherwise the registered **device-transfer provider** for that kind performs the upload. The owning backend's slot is tried first, then the flat default slot; with nothing registered the error names the kind and the target device (for `cuda`, the fix is `pip install evoxc[iree]`).
 
@@ -100,7 +100,7 @@ DLPack export aliases memory. `copy=True` and a different `dl_device` are refuse
 
 ## Enumerating devices
 
-`evoxc.devices()` reports what this host actually has, and it never invents anything:
+[`evoxc.devices()`](/api/evoxc/core/devices/) reports what this host actually has, and it never invents anything:
 
 ```python
 evoxc.devices()            # [Device(kind='cpu', index=0)] plus any cuda/rocm devices
@@ -117,7 +117,7 @@ evoxc.devices("vulkan")    # queried only when asked for explicitly
 
 ## Preparing data: split and replicate
 
-`evoxc.split_tensor(tensor, axis, devices)` and `evoxc.replicate_tensor(tensor, devices)` are **explicit data preparation**, not sharding transformations.
+[`evoxc.split_tensor(tensor, axis, devices)`](/api/evoxc/core/split-tensor/) and [`evoxc.replicate_tensor(tensor, devices)`](/api/evoxc/core/replicate-tensor/) are **explicit data preparation**, not sharding transformations.
 They cut (or share) host data into one local tensor per device and touch no graph, no collective and no transfer:
 
 ```python
@@ -138,7 +138,7 @@ There is no `split`/`replicate` op in the graph language either — multi-device
 
 ## Embedding data in a graph
 
-Capturing a concrete tensor from a closure into a `defn` is an error; large data enters a graph through `evoxc.constant(tensor)` — the one (explicit, warned) embedding path — or as an ordinary input spec.
+Capturing a concrete tensor from a closure into a `defn` is an error; large data enters a graph through [`evoxc.constant(tensor)`](/api/evoxc/core/constant/) — the one (explicit, warned) embedding path — or as an ordinary input spec.
 `evoxc.constant` snapshots **host data only**:
 
 ```python

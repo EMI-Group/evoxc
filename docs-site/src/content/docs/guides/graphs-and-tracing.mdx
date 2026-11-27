@@ -6,12 +6,12 @@ sidebar:
 ---
 
 A graph in evoxc is not recorded by watching your function run on real data — it is built by running the function once, on symbolic values, under an active builder.
-This page covers that moment (`evoxc.trace`), what it accepts, what it refuses, and the `Graph` it hands back.
+This page covers that moment (`evoxc.trace`), what it accepts, what it refuses, and the [`Graph`](/api/evoxc/trace/graph/) it hands back.
 
 ## `@evoxc.defn` is a marker, not a JIT
 
-`@evoxc.defn` wraps a plain Python function in a `Defn` and stamps it with an `__evoxc_defn__` marker.
-It adds no execution mode: calling a `Defn` always raises, even with `TensorSpec`s, even from inside another trace.
+[`@evoxc.defn`](/api/evoxc/trace/defn/) wraps a plain Python function in a `Defn` and stamps it with an `__evoxc_defn__` marker.
+It adds no execution mode: calling a `Defn` always raises, even with [`TensorSpec`](/api/evoxc/core/tensorspec/) inputs, even from inside another trace.
 
 ```python
 import evoxc
@@ -96,7 +96,7 @@ Nesting is arbitrary — tuple, list, dict, namedtuple, dataclass, and registere
 
 ### Symbolic dims
 
-A shape entry is a static `int`, a `Dim`, a `DimExpr`, or `None` (runtime-dynamic).
+A shape entry is a static `int`, a [`Dim`](/api/evoxc/core/dim/), a [`DimExpr`](/api/evoxc/core/dimexpr/), or `None` (runtime-dynamic).
 
 ```python
 B = evoxc.dim("B")                     # a named symbolic extent
@@ -116,7 +116,7 @@ Tying dims together is enforced at trace time by shape inference only.
 
 ## The body runs once, at trace time
 
-Tracing calls your function once, as ordinary Python, with `SymbolicTensor`s where the tensor leaves were.
+Tracing calls your function once, as ordinary Python, with [`SymbolicTensor`](/api/evoxc/core/symbolictensor/) values where the tensor leaves were.
 Every op you call appends to the active builder, so a plain Python helper needs no decoration to take part:
 
 ```python
@@ -262,7 +262,7 @@ static Python control flow is only valid over Python values.
 | Used a graph value as a Python boolean | `TraceError` pointing at `evoxc.cond`/`while_loop`/`scan`, with the location |
 | Returned a concrete `Tensor` from the body | `TraceError` with the trace location |
 | Static value changed at run time | `TraceError` "graph was specialized on … does not match" |
-| dtype / shape / device mismatch at run time | `DTypeError` / `ShapeError` / `DeviceError` |
+| dtype / shape / device mismatch at run time | `DTypeError` / `ShapeError` / [`DeviceError`](/api/evoxc/core/deviceerror/) |
 
 ## Pytree in, pytree out
 
