@@ -61,7 +61,7 @@ graph.summary()
 }
 ```
 
-`op_count` counts ops at **every** nesting level, so a `cond` or `while_loop` body is included. `static_values` lists the Python values that specialised the graph (path, kind and a `value_repr`), which is also the list `run` validates against. `source_location_count` is how many ops carry a real call-site location. Shapes print as strings because a symbolic dim is a `Dim`/`DimExpr`, not an integer.
+`op_count` counts ops at **every** nesting level, so a `cond` or `while_loop` body is included. `static_values` lists the Python values that specialised the graph (path, kind and a `value_repr`), mirroring the static values `run` validates against. `source_location_count` is how many ops carry a real call-site location. Shapes print as strings because a symbolic dim is a `Dim`/`DimExpr`, not an integer.
 
 `graph.text()` is the pretty-printed EvoXIR, one op per line with its type and `loc(...)`; `graph.print()` writes the same text to stdout. `graph.verify()` is the explicit IR check — `trace` does not run it for you.
 
@@ -85,7 +85,7 @@ lowered.summary()             # backend, target, payload_kind/bytes, input/outpu
 lowered.source_text()         # the human-readable program, or None when the payload has no text form
 ```
 
-`source_text()` returns MLIR/StableHLO for a compiler payload and the serialized-IR pretty print for the numpy payload; `None` means "this payload has no text form", while `text()` raises in that case. `summary()` adds `required_custom_ops` and `runtime_dependencies`, which is the honest answer to "will this artifact need something at load time?".
+`source_text()` returns MLIR/StableHLO for a compiler payload and the serialized-IR pretty print for the numpy payload; `None` means "this payload has no text form", while `text()` raises in that case. `summary()` also reports `required_custom_ops` and `runtime_dependencies`, the honest answer to "will this artifact need something at load time?".
 
 The same two helpers exist on `CompiledArtifact`, whose `repr` also names the target:
 

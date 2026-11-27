@@ -62,7 +62,7 @@ scripts/build-native.sh            # release build (default)
 scripts/build-native.sh --debug    # faster, for iteration
 ```
 
-It runs `cargo build -p evoxc-python` and copies the cdylib to `evoxc/_evoxc_native.abi3.so`, which `evoxc/_native.py` loads — a gitignored build product.
+It runs `cargo build -p evoxc-python` and copies the cdylib to `evoxc/_evoxc_native.abi3.so`, the extension module the package imports as `evoxc._evoxc_native` — a gitignored build product.
 `import evoxc` never requires it unless a code path delegates to the native core; a missing extension raises an actionable `ImportError` naming how to produce it.
 
 ## The gates
@@ -171,4 +171,4 @@ Page-authoring rules — frontmatter, no repeated H1, absolute trailing-slash in
 - [Architecture](/reference/architecture/) — EvoXIR, the native core and the lowering boundary these rules protect.
 - [Options](/reference/options/) — the compile and lowering options, and their environment defaults.
 - [HuggingFace models](/huggingface/) — the second distribution, built only on the public API.
-- [Python API reference](/api/) — the generated reference for every public module.
+- The generated Python API reference under `api/` — the per-symbol reference for every public module.

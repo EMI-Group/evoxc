@@ -114,7 +114,7 @@ The ROCm default of `O1` is not timidity: `O2`/`O3` hit an upstream `iree-compil
 Device-resident execution is explicit on both sides — placement per leaf, then a run boundary that refuses host inputs:
 
 ```python
-device = evoxc.core.Device("cuda", 0)                        # or Device("rocm", 0)
+device = evoxc.Device("cuda", 0)                        # or evoxc.Device("rocm", 0)
 exe = evoxc_hf.build(fwd, cfg, backend="iree", device=device)
 
 placed = evoxc_hf.place_params(params, device)               # one explicit Tensor.to per weight
@@ -146,7 +146,7 @@ logits = evoxc_hf.run(exe, packed, ids).numpy()
 
 Why it exists: IREE's Python runtime on **llvm-cpu** crashes (`SIGSEGV`, no traceback) at the first run of a graph that *consumes* more than ~161 distinct inputs, and an unpacked 124M model is in that class.
 ROCm has no such cliff, so packing is optional there.
-It is not free: the packed tree is fresh concatenated host arrays plus the pre-transposed tied head, so canonical and packed trees briefly coexist (~1.7 GB peak versus ~1.1 GB unpacked for the 124M `gpt2`), and the interpreter pays a few percent extra latency. That is why the canonical tree stays the default.
+It is not free: the packed tree is fresh concatenated host arrays plus the pre-transposed tied head, so canonical and packed trees briefly coexist (~1.7 GB peak versus ~1.1 GB unpacked for the 124M `gpt2`), and the interpreter pays ~0–2 % extra latency. That is why the canonical tree stays the default.
 A weight's orientation is decided at `param_specs`/pack time, not per call, which is why a packed tied graph contains no weight-sized transpose at all.
 
 ## Supported families

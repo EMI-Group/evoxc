@@ -9,7 +9,7 @@ evoxc refuses loudly.
 A deferred feature is never emulated by a slower path, never approximated, and never silently lowered to something else — so the honest way to read this page is: every row names a thing you cannot do *and the failure you will get if you try*.
 That failure is documentation too: it names the op or option, and where a workaround exists it names that as well.
 
-<Aside type="important" title="There is no silent fallback anywhere">
+<Aside type="caution" title="There is no silent fallback anywhere">
 Every entry below raises a typed error (`TransformError`, `BackendError`, `TraceError`, `ShapeError` …) or is a Python-level `TypeError`/`NotImplementedError`.
 evoxc never falls back to a second backend, a Python loop, a densified copy or an approximation to keep a program running.
 </Aside>
@@ -23,7 +23,7 @@ evoxc never falls back to a second backend, a Python loop, a densified copy or a
 | Batching a `conv` with a *mapped kernel* | `TransformError`: the batch-group count is a static integer attribute, so a symbolic batch axis cannot be represented |
 | `batch_functions` merge gaps | `TransformError` for programs the merge cannot make bit-identical; the merge is all-or-nothing |
 | `vmap`/`grad`/`jvp`/`vjp` over random ops | `TransformError` with category `"random"` — there is no batching or derivative rule for the RNG family |
-| `vmap`/`grad`/`jvp`/`vjp` over ops with no registered rule | `TransformError` naming the op; rules exist per op family, not universally |
+| `vmap`/`grad`/`jvp`/`vjp` over ops with no registered rule | `TransformError` naming the op — rules exist per op family, not universally: `sort`/`argsort`/`tile`/`flip`/`roll`/`diag`/`cumprod`/`nan_to_num`, the linalg factorizations and the collectives have none |
 | Whole-graph transforms over external kernels without a rule or portable | `TransformError` naming the kernel; register rules or a portable decomposition |
 
 Transformed results are ordinary graphs of ordinary ops, so a transform either produces a correct graph or raises — never a graph with a hidden loop.
@@ -98,7 +98,8 @@ The supported kernel path is the other one: `external_call` with `register_exter
 
 | Deferral | What happens |
 |---|---|
-| Device-resident mode on numpy or on the default slot | `BackendError`: `device_resident=True` requires an explicit `"iree"` slot |
+| Device-resident kernel in the default slot | `TypeError` at registration: `device_resident=True` needs an explicit per-backend slot, because the default slot is what the host-array backends fall back to |
+| A `device_resident=True` kernel on numpy or `native` | `BackendError` at run: both hand a kernel host arrays and cannot honour device-resident semantics |
 | Static kernel parameters | not supported in v1 — operands are tensors or Python scalars |
 | Kernels inside control-flow regions on `iree` | `BackendError` |
 | MULTI-function graphs with a kernel boundary on `iree` | `BackendError` |

@@ -13,7 +13,7 @@ Each mechanism makes a different promise, so the choice is a contract decision r
 | Mechanism | You own | The graph carries | Executes on |
 |---|---|---|---|
 | `evoxc.block` | a decomposition written as a normal graph (optional per-backend impls) | a `block_call` op | numpy, `native`, and every compiler adapter |
-| `evoxc.external_call` + `evoxc.register_external_kernel` | the kernel body, outside evoxc | an `external_call` op | numpy (host dispatch), iree (host or device-resident) |
+| `evoxc.external_call` + `evoxc.register_external_kernel` | the kernel body, outside evoxc | an `external_call` op | numpy (host dispatch), iree (host or device-resident); xla/tvm inline a registered portable |
 | `evoxc.custom_call` / `evoxc.inline_stablehlo` / `evoxc.compile_text` | compiler-side IR | a compiler op, or verbatim MLIR | iree / xla / tvm only |
 
 The rule of thumb: if you can express the computation as a graph, write a **block**; if a real kernel has to run, declare an **external call**; if the answer only exists in the compiler's dialect, use an **escape hatch** and accept that the CPU backends refuse it.
@@ -57,7 +57,7 @@ Positional statics bind to the next unfilled attribute in schema order, and ther
 There is also a decorator form, `@evoxc.block(...)` over an `@evoxc.defn` function: the name defaults to the function name, input specs come from the `TensorSpec` annotations, and the return annotation (or `outputs=`/`result=`) declares the outputs.
 Portable implementations must be `@evoxc.defn` functions — a plain Python function is a `BlockError`, because a decomposition is traced, not called.
 
-<Aside type="warning" title="An impl receives encoded attributes">
+<Aside type="caution" title="An impl receives encoded attributes">
 A per-backend implementation is invoked as `impl(*numpy_arrays, **static_args)` where each keyword is the JSON-safe payload dict `{"kind": ..., "value": ...}`, not the decoded Python value.
 An attribute is *specialization*, not data: changing it produces a different graph.
 
@@ -179,13 +179,13 @@ def with_target(x):
 ```
 
 `custom_call(call_target_name, *operands, result, backend_config="", api_version=1, has_side_effect=False)` emits a `stablehlo.custom_call` and forwards the target name and configuration verbatim.
-`inline_stablehlo(body, *operands, result, has_side_effect=False)` raises a raw MLIR snippet into the graph under a token contract evoxc does check: operand *i* is available as `%in<i>`, and every declared result *i* must be assigned to `%out<i>` at least once.
+`inline_stablehlo(body, *operands, result, has_side_effect=False)` raises a raw MLIR snippet into the graph under a token contract evoxc does check: operand *i* is available as `%in<i>`, and every declared result *i* must be assigned to `%out<i>` exactly once.
 Beyond that contract evoxc never parses MLIR — the declared result types are the compiler's to validate.
 
 `evoxc.compile_text(mlir_text, input_specs, output_specs, backend=..., device=..., entry_functions=("main",), **options)` is the same idea without a graph at all: authored or edited StableHLO goes straight to `compile` → `load`, which is also the round trip for `Executable.source_text()`.
 The full example lives on [backends](/guides/backends/).
 
-<Aside type="important" title="Forwarding is not validity">
+<Aside type="caution" title="Forwarding is not validity">
 `custom_ops` claims the text is **forwarded**, not that it is legal. An unknown `stablehlo.custom_call @target` parses and then fails IREE legality (`failed to legalize operation 'stablehlo.custom_call' that was explicitly marked illegal`), and there is no custom-dispatch object-linking path and no PJRT custom-call registration.
 So a kernel that must actually execute is either a self-contained `inline_stablehlo`/`compile_text` body or an `external_call` segment — never a bare custom-call target name.
 </Aside>

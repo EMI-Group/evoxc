@@ -67,7 +67,8 @@ Every non-tensor parameter — an axis, a shape, a padding table, `k`, a dtype, 
 | Compiler adapters (`iree`, `xla`, `tvm`) | The StableHLO-exportable subset; the rest raises an explicit `BackendError` at `lower()` |
 
 The compiler-relevant deferrals today: `tril`, `triu`, `cumsum`, `cumprod`, `flip`, `roll`, `nan_to_num`, `solve`, `erf` and `gelu` (there is no StableHLO error function, so GELU is deferred with it rather than approximated), `diagonal`, the factorizations `cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp`, `random_multinomial`, every `sparse_*` op (densify with `evoxc.sparse.to_dense` first), and the callback ops `runtime_call`/`external_call`/`dist.rank`/`dist.world_size`.
-The frontend compositions below work through their components, so `topk`, `stack`, `clamp`, `matmul`, `isnan`, `eye`, `linspace` and `diag` inherit the coverage of the ops they expand into.
+The frontend compositions below work through their components, so `topk`, `stack`, `clamp`, `matmul`, `isnan`, `eye` and `linspace` inherit the coverage of the ops they expand into.
+`diag` is a single IR op whose own v1 emission is a flatten-plus-gather (rank 2) or an iota mask plus `select` (rank 1), so it needs neither a separate mnemonic nor a composition.
 The two escape hatches `custom_call`/`inline_stablehlo` are gated on the backend's `Capabilities.custom_ops`: the numpy interpreter and the native engine reject them explicitly and the compiler decides their validity.
 
 ## IR op or composition
@@ -91,7 +92,7 @@ The documented exceptions are the compiler escape hatches `custom_call`/`inline_
 | Op | Meaning | Notes |
 |---|---|---|
 | `evoxc.constant(t)` | Embed host tensor data in the graph as a `constant` op | Trace-time only; snapshots a copy of the data; warns above `EVOXC_LARGE_CONSTANT_BYTES` (1 MiB default); host data only — a non-cpu tensor raises `DeviceError` |
-| `evoxc.arange(start, stop, step, dtype)` | A 1-D index vector | A `constant` op, so bounds must be concrete Python numbers; symbolic bounds defer |
+| `evoxc.arange(start, stop=None, step=1, dtype=None)` | A 1-D index vector | A `constant` op, so bounds must be concrete Python numbers; symbolic bounds defer |
 | `evoxc.eye(n, m=None, dtype=evoxc.float32)` | Identity matrix | Composition over constants; `float32` default |
 | `evoxc.linspace(start, stop, num, dtype=None)` | Evenly spaced values | `float64` default (a deliberate deviation from the float32 creation convention); symbolic bounds raise |
 | `evoxc.numpy.zeros/ones/full/empty` | Graph-side array fillers | Graph ops; the **top-level** `evoxc.zeros/ones/full/empty` are concrete host creators, not graph ops |
@@ -153,7 +154,7 @@ The documented exceptions are the compiler escape hatches `custom_call`/`inline_
 | `stack(tensors, axis=0)` | Join along a new axis | Composition: reshape + `concatenate` |
 | `flip(x, axes)` | Reverse along axes | Compiler backends defer |
 | `roll(x, shift, axis=None)` | Cyclic shift | Compiler backends defer |
-| `diag(x)` | Vector → diagonal matrix, matrix → diagonal vector | Composition; exports as flatten + gather or an iota mask |
+| `diag(x)` | Vector → diagonal matrix, matrix → diagonal vector | One IR op (dtype preserved); exports as flatten + gather or an iota mask |
 | `evoxc.numpy.expand_dims` / `squeeze` | Insert/drop extent-1 axes | `evoxc.numpy` spellings only (reshape sugar) |
 
 ## Indexing, gather, scatter, slice and pad
