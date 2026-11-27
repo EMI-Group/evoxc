@@ -8,10 +8,11 @@ sidebar:
 A transform in evoxc takes a `Graph` and returns a `Graph`. It never runs anything, never asks a backend for help, and never leaves a marker op behind: the result is a program made of ordinary `evoxc.ops` ops with static shapes, so the NumPy interpreter, the native engine and every compiler adapter execute it without knowing a transform happened.
 That is design principle 7, and it is why `vmap`-ed or differentiated code can be persisted, inspected and lowered exactly like the graph it came from.
 
-## One Rust implementation, no fallback
+## One Rust implementation for the numeric transforms, no fallback
 
 `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge are a single implementation in the Rust core, reached through the compiled `evoxc._evoxc_native` extension (`scripts/build-native.sh` builds it; `EVOXC_NATIVE_LIB` can point at a prebuilt library).
 There is no Python fallback: if the extension is missing, the first transform call raises `ImportError` with the build instructions instead of silently taking a slower, subtly different path.
+The one exception is the structural pass described under splitting below: `split_by_inputs` and its `analyze_inputs` report compute no derivative, no batch and no value, so they are Python.
 
 Python keeps only frontend duties — argument validation with fixed error wording, `TensorSpec`/pytree adaptation, `Graph` reconstruction, and the rules bridge.
 That bridge is how custom `block` ops (`block:<name>`), external kernels (`external:<name>`) and sparse ops (`sparse_*`) contribute batching and derivative rules: their Python rules run inside the native rewrite and produce subgraphs that the engine splices in.
