@@ -7,4 +7,88 @@ sidebar:
     label: Getting started
 ---
 
-<!-- TODO(content): write the Getting started page. -->
+evoxc — **EvoX Compiler** — is a minimal, explicit, compiler-neutral tensor graph compiler and runtime for Python.
+You write a numerical program as a graph, you inspect it, you transform it, and then you hand it to a backend: the bundled NumPy interpreter, the in-process Rust CPU engine, or an external compiler (IREE, XLA via PJRT, TVM) that receives StableHLO.
+
+Nothing in that sequence happens by accident, and nothing happens out of order.
+Every stage is a public function with its own public result object, so you can stop after tracing, save a graph, load it back in another process, or swap backends without touching the program.
+
+## The three pages in this section
+
+<CardGrid>
+  <Card title="Install" href="/getting-started/install/" icon="ph:download-simple">
+    One `pip install` gets you a complete system on the NumPy interpreter. Add an extra for a compiler backend, and see what a source build needs.
+  </Card>
+  <Card title="Quickstart" href="/getting-started/quickstart/" icon="ph:lightning">
+    Define a graph, trace it, lower it, compile it, load it, run it — then collapse the same work into `build` and `evaluate`.
+  </Card>
+  <Card title="Core concepts" href="/getting-started/core-concepts/" icon="ph:compass">
+    The four value kinds, explicit staging, physical devices, and why nothing happens behind your back.
+  </Card>
+</CardGrid>
+
+## What you need
+
+- **Python 3.11 or newer.** The project's `requires-python` is `>=3.11`, and the released wheels are a single `cp311-abi3` build per platform, so one wheel covers every supported CPython version.
+- **NumPy 1.24 or newer.** It is the only hard runtime dependency, and deliberately so: `evoxc.float32` and friends *are* NumPy dtype objects, and a host `Tensor` payload is an `np.ndarray`.
+- **No GPU.** The reference backend is a CPU NumPy interpreter, the second backend is an in-process Rust CPU engine shipped inside the wheel, and every test in this repository runs on CPU. Accelerators are optional adapters.
+- **A Rust toolchain and a C compiler — only when building from source.** Published wheels already contain the compiled Rust/PyO3 extension, so a normal `pip install evoxc` needs no compiler at all.
+
+That list is the whole prerequisite set. There is no CUDA toolkit to install, no compiler to configure and no environment variable to set before your first graph runs.
+
+<Aside type="tip" title="Nothing to configure">
+  The default backend is the NumPy interpreter, so `evoxc.build(fn, *specs)` without a `backend=` argument is a complete, working pipeline.
+  Compiler backends are activated per call (`backend="iree"`) or by environment default (`EVOXC_BACKEND`), never by a global switch that changes the meaning of existing code.
+</Aside>
+
+## The mental model: the graph is the program
+
+There are two things to internalise before the guides make sense, and they are both consequences of the same design choice.
+
+**The graph is the program.** `@evoxc.defn` marks a *graph definition*, not a compiled function and not an eager function. Calling a `Defn` with concrete tensors is an error rather than a silent trace, because the library never guesses when you wanted a graph. You say so explicitly: `evoxc.trace(fn, *specs)` builds a `Graph` (EvoXIR, a region-based SSA module) and hands it back to you.
+
+**Every stage is an explicit public function.** The pipeline is not a call graph hidden inside a decorator; it is a sequence of calls you can stop, inspect and resume:
+
+```text
+defn → trace → Graph → transform → Graph
+     → lower → LoweredProgram → compile → CompiledArtifact
+     → load → Executable → run → Tensor
+```
+
+| stage | public function | resulting object |
+|---|---|---|
+| graph function | `@evoxc.defn` | `Defn` |
+| trace | `evoxc.trace(fn, *specs)` | `Graph` |
+| transform | `evoxc.vectorize` / `evoxc.vmap` / `evoxc.batch_functions` / `evoxc.grad` / `evoxc.jvp` / `evoxc.vjp` | `Graph` |
+| lower | `evoxc.lower(graph, backend=…)` | `LoweredProgram` |
+| compile | `evoxc.compile(lowered, **options)` | `CompiledArtifact` |
+| load | `evoxc.load(artifact, device=…)` | `Executable` |
+| run | `evoxc.run(exe, *args)` | `Tensor` (same pytree shape you passed in) |
+
+Each object is a distinct public type, and no function silently consumes an earlier-stage object and performs the missing steps. Passing a `Graph` to `evoxc.compile` raises rather than lowering for you.
+
+Convenience APIs exist, and they are documented compositions of exactly those rows — `evoxc.build` is trace → lower → compile → load, `evoxc.evaluate` additionally derives specs from your arguments and runs, and `evoxc.vmap` is a transparent wrapper over `evoxc.vectorize`. Sugar in evoxc never adds semantics you could not have written yourself with the explicit primitives.
+
+```python
+import evoxc
+from evoxc import TensorSpec
+
+@evoxc.defn
+def f(x, w):
+    return evoxc.sum(evoxc.tanh(evoxc.dot(x, w)), axes=1)
+
+spec_x, spec_w = TensorSpec((4, 8), evoxc.float32), TensorSpec((8, 4), evoxc.float32)
+graph = evoxc.trace(f, spec_x, spec_w)          # Graph — nothing has run yet
+print(graph.digest())                           # sha256 over the structural payload
+print(graph.summary()["tensor_inputs"])         # path / shape / dtype of each input
+```
+
+That snippet is the entire idea: a Python function becomes data, and the data is what executes.
+
+## Where to go next
+
+- [Install](/getting-started/install/) — the extras table and the source-build path.
+- [Quickstart](/getting-started/quickstart/) — the full pipeline, plus one transform and one backend switch.
+- [Core concepts](/getting-started/core-concepts/) — the vocabulary the rest of the site assumes.
+- [Graphs and tracing](/guides/graphs-and-tracing/) — `defn`, `trace`, locations, and the structural `digest()`.
+- [Backends and options](/guides/backends/) — what a backend owns, and how options reach it.

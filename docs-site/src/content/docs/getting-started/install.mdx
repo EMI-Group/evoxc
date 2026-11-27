@@ -5,4 +5,148 @@ sidebar:
   order: 1
 ---
 
-<!-- TODO(content): write the Install page. -->
+`evoxc` is a normal Python distribution on PyPI with exactly one hard runtime dependency, NumPy.
+The published wheels carry the compiled Rust/PyO3 extension, so installing needs no compiler toolchain.
+
+```sh
+pip install evoxc        # or: uv add evoxc
+```
+
+That one command is a complete system: the plain `evoxc` package, the NumPy interpreter backend (the default), the StableHLO exporter, and every graph transform.
+You can trace, transform, lower and run graphs immediately, entirely on CPU, without installing a compiler.
+
+## Verify the install
+
+```python
+import evoxc
+
+print(evoxc.__version__)   # the installed distribution version
+```
+
+If that prints a version, the package imports. It does **not** prove the native extension is present — `import evoxc` deliberately never requires it (see [troubleshooting](#troubleshooting)).
+
+## What the wheel is
+
+`evoxc` is a mixed Python/Rust project built by maturin: the flat `evoxc` package plus the `abi3-py311` extension module `evoxc._evoxc_native`, compiled from the in-repo Rust workspace.
+The result is one per-platform wheel per target (for example `evoxc-…-cp311-abi3-linux_x86_64.whl`), where the stable ABI means a single build serves every supported CPython from 3.11 up.
+
+Because the extension ships inside the wheel:
+
+- a wheel install needs **no** Rust toolchain, **no** C compiler and **no** network access at import time;
+- a **source** install does need both, because pip has to compile the extension. Wheels exist for the usual platforms; if pip cannot use one it falls back to building the sdist.
+
+## Extras
+
+Each extra enables exactly one capability and nothing else. `evoxc`'s own extras never pull in torch/transformers unless the extra *is* the PyTorch-facing one (`interop`, `bench`).
+
+| extra | installs | enables |
+|---|---|---|
+| `dev` | `pytest` | the test suite |
+| `interop` | `torch` | DLPack interop tests (`tests` only — never a runtime requirement) |
+| `bench` | `torch` | the `evoxc.bench` PyTorch comparison column |
+| `iree` | `iree-base-compiler` + `iree-base-runtime` (3.13.x) | the IREE adapter on llvm-cpu, CUDA, ROCm and Vulkan-SPIRV |
+| `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib supplies the MLIR bindings only) |
+| `compilers` | IREE + TVM | both compiler adapters at once |
+| *(xla)* | **no extra** | the XLA adapter — see below |
+
+```sh
+pip install "evoxc[iree]"        # + IREE
+pip install "evoxc[tvm]"         # + TVM
+pip install "evoxc[compilers]"   # + IREE and TVM
+pip install "evoxc[interop]"     # + torch, for the DLPack interop tests
+pip install "evoxc[bench]"       # + torch, for the bench harness comparison column
+```
+
+Adapter packages are pure-Python wrappers around the external compiler: they are imported and probed only when you ask for that backend, so having `iree-base-*` installed changes nothing about a NumPy-backend run.
+
+```python
+exe = evoxc.build(f, spec_x, spec_w, backend="iree")   # needs the `iree` extra
+```
+
+### The `xla` adapter has no pip extra
+
+There is nothing pip-installable that provides a PJRT C API plugin for the CPU, so `xla` does not ship an extra.
+The adapter drives a PJRT C API plugin `.so` over ctypes and discovers it in this order:
+
+1. the `plugin_path` option — e.g. `evoxc.load(artifact, backend="xla", plugin_path="/path/to/pjrt_plugin.so")`;
+2. the `EVOXC_PJRT_PLUGIN` environment variable;
+3. the well-known installation paths;
+4. an installed JAX PJRT plugin in the `jax_plugins/<platform>/<name>_plugin.so` layout.
+
+Step 4 is how most users get a real accelerator: `pip install jax-rocm7-pjrt` for AMD, `pip install jax-cuda12-pjrt` for NVIDIA.
+`jax` and `jaxlib` are never imported — the plugin `.so` is dlopen-ed directly — and `EVOXC_PJRT_PLUGIN_DISCOVERY=0` opts out of step 4 entirely.
+Without a plugin, `backend="xla"` fails with a `BackendError` describing all four steps.
+
+## Install from source
+
+Force a source build of `evoxc` alone (dependencies may still come from wheels):
+
+```sh
+python -m pip install --no-binary=evoxc evoxc
+```
+
+This compiles the Rust extension, so a Rust toolchain and a C compiler must be on `PATH`.
+
+From a checkout, for development — the repository is a `uv` workspace holding **two** distributions, `evoxc` and the separate `evoxc-hf` member:
+
+```sh
+uv sync --all-packages --extra dev   # the locked workspace environment: both members + pytest
+uv run pytest                        # CPU-only suite
+uv build --all-packages              # both wheels + sdists into dist/
+
+# or, evoxc alone with pip, editable:
+pip install -e ".[dev]"
+pytest
+```
+
+<Aside type="caution" title="`--all-packages` is not optional">
+  A plain `uv sync` installs only the root `evoxc` project and uninstalls the `evoxc_hf` workspace member, which can leave an importable-looking but incomplete namespace package behind.
+  Use `uv sync --all-packages` (add `--all-extras` for the optional adapters and reference-test dependencies).
+</Aside>
+
+Both source installs build the extension, so both need the same Rust + C toolchain.
+
+## The separate `evoxc-hf` distribution
+
+HuggingFace checkpoint support is **not** in `evoxc`. It is `evoxc-hf`, its own distribution published from the same repository, whose hard dependencies are `numpy` and `evoxc`:
+
+```sh
+pip install evoxc-hf          # the model layer, built on evoxc's public API
+pip install "evoxc-hf[hf]"    # + torch and transformers, the reference oracles
+```
+
+The `hf` extra installs torch and transformers solely to validate and benchmark the model forward against the reference implementations; it is **oracle-only** and never a runtime requirement. `import evoxc` never imports `evoxc_hf`, torch or transformers.
+
+See [HuggingFace models](/huggingface/) for the API.
+
+## Troubleshooting
+
+<Aside type="note" title="`evoxc._evoxc_native` is missing">
+  A run that needs the Rust extension — any `vectorize`/`vmap`/`grad`/`jvp`/`vjp`/`batch_functions` transform, and `backend="native"` — raises an `ImportError` that names the extension and how to produce it.
+  `import evoxc` itself, tracing, lowering and the NumPy backend keep working, by design; the extension is an implementation of the transforms, not an import-time requirement.
+
+  Rebuild the extension from a checkout with the helper scripts, which write `evoxc/_evoxc_native*.so` into the package:
+
+  ```sh
+  source scripts/dev-env.sh && scripts/build-native.sh
+  ```
+
+  Alternatively set `EVOXC_NATIVE_LIB` to the path of an already built `.so`/`.pyd`. Reinstalling `evoxc` from a wheel also restores it.
+</Aside>
+
+<Aside type="note" title="A compiler backend reports that it is absent">
+  Compiler adapters are optional and fail loudly, with the exact pip command, rather than falling back:
+
+  - `backend="iree"` or `backend="tvm"` probes its pip package when the backend is activated and raises `BackendError` with `pip install evoxc[iree]` / `pip install evoxc[tvm]` when it is missing.
+  - `backend="xla"` activates unconditionally — its plugin is a runtime artifact — so the four-step discovery message comes from `compile`/`load` instead. The XLA backend class exposes `check_available()` as the explicit option-less preflight if you want to ask before you build.
+  - Compiler and runtime versions must match: IREE artifacts are version-specific and a mismatch is rejected at load.
+
+  No execution path silently switches to another backend or to a Python loop. If an unsupported operation reaches a backend, it raises `BackendError` naming the operation.
+</Aside>
+
+## Next
+
+- [Quickstart](/getting-started/quickstart/) — one graph through every explicit stage.
+- [Core concepts](/getting-started/core-concepts/) — the four value kinds and the staging contract.
+- [Compiler adapters](/guides/compiler-adapters/) — device kinds, target flags, validation state per adapter.
+- [Development](/development/) — the workspace build, gates and docs maintenance.
