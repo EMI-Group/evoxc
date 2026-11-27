@@ -1,0 +1,69 @@
+# Documentation-infrastructure config for the evoxc docs site
+# (https://compiler.evox.group, a Nimbus/Astro site under ./docs-site/).
+#
+# Consumed by the reusable workflows in EMI-Group/evox-docs-infra:
+#   .github/workflows/docs-site.yml     — build.yml + deploy.yml (the site)
+#   `docs-infra python-api`             — generated Python API reference pages
+#   `docs-infra translate`              — translations (disabled below)
+#
+# The site's own authoring and deployment contract lives in
+# ./docs-site/CONTEXT.md.
+version: 1
+translation:
+  source_locale: en
+  # Single-language site. To publish translated pages, add the locale IDs here
+  # (for example [zh-cn]), register the matching Nimbus `docs-<locale>`
+  # collection and route in docs-site/, and add the
+  # .github/workflows/docs-translate.yml caller from the toolkit starter.
+  locales: []
+  release_policy: release-series
+  sources:
+    - source: docs-site/src/content/docs
+      output: docs-site/src/content/docs-{locale}
+      exclude: [api]
+  glossary:
+    zh-cn:
+      evoxc: evoxc
+      EvoX Compiler: EvoX Compiler
+# Generated Python API reference pages: `docs-infra python-api` walks the
+# package's public namespaces with Griffe (static analysis, no imports) and
+# writes ordinary Nimbus pages into the site's `api/` collection, which the
+# build workflow regenerates before every site build.
+python_api:
+  package: evoxc
+  source_path: .
+  # The first module that exports a symbol owns its canonical page URL, so the
+  # definition modules come before the sugar namespaces. The top-level `evoxc`
+  # namespace is deliberately absent: its `__all__` is computed at import time
+  # (`sorted(name for name in globals() ...)`), which Griffe's static analysis
+  # cannot evaluate, so it yields no symbols; ./docs-site/ hand-writes the
+  # top-level surface instead. The package's public names are documented on
+  # their definition pages with every secondary import path as an alias.
+  modules:
+    - evoxc.core
+    - evoxc.ir
+    - evoxc.ops
+    - evoxc.numpy
+    - evoxc.trace
+    - evoxc.transforms
+    - evoxc.block
+    - evoxc.backends
+    - evoxc.pipeline
+    - evoxc.dist
+    - evoxc.sparse
+    - evoxc.persist
+    - evoxc.formats
+    - evoxc.external
+    - evoxc.random
+    - evoxc.build_cache
+    - evoxc.io
+  # `evoxc.ir.OpDef` (the class) and `evoxc.ir.opdef` (the lookup function)
+  # differ only in case, and the toolkit lowercases page paths, so both map to
+  # `api/evoxc/ir/opdef/`. Keep the class page (richer: attributes and
+  # docstring, cited from reference/architecture) and drop the function's; the
+  # lookup is described in the architecture page.
+  exclude: [evoxc.ir.opdef]
+  docstring_style: auto
+  output: probe-api-out
+  url_prefix: /api
+  repository: https://github.com/EMI-Group/evoxc

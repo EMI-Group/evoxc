@@ -1,0 +1,54 @@
+# Documentation site — compiler.evox.group
+#
+# Builds the Nimbus/Astro site under `docs-site/` on every pull request and
+# deploys it to the `evoxc-docs` Cloudflare Worker on pushes to `main`.
+#
+# The work happens in reusable workflows from the shared toolkit repository
+# `EMI-Group/evox-docs-infra` (pinned to its published `v0.1.0` tag):
+#   build.yml  — installs the toolkit, regenerates the Python API reference
+#                (`docs-infra python-api`, configured by `docs-infra.yml`),
+#                runs `npm ci && npm run build` in `docs-site/` and uploads
+#                `docs-site/dist/` as the `docs-site` artifact.
+#   deploy.yml — downloads that artifact and runs `wrangler deploy` with
+#                `docs-site/wrangler.jsonc` into the `docs-production`
+#                environment.
+#
+# Required repository setup (see `docs-site/CONTEXT.md`):
+#   - environment `docs-production` with the `CLOUDFLARE_API_TOKEN` secret and
+#     the `CLOUDFLARE_ACCOUNT_ID` variable,
+#   - the Worker `evoxc-docs` with the Custom Domain `compiler.evox.group`.
+# `DOCS_INFRA_READ_TOKEN` is optional: the toolkit is public, so the caller
+# falls back to the job token.
+#
+# The site is independent of the Python gate in `ci.yml` and of the release
+# workflows: a docs change never blocks a release, and a release never
+# publishes docs.
+name: Documentation
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    uses: EMI-Group/evox-docs-infra/.github/workflows/build.yml@v0.1.0
+    with:
+      site_directory: docs-site
+      output_directory: docs-site/dist
+      upload: ${{ github.event_name != 'pull_request' }}
+    secrets:
+      toolkit_token: ${{ secrets.DOCS_INFRA_READ_TOKEN }}
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    uses: EMI-Group/evox-docs-infra/.github/workflows/deploy.yml@v0.1.0
+    with:
+      output_directory: docs-site/dist
+      wrangler_config: docs-site/wrangler.jsonc
+    secrets:
+      toolkit_token: ${{ secrets.DOCS_INFRA_READ_TOKEN }}

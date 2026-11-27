@@ -1,0 +1,15 @@
+{
+  "$schema": "https://nimbus-docs.com/schema/nimbus.json",
+  "version": "0.9.0",
+  "lastReviewedNimbusVersion": "0.20.0",
+  "templatesTag": "templates-v0.9.0",
+  "variant": "starter",
+  "registry": "https://nimbus-docs.com/registry",
+  "install": {
+    "root": "src",
+    "aliases": {
+      "@/*": "src/*"
+    }
+  },
+  "components": []
+}

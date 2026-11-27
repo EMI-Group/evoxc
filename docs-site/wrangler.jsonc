@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "evoxc-docs",
+  "compatibility_date": "2026-11-27",
+  // The Worker is reachable only through its Custom Domain (compiler.evox.group),
+  // attached in the Cloudflare dashboard; there is no workers.dev URL.
+  "workers_dev": false,
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page"
+  }
+}
