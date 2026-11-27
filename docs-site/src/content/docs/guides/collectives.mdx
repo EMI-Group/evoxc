@@ -18,7 +18,7 @@ def distributed_sum(x):
     return evoxc.dist.all_reduce(x, op="sum", group=grp)
 
 evoxc.trace(distributed_sum, evoxc.TensorSpec((4, 8), evoxc.float32)).print()
-#   %0 = evoxc.all_reduce(%arg0) attributes {group = "dp", group_size = 4, reduce_op = "sum"}
+#   %0 = evoxc.all_reduce(%arg0) attributes {group = "dp", group_size = 4, reduce_op = "sum"} : tensor<4x8xf32> loc("collectives.py":6:11)
 ```
 
 The value model underneath is the same as everywhere else: a tensor is a **local** physical tensor, so a collective's result has your rank's local shape, and no global tensor type ever appears in the IR.
@@ -82,9 +82,9 @@ def who_am_i(x):
 They carry a `read` effect rather than `pure`, so a backend must resolve them per execution and must not constant-fold them at lower or compile time.
 Trying to use one as a Python control-flow value is not special-cased: it is a `SymbolicTensor`, so it fails the same way any symbolic value does in `if` — see [in-graph control flow](/guides/control-flow/).
 
-## What the numpy interpreter does
+## What the NumPy interpreter does
 
-The numpy interpreter installs a **single-process identity executor** at import: with one rank and a world size of one, every collective returns its input (a copy).
+The NumPy interpreter installs a **single-process identity executor** at import: with one rank and a world size of one, every collective returns its input (a copy).
 That is emulation, not parallelism — it keeps a distributed graph runnable and inspectable on one machine, and it is the one documented place where the backend layer reaches into `evoxc.dist` (to install the executor and to read the rank context).
 
 The hook itself is public and process-global:
@@ -98,7 +98,7 @@ An executor implements one method per collective — `all_reduce`, `all_gather`,
 Executors may coordinate across ranks in-process (the multi-rank tests do) or delegate to a real transport.
 `set_collective_executor(None)` resets the slot; a non-executor raises `TypeError`.
 
-For multi-rank simulation on the numpy interpreter, run the same executable once per simulated rank with a per-run rank context:
+For multi-rank simulation on the NumPy interpreter, run the same executable once per simulated rank with a per-run rank context:
 
 ```python
 ctx = evoxc.dist.RankContext(rank=1, world_size=4)     # frozen, validated
@@ -111,7 +111,7 @@ The context is thread-local for the duration of that run, so `rank()`/`world_siz
 
 `collectives` is `False` in every compiler adapter's `Capabilities`, and the capability pre-check rejects the op at `lower()` with a `BackendError` naming it — multi-rank runtime channels are simply not wired yet.
 There is no fallback and no silent single-rank rewriting.
-Practical consequence: a distributed graph runs on the numpy interpreter (or the `native` engine, whose collectives are single-rank identity semantics), and only the per-rank compute graph goes to a compiler.
+Practical consequence: a distributed graph runs on the NumPy interpreter (or the `native` engine, whose collectives are single-rank identity semantics), and only the per-rank compute graph goes to a compiler.
 
 ## A data-parallel step, end to end
 
@@ -148,11 +148,10 @@ Three things to notice:
 - The graph contains one explicit `all_reduce` and nothing else — no implicit gradient synchronization, no sharding pass, no collective inserted by a builder.
 - On the built-in single-process executor each rank gets its own local result back; the *same* graph, driven by a real multi-rank executor, computes the cross-rank average.
 
-<Aside type="warning" title="Placement is physical">
+<Aside type="caution" title="Placement is physical">
 A group names ranks; it does not place tensors.
 Multi-device work therefore means **one executable per device**, data moved with `Tensor.to(device)`, and communication declared in the graph with `evoxc.dist.*`.
-Two ranks in one process each need their own local input tensors and their own run of the executable — and the run boundary rejects any input whose `device` differs from the executable's device with a `DeviceError`.
-`evoxc.devices()` tells you what the host actually has; the compiler adapters own how a kind maps onto hardware — see [compiler adapters](/guides/compiler-adapters/).
+The run boundary rejects any input whose `device` differs from the executable's device with a `DeviceError`; placement rules live in [tensors and devices](/guides/tensors-and-devices/), and the compiler adapters own how a kind maps onto hardware — see [compiler adapters](/guides/compiler-adapters/).
 </Aside>
 
 For the surrounding machinery, see [tensors and devices](/guides/tensors-and-devices/) for placement and [backends and options](/guides/backends/) for choosing where each per-rank graph runs.

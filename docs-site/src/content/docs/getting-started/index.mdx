@@ -34,7 +34,7 @@ Every stage is a public function with its own public result object, so you can s
 - **No GPU.** The reference backend is a CPU NumPy interpreter, the second backend is an in-process Rust CPU engine shipped inside the wheel, and every test in this repository runs on CPU. Accelerators are optional adapters.
 - **A Rust toolchain and a C compiler — only when building from source.** Published wheels already contain the compiled Rust/PyO3 extension, so a normal `pip install evoxc` needs no compiler at all.
 
-That list is the whole prerequisite set. There is no CUDA toolkit to install, no compiler to configure and no environment variable to set before your first graph runs.
+That list is the whole prerequisite set. There is no CUDA toolkit to install, no compiler to configure and no environment variable to set before your first graph runs. [Install](/getting-started/install/) has the extras table and the source-build path.
 
 <Aside type="tip" title="Nothing to configure">
   The default backend is the NumPy interpreter, so `evoxc.build(fn, *specs)` without a `backend=` argument is a complete, working pipeline.
@@ -55,19 +55,10 @@ defn → trace → Graph → transform → Graph
      → load → Executable → run → Tensor
 ```
 
-| stage | public function | resulting object |
-|---|---|---|
-| graph function | `@evoxc.defn` | `Defn` |
-| trace | `evoxc.trace(fn, *specs)` | `Graph` |
-| transform | `evoxc.vectorize` / `evoxc.vmap` / `evoxc.batch_functions` / `evoxc.grad` / `evoxc.jvp` / `evoxc.vjp` | `Graph` |
-| lower | `evoxc.lower(graph, backend=…)` | `LoweredProgram` |
-| compile | `evoxc.compile(lowered, **options)` | `CompiledArtifact` |
-| load | `evoxc.load(artifact, device=…)` | `Executable` |
-| run | `evoxc.run(exe, *args)` | `Tensor` (same pytree shape you passed in) |
+Each arrow is one public function returning one public object type, and no function consumes an earlier-stage object and performs the missing steps.
+[Core concepts](/getting-started/core-concepts/) tabulates which call produces which object; [Pipeline objects](/reference/pipeline-objects/) lists what each one exposes.
 
-Each object is a distinct public type, and no function silently consumes an earlier-stage object and performs the missing steps. Passing a `Graph` to `evoxc.compile` raises rather than lowering for you.
-
-Convenience APIs exist, and they are documented compositions of exactly those rows — `evoxc.build` is trace → lower → compile → load, `evoxc.evaluate` additionally derives specs from your arguments and runs, and `evoxc.vmap` is a transparent wrapper over `evoxc.vectorize`. Sugar in evoxc never adds semantics you could not have written yourself with the explicit primitives.
+Convenience APIs exist, and they are documented compositions of exactly those stages — `evoxc.build`, `evoxc.evaluate`, `evoxc.build_cached` and `evoxc.vmap` add no semantics you could not have written yourself.
 
 ```python
 import evoxc
@@ -87,14 +78,14 @@ That snippet is the entire idea: a Python function becomes data, and the data is
 
 ## Four words
 
-The design is easiest to remember as four words — each one is a constraint on what the library is allowed to do.
+The design is easiest to remember as four words — the same four the [landing page](/#the-four-defining-properties) opens with, each a constraint on what the library is allowed to do.
 
-- **Minimal.** NumPy is the only runtime dependency. The package is a Python frontend, a NumPy interpreter and a compiled Rust extension; a prebuilt wheel runs graphs with no compiler toolchain installed.
-- **Explicit.** Every pipeline stage is a public function with its own result type. You can inspect, save or transfer the intermediate object at any stage, and no stage runs on your behalf.
-- **Compiler-neutral.** EvoXIR — a region-based SSA IR — represents the program. StableHLO connects it to IREE, XLA and TVM; which one you get is decided by `backend=`, not by the language you wrote.
 - **Simple.** Convenience APIs compose the pipeline and add no semantics: `vmap` uses `vectorize`, `bind` supplies arguments, `build` chains trace → lower → compile → load.
+- **Minimal.** NumPy is the only runtime dependency. The package is a Python frontend, a NumPy interpreter and a compiled Rust extension; a prebuilt wheel runs graphs with no compiler toolchain installed.
+- **Explicit.** Every pipeline stage is a public function with its own result type, and no stage runs on your behalf.
+- **Compiler-neutral.** EvoXIR — a region-based SSA IR — represents the program. StableHLO connects it to IREE, XLA and TVM; which one you get is decided by `backend=`, not by the language you wrote.
 
-The corollary is a short list of things evoxc deliberately does **not** do: it has no eager mode to fall back to, no implicit tracing, no hidden recompilation when a Python value changes, no automatic device movement, and no silent fallback from a compiler backend to NumPy.
+What follows from those words — no eager mode, no implicit tracing, no hidden recompilation, no automatic device movement, no silent fallback — is spelled out in [Core concepts](/getting-started/core-concepts/).
 
 ## What a first session looks like
 
@@ -117,9 +108,9 @@ The corollary is a short list of things evoxc deliberately does **not** do: it h
 
 ## Backends in one paragraph
 
-Two backends ship inside the wheel: the **NumPy interpreter**, which is the default and interprets EvoXIR with NumPy kernels, and the **`native`** backend, which runs the same EvoXIR on the in-process Rust CPU engine. Neither is a mode — you select one with `backend=` and the graph's meaning is unchanged.
+Two backends ship inside the wheel: the **NumPy interpreter**, which is the default and interprets EvoXIR with NumPy kernels, and the **`native`** backend, which runs the same EvoXIR on the in-process Rust CPU engine. Neither is a mode — you select one with `backend=` and the graph's meaning is unchanged; [Backends and options](/guides/backends/) is the full story.
 
-Everything else is an optional adapter that receives StableHLO: **IREE** (llvm-cpu, CUDA, ROCm, Vulkan-SPIRV), **XLA** (through a PJRT C API plugin the adapter discovers) and **TVM**. Because the boundary is a compiler-neutral IR, choosing a backend is a deployment decision, not a rewrite — and an absent or incapable backend raises `BackendError` instead of quietly doing something else.
+Everything else is an optional adapter that receives StableHLO: **IREE** (llvm-cpu, CUDA, ROCm, Vulkan-SPIRV), **XLA** (through a PJRT C API plugin the adapter discovers) and **TVM**. Because the boundary is a compiler-neutral IR, choosing a backend is a deployment decision, not a rewrite — an absent or incapable backend raises `BackendError` instead of quietly doing something else, as [Compiler adapters](/guides/compiler-adapters/) records per adapter.
 
 ## Reading this site
 

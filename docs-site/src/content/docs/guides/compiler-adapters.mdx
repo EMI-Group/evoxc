@@ -132,7 +132,7 @@ XLA additionally compiles static shapes only, and enforces the recorded shapes e
 ## Rank-0 float reductions on Vulkan
 
 A reduce whose result is rank-0 is lowered by IREE to a single workgroup of a single thread, so a full reduction is dramatically slower than an axis reduction.
-On the reference Intel iGPU a full `sum` of 16.8M f32 measured **648.5 ms**, versus **10.9 ms** with `split_reduction_non_exact=True` — about 59× — on the same graph.
+On the reference Intel iGPU a full `sum` of a 4096×4096 f32 tensor (16.8M elements) measured **648.5 ms**, versus **10.9 ms** with `split_reduction_non_exact=True` — about 59× — on the same graph, with both results `allclose` to the NumPy one (`./evoxc/backends/adapters/CONTEXT.md` records the medians).
 
 ```python
 exe = evoxc.build(fn, spec, backend="iree", device="vulkan",

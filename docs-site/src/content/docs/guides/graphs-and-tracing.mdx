@@ -57,8 +57,8 @@ module @"main" version 1 {
   func @main(%arg0: tensor<4x8xf32>, %arg1: tensor<8x4xf32>) -> tensor<4xf32> {
     %0 = evoxc.dot(%arg0, %arg1) : tensor<4x4xf32> loc("f.py":6:0)
     %1 = evoxc.tanh(%0) : tensor<4x4xf32> loc("f.py":6:0)
-    %2 = evoxc.reduce_sum(%1) attributes {axes = [1], keepdims = False, reduce_op = "sum"} : tensor<4xf32>
-    evoxc.return(%2)
+    %2 = evoxc.reduce_sum(%1) attributes {axes = [1], keepdims = False, reduce_op = "sum"} : tensor<4xf32> loc("f.py":6:0)
+    evoxc.return(%2) loc("f.py":6:0)
   }
 }
 ```
@@ -75,7 +75,7 @@ Each flattened leaf of `specs` must be one of two things:
 | Leaf kind | Meaning |
 |---|---|
 | `TensorSpec(shape, dtype, device=None, name=None)` | A tensor input: one block argument, one entry in `graph.tensor_specs` |
-| A static Python value — `None`, bool, int, float, complex, str, `Enum`, numpy `dtype`, `slice`, `ndarray`, `Dim`, `DimExpr`, `Device` | Graph specialization: recorded in `static_values`, never an input |
+| A static Python value — `None`, bool, int, float, complex, str, `Enum`, NumPy `dtype`, `slice`, `ndarray`, `Dim`, `DimExpr`, `Device` | Graph specialization: recorded in `static_values`, never an input |
 
 Anything else raises. The message names the pytree path and repeats the sanctioned paths:
 
@@ -106,7 +106,7 @@ sized = evoxc.TensorSpec((evoxc.Dim("B", 32), 4), evoxc.float32)
 ```
 
 `Dim` equality is structural on `(name, size)`, so two separately constructed `Dim("B")`s unify — you do not have to reuse one object.
-Inside a trace, symbolic values carry those dims through inference, and the numpy interpreter binds each named dim to one extent per run.
+Inside a trace, symbolic values carry those dims through inference, and the NumPy interpreter binds each named dim to one extent per run.
 
 <Aside type="caution" title="Run-time shape checks are per leaf">
 `flatten_inputs` validates each tensor leaf against its own spec: rank, static dims, dtype and device.
@@ -233,7 +233,8 @@ Anything that changes the program — an op, an attribute, a dtype, a shape, a s
 
 ## Source locations in errors
 
-Every op built by the frontend carries a call-site `Location`, and errors raised through a graph value include it, so a shape problem points at the line that caused it:
+Every op built by the frontend carries a call-site `Location`, and errors raised through a graph value include it, so a shape problem points at the line that caused it.
+Truth-testing a graph value is the first place you meet that: [In-graph control flow](/guides/control-flow/) owns the rule, and here is only what the location adds —
 
 ```python
 @evoxc.defn

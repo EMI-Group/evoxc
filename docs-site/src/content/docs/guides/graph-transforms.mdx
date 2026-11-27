@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-A transform in evoxc takes a `Graph` and returns a `Graph`. It never runs anything, never asks a backend for help, and never leaves a marker op behind: the result is a program made of ordinary `evoxc.ops` ops with static shapes, so numpy, the native engine and every compiler adapter execute it without knowing a transform happened.
+A transform in evoxc takes a `Graph` and returns a `Graph`. It never runs anything, never asks a backend for help, and never leaves a marker op behind: the result is a program made of ordinary `evoxc.ops` ops with static shapes, so the NumPy interpreter, the native engine and every compiler adapter execute it without knowing a transform happened.
 That is design principle 7, and it is why `vmap`-ed or differentiated code can be persisted, inspected and lowered exactly like the graph it came from.
 
 ## One Rust implementation, no fallback
@@ -90,7 +90,7 @@ scores = evoxc.run(exe, W, X)          # X: (5, 4) → scores: (5,)
 ### Axis levels and the batch dimension
 
 One batching pass creates **one** fresh batch `Dim` shared by all of its mapped inputs, named after the pass depth: `batch` at depth 0, `batch_1` at depth 1, and so on.
-The name must be level-distinct because the numpy interpreter binds symbolic dims by name: a mismatch then raises a clear `ShapeError` ("dimension 'batch' is already bound to 4, got 1") instead of silently broadcasting.
+The name must be level-distinct because the NumPy interpreter binds symbolic dims by name: a mismatch then raises a clear `ShapeError` ("dimension 'batch' is already bound to 4, got 1") instead of silently broadcasting.
 
 The depth counter follows `TransformCallable` composition, which is why `vmap(vmap(f))` and `vmap(grad(f))` nest cleanly.
 `vectorize(vectorize(g))` on the Graph path runs both passes at depth 0 and yields same-named dims — a documented v1 fail-explicit: unequal extents raise `ShapeError`.
