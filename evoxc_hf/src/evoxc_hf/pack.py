@@ -46,7 +46,7 @@ inside the graph would materialise it on every call, so the plan declares that
 copy instead — inferred from the spec tree by
 :func:`evoxc_hf._specs.transposed_aliases` (a tree with an ``embed.weight`` and no
 ``lm_head.weight`` is a tied tree), or passed explicitly as
-``pack_plan(..., transposed_aliases=...)`: the plan stores
+``pack_plan(..., transposed_aliases=...)``: the plan stores
 ``np.ascontiguousarray(params["embed.weight"].T)`` **once** as its own packed
 entry under the derived key ``lm_head.weight``, and ``unpack`` slices it with the
 same static :class:`~evoxc_hf.pack.PackEntry` (``transposed=True``,

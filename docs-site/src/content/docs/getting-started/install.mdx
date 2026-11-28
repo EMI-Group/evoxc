@@ -68,14 +68,14 @@ exe = evoxc.build(f, spec_x, spec_w, backend="iree")   # needs the `iree` extra
 There is nothing pip-installable that provides a PJRT C API plugin for the CPU, so `xla` does not ship an extra.
 The adapter drives a PJRT C API plugin `.so` over ctypes and discovers it in this order:
 
-1. the `plugin_path` option — e.g. `evoxc.load(artifact, backend="xla", plugin_path="/path/to/pjrt_plugin.so")`;
+1. the `plugin_path` option — e.g. [`evoxc.load(artifact, backend="xla", plugin_path="/path/to/pjrt_plugin.so")`](/api/evoxc/pipeline/load/);
 2. the `EVOXC_PJRT_PLUGIN` environment variable;
 3. the well-known installation paths;
 4. an installed JAX PJRT plugin in the `jax_plugins/<platform>/<name>_plugin.so` layout.
 
 Step 4 is how most users get a real accelerator: `pip install jax-rocm7-pjrt` for AMD, `pip install jax-cuda12-pjrt` for NVIDIA.
 `jax` and `jaxlib` are never imported — the plugin `.so` is dlopen-ed directly — and `EVOXC_PJRT_PLUGIN_DISCOVERY=0` opts out of step 4 entirely.
-Without a plugin, `backend="xla"` fails with a `BackendError` describing all four steps.
+Without a plugin, `backend="xla"` fails with a [`BackendError`](/api/evoxc/core/backenderror/) describing all four steps.
 
 ## Install from source
 
@@ -138,7 +138,7 @@ See [HuggingFace models](/huggingface/) for the API.
   Compiler adapters are optional and fail loudly, with the exact pip command, rather than falling back:
 
   - `backend="iree"` or `backend="tvm"` probes its pip package when the backend is activated and raises `BackendError` with the pip hint when it is missing.
-  - `backend="xla"` activates unconditionally — its plugin is a runtime artifact — so its four-step discovery message comes from `compile`/`load` instead.
+  - `backend="xla"` activates unconditionally — its plugin is a runtime artifact — so its four-step discovery message comes from [`compile`](/api/evoxc/pipeline/compile/)/`load` instead.
 
   No execution path silently switches to another backend or to a Python loop. Per-adapter failure points and remedies: [Compiler adapters](/guides/compiler-adapters/#activation-and-explicit-failure).
 </Aside>

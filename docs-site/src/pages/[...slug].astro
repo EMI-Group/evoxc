@@ -14,6 +14,8 @@ import {
 } from "@cloudflare/nimbus-docs/runtime";
 import { components } from "../components";
 
+import type { SidebarItem } from "@cloudflare/nimbus-docs/types";
+
 export const getStaticPaths = getDocsStaticPaths;
 
 const page = await getDocsPage(Astro);
@@ -24,8 +26,37 @@ const currentSlug = stripBase(Astro.url.pathname, import.meta.env.BASE_URL).repl
 
 const { sidebar: sidebarOn, tableOfContents: tocOn } = await getRouteFlags(entry);
 
+/**
+ * The generated Python API reference nests three levels deep
+ * (`api/<package>/<module>/<symbol>/`, ~400 pages) and a Nimbus sidebar group
+ * renders open unless its `collapsed` is `true`, which would flood the rail.
+ * Collapse every group that hangs off `api/`; the group holding the current
+ * page still opens, because `SidebarGroup.astro` treats an active descendant
+ * as open. Scoped to `api/` so the hand-written sections keep their rail.
+ */
+function collapseApiGroups(items: SidebarItem[]): SidebarItem[] {
+  const withinApi = (children: SidebarItem[]): boolean =>
+    children.some((item) =>
+      item.type === "link"
+        ? item.href === "/api/" || item.href.startsWith("/api/")
+        : item.type === "group"
+          ? withinApi(item.children)
+          : false,
+    );
+  return items.map((item) => {
+    if (item.type !== "group") return item;
+    const children = collapseApiGroups(item.children);
+    return withinApi(children)
+      ? { ...item, collapsed: true, children }
+      : { ...item, children };
+  });
+}
+
 const sidebar = sidebarOn
-  ? await getSidebar(currentSlug, { collection: entry.collection })
+  ? await getSidebar(currentSlug, {
+      collection: entry.collection,
+      transform: ({ tree }) => collapseApiGroups(tree),
+    })
   : false;
 const prevNext = await getPrevNext(currentSlug, {
   sidebarTree: sidebar === false ? [] : sidebar,
