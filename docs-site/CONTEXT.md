@@ -35,7 +35,7 @@ npm run build                                   # astro build → dist/ (467 pag
 `check` reports Environment, Migrations and Types green, Structure and Authoring "partly checked" — the computed `sidebar` needs a real build, and the authoring rules read `.mdx` only, so the 439 generated `.md` pages are never linted.
 The build therefore validates the generated pages structurally (every page renders, the strict `docs` frontmatter schema accepts it), and `nimbus/internal-link` covers the hand-written `.mdx` links into `/api/`.
 Links *inside* a generated page are not link-checked by either tool: to verify them, scan the built output (every `href`/`src` starting `/` must resolve to a file or `<path>/index.html` in `dist/`).
-The current tree resolves 233,402 internal `href`/`src` targets across `dist/` (467 HTML files) with 0 missing.
+The current tree resolves 233,419 internal `href`/`src` targets across `dist/` (467 HTML files) with 0 missing.
 
 ## The generated Python API reference (committed)
 
