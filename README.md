@@ -6,6 +6,7 @@
 <p><strong>EvoX Compiler</strong> — a minimal, explicit, compiler-neutral tensor graph compiler and runtime.</p>
 
 <p>
+  <a href="https://compiler.evox.group"><img src="https://img.shields.io/badge/docs-compiler.evox.group-7c5cff?style=flat-square" alt="docs: compiler.evox.group"></a>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
   <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20native%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, native, IREE, XLA, TVM"></a>
@@ -13,10 +14,10 @@
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
-<p><a href="https://github.com/EMI-Group/evox">EvoX</a> · <a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#batch-transformation--one-graph-for-a-whole-population">Batch</a> · <a href="#reusing-part-of-a-computation--split_by_inputs">Split</a> · <a href="#backends">Backends</a> · <a href="#hardware-support">Hardware</a> · <a href="#how-evoxc-compares">Compared</a> · <a href="#install">Install</a></p>
+<p><a href="https://github.com/EMI-Group/evox">EvoX</a> · <a href="https://compiler.evox.group">Docs</a> · <a href="#why-evoxc-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#batch-transformation--one-graph-for-a-whole-population">Batch</a> · <a href="#reusing-part-of-a-computation--split_by_inputs">Split</a> · <a href="#backends">Backends</a> · <a href="#hardware-support">Hardware</a> · <a href="#how-evoxc-compares">Compared</a> · <a href="#install">Install</a></p>
 </div>
 
-**evoxc (EvoX Compiler)** is a Python tensor graph compiler and runtime for building, transforming, and executing numerical programs. It provides explicit computation graphs, composable vectorization and automatic differentiation, and StableHLO integration with IREE, XLA, and TVM — plus explicit escape hatches for custom kernels, custom calls and hand-written StableHLO. A NumPy interpreter lets you get started without a compiler toolchain.
+**evoxc (EvoX Compiler)** is a Python tensor graph compiler and runtime for building, transforming, and executing numerical programs. It provides explicit computation graphs, composable vectorization and automatic differentiation, and StableHLO integration with IREE, XLA, and TVM — plus explicit escape hatches for custom kernels, custom calls and hand-written StableHLO. A NumPy interpreter lets you get started without a compiler toolchain. Full documentation is at **[compiler.evox.group](https://compiler.evox.group)**.
 
 Part of the [EvoX ecosystem](https://github.com/EMI-Group/evox), evoxc provides the compilation and execution foundation for the experimental [EvoX 2.0 alpha](https://github.com/EMI-Group/evox/tree/evoxc-exp). Its graph transformations support population-based workloads, including batched evaluation and combining multiple candidate programs into a single graph. evoxc can also be used independently for numerical computing.
 
@@ -25,8 +26,10 @@ evoxc owns graph construction, transformations, and the explicit trace → lower
 ---
 
 ## Documentation
-The reference documentation lives at **[compiler.evox.group](https://compiler.evox.group)** — installation, the explicit pipeline, graph transforms, control flow, backends and compiler adapters, collectives, persistence, tensor formats, sparse tensors, the op catalogue, the option tables and the generated Python API reference.
-The site is built from this repository's `./docs-site/` directory through the shared [EMI-Group/evox-docs-infra](https://github.com/EMI-Group/evox-docs-infra) workflows; its authoring contract is `./docs-site/CONTEXT.md`.
+
+The reference site at **[compiler.evox.group](https://compiler.evox.group)** covers installation, the explicit pipeline, graph transforms, control flow, backends and compiler adapters, collectives, persistence, tensor formats, sparse tensors, the op catalogue, the option tables and the generated Python API reference.
+Its source is this repository's `./docs-site/` directory, built and deployed through the shared [EMI-Group/evox-docs-infra](https://github.com/EMI-Group/evox-docs-infra) workflows; its authoring contract is `./docs-site/CONTEXT.md`.
+Architecture and contracts are documented in-repo: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchmark status) · [`./evoxc/CONTEXT.md`](evoxc/CONTEXT.md) (the binding public API contract) · [`./evoxc_hf/CONTEXT.md`](evoxc_hf/CONTEXT.md) · [`./tests/CONTEXT.md`](tests/CONTEXT.md) — every package directory carries its own `CONTEXT.md` describing its purpose, API surface and constraints.
 
 ## Why evoxc exists
 
@@ -62,7 +65,7 @@ The **frontend** owns the tensor-graph language, EvoXIR, graph transformations, 
 
 The default **NumPy interpreter** executes EvoXIR with NumPy kernels and uses serialized IR as its compiled artifact. The **`native`** backend runs EvoXIR on the Rust CPU engine. **IREE**, **XLA**, and **TVM** compile StableHLO and execute through their own runtimes.
 
-See [CONTEXT.md](CONTEXT.md#architecture-overview) for module dependencies and architecture details.
+See [CONTEXT.md](CONTEXT.md#architecture-overview) for the module dependency graph.
 
 ## Quickstart — sixty seconds
 
@@ -139,7 +142,7 @@ Python values specialize a graph, symbolic values describe its computation, and 
 | Python/static value | `None`, bool, int, float, str, `Enum`, dtype, `slice`, config objects | n/a | evaluated at trace time and snapshotted into the graph; changing a static value requires tracing a new graph |
 | `TensorSpec` | describes a future runtime tensor: `shape` (symbolic dims allowed), `dtype`, optional `device` | no | the only thing you can pass as a trace input besides static values |
 | `SymbolicTensor` | an SSA value inside a graph | **no** | `dtype`, symbolic shape, source location, SSA identity |
-| `Tensor` | a materialized runtime tensor | yes | concrete shape/dtype and a **physical** `device`: numpy host data is `Device('cpu', 0)`, a device payload reports its real device |
+| `Tensor` | a materialized runtime tensor | yes | concrete shape/dtype and a **physical** `device`: NumPy host data is `Device('cpu', 0)`, a device payload reports its real device |
 
 Pass runtime tensors as graph inputs. Capturing a `Tensor` in a closure raises `TraceError`; use `evoxc.constant` to embed host data explicitly (this emits a warning).
 
@@ -245,7 +248,7 @@ The recipe follows the hardware: **CPU → `bands="auto"`; GPU → `bands=16` or
 
 On divergent genetic-programming populations, NumPy evaluations with `bands="auto"` were **2.6–10.7× faster** than with a flat merge. For identical programs, it selected a flat merge and emitted zero `select` operations. See the [batching measurements](evoxc/transforms/CONTEXT.md#batch_functions-frontend-batch_functionspy-_native_batchpy-_reportpy).
 
-On a merged population running through IREE 3.11.0 on ROCm, `dispatch_formation="aggressive"` reduced the dispatch count from **596 to 548** and warm execution time by **9%**. See the [dispatch formation results](evoxc/bench/dispatch_formation_findings.md).
+On a merged population running through IREE 3.11.0 on ROCm, `dispatch_formation="aggressive"` cut the dispatch count from **596 to 548** and warm execution time by **7–9%** (population 1000–4000). The flag is opt-in, because llvm-cpu warm time is flat to marginally worse. See the [dispatch formation results](evoxc/bench/dispatch_formation_findings.md).
 
 Inspect the merge through `graph.batch_report`: it records value classes, shared and switched operations, output muxes, emitted operations, band sizes, and cost estimates. This transform metadata is available in memory and is not saved with the graph. See [current limitations](#status--deferrals) for unsupported batching rules.
 
@@ -307,7 +310,7 @@ evoxc.trace(distributed_step, TensorSpec((4,), evoxc.float32)).print()
 
 ### Sparse tensors
 
-`evoxc.sparse` is a first-class value model — `SparseTensor`/`CSRTensor`/`CSCTensor` for data, `SparseTensorSpec` at trace time, symbolic instances inside graphs — with 16 graph ops (COO/CSR/CSC conversion, union `add`, intersection `multiply`, `multiply_dense`, `reduce_sum`, `transpose`, `reshape`, `concatenate`, sparse@dense and dense@sparse `matmul`) and numpy kernels that validate structure at runtime. Batching and derivative rules travel with the ops, so sparse values flow through `vmap`/`grad` and through `cond`/`while_loop`/`scan`. Compiler backends defer sparse with an explicit `BackendError` suggesting `evoxc.sparse.to_dense`.
+`evoxc.sparse` is a first-class value model — `SparseTensor`/`CSRTensor`/`CSCTensor` for data, `SparseTensorSpec` at trace time, symbolic instances inside graphs — with 16 graph ops (COO/CSR/CSC conversion, union `add`, intersection `multiply`, `multiply_dense`, `reduce_sum`, `transpose`, `reshape`, `concatenate`, sparse@dense and dense@sparse `matmul`) and NumPy kernels that validate structure at runtime. Batching and derivative rules travel with the ops, so sparse values flow through `vmap`/`grad` and through `cond`/`while_loop`/`scan`. Compiler backends defer sparse with an explicit `BackendError` suggesting `evoxc.sparse.to_dense`.
 
 ```python
 s = evoxc.sparse.coo(np.array([[0, 0], [1, 2]]), np.array([1.5, 2.5], np.float32), (3, 4))
@@ -393,7 +396,7 @@ exe_b = evoxc.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
 print(exe_a is exe_b, cache.hits, cache.misses)  # True 1 1
 ```
 
-Inspection is pure reads at every stage: `graph.summary()` (counts, input/output trees, static values), `graph.digest()` (a structural hash that ignores source locations, so it is stable across processes and `save`/`load`), `graph.text()`, `program.summary()`/`source_text()`, and `exe.summary()`/`plan_text()` — the last renders the backend's actual plan, numpy or native.
+Inspection is pure reads at every stage: `graph.summary()` (counts, input/output trees, static values), `graph.digest()` (a structural hash that ignores source locations, so it is stable across processes and `save`/`load`), `graph.text()`, `program.summary()`/`source_text()`, and `exe.summary()`/`plan_text()` — the last renders the backend's actual plan, NumPy or native.
 
 ### Tensor containers: safetensors and GGUF
 
@@ -423,7 +426,7 @@ evoxc.io.wait_all()
 
 ### A conformance and benchmark harness
 
-The `evoxc.bench` conformance/benchmark harness — a curated set of operation-level, small-block and end-to-end example programs, staged through the explicit pipeline and compared against pure-numpy references (plus PyTorch when installed) — lives in the separate `evoxc-bench` repository together with the wider campaign records and generated reports; none of its paths exist in this tree.
+The `evoxc.bench` conformance/benchmark harness — a curated set of operation-level, small-block and end-to-end example programs, staged through the explicit pipeline and compared against pure-NumPy references (plus PyTorch when installed) — lives in the separate `evoxc-bench` repository together with the wider campaign records and generated reports; none of its paths exist in this tree.
 
 The in-tree [`evoxc/bench/`](evoxc/bench) is the committed evidence cited above: the deterministic probe scripts, their raw JSON records and the narrated findings for dispatch formation, compile/staging cost, the native engine, IREE 3.13 on ROCm and Intel Vulkan.
 
@@ -431,8 +434,8 @@ The in-tree [`evoxc/bench/`](evoxc/bench) is the committed evidence cited above:
 
 | backend | how to enable | what it owns | validated on |
 |---|---|---|---|
-| **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
-| **`native`** | `backend="native"` — optional, shipped in the wheel | the in-process Rust CPU engine: immutable plans over typed host buffers, numpy-mirroring staging | CPU (this host; `native/tools/parity_cpu.py` at parity with numpy — exact bool/integer, measured float tolerances) |
+| **numpy interpreter** | nothing — the default | interprets EvoXIR directly with NumPy kernels; all symbolic shapes | CPU (always) |
+| **`native`** | `backend="native"` — optional, shipped in the wheel | the in-process Rust CPU engine: immutable plans over typed host buffers, NumPy-mirroring staging | CPU (this host; `native/tools/parity_cpu.py` at parity with NumPy — exact bool/integer, measured float tolerances) |
 | **StableHLO export** | nothing — `evoxc.backends.stablehlo.export(graph)` | MLIR text emission; also the lowering input for every compiler | n/a (text) |
 | **IREE** | `pip install evoxc[iree]`, `lower(..., backend="iree")` | IREE compile + HAL runtime, external-kernel host dispatch, device-resident payloads | llvm-cpu, CUDA, ROCm, Vulkan-SPIRV |
 | **XLA** | `backend="xla"` — no path plumbing: it discovers an installed JAX plugin (`pip install jax-rocm7-pjrt` / `jax-cuda12-pjrt`), else `EVOXC_PJRT_PLUGIN` / `plugin_path` | PJRT C API via ctypes over an auto-discovered plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
@@ -468,7 +471,7 @@ The CPU engine builds on mature crates rather than hand-rolled N-dimensional mac
 
 The reusable crate is **`evoxc`**, with features `cpu` (the CPU execution engine), `runtime` (the runtime session layer) and `full`; with `default-features = false` it is the graph/transform core on its own, without the CPU engine. The Rust crates publish separately on crates.io in dependency order (`evoxc-core` → `evoxc-compiler` → `evoxc-runtime` → `evoxc-cpu` → `evoxc`), so another language frontend can depend on the same numerical authority.
 
-The Python package `evoxc` binds that crate through PyO3 as the extension module `evoxc._evoxc_native`, which `pip install evoxc` loads; Python keeps the frontend duties (executing `defn` bodies, specs/pytree adaptation, the extension-rule bridge) and never a second transform implementation. Tensors cross that boundary as typed numpy views in and zero-copy numpy arrays out: an input is copied once into the engine's owned buffers, and a returned array is a fresh, C-contiguous, writeable array that shares no memory with any input.
+The Python package `evoxc` binds that crate through PyO3 as the extension module `evoxc._evoxc_native`, which `pip install evoxc` loads; Python keeps the frontend duties (executing `defn` bodies, specs/pytree adaptation, the extension-rule bridge) and never a second transform implementation. Tensors cross that boundary as typed NumPy views in and zero-copy NumPy arrays out: an input is copied once into the engine's owned buffers, and a returned array is a fresh, C-contiguous, writeable array that shares no memory with any input.
 
 The release builds `cp311-abi3` wheels for Linux x86-64 and AArch64 (manylinux2014 and musllinux 1.2), macOS x86-64 and Arm64, and Windows x86-64, plus a source distribution with the whole Rust workspace. The wheels use the CPython 3.11 stable ABI and are smoke-tested on CPython 3.11; Ubuntu CI separately tests Python 3.11–3.14. See the [tested platforms](RELEASING.md#tested-distribution-artifacts) for details.
 
@@ -489,10 +492,10 @@ cfg, params = loaded.config, loaded.params
 fwd = evoxc_hf.forward_fn(cfg, seq_len=32)         # (params, input_ids) -> logits; captures no weights
 ids = np.zeros((1, 32), np.int32)                # static (batch, seq_len)
 
-exe = evoxc_hf.build(fwd, cfg, backend="iree")     # numpy interpreter by default
+exe = evoxc_hf.build(fwd, cfg, backend="iree")     # NumPy interpreter by default
 logits = evoxc_hf.run(exe, params, ids)            # -> evoxc.Tensor on the executable's device
 host = evoxc_hf.predict(loaded, ids, backend="iree")    # host-facing shorthand -> np.ndarray
-oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-numpy oracle
+oracle = evoxc_hf.reference_logits(cfg, params, ids)    # independent pure-NumPy oracle
 ```
 
 - **Families:** `llama` (also `mistral`/`qwen2`/`qwen3` — RMSNorm, RoPE, GQA, SwiGLU; Qwen3 adds per-head QK-Norm) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
@@ -512,7 +515,7 @@ PyTorch and JAX provide broader libraries for model development and eager execut
 ## Install
 
 ```bash
-pip install evoxc               # numpy only — a complete system, running on the default numpy interpreter
+pip install evoxc               # NumPy only — a complete system, running on the default NumPy interpreter
 pip install "evoxc[iree]"       # + the IREE adapter: llvm-cpu, CUDA, ROCm, Vulkan-SPIRV
 pip install "evoxc[compilers]"  # + IREE and TVM
 
@@ -555,25 +558,23 @@ Both source install commands build the extension and need a Rust toolchain and a
 
 ```
 evoxc/            the `evoxc` distribution's package: core, ir, ops, trace, transforms, backends, dist,
-                sparse, random, io, pipeline, persist, build_cache, block, external, bench
+                  sparse, random, io, pipeline, persist, build_cache, block, external, bench
 evoxc_hf/         the separate `evoxc-hf` distribution: workspace member, src layout
-                (evoxc_hf/src/evoxc_hf/), own pyproject/README/LICENSE/version/extras
+                  (evoxc_hf/src/evoxc_hf/), own pyproject/README/LICENSE/version/extras
 native/           the Rust workspace: numerical core, transform engines, the PyO3 extension
 scripts/          dev-env and native-build helpers (`dev-env.sh`, `build-native.sh`)
-tests/          pytest suite mirroring evoxc/ + spec-compliance tests
-assets/         the diagrams in this README
-CONTEXT.md      architecture, contracts and status (root, the source of truth)
+tests/            pytest suite mirroring evoxc/ + spec-compliance tests
+assets/           the diagrams in this README
+CONTEXT.md        architecture, contracts and status (root, the source of truth)
 ```
-
-Docs map: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchmark status) · [`./evoxc/CONTEXT.md`](evoxc/CONTEXT.md) (the binding public API contract) · [`./evoxc_hf/CONTEXT.md`](evoxc_hf/CONTEXT.md) · [`./tests/CONTEXT.md`](tests/CONTEXT.md) — every package directory carries its own `CONTEXT.md` describing its purpose, API surface and constraints.
 
 ## Status & deferrals
 
-Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops (their portables inline on every compiler backend), `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), the `evoxc.custom_call`/`evoxc.inline_stablehlo` compiler escape hatches and `evoxc.compile_text`, pluggable backends (`register`/`unregister`/`replace=True` and `evoxc.backends` entry-point discovery), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against numpy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the numpy interpreter, the optional `native` Rust CPU-engine backend, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the committed bench evidence under [`evoxc/bench/`](evoxc/bench).
+Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, `vectorize`/`vmap`/`grad`/`jvp`/`vjp` and the `batch_functions` merge (each executed by one in-repo Rust implementation — the numerical engine in `./native/`, reached through the packaged `evoxc/_evoxc_native` PyO3 extension that maturin compiles into the wheel — with Python keeping validation, spec/pytree adaptation, the extension-rule bridge and `Graph` reconstruction, never a second transform implementation), `evoxc.dist` collectives, `evoxc.block` custom ops (their portables inline on every compiler backend), `evoxc.external_call` kernels (numpy + IREE host and device-resident dispatch), the `evoxc.custom_call`/`evoxc.inline_stablehlo` compiler escape hatches and `evoxc.compile_text`, pluggable backends (`register`/`unregister`/`replace=True` and `evoxc.backends` entry-point discovery), `evoxc.sparse`, `evoxc.random` (3 algorithms, bit-exact against NumPy), `evoxc.io`, `evoxc.persist`/`Cache`, `evoxc.numpy`, the NumPy interpreter, the optional `native` Rust CPU-engine backend, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the committed bench evidence under [`evoxc/bench/`](evoxc/bench).
 
 The structural passes [`split_by_inputs`](#reusing-part-of-a-computation--split_by_inputs) and `analyze_inputs` are Python-only by design — they slice a graph's data structure and carry no numerical authority — so they need no Rust engine and no backend support.
 
-The recorded November 24, 2026 baseline for `tests/` was **8,018 passed, 88 skipped, and 1 expected failure** with IREE installed and the native extension built. See the [test baseline and environment](tests/CONTEXT.md#baseline-measured-at-this-head).
+The recorded November 28, 2026 baseline for `tests/` was **8,139 passed, 88 skipped, and 1 expected failure** with IREE installed and the native extension built. See the [test baseline and environment](tests/CONTEXT.md#baseline-measured-at-this-head).
 
 The separate `evoxc_hf` suite recorded **695 passed and 33 skipped** in the base environment. See the [HuggingFace integration notes](evoxc_hf/CONTEXT.md).
 
@@ -585,7 +586,7 @@ The separate `evoxc_hf` suite recorded **695 passed and 33 skipped** in the base
 - StableHLO export deferrals: `cumsum`, `cumprod`, `diagonal`, `erf`/`gelu`, `tril`/`triu`, `flip`, `roll`, `nan_to_num`, `random_multinomial`, and the linalg `solve`/`cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp` (`eigh` is v1 via a cyclic-Jacobi while-loop composition).
 - Sparse on compiler backends (densify with `evoxc.sparse.to_dense`), `sparse@sparse` matmul, sparse constants, whole-sparse `bind`.
 - Collectives and `runtime_call` are not compiled by any adapter in v1 (multi-rank runtime channels are not wired).
-- Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
+- Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the NumPy backend handles every symbolic shape).
 - `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`.
 - `split_by_inputs` handles straight-line graphs only: control-flow regions and effectful ops (collectives, `runtime_call`/`external_call`/`custom_call`/`inline_stablehlo`) raise `TransformError`, plain tuple/list/dict containers prune per tensor leaf, and nothing re-prepares a changed fixed input automatically.
 
