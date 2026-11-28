@@ -70,7 +70,7 @@ Every reference page is consistent with this one chain, and each arrow is a publ
 | define | `evoxc.defn` | `Defn` |
 | trace | `evoxc.trace` | `Graph` (EvoXIR) |
 | transform (optional) | `evoxc.vectorize` / `vmap` / `grad` / `jvp` / `vjp` / `batch_functions` | `Graph` |
-| transform (structural, optional) | `evoxc.split_by_inputs` | `SplitPlan` — a `prepare` / `apply` pair of `Graph`s |
+| transform (structural, optional) | [`evoxc.split_by_inputs`](/api/evoxc/transforms/split-by-inputs/) | [`SplitPlan`](/api/evoxc/transforms/splitplan/) — a `prepare` / `apply` pair of `Graph`s |
 | lower | `evoxc.lower` | `LoweredProgram` |
 | compile | `evoxc.compile` | `CompiledArtifact` |
 | load | `evoxc.load` | `Executable` |

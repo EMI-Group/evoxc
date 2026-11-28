@@ -62,7 +62,7 @@ f(evoxc.ones((4, 8)), evoxc.ones((8, 4)))   # TraceError, not a result
 
 **Produced by** `evoxc.trace(fn_or_defn, *specs)` or by any graph transform (`vectorize`, `vmap`, `grad`, `jvp`, `vjp`, `batch_functions`).
 
-`evoxc.split_by_inputs` is the structural exception among the transforms: it does not hand back a `Graph` itself, but a `SplitPlan` whose `prepare` and `apply` halves are two `Graph`s produced exactly this way.
+[`evoxc.split_by_inputs`](/api/evoxc/transforms/split-by-inputs/) is the structural exception among the transforms: it does not hand back a `Graph` itself, but a `SplitPlan` whose `prepare` and `apply` halves are two `Graph`s produced exactly this way.
 A [`Graph`](/api/evoxc/trace/graph/) is EvoXIR: a region-based SSA module, the input/output trees, and the static Python values the trace specialized on. Its attributes are `module`, `input_specs`, `output_tree`, `static_values` and `source_locations`.
 
 - **Exposed:** `summary()`, `digest()`, `text()`, `print()`, `verify()`, `save(path)` / `Graph.load(path)`, and the I/O helpers `flatten_inputs(args)`, `unflatten_outputs(flat)`, `validate_inputs(args)`.
@@ -93,7 +93,7 @@ Given a callable or `Defn` instead of a `Graph`, `evoxc.split_by_inputs` returns
 
 ## `InputAnalysis`
 
-**Produced by** `evoxc.analyze_inputs(graph)`; anything that is not a traced `Graph` raises `TypeError`.
+**Produced by** [`evoxc.analyze_inputs(graph)`](/api/evoxc/transforms/analyze-inputs/); anything that is not a traced `Graph` raises `TypeError`.
 
 It is pure inspection over the same helpers the split uses, so the report cannot drift from the transform — it never mutates, traces, executes or imports a backend.
 

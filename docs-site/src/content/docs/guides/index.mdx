@@ -67,7 +67,7 @@ The distinction that matters most: a static value is *Python*, so Python `if`/`f
     `@evoxc.defn`, `evoxc.trace`, and the `Graph` you get back — specs, static values, pytrees, `summary()`, `digest()`.
   </Card>
   <Card title="Graph transforms" href="/guides/graph-transforms/">
-    `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` as ordinary graph-to-graph functions, plus `split_by_inputs` (one graph into a fixed/varying `prepare`/`apply` pair) and `analyze_inputs`.
+    `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and `batch_functions` as ordinary graph-to-graph functions, plus [`split_by_inputs`](/api/evoxc/transforms/split-by-inputs/) (one graph into a fixed/varying `prepare`/`apply` pair) and [`analyze_inputs`](/api/evoxc/transforms/analyze-inputs/).
   </Card>
   <Card title="In-graph control flow" href="/guides/control-flow/">
     `cond`, `while_loop` and `scan` — runtime branches and loops that stay inside the persisted program.

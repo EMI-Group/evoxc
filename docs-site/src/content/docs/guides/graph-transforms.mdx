@@ -12,7 +12,7 @@ That is design principle 7, and it is why `vmap`-ed or differentiated code can b
 
 [`vectorize`](/api/evoxc/transforms/vectorize/), [`vmap`](/api/evoxc/transforms/vmap/), [`grad`](/api/evoxc/transforms/grad/), [`jvp`](/api/evoxc/transforms/jvp/), [`vjp`](/api/evoxc/transforms/vjp/) and the [`batch_functions`](/api/evoxc/transforms/batch-functions/) merge are a single implementation in the Rust core, reached through the compiled `evoxc._evoxc_native` extension (`scripts/build-native.sh` builds it; `EVOXC_NATIVE_LIB` can point at a prebuilt library).
 There is no Python fallback: if the extension is missing, the first transform call raises `ImportError` with the build instructions instead of silently taking a slower, subtly different path.
-The one exception is the structural pass described under splitting below: `split_by_inputs` and its `analyze_inputs` report compute no derivative, no batch and no value, so they are Python.
+The one exception is the structural pass described under splitting below: [`split_by_inputs`](/api/evoxc/transforms/split-by-inputs/) and its [`analyze_inputs`](/api/evoxc/transforms/analyze-inputs/) report compute no derivative, no batch and no value, so they are Python.
 
 Python keeps only frontend duties — argument validation with fixed error wording, [`TensorSpec`](/api/evoxc/core/tensorspec/)/pytree adaptation, `Graph` reconstruction, and the rules bridge.
 That bridge is how custom [`block`](/api/evoxc/block/block/) ops (`block:<name>`), external kernels (`external:<name>`) and sparse ops (`sparse_*`) contribute batching and derivative rules: their Python rules run inside the native rewrite and produce subgraphs that the engine splices in.
@@ -222,8 +222,8 @@ evoxc.split_by_inputs(graph_or_fn, fixed=None, *, fixed_leaves=None)
 # Graph → SplitPlan;  callable/Defn → SplitCallable
 ```
 
-A callable or `Defn` input returns a `SplitCallable` for the same reason `vmap` does: the shapes must be known before the slice can be computed, and `evoxc.transforms` may not import the pipeline.
-Call it with specs and it traces exactly once and returns a `SplitPlan`; concrete `Tensor` arguments raise `TraceError`, because a plan never executes anything.
+A callable or `Defn` input returns a [`SplitCallable`](/api/evoxc/transforms/splitcallable/) for the same reason `vmap` does: the shapes must be known before the slice can be computed, and `evoxc.transforms` may not import the pipeline.
+Call it with specs and it traces exactly once and returns a [`SplitPlan`](/api/evoxc/transforms/splitplan/); concrete `Tensor` arguments raise `TraceError`, because a plan never executes anything.
 
 This is the first structural — non-numeric — pass in `evoxc.transforms`: it only slices the graph data structure (no derivatives, no batching, no computation), so unlike `vectorize`, `vmap`, `grad`, `jvp`, `vjp` and the `batch_functions` merge it is a Python pass rather than part of the Rust engine, under the same import constraints: no backend awareness, no lowering.
 
@@ -237,7 +237,7 @@ The source graph is never mutated: its `digest()` is unchanged by a split, so yo
 
 One rule decides what crosses the boundary: a fixed-only value crosses only where a `return` operand *is* it or a mixed op consumes it.
 A fixed-only value consumed only by fixed-only ops stays inside `prepare`, so the computed downstream value is what crosses, not its inputs; constants are re-cloned into `apply` instead of being shipped across the boundary.
-`plan.boundary` lists the `BoundaryValue`s in `prepare`-output order, and `plan.boundary_specs` / `plan.boundary_bytes` describe their types and size.
+`plan.boundary` lists the [`BoundaryValue`](/api/evoxc/transforms/boundaryvalue/)s in `prepare`-output order, and `plan.boundary_specs` / `plan.boundary_bytes` describe their types and size.
 A varying input the source never reads stays in `apply`'s signature for stability and is listed in `plan.unused_varying_leaves`.
 
 The boundary is a **snapshot**, not a cache: neither graph carries state or invalidation logic, so when a fixed input changes you run `prepare` again — running `apply` on a stale boundary silently computes a stale answer.
@@ -314,7 +314,7 @@ analysis.split(fixed_leaves=[1])                 # == split_by_inputs(graph, fix
 ```
 
 `.text()` prints a header line with the counts (tensor inputs, static values, entry-block ops, tensor outputs), a `splittable:` line, and one row per tensor input under the columns `idx`, `path`, `shape`, `dtype`, `bytes`, `consumers`, `ops`, `outputs`, `boundary(alone)`.
-`InputAnalysis` also carries `source`, `inputs`, `op_count` (non-terminator entry-block ops), `output_count`, `splittable`, `blocked_reason` (the gate's own message when the graph cannot be split), `summary()` (five keys), `as_dict()` and `text()`.
+[`InputAnalysis`](/api/evoxc/transforms/inputanalysis/) also carries `source`, `inputs`, `op_count` (non-terminator entry-block ops), `output_count`, `splittable`, `blocked_reason` (the gate's own message when the graph cannot be split), `summary()` (five keys), `as_dict()` and `text()`.
 `split(...)` is the sugar over `split_by_inputs` on the same graph and takes the identical `fixed` / `fixed_leaves` arguments.
 
 ### When to prefer it over `vmap` or `batch_functions`
