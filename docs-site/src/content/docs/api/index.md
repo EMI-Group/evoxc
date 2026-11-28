@@ -250,8 +250,14 @@ title: "Python API reference"
 ### [evoxc.transforms](/api/evoxc/transforms/)
 
 - [`BatchReport`](/api/evoxc/transforms/batchreport/) — What one `batch_functions` merge actually did (the `batch_report`).
+- [`BoundaryValue`](/api/evoxc/transforms/boundaryvalue/) — One tensor crossing the `prepare` → `apply` boundary.
+- [`InputAnalysis`](/api/evoxc/transforms/inputanalysis/) — The result of `analyze_inputs`: the per-input facts of one graph.
+- [`InputInfo`](/api/evoxc/transforms/inputinfo/) — Per-tensor-input facts of one traced graph (`analyze_inputs`).
+- [`SplitCallable`](/api/evoxc/transforms/splitcallable/) — Returned by `split_by_inputs` when given a callable/`Defn`.
+- [`SplitPlan`](/api/evoxc/transforms/splitplan/) — The result of `split_by_inputs`: a `prepare` / `apply` graph pair.
 - [`SwitchRecord`](/api/evoxc/transforms/switchrecord/) — One switch class emitted by `batch_functions`.
 - [`TransformCallable`](/api/evoxc/transforms/transformcallable/) — Returned by transforms applied to a callable/`Defn`.
+- [`analyze_inputs`](/api/evoxc/transforms/analyze-inputs/) — Report the per-tensor-input facts of a traced graph.
 - [`batch_functions`](/api/evoxc/transforms/batch-functions/) — Merge N same-signature programs into one graph with a function axis.
 - [`grad`](/api/evoxc/transforms/grad/) — Reverse-mode gradients: inputs → gradients w.r.t.
 - [`jvp`](/api/evoxc/transforms/jvp/) — Forward-mode differentiation: push tangents through the computation.
@@ -259,6 +265,7 @@ title: "Python API reference"
 - [`register_batching_rule`](/api/evoxc/transforms/register-batching-rule/) — Register (or replace) the batching rule for `op_name`.
 - [`register_jvp_rule`](/api/evoxc/transforms/register-jvp-rule/) — Register (or replace) the JVP rule for `op_name`.
 - [`register_vjp_rule`](/api/evoxc/transforms/register-vjp-rule/) — Register (or replace) the VJP rule for `op_name`.
+- [`split_by_inputs`](/api/evoxc/transforms/split-by-inputs/) — Split a graph into a `prepare` / `apply` pair at its input structure.
 - [`vectorize`](/api/evoxc/transforms/vectorize/) — Vectorize a traced graph via per-op batching rules.
 - [`vjp`](/api/evoxc/transforms/vjp/) — Reverse-mode differentiation: pull cotangents back to the inputs.
 - [`vmap`](/api/evoxc/transforms/vmap/) — Vectorize a function or graph over a leading axis (function-side sugar).
